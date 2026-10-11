@@ -49,7 +49,7 @@ fn parse_endpoint(value: &str) -> Result<String, String> {
 #[derive(clap::Args)]
 struct BenchOptions {
     /// Timed job scenario instead of the ordinary suite (60s, concurrency 27).
-    #[arg(long, value_enum, conflicts_with_all = ["quick", "compare", "capacity", "disruptive", "yes"])]
+    #[arg(long, value_enum, conflicts_with_all = ["quick", "capacity", "disruptive", "yes"])]
     scenario: Option<reliaburger::relish::bench_jobs::JobScenario>,
     /// Measurement window for job scenarios; positive drain follows it.
     #[arg(long, default_value_t = 60, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=86400))]
@@ -75,9 +75,13 @@ struct BenchOptions {
     /// Abbreviated suite for development and CI.
     #[arg(long)]
     quick: bool,
-    /// Compare with a previous JSON benchmark report.
+    /// Compare with a previous JSON benchmark report (a suite report, or a
+    /// `--report` file from the same job scenario).
     #[arg(long)]
     compare: Option<PathBuf>,
+    /// Largest drop in a job scenario's rate, in percent, that `--compare` passes.
+    #[arg(long, default_value_t = reliaburger::relish::bench_jobs::DEFAULT_TOLERANCE_PERCENT, requires_all = ["scenario", "compare"], value_parser = clap::value_parser!(u32).range(1..=90))]
+    tolerance: u32,
     /// Deliberately schedule minimal workloads until the cluster is full.
     #[arg(long, requires = "yes")]
     capacity: bool,
@@ -87,6 +91,35 @@ struct BenchOptions {
     /// Acknowledge capacity saturation and disruptive benchmark effects.
     #[arg(long)]
     yes: bool,
+}
+
+// Its own parser, boxed, like `BenchOptions`: inline fields would grow the
+// generated `Command` parser past the test-thread stack.
+// Filters for `relish audit`.
+#[derive(clap::Args)]
+struct AuditOptions {
+    /// Records at or after this time: epoch seconds, or a duration
+    /// before now (e.g. "30m", "2h", "7d").
+    #[arg(long)]
+    since: Option<String>,
+    /// Records at or before this time, in the same forms as --since.
+    #[arg(long)]
+    until: Option<String>,
+    /// One action (e.g. "app.deleted"), or a family ("fault.*").
+    #[arg(long)]
+    action: Option<String>,
+    /// A token name or principal id.
+    #[arg(long)]
+    principal: Option<String>,
+    /// Only actions on this namespace.
+    #[arg(long)]
+    namespace: Option<String>,
+    /// How many of the newest records to show (default 100, at most 10000).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Read every node's log, not just this node's, merged by time.
+    #[arg(long)]
+    cluster: bool,
 }
 
 #[derive(Subcommand)]
@@ -310,6 +343,9 @@ enum Command {
         #[command(subcommand)]
         action: FaultAction,
     },
+    /// Show who did what: the durable audit log of applies, deletes, execs,
+    /// upgrades, faults, tokens and the other changes to the cluster.
+    Audit(Box<AuditOptions>),
     /// Manage volume snapshots (Btrfs-backed volumes only).
     Snapshot {
         #[command(subcommand)]
@@ -407,7 +443,7 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
-    /// List bounded job run summaries and rates, or durable schedule definitions.
+    /// List bounded job run summaries and rates, or durable definitions with their last outcomes.
     Jobs {
         #[arg(long)]
         definitions: bool,
@@ -1745,6 +1781,30 @@ async fn main() -> ExitCode {
                 volume,
             } => commands::snapshot_delete(app, namespace, name, volume.as_deref()).await,
         },
+        Command::Audit(options) => {
+            let AuditOptions {
+                since,
+                until,
+                action,
+                principal,
+                namespace,
+                limit,
+                cluster,
+            } = *options;
+            reliaburger::relish::audit_cmd::audit(
+                reliaburger::relish::audit_cmd::AuditFlags {
+                    since,
+                    until,
+                    action,
+                    principal,
+                    namespace,
+                    limit,
+                    cluster,
+                },
+                cli.output,
+            )
+            .await
+        }
         Command::Fault { ref action } => match action {
             FaultAction::Delay {
                 target,
@@ -2378,6 +2438,7 @@ async fn main() -> ExitCode {
                 report,
                 quick,
                 compare,
+                tolerance,
                 capacity,
                 disruptive,
                 yes,
@@ -2394,6 +2455,8 @@ async fn main() -> ExitCode {
                             exec,
                             namespace,
                             report,
+                            compare,
+                            tolerance_percent: tolerance,
                             output: cli.output,
                         },
                     )
@@ -2553,12 +2616,26 @@ mod tests {
     fn readme_command_list_matches_the_cli() {
         use clap::CommandFactory;
         use reliaburger::relish::command_reference::{
-            GROUPS, REGENERATE_COMMAND, render, replace_region,
+            Availability, GROUPS, REGENERATE_COMMAND, render, replace_region,
         };
+        use reliaburger::relish::released_cli::ReleasedCli;
 
-        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme_path = repository.join("README.md");
         let readme = std::fs::read_to_string(&readme_path).unwrap();
-        let section = render(&Cli::command(), GROUPS).unwrap_or_else(|e| panic!("{e}"));
+        // Commands the installer's release lacks are labelled with this
+        // build's version (0.2.0-dev labels them "0.2.0").
+        let released = ReleasedCli::parse(
+            &std::fs::read_to_string(repository.join("scripts/release/released-cli.tsv")).unwrap(),
+        )
+        .unwrap();
+        let upcoming = env!("CARGO_PKG_VERSION").split('-').next().unwrap();
+        let availability = Availability {
+            released: &released,
+            label: released.unreleased_label(upcoming),
+        };
+        let section =
+            render(&Cli::command(), GROUPS, Some(&availability)).unwrap_or_else(|e| panic!("{e}"));
         let updated = replace_region(&readme, &section).unwrap_or_else(|e| panic!("{e}"));
 
         if std::env::var_os("RELIABURGER_UPDATE_README").is_some() {
@@ -2840,6 +2917,44 @@ mod tests {
     }
 
     #[test]
+    fn audit_flags_parse() {
+        let cli = parse(&[
+            "relish",
+            "audit",
+            "--since",
+            "2h",
+            "--action",
+            "fault.*",
+            "--principal",
+            "alice",
+            "--namespace",
+            "team-a",
+            "--limit",
+            "50",
+            "--cluster",
+        ])
+        .unwrap();
+        let Command::Audit(options) = cli.command else {
+            panic!("expected relish audit");
+        };
+        let AuditOptions {
+            since,
+            action,
+            principal,
+            namespace,
+            limit,
+            cluster,
+            ..
+        } = *options;
+        assert_eq!(since.as_deref(), Some("2h"));
+        assert_eq!(action.as_deref(), Some("fault.*"));
+        assert_eq!(principal.as_deref(), Some("alice"));
+        assert_eq!(namespace.as_deref(), Some("team-a"));
+        assert_eq!(limit, Some(50));
+        assert!(cluster);
+    }
+
+    #[test]
     fn fault_run_is_an_alias_for_scenario() {
         let via_alias = parse(&["relish", "fault", "run", "scenario.toml"]).unwrap();
         assert!(matches!(
@@ -2982,7 +3097,9 @@ mod tests {
             vec!["--cpu-request", "0"],
             vec!["--cpu-request", "1001"],
             vec!["--quick"],
-            vec!["--compare", "old.json"],
+            vec!["--tolerance", "0"],
+            vec!["--tolerance", "91"],
+            vec!["--tolerance", "20"],
             vec!["--capacity", "--yes"],
             vec!["--disruptive", "--yes"],
         ] {
@@ -2991,6 +3108,39 @@ mod tests {
             assert!(parse(&command).is_err(), "{command:?}");
         }
         assert!(parse(&["relish", "bench", "--seconds", "20"]).is_err());
+        assert!(
+            parse(&[
+                "relish",
+                "bench",
+                "--compare",
+                "old.json",
+                "--tolerance",
+                "20"
+            ])
+            .is_err()
+        );
+        let cli = parse(&[
+            "relish",
+            "bench",
+            "--scenario",
+            "jobs-host-processes",
+            "--compare",
+            "baseline.json",
+            "--tolerance",
+            "15",
+        ])
+        .unwrap();
+        let Command::Bench(options) = cli.command else {
+            panic!("expected bench");
+        };
+        assert!(matches!(
+            *options,
+            BenchOptions {
+                compare: Some(ref path),
+                tolerance: 15,
+                ..
+            } if path == std::path::Path::new("baseline.json")
+        ));
         let cli = parse(&[
             "relish",
             "bench",

@@ -82,6 +82,8 @@ Cleanup happens through two independent mechanisms:
 
 The reversal is the part that's easy to get wrong, and it's worth being blunt about why. A chaos experiment that can't undo itself isn't an experiment, it's an outage you scheduled. Every persistent fault records what it needs to restore at the moment it's applied — the saved cgroup value, the list of PIDs it froze — and stashes that on the registry entry. When the fault is cleared (`relish fault clear <id>`), cleared en masse, or expires on its own, the same reversal runs. Three doors, one exit.
 
+Each door leaves a mark in the audit log, too. A clear is someone's request, so the API records `fault.cleared` under the caller's credential. An expiry is nobody's request: the agent notices the deadline and reverses the effect itself, so it records `fault.expired` with principal `system`, the fault's id and type, and who injected it. For a long time expiry only printed a line to stderr, which made "who undid this, and when?" a question for whoever still had the node's logs. The agent loop doesn't wait for the record to reach the disk (it has a node to run), so it drops the receipt the audit log hands back; an API handler waits on its receipt before answering. Chapter 10 has the audit log itself. The record of an injection also names its namespace and whether `--include-leader` or `--override-safety` was used, and an injection with either is recorded as critical rather than as a warning, so a game day that overrode a rail stands out when you read the log back.
+
 The registry is wrapped in `Arc<tokio::sync::Mutex<FaultRegistry>>` because the agent event loop and the expiry background task both need access. We use `tokio::sync::Mutex`, not `std::sync::Mutex`. In async code, a standard mutex can block the tokio runtime if the lock is held across an `.await` point. The tokio mutex yields instead.
 
 ## Process faults: the easy ones
@@ -1055,6 +1057,57 @@ signal succeeds while the process runs or exits and fails only on a real
 permission refusal. Retirement still lists every group member before it writes
 `Retiring`, so accepting the refusal can't publish a false absence.
 
+That fix stayed in the exec owner, and the same refusal turned up later in the
+process runtime's own `stop` and `kill` ([#723](https://github.com/reliaburger/reliaburger/issues/723)).
+Now and then on a loaded Mac, a log-capture test failed with
+`StopFailed … Operation not permitted` while killing a `printf` child. Both
+calls work in two steps. First `try_wait` asks whether the child has already
+exited; if so there's nothing to signal. Otherwise they signal its group with
+`kill(-pid, signal)`, treating `ESRCH` ("no such process") as "already gone".
+A `printf` lives for about a millisecond, so once in a while it exited between
+those two steps. It was a zombie when the signal went out, and macOS refused a
+group of zombies with `EPERM`, not `ESRCH`.
+
+`nix` hands back the C `errno` as a Rust enum, `nix::errno::Errno`, so each
+error code is a variant we can `match` on, not a magic integer. The arm that
+handles the refusal has the same shape as the exec owner's:
+
+```rust
+match nix::sys::signal::kill(group, signal) {
+    Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+    #[cfg(target_os = "macos")]
+    Err(nix::errno::Errno::EPERM) => {
+        observe_child_exit(entry)?;
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    Err(error) => Err(error.into()),
+}
+```
+
+Ignoring `EPERM` outright would have been one line, and it would hide a real
+refusal, such as a group member running as another user. Instead the refusal
+makes us look again. If `try_wait` now reports the exit, we record the exit
+code and the stop has nothing left to do. If the child still hasn't exited, we
+signal it directly, which succeeds while it runs or exits, so an error from
+that second `kill` really is a permission problem and goes back to the caller.
+On Linux the arm doesn't exist: `#[cfg(target_os = "macos")]` removes it at
+compile time, and a Linux `EPERM` still fails the stop as before.
+
+The window between the two steps lasts microseconds, far too short to aim a
+test at through `stop` itself. So the regression,
+`signalling_a_child_that_exited_after_the_exit_check_is_not_an_error`, builds
+the race's end state directly. It starts a child that exits at once, waits
+with `waitid(…, WNOWAIT)` until the exit is visible *without* reaping it, then
+runs the signalling step that `stop` and `kill` share. Before the fix it failed
+on every run on macOS with `Operation not permitted`; afterwards the original
+test passed 400 loaded iterations in a row.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill
@@ -1155,8 +1208,7 @@ The state machine compares that position with its previous applied entry
 before changing either placements or batches. If another admission got there
 first, the candidate is refused and the leader plans again. This is a
 compare-and-swap operation: Rust's `Option<LogId>` represents either the exact
-position we read or the absence of any applied entry. After a bounded number
-of competing writes, submission returns a retryable error. The entire placement
+position we read or the absence of any applied entry. The entire placement
 pass is one guarded transaction: an invalid later decision can't leave earlier
 apps committed. The old unguarded placement request is refused.
 
@@ -1169,12 +1221,20 @@ gap before the aggregator's next publication. These checks stay on the leader;
 Raft application never depends on a replica's clock. Missing evidence doesn't
 turn a cluster into an unlimited standalone node.
 
-Batch planning and registration have a five-second overall deadline and at
-most eight attempts after competing writes. If the acknowledgement is lost,
-submission returns 503 without dispatching. A late committed allocation stays
-reserved because timing out the caller doesn't prove Raft refused the write.
-The ordinary scheduler bounds its whole-pass proposal too and replans from
-committed state on the next tick.
+Nothing in production plans and registers a batch this way any more. Public
+jobs are admitted as runs in the job store (Chapter 17), and the guarded
+`BatchRegister` survives only to seed the retained ownership fixtures. A late
+committed reservation still stays reserved, because timing out the caller
+doesn't prove Raft refused the write. The ordinary scheduler bounds its
+whole-pass proposal and replans from committed state on the next tick.
+
+The fixtures taught us that "nobody else is writing" is never a safe
+assumption. A leader's job loop commits entries of its own, a cron observation
+on its first tick and again every minute. A fixture that read the position
+and then wrote now and then lost that race and was refused with "admission
+revision changed" ([#735](https://github.com/reliaburger/reliaburger/issues/735)).
+The state machine was right. The fixture now replans on that refusal, as the
+scheduler does.
 
 Durable retirement excludes a worker even while gossip and reports still call
 it alive. The planner filters it, and Raft refuses a registration assigned to

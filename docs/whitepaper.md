@@ -269,7 +269,11 @@ unknown outcome owned until a user acknowledges replay; bulk work can opt into
 at-least-once retry. Neither policy promises exactly-once external effects.
 Encrypted templates and authorised scripts retain namespace and host-execution
 checks. Bounded summaries, accepted rates, backlog, duration histograms and
-selected result pages replace listing millions of jobs. The daily throughput
+selected result pages replace listing millions of jobs. Each definition keeps
+its last ten outcomes after the runs' detail is pruned, every node exports job
+counters and duration histograms labelled only by namespace, definition,
+profile and node, and the leader records one event per run (never per task),
+sending failed and unknown-outcome runs to the alert webhooks. The daily throughput
 claim still needs sustained qualification, including container launch cost,
 resource demand, storage and service quality. See the [job manual](manual/14_batch-jobs.md).
 
@@ -646,7 +650,9 @@ Certificate revocation uses a CRL kept in the council's replicated state; each n
 
 ### 11.5 Audit Logging
 
-Today, fault-injection operations emit a structured audit event attributed to the authenticated credential (not a client-supplied name), held in an in-memory bounded event history. **Status: comprehensive audit logging is planned — not yet implemented.** The full vision (an entry for every modifying API operation, with identity, source IP and timestamp, persisted via Ketchup and queryable from the CLI) is not what the current binary does: there is no source-IP capture, no Ketchup-backed audit store, and the events cover only fault injection.
+Every node keeps a durable, bounded audit log of the actions it served: applies, deletes, stops, execs, rollbacks, job, array and build submissions, upgrades, decommissions, elections, snapshots, test leases, fault injection, clearing and expiry, and every change to tokens, secrets and CAs. Each record carries the authenticated principal (never a client-supplied name), the app and namespace, the source address, a timestamp and the action's own facts, and never a secret. The node writes the record as a line of JSON under its data directory and syncs it before answering, so an acknowledged action survives a restart; the log rotates in segments and drops the oldest first, within a configurable bound (64 MiB by default). A write that fails is logged and counted but never fails the operator's action. `GET /v1/audit` and `relish audit` filter by time, action, principal and namespace, and `--cluster` merges every node's log. Only an unscoped Admin may read it, never the internal service principal. The in-memory event ring still shows audit records live, but no longer holds the only copy.
+
+**Status:** the log is per node. Central retention (shipping records off the node, so a lost or decommissioned node doesn't take its history with it) is planned, not implemented, as is tamper evidence (hash-chaining records).
 
 > For the full PKI model, API authentication, secret encryption, and threat model, see [design/security-sesame.md](design/security-sesame.md).
 
@@ -737,7 +743,7 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 
 Reliaburger includes a complete observability stack with zero configuration:
 
-**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
+**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
 
 **Logs (Ketchup):** Captures stdout/stderr from every container. Structured storage with timestamp-based indexing and zstd compression. `relish logs --json-field key=value` filters JSON lines on the client, after the server has returned the lines you asked for; server-side field queries are planned. Each node exports its log files to a directory, `s3://` or `gs://` on a schedule.
 
@@ -769,7 +775,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
 | `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
-| `relish top` | Every workload on every node, with its latest CPU and memory samples | `kubectl top` (requires metrics-server) |
+| `relish top` | Workloads with their latest CPU and memory, running array tasks included | `kubectl top` (requires metrics-server) |
 | `relish metrics <app>` | An app's own Prometheus metrics, scraped by its nodes | (none — requires Prometheus) |
 | `relish dashboard` | Read-only web dashboard through your authenticated CLI | `kubectl proxy` + a dashboard install |
 | `relish wtf` | Automated health check | (none — requires runbooks + Prometheus alerts) |
@@ -817,6 +823,12 @@ What the current binary actually enforces is a policy layer, not a sandbox:
 
 On rootful Linux, process batches use a bounded native executor pool. Each command starts as a fresh host process inside its resource-profile cgroup, with CPU, memory, swap and PID limits applied before execution. A durable owner holds the executor subtree until retirement. These jobs run as Bun's user and retain access to the host; they are trusted workloads, not a security sandbox. Every host backend passes only a short allowlist of Bun's environment (`PATH`, `HOME`, locale and a few more) plus the job's own variables.
 
+Process apps get the supervisor's per-process CPU and memory samples. Process
+batch tasks don't run under the supervisor, so each node measures their
+executor cgroups (or, without cgroups, their processes) per job definition and
+profile instead: Mayo stores those as job series and `relish top` shows one
+row per definition with its running task count.
+
 Process applications, ordinary process jobs and every host workload on platforms without the native backend still use the process owner directly. Explicit job resource limits are refused when that backend cannot enforce them. **Status: further kernel isolation is planned.** There is no dedicated `burger` user, seccomp profile or network/PID/mount namespace for host workloads. Mount-namespace isolation is explicitly refused when `mount_isolation` is requested.
 
 > For the full isolation model, security controls, and when-to-use-what guidance, see [design/agent-bun.md](design/agent-bun.md).
@@ -848,6 +860,13 @@ restart is [#699](https://github.com/reliaburger/reliaburger/issues/699). Admin 
 override a disabled operation, and Bun attributes audit events to the
 authenticated credential rather than a client-supplied name.
 
+In 0.2.0 workload faults target apps only: the replica guard refuses a kill or
+pause aimed at a job, and array or shared-executor attempts aren't Smoker
+targets. Jobs are tested under node-level faults instead (Bun killed on a
+worker or the leader, delayed traffic between nodes, a full disk, slow
+fsync), which is how the release's job qualification breaks them. Job-aware
+chaos is planned for 0.2.2.
+
 | | Chaos Mesh (K8s) | Litmus (K8s) | Gremlin (SaaS) | **Smoker** |
 |---|---|---|---|---|
 | **Installation** | CRDs + operator + RBAC | CRDs + operator + agent | SaaS agent | **Built-in** |
@@ -878,7 +897,15 @@ Consent can't override server policy. Each case owns exact fault ids and
 reverses them after failure, timeout or panic; unconfirmed reversal is
 `Unknown`.
 
-`relish bench` measures the data plane of a live cluster and, with `--compare`, checks the report against a previous one to catch regressions. It compares against that stored baseline, not against the design goals in Section 2. `--disruptive` adds a leader-failure reconstruction run, and `--scenario` runs the timed job comparisons behind the [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md), which measure per-job overhead, not sustained throughput.
+`relish bench` measures the data plane of a live cluster and, with `--compare`, checks the report against a previous one to catch regressions. It compares against that stored baseline, not against the design goals in Section 2, and `--disruptive` adds a leader-failure reconstruction run.
+Four job scenarios (`--scenario jobs-containers`, `jobs-shared-containers`,
+`jobs-host-processes` and the raw `jobs-vm-baseline`) count unique accepted
+successes in a fixed window through the public job API. Each writes a strict
+JSON report, and `--compare` with an earlier report of the same scenario fails
+on a drop in the window rate beyond `--tolerance` (10% by default); different
+settings make the comparison informational. A window rate is a regression
+guard, never a daily qualification: the 100-million-a-day claim needs the
+24-hour job qualification on at least three nodes.
 
 > For test output examples, benchmark methodology, and CI integration, see the design docs for each component.
 
@@ -888,7 +915,7 @@ reverses them after failure, timeout or panic; unconfirmed reversal is
 
 Since every component of a node lives in the one `bun` binary, upgrading a node means replacing that binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). So until 1.0, self-upgrade works only between builds of the same format. Every release from 0.1.0 to 0.2.0 bumped one, so no rolling upgrade between two published releases has run yet; shipping a patch release that keeps its predecessor's formats, and qualifying a real published-to-published rolling walk on it, is a goal. A compatibility promise across versions is a post-1.0 goal.
 
-Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Published release metadata carries only the release signature, so `relish upgrade start <version>` countersigns each download with the operator's key (`--external-key`) or takes a countersigned envelope (`--sig`). It picks the build for the platform each node reports rather than the one relish runs on, and a cluster that mixes architectures gets one build per platform. Automatic rollback triggers if a node fails to start on the new version.
+Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Published release metadata carries only the release signature, so `relish upgrade start <version>` countersigns each download with the operator's key (`--external-key`) or takes a countersigned envelope (`--sig`). It picks the build for the platform each node reports rather than the one relish runs on, and a cluster that mixes architectures gets one build per platform. Before staging, each node runs the verified candidate once with `--compatibility` and refuses a binary whose formats differ or that doesn't answer within 60 seconds, a hang guard sized for macOS, which assesses every new executable before its first run. Automatic rollback triggers if a node fails to start on the new version.
 
 > For the upgrade sequence, binary versioning, rollback procedure, and security considerations, see [design/agent-bun.md](design/agent-bun.md).
 

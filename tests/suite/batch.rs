@@ -24,6 +24,7 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::admission_fixture::write_admission_fixture;
 use crate::task_harness;
 use task_harness::TestTasks;
 
@@ -543,6 +544,65 @@ async fn a_new_leader_refuses_cross_worker_reuse_of_a_pruned_execution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn another_worker_cannot_apply_an_ordinary_job_over_a_pruned_batch_execution() {
     assert_pruned_execution_cannot_be_claimed_elsewhere("other-worker", "job").await;
+}
+
+/// A running API's leader loop commits entries of its own: its first tick
+/// records a cron observation. A seeded admission entry planned just before
+/// such a write is refused with "admission revision changed" (#735), so the
+/// fixture must replan from committed state, as the scheduler does. The
+/// writer here commits about every millisecond, far more often than the
+/// leader loop, so a fixture that plans only once is refused within a hundred
+/// rounds (19 runs out of 20 when this was written).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_fixture_replans_when_another_entry_lands_first() {
+    use reliaburger::council::types::{CouncilResponse, RaftRequest};
+
+    let council = single_node_leader().await;
+    let stop = CancellationToken::new();
+    let writer = {
+        let council = council.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.is_cancelled() {
+                council.write(RaftRequest::Noop).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    let mut registered = 0;
+    for round in 0..100 {
+        let batch = BatchRecord {
+            jobs: vec![BatchJobRecord {
+                name: format!("seed-{round}"),
+                execution_name: format!("seed-{round}-execution"),
+                namespace: "default".into(),
+                spec_digest: "a".repeat(64),
+                resources: reliaburger::meat::Resources::default(),
+                node: None,
+                status: JobStatus::Pending,
+            }],
+            submitted_at_epoch_secs: epoch_now_secs(),
+        };
+        let response = write_admission_fixture(
+            &council,
+            RaftRequest::BatchRegister {
+                expected_log_id: None,
+                batch,
+            },
+        )
+        .await
+        .unwrap();
+        if matches!(response, CouncilResponse::BatchRegistered { .. }) {
+            registered += 1;
+        }
+    }
+    stop.cancel();
+    writer.await.unwrap();
+    council.shutdown().await.unwrap();
+    assert_eq!(
+        registered, 100,
+        "seeded registrations refused by a competing writer"
+    );
 }
 
 fn jobs_from(toml: &str) -> std::collections::BTreeMap<String, reliaburger::config::job::JobSpec> {
@@ -3967,8 +4027,18 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
         config.app.insert("other-api".into(), app);
         config.job.get_mut("migrate").unwrap().run_before = vec!["app.other-api".into()];
     }
-    let retry =
-        tokio::time::timeout(Duration::from_secs(3), new_leader.client.apply(&config)).await;
+    // The harness's leader loop takes chunks back from a holder silent for
+    // three seconds (`with_timings` above), and node-1 never answers node-2.
+    // A conservative hook's lost holder is an unknown outcome, so the same
+    // operation first stays pending and then reports that outcome (#774).
+    // Wait well past the silence so "same" checks the settled answer instead
+    // of racing it; a conflicting claim must still refuse promptly.
+    let window = if mode == "same" {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(3)
+    };
+    let retry = tokio::time::timeout(window, new_leader.client.apply(&config)).await;
     // Release before assertions so even unchanged production's erroneous
     // second launch is cleaned up and the original process does not linger.
     std::fs::write(&release, b"release").unwrap();
@@ -3985,9 +4055,21 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
         council.shutdown().await.unwrap();
     }
     if mode == "same" {
+        // The repeat is the same durable operation, never a new attempt: it
+        // reports the original hook's unknown ownership rather than success.
+        let operations: Vec<String> = final_state
+            .task_arrays
+            .deployments()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        assert_eq!(operations.len(), 1, "{operations:?}");
+        let error = retry
+            .expect("the repeat must settle once node-1's silence makes its hook unknown")
+            .expect_err("an uncertain prerequisite was reported as applied");
+        let message = error.to_string();
         assert!(
-            retry.is_err(),
-            "an idempotent repeat must observe the same pending operation"
+            message.contains(&operations[0]) && message.contains("retains unknown hook ownership"),
+            "an idempotent repeat must observe the same operation's unknown hook: {message}"
         );
     } else {
         let error = retry
@@ -4372,26 +4454,6 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
     assert_eq!(observed.id, deploy_id);
     assert!(observed.cancellation_requested_at.is_some());
     assert_ne!(observed.outcome, Some(DeployOperationOutcome::Completed));
-}
-
-async fn write_admission_fixture(
-    council: &reliaburger::council::CouncilNode,
-    mut request: reliaburger::council::RaftRequest,
-) -> Result<reliaburger::council::CouncilResponse, reliaburger::council::CouncilError> {
-    let previous = council.desired_state().await.last_applied_log;
-    match &mut request {
-        reliaburger::council::RaftRequest::BatchRegister {
-            expected_log_id, ..
-        } => *expected_log_id = previous,
-        reliaburger::council::RaftRequest::SchedulingDecision(decision) => {
-            request = reliaburger::council::RaftRequest::SchedulingDecisions {
-                expected_log_id: previous,
-                decisions: vec![decision.clone()],
-            }
-        }
-        _ => {}
-    }
-    council.write(request).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -66,6 +66,7 @@ pub async fn sweep_expired_tokens_once(
                 app: None,
                 namespace: None,
                 node: Some(node.to_string()),
+                source_address: None,
                 details: std::collections::BTreeMap::from([("token".to_string(), name.clone())]),
                 message: format!("expired API token {name} removed"),
             });

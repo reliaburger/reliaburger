@@ -20,6 +20,7 @@ fn record(index: u32) -> TaskRecord {
         exit_code: Some(0),
         run_ms: 1,
         output: None,
+        retry_causes: Default::default(),
     }
 }
 fn node(root: &Path, delay: Duration, concurrency: u32) -> TaskArrayNode {
@@ -61,6 +62,7 @@ fn assignment(id: u64, count: u32, attempt: u64) -> ArrayAssignment {
         }],
         stopping: false,
         replay_unknown: true,
+        labels: Default::default(),
     }
 }
 fn request(arrays: Vec<ArrayAssignment>) -> NodeSyncRequest {
@@ -193,6 +195,7 @@ fn failed_only_results_discard_a_superseded_failure() {
                 failed_indices: IndexRangeSet::new(),
                 not_run: 0,
                 retried: 0,
+                retry_causes: Default::default(),
             },
         )
         .unwrap();

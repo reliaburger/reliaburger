@@ -95,6 +95,10 @@ Stopped.
 
 ### Jobs and cron
 
+This section describes 0.2.0, not in 0.1.6: build matching development binaries
+and start a fresh cluster to try it. The [job manual](manual/14_batch-jobs.md)
+covers it in full.
+
 Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
 definition, a run with a trigger identity, and indexed tasks the leader hands to
 workers with room for them. A TOML job sets its policy with the manifest's field
@@ -125,6 +129,14 @@ idempotency key before sending. If a submission times out, retry with
 `--idempotency-key KEY` and the cluster returns the runs it already admitted.
 Manifests and JSON `tasks` refuse unknown fields, so a typo fails at
 `--dry-run` rather than falling back to defaults.
+
+Each job definition keeps its last ten run outcomes after a run's own detail
+is pruned (`relish jobs --definitions`, and the dashboard's job card). The
+leader records one event per run, never per task, and sends failed and
+unknown-outcome runs to the alert webhooks. Every node exports `job_*`
+counters, a duration histogram and task CPU and memory, labelled only by
+namespace, definition, profile and node, and `relish top` lists running array
+tasks. See [job history, metrics and events](manual/14_batch-jobs.md#job-history-metrics-and-events).
 
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations; keep using the same node endpoint for a
@@ -406,7 +418,7 @@ selects ignored tests only and fails if its filter finds no tests. Target-specif
 macOS. Retries are disabled.
 
 The deferred Apple Container adapter has manual development tests on Apple silicon;
-these are not a 0.1.0 acceptance gate. See the [test harness design](design/test-harness.md)
+these aren't a release acceptance gate. See the [test harness design](design/test-harness.md)
 for the audit, exact suite contracts and CI mapping.
 
 ### Benchmarks
@@ -419,9 +431,13 @@ make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
 
-CI runs both on pushes to `main`, nightly, and on pull requests that touch
-`src/mustard/` or `benches/`. Nothing gates on the numbers yet, so other pull
-requests skip the release build.
+CI runs all three on pushes to `main` and nightly. A pull request runs the
+gossip benchmarks when it touches `src/mustard/` or the gossip benches, and the
+task-array benchmarks when it touches the task-array leader, node pool,
+executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
+nothing; the task-array job fails only on a benchmark more than twice as slow
+as main's last baseline, and keeps its Criterion output for 90 days
+([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
 
@@ -501,7 +517,7 @@ The agent prints its version, the commit it was built from, and the runtime
 it selected on startup:
 
 ```
-bun: reliaburger node agent v0.1.0 (3fcb1fd)
+bun: reliaburger node agent v0.2.0-dev (3fcb1fd)
 bun: auto-detected runtime: process
 bun: API server listening on 127.0.0.1:9117
 ```
@@ -1172,6 +1188,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
 | `GET` | `/v1/chaos/status` | Show the replicated node-experiment reservation, if any |
+| `GET` | `/v1/audit` | Read the node's durable audit log (`since`, `until`, `action`, `principal`, `namespace`, `limit`; `cluster=true` merges every node). Unscoped Admin with cluster-wide `admin`, never the service principal |
 
 The CLI uses this API internally. You can also call it directly:
 
@@ -1275,7 +1292,10 @@ failures and the hard safety limit fail the suite.
 (60 seconds at concurrency 27 by default), with fresh-container, host-process
 and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
 it measures per-job overhead rather than real work; see the batch manual for
-prerequisites and resource profiles.
+prerequisites and resource profiles. `--compare OLD.json` checks a scenario
+against an earlier report of the same scenario and fails on a drop beyond
+`--tolerance` (10% by default). The 100-million-a-day claim itself needs the
+24-hour job qualification (`scripts/release/qualify-jobs-sustained.sh`).
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
@@ -1471,45 +1491,25 @@ machines.
 They're one part of a release's acceptance, not all of it; the
 [release runbook](releasing.md) lists the gates a candidate has to pass.
 
-Held cluster jobs conservatively reserve their CPU/memory requests on every app or batch placement candidate until positive settlement. This can over-reserve; it does not add initial node-local job capacity admission.
+### Running jobs on a development build
 
-### Delegated jobs (0.2.0 development preview)
+The job lifecycle here is 0.2.0, not in 0.1.6. [Batch jobs](manual/14_batch-jobs.md)
+explains it: one-off jobs, cron, deployment hooks and task arrays, how they share
+resources with apps, namespace quotas and caps, retries, watching a run, and
+reading its results. The [burger manifest](../examples/demo/burger/jobs.toml)
+gives you mixed-size work to run beside a service. 0.2.0 changes the cluster's
+formats, so build matching development binaries and start a fresh cluster.
 
-[Batch jobs](manual/14_batch-jobs.md) explains compact arrays, atomic mixed-profile
-manifests, app/job resource accounting, namespace quotas and per-namespace job
-caps, watch summaries, indexed detail, retries and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
-mixed-resource work beside a service. The standalone landing-page job recording
-uses the built-in `relish bench` scenarios. Build matching development binaries
-and use a fresh cluster (protocol 51 / state 68). The
-[implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
-and the still-unqualified 100m/day sustained throughput target.
+Image jobs run in a fresh container per attempt by default. Linux image jobs
+can set `runtime = "shared-runc"` to reuse a small pool of containers, with
+each command still in its own process under its own limits. Host jobs
+(`runtime = "process"`) run an allowlisted command; Linux `bun --runtime
+mixed`, or `auto` with runc installed, accepts them alongside containers. On
+rootful Linux, host task arrays enforce CPU and memory limits; other host jobs
+refuse limits.
 
-The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
-describes #638: ordinary singleton jobs, arrays, durable UTC cron and deployment
-hooks share the definition/run/task/attempt lifecycle, resource admission and
-accepted-result machinery. Standalone admission persists before acknowledgement;
-conservative jobs retain unknown ownership until acknowledged replay.
-
-Linux image jobs can choose `runtime = "shared-runc"` to retain bounded,
-compatible owned containers while starting a separate limited process for each
-command. Idle profiles and helper resources stay charged to the application/task
-budget; uncertain cleanup retires the whole container before reuse. Fresh
-containers remain the default. Linux `--runtime mixed`, or `auto` with runc
-installed, accepts explicit `runtime = "process"` jobs alongside containers;
-explicit `--runtime runc` stays container-only and `--runtime process` host-only.
-On rootful Linux, host batches use bounded native executors that enforce
-explicit CPU/memory limits before each fresh command starts; ordinary host jobs
-and other platforms refuse limits. Host applications retain their existing
-runtime contract. Verified duration summaries let fast workers queue bounded
-lookahead across control-report rounds; execution still waits for concurrency
-and resources.
-
-The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
-tracks reusable executors (#639), the demonstration (#640) and the
-still-unqualified sustained target (#668). The
-[timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
-record each runtime's per-job overhead for 60 seconds on a small VM, with the
-rig, profiles and limits, and four completed one-hour soaks beside a live
-application; global storage bounds and daily qualification remain in #668. The
-[earlier evidence](qualification/2026-10-08-job-measurements/README.md) keeps
-the recovery results. Resident model workers (#641) remain separate.
+The landing page's job recording uses the built-in `relish bench` scenarios.
+The [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
+record what each kind of job costs for 60 seconds on a small VM, with the rig
+and its limits. The sustained target of 100 million jobs a day isn't qualified
+yet (#668), and resident model workers (#641) are a separate, later feature.

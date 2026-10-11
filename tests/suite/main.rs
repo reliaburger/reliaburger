@@ -13,9 +13,13 @@
 mod bun_process;
 #[path = "../support/cluster.rs"]
 mod cluster_support;
+#[path = "../support/first_launch.rs"]
+mod first_launch;
 // `cluster.rs` already includes the task harness; loading the file a second
 // time would compile two distinct `TestTasks` types.
 use cluster_support::task_harness;
+// Seeds whole-pass admission entries the way a planner commits them.
+mod admission_fixture;
 
 mod agent_cluster;
 mod api_tls;
@@ -24,6 +28,7 @@ mod app_metrics;
 mod batch;
 mod bun_auth_startup;
 mod ca_trust_rotation;
+mod cluster_fixtures;
 mod compatibility;
 mod council_persistence;
 mod council_snapshot_install;
@@ -33,6 +38,7 @@ mod dependency_audit;
 mod dev_robustness;
 mod dns;
 mod endpoint_withdrawal;
+mod fixture_scripts;
 mod gitops;
 mod ingress;
 mod ingress_certificates;

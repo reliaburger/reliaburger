@@ -1,3 +1,4 @@
+pub mod audit_cmd;
 pub mod bench_cmd;
 pub mod bench_jobs;
 pub mod ca_cmd;
@@ -42,6 +43,7 @@ pub mod plan;
 pub mod quickstart;
 pub mod reader;
 pub mod readiness;
+pub mod released_cli;
 pub mod setup;
 pub mod source;
 pub mod test_cmd;

@@ -127,7 +127,11 @@ async fn an_upgrade_execs_only_after_its_answer_is_delivered() {
     })
     .await
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), answer)
+    // The agent answers within the compatibility query's own bound, even
+    // when the probe fails; ten more seconds cover everything around it.
+    let answer_wait =
+        crate::upgrade::compatibility::QUERY_DEADLINE + std::time::Duration::from_secs(10);
+    tokio::time::timeout(answer_wait, answer)
         .await
         .unwrap_or_else(|error| panic!("upgrade-fixture phase=initial-answer elapsed={:?} candidate-probe-reached={} timeout={error}",
             started.elapsed(), _dir.path().join("bin/probe-entered").exists()))

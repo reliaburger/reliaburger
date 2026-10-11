@@ -816,6 +816,21 @@ pub async fn batch_submit_handler(
     if let Err((status, error)) = validate_batch_jobs(&state, &jobs, &headers).await {
         return (status, Json(serde_json::json!({"error": error}))).into_response();
     }
+    let namespaces: std::collections::BTreeSet<&str> =
+        jobs.iter().map(|job| job.namespace()).collect();
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        app: None,
+        namespace: (namespaces.len() == 1)
+            .then(|| namespaces.first().map(|namespace| namespace.to_string()))
+            .flatten(),
+        details: std::collections::BTreeMap::from([
+            ("jobs".to_string(), jobs.len().to_string()),
+            (
+                "namespaces".to_string(),
+                namespaces.iter().copied().collect::<Vec<_>>().join(","),
+            ),
+        ]),
+    });
     let permissions = super::api::permission_map(&state).await;
     for job in &jobs {
         if let Err(response) = crate::sesame::auth::authorize_workload(
@@ -1182,6 +1197,8 @@ pub async fn batch_status_handler(
                 let progress = record.state.summary();
                 let mut summary = super::task_array_api::array_summary(batch_id, record, &nodes);
                 super::task_array_api::enrich_summary(&mut summary, &arrays, batch_id);
+                summary["state_bytes"] =
+                    serde_json::json!(super::task_array_api::state_bytes([record]));
                 summary["rates"] = serde_json::to_value(
                     state
                         .task_arrays
@@ -1197,16 +1214,21 @@ pub async fn batch_status_handler(
                 {
                     return response;
                 }
-                return Json(
-                    super::task_array_api::manifest_summary(
-                        batch_id,
-                        manifest,
-                        &arrays,
-                        &state.task_arrays,
-                    )
-                    .await,
+                let mut summary = super::task_array_api::manifest_summary(
+                    batch_id,
+                    manifest,
+                    &arrays,
+                    &state.task_arrays,
                 )
-                .into_response();
+                .await;
+                let cohorts: Option<Vec<_>> = manifest
+                    .cohorts
+                    .iter()
+                    .map(|(_, id)| arrays.get(*id))
+                    .collect();
+                summary["state_bytes"] =
+                    serde_json::json!(cohorts.and_then(super::task_array_api::state_bytes));
+                return Json(summary).into_response();
             }
             (
                 StatusCode::NOT_FOUND,

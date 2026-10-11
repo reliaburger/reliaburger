@@ -233,19 +233,30 @@ impl UpgradeManager {
     /// different bytes under an existing version). A plain install with no
     /// store file yet falls back to the executable itself. Hashing a whole
     /// Bun binary is CPU work, so it runs on the blocking pool, once.
+    /// `bun` starts that work at boot with
+    /// [`UpgradeManager::spawn_running_binary_hash`]; a caller that arrives
+    /// while it is still running waits for the same result.
     pub async fn running_binary_sha256(&self) -> Option<String> {
+        hash_once(
+            &self.running_sha256,
+            self.store.binary_path(&self.running_version),
+        )
+        .await
+    }
+
+    /// Start hashing the running binary in the background, so the first
+    /// `/v1/version` request reads a cached digest instead of paying for it.
+    ///
+    /// A debug Bun is over 500 MB. Hashed on demand, the first request
+    /// waited seconds for it, longer than a joiner's deadline on a loaded
+    /// host (#765). The handle resolves once the cache is filled, or once
+    /// hashing has failed and the next caller will retry.
+    pub fn spawn_running_binary_hash(&self) -> tokio::task::JoinHandle<()> {
+        let cell = std::sync::Arc::clone(&self.running_sha256);
         let stored = self.store.binary_path(&self.running_version);
-        self.running_sha256
-            .get_or_try_init(|| async move {
-                tokio::task::spawn_blocking(move || hash_running_binary(&stored))
-                    .await
-                    .ok()
-                    .flatten()
-                    .ok_or(())
-            })
-            .await
-            .ok()
-            .cloned()
+        tokio::spawn(async move {
+            hash_once(&cell, stored).await;
+        })
     }
 
     /// Can this node accept a cluster (network) upgrade? Those directives
@@ -946,12 +957,48 @@ impl UpgradeManager {
 
 /// Hash the running binary: the store's copy if present, else the
 /// executable this process was started from.
+/// Fill `cell` with the running binary's digest unless it already holds one.
+///
+/// `OnceCell::get_or_try_init` runs the closure for the first caller only;
+/// a concurrent caller awaits that same attempt rather than hashing again.
+async fn hash_once(cell: &tokio::sync::OnceCell<String>, stored: PathBuf) -> Option<String> {
+    cell.get_or_try_init(|| async move {
+        tokio::task::spawn_blocking(move || hash_running_binary(&stored))
+            .await
+            .ok()
+            .flatten()
+            .ok_or(())
+    })
+    .await
+    .ok()
+    .cloned()
+}
+
+/// How much of the binary [`hash_running_binary`] reads at a time.
+const HASH_CHUNK_BYTES: usize = 1024 * 1024;
+
 fn hash_running_binary(stored: &Path) -> Option<String> {
-    let bytes = match std::fs::read(stored) {
-        Ok(bytes) => bytes,
-        Err(_) => std::fs::read(running_executable()?).ok()?,
+    let file = match std::fs::File::open(stored) {
+        Ok(file) => file,
+        Err(_) => std::fs::File::open(running_executable()?).ok()?,
     };
-    Some(signing::sha256_hex(&bytes))
+    hash_file(file).ok()
+}
+
+/// SHA-256 of a whole file, read in fixed chunks so hashing a 500 MB debug
+/// binary doesn't first allocate 500 MB.
+fn hash_file(mut file: std::fs::File) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hex::encode(hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
+    }
 }
 
 /// The executable this process runs. On Linux `/proc/self/exe` opens the
@@ -1195,6 +1242,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_boot_time_hash_answers_later_requests_without_hashing_again() {
+        // #765: `/v1/version` used to hash a 580 MB debug Bun on its first
+        // request, which took longer than a joiner's 10 s deadline under
+        // load. Bun now hashes at boot; a request afterwards reads the cache.
+        let fixture = fixture();
+        fixture.manager.spawn_running_binary_hash().await.unwrap();
+
+        // Change the stored bytes. A request that hashed now would see them.
+        let stored = fixture.manager.store().binary_path(&v("0.1.0"));
+        std::fs::write(&stored, b"bytes written after boot").unwrap();
+
+        assert_eq!(
+            fixture.manager.running_binary_sha256().await.as_deref(),
+            Some(sha256_hex(b"old binary").as_str())
+        );
+    }
+
+    #[test]
+    fn the_running_binary_hash_streams_a_file_larger_than_one_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bun");
+        // Not a multiple of the chunk size, so the last read is partial.
+        let bytes: Vec<u8> = (0..HASH_CHUNK_BYTES * 2 + 12_345)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            hash_running_binary(&path).as_deref(),
+            Some(sha256_hex(&bytes).as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn same_version_directive_with_different_bytes_is_refused_untouched() {
         let fixture = fixture();
         let mut directive = directive_for(&fixture, b"rebuilt binary", "same-version");
@@ -1304,19 +1385,39 @@ mod tests {
                 }
             }));
         }
-        let results = futures_util::future::join_all((0..32).map(|_| async {
-            let fixture = fixture();
-            let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
-            fixture
-                .manager
-                .prepare(&directive, vec![])
-                .await
-                .map(|prepared| {
-                    assert!(prepared.is_some());
-                    assert!(fixture.manager.upgrade_in_flight());
-                })
-        }))
-        .await;
+        // 32 probes, at most four in flight: they still overlap each other
+        // and the churn (the Linux `ETXTBSY` race needs a fork during a
+        // probe's write), but they don't queue 32 new executables at once.
+        // macOS assesses each new executable's first exec one at a time
+        // across the host, so 32 simultaneous probes measured that queue
+        // (12.9 s for 32 fresh scripts) rather than the probe (#722). A node
+        // runs one probe at a time.
+        use futures_util::StreamExt as _;
+        let probes: Vec<_> = (0..32)
+            .map(|_| {
+                let fixture = fixture();
+                let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
+                (fixture, directive)
+            })
+            .collect();
+        let results: Vec<_> = futures_util::stream::iter(probes)
+            .map(|(fixture, directive)| async move {
+                // Move the whole fixture in: the block only names its
+                // manager, and a field-by-field capture would drop the
+                // temporary directory before the probe runs.
+                let fixture = fixture;
+                fixture
+                    .manager
+                    .prepare(&directive, vec![])
+                    .await
+                    .map(|prepared| {
+                        assert!(prepared.is_some());
+                        assert!(fixture.manager.upgrade_in_flight());
+                    })
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
         shutdown.cancel();
         for task in churn {
             task.await.unwrap();
@@ -1579,16 +1680,25 @@ mod tests {
         let started = std::time::Instant::now();
         // The query deadline is a Tokio timer. With the clock paused it
         // expires as soon as the runtime idles on the silent candidate, so
-        // the test proves the bound without spending ten real seconds.
+        // the test proves the bound without spending a real minute.
         tokio::time::pause();
         let prepared = fixture.manager.prepare(&directive, vec![]).await;
         tokio::time::resume();
-        // Only the deadline yields `Elapsed`; a spawn or exit failure would
+        // Only the deadline says "timed out"; a spawn or exit failure would
         // be a different incompatibility and must not pass as a timeout.
+        // The message says how far the candidate got (#722): it was
+        // launched, said nothing, and was still running at the deadline.
+        let Err(UpgradeError::IncompatibleBinary(message)) = &prepared else {
+            panic!("expected a timed-out query, got {prepared:?}");
+        };
+        let bound = super::super::compatibility::QUERY_DEADLINE.as_secs();
         assert!(
-            matches!(&prepared, Err(UpgradeError::IncompatibleBinary(message)) if message.contains("Elapsed")),
-            "{prepared:?}"
+            message.contains(&format!("timed out after {bound}s")),
+            "{message}"
         );
+        assert!(message.contains("launched as pid "), "{message}");
+        assert!(message.contains("no output"), "{message}");
+        assert!(message.contains("still running"), "{message}");
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
         assert!(!fixture.manager.upgrade_in_flight());
         assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());

@@ -262,7 +262,7 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
 
 /// Parse a point in time for `--flag`: raw epoch seconds, or a duration like
 /// `30s`, `5m`, `2h`, `1d` before now.
-fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
+pub(super) fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
     if value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty() {
         return value.parse::<u64>().map_err(|e| RelishError::InvalidFlag {
             flag: flag.to_string(),
@@ -1681,7 +1681,10 @@ fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
         "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
     );
     for row in rows {
-        let pid = pid_cell(&row.instance);
+        // A job row stands for many tasks, so it shows their count, not a PID.
+        let pid = row
+            .tasks
+            .map_or_else(|| pid_cell(&row.instance), |tasks| format!("tasks:{tasks}"));
         let cpu = row
             .cpu_percent
             .map(|cpu| format!("{cpu:.1}%"))
@@ -2649,14 +2652,7 @@ pub async fn jobs(definitions: bool, output: OutputFormat) -> Result<(), RelishE
     }
     if definitions {
         for row in rows["definitions"].as_array().into_iter().flatten() {
-            println!(
-                "{}/{} revision {}: {} tasks, UTC schedule {}",
-                row["namespace"].as_str().unwrap_or("?"),
-                row["name"].as_str().unwrap_or("?"),
-                row["revision"],
-                row["count"],
-                row["cron"]["expression"].as_str().unwrap_or("disabled")
-            );
+            print!("{}", format_definition(row));
         }
     } else {
         for row in rows["batches"].as_array().into_iter().flatten() {
@@ -2780,6 +2776,22 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         count("not_run"),
         count("retried"),
     ));
+    let causes: Vec<String> = [
+        ("exit_code", "non-zero exit"),
+        ("signal", "signal"),
+        ("timeout", "timeout"),
+        ("unknown", "unknown outcome"),
+        ("unrecorded", "not recorded across a restart"),
+    ]
+    .into_iter()
+    .filter_map(|(key, label)| {
+        let value = summary["retry_causes"][key].as_u64()?;
+        (value > 0).then(|| format!("{value} {label}"))
+    })
+    .collect();
+    if !causes.is_empty() {
+        out.push_str(&format!("  retry causes: {}\n", causes.join(", ")));
+    }
     out.push_str(&format!(
         "  chunks: {} of {} done; {} tasks held by nodes, {} queued\n",
         count("chunks_done"),
@@ -3086,6 +3098,42 @@ fn render_token_scope(scope: &super::client::TokenScopeSummary) -> String {
     }
 }
 
+/// One job definition for `relish jobs --definitions`: its schedule, then
+/// its last outcomes, newest first. The outcomes outlive the runs' details.
+fn format_definition(row: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "{}/{} revision {}: {} tasks, UTC schedule {}\n",
+        row["namespace"].as_str().unwrap_or("?"),
+        row["name"].as_str().unwrap_or("?"),
+        row["revision"],
+        row["count"],
+        row["cron"]["expression"].as_str().unwrap_or("disabled")
+    );
+    let history = row["history"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for outcome in history.iter().rev() {
+        let _ = write!(
+            text,
+            "  run {} finished {}: {}, {} succeeded, {} failed",
+            outcome["run"],
+            outcome["finished_at_epoch_secs"]
+                .as_u64()
+                .map_or_else(|| "?".to_string(), format_utc),
+            outcome["status"].as_str().unwrap_or("?"),
+            outcome["succeeded"],
+            outcome["failed"],
+        );
+        if outcome["not_run"].as_u64().is_some_and(|count| count > 0) {
+            let _ = write!(text, ", {} not run", outcome["not_run"]);
+        }
+        if let Some(index) = outcome["first_failed_index"].as_u64() {
+            let _ = write!(text, "; first failure: task {index}");
+        }
+        text.push('\n');
+    }
+    text
+}
+
 /// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
 fn format_utc(unix_seconds: u64) -> String {
     let Ok(at) = i64::try_from(unix_seconds)
@@ -3328,7 +3376,36 @@ mod tests {
             },
             cpu_percent: cpu,
             memory_bytes: memory,
+            tasks: None,
         }
+    }
+
+    #[test]
+    fn job_definitions_list_their_last_outcomes_newest_first() {
+        let text = format_definition(&serde_json::json!({
+            "namespace": "ops", "name": "nightly", "revision": 2, "count": 1,
+            "cron": {"expression": "0 3 * * *"},
+            "history": [
+                {"run": 40, "finished_at_epoch_secs": 1_791_601_200u64, "status": "Succeeded",
+                 "succeeded": 1, "failed": 0, "not_run": 0},
+                {"run": 41, "finished_at_epoch_secs": 1_791_687_600u64, "status": "CompletedWithFailures",
+                 "succeeded": 0, "failed": 1, "not_run": 0, "first_failed_index": 0},
+            ],
+        }));
+        insta::assert_snapshot!(text);
+    }
+
+    #[test]
+    fn top_shows_a_job_row_with_its_running_task_count() {
+        let mut job = top_row("rb-2", "tasks", None, Some(250.0), Some(8 << 20));
+        job.instance.app_name = "render".into();
+        job.tasks = Some(27);
+        let table = render_top(&[job]);
+        let line = table.lines().nth(1).unwrap();
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(columns[1], "render", "{table}");
+        assert_eq!(columns[4], "tasks:27", "{table}");
+        assert_eq!(columns[6], "250.0%", "{table}");
     }
 
     #[test]
@@ -4624,6 +4701,8 @@ mod task_array_tests {
             "kind": "array", "name": "render", "namespace": "default",
             "status": "Running", "total": 100000, "succeeded": 51200,
             "failed": 5, "not_run": 0, "retried": 12, "queued": 40000,
+            "retry_causes": { "exit_code": 10, "signal": 2, "timeout": 0,
+                              "unknown": 0, "unrecorded": 0 },
             "held": 8800, "chunks": 98, "chunks_done": 50,
             "failed_indices": [[7, 7], [1000, 1002]],
             "nodes": [
@@ -4637,6 +4716,7 @@ mod task_array_tests {
             format_array_summary(3, &summary),
             "task array 3 (render in default): Running\n\
              \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 12 retries\n\
+             \x20 retry causes: 10 non-zero exit, 2 signal\n\
              \x20 chunks: 50 of 98 done; 8800 tasks held by nodes, 40000 queued\n\
              \x20 failed indices: 7, 1000-1002 and 1 more (see relish batch results 3 --failed)\n\
              \x20 node-1: 8 slots, 8 running, 51200 succeeded, 5 failed\n\

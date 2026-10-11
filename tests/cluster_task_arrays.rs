@@ -7,7 +7,9 @@
 //! syncs all three nodes over HTTP. Partway through, one follower is
 //! killed while it holds chunks: the leader must take them back after the
 //! silence timeout and the array must still finish with every task
-//! counted exactly once.
+//! counted exactly once. A second test kills the leader itself while it
+//! holds chunks: the new leader's silence clock must take them back and
+//! the array must still count every task exactly once.
 //!
 //! Gated behind `RELIABURGER_CLUSTER_TESTS=1` like the other multi-node
 //! suites. Run via `make test-cluster`, or
@@ -26,8 +28,11 @@ use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
+use bun_process::{PortBlockReservation, reserve_port_block_lease};
 use cluster_support::{
     MembershipSource, WiredNode, WiredNodeOptions, cluster_tests_enabled, local, start_wired_node,
 };
@@ -69,6 +74,7 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
 }
 
 async fn start_node(
+    base: u16,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
@@ -76,10 +82,11 @@ async fn start_node(
 ) -> WiredNode {
     start_wired_node(WiredNodeOptions {
         name: format!("ta{index}"),
-        gossip_port: BASE_PORT + (index as u16) * 10,
+        gossip_port: base + (index as u16) * 10,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-task-arrays",
+        data_root: None,
         stale_report_timeout_secs: 10,
         metrics_rollup: None,
         scheduler: None,
@@ -152,9 +159,18 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_node(0, vec![], &root, data[0].path()).await];
+    let mut nodes = vec![start_node(BASE_PORT, 0, vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(start_node(index, vec![local(BASE_PORT)], &root, directory.path()).await);
+        nodes.push(
+            start_node(
+                BASE_PORT,
+                index,
+                vec![local(BASE_PORT)],
+                &root,
+                directory.path(),
+            )
+            .await,
+        );
     }
     // Killing a node before the voter set settles could leave the others
     // on a joint configuration that still needs it.
@@ -315,6 +331,208 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     root.cancel();
 }
 
+/// Ports for the leader-loss test, clear of the other tests' blocks.
+const LEADER_LOSS_BASE_PORT: u16 = BASE_PORT + 200;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    let root = CancellationToken::new();
+    let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = vec![start_node(LEADER_LOSS_BASE_PORT, 0, vec![], &root, data[0].path()).await];
+    for (index, directory) in data.iter().enumerate().skip(1) {
+        nodes.push(
+            start_node(
+                LEADER_LOSS_BASE_PORT,
+                index,
+                vec![local(LEADER_LOSS_BASE_PORT)],
+                &root,
+                directory.path(),
+            )
+            .await,
+        );
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&nodes).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    wait_until(
+        "gossip sees everyone",
+        Duration::from_secs(60),
+        async || {
+            for node in &nodes {
+                if node.membership_table.read().await.len() < 3 {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    let mut leader = None;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.council.is_leader().await {
+            leader = Some(index);
+        }
+    }
+    let leader = leader.expect("a leader");
+    let survivors = [(leader + 1) % 3, (leader + 2) % 3];
+    let http = reqwest::Client::new();
+    let answer: Value = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/batch/array",
+            nodes[survivors[0]].api_port
+        ))
+        .json(&json!({
+            "name": "leader-loss",
+            "template": { "runtime":"process","exec": BINARY, "command": ["{index}"] },
+            "spec": { "count": TASKS },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let batch_id = answer["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{answer}"));
+
+    // The leader is a worker too: kill it once it is running its own share.
+    let leader_name = format!("ta{leader}");
+    wait_until(
+        "the leader holds work",
+        Duration::from_secs(60),
+        async || {
+            status(&http, &nodes[leader], batch_id)
+                .await
+                .is_some_and(|summary| {
+                    summary["nodes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|node| {
+                            node["node"] == leader_name.as_str()
+                                && node["counters"]["succeeded"].as_u64().unwrap_or(0) > 0
+                        })
+                })
+        },
+    )
+    .await;
+    nodes[leader].shutdown.cancel();
+
+    // The new leader starts its silence clock at its election, so for the
+    // first few seconds its view still shows what the old leader held.
+    let mut new_leader = None;
+    wait_until("a new leader", Duration::from_secs(30), async || {
+        for index in survivors {
+            if nodes[index].council.is_leader().await {
+                new_leader = Some(index);
+            }
+        }
+        new_leader.is_some()
+    })
+    .await;
+    let new_leader = new_leader.unwrap();
+    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    let held_at_loss = nodes[new_leader]
+        .council
+        .desired_state()
+        .await
+        .task_arrays
+        .get(batch_id)
+        .and_then(|record| record.state.held_by(&lost).cloned())
+        .unwrap_or_default();
+    let raft_before = nodes[new_leader]
+        .metrics_rx
+        .borrow()
+        .last_log_index
+        .unwrap_or(0);
+
+    let mut last = Value::Null;
+    wait_until(
+        "the array finishes under the new leader",
+        Duration::from_secs(180),
+        async || match status(&http, &nodes[new_leader], batch_id).await {
+            Some(summary) => {
+                let done = summary["done"] == true;
+                last = summary;
+                done
+            }
+            None => false,
+        },
+    )
+    .await;
+    // Nothing lost, nothing counted twice: the dead leader's commands may
+    // have finished, but no report of theirs can be accepted any more.
+    assert_eq!(last["status"], "Succeeded", "{last}");
+    assert_eq!(last["succeeded"], TASKS, "{last}");
+    assert_eq!(last["failed"], 0, "{last}");
+    assert_eq!(last["not_run"], 0, "{last}");
+    assert_eq!(
+        last["retried"],
+        TASKS / 500,
+        "exactly one accepted retry per flaky index: {last}"
+    );
+    assert_eq!(last["retry_causes"]["exit_code"], TASKS / 500, "{last}");
+
+    // Bounded replay: only the chunks the dead leader held run again, each
+    // at a later grant attempt on a survivor.
+    let record = nodes[new_leader]
+        .council
+        .desired_state()
+        .await
+        .task_arrays
+        .get(batch_id)
+        .unwrap()
+        .clone();
+    let chunks = record.state.spec.chunk_count();
+    assert_eq!(record.state.done().len(), u64::from(chunks));
+    let mut replayed = 0u64;
+    for chunk in 0..chunks {
+        let grant = record
+            .state
+            .accepted_grant(reliaburger::meat::task_array::ChunkId(chunk))
+            .expect("every chunk has one accepted grant");
+        let attempt = grant.attempt;
+        // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
+        assert_ne!(
+            grant.owner,
+            Some(lost.clone()),
+            "chunk {chunk} was accepted from the dead leader"
+        );
+        if attempt > 1 {
+            replayed += 1;
+            assert!(
+                held_at_loss.contains(chunk),
+                "chunk {chunk} replayed at attempt {attempt} but the dead leader didn't hold it"
+            );
+        }
+    }
+    assert!(
+        replayed <= held_at_loss.len(),
+        "{replayed} chunks replayed, {} held by the dead leader",
+        held_at_loss.len()
+    );
+    let entries = nodes[new_leader]
+        .metrics_rx
+        .borrow()
+        .last_log_index
+        .unwrap_or(0)
+        - raft_before;
+    eprintln!(
+        "cluster_task_arrays: leader lost mid-run; {} chunks held at loss, {replayed} replayed, {entries} Raft entries afterwards",
+        held_at_loss.len()
+    );
+    root.cancel();
+}
+
 async fn start_common_node(
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
@@ -345,6 +563,7 @@ async fn start_common_node(
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-common-jobs",
+        data_root: None,
         stale_report_timeout_secs: 10,
         metrics_rollup: None,
         scheduler: None,
@@ -421,6 +640,60 @@ async fn common_cluster(
     (root, data, nodes, operator.plaintext)
 }
 
+/// Move Raft leadership off `leader` and return the index of the node that
+/// leads instead.
+///
+/// openraft 0.9 has no leadership transfer, and one `trigger().elect()` on a
+/// follower doesn't guarantee a handover. Right after a cron fire the leader
+/// writes the run's next entries, so the campaign can start while the leader
+/// holds an entry the candidate hasn't received yet. The leader and the other
+/// follower then refuse the candidate's shorter log. Its higher term still
+/// deposes the leader, but the election that follows favours the longest
+/// log, which is the old leader's, so the old leader wins again. Its
+/// elections therefore stay off until another voter leads, and the most
+/// up-to-date other voter campaigns every 3 s (longer than the 2 s leader
+/// lease) until one does.
+async fn hand_over_leadership(nodes: &[WiredNode], leader: usize) -> usize {
+    let others: Vec<usize> = (0..nodes.len()).filter(|&i| i != leader).collect();
+    nodes[leader].council.raft().runtime_config().elect(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut new_leader = None;
+    let mut campaigns = 0;
+    let term_before = nodes[leader].metrics_rx.borrow().current_term;
+    'campaigns: while tokio::time::Instant::now() < deadline {
+        let candidate = others
+            .iter()
+            .copied()
+            .max_by_key(|&i| nodes[i].metrics_rx.borrow().last_log_index)
+            .unwrap();
+        nodes[candidate]
+            .council
+            .raft()
+            .trigger()
+            .elect()
+            .await
+            .unwrap();
+        campaigns += 1;
+        let round = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < round {
+            for &other in &others {
+                if nodes[other].council.is_leader().await {
+                    new_leader = Some(other);
+                    break 'campaigns;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    nodes[leader].council.raft().runtime_config().elect(true);
+    let new_leader = new_leader.expect("timed out: replacement cron leader");
+    let term = nodes[new_leader].metrics_rx.borrow().current_term;
+    eprintln!(
+        "handover: node {new_leader} leads at term {term} (was {term_before}) after {campaigns} campaign(s)"
+    );
+    new_leader
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a real multi-node cluster; run with make test-cluster"]
 async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change() {
@@ -432,6 +705,13 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
         .unwrap();
     let follower = (leader + 1) % 3;
     let http = reqwest::Client::new();
+    // Registering a schedule marks the minute it lands in as already seen, so
+    // a request sent in a minute's last moments could land in the target
+    // minute and never fire. Register early in a minute instead.
+    let now = time::OffsetDateTime::now_utc();
+    if now.second() > 45 {
+        tokio::time::sleep(Duration::from_secs(61 - u64::from(now.second()))).await;
+    }
     // One upcoming minute, so a later legitimate occurrence cannot look like a duplicate.
     let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
     let expression = format!(
@@ -464,29 +744,10 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
     .await;
     let id = id.unwrap();
     eprintln!("common cluster: UTC cron admitted run {id}; moving leadership");
-    // Trigger a real election while keeping all workers and quorum alive.
-    // Removing a voter is not a handover: the self-healing council may restore it.
-    nodes[follower]
-        .council
-        .raft()
-        .trigger()
-        .elect()
-        .await
-        .unwrap();
-    wait_until(
-        "replacement cron leader",
-        Duration::from_secs(30),
-        async || {
-            nodes[follower].council.is_leader().await
-                || nodes[(leader + 2) % 3].council.is_leader().await
-        },
-    )
-    .await;
-    let new_leader = if nodes[follower].council.is_leader().await {
-        follower
-    } else {
-        (leader + 2) % 3
-    };
+    // Move leadership with a real election while keeping all workers and
+    // quorum alive. Removing a voter is not a handover: the self-healing
+    // council may restore it.
+    let new_leader = hand_over_leadership(&nodes, leader).await;
     wait_until(
         "accepted scheduled singleton",
         Duration::from_secs(15),
@@ -573,7 +834,11 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
     let http = reqwest::Client::new();
     let api = |index: usize| format!("http://127.0.0.1:{}", nodes[index].api_port);
 
-    let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+    // The bulk submissions below take a few seconds and must all land before
+    // the occurrence fires, or it takes one of their slots. Skip to the minute
+    // after next when the next one is less than 30 seconds away.
+    let now = time::OffsetDateTime::now_utc();
+    let next = now + time::Duration::minutes(if now.second() >= 30 { 2 } else { 1 });
     let expression = format!(
         "{} {} {} {} *",
         next.minute(),
@@ -603,7 +868,13 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
     for i in 0..bulk {
         let namespace = format!("tenant-{}", i / MAX_ACTIVE_RUNS_PER_NAMESPACE);
         let response = submit(format!("bulk-{i}"), namespace).await;
-        assert_eq!(response.status(), 202, "bulk array {i}");
+        let status = response.status();
+        assert_eq!(
+            status,
+            202,
+            "bulk array {i}: {}",
+            response.text().await.unwrap_or_default()
+        );
     }
     let refused = submit("one-more".into(), "tenant-late".into()).await;
     assert!(refused.status().is_client_error(), "{}", refused.status());
@@ -615,7 +886,7 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
 
     wait_until(
         "the cron occurrence admitted into the reserved headroom",
-        Duration::from_secs(75),
+        Duration::from_secs(135),
         async || {
             nodes[leader]
                 .council
@@ -776,13 +1047,18 @@ async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another
     root.cancel();
 }
 
-const HUNG_BASE_PORT: u16 = BASE_PORT + 300;
+/// Ports one wired node binds: gossip, Raft, reporting and the API.
+const HUNG_PORTS_PER_NODE: u16 = 4;
 const HUNG_ARRAYS: usize = 16;
-const HUNG_TASKS: u32 = 6_000;
+// 16 arrays of 4,000 tasks at 20 ms each on 3 × 16 slots take at least
+// 27 s however fast the host is: three times the ~9 s from submitting them
+// to the end of the hung window, and 13 s less than 6,000 tasks took (#760).
+const HUNG_TASKS: u32 = 4_000;
 const HUNG_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
 async fn start_hung_node(
     index: usize,
+    ports: &PortBlockReservation,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
     data: &std::path::Path,
@@ -810,10 +1086,11 @@ async fn start_hung_node(
     );
     start_wired_node(WiredNodeOptions {
         name: format!("hung{index}"),
-        gossip_port: HUNG_BASE_PORT + (index as u16) * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-hung-worker",
+        data_root: None,
         stale_report_timeout_secs: 10,
         metrics_rollup: None,
         scheduler: None,
@@ -850,25 +1127,48 @@ async fn hang_sync(control: &std::path::Path) {
     panic!("the worker kept replacing its fence file");
 }
 
-/// Release the hung sync: open the FIFO's write end (which lets the blocked
-/// reader's open finish), remove it, then close it so the read sees end of
-/// file. The node's next sync finds no fence file and carries on.
+/// Release every hung sync. The leader gives up on a sync after its 3 s
+/// timeout and sends another, so by now two or more of the worker's syncs
+/// can be blocked on the FIFO, each holding a blocking thread.
+///
+/// First move the FIFO aside, so the next sync finds no fence file and
+/// carries on. Then open and close its write end until no reader holds it.
+/// An open wakes the readers blocked opening the FIFO, and a close lets
+/// their reads see end of file. One open and close frees every reader on
+/// Linux, but on macOS some readers stay blocked in `read` after it, and
+/// the runtime then waits for their threads forever at shutdown (#760).
+/// No reader is left once opening the write end without blocking fails
+/// with `ENXIO` a few times in a row.
 async fn release_sync(control: std::path::PathBuf) {
     use std::os::unix::fs::OpenOptionsExt;
     tokio::task::spawn_blocking(move || {
-        for _ in 0..100 {
-            if let Ok(writer) = std::fs::OpenOptions::new()
+        let aside = control.with_extension("released");
+        std::fs::rename(&control, &aside).unwrap();
+        let mut woke = false;
+        let mut unheld = 0;
+        for _ in 0..200 {
+            match std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-                .open(&control)
+                .open(&aside)
             {
-                std::fs::remove_file(&control).unwrap();
-                drop(writer);
-                return;
+                Ok(writer) => {
+                    woke = true;
+                    unheld = 0;
+                    drop(writer);
+                }
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                    unheld += 1;
+                    if woke && unheld >= 3 {
+                        std::fs::remove_file(&aside).unwrap();
+                        return;
+                    }
+                }
+                Err(error) => panic!("can't open the FIFO's write end: {error}"),
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("nothing was blocked on the FIFO");
+        panic!("readers still hold the FIFO, or none was ever blocked on it");
     })
     .await
     .unwrap();
@@ -892,11 +1192,16 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_hung_node(0, vec![], &root, data[0].path()).await];
+    // Leased blocks, held until the test ends, so no other fixture on the
+    // host binds these ports while the cluster runs.
+    let ports: Vec<PortBlockReservation> = (0..3)
+        .map(|_| reserve_port_block_lease(HUNG_PORTS_PER_NODE))
+        .collect();
+    let seed = local(ports[0].base);
+    let mut nodes = vec![start_hung_node(0, &ports[0], vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(
-            start_hung_node(index, vec![local(HUNG_BASE_PORT)], &root, directory.path()).await,
-        );
+        nodes
+            .push(start_hung_node(index, &ports[index], vec![seed], &root, directory.path()).await);
     }
     wait_until(
         "three settled voters",

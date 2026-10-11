@@ -45,8 +45,24 @@ async fn finish_status_readers(
     errors
 }
 
+/// The fake `limactl`: it answers only `list`, marks that it ran, and prints
+/// the `list.json` beside the path it was started as.
+const FAKE_LIMA: &str = "#!/bin/sh\n[ \"$1\" = list ] || exit 70\ndir=${0%/*}\ntouch \"$dir/ready\"\ncat \"$dir/list.json\"\n";
+
 #[tokio::test]
 async fn managed_status_fails_for_missing_stopped_and_unreachable_nodes() {
+    // The 15-second deadline below bounds `relish local status`, not the
+    // host. macOS assesses each newly written executable on its first exec,
+    // after spawn returns, and a fresh debug relish queued behind other fresh
+    // binaries took longer than the whole deadline (#573). Pay that once
+    // here, and write the fake Lima once: every phase hard-links the same,
+    // already launched file instead of writing a new one.
+    let relish = std::path::Path::new(env!("CARGO_BIN_EXE_relish"));
+    let fixtures = tempfile::tempdir().unwrap();
+    let fake_lima = fixtures.path().join("limactl");
+    std::fs::write(&fake_lima, FAKE_LIMA).unwrap();
+    std::fs::set_permissions(&fake_lima, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::first_launch::first_launch(&[(relish, &["--version"]), (&fake_lima, &["warm-up"])]);
     for status in [None, Some("Stopped"), Some("Running")] {
         let phase = status.unwrap_or("missing");
         let started = tokio::time::Instant::now();
@@ -78,16 +94,16 @@ async fn managed_status_fails_for_missing_stopped_and_unreachable_nodes() {
             .map(|status| serde_json::json!({"name":name,"status":status}).to_string())
             .unwrap_or_default();
         std::fs::write(
-            &lima,
-            format!("#!/bin/sh\n[ \"$1\" = list ] || exit 70\ndir=${{0%/*}}\ntouch \"$dir/ready\"\nprintf '%s\\n' '{output}'\n"),
+            lima.parent().unwrap().join("list.json"),
+            format!("{output}\n"),
         )
         .unwrap();
-        std::fs::set_permissions(&lima, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::hard_link(&fake_lima, &lima).unwrap();
         eprintln!(
             "managed-status phase={phase} setup-end elapsed={:?}",
             started.elapsed()
         );
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+        let mut child = tokio::process::Command::new(relish)
             .args(["local", "status", "--name", "status-test"])
             .env("RELIABURGER_HOME", root.path())
             .stdout(std::process::Stdio::piped())

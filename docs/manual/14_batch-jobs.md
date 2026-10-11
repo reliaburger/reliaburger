@@ -1,8 +1,8 @@
 # Batch jobs
 
-Development preview for 0.2.0. Build matching development binaries and start a
-fresh cluster: protocol 51 and state 68 change control messages and durable
-state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
+Development preview: 0.2.0, not in 0.1.6. Build matching development binaries
+and start a fresh cluster, because 0.2.0 changes the control messages and the
+durable state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.
 
@@ -207,11 +207,22 @@ and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
 `relish batch watch ID` polls once per second. Status and the dashboard show
 counts, backlog, retries, resource profiles and accepted success rates. Rates
 count unique outcomes accepted by the cluster, rather than attempts started.
-They begin as unknown and reset after leadership changes or stale samples.
+They begin as unknown and reset after leadership changes or stale samples
+(the Mayo job counters below don't; each node keeps its own).
 Accepted counts arrive when chunks are acknowledged, so a one-second rate can
 alternate between zero and a burst. Use a sustained interval for capacity planning.
 Duration histograms merge across workers; watch displays p50, p95 and p99 bucket
 upper bounds for final attempts. They exclude queueing and earlier retries.
+Retries come with their causes: non-zero exit, a signal (including the memory
+limit's kill), a timeout, an unknown outcome, or "not recorded across a
+restart" when a worker read an attempt count back from its ledger, which
+keeps counts but not reasons. The causes always add up to the retry count,
+and they're a handful of counters per run, never a log per task.
+Each node's row also carries `start_lag_ms_counts`: how long pooled commands
+(shared containers and host jobs) waited between the pool taking an attempt
+and the command starting, in the same millisecond buckets. A single run's
+summary reports `state_bytes`, the replicated state its chunk bookkeeping
+occupies.
 `relish --output json batch-status ID` returns the machine-readable summary.
 `GET /v1/batch/summaries` lists retained parent summaries and standalone arrays,
 filtered to the caller's scope. Views and metric labels do not enumerate tasks.
@@ -239,12 +250,15 @@ missing detail as success. A missing or corrupt result index is an explicit
 error; rebuilding it is worker recovery, rather than an unbounded page read.
 Use the child array ID for results and logs.
 
-Detail remains on the worker disk for one hour **after completion**, and the
-cluster keeps at most the newest 20 terminal submissions. The leader checks
-every second and prunes expired runs with one replicated write, whether or not
-anyone submits new work; workers then delete the run's ledger, index and kept
-output on their next sync. For a mixed manifest,
+Detail remains on the worker disk for one hour **after completion**. Each
+namespace keeps its newest 20 finished submissions, and the cluster keeps 24
+in all: when more finish, the namespace keeping the most loses its oldest
+first, so a per-minute cron in one namespace can't push out another
+namespace's runs. The leader checks every second and prunes expired runs with
+one replicated write, whether or not anyone submits new work; workers then
+delete the run's ledger, index and kept output on their next sync. For a mixed manifest,
 the clock starts when its last profile finishes; profiles are pruned together.
+A run's outcome outlives its detail: see [Job history](#job-history-metrics-and-events).
 Permanent worker or disk loss can lose
 individual results even when accepted aggregate counts remain replicated.
 Export needed results before retention expires. Cancelling counts never-started and interrupted
@@ -252,6 +266,59 @@ tasks as not run, separately from terminal failures and drains active runtime ow
 capacity. An abandoned attempt quarantines its capacity until startup recovery;
 a dropped future cannot free an uncertain execution's request. Retries release
 capacity during backoff.
+
+## Job history, metrics and events
+
+Did last night's cron job succeed? A run's detail goes after an hour, but its
+outcome stays with its definition. Each definition remembers its last 10
+finished runs: run ID, when it started and finished, how it ended, how many
+tasks succeeded, failed or never ran, and the lowest failed task index, which
+is where to start reading failure output:
+
+```sh
+relish jobs --definitions
+```
+
+```text
+ops/nightly revision 2: 1 tasks, UTC schedule 0 3 * * *
+  run 41 finished 2026-10-11 03:00 UTC: CompletedWithFailures, 0 succeeded, 1 failed; first failure: task 0
+  run 40 finished 2026-10-10 03:00 UTC: Succeeded, 1 succeeded, 0 failed
+```
+
+The dashboard's job card shows a schedule's last five outcomes beside it.
+History lives with the definition, so schedules and deployment hooks keep it
+until you stop or delete them; a one-off definition and its history expire
+with its last run. Manifest profiles have no definition and keep no history.
+
+Every node exports Mayo series for the attempts it ran itself, so they survive
+a leader change. Each carries only `namespace`, `definition` (the job or array
+name), `profile` (a manifest's resource profile, `default` otherwise) and
+`node`, never a task index or run ID. A node keeps at most 1,024 label sets.
+
+| Series | Meaning |
+|--------|---------|
+| `job_attempts_started_total` | Attempts started, retries included |
+| `job_tasks_succeeded_total`, `job_tasks_failed_total` | Tasks that ended either way |
+| `job_task_retries_total` | Extra attempts spent on retries |
+| `job_tasks_running` | Attempts holding a slot now |
+| `job_task_duration_ms_bucket{le}`, `job_task_duration_ms_count` | Final-attempt durations, cumulative buckets from 1 ms to 16,384 ms and `+Inf` |
+| `job_cpu_percent`, `job_memory_bytes` | Usage of the running attempts, from their cgroups on Linux |
+
+Counters start at zero when a node restarts, as Prometheus counters do.
+
+The leader records one event per run, never one per task: `job-completed`
+when every task succeeded, `job-failed` when any failed for good,
+`job-cancelled`, and `job-unknown` when a node holding the run's work went
+quiet and nobody knows whether its tasks ran. `job-failed` and `job-unknown`
+also go to every alert destination (`[[alerts.destinations]]`) as a critical
+`job_run_failed` or `job_run_unknown_outcome` alert, labelled with `job`,
+`namespace` and `run`. A new leader doesn't announce runs that finished
+before it took over, so a run finishing in the second before a leader change
+can go unannounced; its outcome is still in the definition's history.
+
+`relish top` lists running array tasks as one row per definition and profile
+on each node, with the number of tasks in the PID column (`tasks:27`) and
+their CPU and memory. A singleton run keeps its own `run-ID` row.
 
 ## Execution and capacity limits
 
@@ -265,6 +332,9 @@ Every namespace shares the cluster, so no namespace may take all of it:
 | Job definitions per namespace | 64 | Refused; one-off definitions expire with their last run |
 | Job definitions, whole cluster | 1,024 | Refused |
 | Retained run receipts, whole cluster | 2,048 | Retention keeps it below this backstop |
+| Finished submissions kept per namespace | 20 | The namespace's oldest detail is pruned |
+| Finished submissions kept, whole cluster | 24 | The namespace keeping the most loses its oldest |
+| Outcomes remembered per definition | 10 | The oldest outcome is dropped |
 | Named jobs in one finite batch | 64 | Refused |
 
 Cron fires and deployment hooks never compete with bulk work for their
@@ -669,8 +739,26 @@ Use `--cpu-request` to change admission while retaining the one-core limit,
 `--namespace` to select a namespace you can deploy into, and `--image` for another
 digest-pinned image containing `/bin/busybox`. A report file must not already
 exist. Without `--scenario`, `relish bench` still runs its ordinary data-plane
-suite. Its `--quick`, `--compare`, `--capacity` and `--disruptive` options belong
-to that suite and cannot be combined with job scenarios.
+suite. Its `--quick`, `--capacity` and `--disruptive` options belong to that
+suite and cannot be combined with job scenarios.
+
+`--compare` works for both. Given an earlier `--report` file from the same
+scenario, it compares the window rates and fails when this run is slower by
+more than `--tolerance` percent (10 by default):
+
+```sh
+relish bench --scenario jobs-host-processes --report before.json
+# ... change something ...
+relish bench --scenario jobs-host-processes --compare before.json --tolerance 15
+```
+
+A baseline from another scenario, or one that didn't complete and clean up,
+is refused before anything runs. A different window, concurrency, CPU
+request, image or executable makes the verdict informational: it's printed
+but never fails the command. Compare on the same rig and build only; a laptop
+VM moved by about 11% between two sessions of the same binary. The
+[five-round rerun's reports](../qualification/2026-10-09-timed-job-scenarios/README.md#independent-five-round-rerun)
+are committed as baselines for that rig.
 
 The public clock starts before submission. Image pulls and cold executors are
 included unless you prepare the image before running. Fresh containers use
@@ -891,8 +979,9 @@ The original node/application identities remained stable until the fixture and
 its exact kernel owner retired after measurement.
 
 Disk use grew materially: sampled VM free disk ended at 209.6 MiB, and all capped
-storage scans were incomplete. The four fresh retries recovered, but retained
-final outcomes don't identify their earlier failure causes. The [full hourly
+storage scans were incomplete. The four fresh retries recovered, but that
+build's retained final outcomes didn't identify their earlier failure causes;
+summaries now count retries by cause. The [full hourly
 record](../qualification/2026-10-09-timed-job-scenarios/README.md#hourly-sequence)
 includes resource samples, latency, cleanup proofs and these diagnostic limits.
 These completed hours establish saturation observations; global metadata bounds,

@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Compare a Criterion run with the baseline main saved, and save new baselines.
+
+The task-array benchmarks (benches/task_arrays.rs) run nightly on hosted
+runners, whose speed varies from run to run. Criterion's own change report
+flags differences of a few per cent, which would make a gate a flake source,
+so CI fails only when a benchmark's mean is more than `--max-ratio` times its
+baseline mean. Everything else is kept as an artefact for the trend.
+
+    bench_baseline.py save    --criterion target/criterion --baseline FILE
+    bench_baseline.py compare --criterion target/criterion --baseline FILE \\
+                              [--max-ratio 2] [--summary $GITHUB_STEP_SUMMARY]
+
+A benchmark is named by its directory under target/criterion
+(`group/function[/parameter]`); its result is `new/estimates.json`.
+
+Fixtures: scripts/ci/test_bench_baseline.py.
+"""
+import argparse
+import json
+from pathlib import Path
+import sys
+
+SCHEMA = 1
+
+
+def read_means(criterion):
+    """{benchmark name: mean in nanoseconds} for every benchmark Criterion ran."""
+    means = {}
+    for estimates in sorted(Path(criterion).rglob("new/estimates.json")):
+        name = estimates.parent.parent.relative_to(criterion).as_posix()
+        means[name] = float(json.loads(estimates.read_text())["mean"]["point_estimate"])
+    if not means:
+        raise ValueError(f"no Criterion results under {criterion}")
+    return means
+
+
+def save(criterion, baseline):
+    """Write this run's means as the baseline for later runs."""
+    baseline = Path(baseline)
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_text(json.dumps({"schema": SCHEMA, "benchmarks": read_means(criterion)},
+                                   indent=2, sort_keys=True) + "\n")
+
+
+def load(baseline):
+    """The baseline's means, or None when no baseline has been saved yet."""
+    path = Path(baseline)
+    if not path.exists():
+        return None
+    document = json.loads(path.read_text())
+    if document.get("schema") != SCHEMA:
+        raise ValueError(f"{path}: unknown baseline schema {document.get('schema')!r}")
+    return {name: float(mean) for name, mean in document["benchmarks"].items()}
+
+
+def compare(current, baseline, max_ratio):
+    """Rows of (name, baseline mean or None, current mean, ratio or None), and the regressions.
+
+    A regression is a benchmark whose mean exceeds `max_ratio` times its
+    baseline. Benchmarks that are new, or gone, have nothing to compare.
+    """
+    rows, regressions = [], []
+    for name, mean in sorted(current.items()):
+        before = baseline.get(name)
+        ratio = mean / before if before else None
+        rows.append((name, before, mean, ratio))
+        if ratio is not None and ratio > max_ratio:
+            regressions.append(name)
+    return rows, regressions
+
+
+def table(rows, max_ratio):
+    lines = [f"Task-array benchmarks against main's baseline (fails above {max_ratio:g}x)", "",
+             "| Benchmark | Baseline mean | This run | Ratio |", "|---|---:|---:|---:|"]
+    for name, before, mean, ratio in rows:
+        before_text = f"{before / 1e6:.3f} ms" if before is not None else "none"
+        ratio_text = f"{ratio:.2f}" if ratio is not None else "new"
+        lines.append(f"| `{name}` | {before_text} | {mean / 1e6:.3f} ms | {ratio_text} |")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("save", "compare"):
+        command = commands.add_parser(name)
+        command.add_argument("--criterion", type=Path, required=True)
+        command.add_argument("--baseline", type=Path, required=True)
+        if name == "compare":
+            command.add_argument("--max-ratio", type=float, default=2.0)
+            command.add_argument("--summary", type=Path)
+    arguments = parser.parse_args(argv)
+
+    if arguments.command == "save":
+        save(arguments.criterion, arguments.baseline)
+        print(f"saved the baseline to {arguments.baseline}")
+        return 0
+
+    current = read_means(arguments.criterion)
+    baseline = load(arguments.baseline)
+    if baseline is None:
+        print(f"no baseline at {arguments.baseline} yet; nothing to compare")
+        baseline = {}
+    rows, regressions = compare(current, baseline, arguments.max_ratio)
+    report = table(rows, arguments.max_ratio)
+    print(report)
+    if arguments.summary:
+        with arguments.summary.open("a") as summary:
+            summary.write(report)
+    for name in regressions:
+        print(f"{name}: more than {arguments.max_ratio:g}x slower than main's baseline",
+              file=sys.stderr)
+    return 1 if regressions else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

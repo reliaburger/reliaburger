@@ -35,7 +35,7 @@ Everything in the batch path Chapter 12 built ([fifty envelopes](12-squeezing-ev
 
 Kubernetes has the same problem in a different shape. An Indexed Job creates one Pod per index, and each Pod is several etcd writes over its life (create, bind, status updates, finalizer removal, deletion). The upstream scalability envelope stops at 150,000 Pods per cluster, so a million tasks run in waves. The usual escape hatch is a work queue: a few long-lived workers draining Redis. That scales beautifully, and the orchestrator no longer knows your tasks exist. Retries, logs and results become your code.
 
-We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost proportional to chunks rather than individual tasks. This section first builds the pieces as libraries, tested hard and measured in one process, and then wires them into Raft, the API and `relish`. Wiring changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 needs a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/2026-09-28-plan-million-jobs.md` has the details).
+We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost proportional to chunks rather than individual tasks. This section first builds the pieces as libraries, tested hard and measured in one process, and then wires them into Raft, the API and `relish`. Wiring changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 needs a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/archive/2026-09-28-plan-million-jobs.md` has the details).
 
 ### Template plus count, ranges instead of records
 
@@ -105,6 +105,8 @@ A block cut short by a crash at the very end is truncated before new records are
 ### Putting it together, in one process
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
+
+A benchmark nobody runs measures nothing, and for a while nothing ran this one. CI now does, every night on `main` and on any pull request that touches the leader, the pool, the executor or the benchmark itself. Each run's Criterion output is kept for 90 days, so a cost claim can point at a trend rather than one good afternoon on a laptop. The job fails only when a benchmark gets more than twice as slow as the last baseline `main` saved: a hosted runner's speed wanders by tens of per cent, and we'd rather miss a 30% regression in CI (the trend shows it) than teach everyone to re-run a red benchmark.
 
 ### Wiring it in: one Raft entry per tick
 
@@ -300,6 +302,22 @@ and state formats, so it needs matching binaries and a fresh cluster
 ([cluster compatibility](../releasing.md#cluster-compatibility)). Executor reuse, throughput
 qualification and resident model workers remain separate issues; these semantics
 don't establish 100m accepted successes/day.
+
+The cron regression on a real three-node cluster was flaky for a while, and the
+product wasn't to blame. The test fires a cron occurrence, moves leadership and
+checks the new leader keeps the same run. It moved leadership with one
+`trigger().elect()` on a follower, which is the trap chapter 14 describes. The
+test called the election the moment the run appeared, which is exactly when the
+leader writes the next entries for that run. So the campaign often started a few
+milliseconds before the follower received the latest entry, and the leader and
+the other follower refused a candidate with a shorter log. Its higher term still deposed the leader, but the next election
+favours the longest log, so the old leader won it a second later and the test
+waited 30 seconds for a handover that never came. Now the helper switches off
+the old leader's elections (openraft's `runtime_config().elect(false)`) and has
+the most up-to-date other voter campaign every 3 seconds until one of them
+leads. The test also registers its schedule early in a minute: the minute a
+schedule lands in counts as already seen, so a request sent at 59 seconds could
+miss the occurrence it was waiting for.
 
 ### A contract you can retry, and can't misspell
 
@@ -502,6 +520,8 @@ self.file.write_all_at(&slot(raw), offset)?;
 
 A million tasks now cost 22.4 bytes of ledger and 25.0 of index on APFS, about 45 MiB. That still isn't the plan's 16 MiB per million (the ledger alone is over it), so we recorded the measured bound instead, 50 bytes a task (some headroom for filesystem block rounding), and `make bench-task-arrays` fails above it.
 
+That headroom isn't decoration, as the unit test found out a day later. It had also asserted at most 23 allocated bytes a task for the ledger, and it failed about one run in twenty on a Mac (#717). Nothing in the file had changed. Its logical length was 22,079,408 bytes every single time: the 8-byte magic, 245 block headers and a million 22-byte records. What changed was the allocation. APFS keeps up to about 1 MiB allocated past the end of a file that grows by fsynced appends, and how much it keeps varies from run to run, from 8 KiB to 1,000 KiB in forty runs of the same test. Write the same records as one big block and the slack disappears, which is why the test keeps production-sized 4,096-record blocks: a worker's disk pays that slack too. So the test now checks the two things it can know exactly, the logical length of each file to the byte, and leaves allocated bytes to the one bound that allows for the filesystem's choices, 50 a task for the pair. The worst of those forty runs was 47.6.
+
 Bytes per task only matter if they eventually go away. Workers already deleted a run's directory once the leader stopped listing it, but the leader only forgot a finished run when someone *submitted* something: pruning lived in the registration path. An idle cluster, or one running the same long array all day, kept everything. The fix is a new replicated write:
 
 ```rust
@@ -624,6 +644,111 @@ recorded as skipped, daily named arrays keep working past the definition cap,
 and on a real three-node cluster a cron job fires while other tenants fill
 every bulk slot.
 
+### Watching a million jobs
+
+Here's the question that started issue #684: did last night's cron job
+succeed? At 08:00 the answer was usually "who knows". Finished runs were kept
+for an hour and at most twenty across the whole cluster, so a per-minute cron
+in another namespace pushed the 03:00 failure out before anyone had coffee. No
+event recorded it, no metric counted it, no webhook fired. And `relish top`
+didn't list array tasks at all, because they run in the task executor, not
+under the supervisor that `top` asks.
+
+The fix has four parts, and each one is about *where* a fact should live.
+
+**Outcomes live with the definition.** A run's detail (results, logs, failed
+index ranges) is big and belongs to the run. Its outcome is small. So
+`DefinitionRecord` gained a `history: Vec<RunOutcome>` of at most ten entries,
+each a fixed handful of numbers: run id, start and finish time, terminal
+status, succeeded, failed and not-run counts, and the lowest failed index.
+`mark_terminal`, the one place every write path goes through when a run ends,
+appends to it. Pruning then can't lose it, because pruning never touches
+definitions it doesn't expire. Retention itself became per namespace: twenty
+finished runs each, twenty-four in all, and when the cluster is over, the
+namespace keeping the most gives up its oldest. That's a few lines in
+`retention_evictions`:
+
+```rust
+let Some(units) = kept.values_mut().rev().max_by_key(|units| units.len()) else {
+    break;
+};
+```
+
+`let ... else` binds the pattern or runs the `else` block, which must leave the
+scope (`break`, `return`, `continue`). It's the early return Go programmers
+write by hand, without an extra level of nesting. The `rev()` is for
+determinism: `max_by_key` keeps the *last* maximum it sees, so walking the
+`BTreeMap` backwards makes ties go to the first namespace by name. Every Raft
+replica prunes the same runs, or their snapshots disagree.
+
+**Counters live on the node that ran the attempts.** The leader already
+computed accepted rates, but in memory: they reset whenever leadership moved.
+So each node's executor now feeds a `JobTelemetry` on every sync, with each
+run's live counters, and Bun's collection loop exports the totals as
+`job_attempts_started_total`, `job_tasks_failed_total` and friends, plus a
+cumulative duration histogram. The labels are fixed: namespace, definition,
+profile, node. We considered labelling by batch id, as the September plan
+sketched, and decided against it: every one-off run would mint a new series,
+and a daily `render-$DATE` would grow the store for ever. A test checks that
+no other label ever appears, and that a node never keeps more than 1,024
+label sets however many definitions come and go.
+
+The telemetry is shared by async tasks and synchronous code, so it sits behind
+a `std::sync::Mutex`, not a tokio one. That's allowed here because no critical
+section contains an `.await`: each is a few map operations. Holding a std mutex
+across an `.await` would block the whole worker thread while the future slept,
+which is why the project rule says tokio mutexes by default.
+
+Counters only go up. A node that restarts reopens its runs with counters at
+zero, so `observe` treats a counter that went backwards as "everything here is
+new" rather than subtracting into a huge unsigned number:
+
+```rust
+let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
+```
+
+**Events come from replicated state, not from tasks.** The leader keeps a
+`JobEventTracker` and, at the start of each tick, compares the committed job
+state with what it has announced. A run that reached a terminal state gets one
+event (`job-completed`, `job-failed` or `job-cancelled`); a run that gained an
+unknown owner gets `job-unknown`. Failed and unknown runs also go to the alert
+webhook, dressed as an ordinary `AlertTransition`, so Slack and PagerDuty get
+their usual payloads with no new code. Because the tracker reads runs, not
+results, a million-task run is one event, and there's a test that says so.
+
+What happens when leadership moves? The new leader's first look is silent: it
+records what's already finished and announces nothing. Otherwise every leader
+change would re-send every retained failure to PagerDuty. The cost is a small
+window: a run finishing in the second before the change may go unannounced.
+We could close it with a durable "announced" marker per run, one more Raft
+write each, and decided the definition's history was a good enough safety net
+for now.
+
+**Usage comes from cgroups.** On Linux every attempt already runs inside a
+cgroup: the reusable executor's, or a fresh runtime's. So the runner reports
+*where* to measure, and the collection loop reads `cpu.stat` and
+`memory.current` there. For fresh runtimes the runner has to remember which
+attempts are running, and an attempt can end through a dozen early returns.
+Rather than remember to clean up at each one, it holds a guard:
+
+```rust
+let _listing = task
+    .run
+    .as_ref()
+    .map(|run| AttemptListing::new(&self.attempts, run.batch_id, id.clone(), cgroup.clone()));
+```
+
+`AttemptListing::new` adds the attempt to the map, and its `Drop`
+implementation removes it. Rust runs `drop` when the value goes out of scope,
+however the function returns, including on `?`. It's Go's `defer`, attached to
+a value instead of a statement. The leading underscore matters: `let _ = ...`
+would drop the guard immediately, while `let _listing` keeps it alive to the
+end of the function and only tells the compiler we won't read it.
+
+`relish top` then shows one row per definition and profile on each node, with
+`tasks:27` where a PID would be. A singleton run already had its own `run-N`
+row, so its usage fills that row instead of adding a second one.
+
 ### Dispatch at scale: sixty-four arrays and a node that won't answer
 
 Every throughput number so far came from one array. The leader's tick had
@@ -714,6 +839,24 @@ by swapping its control fence file for a FIFO with no writer, so its next sync
 blocks reading it, then checks that the leader still hears from the healthy
 node several times a second and that every array still finishes with each task
 counted once.
+
+That test passed on Linux and hung on macOS, and the hang wasn't in Reliaburger.
+Each sync the leader gives up on drops its HTTP request, the worker's handler
+is dropped with it, and the blocking thread reading the FIFO carries on. The
+next sync then blocks on the FIFO too, so by the time the test lets go, two
+threads are stuck there. The test released them by opening the FIFO's write end
+once and closing it. On Linux that wakes every reader and each read sees end of
+file. On macOS a reader could stay blocked in `read` for ever. A small Python
+script reproduces it: one reader was always freed, but with two readers one
+open and close freed both in only 11 runs out of 20. Dropping a tokio runtime
+waits for its blocking threads to return, so the test's assertions all passed in
+about 65 seconds, and then the process never exited until nextest killed it at
+120 seconds. Now the test renames the
+FIFO aside first, so the worker's next sync finds no fence file. Then it keeps
+opening and closing the write end until opening without blocking fails with
+`ENXIO`, which means no reader holds the FIFO any more. The arrays also shrank
+from 6,000 tasks to 4,000. Twenty milliseconds a task on 48 slots still takes at
+least 27 seconds, three times longer than the hung window needs work running.
 
 The third cost was copying. `desired_state()` clones the whole replicated
 state, apps and all, and the leader called it four times a tick. The tick now
@@ -1187,6 +1330,69 @@ back. The same change moved the start-up filesystem work (creating
 directories, permissions, `chown`, preparing cgroups) onto the blocking pool
 with `spawn_blocking`, off the async worker threads.
 
+**Retrying a cold start that failed.** On 11 October a privileged CI run failed
+one task out of six with `container rbtest-batch__executor-…-1 state
+unavailable: runtime command … did not finish within 5s`. Every runc call the
+owned runtime makes runs under its own durable owner process and gets five
+seconds to finish. Starting an executor polls `runc state` until the
+container's init is running, and on that loaded runner one poll missed the
+bound. The pool reported the failed start as `SpawnFailed`, the outcome for a
+binary that doesn't exist, so the task pool never retried it. Yet the user's
+command hadn't run anywhere: it's only sent once the helper connects.
+
+We tried to reproduce the slow call in the Lima VM first, as root, with
+eighteen busy loops on six CPUs and then twelve busy loops plus four writers
+doing `dd conv=fsync` in a loop. In 27 runs of the test, no runtime command
+took over a second. So the five-second bound has plenty of headroom, and
+raising it would only move the edge. What the failure showed was a real gap:
+a transient failure of *our* machinery cost a task one of its attempts, or
+all of them with `max_attempts = 1`.
+
+Now a cold start that fails on a runtime, I/O or helper error retires that
+executor and starts one fresh one, at most twice in all
+(`STARTUP_ATTEMPTS`). Both share the command's deadline, and the retry happens
+only once the first executor has positively retired. One that hasn't stays
+quarantined with its slot, exactly as before. A refusal about the job itself,
+such as an unpinned image, isn't retried: a second executor would refuse it
+too. `ExecutorError::is_transient` makes that split.
+
+The loop hit a borrow-checker lesson on the way. `tokio::pin!(started)` pins
+the start future on the stack, and that future holds a mutable borrow of the
+slot's context until it's dropped. Our first version matched on the result
+in the same scope and then called `checkout.retire()`, and the compiler
+refused: `checkout` was still borrowed by a future we'd finished with. The
+fix is to give the future a smaller scope that ends in a value:
+
+```rust
+let startup = {
+    let started = self.start(new, &template, profile, &stop);
+    tokio::pin!(started);
+    tokio::select! { biased;
+        outcome = interrupted() => {
+            stop.cancel();
+            let _ = (&mut started).await;
+            Startup::Interrupted(outcome)
+        }
+        result = &mut started => match result {
+            Ok(()) => Startup::Started,
+            Err(error) => Startup::Failed(error),
+        },
+    }
+};
+```
+
+The block's closing brace drops `started`, the borrow ends with it, and the
+`Startup` enum carries out everything we need to decide what's next. In C you
+could keep using the struct here and hope the future was done with it. Rust
+makes you say so.
+
+`runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor` wraps
+the real runc runtime and reports the CI error after a real start. The first
+command succeeds on the second executor; when every start fails, the command
+gets the runtime's reason after exactly two starts, with the budget returned
+and nothing left running. Against the old pool it fails with the same
+`SpawnFailed` CI saw.
+
 Retirement can't wait forever either. A process stuck in an uninterruptible
 kernel wait, say on a hung NFS mount, ignores `SIGKILL` until the kernel lets
 go. `RETIREMENT_DEADLINE` gives up after ten seconds: the caller gets its
@@ -1491,6 +1697,24 @@ about 11 ms. Host jobs fell from the roughly 4,000 a second we'd measured
 before to 1,233 a second, the same in every round. The check now runs before
 polling. A gated test times 200 quiet commands on one warm executor: 2.35
 seconds with the bug, 0.17 seconds without, against a two-second limit.
+
+The third bug showed up once on a CI runner (#715). The gated test runs
+`yes & sleep 0.2; exit 0` and expects the truncation line after 16 MiB. One
+run returned 22 MB with no line at the end. Nothing in Bun caps output, and
+every error path in the helper fails the command, which hadn't happened. That
+left the quiet period. On a busy runner `yes` can go unscheduled for more than
+10 ms, and to the helper that looks just like a descendant that's finished
+talking. So it stopped reading, sent no line and closed the pipe. Whatever
+`yes` wrote next was lost, and nothing said so. A longer quiet period wouldn't
+fix this, because a long enough stall beats any timeout. What we can promise
+is that output never vanishes silently. So the rule is now simpler: if the
+helper stops reading while any stream is still open, it appends the line,
+whether it stopped at the cap or on silence. The protocol test makes the stall
+deterministic. It sends `SIGSTOP` to a looping writer just as the command
+exits and resumes it 300 ms later. Before the fix, standard error came back
+empty. There's a cost. A command that leaves a silent daemon holding its
+stdout now gets the line too, even if the daemon never writes again. The
+helper can't tell those two cases apart, so it warns in both.
 
 None of this keeps a *model* loaded. Each command is still a new process that
 loads whatever it loads. Keeping a model resident between requests is a
@@ -1800,6 +2024,158 @@ the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage/24-hour work
 answer different questions. No extrapolated daily rate determines a soak pass.
 
+### The exit gate: a day of faults
+
+So when can 0.2.0 say "100 million jobs a day"? The roadmap said the release
+"still requires real-runtime qualification", #668 had one list of conditions
+and the September plan had a table of targets nobody had measured. Three
+answers is no answer. The audit settled it (decision D18-C): #668's list is the
+gate, on at least three nodes. That means 24 hours at 1,158 accepted successes
+a second or more (100 million divided by 86,400 seconds) plus headroom, with
+apps running, several resource profiles, and worker loss, leader loss, delayed
+messages and disk faults along the way. The September table survives as
+measurements every run records, but none of them can fail it.
+
+We didn't write a new harness for this. The soak controller above already
+admits work idempotently, audits effects and proves fault overlap, so the job
+qualification is the same soak with three switches, which
+`qualify-jobs-sustained.sh` sets per tier. `--job-load target` turns the
+shared and host short runs into 1,048,576-task arrays of `true` and fails the
+record if the campaign averages less than the target rate, faults included.
+`--node-faults` adds one node-level fault to every cycle: netem delay towards
+a peer, a disk filled to its last 64 MiB, or Bun's own writes throttled to 20
+IOPS with a systemd property. And every run writes a `.jobs.json` beside its
+record with the accepted rates and the M8 measurements. `--plan` prints the
+schedule without touching a cluster, which is how the CI tests check that the
+90-minute fast tier puts every fault kind on every node.
+
+Why node-level faults only? `relish fault kill` against a job is refused by the
+same replica rail that protects apps, and an array's attempts inside a shared
+executor aren't anything Smoker can name. Making chaos job-aware is real work
+(#704, in 0.2.2). Killing Bun, delaying a node or filling its disk needs no
+per-job targeting, and it's what an operator's hardware does anyway.
+
+Two measurements needed a little product code. A retry used to be a number:
+the bulk ledger keeps final outcomes, so when four fresh-container retries
+recovered during the hourly runs, nobody could say why the first attempts had
+failed. Now each chunk report carries counters by cause:
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryCauses {
+    pub exit_code: u64,
+    pub signal: u64,
+    pub timeout: u64,
+    pub unknown: u64,
+    pub unrecorded: u64,
+}
+
+impl RetryCauses {
+    pub fn total(&self) -> Option<u64> {
+        [self.signal, self.timeout, self.unknown, self.unrecorded]
+            .into_iter()
+            .try_fold(self.exit_code, u64::checked_add)
+    }
+}
+```
+
+Five numbers per chunk, never a row per task. `try_fold` walks the array with
+an accumulator and stops at the first `None`, and `u64::checked_add` returns
+`None` on overflow, so `total()` can't wrap around to a small number the way
+an unsigned `a + b` does in C (and in a Rust release build, where overflow
+checks are off). The leader refuses a chunk whose causes don't sum
+to its `retried` count, just as it refuses one whose outcomes don't sum to its
+size. The `unrecorded` bucket is the honest part: the node's ledger stores
+attempt counts but not reasons (22 bytes a record, and #678 is busy shrinking
+that), so a chunk resumed after a restart reports the retries it can't explain
+as exactly that. The node only counts a cause once the next attempt has really
+started, which keeps the sum equal to `attempts - 1` on every early return.
+
+The other was start lag. The reusable pools already time the command itself,
+so the gap between the pool taking an attempt and the command starting falls
+out of a subtraction, binned into the same power-of-two millisecond buckets as
+the run times. `std::array::from_fn(|bucket| counters[bucket].load(..))` turns
+sixteen atomics into the plain `[u64; 16]` the node sends to the leader: the
+closure runs once per index, so there's no loop and no uninitialised array to
+fill.
+
+The harness covers real VMs; a test has to cover the case the issue called
+untested. Every leader change test so far moved leadership with cron, never
+while an array held grants. The new cluster test kills the leader *after* it
+starts running its own share. It reads which chunks the dead leader held from
+the new leader's state before the silence clock can take them back, then waits
+for the array to finish and checks three things: every task succeeded exactly
+once, the accepted retry count is exactly one per flaky index (with its cause),
+and every chunk accepted at a later grant attempt is one the dead leader held.
+Two Linux versions of the same test use real shared-runc and host executors.
+There the old leader's executor keeps running after its control plane stops,
+which is the nastier case: its commands finish, and none of their reports may
+ever count.
+
+Finally, a regression guard. `relish bench --scenario` and `--compare` used to
+be mutually exclusive, so the throughput we were proudest of had none.
+`--compare OLD.json` now checks a scenario against an earlier report of the
+same scenario and fails on a drop beyond `--tolerance`. A different window or
+concurrency makes the verdict informational, because comparing unlike runs is
+how the misleading numbers above happened. The five-round rerun's forty reports
+are committed as the first baselines.
+
+## Telling visitors what they can actually run
+
+All of this lives on the development branch, while the one-line installer
+still fetches 0.1.6. For a while the README listed `relish jobs` and
+`relish run --batch` next to the install line, and the tour's last bullet sent
+people to `relish bench --scenario jobs-shared-containers`. Follow it on a
+fresh install and you got an unknown-subcommand error. The existing website
+test couldn't see the problem: it parsed every advertised command with the CLI
+built from the same checkout, which of course had them all.
+
+So the check needs the *released* command line, not ours. We don't want
+CI to download and run a binary, so `scripts/release/released_cli.py` does
+that once per promotion: it walks the published `relish`'s own `-h` pages
+and writes every command, positional and option (with its aliases and the
+values clap lists) to `scripts/release/released-cli.tsv`. A tab-separated row
+per fact keeps the diff readable when the next release adds a command.
+
+`src/relish/released_cli.rs` reads it back and models just enough of clap to
+judge a line. Parsing each row is a `match` on a slice:
+
+```rust
+let fields: Vec<&str> = line.split('\t').collect();
+match fields.as_slice() {
+    ["version", value] => version = Some(value.to_string()),
+    ["command", path] => {
+        commands.insert(path.to_string());
+    }
+    ["option", path, aliases, value, choices] => { /* … */ }
+    _ => return Err(ReleasedCliError::Malformed { /* … */ }),
+}
+```
+
+A *slice pattern* matches on length and contents at once: `["command", path]`
+only fits a two-element slice whose first element is `"command"`, and binds
+the second to `path`. In C you'd check `argc`, then `strcmp`, then index;
+here the compiler won't let you read `path` from a row too short to have one.
+
+`ReleasedCli::check` then walks a line's words the way clap would: descend
+into a subcommand while one matches, look each `--flag` up on that command or
+the root (clap repeats global options on every page, so the snapshot keeps
+them once), check a value against the listed choices, and count positionals.
+That last part catches the sneakiest case. 0.1.6's `batch` takes a manifest
+path, so `relish batch submit jobs.toml` reads to it as the path `submit`
+followed by a stray argument. That's a rejection, not a pass.
+
+Two tests use it. `every_advertised_command_exists_in_the_installed_release`
+lets the tour use only released commands; everything else on the homepage,
+in the README and in the tour chapter must carry "0.2.0, not in 0.1.6" in the
+same paragraph or section. The README's generated command list adds that
+label by itself, because `command_reference::render` now takes the snapshot.
+And `the_tour_recording_matches_the_installer_version` reads the version that
+`scripts/demo/tour.sh` writes into the recording's title, so the next
+promotion can't skip the re-record the way 0.1.5 and 0.1.6 did. It caught
+something on its first run, too: the new 0.3.0 card on the homepage said
+`relish netboot`, a command no release has yet.
+
 ## What 0.2.0 doesn't do yet
 
 An audit of the job path before the release
@@ -1818,11 +2194,6 @@ should shrink to nothing before the release ships.
   reserve CPU and memory in each node's own budget, which the leader's app
   scheduler can't see. It can place a replica on a node that jobs have already
   filled.
-- **Job history and events**
-  ([#684](https://github.com/reliaburger/reliaburger/issues/684)). Finished
-  runs are pruned within the hour, there are no job metrics or events, and
-  array tasks don't show in `relish top`. You can't yet answer "did last
-  night's cron job succeed?" the next morning.
 
 ## Lessons
 
@@ -1856,6 +2227,11 @@ binding, then treated the `pending` instance with no PID as a running process
 missing one. The waiter now waits through non-running states but still fails
 at once if a known running process has no PID. We kept the cases separate, so
 fixing the test couldn't hide the real missing-PID bug it was written to catch.
+
+**Write the gate down before you run it.** Three documents had three
+different "million-task gates", so no run could have passed all of them. One
+written decision, with the measurements recorded rather than gated, turned an
+argument into a schedule.
 
 **Measure the thing you claim.** The most misleading numbers here weren't
 wrong. They measured something else: unequal reservations, unequal counts,

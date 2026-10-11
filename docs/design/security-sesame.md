@@ -1228,6 +1228,21 @@ startup.
 
 ---
 
+### 5.11 Audit Log
+
+**Shipped (#685).** Audit records used to live only in the 1024-entry event ring (`bun::events::EventStore`), next to health, deploy and job events. A busy array evicted them within seconds, a restart emptied the ring, and only five areas (tokens, CAs, secrets, namespace keys, faults) recorded anything. Each node now keeps its own store, `bun::audit::AuditLog`:
+
+- **Format and place.** JSON Lines under `{[storage] data}/audit/`, in segments named `audit-<first sequence>.jsonl`. A record (`AuditRecord`) has a per-node `sequence` that keeps counting across restarts, `timestamp`, `kind`, `severity`, `action`, `principal`, `app`, `namespace`, `node`, `source_address`, `details` and `message`.
+- **Durability.** One dedicated writer thread owns the files, fed by a bounded `mpsc` queue, so no Tokio worker blocks on disk. It appends and `sync_data`s each record and replies on a oneshot; the API waits for that (at most `AUDIT_WRITE_TIMEOUT`, 5 s) before answering. Audit traffic is a few records a second, so one sync per record is cheap. On open, a half-written last line is ended with a newline and skipped on read.
+- **Bound.** `[storage] audit_max_bytes` (64 MiB default, 64 KiB minimum) is shared by eight segments. A record that would push the newest segment past its share starts a new one; when the total passes the bound the oldest segment is deleted, never the newest.
+- **Failure.** A failed write (or a full queue) is printed to stderr and counted (`AuditLog::failures`); the action still happens. `GET /v1/audit` reports the count as a warning.
+- **No secrets.** Handlers never put one in a record; as a backstop the writer replaces anything shaped like `rbrg_…` (API and join tokens) with `rbrg_[redacted]`.
+- **Coverage.** One route layer (`bun::api::audit::audit_layer`, inside the auth layer) records every route in `AUDITED_ROUTES` that answers 2xx, with the caller's principal, the address from `ConnectInfo`, and `{app}`/`{namespace}` from the path. Handlers that know more add it through `bun::audit::annotate` (a manifest's namespace and workloads, a decommission's target, an upgrade's version), carried in a task-local for the request. Token, CA, secret and fault handlers record their own, richer events; the agent records `fault.expired` and the token sweep and namespace-key loops record as `system`. A test (`every_mutating_route_is_audited_or_exempt`) makes every `POST`/`DELETE` route in the authorisation matrix choose: layer-audited, self-audited or exempt with a reason (node-to-node plumbing, heartbeats, reads).
+- **Read.** `GET /v1/audit?since&until&action&principal&namespace&limit` (newest `limit`, default 100, at most 10,000, oldest first) needs an unscoped Admin with the cluster-wide `admin` permission, and refuses the service principal. `?cluster=true` asks every live member under the caller's own credential (not the service token), so each repeats the check, and merges by `(timestamp, node, sequence)` with a warning per member that didn't answer. `relish audit` wraps it.
+- **Ring.** `EventStore::record_audit` still puts each record in the ring and the live stream, so the TUI and `relish events` show it as it happens.
+
+A call a follower forwards to the leader is recorded on both: the entry node with the client's address, the leader with the forwarder's. **Planned:** central retention (shipping records off the node, so a decommissioned node's history survives it) and tamper evidence (hash-chained records).
+
 ## 6. Configuration
 
 All security configuration lives in the cluster config (applied via `relish apply` or set during `relish init`).
@@ -1595,7 +1610,7 @@ The threat model assumes:
 3. Rotate the age keypair: `relish secret rotate`.
 4. Rotate the OIDC signing keypair (re-minting all JWTs).
 5. Rotate all API tokens.
-6. Audit all cluster activity during the compromise window.
+6. Audit all cluster activity during the compromise window: `relish audit --cluster --since <start> --until <end>` lists every node's records, with the principal and source address of each action (§5.11). Read the compromised node's log before you rebuild it; there is no central copy yet.
 7. Investigate the attack vector and harden council node access.
 
 **Prevention:**
@@ -1750,6 +1765,8 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 - **Stale CRL test:** Disconnect a node before CRL distribution, then reconnect. Verify that the node receives the updated CRL on reconnection.
 
 ### 10.7 Audit Logging
+
+- **Durable audit tests (shipped, #685):** a record survives a restart and the log stays within its bound, dropping the oldest segment first (`src/bun/audit.rs`); job events can't evict an audit record (`job_events_cannot_evict_audit_records`); apply, exec, delete, upgrade and decommission are recorded with principal, namespace and source address, and a fault's record carries its namespace and override flags (`src/bun/api/audit_tests.rs`); only a cluster-wide Admin reads the log, never the service principal; a token created before a Bun restart is listed after it (`tests/suite/security_integration.rs`); and `?cluster=true` merges every node (`cluster_audit_query_merges_every_node`, `make test-cluster`).
 
 - **Token audit test:** Use an API token to perform operations. Verify that `relish token list` shows the correct `last_used` timestamp.
 - **Secret decryption audit test:** Deploy an app with encrypted secrets. Verify that `relish events --type secret` shows the decryption events with correct app, node, and timestamp.

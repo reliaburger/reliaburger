@@ -959,6 +959,8 @@ Remove member flow:
 5. Leader broadcasts updated council membership via Mustard.
 ```
 
+In the implementation, promotion and eviction go through openraft's joint consensus (`change_membership`): a joint configuration commits first, then the uniform one. The caller's future proposes the second step, so a caller that times out or a leader that fails over between the steps leaves a committed joint configuration behind. The council reconciler finishes it before planning anything else (`CouncilNode::finish_membership_change`), proposing the joint configuration's target voter set; otherwise its change-in-flight gate would hold every later membership change (#673).
+
 ---
 
 ## 6. Configuration

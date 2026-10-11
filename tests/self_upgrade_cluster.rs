@@ -23,6 +23,9 @@ use tokio::sync::watch;
 
 use reliaburger::upgrade::signing::{self, encode_public_key};
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
+
 /// Cluster operations are slow: convergence, four swaps, verification.
 const WAIT: Duration = Duration::from_secs(180);
 
@@ -54,26 +57,22 @@ struct ClusterHarness {
     release_pkcs8: Vec<u8>,
     external_pkcs8: Vec<u8>,
     service_token: String,
+    /// Every node's fixed ports, leased until the harness drops.
+    _held_ports: Vec<bun_process::PortBlockReservation>,
 }
 
-fn free_tcp_port(allocated: &mut HashSet<u16>) -> u16 {
-    loop {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        if allocated.insert(port) {
-            return port;
-        }
-    }
-}
-
-fn free_udp_port(allocated: &mut HashSet<u16>) -> u16 {
-    loop {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = socket.local_addr().unwrap().port();
-        if allocated.insert(port) {
-            return port;
-        }
-    }
+/// A TCP- and UDP-free port, leased in `held` for the harness's lifetime.
+///
+/// Every upgrade exec and respawn closes a node's sockets and binds the same
+/// ports again. A `bind(0)` port comes from the ephemeral range, where
+/// another test can take it in that gap (#734); the shared allocator's range
+/// lies below it, and a held lease keeps every other fixture, and this
+/// harness's other nodes, off it.
+fn free_port(held: &mut Vec<bun_process::PortBlockReservation>) -> u16 {
+    let reservation = bun_process::reserve_port_block_lease(1);
+    let port = reservation.base;
+    held.push(reservation);
+    port
 }
 
 /// How far above its gossip port each node's Raft port sits. Bun derives a
@@ -85,16 +84,20 @@ const RAFT_PORT_OFFSET: u16 = 1000;
 
 /// A free gossip (UDP) port whose Raft (TCP) port, [`RAFT_PORT_OFFSET`]
 /// above it, is free too.
-fn free_gossip_and_raft_ports(allocated: &mut HashSet<u16>) -> (u16, u16) {
+fn free_gossip_and_raft_ports(held: &mut Vec<bun_process::PortBlockReservation>) -> (u16, u16) {
     loop {
-        let gossip = free_udp_port(allocated);
-        let Some(raft) = gossip.checked_add(RAFT_PORT_OFFSET) else {
+        let gossip = bun_process::reserve_port_block_lease(1);
+        let Some(raft) = gossip
+            .base
+            .checked_add(RAFT_PORT_OFFSET)
+            .and_then(|port| bun_process::PortBlockReservation::try_reserve(port, 1))
+        else {
             continue;
         };
-        if !allocated.contains(&raft) && std::net::TcpListener::bind(("127.0.0.1", raft)).is_ok() {
-            allocated.insert(raft);
-            return (gossip, raft);
-        }
+        let ports = (gossip.base, raft.base);
+        held.push(gossip);
+        held.push(raft);
+        return ports;
     }
 }
 
@@ -172,11 +175,12 @@ impl ClusterHarness {
 
         let mut nodes = Vec::new();
         let mut seed_gossip: Option<u16> = None;
-        // Keep every endpoint numerically distinct for the lifetime of this
-        // harness. Binding port 0 and immediately dropping the socket can
-        // return the same number on the very next call; that made a node's
-        // registry collide with its API or Raft listener and crash-loop.
-        let mut allocated_ports = HashSet::new();
+        // Keep every endpoint numerically distinct and leased for the
+        // lifetime of this harness. Binding port 0 and immediately dropping
+        // the socket can return the same number on the very next call; that
+        // made a node's registry collide with its API or Raft listener and
+        // crash-loop.
+        let mut held_ports = Vec::new();
 
         for index in 0..count {
             let name = format!("n{index}");
@@ -187,10 +191,10 @@ impl ClusterHarness {
             install_version(&source, &bin_dir, "v0.2.0");
             std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
-            let api_port = free_tcp_port(&mut allocated_ports);
-            let (gossip_port, raft_port) = free_gossip_and_raft_ports(&mut allocated_ports);
-            let reporting_port = free_tcp_port(&mut allocated_ports);
-            let registry_port = free_tcp_port(&mut allocated_ports);
+            let api_port = free_port(&mut held_ports);
+            let (gossip_port, raft_port) = free_gossip_and_raft_ports(&mut held_ports);
+            let reporting_port = free_port(&mut held_ports);
+            let registry_port = free_port(&mut held_ports);
             let join = match seed_gossip {
                 Some(seed) => format!("join = [\"127.0.0.1:{seed}\"]"),
                 None => "join = []".to_string(),
@@ -310,6 +314,7 @@ retain_versions = 3
             release_pkcs8,
             external_pkcs8,
             service_token,
+            _held_ports: held_ports,
         };
 
         // Every node healthy, then a leader elected with a full council.
