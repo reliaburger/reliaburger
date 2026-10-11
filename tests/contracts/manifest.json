@@ -7200,6 +7200,33 @@
       "boundaries": [
         "The in-process leader stops its control plane rather than receiving SIGKILL; the release job qualification (qualify-jobs-sustained.sh) SIGKILLs Bun on real VMs."
       ]
+    },
+    {
+      "id": "issue-734-rootless-test-cleanup",
+      "issue": 734,
+      "promise": "A failed rootless OCI test leaves none of its network helpers running.",
+      "supported_paths": [
+        "Rootless runc nodes whose owners supervise slirp4netns helpers"
+      ],
+      "cases": [
+        {
+          "id": "rootless-cleanup-normal_rootless_bun_cleanup_leaves_no_network_helper_behind",
+          "binary": "reliaburger::oci_crash",
+          "test": "normal_rootless_bun_cleanup_leaves_no_network_helper_behind",
+          "requires": [
+            "rootless-linux"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A helper whose command line names only its generation directory is still found through the root's runtime intents."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production retirement of rootless helpers is covered by the owned_rootless cases."
+      ]
     }
   ]
 }

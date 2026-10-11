@@ -925,6 +925,12 @@
   },
   {
     "source": "tests/oci_crash.rs",
+    "function": "normal_rootless_bun_cleanup_leaves_no_network_helper_behind",
+    "binary": "reliaburger::oci_crash",
+    "test": "normal_rootless_bun_cleanup_leaves_no_network_helper_behind"
+  },
+  {
+    "source": "tests/oci_crash.rs",
     "function": "normal_rootless_bun_recovers_owned_forward_and_discovery",
     "binary": "reliaburger::oci_crash",
     "test": "normal_rootless_bun_recovers_owned_forward_and_discovery"

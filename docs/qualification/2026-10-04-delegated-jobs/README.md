@@ -106,7 +106,7 @@ executor identities**, **31,728 ledger bytes** and
 **3,178,496 index bytes**. The failed-only page was empty and direct index 42
 returned success. These are short-run observations, not a memory/storage plateau
 or sustained capacity claim. The results are in [the bounded report](demo-report.json).
-The [homepage recording](../../website/assets/jobs.cast) cuts idle gaps to two
+The [homepage recording](https://github.com/reliaburger/reliaburger/blob/cd73c90dd783cc482840190d40f6380aa71f2ed3/docs/website/assets/jobs.cast) cuts idle gaps to two
 seconds and states the actual elapsed time. Its binaries were built from the
 implementation working tree; the package version still identifies 0.1.4 until
 the maintainer's release process advances it.
