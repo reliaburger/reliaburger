@@ -41,13 +41,15 @@ changed=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA:-HEAD}")
 # compiled into relish, and documentation_first_run checks snippets in the
 # READMEs, the whitepaper, the relish design doc, the Linux servers guide and
 # book chapters 2 and 4.
-# tests/suite/website.rs parses the homepage tour's commands with relish.
+# tests/suite/website.rs parses the homepage tour's commands with relish and
+# checks the site's installer, recordings and release cards against the
+# roadmap, the quickstart and the release runbook.
 is_docs_only() {
     case "$1" in
         docs/manual/* | README.md | docs/README.md | docs/whitepaper.md | \
             docs/design/cli-relish.md | docs/linux-servers.md | \
             docs/book/02-* | docs/book/04-* | \
-            docs/website/index.html)
+            docs/website/* | docs/roadmap.md | docs/quickstart.md | docs/releasing.md)
             return 1 ;;
         docs/* | website/* | *.md) return 0 ;;
         *) return 1 ;;

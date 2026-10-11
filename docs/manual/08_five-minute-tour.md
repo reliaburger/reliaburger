@@ -189,4 +189,4 @@ tools and the image cache.
 - Write your own app config: `deploy-an-app`
 - How the cluster fits together: `cluster-basics`
 - More ways to break things: `chaos`
-- Compare job runtimes with `relish bench --scenario jobs-shared-containers`: `batch`
+- Jobs, cron and batch work: `batch`

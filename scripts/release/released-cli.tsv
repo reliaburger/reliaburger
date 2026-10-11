@@ -1,0 +1,508 @@
+# What relish v0.1.6 accepts, read from its -h pages by
+# scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
+# default version changes; tests/suite/website.rs checks the two match.
+version	v0.1.6
+argument	relish apply	[PATH_OR_URL]
+argument	relish batch	<PATH>
+argument	relish batch-status	<ID>
+argument	relish build	<PATH>
+argument	relish ca verify	<FILE>
+argument	relish cancel-deploy	<OPERATION_ID>
+argument	relish compile	<PATH>
+argument	relish decommission-node	<NODE_ID>
+argument	relish delete	<APP>
+argument	relish deploy	<PATH>
+argument	relish dev countersign-binary	<BINARY>
+argument	relish dev create	[NAME]
+argument	relish dev destroy	[NAME]
+argument	relish dev shell	<NODE>
+argument	relish dev sign-binary	<BINARY>
+argument	relish dev start	[NAME]
+argument	relish dev status	[NAME]
+argument	relish dev stop	[NAME]
+argument	relish dev test	[FILTER]
+argument	relish diff	<PATH_A>
+argument	relish diff	[PATH_B]
+argument	relish exec	<APP>
+argument	relish exec	[COMMAND]...
+argument	relish fault bandwidth	<LIMIT>
+argument	relish fault bandwidth	<TARGET>
+argument	relish fault clear	[TARGET]
+argument	relish fault cpu	<PERCENTAGE>
+argument	relish fault cpu	<TARGET>
+argument	relish fault delay	<DELAY>
+argument	relish fault delay	<TARGET>
+argument	relish fault disk-io	<LIMIT>
+argument	relish fault disk-io	<TARGET>
+argument	relish fault dns	<FAULT_TYPE>
+argument	relish fault dns	<TARGET>
+argument	relish fault drop	<PERCENTAGE>
+argument	relish fault drop	<TARGET>
+argument	relish fault kill	<TARGET>
+argument	relish fault memory	<TARGET>
+argument	relish fault memory	<VALUE>
+argument	relish fault node-drain	<TARGET>
+argument	relish fault node-kill	<TARGET>
+argument	relish fault node-pressure	<TARGET>
+argument	relish fault partition	<TARGET>
+argument	relish fault pause	<TARGET>
+argument	relish fault resume	<TARGET>
+argument	relish fault scenario	<PATH>
+argument	relish fmt	<PATH>
+argument	relish help	[COMMAND]...
+argument	relish history	<APP>
+argument	relish init	[DIR]
+argument	relish inspect	<NAME>
+argument	relish join	<ADDR>
+argument	relish lint	<PATH>
+argument	relish local	<ACTION>
+argument	relish local	[NODE]
+argument	relish logs	<NAME>
+argument	relish logs-search	<SOURCE>
+argument	relish logs-search	<SQL>
+argument	relish manual	[CHAPTER]
+argument	relish metrics	<APP>
+argument	relish path	<SOURCE>
+argument	relish resolve	<NAME>
+argument	relish rollback	<APP>
+argument	relish secret encrypt	<VALUE>
+argument	relish secret pubkey	[DIR]
+argument	relish sign	<IMAGE>
+argument	relish snapshot create	<APP>
+argument	relish snapshot delete	<APP>
+argument	relish snapshot delete	<NAME>
+argument	relish snapshot list	<APP>
+argument	relish snapshot restore	<APP>
+argument	relish snapshot restore	<NAME>
+argument	relish source	[QUERY]
+argument	relish stop	<APP>
+argument	relish token revoke	<NAME>
+argument	relish token rotate	<NAME>
+argument	relish upgrade plan	<VERSION>
+argument	relish upgrade rollback	[VERSION]
+argument	relish upgrade start	[VERSION]
+command	relish
+command	relish apply
+command	relish batch
+command	relish batch-status
+command	relish bench
+command	relish build
+command	relish ca
+command	relish ca backup
+command	relish ca rotate
+command	relish ca verify
+command	relish cancel-deploy
+command	relish compile
+command	relish council
+command	relish council re-enrol
+command	relish council recover
+command	relish council status
+command	relish dashboard
+command	relish decommission-node
+command	relish delete
+command	relish deploy
+command	relish dev
+command	relish dev clean
+command	relish dev countersign-binary
+command	relish dev create
+command	relish dev destroy
+command	relish dev disk
+command	relish dev keygen
+command	relish dev shell
+command	relish dev sign-binary
+command	relish dev start
+command	relish dev status
+command	relish dev stop
+command	relish dev test
+command	relish diff
+command	relish exec
+command	relish export
+command	relish fault
+command	relish fault bandwidth
+command	relish fault clear
+command	relish fault cpu
+command	relish fault delay
+command	relish fault disk-io
+command	relish fault dns
+command	relish fault drop
+command	relish fault kill
+command	relish fault list
+command	relish fault memory
+command	relish fault node-drain
+command	relish fault node-kill
+command	relish fault node-pressure
+command	relish fault partition
+command	relish fault pause
+command	relish fault resume
+command	relish fault scenario
+command	relish fmt
+command	relish help
+command	relish history
+command	relish images
+command	relish import
+command	relish init
+command	relish inspect
+command	relish join
+command	relish join-token
+command	relish join-token create
+command	relish lint
+command	relish local
+command	relish logs
+command	relish logs-export
+command	relish logs-search
+command	relish manual
+command	relish manual examples
+command	relish metrics
+command	relish nodes
+command	relish path
+command	relish resolve
+command	relish rollback
+command	relish routes
+command	relish secret
+command	relish secret encrypt
+command	relish secret pubkey
+command	relish secret rotate
+command	relish setup
+command	relish sign
+command	relish sign keygen
+command	relish snapshot
+command	relish snapshot create
+command	relish snapshot delete
+command	relish snapshot list
+command	relish snapshot restore
+command	relish source
+command	relish status
+command	relish stop
+command	relish test
+command	relish token
+command	relish token create
+command	relish token list
+command	relish token revoke
+command	relish token rotate
+command	relish top
+command	relish tui
+command	relish uninstall
+command	relish upgrade
+command	relish upgrade abort
+command	relish upgrade check
+command	relish upgrade plan
+command	relish upgrade resume
+command	relish upgrade rollback
+command	relish upgrade start
+command	relish upgrade status
+command	relish wtf
+option	relish	--ca-cert	<CA_CERT>	
+option	relish	--endpoint	<ENDPOINT>	
+option	relish	--output	<OUTPUT>	human,json,yaml
+option	relish	--token	<TOKEN>	
+option	relish apply	--dry-run		
+option	relish apply	--rerun-jobs		
+option	relish apply	-f,--file	<PATH_OR_URL>	
+option	relish batch-status	--timeout	<TIMEOUT>	
+option	relish batch-status	--wait		
+option	relish bench	--capacity		
+option	relish bench	--compare	<COMPARE>	
+option	relish bench	--disruptive		
+option	relish bench	--quick		
+option	relish bench	--yes		
+option	relish build	--registry-port	<REGISTRY_PORT>	
+option	relish build	--timeout	<TIMEOUT>	
+option	relish ca backup	--cluster-name	<CLUSTER_NAME>	
+option	relish ca backup	--dir	<DIR>	
+option	relish ca backup	--out	<OUT>	
+option	relish ca backup	--output	<OUTPUT>	
+option	relish ca backup	--passphrase-file	<PASSPHRASE_FILE>	
+option	relish ca backup	--recipient	<RECIPIENT>	
+option	relish ca backup	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish ca backup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish ca backup	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca backup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish ca backup	Print help (see more with	'--help')	
+option	relish ca backup	Read the passphrase from the first line of this file instead of	asking	
+option	relish ca backup	Seal to this age public key (`age1...`) instead of a	passphrase	
+option	relish ca backup	The cluster name,when the directory holds more than	one	
+option	relish ca backup	The directory `relish init` wrote to [default:	/etc/reliaburger]	
+option	relish ca backup	Where to write the sealed backup (created	owner-only)	
+option	relish ca rotate	--finalize		
+option	relish ca rotate	--identity	<IDENTITY>	
+option	relish ca rotate	--output	<OUTPUT>	
+option	relish ca rotate	--passphrase-file	<PASSPHRASE_FILE>	
+option	relish ca rotate	--role	<ROLE>	
+option	relish ca rotate	--root-backup	<ROOT_BACKUP>	
+option	relish ca rotate	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish ca rotate	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish ca rotate	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca rotate	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish ca rotate	Print help (see more with	'--help')	
+option	relish ca rotate	Read the backup's passphrase from the first line of this file instead of	asking	
+option	relish ca rotate	Retire the old CA instead of starting a	rotation	
+option	relish ca rotate	The intermediate to rotate [possible values: node,workload,ingress]		node,workload,ingress
+option	relish ca rotate	The sealed root backup `relish ca backup`	wrote	
+option	relish ca rotate	Your age identity file,for a backup sealed with	`--recipient`	
+option	relish ca verify	--fingerprint	<FINGERPRINT>	
+option	relish ca verify	--identity	<IDENTITY>	
+option	relish ca verify	--output	<OUTPUT>	
+option	relish ca verify	--passphrase-file	<PASSPHRASE_FILE>	
+option	relish ca verify	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish ca verify	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish ca verify	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca verify	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish ca verify	Print help (see more with	'--help')	
+option	relish ca verify	Read the passphrase from the first line of this file instead of	asking	
+option	relish ca verify	The cluster's root CA fingerprint	(`sha256:...`)	
+option	relish ca verify	Your age identity file,for a backup sealed with	`--recipient`	
+option	relish council re-enrol	--data-dir	<DATA_DIR>	
+option	relish council re-enrol	--force		
+option	relish council recover	--data-dir	<DATA_DIR>	
+option	relish council recover	--force		
+option	relish council recover	--from	<FROM>	
+option	relish council recover	--master-key	<MASTER_KEY>	
+option	relish dashboard	--no-open		
+option	relish dashboard	--port	<PORT>	
+option	relish decommission-node	--reason	<REASON>	
+option	relish decommission-node	--workloads-stopped		
+option	relish delete	--namespace	<NAMESPACE>	
+option	relish deploy	--dry-run		
+option	relish dev countersign-binary	--external-key	<EXTERNAL_KEY>	
+option	relish dev countersign-binary	--out	<OUT>	
+option	relish dev countersign-binary	--sig	<SIG>	
+option	relish dev create	--bun	<BUN>	
+option	relish dev create	--cpus	<CPUS>	
+option	relish dev create	--memory	<MEMORY>	
+option	relish dev create	--nodes	<NODES>	
+option	relish dev create	--relish	<RELISH>	
+option	relish dev create	--runtime	<RUNTIME>	runc,process
+option	relish dev keygen	--out	<OUT>	
+option	relish dev sign-binary	--external-key	<EXTERNAL_KEY>	
+option	relish dev sign-binary	--key	<KEY>	
+option	relish dev sign-binary	--out	<OUT>	
+option	relish dev test	--recreate		
+option	relish exec	--namespace	<NAMESPACE>	
+option	relish export	-f,--file	<FILE>	
+option	relish fault bandwidth	--acknowledge		
+option	relish fault bandwidth	--duration	<DURATION>	
+option	relish fault bandwidth	--instance	<INSTANCE>	
+option	relish fault bandwidth	--namespace	<NAMESPACE>	
+option	relish fault bandwidth	--node	<NODE>	
+option	relish fault bandwidth	--override-safety		
+option	relish fault bandwidth	--reason	<REASON>	
+option	relish fault clear	--acknowledge		
+option	relish fault clear	--namespace	<NAMESPACE>	
+option	relish fault clear	--node	<NODE>	
+option	relish fault cpu	--acknowledge		
+option	relish fault cpu	--cores	<CORES>	
+option	relish fault cpu	--duration	<DURATION>	
+option	relish fault cpu	--instance	<INSTANCE>	
+option	relish fault cpu	--namespace	<NAMESPACE>	
+option	relish fault cpu	--node	<NODE>	
+option	relish fault cpu	--override-safety		
+option	relish fault cpu	--reason	<REASON>	
+option	relish fault delay	--acknowledge		
+option	relish fault delay	--duration	<DURATION>	
+option	relish fault delay	--from	<FROM>	
+option	relish fault delay	--instance	<INSTANCE>	
+option	relish fault delay	--jitter	<JITTER>	
+option	relish fault delay	--namespace	<NAMESPACE>	
+option	relish fault delay	--node	<NODE>	
+option	relish fault delay	--override-safety		
+option	relish fault delay	--reason	<REASON>	
+option	relish fault disk-io	--acknowledge		
+option	relish fault disk-io	--duration	<DURATION>	
+option	relish fault disk-io	--instance	<INSTANCE>	
+option	relish fault disk-io	--namespace	<NAMESPACE>	
+option	relish fault disk-io	--node	<NODE>	
+option	relish fault disk-io	--override-safety		
+option	relish fault disk-io	--reason	<REASON>	
+option	relish fault disk-io	--write-only		
+option	relish fault dns	--acknowledge		
+option	relish fault dns	--duration	<DURATION>	
+option	relish fault dns	--instance	<INSTANCE>	
+option	relish fault dns	--namespace	<NAMESPACE>	
+option	relish fault dns	--node	<NODE>	
+option	relish fault dns	--override-safety		
+option	relish fault dns	--reason	<REASON>	
+option	relish fault drop	--acknowledge		
+option	relish fault drop	--duration	<DURATION>	
+option	relish fault drop	--instance	<INSTANCE>	
+option	relish fault drop	--namespace	<NAMESPACE>	
+option	relish fault drop	--node	<NODE>	
+option	relish fault drop	--override-safety		
+option	relish fault drop	--reason	<REASON>	
+option	relish fault kill	--acknowledge		
+option	relish fault kill	--count	<COUNT>	
+option	relish fault kill	--instance	<INSTANCE>	
+option	relish fault kill	--namespace	<NAMESPACE>	
+option	relish fault kill	--node	<NODE>	
+option	relish fault kill	--override-safety		
+option	relish fault kill	--reason	<REASON>	
+option	relish fault memory	--acknowledge		
+option	relish fault memory	--duration	<DURATION>	
+option	relish fault memory	--instance	<INSTANCE>	
+option	relish fault memory	--namespace	<NAMESPACE>	
+option	relish fault memory	--node	<NODE>	
+option	relish fault memory	--override-safety		
+option	relish fault memory	--reason	<REASON>	
+option	relish fault node-drain	--acknowledge		
+option	relish fault node-drain	--duration	<DURATION>	
+option	relish fault node-drain	--include-leader		
+option	relish fault node-drain	--override-safety		
+option	relish fault node-drain	--reason	<REASON>	
+option	relish fault node-kill	--acknowledge		
+option	relish fault node-kill	--containers		
+option	relish fault node-kill	--duration	<DURATION>	
+option	relish fault node-kill	--include-leader		
+option	relish fault node-kill	--override-safety		
+option	relish fault node-kill	--reason	<REASON>	
+option	relish fault node-pressure	--acknowledge		
+option	relish fault node-pressure	--cpu	<CPU>	
+option	relish fault node-pressure	--duration	<DURATION>	
+option	relish fault node-pressure	--include-leader		
+option	relish fault node-pressure	--memory	<MEMORY>	
+option	relish fault node-pressure	--override-safety		
+option	relish fault node-pressure	--reason	<REASON>	
+option	relish fault partition	--acknowledge		
+option	relish fault partition	--duration	<DURATION>	
+option	relish fault partition	--from	<FROM>	
+option	relish fault partition	--instance	<INSTANCE>	
+option	relish fault partition	--namespace	<NAMESPACE>	
+option	relish fault partition	--node	<NODE>	
+option	relish fault partition	--override-safety		
+option	relish fault partition	--reason	<REASON>	
+option	relish fault pause	--acknowledge		
+option	relish fault pause	--duration	<DURATION>	
+option	relish fault pause	--instance	<INSTANCE>	
+option	relish fault pause	--namespace	<NAMESPACE>	
+option	relish fault pause	--node	<NODE>	
+option	relish fault pause	--override-safety		
+option	relish fault pause	--reason	<REASON>	
+option	relish fault resume	--acknowledge		
+option	relish fault resume	--instance	<INSTANCE>	
+option	relish fault resume	--namespace	<NAMESPACE>	
+option	relish fault resume	--node	<NODE>	
+option	relish fault resume	--override-safety		
+option	relish fault resume	--reason	<REASON>	
+option	relish fault scenario	--acknowledge		
+option	relish fault scenario	--dry-run		
+option	relish fault scenario	--speed	<SPEED>	
+option	relish fmt	--check		
+option	relish history	--namespace	<NAMESPACE>	
+option	relish import	--strict		
+option	relish import	-f,--file	<FILES>	
+option	relish init	--cluster-name	<CLUSTER_NAME>	
+option	relish init	--development-plaintext		
+option	relish init	--node-id	<NODE_ID>	
+option	relish join	--ca-fingerprint	<CA_FINGERPRINT>	
+option	relish join	--identity-dir	<IDENTITY_DIR>	
+option	relish join	--node-id	<NODE_ID>	
+option	relish join	--output	<OUTPUT>	
+option	relish join	--token-file	<TOKEN_FILE>	
+option	relish join	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish join	Directory to write the received identity into. Defaults to `identity` in the current directory (matching `relish	init`)	
+option	relish join	Join token issued by `relish init` or `relish join-token	create`	
+option	relish join	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish join	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish join	Pin the cluster's root CA fingerprint (`sha256:...`). When set,a member offering a different root CA is	refused	
+option	relish join	Print	help	
+option	relish join	Read the join token from a private file instead of command-line	arguments	
+option	relish join	This node's identifier (the certificate's common	name)	
+option	relish join-token create	--node-id	<NODE_ID>	
+option	relish join-token create	--ttl	<TTL>	
+option	relish local	--name	<NAME>	
+option	relish local	--yes		
+option	relish logs	--grep	<GREP>	
+option	relish logs	--instance	<INSTANCE>	
+option	relish logs	--json-field	<JSON_FIELD>	
+option	relish logs	--namespace	<NAMESPACE>	
+option	relish logs	--since	<SINCE>	
+option	relish logs	--stream	<STREAM>	
+option	relish logs	--tail	<TAIL>	
+option	relish logs	--until	<UNTIL>	
+option	relish logs	-f,--follow		
+option	relish logs-export	--dest	<DEST>	
+option	relish logs-export	--node-id	<NODE_ID>	
+option	relish logs-export	--source	<SOURCE>	
+option	relish manual	--port	<PORT>	
+option	relish manual	--web		
+option	relish manual examples	--dir	<DIR>	
+option	relish metrics	--name	<NAME>	
+option	relish metrics	--namespace	<NAMESPACE>	
+option	relish metrics	--since	<SINCE>	
+option	relish path	--count	<COUNT>	
+option	relish path	--namespace	<NAMESPACE>	
+option	relish path	--port	<PORT>	
+option	relish path	--to	<TO>	
+option	relish path	--to-namespace	<TO_NAMESPACE>	
+option	relish rollback	--namespace	<NAMESPACE>	
+option	relish secret encrypt	--pubkey	<PUBKEY>	
+option	relish secret pubkey	--namespace	<NAMESPACE>	
+option	relish secret rotate	--finalize		
+option	relish secret rotate	--namespace	<NAMESPACE>	
+option	relish setup	--api-port	<API_PORT>	
+option	relish setup	--binary-dir	<BINARY_DIR>	
+option	relish setup	--development-binaries	<DEVELOPMENT_BINARIES>	
+option	relish setup	--dir	<DIR>	
+option	relish setup	--ingress-port	<INGRESS_PORT>	
+option	relish setup	--name	<NAME>	
+option	relish setup	--nodes	<NODES>	
+option	relish setup	--output	<OUTPUT>	
+option	relish setup	--quickstart		
+option	relish setup	--registry-port	<REGISTRY_PORT>	
+option	relish setup	--release-mirror	<RELEASE_MIRROR>	
+option	relish setup	--release-url	<RELEASE_URL>	
+option	relish setup	--timings		
+option	relish setup	--yes		
+option	relish setup	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish setup	Accept the default answer to every question	(non-interactive)	
+option	relish setup	Also print every setup step's timing (always saved as	timings.json)	
+option	relish setup	Boot a secure managed Linux cluster and verify a sample	container	
+option	relish setup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish setup	Directory to install the bun binary into (default:	~/.reliaburger/bin)	
+option	relish setup	Directory to write reliaburger.toml into [default:	.]	
+option	relish setup	HTTPS directory containing unchanged signed release candidate	assets	
+option	relish setup	Host port forwarded to the managed Pickle registry (default:	15050)	
+option	relish setup	Output format: human,json,or yaml [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish setup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish setup	Print	help	
+option	relish setup	Release metadata URL [default:	https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json]	
+option	relish setup	Use explicitly supplied Linux binaries for development before a release	exists	
+option	relish sign	--key	<KEY>	
+option	relish sign keygen	--out	<OUT>	
+option	relish snapshot create	--name	<NAME>	
+option	relish snapshot create	--volume	<VOLUME>	
+option	relish snapshot create	-n,--namespace	<NAMESPACE>	
+option	relish snapshot delete	--volume	<VOLUME>	
+option	relish snapshot delete	-n,--namespace	<NAMESPACE>	
+option	relish snapshot list	-n,--namespace	<NAMESPACE>	
+option	relish snapshot restore	--volume	<VOLUME>	
+option	relish snapshot restore	-n,--namespace	<NAMESPACE>	
+option	relish stop	--namespace	<NAMESPACE>	
+option	relish test	--chaos		
+option	relish test	--filter	<FILTER>	
+option	relish test	--namespace	<NAMESPACE>	
+option	relish test	--parallel	<PARALLEL>	
+option	relish test	--profile	<PROFILE>	
+option	relish test	--timeout	<TIMEOUT>	
+option	relish test	--yes		
+option	relish token create	--apps	<APPS>	
+option	relish token create	--inherit-permissions		
+option	relish token create	--name	<NAME>	
+option	relish token create	--namespaces	<NAMESPACES>	
+option	relish token create	--no-expiry		
+option	relish token create	--role	<ROLE>	
+option	relish token create	--ttl-days	<TTL_DAYS>	
+option	relish token rotate	--grace-hours	<GRACE_HOURS>	
+option	relish uninstall	--yes		
+option	relish upgrade check	--url	<URL>	
+option	relish upgrade plan	--cluster-size	<CLUSTER_SIZE>	
+option	relish upgrade plan	--parallel	<PARALLEL>	
+option	relish upgrade rollback	--node-address	<NODE_ADDRESSES>	
+option	relish upgrade start	--allow-downgrade		
+option	relish upgrade start	--binary	<BINARY>	
+option	relish upgrade start	--node-address	<NODE_ADDRESSES>	
+option	relish upgrade start	--parallel	<PARALLEL>	
+option	relish upgrade start	--registry	<REGISTRY>	
+option	relish upgrade start	--sig	<SIG>	
+option	relish upgrade start	--url	<URL>	
+option	relish wtf	--app	<APP>	
+option	relish wtf	--interval	<INTERVAL>	
+option	relish wtf	--watch		

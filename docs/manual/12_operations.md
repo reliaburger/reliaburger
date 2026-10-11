@@ -135,6 +135,13 @@ recorded:
 refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58. …
 ```
 
+The candidate gets 60 seconds to answer. It normally takes milliseconds, but
+on macOS the first run of a new executable waits while the system assesses
+it: about a second for a release `bun`, and longer while the host is starting
+other new programs. A candidate that doesn't answer in time is refused, and
+the message says how far it got, for example `compatibility query timed out
+after 60s (launched as pid 4242 after 2ms, no output, still running)`.
+
 From 0.2.0 the release metadata names each release's pair (`compatibility` in
 `metadata.json`), so relish can tell sooner. `relish upgrade check` reports a
 release with another pair as needing a fresh cluster instead of offering the

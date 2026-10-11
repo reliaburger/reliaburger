@@ -39,7 +39,15 @@ jobs:
         # serve a different manifest from the one CI imports.
         # The tour's build step downloads https://reliaburger.com/demo/burger.tar.gz,
         # packed here from the example directory for the same reason.
+        # Both come from the release install.sh installs, not from main: the
+        # person running the tour has that release, and main's examples may
+        # need features it doesn't have (tests/suite/website.rs checks this).
         run: |
+          tag=$(sed -n 's/.*RELIABURGER_VERSION:-\(v[0-9][0-9.]*\)}.*/\1/p' docs/website/install.sh)
+          test -n "$tag"
+          git fetch --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          rm -rf examples/demo/burger
+          git checkout "$tag" -- examples/kubernetes/podinfo.yaml examples/demo/burger
           mkdir -p docs/website/demo
           cp examples/kubernetes/podinfo.yaml docs/website/demo/podinfo.yaml
           tar -czf docs/website/demo/burger.tar.gz -C examples/demo burger
