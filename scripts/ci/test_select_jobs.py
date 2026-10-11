@@ -105,6 +105,10 @@ class SelectJobsTests(unittest.TestCase):
         self.assertEqual(self.repo.select(base_sha=self.main),
                          {"code": False, "gossip": False, "heavy": False, "task_arrays": False})
 
+    def test_the_website_counts_as_code_because_its_tests_read_it(self):
+        self.pull_request("docs/website/assets/tour.cast")
+        self.assertTrue(self.repo.select(base_sha=self.main)["code"])
+
     def test_the_manual_counts_as_code_because_relish_compiles_it_in(self):
         self.pull_request("docs/manual/intro.md")
         self.assertTrue(self.repo.select(base_sha=self.main)["code"])
