@@ -630,6 +630,8 @@ def evaluate(evidence, snapshot):
             findings += restart_findings(state, node, inventory, restart_expectations(evidence, node), now)
             findings += resource_trend_findings(state, node, inventory, now)
             findings += clock_findings(state, node, inventory, fault_window)
+            if jobs_enabled:
+                job_metric_samples(state, node, inventory, now)
             owned=None
             if jobs_enabled:
                 text=read(snapshot,f"jobs-{node}.txt")
@@ -859,6 +861,63 @@ def resource_trend_findings(state, node, inventory, now):
     findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
     findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
     return findings
+
+
+def job_metric_samples(state, node, inventory, now):
+    """Accumulate Bun and executor-helper CPU for the M8 measurements.
+
+    Counters only grow within one process or cgroup, so a restart or a
+    retired helper starts a new baseline instead of counting backwards."""
+    metrics = state.setdefault("job_metrics", {}).setdefault(node, {"bun_cpu_seconds": 0.0, "executor_cpu_seconds": 0.0})
+    pid = inventory_number(inventory, "bun_pid")
+    ticks = inventory_number(inventory, "bun_cpu_ticks")
+    hertz = inventory_number(inventory, "clk_tck")
+    mark = metrics.get("bun_mark")
+    if ticks is not None and hertz:
+        if mark and mark[0] == pid and ticks >= mark[1]:
+            metrics["bun_cpu_seconds"] += (ticks - mark[1]) / hertz
+            metrics["bun_wall_seconds"] = metrics.get("bun_wall_seconds", 0) + now - mark[2]
+        metrics["bun_mark"] = [pid, ticks, now]
+    helpers = {}
+    for line in inventory.get("executor_cpu", []):
+        group, _, usec = line.rpartition(" ")
+        if group and usec.isdigit():
+            helpers[group] = int(usec)
+    if "executor_mark" in metrics:
+        previous, since = metrics["executor_mark"]
+        for group, usec in helpers.items():
+            if group in previous and usec >= previous[group]:
+                metrics["executor_cpu_seconds"] += (usec - previous[group]) / 1e6
+        metrics["executor_wall_seconds"] = metrics.get("executor_wall_seconds", 0) + now - since
+    metrics["executor_mark"] = [helpers, now]
+
+
+def job_host_metrics(state, accepted):
+    """M8 measurements the guests' inventories give, recorded and never gated."""
+    trends = state.get("trends", {})
+    per_node = {}
+    for node, metrics in sorted(state.get("job_metrics", {}).items()):
+        rss = trends.get(node, {}).get("rss_kb", {})
+        logs = trends.get(node, {}).get("disk_kb logs", {})
+        ledger = state.get("job_resources", {}).get(node, {}).get("peak_storage_kb", {}).get("task-arrays")
+        per_node[node] = dict(
+            bun_rss_growth_mib=(rss["max"] - rss["first"]) / 1024 if rss else None,
+            bun_cpu_cores=metrics["bun_cpu_seconds"] / metrics["bun_wall_seconds"] if metrics.get("bun_wall_seconds") else None,
+            executor_helper_cpu_cores=metrics["executor_cpu_seconds"] / metrics["executor_wall_seconds"] if metrics.get("executor_wall_seconds") else None,
+            retained_log_mb=logs.get("max", 0) * 1024 / 1e6 if logs else None,
+            peak_task_array_storage_mib=ledger / 1024 if ledger is not None else None)
+    def worst(key):
+        values = [row[key] for row in per_node.values() if row[key] is not None]
+        return max(values) if values else None
+    logs = [row["retained_log_mb"] for row in per_node.values() if row["retained_log_mb"] is not None]
+    ledgers = [row["peak_task_array_storage_mib"] for row in per_node.values() if row["peak_task_array_storage_mib"] is not None]
+    return dict(per_node=per_node,
+                # The leader moves during the soak: the worst Bun bounds it.
+                leader_rss_growth_mib=worst("bun_rss_growth_mib"),
+                leader_cpu_cores=worst("bun_cpu_cores"),
+                executor_overhead_cores_per_node=worst("executor_helper_cpu_cores"),
+                retained_log_mb=sum(logs) if logs else None,
+                node_ledger_mib_per_million_tasks=(sum(ledgers) / accepted * 1e6) if ledgers and accepted else None)
 
 
 def record_baseline(evidence, snapshot):
@@ -1111,7 +1170,8 @@ def render(evidence, record):
         need = max(0, int(elapsed // reload_period) - 1)
         gates.append(("operator ingress reloads (all nodes)", str(reloads), f"≥ {need}", "PASS" if reloads >= need else "FAIL"))
     job_report=read_json(evidence,"jobs/snapshot.json")
-    job_missing=job_soak.coverage_failures(job_report,state.get("nodes",[])) if metadata.get("job_soak") is True else []
+    fault_kinds=job_soak.FAULT_KINDS+(job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())
+    job_missing=job_soak.coverage_failures(job_report,state.get("nodes",[]),fault_kinds) if metadata.get("job_soak") is True else []
     if metadata.get("job_soak") is True:
         if job_report and (type(job_report.get("stop_requested_at")) is not int or job_report["stop_requested_at"] < metadata.get("job_stop_at",0)):
             job_missing.append("job campaign requested drain before the final two-minute interval")
@@ -1188,6 +1248,13 @@ def render(evidence, record):
         for node, sample in state.get("job_resources",{}).items():
             lines.append(f"- {node}: latest complete job storage (KiB) {sample.get('storage_kb')}; free {sample.get('available_kb')} KiB; live/peak owners {sample.get('live_owners')}/{sample.get('peak_owners')}; peak storage {sample.get('peak_storage_kb')}")
         lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 24-hour qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
+        qualification = job_qualification(job_report, state, metadata, elapsed)
+        lines += job_qualification_lines(qualification)
+        evidence_json = record.with_name(record.stem + ".jobs.json")
+        if evidence_json.exists():
+            raise SystemExit(f"{evidence_json} already exists")
+        record.parent.mkdir(parents=True, exist_ok=True)
+        evidence_json.write_text(json.dumps(qualification, indent=1, sort_keys=True) + "\n")
     lines += ["## Data", "",
               f"- Volume writer: highest ACK {state.get('writer-ack', 'none')} in the log view; "
               "the writer file checks (writer-lost, writer-regression) decide data loss, "
@@ -1232,6 +1299,53 @@ def render(evidence, record):
     record.parent.mkdir(parents=True, exist_ok=True)
     record.write_text("\n".join(lines) + "\n")
     return 0 if result == "PASS" else 1
+
+
+def job_qualification(job_report, state, metadata, elapsed):
+    """The job qualification report written beside the record (D18-C)."""
+    report = job_soak.report(job_report)
+    accepted = sum((report.get("accepted_successes") or {}).values())
+    report["m8"] = dict(report.get("m8") or {}, **job_host_metrics(state, accepted))
+    report["gate"] = dict(
+        decision="D18-C",
+        nodes=len(state.get("nodes", [])),
+        soak_seconds=elapsed,
+        tier=metadata.get("tier"),
+        schedule=metadata.get("schedule"),
+        node_faults=metadata.get("node_faults") is True,
+        fault_kinds=list(job_soak.FAULT_KINDS + (job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())))
+    return report
+
+
+def job_qualification_lines(report):
+    """The record's table of the job gate and the recorded M8 measurements."""
+    m8 = report.get("m8", {})
+    def show(value, unit=""):
+        if value is None:
+            return "not measured"
+        return (f"{value:,.2f}" if isinstance(value, float) else f"{value:,}") + unit
+    wall = m8.get("million_task_array_wall_seconds") or {}
+    rate = report.get("accepted_successes_per_second") or 0
+    target = report.get("target_rate")
+    lines = ["## Job qualification (D18-C)", "",
+             f"Load: {report.get('load')}; {report.get('gate', {}).get('nodes', 0)} nodes; "
+             f"accepted {rate:,.1f}/s" + (f" against a {target}/s target: {'PASS' if report.get('target_met') else 'FAIL'}" if target else " (calibration load: not gated)") + ".", "",
+             "| Measure (recorded, not gated) | Observed | September plan target |", "|---|---|---|",
+             f"| Wall time of a 1,048,576-task array (median / max of {wall.get('runs', 0)}) | {show(wall.get('median'), ' s')} / {show(wall.get('max'), ' s')} | ≤ 600 s |",
+             f"| p99 start lag, pooled executors | {show(m8.get('p99_start_lag_ms'), ' ms')} (bucket upper bound) | < 1,000 ms |",
+             f"| Raft entries per second, all writes | {show(m8.get('raft_entries_per_second'))} | ≤ 3 per second of batch, plus 1 |",
+             f"| Raft state of one run, largest seen | {show(m8.get('raft_state_bytes_max'), ' B')} | ≤ 256 KiB per 1M tasks |",
+             f"| Bun RSS growth, worst node | {show(m8.get('leader_rss_growth_mib'), ' MiB')} | ≤ 64 MiB (leader) |",
+             f"| Bun CPU, busiest node | {show(m8.get('leader_cpu_cores'), ' cores')} | ≤ 1 core (leader batch control) |",
+             f"| Executor helper CPU, busiest node | {show(m8.get('executor_overhead_cores_per_node'), ' cores')} | ≤ 0.5 core |",
+             f"| Node task-array storage per 1M accepted tasks (peaks summed) | {show(m8.get('node_ledger_mib_per_million_tasks'), ' MiB')} | ≤ 16 MiB, deleted after retirement |",
+             f"| Retained log volume, all nodes | {show(m8.get('retained_log_mb'), ' MB')} | ≤ 50 MB |", ""]
+    causes = report.get("retry_causes") or {}
+    for mode in job_soak.MODES:
+        if causes.get(mode):
+            lines.append(f"- {mode} retry causes: " + ", ".join(f"{key} {value}" for key, value in causes[mode].items()))
+    lines += [f"- Audited executions: {report.get('audited_attempts', 0)}; operator replay decisions: {report.get('operator_replay_decisions', 0)}", ""]
+    return lines
 
 
 # --- command line ------------------------------------------------------------

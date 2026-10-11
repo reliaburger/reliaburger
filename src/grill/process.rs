@@ -282,14 +282,43 @@ fn observe_child_exit(entry: &mut ProcessEntry) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Signal the group while the unreaped Child still owns its process identifier.
-fn signal_child_group(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
+/// Signal an owned child's process group after `observe_child_exit` saw it
+/// still running.
+///
+/// The child is unreaped, so its process identifier (and the group named
+/// after it) can't be recycled while we hold it. A child that exits after
+/// the exit check is a zombie by the time the signal goes out. Linux
+/// delivers the group signal (or answers ESRCH) either way. macOS answers
+/// EPERM instead, because XNU skips zombies and exiting processes and
+/// reports EPERM when no member of the group accepted the signal (#723).
+/// On macOS an EPERM therefore checks the child again: if it has exited,
+/// its exit is recorded and there is nothing left to signal. If it hasn't,
+/// the child itself is signalled directly, which succeeds while it runs
+/// or exits, so only a genuine permission refusal comes back as an error.
+fn signal_child_group(
+    entry: &mut ProcessEntry,
+    signal: nix::sys::signal::Signal,
+) -> std::io::Result<()> {
+    let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) else {
+        return Ok(());
+    };
     #[cfg(unix)]
-    let pid = nix::unistd::Pid::from_raw(-(pid as i32));
+    let group = nix::unistd::Pid::from_raw(-(pid as i32));
     #[cfg(not(unix))]
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
-    match nix::sys::signal::kill(pid, signal) {
+    let group = nix::unistd::Pid::from_raw(pid as i32);
+    match nix::sys::signal::kill(group, signal) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(nix::errno::Errno::EPERM) => {
+            observe_child_exit(entry)?;
+            if entry.state == ContainerState::Stopped {
+                return Ok(());
+            }
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -744,9 +773,11 @@ impl super::Grill for ProcessGrill {
         if entry.state == ContainerState::Stopped {
             return Ok(());
         }
-        if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
-            signal_child_group(pid, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
-            entry.state = ContainerState::Stopping;
+        if entry.child.as_ref().and_then(|child| child.id()).is_some() {
+            signal_child_group(entry, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
+            if entry.state != ContainerState::Stopped {
+                entry.state = ContainerState::Stopping;
+            }
         } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
                 .map_err(error)?
@@ -785,10 +816,11 @@ impl super::Grill for ProcessGrill {
         if entry.state == ContainerState::Stopped {
             return Ok(());
         }
+        signal_child_group(entry, nix::sys::signal::Signal::SIGKILL).map_err(error)?;
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
         if let Some(ref mut child) = entry.child {
-            if let Some(pid) = child.id() {
-                signal_child_group(pid, nix::sys::signal::Signal::SIGKILL).map_err(error)?;
-            }
             entry.state = ContainerState::Stopping;
             child.start_kill().map_err(error)?;
             let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
@@ -1298,6 +1330,44 @@ mod tests {
         }
     }
 
+    /// Wait until the child `pid` has exited, without reaping it.
+    ///
+    /// WNOWAIT observes the exit but leaves the zombie in place, preserving
+    /// the exact zombie-group state that macOS refuses to signal.
+    async fn wait_until_exited_unreaped(pid: u32) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+                // SAFETY: pid belongs to a child this test spawned; info points
+                // to correctly sized, initialised storage. WNOHANG bounds the
+                // call and WNOWAIT preserves ownership.
+                let result = unsafe {
+                    nix::libc::waitid(
+                        nix::libc::P_PID,
+                        pid as nix::libc::id_t,
+                        info.as_mut_ptr(),
+                        nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(
+                    result,
+                    0,
+                    "waitid failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: the POD buffer was zero-initialised and waitid
+                // succeeded; si_pid reads the process-event member.
+                let observed_pid = unsafe { info.assume_init().si_pid() };
+                if observed_pid == pid as nix::libc::pid_t {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn stop_and_kill_reap_already_exited_children_without_signalling_zombies() {
         for operation in ["stop", "kill"] {
@@ -1309,39 +1379,7 @@ mod tests {
                 grill.create(&id, &spec).await.unwrap();
                 grill.start(&id).await.unwrap();
                 let pid = grill.pid(&id).await.unwrap().unwrap();
-                // WNOWAIT observes exit without reaping the child, preserving
-                // the exact zombie-group state that macOS refuses to signal.
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
-                        // SAFETY: pid belongs to the child just spawned above;
-                        // info points to correctly sized, initialised storage.
-                        // WNOHANG bounds the call and WNOWAIT preserves ownership.
-                        let result = unsafe {
-                            nix::libc::waitid(
-                                nix::libc::P_PID,
-                                pid as nix::libc::id_t,
-                                info.as_mut_ptr(),
-                                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
-                            )
-                        };
-                        assert_eq!(
-                            result,
-                            0,
-                            "waitid failed: {}",
-                            std::io::Error::last_os_error()
-                        );
-                        // SAFETY: the POD buffer was zero-initialised and waitid
-                        // succeeded; si_pid reads the process-event member.
-                        let observed_pid = unsafe { info.assume_init().si_pid() };
-                        if observed_pid == pid as nix::libc::pid_t {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                wait_until_exited_unreaped(pid).await;
                 let result = if operation == "stop" {
                     grill.stop(&id).await
                 } else {
@@ -1351,6 +1389,44 @@ mod tests {
                     result.is_ok(),
                     "{operation} on exited child failed: {result:?}"
                 );
+                assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+                assert_eq!(grill.exit_code(&id).await.unwrap(), Some(exit));
+            }
+        }
+    }
+
+    /// `stop` and `kill` first look for an exit, then signal the group. A
+    /// child that exits between those two steps is an unreaped zombie when
+    /// the signal goes out, and macOS refuses a group of zombies with EPERM
+    /// rather than ESRCH (#723). That window can't be hit on demand through
+    /// `stop` or `kill`, so this drives their signalling step directly on a
+    /// zombie whose exit nobody has observed yet.
+    #[tokio::test]
+    async fn signalling_a_child_that_exited_after_the_exit_check_is_not_an_error() {
+        for signal in [
+            nix::sys::signal::Signal::SIGTERM,
+            nix::sys::signal::Signal::SIGKILL,
+        ] {
+            for exit in [0, 7] {
+                let grill = ProcessGrill::new();
+                let id = InstanceId(format!("raced-{signal}-{exit}"));
+                let spec =
+                    spec_with_args(vec!["/bin/sh".into(), "-c".into(), format!("exit {exit}")]);
+                grill.create(&id, &spec).await.unwrap();
+                grill.start(&id).await.unwrap();
+                let pid = grill.pid(&id).await.unwrap().unwrap();
+                wait_until_exited_unreaped(pid).await;
+
+                let result = {
+                    let mut procs = grill.processes.lock().await;
+                    signal_child_group(procs.get_mut(&id).unwrap(), signal)
+                };
+                assert!(
+                    result.is_ok(),
+                    "{signal} to an exited child failed: {result:?}"
+                );
+                // Whether the platform delivered the signal to the zombie or
+                // refused it, the next look reports the child's real exit.
                 assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
                 assert_eq!(grill.exit_code(&id).await.unwrap(), Some(exit));
             }

@@ -264,6 +264,17 @@ host processes kept running. No builds or tests ran during the rounds.
 | Shared containers | 966.7/s | 1,667/s (1,233–2,333) | 2,483/s (2,317–2,700) |
 | Fresh containers | 3.55/s | 10.7/s (10.5–10.7) | 10.8/s (10.4–10.9) |
 
+All forty reports are committed: [`five-round-rerun/pr-654`](five-round-rerun/pr-654/)
+for #654 as submitted (Bun `f90e7cd0…`, relish `cad90260…`, recorded in its
+`binaries.txt`) and [`five-round-rerun/review-fixes`](five-round-rerun/review-fixes/)
+for the final head, each with the `progress.log` of its rounds.
+[`scripts/release/job_bench_rounds.sh`](../../../scripts/release/job_bench_rounds.sh)
+reproduces a session on a disposable VM: a fresh single-node cluster, the same
+application, then the rotating rounds. Each report is a baseline for
+`relish bench --scenario S --compare FILE` on the same rig. This table came
+from builds before the release candidate; the candidate re-records it with the
+same script before the throughput claims ship.
+
 No round had a terminal failure or an accepted retry. On this rig, raw and host
 rates came out 14–23% below the recording, and the container paths 1.7 to 3
 times above it. A newer runc is one plausible reason for the container gap; this

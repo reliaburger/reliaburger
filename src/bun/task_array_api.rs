@@ -575,6 +575,7 @@ pub fn array_summary(
         "failed": summary.failed,
         "not_run": summary.not_run,
         "retried": summary.retried,
+        "retry_causes": summary.retry_causes,
         "queued": summary.queued,
         "held": summary.held,
         "active_commands": active,
@@ -667,6 +668,7 @@ pub async fn manifest_summary(
     let mut failed = 0;
     let mut not_run = 0;
     let mut retried = 0;
+    let mut retry_causes = crate::meat::task_array_state::RetryCauses::default();
     let mut queued = 0;
     let mut held = 0;
     let mut done = true;
@@ -687,6 +689,7 @@ pub async fn manifest_summary(
             failed += s.failed;
             not_run += s.not_run;
             retried += s.retried;
+            retry_causes.add(&s.retry_causes);
             queued += s.queued;
             held += s.held;
             done &= s.status.is_terminal();
@@ -735,9 +738,19 @@ pub async fn manifest_summary(
         epoch_now_secs()
     };
     let elapsed = end.saturating_sub(manifest.submitted_at_epoch_secs);
-    serde_json::json!({ "batch_id":batch_id,"kind":"manifest","name":manifest.name,"namespace":manifest.namespace,"total":total,"succeeded":succeeded,"failed":failed,"not_run":not_run,"retried":retried,"queued":queued,"held":held,"done":done,
+    serde_json::json!({ "batch_id":batch_id,"kind":"manifest","name":manifest.name,"namespace":manifest.namespace,"total":total,"succeeded":succeeded,"failed":failed,"not_run":not_run,"retried":retried,"retry_causes":retry_causes,"queued":queued,"held":held,"done":done,
         "status":if unknown && !done {"Unknown"} else if stopping {"Stopping"} else if !done {"Running"} else if stopped_failed {"Failed"} else if not_run>0 {"Cancelled"} else if failed>0 {"CompletedWithFailures"} else {"Succeeded"},
         "active_commands":active,"other_in_flight_attempts":other,"elapsed_seconds":elapsed,"whole_run_successes_per_second":(elapsed>0).then(||succeeded as f64/elapsed as f64),"activity_semantics":"last_node_sync_verified_start_to_positive_cleanup","cohorts":cohorts,"duration_final_attempt_ms":{"bounds":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null],"counts":durations},"rates":service.rates(batch_id,(succeeded,failed)).await,"details_retention_seconds":crate::meat::task_array_store::TERMINAL_RETENTION_SECS,"execution_semantics":if manifest.common_jobs {"acknowledged_unknown_replay"} else {"at_least_once"} })
+}
+
+/// Bytes of replicated Raft state a run's chunk bookkeeping occupies, as the
+/// JSON the council stores. Serialising costs time, so only a single run's
+/// summary reports it, never the list of every run.
+pub fn state_bytes<'a>(records: impl IntoIterator<Item = &'a TaskArrayRecord>) -> Option<usize> {
+    records.into_iter().try_fold(0usize, |total, record| {
+        let bytes = serde_json::to_vec(&record.state).ok()?.len();
+        total.checked_add(bytes)
+    })
 }
 
 /// `POST /v1/batch/array/sync`: the leader's once-a-second call.
@@ -1343,6 +1356,7 @@ mod tests {
                         failed_indices: IndexRangeSet::new(),
                         not_run: 0,
                         retried: 0,
+                        retry_causes: Default::default(),
                         duration_counts: [0; 16],
                     },
                 )
@@ -1470,6 +1484,7 @@ mod tests {
                     failed_indices,
                     not_run: 0,
                     retried: 0,
+                    retry_causes: Default::default(),
                 },
             )
             .unwrap();
@@ -1556,6 +1571,7 @@ mod tests {
                         failed_indices: IndexRangeSet::new(),
                         not_run: 0,
                         retried: 0,
+                        retry_causes: Default::default(),
                     },
                 )
                 .unwrap();
@@ -1664,6 +1680,61 @@ mod tests {
         assert_eq!(
             summary["failed_indices"],
             serde_json::json!([[2, 3], [7, 7]])
+        );
+    }
+
+    #[test]
+    fn state_bytes_counts_the_replicated_json_of_every_cohort() {
+        let record = record_with_failures(&[2, 3, 7]);
+        let one = serde_json::to_vec(&record.state).unwrap().len();
+        assert_eq!(state_bytes([&record]), Some(one));
+        assert_eq!(state_bytes([&record, &record]), Some(2 * one));
+        assert_eq!(state_bytes([]), Some(0));
+    }
+
+    #[test]
+    fn an_array_summary_reports_retry_causes_beside_the_retry_count() {
+        use crate::meat::task_array::ChunkId;
+        use crate::meat::task_array_state::ChunkResult;
+        let mut state = TaskArrayState::new(TaskArraySpec::with_count(4), 0).unwrap();
+        let node = NodeId::new("worker");
+        state
+            .grant(&node, &IndexRangeSet::from_range(0..=0))
+            .unwrap();
+        let causes = crate::meat::task_array_state::RetryCauses {
+            exit_code: 1,
+            signal: 2,
+            ..Default::default()
+        };
+        state
+            .complete(
+                &node,
+                &ChunkResult {
+                    chunk: ChunkId(0),
+                    attempt: 1,
+                    succeeded: 4,
+                    failed_count: 0,
+                    failed_indices: IndexRangeSet::new(),
+                    not_run: 0,
+                    retried: 3,
+                    retry_causes: causes,
+                    duration_counts: [0; 16],
+                },
+            )
+            .unwrap();
+        let record = TaskArrayRecord {
+            name: "causes".into(),
+            namespace: "default".into(),
+            template: template(),
+            state,
+            terminal_at_epoch_secs: Some(1),
+            quota_blocked: None,
+        };
+        let summary = array_summary(9, &record, &[]);
+        assert_eq!(summary["retried"], 3);
+        assert_eq!(
+            summary["retry_causes"],
+            serde_json::json!({"exit_code":1,"signal":2,"timeout":0,"unknown":0,"unrecorded":0})
         );
     }
 }

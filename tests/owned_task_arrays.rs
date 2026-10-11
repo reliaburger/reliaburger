@@ -8,6 +8,9 @@ use reliaburger::grill::{ContainerState, Grill, ImageStore};
 use std::path::Path;
 use std::time::Duration;
 
+#[path = "support/cluster.rs"]
+mod cluster_support;
+
 /// Retired, and then forgotten once that retirement is proven (#678).
 async fn assert_retired(runtime: &impl Grill, id: &reliaburger::grill::InstanceId) {
     match runtime.state(id).await {
@@ -2019,6 +2022,24 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
     .await;
 }
 
+/// The pid of the one-slot runner's live executor helper, once it has one.
+async fn running_helper(runtime: &reliaburger::grill::ProcessGrill) -> nix::unistd::Pid {
+    use reliaburger::grill::Grill;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let inventory = runtime.launch_inventory().await.unwrap().unwrap();
+            if let [launch] = inventory.as_slice()
+                && let Some(pid) = runtime.pid(&launch.instance_id).await.unwrap()
+            {
+                return nix::unistd::Pid::from_raw(pid as i32);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the executor helper")
+}
+
 /// Output still buffered in an enlarged pipe at exit must all arrive; output
 /// that never stops after exit is cut off with a visible marker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2026,7 +2047,6 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
 async fn cgroup_host_executor_drains_output_buffered_at_exit() {
     use nix::sys::signal::{Signal, kill};
     use reliaburger::bun::task_executor::TaskRunner;
-    use reliaburger::grill::Grill;
     let root = tempfile::Builder::new()
         .prefix("rb-native-drain-")
         .tempdir()
@@ -2041,13 +2061,12 @@ async fn cgroup_host_executor_drains_output_buffered_at_exit() {
         )
         .await;
     assert!(warm.outcome.succeeded(), "{warm:?}");
-    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
-        .instance_id
-        .clone();
-    let helper = nix::unistd::Pid::from_raw(runtime.pid(&id).await.unwrap().unwrap() as i32);
     // Stop the helper while the command fills a 1 MiB pipe (F_SETPIPE_SZ is
     // 1031) and exits, so all 500,000 bytes are still buffered when the
     // helper sees the exit. Running, it would drain them as they arrive.
+    // Look the helper up only once the command holds its slot: the pool
+    // retires an executor idle for a second, and on a loaded host the warm
+    // one can go before the command starts, leaving a stale pid (#715).
     let python = shell_task(
         &template,
         1,
@@ -2056,6 +2075,7 @@ async fn cgroup_host_executor_drains_output_buffered_at_exit() {
     let buffered = runner.run(&python, Duration::from_secs(10), &cancel);
     let pause = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
+        let helper = running_helper(&runtime).await;
         kill(helper, Signal::SIGSTOP).unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         kill(helper, Signal::SIGCONT).unwrap();
@@ -2620,4 +2640,335 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     })
     .await
     .expect("the stopped array never finished");
+}
+
+/// Each task fails its first attempt when its index ends in 07, so the
+/// accepted retry count is exact and every retry has a known cause.
+const LEADER_LOSS_SCRIPT: &str = "sleep 0.05; [ \"$RELIABURGER_TASK_ATTEMPT\" -gt 1 ] || [ $((RELIABURGER_TASK_INDEX % 100)) -ne 7 ]";
+const LEADER_LOSS_TASKS: u64 = 3000;
+
+/// Three in-process nodes with the same gossip, Raft, HTTP API and leader
+/// loop as `bun --cluster`, each with its own real executor (distinct
+/// executor identities over one host runtime). The leader is a worker too;
+/// once it is running its own share, its control plane stops without a
+/// handover while its executor keeps running. Those commands may finish,
+/// but no report of theirs can ever be accepted: the new leader must take
+/// back exactly the chunks it held and count every task once.
+async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
+    use reliaburger::bun::task_array_leader::TaskArrayService;
+    use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
+    use reliaburger::bun::task_ledger::GroupCommit;
+    use reliaburger::bun::task_runtime::OwnedRunner;
+    use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
+    use reliaburger::grill::AnyGrill;
+    use reliaburger::meat::task_array::ChunkId;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-leader-loss-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("leader-loss fixture: {}", root.display());
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = AnyGrill::with_host_processes(
+        RuncGrill::new(
+            root.join("bundles"),
+            images,
+            false,
+            root.join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap(),
+        &root.join("instances"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    );
+    let mut template = template;
+    if template["runtime"] != "process" {
+        template["image"] = json!(image);
+    }
+
+    let shutdown = CancellationToken::new();
+    let mut nodes = Vec::new();
+    for index in 0..3usize {
+        let data = root.join(format!("node-{index}"));
+        std::fs::create_dir_all(&data).unwrap();
+        let runner = OwnedRunner::for_data_dir(runtime.clone(), &data).unwrap();
+        let executor = TaskArrayNode::new(
+            TaskArrayNodeConfig {
+                root: data.join("task-arrays"),
+                policy: ProcessWorkloadsConfig {
+                    allowed_binaries: vec!["/bin/sh".into()],
+                    mount_isolation: false,
+                    ..Default::default()
+                },
+                default_concurrency: 4,
+                backoff: (Duration::from_millis(1), Duration::from_millis(5)),
+                group_commit: GroupCommit::default(),
+            },
+            NodeRunner::Owned(Box::new(runner)),
+        );
+        nodes.push(
+            cluster_support::start_wired_node(cluster_support::WiredNodeOptions {
+                name: format!("loss{index}"),
+                gossip_port: base_port + index as u16 * 10,
+                seeds: if index == 0 {
+                    vec![]
+                } else {
+                    vec![cluster_support::local(base_port)]
+                },
+                shutdown: shutdown.child_token(),
+                data_dir_prefix: "rb-leader-loss",
+                stale_report_timeout_secs: 10,
+                metrics_rollup: None,
+                scheduler: None,
+                lease_reaper: false,
+                membership: cluster_support::MembershipSource::Gossip,
+                service_identity: Some("leader-loss-service".into()),
+                operator_token: None,
+                fault_injection: false,
+                labels: Default::default(),
+                keep_data_dir: false,
+                task_arrays: Some(Arc::new(TaskArrayService::with_timings(
+                    Some(Arc::new(executor)),
+                    Duration::from_millis(200),
+                    Duration::from_secs(3),
+                ))),
+            })
+            .await,
+        );
+    }
+    let deadline = |seconds| tokio::time::Instant::now() + Duration::from_secs(seconds);
+    let until = deadline(60);
+    loop {
+        let mut ready = true;
+        for node in &nodes {
+            ready &= node.membership_table.read().await.len() == 3
+                && node
+                    .metrics_rx
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .count()
+                    == 3;
+        }
+        if ready {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "three voters never formed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut leader = None;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.council.is_leader().await {
+            leader = Some(index);
+        }
+    }
+    let leader = leader.expect("a leader");
+    let survivors = [(leader + 1) % 3, (leader + 2) % 3];
+    let http = reqwest::Client::new();
+    let status = async |node: &cluster_support::WiredNode, id: u64| -> Option<Value> {
+        http.get(format!("http://127.0.0.1:{}/v1/batch/{id}", node.api_port))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()
+    };
+    let answer: Value = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/batch/array",
+            nodes[survivors[0]].api_port
+        ))
+        .json(&json!({
+            "name": "leader-loss",
+            "template": template,
+            "spec": { "count": LEADER_LOSS_TASKS, "chunk_size": 20, "per_node_concurrency": 4 },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let batch_id = answer["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{answer}"));
+
+    let leader_name = format!("loss{leader}");
+    let until = deadline(180);
+    loop {
+        let running = status(&nodes[leader], batch_id)
+            .await
+            .is_some_and(|summary| {
+                summary["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|row| {
+                        row["node"] == leader_name.as_str()
+                            && row["counters"]["succeeded"].as_u64().unwrap_or(0) > 0
+                    })
+            });
+        if running {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the leader never ran its share"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    nodes[leader].shutdown.cancel();
+
+    let until = deadline(30);
+    let new_leader = loop {
+        let mut found = None;
+        for index in survivors {
+            if nodes[index].council.is_leader().await {
+                found = Some(index);
+            }
+        }
+        if let Some(index) = found {
+            break index;
+        }
+        assert!(tokio::time::Instant::now() < until, "no new leader");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    let held_at_loss = nodes[new_leader]
+        .council
+        .desired_state()
+        .await
+        .task_arrays
+        .get(batch_id)
+        .and_then(|record| record.state.held_by(&lost).cloned())
+        .unwrap_or_default();
+
+    let until = deadline(300);
+    let last = loop {
+        if let Some(summary) = status(&nodes[new_leader], batch_id).await
+            && summary["done"] == true
+        {
+            break summary;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the array never finished under the new leader"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let flaky = LEADER_LOSS_TASKS / 100;
+    assert_eq!(last["status"], "Succeeded", "{last}");
+    assert_eq!(last["succeeded"], LEADER_LOSS_TASKS, "{last}");
+    assert_eq!(last["failed"], 0, "{last}");
+    assert_eq!(last["not_run"], 0, "{last}");
+    assert_eq!(last["retried"], flaky, "{last}");
+    assert_eq!(last["retry_causes"]["exit_code"], flaky, "{last}");
+
+    let record = nodes[new_leader]
+        .council
+        .desired_state()
+        .await
+        .task_arrays
+        .get(batch_id)
+        .unwrap()
+        .clone();
+    let chunks = record.state.spec.chunk_count();
+    let mut replayed = 0u64;
+    for chunk in 0..chunks {
+        let grant = record
+            .state
+            .accepted_grant(ChunkId(chunk))
+            .expect("every chunk has one accepted grant");
+        let attempt = grant.attempt;
+        // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
+        assert_ne!(
+            grant.owner,
+            Some(lost.clone()),
+            "chunk {chunk} was accepted from the lost leader"
+        );
+        if attempt > 1 {
+            replayed += 1;
+            assert!(
+                held_at_loss.contains(chunk),
+                "chunk {chunk} replayed at attempt {attempt} but the lost leader didn't hold it"
+            );
+        }
+    }
+    assert!(replayed <= held_at_loss.len());
+    eprintln!(
+        "leader loss with {}: {} chunks held at loss, {replayed} replayed",
+        template["runtime"],
+        held_at_loss.len()
+    );
+    shutdown.cancel();
+    // Idle executors retire on their own; leave no runtime owner behind.
+    let until = deadline(120);
+    loop {
+        let mut running = 0;
+        for launch in runtime
+            .launch_inventory()
+            .await
+            .unwrap()
+            .unwrap_or_default()
+        {
+            if runtime.state(&launch.instance_id).await.ok() == Some(ContainerState::Running) {
+                running += 1;
+            }
+        }
+        if running == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "{running} executors still running"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The leader loses its control plane while shared-runc chunks run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root, runc, cgroup v2 and the pinned test image; run with make test-linux"]
+async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors() {
+    leader_loss_mid_array(
+        serde_json::json!({
+            "runtime": "shared-runc",
+            "command": ["/bin/sh", "-c", LEADER_LOSS_SCRIPT],
+            "cpu": "100m",
+            "memory": "32Mi",
+        }),
+        24510,
+    )
+    .await;
+}
+
+/// The leader loses its control plane while native host chunks run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root, runc, cgroup v2 and the pinned test image; run with make test-linux"]
+async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors() {
+    leader_loss_mid_array(
+        serde_json::json!({
+            "runtime": "process",
+            "exec": "/bin/sh",
+            "command": ["-c", LEADER_LOSS_SCRIPT],
+            "cpu": "100m",
+            "memory": "32Mi",
+        }),
+        24610,
+    )
+    .await;
 }

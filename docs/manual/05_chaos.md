@@ -24,6 +24,17 @@ relish fault node-pressure node-03 --cpu 80% --memory 90% --acknowledge
 Workload faults take `--namespace` (default `default`), `--instance` to hit
 one instance, `--duration` and `--reason`, which is recorded with the fault.
 
+In 0.2.0 workload faults target apps only. `relish fault kill` or `pause`
+against a job is refused by the replica-minimum rail, and the attempts of an
+array or a shared executor are invisible to Smoker. To test jobs under
+failure, break the node instead: `node-kill`, `node-pressure`, or the
+node-level faults the release's job qualification uses (killing Bun on a
+worker or on the leader, delaying traffic between nodes, filling the disk,
+slowing fsync; see `scripts/release/qualify-jobs-sustained.sh`). Job-aware
+chaos, which exempts run-to-completion work from the rail and targets
+executors, is planned for 0.2.2
+([#704](https://github.com/reliaburger/reliaburger/issues/704)).
+
 Every fault has a duration (default 10 minutes) and cleans up after itself:
 
 ```sh

@@ -23,6 +23,7 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::admission_fixture::write_admission_fixture;
 use crate::task_harness;
 use task_harness::TestTasks;
 
@@ -317,6 +318,56 @@ async fn single_node_leader() -> Arc<CouncilNode> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     node
+}
+
+/// A running API's leader loop commits entries of its own: its first tick
+/// records a cron observation. A seeded admission entry planned just before
+/// such a write is refused with "admission revision changed" (#735), so the
+/// fixture must replan from committed state, as the scheduler does. The
+/// writer here commits about every millisecond, far more often than the
+/// leader loop, so a fixture that plans only once is refused within a hundred
+/// rounds (19 runs out of 20 when this was written).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_fixture_replans_when_another_entry_lands_first() {
+    use reliaburger::council::types::{CouncilResponse, RaftRequest};
+    use reliaburger::meat::types::{Placement, SchedulingDecision};
+
+    let council = single_node_leader().await;
+    let stop = CancellationToken::new();
+    let writer = {
+        let council = council.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.is_cancelled() {
+                council.write(RaftRequest::Noop).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    let mut applied = 0;
+    for round in 0..100 {
+        let decision = SchedulingDecision {
+            app_id: reliaburger::meat::AppId::new(format!("seed-{round}"), "default"),
+            placements: vec![Placement {
+                node_id: reliaburger::meat::NodeId::new("worker"),
+                resources: reliaburger::meat::Resources::default(),
+                ordinal: 0,
+            }],
+        };
+        let response = write_admission_fixture(&council, RaftRequest::SchedulingDecision(decision))
+            .await
+            .unwrap();
+        if matches!(response, CouncilResponse::Applied { .. }) {
+            applied += 1;
+        }
+    }
+    stop.cancel();
+    writer.await.unwrap();
+    council.shutdown().await.unwrap();
+    assert_eq!(
+        applied, 100,
+        "seeded decisions refused by a competing writer"
+    );
 }
 
 fn jobs_from(toml: &str) -> std::collections::BTreeMap<String, reliaburger::config::job::JobSpec> {

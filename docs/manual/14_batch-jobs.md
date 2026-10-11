@@ -213,6 +213,16 @@ Accepted counts arrive when chunks are acknowledged, so a one-second rate can
 alternate between zero and a burst. Use a sustained interval for capacity planning.
 Duration histograms merge across workers; watch displays p50, p95 and p99 bucket
 upper bounds for final attempts. They exclude queueing and earlier retries.
+Retries come with their causes: non-zero exit, a signal (including the memory
+limit's kill), a timeout, an unknown outcome, or "not recorded across a
+restart" when a worker read an attempt count back from its ledger, which
+keeps counts but not reasons. The causes always add up to the retry count,
+and they're a handful of counters per run, never a log per task.
+Each node's row also carries `start_lag_ms_counts`: how long pooled commands
+(shared containers and host jobs) waited between the pool taking an attempt
+and the command starting, in the same millisecond buckets. A single run's
+summary reports `state_bytes`, the replicated state its chunk bookkeeping
+occupies.
 `relish --output json batch-status ID` returns the machine-readable summary.
 `GET /v1/batch/summaries` lists retained parent summaries and standalone arrays,
 filtered to the caller's scope. Views and metric labels do not enumerate tasks.
@@ -745,8 +755,26 @@ Use `--cpu-request` to change admission while retaining the one-core limit,
 `--namespace` to select a namespace you can deploy into, and `--image` for another
 digest-pinned image containing `/bin/busybox`. A report file must not already
 exist. Without `--scenario`, `relish bench` still runs its ordinary data-plane
-suite. Its `--quick`, `--compare`, `--capacity` and `--disruptive` options belong
-to that suite and cannot be combined with job scenarios.
+suite. Its `--quick`, `--capacity` and `--disruptive` options belong to that
+suite and cannot be combined with job scenarios.
+
+`--compare` works for both. Given an earlier `--report` file from the same
+scenario, it compares the window rates and fails when this run is slower by
+more than `--tolerance` percent (10 by default):
+
+```sh
+relish bench --scenario jobs-host-processes --report before.json
+# ... change something ...
+relish bench --scenario jobs-host-processes --compare before.json --tolerance 15
+```
+
+A baseline from another scenario, or one that didn't complete and clean up,
+is refused before anything runs. A different window, concurrency, CPU
+request, image or executable makes the verdict informational: it's printed
+but never fails the command. Compare on the same rig and build only; a laptop
+VM moved by about 11% between two sessions of the same binary. The
+[five-round rerun's reports](../qualification/2026-10-09-timed-job-scenarios/README.md#independent-five-round-rerun)
+are committed as baselines for that rig.
 
 The public clock starts before submission. Image pulls and cold executors are
 included unless you prepare the image before running. Fresh containers use
@@ -967,8 +995,9 @@ The original node/application identities remained stable until the fixture and
 its exact kernel owner retired after measurement.
 
 Disk use grew materially: sampled VM free disk ended at 209.6 MiB, and all capped
-storage scans were incomplete. The four fresh retries recovered, but retained
-final outcomes don't identify their earlier failure causes. The [full hourly
+storage scans were incomplete. The four fresh retries recovered, but that
+build's retained final outcomes didn't identify their earlier failure causes;
+summaries now count retries by cause. The [full hourly
 record](../qualification/2026-10-09-timed-job-scenarios/README.md#hourly-sequence)
 includes resource samples, latency, cleanup proofs and these diagnostic limits.
 These completed hours establish saturation observations; global metadata bounds,

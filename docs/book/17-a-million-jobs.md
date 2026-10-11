@@ -35,7 +35,7 @@ Everything in the batch path Chapter 12 built ([fifty envelopes](12-squeezing-ev
 
 Kubernetes has the same problem in a different shape. An Indexed Job creates one Pod per index, and each Pod is several etcd writes over its life (create, bind, status updates, finalizer removal, deletion). The upstream scalability envelope stops at 150,000 Pods per cluster, so a million tasks run in waves. The usual escape hatch is a work queue: a few long-lived workers draining Redis. That scales beautifully, and the orchestrator no longer knows your tasks exist. Retries, logs and results become your code.
 
-We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost proportional to chunks rather than individual tasks. This section first builds the pieces as libraries, tested hard and measured in one process, and then wires them into Raft, the API and `relish`. Wiring changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 needs a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/2026-09-28-plan-million-jobs.md` has the details).
+We wanted the other thing: every task its own process, retried and tracked by the orchestrator, at a control-plane cost proportional to chunks rather than individual tasks. This section first builds the pieces as libraries, tested hard and measured in one process, and then wires them into Raft, the API and `relish`. Wiring changes the Raft log and snapshot formats, so it bumps the compatibility generations, and 0.2.0 needs a fresh cluster; before 1.0.0 we don't migrate (the plan in `docs/plans/archive/2026-09-28-plan-million-jobs.md` has the details).
 
 ### Template plus count, ranges instead of records
 
@@ -1613,6 +1613,24 @@ before to 1,233 a second, the same in every round. The check now runs before
 polling. A gated test times 200 quiet commands on one warm executor: 2.35
 seconds with the bug, 0.17 seconds without, against a two-second limit.
 
+The third bug showed up once on a CI runner (#715). The gated test runs
+`yes & sleep 0.2; exit 0` and expects the truncation line after 16 MiB. One
+run returned 22 MB with no line at the end. Nothing in Bun caps output, and
+every error path in the helper fails the command, which hadn't happened. That
+left the quiet period. On a busy runner `yes` can go unscheduled for more than
+10 ms, and to the helper that looks just like a descendant that's finished
+talking. So it stopped reading, sent no line and closed the pipe. Whatever
+`yes` wrote next was lost, and nothing said so. A longer quiet period wouldn't
+fix this, because a long enough stall beats any timeout. What we can promise
+is that output never vanishes silently. So the rule is now simpler: if the
+helper stops reading while any stream is still open, it appends the line,
+whether it stopped at the cap or on silence. The protocol test makes the stall
+deterministic. It sends `SIGSTOP` to a looping writer just as the command
+exits and resumes it 300 ms later. Before the fix, standard error came back
+empty. There's a cost. A command that leaves a silent daemon holding its
+stdout now gets the line too, even if the daemon never writes again. The
+helper can't tell those two cases apart, so it warns in both.
+
 None of this keeps a *model* loaded. Each command is still a new process that
 loads whatever it loads. Keeping a model resident between requests is a
 separate piece of work, #641.
@@ -1921,6 +1939,102 @@ the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage/24-hour work
 answer different questions. No extrapolated daily rate determines a soak pass.
 
+### The exit gate: a day of faults
+
+So when can 0.2.0 say "100 million jobs a day"? The roadmap said the release
+"still requires real-runtime qualification", #668 had one list of conditions
+and the September plan had a table of targets nobody had measured. Three
+answers is no answer. The audit settled it (decision D18-C): #668's list is the
+gate, on at least three nodes. That means 24 hours at 1,158 accepted successes
+a second or more (100 million divided by 86,400 seconds) plus headroom, with
+apps running, several resource profiles, and worker loss, leader loss, delayed
+messages and disk faults along the way. The September table survives as
+measurements every run records, but none of them can fail it.
+
+We didn't write a new harness for this. The soak controller above already
+admits work idempotently, audits effects and proves fault overlap, so the job
+qualification is the same soak with three switches, which
+`qualify-jobs-sustained.sh` sets per tier. `--job-load target` turns the
+shared and host short runs into 1,048,576-task arrays of `true` and fails the
+record if the campaign averages less than the target rate, faults included.
+`--node-faults` adds one node-level fault to every cycle: netem delay towards
+a peer, a disk filled to its last 64 MiB, or Bun's own writes throttled to 20
+IOPS with a systemd property. And every run writes a `.jobs.json` beside its
+record with the accepted rates and the M8 measurements. `--plan` prints the
+schedule without touching a cluster, which is how the CI tests check that the
+90-minute fast tier puts every fault kind on every node.
+
+Why node-level faults only? `relish fault kill` against a job is refused by the
+same replica rail that protects apps, and an array's attempts inside a shared
+executor aren't anything Smoker can name. Making chaos job-aware is real work
+(#704, in 0.2.2). Killing Bun, delaying a node or filling its disk needs no
+per-job targeting, and it's what an operator's hardware does anyway.
+
+Two measurements needed a little product code. A retry used to be a number:
+the bulk ledger keeps final outcomes, so when four fresh-container retries
+recovered during the hourly runs, nobody could say why the first attempts had
+failed. Now each chunk report carries counters by cause:
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryCauses {
+    pub exit_code: u64,
+    pub signal: u64,
+    pub timeout: u64,
+    pub unknown: u64,
+    pub unrecorded: u64,
+}
+
+impl RetryCauses {
+    pub fn total(&self) -> Option<u64> {
+        [self.signal, self.timeout, self.unknown, self.unrecorded]
+            .into_iter()
+            .try_fold(self.exit_code, u64::checked_add)
+    }
+}
+```
+
+Five numbers per chunk, never a row per task. `try_fold` walks the array with
+an accumulator and stops at the first `None`, and `u64::checked_add` returns
+`None` on overflow, so `total()` can't wrap around to a small number the way
+an unsigned `a + b` does in C (and in a Rust release build, where overflow
+checks are off). The leader refuses a chunk whose causes don't sum
+to its `retried` count, just as it refuses one whose outcomes don't sum to its
+size. The `unrecorded` bucket is the honest part: the node's ledger stores
+attempt counts but not reasons (22 bytes a record, and #678 is busy shrinking
+that), so a chunk resumed after a restart reports the retries it can't explain
+as exactly that. The node only counts a cause once the next attempt has really
+started, which keeps the sum equal to `attempts - 1` on every early return.
+
+The other was start lag. The reusable pools already time the command itself,
+so the gap between the pool taking an attempt and the command starting falls
+out of a subtraction, binned into the same power-of-two millisecond buckets as
+the run times. `std::array::from_fn(|bucket| counters[bucket].load(..))` turns
+sixteen atomics into the plain `[u64; 16]` the node sends to the leader: the
+closure runs once per index, so there's no loop and no uninitialised array to
+fill.
+
+The harness covers real VMs; a test has to cover the case the issue called
+untested. Every leader change test so far moved leadership with cron, never
+while an array held grants. The new cluster test kills the leader *after* it
+starts running its own share. It reads which chunks the dead leader held from
+the new leader's state before the silence clock can take them back, then waits
+for the array to finish and checks three things: every task succeeded exactly
+once, the accepted retry count is exactly one per flaky index (with its cause),
+and every chunk accepted at a later grant attempt is one the dead leader held.
+Two Linux versions of the same test use real shared-runc and host executors.
+There the old leader's executor keeps running after its control plane stops,
+which is the nastier case: its commands finish, and none of their reports may
+ever count.
+
+Finally, a regression guard. `relish bench --scenario` and `--compare` used to
+be mutually exclusive, so the throughput we were proudest of had none.
+`--compare OLD.json` now checks a scenario against an earlier report of the
+same scenario and fails on a drop beyond `--tolerance`. A different window or
+concurrency makes the verdict informational, because comparing unlike runs is
+how the misleading numbers above happened. The five-round rerun's forty reports
+are committed as the first baselines.
+
 ## One budget, two schedulers
 
 Here's a cluster that looks healthy and isn't. Three nodes, 8000 millicores
@@ -2151,6 +2265,11 @@ binding, then treated the `pending` instance with no PID as a running process
 missing one. The waiter now waits through non-running states but still fails
 at once if a known running process has no PID. We kept the cases separate, so
 fixing the test couldn't hide the real missing-PID bug it was written to catch.
+
+**Write the gate down before you run it.** Three documents had three
+different "million-task gates", so no run could have passed all of them. One
+written decision, with the measurements recorded rather than gated, turned an
+argument into a schedule.
 
 **Measure the thing you claim.** The most misleading numbers here weren't
 wrong. They measured something else: unequal reservations, unequal counts,
