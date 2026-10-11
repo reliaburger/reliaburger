@@ -11,6 +11,8 @@ use reliaburger::relish::client::BunClient;
 
 #[path = "support/bun_process.rs"]
 mod bun_process;
+#[path = "support/root_processes.rs"]
+mod root_processes;
 use bun_process::PortBlockReservation;
 
 struct Node {
@@ -150,7 +152,9 @@ impl Drop for RootCleanup {
         needles.extend(helper_directories.iter().map(|d| d.as_bytes().to_vec()));
         // The kernel ownership lock is released only once Bun has exited, and
         // SIGKILL doesn't wait for that.
-        wait_for_exit(&kill_processes(&processes_naming(&needles)));
+        wait_for_exit(&root_processes::kill_owned(&root_processes::matching(
+            &needles,
+        )));
         for directory in &helper_directories {
             let _ = std::fs::remove_dir_all(directory);
         }
@@ -199,77 +203,6 @@ fn rootless_helper_directories(node: &Path) -> Vec<String> {
                 .map(|generation| format!("/tmp/rbr-{uid}-{generation}/"))
         })
         .collect()
-}
-
-/// Every process whose command line, or any of whose open files, contains
-/// one of `needles`.
-fn processes_naming(needles: &[Vec<u8>]) -> Vec<nix::unistd::Pid> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
-            // The test itself may hold a file under the root as it unwinds.
-            if pid == std::process::id() as i32 {
-                return None;
-            }
-            let names = |bytes: &[u8]| {
-                needles
-                    .iter()
-                    .any(|needle| bytes.windows(needle.len()).any(|part| part == needle))
-            };
-            // A Bun already dying from its `Child`'s kill-on-drop has dropped
-            // its memory, so its command line reads empty, but its threads
-            // keep its files (the kernel ownership lock among them) a moment
-            // longer. Those files still name the root, so match on them too
-            // and wait for the exact lock owner (#673).
-            let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
-            (names(&command) || holds_file_under(&entry.path(), &names))
-                .then(|| nix::unistd::Pid::from_raw(pid))
-        })
-        .collect()
-}
-
-/// SIGKILL these processes: Bun, its detached owners, the Runc commands they
-/// were running and their rootless network helpers. Returns them.
-fn kill_processes(processes: &[nix::unistd::Pid]) -> Vec<nix::unistd::Pid> {
-    use nix::sys::signal::{Signal, kill, killpg};
-    use nix::unistd::{getpgid, getpgrp};
-    for &pid in processes {
-        // An owner leads its own group, so killing the group takes the Runc
-        // child it is waiting on too. Bun shares the test's group, and
-        // signalling that group would kill the test binary itself.
-        match getpgid(Some(pid)) {
-            Ok(group) if group != getpgrp() => {
-                let _ = killpg(group, Signal::SIGKILL);
-            }
-            _ => {
-                let _ = kill(pid, Signal::SIGKILL);
-            }
-        }
-    }
-    processes.to_vec()
-}
-
-/// Does any thread of the process at `/proc/<pid>` hold an open file whose
-/// path matches? Threads share one file table, but once the main thread has
-/// exited only the others still show it.
-fn holds_file_under(process: &Path, matches: &dyn Fn(&[u8]) -> bool) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    std::fs::read_dir(process.join("task"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .flat_map(|thread| {
-            std::fs::read_dir(thread.path().join("fd"))
-                .into_iter()
-                .flatten()
-        })
-        .flatten()
-        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-        .any(|target| matches(target.as_os_str().as_bytes()))
 }
 
 /// Wait up to ten seconds for every process to exit. A zombie whose threads
@@ -1338,13 +1271,13 @@ async fn normal_rootless_bun_cleanup_leaves_no_network_helper_behind() {
         .collect();
     assert!(!needles.is_empty(), "no rootless runtime intent recorded");
     assert!(
-        !processes_naming(&needles).is_empty(),
+        !root_processes::matching(&needles).is_empty(),
         "no rootless network helper is running"
     );
     // Fail the way a panicking test does: Bun dies, its owners don't.
     node.crash().await;
     drop(cleanup);
-    let left = processes_naming(&needles);
+    let left = root_processes::matching(&needles);
     assert!(left.is_empty(), "cleanup left rootless helpers {left:?}");
 }
 

@@ -15,6 +15,9 @@ mod bun_process;
 mod cluster_support;
 #[path = "../support/first_launch.rs"]
 mod first_launch;
+#[cfg(target_os = "linux")]
+#[path = "../support/root_processes.rs"]
+mod root_processes;
 // `cluster.rs` already includes the task harness; loading the file a second
 // time would compile two distinct `TestTasks` types.
 use cluster_support::task_harness;
@@ -69,6 +72,8 @@ mod registry_standard_clients;
 mod registry_upload;
 mod relish_cli;
 mod reporting_tree;
+#[cfg(target_os = "linux")]
+mod root_teardown;
 mod runtime_executor;
 mod security_integration;
 mod server_idle_connections;
