@@ -305,13 +305,26 @@ impl UpgradeManager {
         // when the bytes came from the network by either route (M5): a Pickle
         // fetch, or a single-node download staged as a local file.
         let is_network = directive.source.is_network() || directive.network_provenance;
-        signing::verify_binary(
-            &bytes,
-            &envelope,
-            &self.release_keys,
-            self.external_key.as_ref(),
-            is_network,
-        )?;
+        // Hashing and checking two signatures over a release-sized binary is
+        // seconds of CPU. Done in place it starved this worker's other tasks,
+        // the council's Raft core among them, and a node being upgraded
+        // called an election that deposed a healthy leader (#783).
+        let release_keys = self.release_keys.clone();
+        let external_key = self.external_key;
+        let checked = envelope.clone();
+        let (bytes, verified) = tokio::task::spawn_blocking(move || {
+            let verified = signing::verify_binary(
+                &bytes,
+                &checked,
+                &release_keys,
+                external_key.as_ref(),
+                is_network,
+            );
+            (bytes, verified)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        verified?;
 
         #[cfg(test)]
         eprintln!(
@@ -401,16 +414,25 @@ impl UpgradeManager {
 
         let (bytes, envelope) = self.fetch_verified(directive, Fetch::Retrying).await?;
 
-        // First upgrade from an un-versioned install: adopt the running
-        // binary into the store so rollback has something to return to.
-        self.adopt_running_binary_if_missing()?;
-
         #[cfg(test)]
         let fixture_stage_started = std::time::Instant::now();
         #[cfg(test)]
         eprintln!("upgrade-fixture phase=stage-begin");
-        self.store
-            .stage(&directive.target_version, &bytes, &envelope)?;
+        // Staging reads, hashes, writes and syncs the whole binary: blocking
+        // work, kept off the runtime for the same reason as the signature
+        // check (#783).
+        let store = self.store.clone();
+        let running_version = self.running_version.clone();
+        let target_version = directive.target_version.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), UpgradeError> {
+            // First upgrade from an un-versioned install: adopt the running
+            // binary into the store so rollback has something to return to.
+            adopt_running_binary_if_missing(&store, &running_version)?;
+            store.stage(&target_version, &bytes, &envelope)?;
+            Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=stage-end elapsed={:?}",
@@ -616,7 +638,13 @@ impl UpgradeManager {
             .and_then(|n| n.to_str())
             .unwrap_or("bun")
             .to_string();
-        self.adopt_running_binary_if_missing()?;
+        let store = self.store.clone();
+        let running_version = self.running_version.clone();
+        tokio::task::spawn_blocking(move || {
+            adopt_running_binary_if_missing(&store, &running_version)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         let marker = UpgradeMarker {
             schema: 1,
             upgrade_id: rollback_id(&target),
@@ -892,28 +920,6 @@ impl UpgradeManager {
         Ok(bytes.to_vec())
     }
 
-    /// First-upgrade bootstrap: if the running version has no versioned
-    /// file in the store (plain `bun` install), copy the current
-    /// executable in so rollback has a target.
-    fn adopt_running_binary_if_missing(&self) -> Result<(), UpgradeError> {
-        let path = self.store.binary_path(&self.running_version);
-        if path.is_file() {
-            return Ok(());
-        }
-        let current = std::fs::canonicalize(std::env::current_exe()?)?;
-        let bytes = std::fs::read(&current)?;
-        // No signature envelope for a pre-existing binary; store a stub so
-        // the file pair stays consistent. It is never re-verified locally.
-        let envelope = SignatureEnvelope {
-            schema: 1,
-            sha256: signing::sha256_hex(&bytes),
-            embedded: String::new(),
-            external: None,
-        };
-        self.store.stage(&self.running_version, &bytes, &envelope)?;
-        Ok(())
-    }
-
     fn append_history(&self, entry: &UpgradeHistoryEntry) -> Result<(), UpgradeError> {
         use std::io::Write as _;
         if let Some(dir) = self.history_path.parent() {
@@ -970,6 +976,31 @@ fn running_executable() -> Option<PathBuf> {
 /// The marker id of a rollback to `target`.
 fn rollback_id(target: &BinaryVersion) -> String {
     format!("rollback-to-{target}")
+}
+
+/// First-upgrade bootstrap: if the running version has no versioned file
+/// in the store (plain `bun` install), copy the current executable in so
+/// rollback has a target. Blocking: it reads and writes a whole binary.
+fn adopt_running_binary_if_missing(
+    store: &BinaryStore,
+    running_version: &BinaryVersion,
+) -> Result<(), UpgradeError> {
+    let path = store.binary_path(running_version);
+    if path.is_file() {
+        return Ok(());
+    }
+    let current = std::fs::canonicalize(std::env::current_exe()?)?;
+    let bytes = std::fs::read(&current)?;
+    // No signature envelope for a pre-existing binary; store a stub so
+    // the file pair stays consistent. It is never re-verified locally.
+    let envelope = SignatureEnvelope {
+        schema: 1,
+        sha256: signing::sha256_hex(&bytes),
+        embedded: String::new(),
+        external: None,
+    };
+    store.stage(running_version, &bytes, &envelope)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1088,6 +1119,51 @@ mod tests {
             pid: 4242,
             full_id: "default__web-0".to_string(),
         }]
+    }
+
+    /// #783: verifying and staging a release-sized binary took seconds of
+    /// synchronous hashing and disk work on a Tokio worker. The council's
+    /// Raft core on that worker missed its heartbeats, and the node being
+    /// upgraded called an election just before it exec'd, deposing a healthy
+    /// leader. On a one-thread runtime any work done in place stops every
+    /// other task, so a ticker beside `prepare` shows whether it was.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparing_a_large_binary_leaves_the_runtime_free() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        let fixture = fixture();
+        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
+        let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n").into_bytes();
+        binary.resize(binary.len() + 96 * 1024 * 1024, b'#');
+        let directive = directive_for(&fixture, &binary, "large");
+
+        let stop = CancellationToken::new();
+        let ticker = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let mut longest = Duration::ZERO;
+                let mut last = std::time::Instant::now();
+                while !stop.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    longest = longest.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                longest
+            }
+        });
+        let started = std::time::Instant::now();
+        let prepared = fixture.manager.prepare(&directive, vec![]).await;
+        let took = started.elapsed();
+        stop.cancel();
+        let longest = ticker.await.unwrap();
+
+        assert!(prepared.unwrap().is_some());
+        // Raft's shortest election timeout is a second; a quarter of that is
+        // far above scheduling noise and far below the stall this caught.
+        assert!(
+            longest < Duration::from_millis(250),
+            "prepare held the runtime for {longest:?} of its {took:?}"
+        );
     }
 
     #[tokio::test]
