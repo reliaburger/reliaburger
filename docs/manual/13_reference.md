@@ -161,6 +161,7 @@ under systemd or another supervisor yourself. Bun's own data goes where
 | `[storage] metrics` | `/var/lib/reliaburger/metrics` |
 | `[storage] volumes` | `/var/lib/reliaburger/volumes` |
 | `[storage] allowed_host_paths` | `[]`: absolute prefixes a volume or `config_file` `source` may mount from; empty refuses every host path, and the directories above are always refused (see `images-and-volumes`) |
+| `[storage] audit_max_bytes` | `67108864` (64 MiB): the bound on the audit log in `{data}/audit`, which `relish audit` reads; at least 64 KiB (see `security`) |
 
 ## Node config sections
 
@@ -171,7 +172,7 @@ startup instead of being ignored.
 |---------|-----|
 | `[node]` | `name`, `labels` (matched by `placement`) |
 | `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
-| `[storage]` | data directories, `allowed_host_paths`, `[storage.snapshots]` (see `images-and-volumes`) |
+| `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` |
 | `[security]` | master key, bootstrap and identity paths, `require_mtls`, `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |

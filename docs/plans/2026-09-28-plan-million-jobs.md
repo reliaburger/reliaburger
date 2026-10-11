@@ -711,8 +711,14 @@ k3s cluster of the same size, and publish both scripts.
 
 - [ ] `batch-status --watch` and `--cost`
 - [x] `relish batch logs --index`, `relish batch results [--failed] [--limit]` (landed with M5: failed tasks' output kept per node; results merged from every node's ledger)
-- [ ] Ketchup sampling, Mayo counters
-- [ ] TUI batch view, dashboard card
+- [ ] Ketchup sampling
+- [x] Mayo counters (#684): node-side `job_*` counters, running gauge, duration
+      histogram and cgroup CPU/memory, labelled by `namespace`, `definition`,
+      `profile` and `node` rather than the `batch` label sketched above, so a
+      series outlives one run; one event per run and a failed/unknown-outcome
+      webhook; per-definition outcome history; job rows in `relish top`
+- [ ] TUI batch view
+- [x] dashboard card (`/ui/fragment/batches`, with each schedule's last outcomes since #684)
 
 ### M7: host processes on quickstart nodes
 

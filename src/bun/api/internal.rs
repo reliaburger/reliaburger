@@ -34,6 +34,13 @@ pub(super) async fn node_decommission_handler(
     if let Err(error) = request.validate() {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        details: std::collections::BTreeMap::from([
+            ("target_node".to_string(), request.node_id.clone()),
+            ("reason".to_string(), request.reason.clone()),
+        ]),
+        ..crate::bun::audit::AuditNote::default()
+    });
     let Some(council) = &state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
