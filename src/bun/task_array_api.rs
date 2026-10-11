@@ -177,6 +177,7 @@ pub async fn submit_handler(
     if let Err(response) = crate::sesame::auth::authorize_scoped(auth, &request.name, &namespace) {
         return response;
     }
+    crate::bun::audit::annotate_workload(&request.name, &namespace);
     if let Some(council) = follower_council(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/array", body, &headers).await;
     }
@@ -288,6 +289,7 @@ pub async fn manifest_handler(
     {
         return response;
     }
+    crate::bun::audit::annotate_workload(&request.name, &request.namespace);
     for cohort in &mut request.cohort {
         let mut array = TaskArraySubmitRequest {
             name: request.name.clone(),
@@ -479,6 +481,7 @@ pub async fn cancel_handler(
             format!("task submission {batch_id} not found"),
         );
     };
+    crate::bun::audit::annotate_workload(name, namespace);
     if arrays
         .manifest(batch_id)
         .is_none_or(|manifest| !manifest.common_jobs)
@@ -1258,7 +1261,7 @@ pub async fn summaries(
             "status":"Scheduled", "batch_id":null, "revision":record.revision,
             "cron":cron, "last_observed_minute":record.last_observed_minute,
             "skipped":record.skipped, "skipped_count":record.skipped_count,
-            "total":record.definition.tasks.count}),
+            "history":record.history, "total":record.definition.tasks.count}),
         );
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r["batch_id"].as_u64().unwrap_or(0)));

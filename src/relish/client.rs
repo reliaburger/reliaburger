@@ -1110,6 +1110,17 @@ impl BunClient {
         Ok(view.events)
     }
 
+    /// Read the audit log: the newest records matching `filter`, oldest
+    /// first, from the node this client talks to or, with `cluster`, from
+    /// every live node.
+    pub async fn audit(
+        &self,
+        filter: &crate::bun::audit::AuditFilter,
+        cluster: bool,
+    ) -> Result<crate::bun::audit::AuditListing, RelishError> {
+        self.get_typed_json(&audit_path(filter, cluster)).await
+    }
+
     /// Ask a node what it has wired up (Phase 15).
     ///
     /// The test runner, `wtf` and `bench` all consult this before deciding
@@ -2850,6 +2861,33 @@ fn secret_public_key_path(namespace: Option<&str>) -> String {
         }
         None => "/v1/secret/public-key".to_string(),
     }
+}
+
+/// The `GET /v1/audit` path for `filter`.
+fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String {
+    let mut params = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(since) = filter.since {
+        params.append_pair("since", &since.to_string());
+    }
+    if let Some(until) = filter.until {
+        params.append_pair("until", &until.to_string());
+    }
+    if let Some(action) = &filter.action {
+        params.append_pair("action", action);
+    }
+    if let Some(principal) = &filter.principal {
+        params.append_pair("principal", principal);
+    }
+    if let Some(namespace) = &filter.namespace {
+        params.append_pair("namespace", namespace);
+    }
+    if let Some(limit) = filter.limit {
+        params.append_pair("limit", &limit.to_string());
+    }
+    if cluster {
+        params.append_pair("cluster", "true");
+    }
+    format!("/v1/audit?{}", params.finish())
 }
 
 #[cfg(test)]

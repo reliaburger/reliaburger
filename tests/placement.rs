@@ -2725,6 +2725,128 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     }
 }
 
+/// `GET /v1/audit?cluster=true` asks every node for its own durable log
+/// and merges the answers by time (#685).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "multi-node audit query acceptance; run with make test-cluster"]
+async fn cluster_audit_query_merges_every_node() {
+    let auth = NodeFaultAuth::admin("audit-admin");
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("audit1", 20641, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "audit2",
+        20645,
+        vec![local(20641)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        "audit3",
+        20649,
+        vec![local(20641)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                let metrics = council.metrics().borrow().clone();
+                metrics.current_leader.is_some()
+                    && metrics.membership_config.membership().voter_ids().count() == 3
+            })
+        }))
+        .await
+    );
+    // One audited action through each node: each records it in its own log
+    // (and the leader again, for the ones forwarded to it).
+    for node in nodes {
+        let manifest = format!("[namespace.from-{}]\nmax_apps = 1\n", node.name);
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/apply", node.client.base_url()))
+            .bearer_auth(&auth.plaintext)
+            .body(manifest)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+    }
+    let filter = reliaburger::bun::audit::AuditFilter {
+        action: Some("app.applied".to_string()),
+        ..reliaburger::bun::audit::AuditFilter::default()
+    };
+    // Every node answers once gossip has shown the querying node all three.
+    let mut listing = reliaburger::bun::audit::AuditListing::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(answer) = n1.client.audit(&filter, true).await {
+            listing = answer;
+            let recorded_on: std::collections::BTreeSet<_> = listing
+                .records
+                .iter()
+                .filter_map(|record| record.node.clone())
+                .collect();
+            if listing.warnings.is_empty() && recorded_on.len() == 3 {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cluster audit query never merged all three nodes: {listing:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let names: std::collections::BTreeSet<_> = listing
+        .records
+        .iter()
+        .filter_map(|record| record.node.clone())
+        .collect();
+    assert_eq!(
+        names,
+        ["audit1", "audit2", "audit3"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+    // Merged oldest first.
+    assert!(
+        listing
+            .records
+            .windows(2)
+            .all(|pair| pair[0].timestamp <= pair[1].timestamp)
+    );
+    for node in nodes {
+        let namespace = format!("from-{}", node.name);
+        assert!(
+            listing
+                .records
+                .iter()
+                .any(|record| record.node.as_deref() == Some(node.name.as_str())
+                    && record.namespace.as_deref() == Some(namespace.as_str())),
+            "{} did not record its own apply: {listing:?}",
+            node.name
+        );
+    }
+    // Without `cluster`, a node answers from its own log only.
+    let local = n2.client.audit(&filter, false).await.unwrap();
+    assert!(!local.records.is_empty());
+    assert!(
+        local
+            .records
+            .iter()
+            .all(|record| record.node.as_deref() == Some("audit2"))
+    );
+    shutdown.cancel();
+    for node in nodes {
+        node.handle.council.as_ref().unwrap().shutdown().await.ok();
+    }
+}
+
 /// Administrative apply must retain the user's authority at the leader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "multi-node apply forwarding acceptance; run with make test-cluster"]

@@ -185,6 +185,9 @@ pub const ROUTE_MATRIX: &[Route] = &[
         Body(DEPLOY),
     ),
     route(Get, "/v1/events", AnyToken),
+    // The audit log spans every tenant: an unscoped Admin only, never the
+    // service principal (#685).
+    gated(Get, "/v1/audit", Admin, Cluster(ADMIN)),
     route(Get, "/v1/ws/events", AnyToken),
     gated(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken, App(LOGS)),
     route(Get, "/v1/status/{app}/{namespace}", AnyToken),
@@ -628,6 +631,7 @@ mod tests {
     const API_ROUTE_MODULES: &[&str] = &[
         include_str!("api/apply.rs"),
         include_str!("api/apps.rs"),
+        include_str!("api/audit.rs"),
         include_str!("api/ca.rs"),
         include_str!("api/deploys.rs"),
         include_str!("api/discovery.rs"),

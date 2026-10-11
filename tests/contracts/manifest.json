@@ -5755,6 +5755,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-placement-cluster_audit_query_merges_every_node",
+          "binary": "reliaburger::placement",
+          "test": "cluster_audit_query_merges_every_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-placement-follower_apply_preserves_user_authority_for_administrative_manifests",
           "binary": "reliaburger::placement",
           "test": "follower_apply_preserves_user_authority_for_administrative_manifests",
@@ -7111,6 +7122,33 @@
       ],
       "boundaries": [
         "This case needs runc in the Linux gate; the portable supervisor tests cover the same policy with a mock runtime."
+      ]
+    },
+    {
+      "id": "issue-684-shared-profile-usage-from-cgroups",
+      "issue": 684,
+      "promise": "A running shared-runc profile reports CPU and memory from its executor cgroup, labelled by namespace, definition, profile and node, for Mayo and relish top.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "job-usage-runc_shared_profile_reports_cgroup_cpu_and_memory",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_shared_profile_reports_cgroup_cpu_and_memory",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A task index or run id never becomes a metric label."
+      ],
+      "boundaries": [
+        "The executor's cgroup includes its helper, so the sample carries the helper's small overhead."
       ]
     }
   ]

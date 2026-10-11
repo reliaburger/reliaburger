@@ -153,6 +153,11 @@ pub(super) async fn test_lease_create_handler(
         )
             .into_response();
     }
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        app: None,
+        namespace: Some(namespace.clone()),
+        details: std::collections::BTreeMap::from([("lease_id".to_string(), lease_id.clone())]),
+    });
     let now = crate::testkit::lease::now_unix_millis();
     let lease = match crate::testkit::lease::TestLease::new_scoped(
         lease_id,

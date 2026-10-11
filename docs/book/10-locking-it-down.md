@@ -918,6 +918,81 @@ Escaping is context-sensitive. What's safe between tags isn't necessarily safe i
 
 The lesson generalises past this one attribute: match your escaping to the exact syntactic slot the value lands in, and when in doubt, escape both quote characters so a value can't jump contexts.
 
+## Who did what
+
+After an incident, the first question is usually "who changed this?" Reliaburger had an answer of sorts: token creation, CA rotation, secret rotation and fault injection each recorded an audit event, attributed to the credential that asked. But those events went into the same 1024-entry ring as every health check, deploy and job completion. A busy task array finishes runs by the hundred, so an admin's `token.created` could be pushed out of memory within seconds of happening, and a Bun restart emptied the ring outright. Worse, the actions you'd most want to trace (apply, delete, exec, upgrade, decommission) recorded nothing at all. The security runbook's step "audit all cluster activity during the compromise window" had nothing to read.
+
+The fix was to give the audit trail a store of its own (plan group G16 in the [0.2.0 audit](https://github.com/reliaburger/reliaburger/issues/674)). The ring stays as it was, for the TUI and the live stream. Every node also keeps `bun::audit::AuditLog`: JSON Lines under `[storage] data/audit/`, one record per action, synced to disk before the API answers.
+
+### A thread that owns the files
+
+Writing a file blocks. A Tokio worker thread that blocks stalls every task scheduled on it, so the log's file I/O lives on one dedicated thread, fed through a channel:
+
+```rust
+std::thread::Builder::new()
+    .name("audit-writer".to_string())
+    .spawn(move || run_writer(writer, receiver, thread_failures))
+    .map_err(AuditError::Thread)?;
+```
+
+`run_writer` loops on `receiver.blocking_recv()`, the synchronous twin of `recv().await` that a non-async thread can call on a Tokio channel. When every `AuditLog` handle has been dropped, the channel closes, `blocking_recv` returns `None` and the thread ends. No shutdown flag needed. We chose a thread over `spawn_blocking` because this one runs for the life of the process, and the blocking pool is for jobs that finish.
+
+Each record travels with a `oneshot` sender, and `AuditLog::submit` hands the caller the other end, wrapped as an `AuditReceipt`:
+
+```rust
+pub async fn written(self) -> bool {
+    let Some(receiver) = self.0 else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(AUDIT_WRITE_TIMEOUT, receiver).await,
+        Ok(Ok(true))
+    )
+}
+```
+
+The writer appends the line, calls `sync_data`, and only then sends `true`. An API handler awaits the receipt before replying, so an action you saw acknowledged is on disk. The agent loop, recording `fault.expired`, just drops the receipt. One method, two policies, and the caller chooses. `written` takes `self` by value, which means a receipt can only be waited on once; the compiler won't let you read the answer twice and wonder which one was real.
+
+A failed write (a full disk, a directory that vanished) increments a counter, prints a line and returns `false`. It never fails the request. That was a deliberate call: an operator whose disk is full must still be able to delete the app that's filling it. `GET /v1/audit` turns the counter into a warning, so the gap isn't silent.
+
+### Bounded, in segments
+
+An append-only log that never shrinks is a disk-full incident with a delay. The log is split into eight segments that share `[storage] audit_max_bytes` (64 MiB by default). A record that would push the newest segment past its share starts a new one, named after its first sequence number and zero-padded (`audit-00000000000000000417.jsonl`), so sorting the file names sorts the segments by age. When the total passes the bound, the oldest segment goes. Dropping a whole file is cheaper and safer than rewriting one, and it means what survives is always an unbroken run of the newest records, which `oldest_segment_is_dropped_first` checks.
+
+A crash mid-write can leave half a line at the end of the newest segment. On open, the writer ends it with a newline, and the reader skips any line that doesn't parse. The sequence number carries on from the last whole record, so a restart never reuses one.
+
+### One layer instead of thirty handlers
+
+The obvious way to audit apply, delete, exec, rollback and the rest is a `record_audit(...)` call in each handler. That's about thirty call sites, each with several early returns, and the first handler someone adds next year won't have one. So most auditing happens in one axum layer, `audit_layer`, that wraps every authenticated route. It sits inside the auth layer, so the caller's `AuthContext` is already in the request's extensions, and it knows the matched route pattern (`MatchedPath`), the path parameters and, after the handler has run, the status. If the route is in `AUDITED_ROUTES` and the response is a success, it writes the record. A refused request changed nothing, so it isn't recorded.
+
+Some handlers know things the path doesn't. An apply's namespace is in the manifest, a decommission's target node is in the JSON body. Passing those back up through every return path would undo the point of the layer, so the handler *annotates* the request instead:
+
+```rust
+crate::bun::audit::annotate(audit::manifest_audit_note(&config));
+```
+
+`annotate` writes into a task-local, a value that belongs to the current Tokio task the way a thread-local belongs to a thread:
+
+```rust
+tokio::task_local! {
+    static REQUEST: RequestAudit;
+}
+```
+
+`task_local!` is a macro that declares the slot; `REQUEST.scope(value, future)` runs `future` with the slot filled, and `REQUEST.try_with(|request| ...)` reads it from anywhere inside, returning an error (rather than panicking) when called outside a scope. The layer opens the scope around the handler, so the handler and everything it awaits see the same `RequestAudit`. That struct holds the caller's address and a `RefCell<AuditNote>`. We met `RefCell` in chapter 7: it lets you mutate through a shared reference, checking the borrow at run time. `try_with` only ever gives you `&RequestAudit`, so the note has to be a `RefCell` for `annotate` to change it. The same task-local is how a fault or token handler, deep inside its own helpers, learns the address the request came from without a new parameter on every function between the router and the record.
+
+Is a task-local hidden state? A little. It's scoped to one request, though, and the alternative was threading a source address through dozens of signatures. We kept it to two facts (the address and the note) and made `annotate` a no-op outside a request, so background code that calls it by accident does nothing rather than crashing.
+
+### Making every route choose
+
+A layer driven by a table has the same weakness as the handlers it replaced: someone has to add the new route to the table. So `every_mutating_route_is_audited_or_exempt` walks the route matrix from earlier in this chapter and fails for any `POST` or `DELETE` route that isn't in exactly one of three lists: audited by the layer, audits itself (tokens, CAs, secrets and faults, which record richer details), or exempt with a written reason (node-to-node plumbing, heartbeats, reads that happen to be `POST`). Adding a route now means making a decision, in a place a reviewer will see it.
+
+### Reading it back
+
+`GET /v1/audit` takes `since`, `until`, `action` (exact, or a family like `fault.*`), `principal` and `namespace`, and returns the newest matching records, oldest first. With `?cluster=true` the node asks every live member for its records and merges them by `(timestamp, node, sequence)`, naming any member that didn't answer. It forwards the *caller's* token rather than the cluster service token, so each node repeats the authorisation itself, and the service token never needs to be able to read the log. That matters: the log lists every principal and the addresses they work from, which is exactly the map an attacker holding a stolen node credential would want. Reading needs an unscoped Admin with `admin` across the cluster. `relish audit` wraps it, with `--since 2h` style times.
+
+What we didn't build: a central copy. Each node's log is its own, so a node you decommission takes its history with it, and a call a follower forwards to the leader shows up on both (with the client's address on one and the follower's on the other). Shipping records to the leader, or to object storage, and chaining their hashes so tampering shows, are the obvious next steps. Neither was needed to make "who did what" answerable after a restart, which was the bug.
+
 ## Join token validation
 
 When a new node runs `relish join --token <token> <addr>`, the join handler on the receiving agent now validates the token against SecurityState. The flow:

@@ -323,14 +323,20 @@ async fn tui_websocket_events_replay_deploy_event() {
         .await
         .unwrap();
     let mut socket = harness.client.ws_events().await.unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let event: reliaburger::bun::events::ClusterEvent =
-        serde_json::from_str(frame.to_text().unwrap()).unwrap();
-    assert_eq!(event.kind, reliaburger::bun::events::EventKind::Deploy);
+    // The apply's own audit record (`app.applied`) is replayed too, before
+    // or after the deploy event, so read until the deploy shows up.
+    let mut kinds = Vec::new();
+    while !kinds.contains(&reliaburger::bun::events::EventKind::Deploy) {
+        assert!(kinds.len() < 10, "no deploy event among {kinds:?}");
+        let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: reliaburger::bun::events::ClusterEvent =
+            serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        kinds.push(event.kind);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
