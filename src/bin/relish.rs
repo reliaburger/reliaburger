@@ -2616,12 +2616,26 @@ mod tests {
     fn readme_command_list_matches_the_cli() {
         use clap::CommandFactory;
         use reliaburger::relish::command_reference::{
-            GROUPS, REGENERATE_COMMAND, render, replace_region,
+            Availability, GROUPS, REGENERATE_COMMAND, render, replace_region,
         };
+        use reliaburger::relish::released_cli::ReleasedCli;
 
-        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme_path = repository.join("README.md");
         let readme = std::fs::read_to_string(&readme_path).unwrap();
-        let section = render(&Cli::command(), GROUPS).unwrap_or_else(|e| panic!("{e}"));
+        // Commands the installer's release lacks are labelled with this
+        // build's version (0.2.0-dev labels them "0.2.0").
+        let released = ReleasedCli::parse(
+            &std::fs::read_to_string(repository.join("scripts/release/released-cli.tsv")).unwrap(),
+        )
+        .unwrap();
+        let upcoming = env!("CARGO_PKG_VERSION").split('-').next().unwrap();
+        let availability = Availability {
+            released: &released,
+            label: released.unreleased_label(upcoming),
+        };
+        let section =
+            render(&Cli::command(), GROUPS, Some(&availability)).unwrap_or_else(|e| panic!("{e}"));
         let updated = replace_region(&readme, &section).unwrap_or_else(|e| panic!("{e}"));
 
         if std::env::var_os("RELIABURGER_UPDATE_README").is_some() {

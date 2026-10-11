@@ -205,7 +205,8 @@ Harnesses own their spawned tasks and cancellation tokens. The main ProcessGrill
 waits for shutdown in `Drop`, then aborts only after a bounded grace period. TCP reporting
 does the same for listeners, workers and aggregators. Tests bind port `0`, use temporary
 directories and keep every resource scoped so worktrees and nextest processes can run
-concurrently.
+concurrently. A listener that must come back on the same port after a restart or an
+upgrade exec is the exception: it leases its port instead (see the cluster fixtures below).
 
 ## A new executable's first launch
 
@@ -360,3 +361,26 @@ tmpfs still mounted, which `start_wired_node` failed to remove and then reused. 
 
 Older suites (`placement`, `cluster_task_arrays`, `council_disaster_recovery`) still use
 fixed blocks below the leased 27000–30000 range; keep new fixed ports out of that range.
+
+The same rule covers any port a process gives up and binds again: a crash fixture's
+restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
+new binary binds the configured ports once it starts. Never choose such a port with
+`bind("127.0.0.1:0")` and release it. That port comes from the ephemeral range, and in the
+gap any other test's `bind(0)`, outgoing `connect()` or slirp forward can take it. That was
+one of #734's two causes: `oci_crash`'s upgrade fixture released its API port, a parallel
+`owned_rootless` test could draw the same number for a slirp forward, and the exec'd Bun
+exited with "Address already in use". Nothing restarts Bun in that fixture, so the walk
+reported only "owned runtime never settled on v0.1.0" after 45 seconds. (The other cause
+was in the product: adoption after an exec refused while the old process's last `runc`
+command was still finishing; see chapter 15.) The upgrade
+fixtures in `oci_crash`, `self_upgrade` and `self_upgrade_cluster`, and the slirp host
+ports in `owned_rootless`, now lease their ports for the whole test. The settle wait also
+fails at once with the node log when the Bun it watches exits.
+
+Cleanup has to find everything a test started, including processes whose command lines
+don't name the test root. `oci_crash`'s `RootCleanup` killed only those that did, so a
+failed rootless run leaked its `slirp4netns` helper: the helper names only its generation's
+`/tmp/rbr-<uid>-<generation>/` directory. The leaked helper also kept every descriptor it
+inherited, including the lock the shared Linux test VM queues its users on, and it held
+that lock for an hour. `RootCleanup` now reads each node's runtime intents for those
+directories and kills whatever names them too.

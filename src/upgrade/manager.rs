@@ -1304,19 +1304,39 @@ mod tests {
                 }
             }));
         }
-        let results = futures_util::future::join_all((0..32).map(|_| async {
-            let fixture = fixture();
-            let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
-            fixture
-                .manager
-                .prepare(&directive, vec![])
-                .await
-                .map(|prepared| {
-                    assert!(prepared.is_some());
-                    assert!(fixture.manager.upgrade_in_flight());
-                })
-        }))
-        .await;
+        // 32 probes, at most four in flight: they still overlap each other
+        // and the churn (the Linux `ETXTBSY` race needs a fork during a
+        // probe's write), but they don't queue 32 new executables at once.
+        // macOS assesses each new executable's first exec one at a time
+        // across the host, so 32 simultaneous probes measured that queue
+        // (12.9 s for 32 fresh scripts) rather than the probe (#722). A node
+        // runs one probe at a time.
+        use futures_util::StreamExt as _;
+        let probes: Vec<_> = (0..32)
+            .map(|_| {
+                let fixture = fixture();
+                let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
+                (fixture, directive)
+            })
+            .collect();
+        let results: Vec<_> = futures_util::stream::iter(probes)
+            .map(|(fixture, directive)| async move {
+                // Move the whole fixture in: the block only names its
+                // manager, and a field-by-field capture would drop the
+                // temporary directory before the probe runs.
+                let fixture = fixture;
+                fixture
+                    .manager
+                    .prepare(&directive, vec![])
+                    .await
+                    .map(|prepared| {
+                        assert!(prepared.is_some());
+                        assert!(fixture.manager.upgrade_in_flight());
+                    })
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
         shutdown.cancel();
         for task in churn {
             task.await.unwrap();
@@ -1579,16 +1599,25 @@ mod tests {
         let started = std::time::Instant::now();
         // The query deadline is a Tokio timer. With the clock paused it
         // expires as soon as the runtime idles on the silent candidate, so
-        // the test proves the bound without spending ten real seconds.
+        // the test proves the bound without spending a real minute.
         tokio::time::pause();
         let prepared = fixture.manager.prepare(&directive, vec![]).await;
         tokio::time::resume();
-        // Only the deadline yields `Elapsed`; a spawn or exit failure would
+        // Only the deadline says "timed out"; a spawn or exit failure would
         // be a different incompatibility and must not pass as a timeout.
+        // The message says how far the candidate got (#722): it was
+        // launched, said nothing, and was still running at the deadline.
+        let Err(UpgradeError::IncompatibleBinary(message)) = &prepared else {
+            panic!("expected a timed-out query, got {prepared:?}");
+        };
+        let bound = super::super::compatibility::QUERY_DEADLINE.as_secs();
         assert!(
-            matches!(&prepared, Err(UpgradeError::IncompatibleBinary(message)) if message.contains("Elapsed")),
-            "{prepared:?}"
+            message.contains(&format!("timed out after {bound}s")),
+            "{message}"
         );
+        assert!(message.contains("launched as pid "), "{message}");
+        assert!(message.contains("no output"), "{message}");
+        assert!(message.contains("still running"), "{message}");
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
         assert!(!fixture.manager.upgrade_in_flight());
         assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());
