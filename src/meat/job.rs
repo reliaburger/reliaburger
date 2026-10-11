@@ -185,10 +185,54 @@ pub struct DefinitionRecord {
     /// How many occurrences were skipped for want of capacity, ever.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped_count: u64,
+    /// The newest finished runs, oldest first, at most
+    /// [`MAX_DEFINITION_HISTORY`]. Kept here rather than with the runs, so
+    /// pruning a run's details never loses its outcome.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<RunOutcome>,
 }
 
 fn is_zero(count: &u64) -> bool {
     *count == 0
+}
+
+/// Most finished runs one definition remembers.
+pub const MAX_DEFINITION_HISTORY: usize = 10;
+
+/// How one finished run of a definition ended. Small and fixed-size, so a
+/// definition's history stays bounded however many tasks its runs had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOutcome {
+    /// The run's batch id.
+    pub run: u64,
+    /// When the run was admitted.
+    pub started_at_epoch_secs: u64,
+    /// When the run reached its terminal state.
+    pub finished_at_epoch_secs: u64,
+    /// The terminal state.
+    pub status: super::task_array_state::TaskArrayStatus,
+    /// Tasks that succeeded.
+    pub succeeded: u64,
+    /// Tasks that failed for good.
+    pub failed: u64,
+    /// Tasks that never ran because the run stopped first.
+    pub not_run: u64,
+    /// The lowest task index that failed, if any: where to start reading
+    /// failure output (`relish batch logs RUN --index N`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_index: Option<u32>,
+}
+
+impl RunOutcome {
+    /// Whether the run should page someone: any task failed for good.
+    pub fn failed(&self) -> bool {
+        use super::task_array_state::TaskArrayStatus;
+        matches!(
+            self.status,
+            TaskArrayStatus::Failed | TaskArrayStatus::CompletedWithFailures
+        )
+    }
 }
 
 /// A matching cron minute that was claimed but not run.
@@ -288,6 +332,7 @@ impl TryFrom<CatalogWire> for JobCatalog {
                 || record
                     .skipped
                     .is_some_and(|skip| Some(skip.minute) > record.last_observed_minute)
+                || record.history.len() > MAX_DEFINITION_HISTORY
             {
                 return Err("invalid job definition revision, namespace or cursor".into());
             }
@@ -365,6 +410,21 @@ impl JobCatalog {
             });
             record.skipped_count = record.skipped_count.saturating_add(1);
         }
+    }
+
+    /// Remember how a run of `namespace/name` ended, dropping the oldest
+    /// outcome once the history is full. A run whose definition has gone
+    /// (forgotten, or a manifest profile) leaves no history.
+    pub(crate) fn record_outcome(&mut self, namespace: &str, name: &str, outcome: RunOutcome) {
+        let Some(record) = self.definitions.get_mut(&format!("{namespace}/{name}")) else {
+            return;
+        };
+        if record.history.iter().any(|known| known.run == outcome.run) {
+            return;
+        }
+        record.history.push(outcome);
+        let excess = record.history.len().saturating_sub(MAX_DEFINITION_HISTORY);
+        record.history.drain(..excess);
     }
 
     /// Drop one-off definitions that no retained run refers to (D22). A
@@ -549,6 +609,9 @@ impl JobCatalog {
                         last_observed_minute,
                         skipped: prior.and_then(|record| record.skipped),
                         skipped_count: prior.map_or(0, |record| record.skipped_count),
+                        history: prior
+                            .map(|record| record.history.clone())
+                            .unwrap_or_default(),
                     },
                 );
                 let Some(trigger) = trigger else {

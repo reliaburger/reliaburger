@@ -109,6 +109,7 @@ Within a page, HTMX swaps small fragments in place via `/ui/fragment/*` polling.
 /ui/fragment/apps              → App-list fragment (HTMX poll)
 /ui/fragment/nodes             → Node-list fragment (HTMX poll)
 /ui/fragment/alerts            → Active-alerts fragment (HTMX poll)
+/ui/fragment/batches           → Job runs and schedules fragment (HTMX poll)
 /ui/fragment/app/{app}/{namespace}/instances → Instance table fragment
 /ui/static/{*path}             → Embedded CSS/JS/font assets
 ```
@@ -955,6 +956,15 @@ JSON). Underlying cluster data is read through the `/v1` API.
 | Node health map | `GET /ui/fragment/nodes` | 5s (HTMX poll) |
 | Active alerts | `GET /ui/fragment/alerts` | 3s (HTMX poll) |
 | Instance table (app detail) | `GET /ui/fragment/app/{app}/{namespace}/instances` | 5s (HTMX poll) |
+| Job runs and schedules | `GET /ui/fragment/batches` | 3s (HTMX poll) |
+
+**Job card.** The "Job runs and schedules" section renders the same scoped
+summaries as `GET /v1/batch/summaries`: one row per retained run (counts,
+backlog, accepted success rate, profiles, and an explanation when an owner's
+outcome is unknown) and one row per cron schedule. A schedule row lists its
+last five outcomes, newest first, from the definition's durable history
+(#684), so a failed overnight run is still visible after its detail has been
+pruned.
 
 Recent-deploys and event-stream feeds are part of the planned dashboard build-out (see Section 3.2).
 

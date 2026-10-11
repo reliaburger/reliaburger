@@ -56,6 +56,50 @@ impl Drop for SingletonLogBinding {
     }
 }
 
+/// Fresh-runtime attempts running now: run id, then instance id to cgroup.
+type RunningAttempts =
+    BTreeMap<u64, std::collections::HashMap<crate::grill::InstanceId, std::path::PathBuf>>;
+
+/// Lists one fresh-runtime attempt in [`OwnedRunner`]'s running attempts
+/// for as long as it lives, however `run` returns.
+struct AttemptListing<'a> {
+    attempts: &'a Mutex<RunningAttempts>,
+    run: u64,
+    id: crate::grill::InstanceId,
+}
+
+impl<'a> AttemptListing<'a> {
+    fn new(
+        attempts: &'a Mutex<RunningAttempts>,
+        run: u64,
+        id: crate::grill::InstanceId,
+        cgroup: std::path::PathBuf,
+    ) -> Self {
+        attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(run)
+            .or_default()
+            .insert(id.clone(), cgroup);
+        Self { attempts, run, id }
+    }
+}
+
+impl Drop for AttemptListing<'_> {
+    fn drop(&mut self) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(run) = attempts.get_mut(&self.run) {
+            run.remove(&self.id);
+            if run.is_empty() {
+                attempts.remove(&self.run);
+            }
+        }
+    }
+}
+
 /// Owned execution backend; host execution retains its separate admission policy.
 pub struct OwnedRunner<G: Grill + Clone> {
     runtime: G,
@@ -69,6 +113,9 @@ pub struct OwnedRunner<G: Grill + Clone> {
     slots: Mutex<VecDeque<u32>>,
     prefix: String,
     singletons: Mutex<BTreeMap<u64, std::sync::Arc<SingletonRuntime>>>,
+    /// Fresh-runtime attempts running now, by run: their instance and cgroup,
+    /// so the metrics loop can measure them.
+    attempts: Mutex<RunningAttempts>,
     available: Notify,
     secrets: Option<(std::sync::Arc<crate::council::CouncilNode>, [u8; 32])>,
     log_sink: Option<tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -102,6 +149,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             slots: Mutex::new((0..256).collect()),
             prefix,
             singletons: Mutex::new(BTreeMap::new()),
+            attempts: Mutex::new(BTreeMap::new()),
             available: Notify::new(),
             secrets: None,
             log_sink: None,
@@ -321,6 +369,53 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         self.log_sink = sink;
         self.capture_offsets = offsets;
         self
+    }
+
+    /// Where to measure the attempts of `run` running on this node: each
+    /// reusable executor it holds, and each fresh runtime it started. A
+    /// runtime that places attempts in cgroups is read there; one that
+    /// doesn't (the macOS process runtime) is measured by process.
+    pub(crate) async fn usage_targets(
+        &self,
+        run: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Vec<crate::mayo::job_metrics::UsageTarget>
+    where
+        G: 'static,
+    {
+        use crate::mayo::job_metrics::UsageTarget;
+        let mut targets = Vec::new();
+        #[cfg(target_os = "linux")]
+        if let Some(Some(pool)) = template.and_then(|template| self.pool_for(template)) {
+            targets.extend(
+                pool.run_cgroups(run)
+                    .await
+                    .into_iter()
+                    .map(UsageTarget::Cgroup),
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = template;
+        let fresh: Vec<_> = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&run)
+            .map(|attempts| {
+                attempts
+                    .iter()
+                    .map(|(id, cgroup)| (id.clone(), cgroup.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (id, cgroup) in fresh {
+            if cfg!(target_os = "linux") && self.runtime.honours_cgroup_path() {
+                targets.push(UsageTarget::Cgroup(cgroup));
+            } else if let Ok(Some(pid)) = self.runtime.pid(&id).await {
+                targets.push(UsageTarget::Pid(pid));
+            }
+        }
+        targets
     }
 
     /// Forget the metadata of this node's retired executor identities, and of
@@ -733,6 +828,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 ran: None,
             };
         };
+        let _listing = task.run.as_ref().map(|run| {
+            AttemptListing::new(&self.attempts, run.batch_id, id.clone(), cgroup.clone())
+        });
         let mut oci = crate::grill::oci::generate_job_oci_spec(
             "task",
             namespace,
