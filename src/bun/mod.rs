@@ -20,6 +20,7 @@ pub mod events;
 pub mod execution_budget;
 pub mod gpu;
 pub mod health;
+pub mod host_paths;
 pub(crate) mod jobs;
 pub mod loop_meter;
 pub mod namespace_keys;

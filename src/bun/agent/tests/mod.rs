@@ -3284,6 +3284,10 @@ async fn deploy_leaves_hostpath_volumes_alone() {
     let source_dir = tempfile::tempdir().unwrap();
     let (mut agent, tx, shutdown) = test_agent();
     agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![source_dir.path().to_path_buf()],
+        vec![volumes_dir.path().to_path_buf()],
+    ));
     let handle = tokio::spawn(async move {
         agent.run().await;
     });
@@ -10480,6 +10484,10 @@ async fn blue_green_volume_app_redeploys_stop_first() {
 async fn host_path_volume_app_keeps_surge_first_rollout() {
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
     let shared = tempfile::tempdir().unwrap();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![shared.path().to_path_buf()],
+        Vec::new(),
+    ));
 
     let config = Config::parse(&format!(
             "[app.web]\nimage = \"web:v1\"\n\n[[app.web.volumes]]\npath = \"/srv\"\nsource = \"{}\"\n\n[app.web.deploy]\ndrain_timeout = \"0s\"\n",
