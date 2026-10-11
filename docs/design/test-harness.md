@@ -240,6 +240,20 @@ serves every test. Library unit tests reach the same file through
 `#[cfg(all(test, unix))] #[path = "../tests/support/first_launch.rs"] mod first_launch;`
 in `src/lib.rs`.
 
+That one shared launch still queues behind whatever else the host is assessing, including
+another worktree's freshly built binaries: a two-line script waited up to 32 s behind one
+fresh 800 MB test binary, and 75 to 94 s behind two at load average 50 to 180. A fake that
+the code under test runs through a configurable program path can avoid the launch
+altogether. The quickstart lifecycle fake is a plain script run as `/bin/sh <script> <args>`
+via the test-only `Lima::shell_script`
+([#762](https://github.com/reliaburger/reliaburger/issues/762)); `/bin/sh` is a system
+binary and never assessed, and the same script started that way took 0.02 s. The runner's
+fake `limactl` does the same, and the provisioning tests define their stub `apt-get`,
+`systemctl`, `dpkg-query` and `install` as Bash functions ahead of the script instead of
+files on `PATH`. Prefer this
+shape for a new fixture whose caller can take an interpreter; use `install_script` when the
+caller needs a single executable path.
+
 The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
 depends on `make warm-executables`, which runs each of them once before the suite
 ([#722](https://github.com/reliaburger/reliaburger/issues/722)).

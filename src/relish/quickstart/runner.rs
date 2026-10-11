@@ -975,7 +975,9 @@ mod tests {
     }
 
     /// A stand-in `limactl` that logs its arguments; a create never returns,
-    /// and writes a console line first only when `boots` is true.
+    /// and writes a console line first only when `boots` is true. It runs
+    /// through `/bin/sh`, so no new executable waits for macOS's first-launch
+    /// assessment inside the watchdog (#517, #762).
     fn fake_lima(home: &Path, boots: bool) -> Lima {
         let script = home.join("limactl");
         let console = if boots {
@@ -983,38 +985,15 @@ mod tests {
         } else {
             "sleep 30"
         };
-        install_warm_executable(
+        std::fs::write(
             &script,
-            &format!(
+            format!(
                 "#!/bin/sh\necho \"$*\" >> \"$LIMA_HOME/calls\"\n\
                  case \"$3\" in --name=*) {console};; esac\n"
             ),
-        );
-        Lima::new(script, Duration::from_secs(5)).with_home(home.to_owned())
-    }
-
-    /// Write an executable script and run it once before the test starts.
-    ///
-    /// macOS checks a new executable file the first time it runs. The check
-    /// takes over 100 ms, and concurrent first runs of different new files
-    /// wait for each other (issue #517). Two tests that each start a fresh
-    /// fake `limactl` under a 200 ms watchdog therefore lost the race to each
-    /// other. Running the script once here pays for the check before the
-    /// timed part of the test; later runs start in a few milliseconds. The
-    /// warm-up's arguments go to a throwaway `LIMA_HOME`, not the test's.
-    fn install_warm_executable(path: &Path, script: &str) {
-        std::fs::write(path, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let throwaway = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(path)
-            .arg("--version")
-            .env("LIMA_HOME", throwaway.path())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "fake limactl failed its warm-up run");
+        )
+        .unwrap();
+        Lima::shell_script(script, Duration::from_secs(5)).with_home(home.to_owned())
     }
 
     #[tokio::test]
@@ -1049,7 +1028,7 @@ mod tests {
     /// from the first VM's start, as in issue #333.
     fn fake_lima_with_shared_network(home: &Path) -> Lima {
         let script = home.join("limactl");
-        install_warm_executable(
+        std::fs::write(
             &script,
             r#"#!/bin/sh
 echo "$*" >> "$LIMA_HOME/calls"
@@ -1077,8 +1056,9 @@ list)
   done;;
 esac
 "#,
-        );
-        Lima::new(script, Duration::from_secs(10)).with_home(home.to_owned())
+        )
+        .unwrap();
+        Lima::shell_script(script, Duration::from_secs(10)).with_home(home.to_owned())
     }
 
     #[tokio::test]
@@ -1109,7 +1089,10 @@ esac
         let lima = fake_lima(home.path(), true);
         let step = super::super::progress::tests_support::detached_step();
         let create = ["start", "--tty=false", "--name=vm", "vm.yaml"];
-        start_watched(&lima, "vm", &create, Duration::from_millis(200), &step)
+        // The create exits as soon as it has written its console line, so a
+        // long silence costs nothing here. 200 ms wasn't always enough for
+        // the shell and `mkdir` to run on a host at load average 40 (#762).
+        start_watched(&lima, "vm", &create, Duration::from_secs(10), &step)
             .await
             .unwrap();
         assert!(lima.console_started("vm").await);

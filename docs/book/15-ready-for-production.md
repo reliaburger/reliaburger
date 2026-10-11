@@ -5850,3 +5850,44 @@ isn't, because it seeds its hasher with random keys when it runs, so the
 compiler refuses it and suggests `LazyLock`. A sorted set needs no seed, and it
 was the shorter fix. The mutex is `std::sync::Mutex`, held only for a lookup in
 a synchronous helper and never across an `.await`.
+
+That still left one launch per machine, and it wasn't enough. Six lifecycle
+tests kept failing on a Mac that three agents shared
+([#762](https://github.com/reliaburger/reliaburger/issues/762)), now with the
+helper's own 45-second bound instead of Lima's five. The shared script's single
+first launch was stuck in the queue. We timed a two-line script started one
+second after a fresh copy of the 800 MB library test binary: it waited 5 to 32
+seconds, and finished within 30 ms of the binary every time. With two copies at
+load average 50 to 180 it waited 75 to 94 seconds. The queue is host-wide, so
+another worktree's build being launched is enough. No bound we'd want to keep
+covers that.
+
+So the lifecycle fake doesn't get launched at all. The same script run as
+`/bin/sh limactl.sh` took 0.02 seconds in those rounds, because the only thing
+`exec`'d is `/bin/sh`, which is part of the system and never assessed. The shell
+reads the script as data. `Lima` gained a test-only constructor that does this:
+
+```rust
+#[cfg(test)]
+pub(crate) fn shell_script(script: PathBuf, timeout: Duration) -> Self {
+    Self {
+        script: Some(script),
+        ..Self::new(PathBuf::from("/bin/sh"), timeout)
+    }
+}
+```
+
+`..Self::new(...)` is the struct update syntax from Chapter 1: every field not
+named comes from a normal `Lima` for `/bin/sh`. `run` passes `script` as the
+first argument when it's set, and production never sets it. `$0` is now the
+script's path rather than a link's, so `${0%/*}` still finds the test's
+directory, and the file doesn't even need its execute bit. A unit test writes
+it with mode 0644 to prove that.
+
+The loop that proved it turned up two neighbours with the same problem. The VM
+runner's fake `limactl` moved to `shell_script` too, which dropped its own
+warm-up helper. The provisioning tests put stub `apt-get`, `systemctl`,
+`dpkg-query` and `install` files on `PATH`. They're now Bash functions defined
+ahead of the provision script (`apt-get() { echo "$*" >> "$APT_LOG"; }`), and a
+function wins over anything on `PATH`, so nothing new is ever launched. Fixtures
+whose caller can only take one executable path still use `install_script`.
