@@ -2725,6 +2725,7 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
                 },
                 shutdown: shutdown.child_token(),
                 data_dir_prefix: "rb-leader-loss",
+                data_root: None,
                 stale_report_timeout_secs: 10,
                 metrics_rollup: None,
                 scheduler: None,
@@ -2740,6 +2741,7 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
                     Duration::from_millis(200),
                     Duration::from_secs(3),
                 ))),
+                task_arrays_on_agent_budget: None,
             })
             .await,
         );
