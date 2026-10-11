@@ -421,6 +421,42 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "cross_namespace_connect_to_container_ip_is_denied",
+    "binary": "reliaburger::ebpf",
+    "test": "cross_namespace_connect_to_container_ip_is_denied"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "cross_namespace_connect_to_node_host_port_is_denied",
+    "binary": "reliaburger::ebpf",
+    "test": "cross_namespace_connect_to_node_host_port_is_denied"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "allow_from_opens_the_real_address_path_too",
+    "binary": "reliaburger::ebpf",
+    "test": "allow_from_opens_the_real_address_path_too"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "exec_workload_is_held_to_its_namespace",
+    "binary": "reliaburger::ebpf",
+    "test": "exec_workload_is_held_to_its_namespace"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "egress_allowlist_still_resolves_dns",
+    "binary": "reliaburger::ebpf",
+    "test": "egress_allowlist_still_resolves_dns"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "job_egress_allowlist_is_enforced",
+    "binary": "reliaburger::ebpf",
+    "test": "job_egress_allowlist_is_enforced"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "dns_responder_resolves_internal_name",
     "binary": "reliaburger::ebpf",
     "test": "dns_responder_resolves_internal_name"

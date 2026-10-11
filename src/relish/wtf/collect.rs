@@ -18,9 +18,9 @@ use crate::relish::council_view::CouncilNodeObservation;
 use super::{
     AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
     ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
-    DiskObservation, Evidence, FaultObservation, LogObservation, NodeObservation,
-    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
-    TokenObservation, WtfInputs,
+    DiskObservation, Evidence, FaultObservation, IsolationObservation, LogObservation,
+    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+    ServiceObservation, TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -209,6 +209,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         collect_council_evidence(cluster_enabled, &collected, council_result, collected_at);
     let restarts = collect_restarts(&collected, collected_at);
     let deploys = collect_deploys(&collected, collected_at);
+    let isolation = collect_isolation(&desired_result, capabilities_result.as_ref(), collected_at);
     let replicas = collect_replicas(&desired_result, &collected, app, collected_at);
     let services = collect_services(desired_result, services_result, app, collected_at);
     let faults = collect_faults(&collected, collected_at);
@@ -239,6 +240,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             certificates: local.certificates,
             registry,
             tokens,
+            isolation,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -932,6 +934,57 @@ fn collect_registry(
         }
     }
     builder.finish(observed_at)
+}
+
+/// Every namespace with a desired app, and whether each node can keep them
+/// apart: its live hooks and runtime can enforce isolation.
+fn collect_isolation(
+    desired: &Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String>,
+    report: Result<&ClusterCapabilityReport, &String>,
+    observed_at: u64,
+) -> Evidence<IsolationObservation> {
+    let (desired, report) = match (desired, report) {
+        (Ok(desired), Ok(report)) => (desired, report),
+        (Err(reason), _) | (_, Err(reason)) => {
+            return Evidence::Unavailable {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let namespaces: BTreeSet<String> = desired.iter().map(|app| app.namespace.clone()).collect();
+    let mut nodes = Vec::new();
+    let mut missing = Vec::new();
+    for node in &report.nodes {
+        match node {
+            CollectedNodeCapability::Unknown {
+                node_id, reason, ..
+            } => missing.push(format!("node {node_id}: {reason}")),
+            CollectedNodeCapability::Evidence {
+                node_id, report, ..
+            } => match &report.placement {
+                Some(placement) => nodes.push(NodeIsolation {
+                    node_id: node_id.clone(),
+                    enforced: placement.egress.can_enforce_isolation(),
+                }),
+                None => missing.push(format!(
+                    "node {node_id}: live enforcement evidence is absent"
+                )),
+            },
+        }
+    }
+    let value = IsolationObservation {
+        namespaces: namespaces.into_iter().collect(),
+        nodes,
+    };
+    if missing.is_empty() {
+        Evidence::available(observed_at, value)
+    } else {
+        Evidence::Degraded {
+            observed_at,
+            value,
+            reason: missing.join("; "),
+        }
+    }
 }
 
 async fn collect_logs(
