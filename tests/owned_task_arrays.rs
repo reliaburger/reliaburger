@@ -2022,6 +2022,24 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
     .await;
 }
 
+/// The pid of the one-slot runner's live executor helper, once it has one.
+async fn running_helper(runtime: &reliaburger::grill::ProcessGrill) -> nix::unistd::Pid {
+    use reliaburger::grill::Grill;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let inventory = runtime.launch_inventory().await.unwrap().unwrap();
+            if let [launch] = inventory.as_slice()
+                && let Some(pid) = runtime.pid(&launch.instance_id).await.unwrap()
+            {
+                return nix::unistd::Pid::from_raw(pid as i32);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the executor helper")
+}
+
 /// Output still buffered in an enlarged pipe at exit must all arrive; output
 /// that never stops after exit is cut off with a visible marker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2029,7 +2047,6 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
 async fn cgroup_host_executor_drains_output_buffered_at_exit() {
     use nix::sys::signal::{Signal, kill};
     use reliaburger::bun::task_executor::TaskRunner;
-    use reliaburger::grill::Grill;
     let root = tempfile::Builder::new()
         .prefix("rb-native-drain-")
         .tempdir()
@@ -2044,13 +2061,12 @@ async fn cgroup_host_executor_drains_output_buffered_at_exit() {
         )
         .await;
     assert!(warm.outcome.succeeded(), "{warm:?}");
-    let id = runtime.launch_inventory().await.unwrap().unwrap()[0]
-        .instance_id
-        .clone();
-    let helper = nix::unistd::Pid::from_raw(runtime.pid(&id).await.unwrap().unwrap() as i32);
     // Stop the helper while the command fills a 1 MiB pipe (F_SETPIPE_SZ is
     // 1031) and exits, so all 500,000 bytes are still buffered when the
     // helper sees the exit. Running, it would drain them as they arrive.
+    // Look the helper up only once the command holds its slot: the pool
+    // retires an executor idle for a second, and on a loaded host the warm
+    // one can go before the command starts, leaving a stale pid (#715).
     let python = shell_task(
         &template,
         1,
@@ -2059,6 +2075,7 @@ async fn cgroup_host_executor_drains_output_buffered_at_exit() {
     let buffered = runner.run(&python, Duration::from_secs(10), &cancel);
     let pause = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
+        let helper = running_helper(&runtime).await;
         kill(helper, Signal::SIGSTOP).unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         kill(helper, Signal::SIGCONT).unwrap();

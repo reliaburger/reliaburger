@@ -1615,6 +1615,24 @@ before to 1,233 a second, the same in every round. The check now runs before
 polling. A gated test times 200 quiet commands on one warm executor: 2.35
 seconds with the bug, 0.17 seconds without, against a two-second limit.
 
+The third bug showed up once on a CI runner (#715). The gated test runs
+`yes & sleep 0.2; exit 0` and expects the truncation line after 16 MiB. One
+run returned 22 MB with no line at the end. Nothing in Bun caps output, and
+every error path in the helper fails the command, which hadn't happened. That
+left the quiet period. On a busy runner `yes` can go unscheduled for more than
+10 ms, and to the helper that looks just like a descendant that's finished
+talking. So it stopped reading, sent no line and closed the pipe. Whatever
+`yes` wrote next was lost, and nothing said so. A longer quiet period wouldn't
+fix this, because a long enough stall beats any timeout. What we can promise
+is that output never vanishes silently. So the rule is now simpler: if the
+helper stops reading while any stream is still open, it appends the line,
+whether it stopped at the cap or on silence. The protocol test makes the stall
+deterministic. It sends `SIGSTOP` to a looping writer just as the command
+exits and resumes it 300 ms later. Before the fix, standard error came back
+empty. There's a cost. A command that leaves a silent daemon holding its
+stdout now gets the line too, even if the daemon never writes again. The
+helper can't tell those two cases apart, so it warns in both.
+
 None of this keeps a *model* loaded. Each command is still a new process that
 loads whatever it loads. Keeping a model resident between requests is a
 separate piece of work, #641.
