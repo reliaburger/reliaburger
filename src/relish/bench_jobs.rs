@@ -155,6 +155,10 @@ impl JobBenchArgs {
             script: None,
             firewall: None,
             egress: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         };
         Ok(TaskManifestRequest {
             name: name.into(),
@@ -424,7 +428,7 @@ async fn measure_public(
                 let request=args.manifest(&name)?;report.submission_names.push(name.clone());
                 // Don't abort a POST on Ctrl-C: its response carries the identity we must drain.
                 unknown_submission=true;
-                let answer=client.submit_task_manifest(&request).await.map_err(|error|failure(format!("submission {name} may have been accepted; inspect `relish jobs`; {error}")))?;
+                let answer=client.submit_task_manifest(&request,Some(&name)).await.map_err(|error|failure(format!("submission {name} may have been accepted; inspect `relish jobs`; {error}")))?;
                 let id=answer["batch_id"].as_u64().filter(|id|*id>0).ok_or_else(||failure(format!("submission {name} returned no positive identity")))?;
                 if report.batch_ids.contains(&id) {return Err(failure("benchmark submission reused a previous task identity"));}
                 report.batch_ids.push(id);active=Some(AcceptedCounts::new(id));unknown_submission=false;

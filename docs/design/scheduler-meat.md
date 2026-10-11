@@ -1060,6 +1060,19 @@ A run's trigger decides its class: `Cron` and `Hook` triggers are *triggered*, e
 
 Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop filters schedules blocked by a pending deployment before taking its sixteen per tick, and starts each tick after the last one it fired, so a long list takes turns.
 
+#### The task-array leader loop at scale
+
+Each tick (`SYNC_INTERVAL`, one second) the leader:
+
+1. Reads the job control state in place with `read_control`, a closure run under the state machine's read lock, and builds each node's sync request. It never clones the whole `DesiredState`; `read_task_arrays` copies only `TaskArrays`, and only for callers that need an owned copy.
+2. Calls every node that isn't still answering an earlier call, and gathers answers until the tick's deadline, `sync_deadline(interval)` (half the interval). Calls that miss it stay in `SyncCalls` and are collected by a later tick; their node isn't called again meanwhile, and `NODE_SYNC_TIMEOUT` (3 s for the request, 3 s for the body) still bounds each one. A node that missed the deadline keeps its chunks and counts towards `SILENCE_TIMEOUT` (30 s) like any silent node, so a hung or slow node delays only its own grants.
+3. Plans every running array with `plan_tick`, again under the read lock: a lost holder's `Requeue` (or `Unknown`, for runs that need acknowledged replay), then the array's `Sync`, then its `QuotaBlocked` note when the limit changed. Planning copies an array's state only when a chunk finished (`Cow`).
+4. Commits the whole batch as one `TaskArrayWrite::Tick` entry (`tick_entries`; at most `MAX_TICK_WRITES` = 1,024 writes per entry, so more would split). The state machine refuses a `Tick` holding anything but those four progress writes, and otherwise applies each on its own: a refused write (an array pruned since planning, a stale `Unknown`) leaves its array unchanged and is reported by array in `TaskArrayApplied::Ticked` / `CouncilResponse::TaskArrayTicked`; the others apply.
+
+The dispatch loop therefore writes at most one Raft entry per tick, however many arrays run, plus a `CronObserve` once a minute and one entry per cron fire. The 0.2.0 budget (#668, D18) is at most three entries a second. `make bench-task-arrays` reports the tick's cost in the `leader_tick` group, with 64 arrays on three nodes (about 1.1 ms of planning and applying on the development laptop) and with one array of one-task chunks on ten nodes (about 160 µs).
+
+**Accepted-range bound.** `TaskArrayState` records the grant (`node → attempt → chunks`) whose report retired each chunk, so results and logs can be fetched from the node that ran it. One-task chunks finishing out of order across many nodes split that record into a range per chunk: 65,536 chunks on ten nodes reached 875 KiB of replicated state. Past `MAX_ACCEPTED_RANGES` (4,096) ranges the per-node record folds into `accepted_folded` (`attempt → chunks`), where the same chunks merge into a few ranges; the worst shape stays under 60 KiB. Folding drops the owner but keeps the attempt, which still fences a result row on its own because each attempt of a chunk is granted to exactly one node. `accepted_grant` returns `owner: None` for a folded chunk, and the results and logs endpoints then ask every node for that grant.
+
 ---
 
 ## 6. Configuration
