@@ -1253,6 +1253,14 @@ Three decisions shape everything that follows, and each earns its keep against t
       CURRENT running binary.
    c. external_signature verifies against external_signing_key in node.toml
       (required for network upgrades).
+   d. the verified bytes, written to a private temporary file, answer
+      `--compatibility` with this node's protocol and state pair. The
+      candidate has 60 s from launch to answer; the bound is a hang guard,
+      wide because macOS assesses the first exec of every new executable
+      one file at a time across the host (about a second for a release
+      `bun`, longer behind other new executables), and the copy is always
+      new. A timeout names how far the candidate got (pid, first output,
+      exit).
    Any failure aborts before staging: the node reports failure and does NOT
    swap.
 

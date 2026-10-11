@@ -437,7 +437,7 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
     for expected in [
         format!("{version} PROTOTYPE"),
         format!("Install {version} "),
-        format!("<strong>{version} (Prototype)</strong>"),
+        format!("<strong>{version}: "),
         format!("href=\"{notes}\""),
     ] {
         assert!(page.contains(&expected), "index.html lacks {expected:?}");
@@ -598,4 +598,397 @@ fn every_tour_step_is_one_command_block_then_one_paragraph() {
             );
         }
     }
+}
+
+// --- What the installed release has (#688) ---------------------------------
+
+const RELEASED_CLI: &str = "scripts/release/released-cli.tsv";
+
+/// TODO(#688): the tour was last recorded against the published 0.1.4
+/// install; 0.1.5 and 0.1.6 skipped the re-record. Re-record it against the
+/// published 0.2.0 install when 0.2.0 is promoted (docs/releasing.md, "Update
+/// the docs"), then set this to `None`. The exemption names the installer
+/// version it was granted under, so it lapses the moment the default moves.
+const TOUR_RECORDED_BEHIND: Option<(&str, &str)> = Some(("0.1.4", "v0.1.6"));
+
+/// The tag `install.sh` fetches by default, such as `v0.1.6`.
+fn installer_default() -> String {
+    read("docs/website/install.sh")
+        .split("${RELIABURGER_VERSION:-")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("install.sh has no RELIABURGER_VERSION default")
+        .to_string()
+}
+
+fn released_cli() -> reliaburger::relish::released_cli::ReleasedCli {
+    reliaburger::relish::released_cli::ReleasedCli::parse(&read(RELEASED_CLI)).unwrap()
+}
+
+/// What docs write next to a command the installed release lacks, e.g.
+/// `0.2.0, not in 0.1.6`: this build's version against the installer's.
+fn unreleased_label() -> String {
+    let upcoming = env!("CARGO_PKG_VERSION").split('-').next().unwrap();
+    released_cli().unreleased_label(upcoming)
+}
+
+/// The README with its generated command list cut out, and that list.
+fn readme_split() -> (String, String) {
+    use reliaburger::relish::command_reference::{END_MARKER, START_MARKER};
+    let readme = read("README.md");
+    let start = readme.find(START_MARKER).unwrap();
+    let end = readme.find(END_MARKER).unwrap();
+    (
+        format!("{}{}", &readme[..start], &readme[end..]),
+        readme[start..end].to_string(),
+    )
+}
+
+/// The `relish …` commands in one Markdown block: every line of a fenced
+/// block, or every inline code span of a paragraph.
+fn block_commands(block: &str) -> Vec<String> {
+    if block.trim_start().starts_with("```") {
+        return block
+            .lines()
+            .map(|line| line.split(" #").next().unwrap().trim().to_string())
+            .filter(|line| line.starts_with("relish "))
+            .collect();
+    }
+    block
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.starts_with("relish "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every `relish …` mention in a Markdown document, each with its paragraph
+/// (or its fenced block) as the context a version label has to be in.
+fn markdown_mentions(document: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut block = String::new();
+    let mut in_fence = false;
+    for line in document.lines() {
+        let fence = line.trim_start().starts_with("```");
+        if fence && !in_fence {
+            blocks.push(std::mem::take(&mut block));
+        }
+        if !in_fence && !fence && line.trim().is_empty() {
+            blocks.push(std::mem::take(&mut block));
+            continue;
+        }
+        block.push_str(line);
+        block.push('\n');
+        if fence && in_fence {
+            blocks.push(std::mem::take(&mut block));
+        }
+        if fence {
+            in_fence = !in_fence;
+        }
+    }
+    blocks.push(block);
+    blocks
+        .iter()
+        .flat_map(|block| {
+            block_commands(block)
+                .into_iter()
+                .map(|command| (command, block.clone()))
+        })
+        .collect()
+}
+
+/// Every `relish …` line inside a `<code>` element on the homepage that isn't
+/// a tour step, with the innermost `<details>` (or else `<section>`) around it.
+fn homepage_mentions() -> Vec<(String, String)> {
+    let page = read("docs/website/index.html");
+    let enclosing = |at: usize, open: &str, close: &str| -> Option<String> {
+        let start = page[..at].rfind(open)?;
+        if page[start..at].contains(close) {
+            return None;
+        }
+        let end = at + page[at..].find(close)? + close.len();
+        Some(page[start..end].to_string())
+    };
+    let mut mentions = Vec::new();
+    for (at, _) in page.match_indices("<code") {
+        let tag_end = at + page[at..].find('>').unwrap();
+        if page[at..tag_end].contains("data-tour") {
+            continue;
+        }
+        let end = tag_end + page[tag_end..].find("</code>").unwrap();
+        let text = decode(&strip_tags(&page[tag_end + 1..end]));
+        for line in text.lines().map(str::trim) {
+            if !line.starts_with("relish ") {
+                continue;
+            }
+            let context = enclosing(at, "<details", "</details>")
+                .or_else(|| enclosing(at, "<section", "</section>"))
+                .unwrap_or_default();
+            mentions.push((line.to_string(), decode(&strip_tags(&context))));
+        }
+    }
+    mentions
+}
+
+/// A visitor installs the release `install.sh` names, so every command the
+/// site, the README and the tour offer must exist in it, or say which
+/// release adds it. The tour itself may only use released commands.
+#[test]
+fn every_advertised_command_exists_in_the_installed_release() {
+    let released = released_cli();
+    let installer = installer_default();
+    assert_eq!(
+        released.version(),
+        installer,
+        "{RELEASED_CLI} describes {} but install.sh installs {installer}; regenerate it with \
+         `python3 scripts/release/released_cli.py {installer} > {RELEASED_CLI}`",
+        released.version()
+    );
+    let label = unreleased_label();
+    let mut failures = Vec::new();
+
+    let (readme, generated) = readme_split();
+    let start = readme.find(INSTALL_LINE).unwrap();
+    let end = start + readme[start..].find("```").unwrap();
+    let quick_start: Vec<String> = readme[start..end]
+        .lines()
+        .map(|line| line.split(" #").next().unwrap().trim().to_string())
+        .collect();
+    let mut tour = relish_lines(&homepage_commands());
+    tour.extend(relish_lines(&manual_commands()));
+    tour.extend(relish_lines(&quick_start));
+    for command in &tour {
+        if let Err(rejection) = released.check(command) {
+            failures.push(format!("the tour runs `{command}`: {rejection}"));
+        }
+    }
+
+    let mut entries = 0;
+    for line in generated.lines() {
+        let Some(synopsis) = line.trim_start().strip_prefix("- `") else {
+            continue;
+        };
+        let synopsis = &synopsis[..synopsis.find('`').unwrap()];
+        entries += 1;
+        let labelled = line.contains(&format!("*({label})*"));
+        match (released.check(synopsis), labelled) {
+            (Ok(()), false) | (Err(_), true) => {}
+            (Ok(()), true) => failures.push(format!(
+                "README labels `{synopsis}` ({label}), but {installer} has it"
+            )),
+            (Err(rejection), false) => failures.push(format!(
+                "README lists `{synopsis}` unlabelled: {rejection}; run `make readme-commands`"
+            )),
+        }
+    }
+    assert!(entries > 50, "found only {entries} README command entries");
+
+    let mut mentions = markdown_mentions(&readme);
+    mentions.extend(markdown_mentions(&read(
+        "docs/manual/08_five-minute-tour.md",
+    )));
+    mentions.extend(homepage_mentions());
+    assert!(mentions.len() > 20, "found only {mentions:?}");
+
+    // Once a release is installed, labels naming the one before it are stale.
+    let installed = installer.trim_start_matches('v');
+    let stale = regex::Regex::new(r"(\d+\.\d+\.\d+), not in (\d+\.\d+\.\d+)").unwrap();
+    for path in [
+        "README.md",
+        "docs/README.md",
+        "docs/website/index.html",
+        "docs/manual/08_five-minute-tour.md",
+        "docs/manual/14_batch-jobs.md",
+    ] {
+        for found in stale.captures_iter(&read(path)) {
+            if &found[2] != installed || &found[1] == installed {
+                failures.push(format!(
+                    "{path} says \"{}\", but install.sh installs {installed}",
+                    &found[0]
+                ));
+            }
+        }
+    }
+    for (command, context) in &mentions {
+        if let Err(rejection) = released.check(command)
+            && !context.contains(&label)
+        {
+            failures.push(format!(
+                "`{command}` is offered without \"{label}\" beside it: {rejection}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The version in a cast's header title, `Reliaburger 0.1.4: …`.
+fn recorded_version(cast: &str) -> String {
+    let header: serde_json::Value =
+        serde_json::from_str(read(cast).lines().next().unwrap()).unwrap();
+    let title = header["title"].as_str().expect("the cast has no title");
+    title
+        .strip_prefix("Reliaburger ")
+        .and_then(|rest| rest.split(':').next())
+        .filter(|version| version.split('.').count() == 3)
+        .unwrap_or_else(|| panic!("{cast}'s title {title:?} names no version"))
+        .to_string()
+}
+
+/// `scripts/demo/tour.sh --record … --install vX.Y.Z` writes the version
+/// into the cast's title, the page's caption names it, and it's the one the
+/// installer fetches, so a promotion can't forget the re-record (#688).
+#[test]
+fn the_tour_recording_matches_the_installer_version() {
+    let recorded = recorded_version("docs/website/assets/tour.cast");
+    let page = read("docs/website/index.html");
+    assert!(
+        page.contains(&format!("against the published {recorded} install")),
+        "the tour's caption doesn't say it was recorded against {recorded}"
+    );
+    assert!(
+        read("scripts/demo/tour.sh").contains("--title \"Reliaburger ${TITLE_VERSION}:"),
+        "tour.sh no longer writes the version into the cast's title"
+    );
+    let installer = installer_default();
+    match TOUR_RECORDED_BEHIND {
+        None => assert_eq!(
+            format!("v{recorded}"),
+            installer,
+            "the tour was recorded against {recorded}, but install.sh installs {installer}; \
+             re-record it (docs/website/README.md, \"Re-recording the tour\")"
+        ),
+        Some((behind, granted_under)) => {
+            assert_eq!(
+                recorded, behind,
+                "the tour was re-recorded; set TOUR_RECORDED_BEHIND to None"
+            );
+            assert_eq!(
+                installer, granted_under,
+                "install.sh now installs {installer}: re-record the tour against it and set \
+                 TOUR_RECORDED_BEHIND to None"
+            );
+        }
+    }
+}
+
+/// Each release in the roadmap's list with the name it gives it
+/// (`- [ ] **0.3.0: "Bare metal in an hour"**`), lower-cased.
+fn roadmap_release_names() -> Vec<(String, String)> {
+    let mut names = Vec::new();
+    for line in read("docs/roadmap.md").lines() {
+        let Some(heading) = line
+            .strip_prefix("- [x] **")
+            .or_else(|| line.strip_prefix("- [ ] **"))
+        else {
+            continue;
+        };
+        let Some((versions, rest)) = heading.split_once(": ") else {
+            continue;
+        };
+        let name = match rest.strip_prefix('"') {
+            Some(quoted) => quoted.split('"').next().unwrap(),
+            None => rest.split(['.', '*']).next().unwrap(),
+        };
+        for version in versions.split(" and ") {
+            names.push((version.to_string(), name.trim().to_lowercase()));
+        }
+    }
+    names
+}
+
+/// The landing page's release cards use the roadmap's names and link to
+/// something real (D37): no "MVP", no "MDE", no arrow that goes nowhere.
+#[test]
+fn release_cards_use_roadmap_release_names() {
+    let page = read("docs/website/index.html");
+    let roadmap = roadmap_release_names();
+    let mut cards = Vec::new();
+    for (at, _) in page.match_indices("<aside class=\"status\"") {
+        let card = &page[at..at + page[at..].find("</aside>").unwrap()];
+        let strong = &card[card.find("<strong>").unwrap() + "<strong>".len()..];
+        let strong = decode(&strong[..strong.find("</strong>").unwrap()]);
+        let (version, name) = strong
+            .split_once(": ")
+            .unwrap_or_else(|| panic!("card {strong:?} isn't \"VERSION: name\""));
+        assert!(
+            roadmap
+                .iter()
+                .any(|(v, n)| v == version && *n == name.to_lowercase()),
+            "card {strong:?} doesn't match a release heading in docs/roadmap.md"
+        );
+        assert!(
+            card.contains("<a href=\"https://"),
+            "card {strong:?} links nowhere"
+        );
+        assert_eq!(
+            card.matches('↗').count(),
+            card.matches("<span aria-hidden=\"true\">↗</span></a>")
+                .count(),
+            "card {strong:?} has an arrow outside a link"
+        );
+        cards.push(version.to_string());
+    }
+    for release in ["0.2.0", "0.3.0", "0.4.0"] {
+        assert!(
+            cards.iter().any(|card| card == release),
+            "no {release} card"
+        );
+    }
+    for stale in ["(MVP)", "(MDE)", "0.7.0"] {
+        assert!(!page.contains(stale), "the page still says {stale:?}");
+    }
+}
+
+/// Every recording under `assets/` is one the page plays, and every one it
+/// plays is there: an orphaned cast is a stale demo nobody checks.
+#[test]
+fn the_site_references_every_published_cast() {
+    let page = read("docs/website/index.html");
+    let mut on_disk: Vec<String> = std::fs::read_dir(repository().join("docs/website/assets"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".cast"))
+        .collect();
+    on_disk.sort();
+    let mut played: Vec<String> = page
+        .split("data-cast=\"./assets/")
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        .collect();
+    played.sort();
+    assert_eq!(on_disk, played);
+}
+
+/// The line the Pages workflow uses to find the release the installer
+/// fetches, and the ones that take the demo's files from that release.
+const DEMO_TAG_LINE: &str =
+    "tag=$(sed -n 's/.*RELIABURGER_VERSION:-\\(v[0-9][0-9.]*\\)}.*/\\1/p' docs/website/install.sh)";
+const DEMO_FETCH_LINE: &str = "git fetch --depth=1 origin \"refs/tags/$tag:refs/tags/$tag\"";
+const DEMO_CHECKOUT_LINE: &str =
+    "git checkout \"$tag\" -- examples/kubernetes/podinfo.yaml examples/demo/burger";
+
+/// `/demo/*` is what someone who just installed the release runs, so the
+/// workflow publishes it from that release's tag, not from `main` (#688).
+#[test]
+fn the_demo_assets_come_from_the_installed_release() {
+    let workflow = read(".github/workflows/static.yml");
+    let tag = workflow.find(DEMO_TAG_LINE).expect("no tag line");
+    let fetch = workflow.find(DEMO_FETCH_LINE).expect("no tag fetch");
+    let remove = workflow
+        .find("rm -rf examples/demo/burger")
+        .expect("burger/ isn't cleared before the checkout");
+    let checkout = workflow.find(DEMO_CHECKOUT_LINE).expect("no tag checkout");
+    let copy = workflow.find(&format!("cp {DEMO_SOURCE}")).unwrap();
+    let pack = workflow.find(BURGER_PACK).unwrap();
+    assert!(tag < fetch && fetch < remove && remove < checkout);
+    assert!(checkout < copy && checkout < pack);
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{DEMO_TAG_LINE}; printf %s \"$tag\""))
+        .current_dir(repository())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), installer_default());
 }

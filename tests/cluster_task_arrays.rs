@@ -28,8 +28,11 @@ use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
+use bun_process::{PortBlockReservation, reserve_port_block_lease};
 use cluster_support::{
     MembershipSource, WiredNode, WiredNodeOptions, cluster_tests_enabled, local, start_wired_node,
 };
@@ -1044,13 +1047,18 @@ async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another
     root.cancel();
 }
 
-const HUNG_BASE_PORT: u16 = BASE_PORT + 300;
+/// Ports one wired node binds: gossip, Raft, reporting and the API.
+const HUNG_PORTS_PER_NODE: u16 = 4;
 const HUNG_ARRAYS: usize = 16;
-const HUNG_TASKS: u32 = 6_000;
+// 16 arrays of 4,000 tasks at 20 ms each on 3 × 16 slots take at least
+// 27 s however fast the host is: three times the ~9 s from submitting them
+// to the end of the hung window, and 13 s less than 6,000 tasks took (#760).
+const HUNG_TASKS: u32 = 4_000;
 const HUNG_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 
 async fn start_hung_node(
     index: usize,
+    ports: &PortBlockReservation,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
     data: &std::path::Path,
@@ -1078,7 +1086,7 @@ async fn start_hung_node(
     );
     start_wired_node(WiredNodeOptions {
         name: format!("hung{index}"),
-        gossip_port: HUNG_BASE_PORT + (index as u16) * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-hung-worker",
@@ -1119,25 +1127,48 @@ async fn hang_sync(control: &std::path::Path) {
     panic!("the worker kept replacing its fence file");
 }
 
-/// Release the hung sync: open the FIFO's write end (which lets the blocked
-/// reader's open finish), remove it, then close it so the read sees end of
-/// file. The node's next sync finds no fence file and carries on.
+/// Release every hung sync. The leader gives up on a sync after its 3 s
+/// timeout and sends another, so by now two or more of the worker's syncs
+/// can be blocked on the FIFO, each holding a blocking thread.
+///
+/// First move the FIFO aside, so the next sync finds no fence file and
+/// carries on. Then open and close its write end until no reader holds it.
+/// An open wakes the readers blocked opening the FIFO, and a close lets
+/// their reads see end of file. One open and close frees every reader on
+/// Linux, but on macOS some readers stay blocked in `read` after it, and
+/// the runtime then waits for their threads forever at shutdown (#760).
+/// No reader is left once opening the write end without blocking fails
+/// with `ENXIO` a few times in a row.
 async fn release_sync(control: std::path::PathBuf) {
     use std::os::unix::fs::OpenOptionsExt;
     tokio::task::spawn_blocking(move || {
-        for _ in 0..100 {
-            if let Ok(writer) = std::fs::OpenOptions::new()
+        let aside = control.with_extension("released");
+        std::fs::rename(&control, &aside).unwrap();
+        let mut woke = false;
+        let mut unheld = 0;
+        for _ in 0..200 {
+            match std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
-                .open(&control)
+                .open(&aside)
             {
-                std::fs::remove_file(&control).unwrap();
-                drop(writer);
-                return;
+                Ok(writer) => {
+                    woke = true;
+                    unheld = 0;
+                    drop(writer);
+                }
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                    unheld += 1;
+                    if woke && unheld >= 3 {
+                        std::fs::remove_file(&aside).unwrap();
+                        return;
+                    }
+                }
+                Err(error) => panic!("can't open the FIFO's write end: {error}"),
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("nothing was blocked on the FIFO");
+        panic!("readers still hold the FIFO, or none was ever blocked on it");
     })
     .await
     .unwrap();
@@ -1161,11 +1192,16 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_hung_node(0, vec![], &root, data[0].path()).await];
+    // Leased blocks, held until the test ends, so no other fixture on the
+    // host binds these ports while the cluster runs.
+    let ports: Vec<PortBlockReservation> = (0..3)
+        .map(|_| reserve_port_block_lease(HUNG_PORTS_PER_NODE))
+        .collect();
+    let seed = local(ports[0].base);
+    let mut nodes = vec![start_hung_node(0, &ports[0], vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(
-            start_hung_node(index, vec![local(HUNG_BASE_PORT)], &root, directory.path()).await,
-        );
+        nodes
+            .push(start_hung_node(index, &ports[index], vec![seed], &root, directory.path()).await);
     }
     wait_until(
         "three settled voters",
