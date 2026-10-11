@@ -3655,6 +3655,49 @@ that only holds the command channel. The loop answers it by publishing a fresh
 snapshot and spawning the runtime reads, so it costs a turn of microseconds,
 not the old 500 ms.
 
+The rootless test failed a fourth time, in a new way (#734): "owned runtime
+never settled on v0.1.0", 45 seconds after a rollback, with nothing else to go
+on. The settle loop only polled `upgrade_status`, so it couldn't tell a slow
+node from a dead one. Now it also asks the Bun child whether it has exited
+and, if so, fails at once with Bun's log. That log showed two different ways
+an exec'd Bun can die before it answers again.
+
+The first is in the test fixture. It chose Bun's fixed API port by binding
+port 0 and closing the socket. Every exec closes Bun's sockets too, and in
+that gap any other test on the runner can draw the same number from the
+ephemeral range. The new Bun then exits with "Address already in use".
+Chapter 14.7 tells that half; the fixtures now lease their ports.
+
+The second is in the product. Bun runs each short `runc` command for a
+container through an independent command owner, so a command outlives the
+process that asked for it. Before admitting the next command, the generation
+checks that every earlier one has retired, and it refused at once if one
+hadn't. Normally that never happens inside one process, because a command
+holds the generation's claim until it finishes. But an exec ends the old
+process mid-command: the state sweep's `runc state` keeps running under its
+owner, the new binary adopts its containers straight away, finds that command
+still running, and fails adoption, which stops Bun from starting. The owner
+retires the command a moment later by itself, so admission now waits up to
+five seconds for an earlier command to finish:
+
+```rust
+let deadline = tokio::time::Instant::now() + EARLIER_COMMAND_RETIREMENT;
+while !self.commands_terminal().await? {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(earlier_command_running());
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+```
+
+The `?` sits inside the loop condition. A failed status read returns the
+error from the whole function at once; only a clean "not yet" goes round the
+loop again. A command still running after five seconds is treated as stuck,
+and admission refuses as it always did, so a hung command still fences off
+everything after it. A test kills a process mid-command, the way an exec
+does, and claims the generation in a fresh one. That test failed with the
+exact error from the CI run before the change.
+
 #### The tick reads in parallel
 
 `check_apps` and `check_jobs` asked the runtime for every running instance's
