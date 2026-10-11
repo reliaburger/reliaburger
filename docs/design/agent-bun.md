@@ -1272,7 +1272,11 @@ Three decisions shape everything that follows, and each earns its keep against t
    Tokio's blocking pool (`spawn_blocking`), never on a runtime worker.
    Done in place they starved the node's Raft core, which missed the
    leader's heartbeats and called an election just before the exec,
-   deposing a healthy leader on every voter swap (#783).
+   deposing a healthy leader on every voter swap (#783). So do the other
+   steps whose cost grows with the binary or the disk: writing and deleting
+   the probe's private copy in 3, and syncing the `Staged` marker. On a busy
+   disk each of those alone held a worker for 0.2 to 0.6 s (#794). The
+   worker only launches the probe and waits for its answer.
 
 5. Exec the new binary in place (execve). The PID does not change; running
    containers keep serving. On startup the new Bun ADOPTS its still-running
