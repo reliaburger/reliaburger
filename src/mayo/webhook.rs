@@ -510,13 +510,17 @@ pub fn latest_series_values(
 ///
 /// Reads the recent window, preserving the newest value of each metric/label
 /// identity. Freshness and derived percentages use [`latest_series_values`].
+///
+/// `now` (Unix seconds) is the evaluation instant: the window reaches back
+/// from it and readings older than the freshness bound before it are
+/// dropped. The caller owns the clock, as with
+/// [`RollupGenerator::generate`](crate::mayo::rollup_generator::RollupGenerator::generate),
+/// so a caller that wrote its samples against one instant judges them
+/// against that same instant (#763).
 pub async fn gather_latest_values(
     store: &crate::mayo::store::MayoStore,
+    now: u64,
 ) -> HashMap<MetricKey, f64> {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let window_start = now.saturating_sub(QUERY_WINDOW_SECS);
 
     let mut series: HashMap<(String, String), (u64, f64)> = HashMap::new();
@@ -633,7 +637,11 @@ mod tests {
             );
         }
         store.flush().await.unwrap();
-        let values = gather_latest_values(&store).await;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let values = gather_latest_values(&store, now).await;
         assert_eq!(values.len(), 2);
         assert_eq!(
             values.get(&MetricKey::with_labels(
@@ -649,6 +657,30 @@ mod tests {
             )),
             Some(&10.0)
         );
+    }
+
+    /// #763: freshness is judged against the caller's clock, not a wall
+    /// clock read inside, so a reading stays fresh for exactly the bound
+    /// after the caller's `now`, however long the caller took to get here.
+    #[tokio::test]
+    async fn freshness_is_judged_against_the_callers_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = crate::mayo::store::MayoStore::new(directory.path().into());
+        let stamped = 1_700_000_000;
+        let key = MetricKey::with_labels("cpu", BTreeMap::from([("node".into(), "a".into())]));
+        store.insert(
+            &key,
+            crate::mayo::types::Sample {
+                timestamp: stamped,
+                value: 42.0,
+            },
+        );
+        store.flush().await.unwrap();
+
+        let fresh = gather_latest_values(&store, stamped + MAX_VALUE_AGE_SECS).await;
+        assert_eq!(fresh.get(&key), Some(&42.0));
+        let stale = gather_latest_values(&store, stamped + MAX_VALUE_AGE_SECS + 1).await;
+        assert!(stale.is_empty(), "{stale:?}");
     }
 
     #[test]

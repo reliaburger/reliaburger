@@ -3076,8 +3076,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = eval_shutdown.cancelled() => break,
                     _ = tick.tick() => {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
                         let store = eval_mayo.read().await;
-                        let latest = gather_latest_values(&store).await;
+                        let latest = gather_latest_values(&store, now_secs).await;
                         drop(store);
 
                         let transitions = {
