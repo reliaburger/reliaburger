@@ -963,7 +963,7 @@ A crash mid-write can leave half a line at the end of the newest segment. On ope
 
 ### One layer instead of thirty handlers
 
-The obvious way to audit apply, delete, exec, rollback and the rest is a `record_audit(...)` call in each handler. That's about thirty call sites, each with several early returns, and the first handler someone adds next year won't have one. So most auditing happens in one axum layer, `audit_layer`, that wraps every authenticated route. It sits inside the auth layer, so the caller's `AuthContext` is already in the request's extensions, and it knows the matched route pattern (`MatchedPath`), the path parameters and, after the handler has run, the status. If the route is in `AUDITED_ROUTES` and the response is a success, it writes the record. A refused request changed nothing, so it isn't recorded.
+The obvious way to audit apply, delete, exec, rollback and the rest is a `record_audit(...)` call in each handler. That's about thirty call sites, each with several early returns, and the first handler someone adds next year won't have one. So most auditing happens in one axum layer, `audit_layer`, that wraps every authenticated route. It sits inside the auth layer, so the caller's `AuthContext` is already in the request's extensions, and it knows the matched route pattern (`MatchedPath`), the path parameters and, after the handler has run, the status. If the route is in `AUDITED_ROUTES` and the response is a success, it writes the record. Refusals get their own record, which we'll come to below.
 
 Some handlers know things the path doesn't. An apply's namespace is in the manifest, a decommission's target node is in the JSON body. Passing those back up through every return path would undo the point of the layer, so the handler *annotates* the request instead:
 
@@ -990,6 +990,75 @@ A layer driven by a table has the same weakness as the handlers it replaced: som
 ### Reading it back
 
 `GET /v1/audit` takes `since`, `until`, `action` (exact, or a family like `fault.*`), `principal` and `namespace`, and returns the newest matching records, oldest first. With `?cluster=true` the node asks every live member for its records and merges them by `(timestamp, node, sequence)`, naming any member that didn't answer. It forwards the *caller's* token rather than the cluster service token, so each node repeats the authorisation itself, and the service token never needs to be able to read the log. That matters: the log lists every principal and the addresses they work from, which is exactly the map an attacker holding a stolen node credential would want. Reading needs an unscoped Admin with `admin` across the cluster. `relish audit` wraps it, with `--since 2h` style times.
+
+### Recording the refusals
+
+Our first version recorded only successes, on the theory that a refused request changed nothing. That's true, and beside the point. After an incident you want to know who tried the door, not just who got in: a token probing namespaces it doesn't own, a stolen credential bouncing off a `[permission]` block, a script hammering `fault inject` with no token at all. So every audited route now records its refusals as `api.refused`, with the principal (or `anonymous`), the source address, the route, the namespace when we know it, and a reason: `unauthenticated`, `forbidden` or `scope`.
+
+Where should that happen? Not in `audit_layer`. A request with a bad token is answered by the auth middleware with a 401 and never reaches a layer inside it. So there's a second layer, `refusal_layer`, *outside* the auth layer, which sees every response on its way out. It knows the route and the status, but not who the caller was: the `AuthContext` lived in the request, which was consumed on the way in. The inner layer does know, so on a 401 or 403 it hands that knowledge outwards on the response:
+
+```rust
+response.extensions_mut().insert(RefusedCaller {
+    principal,
+    token_name,
+    app: note.app,
+    namespace: note.namespace,
+});
+```
+
+An axum (really, `http` crate) request or response carries *extensions*: a map keyed by type, so `insert` stores one value of each type and `extensions().get::<RefusedCaller>()` gets it back. The `::<RefusedCaller>` part is Rust's "turbofish", which names a generic function's type parameter when the compiler can't infer it. Extensions never go on the wire, so a private struct can ride along to the outer layer, which takes it back off with `remove`. `RefusedCaller` isn't `pub`, so nothing outside the module can read or forge one.
+
+The `reason` uses the same trick. A 403 might be a role check, a permission block or a scope check, and we didn't want to tell them apart by parsing error messages. So the scope checks build their refusal through one helper that marks it:
+
+```rust
+pub fn scope_refusal(message: impl Into<String>) -> Response {
+    let mut response = (StatusCode::FORBIDDEN, message.into()).into_response();
+    response.extensions_mut().insert(RefusalReason::Scope);
+    response
+}
+```
+
+`impl Into<String>` in argument position means "any type that converts into a `String`", so callers pass a `&str` literal or a `format!` result without writing `.to_string()`. A 403 without the mark is `forbidden`.
+
+### A flood mustn't flush the log
+
+Here's the catch. A real action costs the caller something: it needs a valid token, and it does work. A refusal costs nothing. A script with a wrong token can make thousands a second, and our log is bounded. Record every one and, within the hour, the oldest segments (the real history) are gone. The audit trail would become a denial-of-service lever against itself.
+
+So refusals go through `RefusalLimiter`, a fixed-window counter per source address and principal. The first five refusals a minute from a source are recorded; the rest are counted; when the minute is over, one `api.refusals_suppressed` record says "45 more refused requests by anonymous from 203.0.113.9 suppressed". The source is the IP without the port, since every new connection gets a new port, and a key that includes it would never repeat.
+
+The key is an enum whose variants carry different data:
+
+```rust
+pub enum RefusalSource {
+    Caller {
+        address: Option<IpAddr>,
+        principal: String,
+    },
+    Overflow,
+}
+```
+
+C has tagged unions you have to keep honest yourself; Rust's enums *are* tagged unions, checked by the compiler, and `#[derive(Hash, PartialEq, Eq)]` makes one a `HashMap` key. `Overflow` is there because the limiter's memory must be bounded too. An attacker with a botnet, or an IPv6 /64, has an endless supply of addresses, and a map with one entry per address is a memory leak with extra steps. The limiter tracks at most 256 sources; while the table is full, refusals from new sources are counted together under `Overflow`. On top of that, all sources together get at most 100 records a minute, so even 256 busy sources can't write more than a few hundred KiB an hour.
+
+Closing windows is a sweep over the map:
+
+```rust
+self.sources.retain(|source, window| {
+    if !window.closed_at(now) {
+        return true;
+    }
+    if window.suppressed > 0 {
+        summaries.push(SuppressedRefusals { /* ... */ });
+    }
+    false
+});
+```
+
+`retain` keeps the entries for which the closure returns `true` and drops the rest, in one pass. The closure borrows `summaries` mutably while `retain` borrows the map, which is fine because they're different values; the borrow checker only objects when two mutable borrows could touch the same thing. The sweep runs on every refusal, so the next refusal from anyone carries the summaries that are due, and a small task runs it every 15 seconds too, so a burst that simply stops still gets its summary.
+
+Notice what the limiter *doesn't* do: it doesn't read the clock. `admit(source, now)` takes the time as an argument. That made the tests trivial: `a_burst_of_refusals_is_summarised_not_stored_one_by_one` sends fifty refusals at one instant and the fifty-first a minute later, with no sleeping and no paused runtime. It also means a clock that steps backwards keeps a window open (`saturating_sub` stops at zero) instead of underflowing.
+
+Last, the log now counts toward the node's disk pressure, alongside task data (chapter 17). It stays within `audit_max_bytes` regardless, but the disk doesn't know which directory a byte belongs to.
 
 What we didn't build: a central copy. Each node's log is its own, so a node you decommission takes its history with it, and a call a follower forwards to the leader shows up on both (with the client's address on one and the follower's on the other). Shipping records to the leader, or to object storage, and chaining their hashes so tampering shows, are the obvious next steps. Neither was needed to make "who did what" answerable after a restart, which was the bug.
 

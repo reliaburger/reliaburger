@@ -923,11 +923,9 @@ fn log_metadata_preflight(
             .as_ref()
             .is_some_and(|allowed| !allowed.iter().any(|value| value == namespace))
     {
-        return Err((
-            StatusCode::FORBIDDEN,
+        return Err(crate::sesame::auth::scope_refusal(
             "token scope does not allow this namespace",
-        )
-            .into_response());
+        ));
     }
     if let Some(grep) = &query.grep {
         crate::ketchup::log_store::validate_grep(grep).map_err(log_query_error)?;
