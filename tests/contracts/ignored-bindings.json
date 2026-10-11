@@ -1297,6 +1297,12 @@
   },
   {
     "source": "tests/self_upgrade_cluster.rs",
+    "function": "version_form_rolls_the_nodes_platform_build_countersigned_by_relish",
+    "binary": "reliaburger::self_upgrade_cluster",
+    "test": "version_form_rolls_the_nodes_platform_build_countersigned_by_relish"
+  },
+  {
+    "source": "tests/self_upgrade_cluster.rs",
     "function": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader",
     "binary": "reliaburger::self_upgrade_cluster",
     "test": "upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader"

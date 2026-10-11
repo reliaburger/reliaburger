@@ -719,16 +719,23 @@ Requirements:
 - **Signatures.** Network upgrades need two Ed25519 signatures over the
   binary: one from the release key set compiled into the running binary, and
   one from the operator key configured as `upgrades.external_signing_key` in
-  node.toml (generate one with `relish dev keygen`). Air-gapped
+  node.toml (generate one with `relish dev keygen`). Published metadata
+  carries only the release signature, so `relish upgrade start <version>`
+  countersigns each download with `--external-key` (or takes a countersigned
+  `--sig`), picking the build for the platform each node reports. Air-gapped
   `upgrade start --binary` needs only the release signature (expects
   `{binary}.sig` alongside the file — see `relish dev sign-binary`).
 - **A versioned binary directory** (default: the directory of the running
   executable): `bun` is a symlink to `bun-vX.Y.Z`; previous versions are
   retained for rollback (`upgrades.retain_versions`, default 3).
-- **Matching formats.** The leader runs `bun --compatibility` on a verified
-  candidate before recording a cluster upgrade and refuses one with a different
-  protocol or state format; a cluster rollback is refused when a node's binary
-  directory lacks the target (`installed_versions` in `GET /v1/version`).
+- **Matching formats.** Until 1.0 a rolling upgrade works only between builds
+  with the same protocol and state format, and every release so far changed
+  one, so moving between releases means a fresh cluster. `relish upgrade check`
+  reads each release's pair from the metadata and says so. The leader runs
+  `bun --compatibility` on a verified candidate before recording a cluster
+  upgrade and refuses one with a different protocol or state format; a cluster
+  rollback is refused when a node's binary directory lacks the target
+  (`installed_versions` in `GET /v1/version`).
 
 The release private key must live outside any repository. The project key's
 public half is compiled into `src/upgrade/keys.rs`; rotating it means shipping

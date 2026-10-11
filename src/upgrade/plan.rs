@@ -16,7 +16,7 @@
 //! *what those nodes are*.
 
 use super::error::UpgradeError;
-use super::types::{NodeRole, NodeUpgradePhase, NodeUpgradeRecord};
+use super::types::{NodeRole, NodeUpgradePhase, NodeUpgradeRecord, PlatformBinary, select_binary};
 use super::version::BinaryVersion;
 
 /// The leader's authoritative view of one node: what relish must match.
@@ -166,6 +166,7 @@ where
             // Authoritative, not the client's copy.
             address,
             role: authoritative.role,
+            platform: None,
             from_version: None,
             phase: NodeUpgradePhase::Pending,
             directive_retry: None,
@@ -184,6 +185,9 @@ pub struct RunningBinary {
     /// Hex SHA-256 of the running executable. `None` when the node could
     /// not (or does not) report it.
     pub sha256: Option<String>,
+    /// `{os}-{arch}` the node reports. `None` when it didn't say, and on a
+    /// single node, where there is only one build to compare against.
+    pub platform: Option<String>,
 }
 
 /// Verdict of [`check_target`] when the upgrade may go ahead.
@@ -246,6 +250,50 @@ pub fn check_target(
     } else {
         Ok(TargetCheck::Proceed)
     }
+}
+
+/// [`check_target`] for a run that carries one build per platform.
+///
+/// Each node is compared with the build for its own platform, and a node
+/// whose platform has no build is refused with
+/// [`UpgradeError::NoBuildForPlatform`]: it would otherwise be handed
+/// another architecture's binary, which can't even start.
+pub fn check_platform_targets(
+    target: &BinaryVersion,
+    binaries: &[PlatformBinary],
+    allow_downgrade: bool,
+    running: &[RunningBinary],
+) -> Result<TargetCheck, UpgradeError> {
+    let mut verdict = TargetCheck::AlreadyRunning;
+    for node in running {
+        let Some(binary) = select_binary(binaries, node.platform.as_deref()) else {
+            return Err(UpgradeError::NoBuildForPlatform {
+                node: node.node.clone(),
+                platform: node
+                    .platform
+                    .clone()
+                    .unwrap_or_else(|| "an unreported platform".to_string()),
+                available: binaries
+                    .iter()
+                    .map(|binary| binary.platform.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        };
+        let node_verdict = check_target(
+            target,
+            &binary.sha256,
+            allow_downgrade,
+            std::slice::from_ref(node),
+        )?;
+        if node_verdict == TargetCheck::Proceed {
+            verdict = TargetCheck::Proceed;
+        }
+    }
+    if running.is_empty() {
+        verdict = TargetCheck::Proceed;
+    }
+    Ok(verdict)
 }
 
 /// Whether one node can accept a cluster (network) upgrade directive, as
@@ -512,6 +560,7 @@ mod tests {
             node: format!("node {node}"),
             version: version.parse().unwrap(),
             sha256: sha256.map(String::from),
+            platform: None,
         }
     }
 
@@ -547,6 +596,58 @@ mod tests {
             err,
             UpgradeError::SameVersionDifferentBinary { .. }
         ));
+    }
+
+    fn build(platform: &str, sha256: &str) -> PlatformBinary {
+        PlatformBinary {
+            platform: platform.to_string(),
+            sha256: sha256.to_string(),
+            embedded_signature: "sig".to_string(),
+            external_signature: Some("ext".to_string()),
+        }
+    }
+
+    fn on(platform: &str, mut node: RunningBinary) -> RunningBinary {
+        node.platform = Some(platform.to_string());
+        node
+    }
+
+    #[test]
+    fn each_node_is_compared_with_the_build_for_its_platform() {
+        let builds = [build("linux-x86_64", "xx"), build("linux-aarch64", "aa")];
+        // Both already run the candidate for their own platform.
+        let nodes = [
+            on("linux-x86_64", running("a", "v0.2.0", Some("xx"))),
+            on("linux-aarch64", running("b", "v0.2.0", Some("aa"))),
+        ];
+        let target = "v0.2.0".parse().unwrap();
+        assert_eq!(
+            check_platform_targets(&target, &builds, false, &nodes).unwrap(),
+            TargetCheck::AlreadyRunning
+        );
+        // The arm64 node runs other bytes on the same version.
+        let nodes = [
+            on("linux-x86_64", running("a", "v0.2.0", Some("xx"))),
+            on("linux-aarch64", running("b", "v0.2.0", Some("xx"))),
+        ];
+        let err = check_platform_targets(&target, &builds, false, &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::SameVersionDifferentBinary { ref node, .. } if node == "node b"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_node_on_a_platform_without_a_build_is_refused() {
+        let builds = [build("linux-x86_64", "xx")];
+        let nodes = [on("linux-aarch64", running("b", "v0.1.0", Some("old")))];
+        let err =
+            check_platform_targets(&"v0.2.0".parse().unwrap(), &builds, false, &nodes).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::NoBuildForPlatform { ref platform, .. } if platform == "linux-aarch64"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("linux-x86_64"), "{err}");
     }
 
     #[test]

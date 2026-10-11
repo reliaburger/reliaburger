@@ -8291,6 +8291,34 @@
       "boundaries": [
         "Real runtime regression; ordinary app instances are not collected."
       ]
+    },
+    {
+      "id": "issue-687-version-form-upgrades-with-the-nodes-platform-build",
+      "issue": 687,
+      "promise": "relish upgrade start <version> downloads the release build for the platform the nodes report, countersigns it with the operator's external key, and the rolling upgrade completes; a release with other cluster formats is refused before anything is recorded.",
+      "supported_paths": [
+        "Cluster upgrades started from relish against release metadata"
+      ],
+      "cases": [
+        {
+          "id": "self-upgrade-cluster-version_form_rolls_the_nodes_platform_build_countersigned_by_relish",
+          "binary": "reliaburger::self_upgrade_cluster",
+          "test": "version_form_rolls_the_nodes_platform_build_countersigned_by_relish",
+          "requires": [
+            "upgrade-cluster"
+          ],
+          "sources": [
+            "tests/self_upgrade_cluster.rs",
+            "src/relish/upgrade.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A release whose metadata names another protocol or state pair is refused with a fresh-cluster message and no run is recorded."
+      ],
+      "boundaries": [
+        "Every node in the harness runs on the test host's platform, so mixed-architecture selection is covered by the relish, orchestrator and plan unit tests."
+      ]
     }
   ]
 }
