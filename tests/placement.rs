@@ -175,6 +175,7 @@ async fn start_node_with(
         seeds,
         shutdown: shutdown.clone(),
         data_dir_prefix: "rb-placement",
+        data_root: None,
         stale_report_timeout_secs: 30,
         metrics_rollup: Some(Duration::from_millis(500)),
         // Fast learning period so the test doesn't wait long.
@@ -964,7 +965,8 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
     "#,
     )
     .unwrap();
-    let [n1, n2, n3] = start_autoscale_cluster(27341, &config, &shutdown).await;
+    // Below the 27000..30000 range other suites lease port blocks from.
+    let [n1, n2, n3] = start_autoscale_cluster(22341, &config, &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     for node in &nodes {

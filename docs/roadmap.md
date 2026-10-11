@@ -302,8 +302,18 @@ migration and no feature gate
   [#640](https://github.com/reliaburger/reliaburger/issues/640). Sustained daily and
   storage-bound qualification [#668](https://github.com/reliaburger/reliaburger/issues/668)
   and resident model workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
-  The million-task release gate and sustained 100m/day claim still require
-  real-runtime qualification ([foundation evidence](qualification/2026-10-04-delegated-jobs/README.md)).
+  **Exit gate (decision D18-C, audit [#674](https://github.com/reliaburger/reliaburger/issues/674)):**
+  #668's list, on at least three nodes: 24 hours at 1,158 accepted successes a
+  second or more (100 million a day) plus headroom, with concurrent apps,
+  several resource profiles, worker and leader loss, delayed messages and disk
+  faults. `scripts/release/qualify-jobs-sustained.sh --tier final` runs it
+  ([#686](https://github.com/reliaburger/reliaburger/issues/686)); bounded job
+  storage ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has
+  to pass first. Every run records the September plan's measurements (wall
+  time of a million-task array, p99 start lag, Raft entries a second and
+  state, leader memory and CPU, executor overhead, ledger bytes, retained
+  logs) without gating on them; that plan is
+  [archived](plans/archive/2026-09-28-plan-million-jobs.md).
   [Chapter 17](book/17-a-million-jobs.md).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
