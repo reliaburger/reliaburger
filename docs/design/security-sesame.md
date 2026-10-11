@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Sesame is Reliaburger's built-in PKI, identity, and security layer. It provides the cryptographic foundation that every other subsystem depends on: mutual TLS between cluster nodes, workload identity certificates for every app and job, API authentication for human operators and CI systems, secret encryption at rest, and network-level firewalling. Raft log encryption is designed and implemented as a module but is **not yet wired into the durable log** — see the status note in §5.6.
+Sesame is Reliaburger's built-in PKI, identity, and security layer. It provides the cryptographic foundation that every other subsystem depends on: mutual TLS between cluster nodes, workload identity certificates for every app and job, API authentication for human operators and CI systems, secret encryption at rest, and network-level firewalling. Raft log entries are encrypted at rest under a key derived from the cluster master key; the Raft snapshot is not (§5.6).
 
 Sesame is not a separate binary or sidecar. It is compiled into the single `reliaburger` binary and activated during `relish init`. Every security primitive -- certificate authorities, certificate signing, token management, secret encryption, firewall rule generation -- is handled by code paths within the existing node roles (council and worker).
 
@@ -13,7 +13,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 - **Workload identity.** SPIFFE-compatible X.509 certificates and OIDC JWTs for every workload, issued via a CSR model, rotated automatically.
 - **API authentication.** Scoped tokens with roles, TTLs, and rate limits. Optional OIDC integration with external identity providers.
 - **Secret encryption.** Asymmetric age encryption for secrets checked into git. Namespace-scoped keypairs for multi-tenant isolation.
-- **Data at rest encryption (planned — implemented but not yet wired).** AES-256-GCM encryption of the Raft log, with HKDF key derivation and optional TPM sealing. The crypto lives in `sesame::raft_encryption` (complete and tested) but has no call sites yet; the durable log currently writes plaintext. TPM sealing is not implemented at all.
+- **Data at rest encryption (Raft log entries only).** Raft log entries are encrypted with AES-256-GCM under a key derived (HKDF-SHA256, fresh salt per entry) from the cluster master key, which is stored on the node. `snapshot.redb` and the vote and log-position metadata are plaintext, and a cluster without a master key writes a plaintext log. This protects a stolen disk or copied log, not a node whose root is compromised. Snapshot encryption with a TPM- or identity-derived key is 0.3.0 appliance work (#402); TPM sealing is not implemented.
 - **Network security.** nftables perimeter firewall, eBPF inter-app firewall, egress allowlists, namespace isolation -- all managed automatically by Bun.
 - **Certificate revocation.** CRL distribution for long-lived node certificates.
 
@@ -732,8 +732,8 @@ pub enum AttestationMode {
 /// Encryption state for the Raft log on a council node.
 #[derive(Debug)]
 pub struct RaftLogEncryption {
-    /// AES-256-GCM key derived via HKDF from the node's identity.
-    /// This is derived at startup and held in memory only.
+    /// Intended design. Today each entry's AES-256-GCM key is derived via
+    /// HKDF from the cluster master key with a per-entry salt (§5.6).
     pub log_encryption_key: [u8; 32],
 
     /// HKDF salt (stored alongside the encrypted Raft log on disk).
@@ -1054,9 +1054,14 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 
 ### 5.6 Raft Log Encryption
 
-> **Status: implemented (with a cluster master key).** `council::durable_log`
-> now routes entry values through `sesame::raft_encryption` (HKDF derivation,
-> AES-256-GCM seal/open) whenever `open_with_key` is given a cluster master key.
+> **Status: log entries encrypted, keyed by the master key; snapshot plaintext.**
+> `council::durable_log` routes entry values through `sesame::raft_encryption`
+> (HKDF derivation from the cluster master key with a per-entry salt,
+> AES-256-GCM seal/open) whenever `open_with_key` is given that key. The master
+> key is stored on the node, so this protects a stolen disk or copied log, not a
+> node whose root is compromised. `snapshot.redb` (token hashes, wrapped keys,
+> desired state) is written in plaintext; encrypting it with a TPM- or
+> identity-derived key is 0.3.0 appliance work (#402).
 > Encrypted entries carry a one-byte marker and a per-entry salt+nonce; a
 > plaintext entry (leading `{`) still decodes, so plaintext and encrypted logs
 > interoperate and a keyless/dev cluster stays plaintext. An encrypted entry
@@ -1065,11 +1070,11 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 > sensitive keys inside the log (step 5) ships as before. TPM sealing (step 2) is
 > still not implemented.
 
-On each council node (intended design):
+On each council node (intended design; step 1 differs today, see the status note):
 
 1. At startup, derive the AES-256-GCM encryption key via HKDF:
-   - **Input keying material:** the node's certificate private key (DER bytes).
-   - **Salt:** a random 32-byte salt stored alongside the Raft log on disk.
+   - **Input keying material:** the node's certificate private key (DER bytes). Today it's the cluster master key.
+   - **Salt:** a random 32-byte salt stored alongside the Raft log on disk. Today each entry carries its own salt.
    - **Info:** `"reliaburger-raft-log-encryption-v1"`.
 2. If a TPM is available, seal the derived key to the current PCR values. The key can only be unsealed on the same hardware with the same boot state.
 3. All Raft log writes are encrypted with AES-256-GCM using the derived key. Each entry gets a unique nonce (96-bit counter, never reused).
@@ -1488,7 +1493,7 @@ council_size = 3
 1. Immediately run `relish ca rotate` for the compromised CA. **(Planned — CA rotation is not implemented yet, §5.8. Until it ships, the practical response is CRL-revoking affected certificates and, in the worst case, re-bootstrapping the PKI.)**
 2. Revoke all certificates issued by the compromised CA (via the CRL, §5.7).
 3. The dual-signing period ensures existing legitimate certificates continue working during the transition.
-4. Investigate how the key was exfiltrated. Council nodes should have restricted access; TPM sealing and at-rest Raft log encryption are planned hardening (§5.6), not yet active.
+4. Investigate how the key was exfiltrated. Council nodes should have restricted access. At-rest encryption covers Raft log entries only, under the master key on the same host (§5.6); TPM sealing is planned hardening, not yet active.
 
 **Root CA compromise:** If the sealed root CA backup is stolen, the attacker can sign new intermediate CAs. This requires a full PKI re-bootstrap: `relish init` on a new cluster and migrating workloads.
 
@@ -1521,9 +1526,9 @@ council_size = 3
 
 ### 7.5 Raft Log Encryption Key Loss
 
-> **Applies only once §5.6 ships.** At-rest Raft log encryption and TPM sealing
-> are not wired today (the log is plaintext), so this failure mode is about the
-> planned design, not current behaviour.
+> **Applies only once TPM sealing ships.** Today the log key comes from the
+> cluster master key, which every node holds, so moving a disk to new hardware
+> doesn't break decryption. This failure mode is about the planned design.
 
 **Scenario:** A council node's disk is moved to different hardware, breaking TPM sealing.
 
@@ -1548,7 +1553,7 @@ council_size = 3
 The threat model assumes:
 
 - **Trusted:** The operator who runs `relish init` and has access to the sealed root CA backup.
-- **Semi-trusted:** Council nodes. They hold sensitive key material. The intended hardening (minimal attack surface, TPM sealing, encrypted Raft logs) is only partly shipped: TPM sealing and at-rest Raft log encryption are planned, not active (§5.6). Today's protection for keys in the log is the per-key HKDF wrapping, not whole-log encryption.
+- **Semi-trusted:** Council nodes. They hold sensitive key material. The intended hardening (minimal attack surface, TPM sealing, encrypted Raft state) is only partly shipped: Raft log entries are encrypted under the master key, the snapshot is plaintext, and TPM sealing is planned (§5.6). For keys in the snapshot, the protection is the per-key HKDF wrapping.
 - **Untrusted:** Worker nodes. They may be compromised. The system is designed so that a compromised worker node has limited blast radius.
 - **Untrusted:** Network between nodes. All inter-node communication is mTLS-authenticated and encrypted.
 - **Untrusted:** External network. Declared app allowlists are default-deny; apps without an egress block remain unrestricted until the planned cluster default lands. nftables perimeter rules and Wrapper-only ingress cover inbound traffic.
@@ -1615,7 +1620,7 @@ The threat model assumes:
 
 - Council nodes should have the smallest possible attack surface.
 - TPM sealing would ensure key material cannot be extracted even with disk access (planned — not implemented).
-- Encrypted Raft logs would protect against offline forensic access (planned — the encryption module exists but is not wired; the log is plaintext today, §5.6). Per-key HKDF wrapping does protect the age/CA keys stored inside the log.
+- Encrypted Raft log entries protect against offline access to a copied log, but the key is the master key on the same host and `snapshot.redb` is plaintext (§5.6). Per-key HKDF wrapping protects the age/CA keys stored in Raft state.
 - Council nodes should be on a restricted management network.
 
 ### 8.4 Join Token Theft
