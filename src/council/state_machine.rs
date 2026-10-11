@@ -1565,6 +1565,9 @@ impl StateMachineInner {
                     Ok(crate::meat::task_array_store::TaskArrayApplied::Registered {
                         batch_id,
                     }) => return Some(CouncilResponse::TaskArrayRegistered { batch_id }),
+                    Ok(crate::meat::task_array_store::TaskArrayApplied::Ticked { refused }) => {
+                        return Some(CouncilResponse::TaskArrayTicked { refused });
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         return Some(CouncilResponse::Refused {
@@ -8091,6 +8094,42 @@ mod tests {
         let array = state.task_arrays.get(1).unwrap();
         assert_eq!(array.state.summary().held, 8);
         assert_eq!(state.batch_state.next_batch_id, 2);
+    }
+
+    #[tokio::test]
+    async fn a_tick_entry_reports_its_refused_arrays() {
+        use crate::meat::index_set::IndexRangeSet;
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let grant = |batch_id| TaskArrayWrite::Sync {
+            now_epoch_secs: 0,
+            batch_id,
+            results: Vec::new(),
+            grants: vec![(
+                crate::meat::types::NodeId::new("n1"),
+                IndexRangeSet::from_range(0..=0),
+            )],
+        };
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply_fixture(vec![
+                normal_entry(1, 1, task_array_register(10)),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::TaskArray(Box::new(TaskArrayWrite::Tick {
+                        writes: vec![grant(1), grant(9)],
+                    })),
+                ),
+            ])
+            .await
+            .unwrap();
+        let CouncilResponse::TaskArrayTicked { refused } = &responses[1] else {
+            panic!("expected a tick, got {:?}", responses[1]);
+        };
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, 9);
+        let state = sm.desired_state().await;
+        assert_eq!(state.task_arrays.get(1).unwrap().state.summary().held, 4);
     }
 
     #[tokio::test]

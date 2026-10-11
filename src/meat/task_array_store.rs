@@ -7,10 +7,11 @@
 //! (no council) apply the same writes to an in-memory copy, so there's one
 //! set of rules either way.
 //!
-//! The writes are few by design: one `Register` per submission, at most one
-//! `Sync` per array per leader tick (carrying every finished chunk and every
-//! new grant since the last one), and a `Cancel` or `Requeue` when those
-//! happen. A million tasks cost a few hundred entries, not millions.
+//! The writes are few by design: one `Register` per submission, one `Tick`
+//! per leader tick (carrying every array's finished chunks, new grants and
+//! lost-node requeues since the last one), and a `Cancel` when someone
+//! cancels. A million tasks cost a few hundred entries, not millions, and
+//! sixty-four busy arrays still cost one entry a second.
 
 use std::collections::BTreeMap;
 
@@ -44,6 +45,11 @@ pub const RESERVED_TRIGGERED_RUNS: usize = 32;
 /// Most active arrays, batches and manual runs one namespace may hold, so one
 /// tenant can't take every slot. Cron fires and deployment jobs don't count.
 pub const MAX_ACTIVE_RUNS_PER_NAMESPACE: usize = 64;
+
+/// Most progress writes one `Tick` entry may carry. A tick with every
+/// active run, each with a sync, a quota note and a few lost nodes, fits;
+/// the leader splits a larger one across entries.
+pub const MAX_TICK_WRITES: usize = 1024;
 
 /// Most named jobs in one finite batch (`relish batch` with several jobs).
 pub const MAX_FINITE_BATCH_JOBS: usize = 64;
@@ -272,9 +278,47 @@ pub enum TaskArrayWrite {
         batch_id: u64,
         reason: Option<crate::meat::quota::QuotaError>,
     },
+    /// One leader tick's progress for every array, in one entry: `Sync`,
+    /// `Requeue`, `Unknown` and `QuotaBlocked` writes, at most
+    /// [`MAX_TICK_WRITES`]. Each applies on its own, so one refused array
+    /// doesn't drop the others.
+    Tick { writes: Vec<TaskArrayWrite> },
 }
 
 impl TaskArrayWrite {
+    /// The array a progress write is about (`None` for every other kind).
+    pub fn progress_batch_id(&self) -> Option<u64> {
+        match self {
+            Self::Sync { batch_id, .. }
+            | Self::Requeue { batch_id, .. }
+            | Self::Unknown { batch_id, .. }
+            | Self::QuotaBlocked { batch_id, .. } => Some(*batch_id),
+            _ => None,
+        }
+    }
+
+    /// Fill in the leader's clock where the write (or, for a `Tick`, each
+    /// of its writes) left it at zero.
+    pub fn stamp(&mut self, now: u64) {
+        match self {
+            Self::Sync { now_epoch_secs, .. }
+            | Self::Cancel { now_epoch_secs, .. }
+            | Self::Requeue { now_epoch_secs, .. }
+            | Self::Replay { now_epoch_secs, .. }
+            | Self::CancelManifest { now_epoch_secs, .. }
+                if *now_epoch_secs == 0 =>
+            {
+                *now_epoch_secs = now;
+            }
+            Self::Tick { writes } => {
+                for write in writes {
+                    write.stamp(now);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// IDs required by an atomic registration; progress writes allocate none.
     pub fn registration_ids(&self) -> usize {
         match self {
@@ -307,6 +351,8 @@ pub enum TaskArrayApplied {
     /// These chunks went back to the queue (or were written off, if the
     /// array had stopped).
     Requeued { chunks: IndexRangeSet },
+    /// A tick applied; these of its writes were refused, by array.
+    Ticked { refused: Vec<(u64, String)> },
 }
 
 /// Why a write was refused as a whole.
@@ -648,6 +694,31 @@ impl TaskArrays {
                 Ok(TaskArrayApplied::JobRecorded)
             }
             TaskArrayWrite::Job(write) => self.apply_job(write, allocate_id),
+            TaskArrayWrite::Tick { writes } => {
+                if writes.len() > MAX_TICK_WRITES
+                    || writes
+                        .iter()
+                        .any(|write| write.progress_batch_id().is_none())
+                {
+                    return Err(TaskArrayStoreError::Job(format!(
+                        "a tick carries at most {MAX_TICK_WRITES} progress writes"
+                    )));
+                }
+                // Each progress write checks everything before it changes
+                // anything, so a refused one leaves its array as it was.
+                let mut refused = Vec::new();
+                for write in writes {
+                    // A function pointer, not a closure: a closure here would be a
+                    // new type for every `allocate_id`, and `apply` would recurse
+                    // through them for ever at compile time.
+                    let no_ids: fn() -> u64 = || 0;
+                    if let Err(error) = self.apply(write, no_ids) {
+                        let batch_id = write.progress_batch_id().unwrap_or_default();
+                        refused.push((batch_id, error.to_string()));
+                    }
+                }
+                Ok(TaskArrayApplied::Ticked { refused })
+            }
             TaskArrayWrite::RegisterManifest {
                 name,
                 namespace,
@@ -1139,15 +1210,19 @@ impl TaskArrays {
     }
 
     fn mark_terminal(&mut self, id: u64, now: u64) -> Result<(), TaskArrayStoreError> {
-        let record = self.record_mut(id)?;
+        // Borrow the two fields separately: the record stays readable while
+        // the run is changed, with no copy of the array's state.
+        let Self { arrays, jobs, .. } = self;
+        let record = arrays
+            .get_mut(&id)
+            .ok_or(TaskArrayStoreError::UnknownArray { batch_id: id })?;
         if record.state.status().is_terminal() && record.terminal_at_epoch_secs.is_none() {
             record.terminal_at_epoch_secs = Some(now.max(record.state.submitted_at_epoch_secs));
             record.quota_blocked = None;
         }
-        let state = record.state.clone();
-        if let Some(run) = self.jobs.run_mut(id) {
+        if let Some(run) = jobs.run_mut(id) {
             run.unknown_owners
-                .retain(|node| state.held_by(node).is_some());
+                .retain(|node| record.state.held_by(node).is_some());
         }
         Ok(())
     }
@@ -2327,6 +2402,142 @@ mod tests {
         let summary = arrays.get(id).unwrap().state.summary();
         assert_eq!(summary.succeeded, 4);
         assert_eq!(summary.held, 4);
+    }
+
+    #[test]
+    fn batched_tick_write_applies_every_array_atomically() {
+        let mut arrays = TaskArrays::default();
+        let ids: Vec<u64> = (1..=3)
+            .map(|id| registered(&mut arrays, &register(8, 4, 1), id))
+            .collect();
+        arrays
+            .apply(
+                &sync(
+                    1,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                || 0,
+            )
+            .unwrap();
+        // One entry: retire and regrant array 1, grant array 2, take array
+        // 1's other chunk back from a lost node, and note a quota on 3.
+        arrays
+            .apply(
+                &sync(
+                    1,
+                    vec![],
+                    vec![(node("b"), IndexRangeSet::from_range(1..=1))],
+                ),
+                || 0,
+            )
+            .unwrap();
+        let tick = TaskArrayWrite::Tick {
+            writes: vec![
+                TaskArrayWrite::Requeue {
+                    batch_id: 1,
+                    node: node("b"),
+                    now_epoch_secs: 5,
+                },
+                sync(
+                    1,
+                    vec![(node("a"), finished(0, 1, 4))],
+                    vec![(node("a"), IndexRangeSet::from_range(1..=1))],
+                ),
+                sync(
+                    2,
+                    vec![],
+                    vec![(node("b"), IndexRangeSet::from_range(0..=1))],
+                ),
+                TaskArrayWrite::QuotaBlocked {
+                    batch_id: 3,
+                    reason: Some(crate::meat::quota::QuotaError::CpuExceeded {
+                        namespace: "default".into(),
+                        current: 1000,
+                        requested: 1000,
+                        limit: 1000,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(tick.registration_ids(), 0);
+        assert_eq!(
+            arrays.apply(&tick, || panic!("a tick allocates no ids")),
+            Ok(TaskArrayApplied::Ticked {
+                refused: Vec::new()
+            })
+        );
+        let first = &arrays.get(ids[0]).unwrap().state;
+        assert_eq!(first.summary().succeeded, 4);
+        assert_eq!(
+            first.held_by(&node("a")),
+            Some(&IndexRangeSet::from_range(1..=1))
+        );
+        assert_eq!(
+            first.attempt_of(ChunkId(1)),
+            2,
+            "requeued before regranting"
+        );
+        assert_eq!(arrays.get(ids[1]).unwrap().state.summary().held, 8);
+        assert!(arrays.get(ids[2]).unwrap().quota_blocked.is_some());
+
+        // A tick may carry only progress writes; anything else refuses the
+        // whole entry before any of it applies.
+        let before = arrays.clone();
+        let mixed = TaskArrayWrite::Tick {
+            writes: vec![
+                sync(2, vec![(node("b"), finished(0, 1, 4))], vec![]),
+                register(8, 4, 1),
+            ],
+        };
+        assert!(arrays.apply(&mixed, || 9).is_err());
+        let nested = TaskArrayWrite::Tick {
+            writes: vec![TaskArrayWrite::Tick { writes: vec![] }],
+        };
+        assert!(arrays.apply(&nested, || 9).is_err());
+        let oversized = TaskArrayWrite::Tick {
+            writes: vec![sync(2, vec![], vec![]); MAX_TICK_WRITES + 1],
+        };
+        assert!(arrays.apply(&oversized, || 9).is_err());
+        assert_eq!(arrays, before);
+    }
+
+    #[test]
+    fn one_refused_array_in_a_batch_does_not_drop_the_others() {
+        let mut arrays = TaskArrays::default();
+        registered(&mut arrays, &register(8, 4, 1), 1);
+        registered(&mut arrays, &register(8, 4, 1), 2);
+        let tick = TaskArrayWrite::Tick {
+            writes: vec![
+                sync(
+                    1,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                // Pruned since the leader planned it.
+                sync(
+                    7,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                TaskArrayWrite::Unknown {
+                    batch_id: 2,
+                    node: node("nobody"),
+                },
+                sync(
+                    2,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(1..=1))],
+                ),
+            ],
+        };
+        let Ok(TaskArrayApplied::Ticked { refused }) = arrays.apply(&tick, || 0) else {
+            panic!("the tick as a whole applies");
+        };
+        let refused: Vec<u64> = refused.iter().map(|(id, _)| *id).collect();
+        assert_eq!(refused, vec![7, 2]);
+        assert_eq!(arrays.get(1).unwrap().state.summary().held, 4);
+        assert_eq!(arrays.get(2).unwrap().state.summary().held, 4);
     }
 
     #[test]
