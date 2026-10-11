@@ -1575,6 +1575,8 @@ mod tests {
             namespace: None,
             exec: Some("/usr/bin/true".into()),
             script: None,
+            firewall: None,
+            egress: None,
         })
     }
 
