@@ -240,9 +240,9 @@ serves every test. Library unit tests reach the same file through
 `#[cfg(all(test, unix))] #[path = "../tests/support/first_launch.rs"] mod first_launch;`
 in `src/lib.rs`.
 
-The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: the
-`warm-executables` step that [#722](https://github.com/reliaburger/reliaburger/issues/722)
-adds runs each of them once before the suite.
+The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
+depends on `make warm-executables`, which runs each of them once before the suite
+([#722](https://github.com/reliaburger/reliaburger/issues/722)).
 
 ## Benchmarks and coverage
 
