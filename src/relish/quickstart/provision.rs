@@ -243,33 +243,27 @@ mod tests {
     /// Run the generated provision script with stub system tools and
     /// record every `apt-get` and `systemctl` invocation. `missing` is a
     /// package the stub `dpkg-query` has never heard of.
+    ///
+    /// The stubs are shell functions defined ahead of the script, not files
+    /// on `PATH`: macOS assesses every newly written executable on its first
+    /// launch, one at a time across the host, so fresh stub files could wait
+    /// out nextest's limit behind another process's large binary (#762).
     #[cfg(unix)]
     fn run_provisioning(missing: Option<&str>) -> Provisioned {
-        use std::os::unix::fs::PermissionsExt;
         let yaml = vm_config("/private/cache/guest.qcow2", "aarch64", 19117, None, None).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let script = value["provision"][0]["script"].as_str().unwrap();
-        let stubs = tempfile::tempdir().unwrap();
-        let apt_log = stubs.path().join("apt.log");
-        let systemctl_log = stubs.path().join("systemctl.log");
-        let tools = [
-            (
-                "dpkg-query",
-                "for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done",
-            ),
-            ("apt-get", "echo \"$*\" >> \"$APT_LOG\""),
-            ("systemctl", "echo \"$*\" >> \"$SYSTEMCTL_LOG\""),
-            ("install", "true"),
-        ];
-        for (name, body) in tools {
-            let path = stubs.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let logs = tempfile::tempdir().unwrap();
+        let apt_log = logs.path().join("apt.log");
+        let systemctl_log = logs.path().join("systemctl.log");
+        let stubs = "dpkg-query() { for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done; }\n\
+                     apt-get() { echo \"$*\" >> \"$APT_LOG\"; }\n\
+                     systemctl() { echo \"$*\" >> \"$SYSTEMCTL_LOG\"; }\n\
+                     install() { true; }\n";
         let status = std::process::Command::new("bash")
             .arg("-c")
-            .arg(script)
-            .env("PATH", format!("{}:/usr/bin:/bin", stubs.path().display()))
+            .arg(format!("{stubs}{script}"))
+            .env("PATH", "/usr/bin:/bin")
             .env("MISSING", missing.unwrap_or(""))
             .env("APT_LOG", &apt_log)
             .env("SYSTEMCTL_LOG", &systemctl_log)
