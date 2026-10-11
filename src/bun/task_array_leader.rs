@@ -1492,6 +1492,7 @@ mod tests {
             failed_indices: IndexRangeSet::new(),
             not_run: 0,
             retried: 0,
+            retry_causes: Default::default(),
         }
     }
 

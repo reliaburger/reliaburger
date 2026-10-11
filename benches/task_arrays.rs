@@ -102,6 +102,7 @@ fn simulate_leader(nodes: usize) -> TaskArrayState {
                     failed_indices: failed,
                     not_run: 0,
                     retried: 0,
+                    retry_causes: Default::default(),
                 };
                 let _ = state.complete(&holder, &result);
             }
@@ -182,6 +183,7 @@ fn answers(arrays: &TaskArrays, nodes: usize) -> Vec<(NodeId, NodeSyncResponse)>
                                     failed_indices: IndexRangeSet::new(),
                                     not_run: 0,
                                     retried: 0,
+                                    retry_causes: Default::default(),
                                 };
                                 result.duration_counts[0] = u64::from(result.succeeded);
                                 result
@@ -349,6 +351,7 @@ fn write_outcomes(directory: &std::path::Path, tasks: u32) -> (u64, u64) {
                 exit_code: Some(i32::from(index % 100 == 0)),
                 run_ms: 5,
                 output: None,
+                retry_causes: Default::default(),
             })
             .collect();
         ledger.append(&records);

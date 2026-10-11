@@ -8421,6 +8421,7 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
                         },
                         not_run: 0,
                         retried: 0,
+                        retry_causes: Default::default(),
                         duration_counts: [0; 16],
                     },
                 )],

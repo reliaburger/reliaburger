@@ -119,7 +119,13 @@ alias by resemblance.
 
 The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
 run through `make test-linux`, where the warmed digest-pinned mirror remains
-reachable. They do not run in the OCI interruption driver's isolated network
+reachable. Two of them start three in-process nodes (gossip, Raft, the API
+and the leader loop, as `bun --cluster` wires them) with real shared-runc or
+cgroup host executors, and stop the leader's control plane while it runs its
+own share of an array: no accepted outcome may be lost or counted twice, and
+only the chunks the lost leader held may run again. `make test-cluster` runs
+the same leader loss with fake runners at a hundred thousand tasks
+(`tests/cluster_task_arrays.rs`). They do not run in the OCI interruption driver's isolated network
 namespace. Their exact identities and the worker-loss cluster case are recorded
 in the finite inventory. A repository check verifies complete ignored-test
 bindings and current fingerprints for the retained OCI aliases.
@@ -275,6 +281,7 @@ a user would install it. The runbook is [`releasing.md`](releasing.md).
 | Staged install | `curl \| sh` against the exact signed candidate, from empty caches, then the homepage tour and a full teardown | [`qualify-staged-install.sh`](../scripts/release/qualify-staged-install.sh), [records](qualification/) |
 | Sustained soak, fast tier | About 90 minutes on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml) ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
 | Sustained soak, final tier | 8 hours on the hourly schedule, once per final candidate, for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run passes V02 | [`qualify-sustained.sh --tier final`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md) |
+| Job qualification (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. Fast: 90 minutes compressed. Final: 24 hours on the full schedule, the #668 run. Records the September plan's measurements without gating on them | [`qualify-jobs-sustained.sh --tier fast\|final`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c), [runbook](releasing.md#staging-a-candidate) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
 
 ## When a test flakes
@@ -296,6 +303,10 @@ building it.
 cover lost admission replies, resumption with the same request ID, monotonic
 accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
+For the job qualification tiers they also parse `--plan` output (every node
+fault kind on every node in the fast tier, a day of them in the final one),
+the target-load bodies and rate gate, retry-cause accounting, CPU sampling
+across restarts and the `.jobs.json` report beside the record.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
 fixtures with:
