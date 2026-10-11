@@ -331,7 +331,7 @@ actions = ["deploy", "scale", "logs", "metrics"]
 apps = ["web", "api"]
 ```
 
-Valid actions: `deploy`, `scale`, `logs`, `metrics`, `exec`, `host-exec`, `admin`, `secret-read`, `secret-write`. The `host-exec` and `admin` actions are required for process workloads and cluster administration respectively; `host-exec` also covers apps that mount a host path with `source`.
+Valid actions: `deploy`, `scale`, `logs`, `metrics`, `exec`, `host-exec`, `fault`, `admin`, `secret-read`, `secret-write`. The `host-exec` and `admin` actions are required for process workloads and cluster administration respectively; `host-exec` also covers apps that mount a host path with `source`. Snapshots and builds need `deploy` on their app, chaos faults need `fault`, and test leases need `admin`.
 
 ### 5.7 Namespace
 
