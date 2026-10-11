@@ -1377,11 +1377,15 @@ Some safety rails can be explicitly overridden with flags:
 | Quorum risk | Cannot be overridden | Always enforced |
 | Last-replica kill | Cannot be overridden | Always enforced |
 
-Overrides are logged with additional prominence in the audit log:
+Overrides are logged with additional prominence in the audit log (#685).
+Every `fault.injected` record carries `include_leader` and `override_safety`
+in its details, `true` or `false`, so a query can find the overridden ones,
+and an injection with either set is recorded at `critical` severity instead
+of `warning`, with "with safety overrides" in its message:
 
-```
-WARN: Fault injected with --override-safety by alice@myorg.
-      Affects 4/6 nodes (67%). Quorum protection still enforced.
+```sh
+relish audit --cluster --action fault.injected -o json \
+  | jq '.records[] | select(.details.override_safety == "true")'
 ```
 
 ---
@@ -1446,23 +1450,38 @@ acknowledgement. An Admin role doesn't override a missing operation grant.
 Council/node faults instead require Admin plus `alter_node_state`; node
 pressure requires Admin plus `saturate_capacity`.
 
-Every successful injection and reversal records a structured event:
+Every successful injection and reversal records a structured event in the
+node's durable audit log (`GET /v1/audit`, `relish audit`; see
+[security-sesame.md §5.11](security-sesame.md)), synced before the API
+answers:
 
 ```json
 {
+  "sequence": 42,
   "kind": "fault",
   "severity": "warning",
   "action": "fault.injected",
   "principal": "token:4f5c…",
   "app": "redis",
+  "namespace": "default",
   "node": "node-03",
+  "source_address": "10.0.4.17:51522",
   "details": {
     "fault_id": "7",
     "fault_type": "DnsNxdomain",
-    "duration_seconds": "300"
+    "duration_seconds": "300",
+    "include_leader": "false",
+    "override_safety": "false",
+    "token_name": "alice"
   }
 }
 ```
+
+The reversals are `fault.cleared` (by id), `fault.cleared-by-service` and
+`fault.cleared-all-workload`, attributed to the caller, and `fault.expired`,
+which the agent records as principal `system` when a fault's duration runs
+out and it reverses the effect. The agent loop doesn't wait for the disk, so
+an expiry reaches the log a moment after it happens.
 
 Permission evaluation flow:
 

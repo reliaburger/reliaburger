@@ -421,6 +421,60 @@ async fn common_cluster(
     (root, data, nodes, operator.plaintext)
 }
 
+/// Move Raft leadership off `leader` and return the index of the node that
+/// leads instead.
+///
+/// openraft 0.9 has no leadership transfer, and one `trigger().elect()` on a
+/// follower doesn't guarantee a handover. Right after a cron fire the leader
+/// writes the run's next entries, so the campaign can start while the leader
+/// holds an entry the candidate hasn't received yet. The leader and the other
+/// follower then refuse the candidate's shorter log. Its higher term still
+/// deposes the leader, but the election that follows favours the longest
+/// log, which is the old leader's, so the old leader wins again. Its
+/// elections therefore stay off until another voter leads, and the most
+/// up-to-date other voter campaigns every 3 s (longer than the 2 s leader
+/// lease) until one does.
+async fn hand_over_leadership(nodes: &[WiredNode], leader: usize) -> usize {
+    let others: Vec<usize> = (0..nodes.len()).filter(|&i| i != leader).collect();
+    nodes[leader].council.raft().runtime_config().elect(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut new_leader = None;
+    let mut campaigns = 0;
+    let term_before = nodes[leader].metrics_rx.borrow().current_term;
+    'campaigns: while tokio::time::Instant::now() < deadline {
+        let candidate = others
+            .iter()
+            .copied()
+            .max_by_key(|&i| nodes[i].metrics_rx.borrow().last_log_index)
+            .unwrap();
+        nodes[candidate]
+            .council
+            .raft()
+            .trigger()
+            .elect()
+            .await
+            .unwrap();
+        campaigns += 1;
+        let round = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < round {
+            for &other in &others {
+                if nodes[other].council.is_leader().await {
+                    new_leader = Some(other);
+                    break 'campaigns;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    nodes[leader].council.raft().runtime_config().elect(true);
+    let new_leader = new_leader.expect("timed out: replacement cron leader");
+    let term = nodes[new_leader].metrics_rx.borrow().current_term;
+    eprintln!(
+        "handover: node {new_leader} leads at term {term} (was {term_before}) after {campaigns} campaign(s)"
+    );
+    new_leader
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a real multi-node cluster; run with make test-cluster"]
 async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change() {
@@ -432,6 +486,13 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
         .unwrap();
     let follower = (leader + 1) % 3;
     let http = reqwest::Client::new();
+    // Registering a schedule marks the minute it lands in as already seen, so
+    // a request sent in a minute's last moments could land in the target
+    // minute and never fire. Register early in a minute instead.
+    let now = time::OffsetDateTime::now_utc();
+    if now.second() > 45 {
+        tokio::time::sleep(Duration::from_secs(61 - u64::from(now.second()))).await;
+    }
     // One upcoming minute, so a later legitimate occurrence cannot look like a duplicate.
     let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
     let expression = format!(
@@ -464,29 +525,10 @@ async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_chan
     .await;
     let id = id.unwrap();
     eprintln!("common cluster: UTC cron admitted run {id}; moving leadership");
-    // Trigger a real election while keeping all workers and quorum alive.
-    // Removing a voter is not a handover: the self-healing council may restore it.
-    nodes[follower]
-        .council
-        .raft()
-        .trigger()
-        .elect()
-        .await
-        .unwrap();
-    wait_until(
-        "replacement cron leader",
-        Duration::from_secs(30),
-        async || {
-            nodes[follower].council.is_leader().await
-                || nodes[(leader + 2) % 3].council.is_leader().await
-        },
-    )
-    .await;
-    let new_leader = if nodes[follower].council.is_leader().await {
-        follower
-    } else {
-        (leader + 2) % 3
-    };
+    // Move leadership with a real election while keeping all workers and
+    // quorum alive. Removing a voter is not a handover: the self-healing
+    // council may restore it.
+    let new_leader = hand_over_leadership(&nodes, leader).await;
     wait_until(
         "accepted scheduled singleton",
         Duration::from_secs(15),

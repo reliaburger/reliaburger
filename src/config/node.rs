@@ -600,6 +600,10 @@ pub struct StorageSection {
     pub logs: PathBuf,
     pub metrics: PathBuf,
     pub volumes: PathBuf,
+    /// The bound, in bytes, on this node's durable audit log under
+    /// `{data}/audit`. When the log reaches it the oldest records go first.
+    /// Defaults to 64 MiB; at least 64 KiB.
+    pub audit_max_bytes: u64,
     /// Absolute path prefixes a workload may bind-mount from this node with a
     /// volume or config-file `source`. Empty (the default) refuses every host
     /// path. Matching is by whole path component after resolving symlinks,
@@ -619,6 +623,7 @@ impl Default for StorageSection {
             logs: PathBuf::from("/var/lib/reliaburger/logs"),
             metrics: PathBuf::from("/var/lib/reliaburger/metrics"),
             volumes: PathBuf::from("/var/lib/reliaburger/volumes"),
+            audit_max_bytes: crate::bun::audit::DEFAULT_AUDIT_MAX_BYTES,
             allowed_host_paths: Vec::new(),
             snapshots: SnapshotsSection::default(),
         }

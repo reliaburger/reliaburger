@@ -63,6 +63,9 @@ struct Slot {
     /// A caller still waiting for admission holds nothing, so isn't counted.
     holder: Option<u64>,
     active_run: Option<u64>,
+    /// The running executor's cgroup while `active_run` is set: the context
+    /// itself is checked out of the slot then, so metrics read it here.
+    cgroup: Option<PathBuf>,
     key: Option<ExecutorKey>,
     context: Option<Context>,
     /// A busy slot whose executor missed [`RETIREMENT_DEADLINE`].
@@ -171,6 +174,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                         busy: false,
                         holder: None,
                         active_run: None,
+                        cgroup: None,
                         key: None,
                         context: None,
                         retiring: None,
@@ -248,6 +252,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .iter()
             .filter(|slot| slot.holder == Some(run))
             .count() as u64
+    }
+    /// The cgroups of the executors running this run's commands right now,
+    /// for CPU and memory sampling. An executor's group holds its helper and
+    /// its task groups, so the sample includes the helper's small overhead.
+    pub(crate) async fn run_cgroups(&self, run: u64) -> Vec<PathBuf> {
+        self.slots
+            .lock()
+            .await
+            .iter()
+            .filter(|slot| slot.active_run == Some(run))
+            .filter_map(|slot| slot.cgroup.clone())
+            .collect()
     }
     pub(crate) async fn active_commands(&self, run: u64) -> u64 {
         self.slots
@@ -1093,6 +1109,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             }
         };
         let run_id = task.run.as_ref().map(|run| run.batch_id);
+        let executor_cgroup = context.base.clone();
         // Only the command's own run time, from the helper's start receipt to
         // its exit: not slot queueing, admission, image pulls or cleanup.
         let mut ran = None;
@@ -1143,7 +1160,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     protocol::Event::Started if !started => {
                         started = true;
                         began = tokio::time::Instant::now();
-                        self.slots.lock().await[index].active_run = run_id;
+                        let mut slots = self.slots.lock().await;
+                        slots[index].active_run = run_id;
+                        slots[index].cgroup = Some(executor_cgroup.clone());
                     }
                     protocol::Event::Output { stream, bytes } if started => {
                         output.push(&bytes);
@@ -1238,6 +1257,7 @@ fn vacate(slot: &mut Slot, context: Option<Context>) {
     slot.busy = false;
     slot.holder = None;
     slot.active_run = None;
+    slot.cgroup = None;
 }
 
 /// Leave a busy slot's executor for the eviction loop to retire. Its
@@ -1249,6 +1269,7 @@ fn quarantine(slot: &mut Slot, context: Context, budget: Duration) {
     );
     slot.holder = None;
     slot.active_run = None;
+    slot.cgroup = None;
     slot.retiring = Some(context);
 }
 
@@ -1342,6 +1363,7 @@ impl<G: Grill + Clone + 'static> Drop for Checkout<G> {
                     let slot = &mut slots[index];
                     slot.holder = None;
                     slot.active_run = None;
+                    slot.cgroup = None;
                     slot.retiring = Some(context);
                 }
                 None => vacate(&mut slots[index], None),

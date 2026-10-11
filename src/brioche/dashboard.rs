@@ -165,6 +165,33 @@ pub fn escape_html(s: &str) -> String {
 }
 
 /// Render aggregate counters only. Names remain escaped like other dashboard input.
+/// A schedule's last few outcomes, newest first, from its durable history:
+/// what's left after the runs' own details were pruned.
+fn recent_outcomes(history: &serde_json::Value) -> String {
+    let outcomes: Vec<String> = history
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .rev()
+        .take(5)
+        .map(|outcome| {
+            format!(
+                "run {}: {} ({} succeeded, {} failed)",
+                outcome["run"],
+                escape_html(outcome["status"].as_str().unwrap_or("?")),
+                outcome["succeeded"],
+                outcome["failed"]
+            )
+        })
+        .collect();
+    if outcomes.is_empty() {
+        String::new()
+    } else {
+        format!("<br>Last runs: {}", outcomes.join("; "))
+    }
+}
+
 pub fn render_batches(rows: &[serde_json::Value]) -> String {
     let mut html = String::from(
         "<table><thead><tr><th>Run</th><th>Namespace</th><th>State</th><th>Succeeded / total</th><th>Failed</th><th>Queued</th><th>Accepted successes/s</th><th>Profiles</th></tr></thead><tbody>",
@@ -175,7 +202,7 @@ pub fn render_batches(rows: &[serde_json::Value]) -> String {
         let status = escape_html(row["status"].as_str().unwrap_or("unknown"));
         if row["kind"] == "schedule" {
             let expression = escape_html(row["cron"]["expression"].as_str().unwrap_or("?"));
-            html.push_str(&format!("<tr><td>{name}</td><td>{ns}</td><td>{status}</td><td colspan=\"5\">UTC schedule: {expression}; {} tasks per occurrence</td></tr>", row["total"]));
+            html.push_str(&format!("<tr><td>{name}</td><td>{ns}</td><td>{status}</td><td colspan=\"5\">UTC schedule: {expression}; {} tasks per occurrence{}</td></tr>", row["total"], recent_outcomes(&row["history"])));
             continue;
         }
         let rate = row["rates"]["successes_per_second"]
@@ -204,6 +231,22 @@ mod tests {
         ]);
         assert!(html.contains("0 3 * * *"));
         assert!(!html.contains("0 nightly"));
+    }
+
+    #[test]
+    fn a_schedule_shows_its_last_outcomes_newest_first() {
+        let html = render_batches(&[serde_json::json!({
+            "kind":"schedule","name":"nightly","namespace":"ops","status":"Scheduled",
+            "cron":{"expression":"0 3 * * *"},"total":1,
+            "history":[
+                {"run":40,"status":"Succeeded","succeeded":1,"failed":0},
+                {"run":41,"status":"CompletedWithFailures","succeeded":0,"failed":1},
+            ],
+        })]);
+        let newest = html.find("run 41: CompletedWithFailures (0 succeeded, 1 failed)");
+        let older = html.find("run 40: Succeeded");
+        assert!(newest.is_some() && older.is_some(), "{html}");
+        assert!(newest < older, "newest first: {html}");
     }
 
     #[test]
