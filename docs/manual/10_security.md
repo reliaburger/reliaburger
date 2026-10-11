@@ -181,7 +181,7 @@ do only what the block lists:
 | `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
-| `host-exec` | jobs and process workloads that run host commands, and apps with a host-path `source` on a volume or `config_file` |
+| `host-exec` | jobs and process workloads that run host commands, and apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`) |
 | `fault` | `relish fault` inject and clear on the listed apps; node faults and clearing every fault need it with `apps = ["*"]` and no `namespaces` |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
@@ -259,9 +259,29 @@ What's recorded:
 | Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
 
-Only actions that succeed are recorded; a refused request changed nothing.
 The cluster's own actions (a fault expiring, an expired token being swept)
 are recorded as `system`.
+
+Refused requests are recorded too, as `api.refused`, for every route in the
+table above: a missing or unknown token, a role or `[permission]` block that
+doesn't allow the call, or a scoped token reaching another namespace. The
+record names the principal (or `anonymous` when there was no valid token),
+the source address, the route, the app and namespace when they're known, and
+a `reason`: `unauthenticated`, `forbidden` or `scope`. It never holds the
+token or the request body.
+
+```sh
+relish audit --cluster --action api.refused --since 1h
+```
+
+A refused request costs the caller nothing, so a script with a wrong token
+could make thousands a second and push every real record out of the bounded
+log. To stop that, a node records at most five refusals a minute from one
+address and principal, and at most 100 a minute in all. It counts the rest,
+and when the minute is over it writes one `api.refusals_suppressed` record
+saying how many it suppressed and from whom. A node tracks at most 256
+sources at once; refusals from further sources are counted together, as
+`*` from "other sources".
 
 The log lives in `audit/` under `[storage] data`, as JSON Lines, one record
 per line. A node writes and syncs the record before it answers the request,
@@ -275,7 +295,8 @@ The log is bounded: 64 MiB per node by default, set with
 `[storage] audit_max_bytes` (at least 64 KiB). It's kept in eight segments,
 and when it reaches the bound the oldest segment is deleted, so you keep the
 most recent history. At a few hundred bytes a record, 64 MiB holds a couple
-of hundred thousand actions.
+of hundred thousand actions. The log counts toward the node's disk pressure
+alongside job data (see [Operations](12_operations.md)).
 
 Each node logs the requests it served. A request that a node forwards to the
 leader (an apply on a follower, say) appears twice: on the node you asked,

@@ -378,8 +378,9 @@ at a real address, unless an app or job's `allow_from` lets a named caller
 in, and egress allowlists hold apps and jobs to the hosts they list.
 
 **An audit log.** Each node keeps a durable, bounded log of who applied,
-deleted, exec'd, upgraded or broke what, and from where. `relish audit` reads
-it (0.2.0, not in 0.1.6).
+deleted, exec'd, upgraded or broke what, and from where, plus the requests
+it refused, rate-limited so a flood of bad tokens can't flush the history.
+`relish audit` reads it (0.2.0, not in 0.1.6).
 
 ## Limits in 0.1.6
 

@@ -168,7 +168,14 @@ maps it into the node range and prepares every read-write volume:
   source that is under, or contains, the node's `[storage]`, identity and
   script directories or the directories holding the master key and security
   bootstrap. At apply, any `source` counts as host access, so a token with a
-  `[permission]` block needs `host-exec` as well as `deploy`.
+  `[permission]` block needs `host-exec` as well as `deploy`. The check
+  returns the resolved path as an `ApprovedHostPath`, and
+  `WorkloadSupervisor::approve_host_paths` runs it again right before each
+  OCI spec is built (fresh instances and rolling or blue-green
+  replacements alike), so the bundle mounts the resolved path the policy
+  approved, not the `source` as written (#797). The remaining race: runc
+  mounts that path by name after the image pull and on every restart, so a
+  directory on it replaced by a symlink in between is still followed.
 - **Rootless runc** skips all of this: the volume was created by the user
   whose id is the container's only mapped id (container root).
 
@@ -1040,7 +1047,7 @@ before their Phase 15 cases can use this contract.
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
-9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was already checked against `[storage] allowed_host_paths` at admission). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
+9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was checked against `[storage] allowed_host_paths` at admission and again when the OCI spec was built, which mounts the resolved path that check approved). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container via containerd sharing the main container's network namespace and volumes. Wait for exit code 0. If any fails, transition to `Failed` and emit event.
 11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
 12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
@@ -1272,7 +1279,11 @@ Three decisions shape everything that follows, and each earns its keep against t
    Tokio's blocking pool (`spawn_blocking`), never on a runtime worker.
    Done in place they starved the node's Raft core, which missed the
    leader's heartbeats and called an election just before the exec,
-   deposing a healthy leader on every voter swap (#783).
+   deposing a healthy leader on every voter swap (#783). So do the other
+   steps whose cost grows with the binary or the disk: writing and deleting
+   the probe's private copy in 3, and syncing the `Staged` marker. On a busy
+   disk each of those alone held a worker for 0.2 to 0.6 s (#794). The
+   worker only launches the probe and waits for its answer.
 
 5. Exec the new binary in place (execve). The PID does not change; running
    containers keep serving. On startup the new Bun ADOPTS its still-running
@@ -1480,7 +1491,7 @@ join = ["10.0.1.5:9443"]
 - `[logs]` and `[metrics]` default to `max_storage_mb = 2048` and `1024`. `0` is an explicit opt-out, and Bun refuses at startup a cap larger than the filesystem holding its data directory.
 - Task data under `<data>/task-arrays/<id>/` is a 22-byte-per-task ledger, a dense result index of 24-byte slots (a sparse file, so a worker pays only for the tasks it ran) and kept failure output: one append-only segment per chunk grant, holding the head and tail of the first 16 failed tasks, written with one fsync per batch. A million tasks measure about 47 bytes per task (`make bench-task-arrays` fails above 50). The index replaced a redb B-tree that measured 87 bytes per task, four times the ledger; ledger plus index, about 109 bytes per task, is the same order as the 82 bytes per accepted task the October qualification rig lost, and nothing else on the task path grows per task.
 - The leader prunes finished runs an hour after they finish with a replicated `Prune` write on its one-second tick, not only on the next registration, and each worker deletes a run's directory once the leader stops listing it. An idle cluster therefore returns to its baseline disk use.
-- Task data counts toward disk pressure. When it passes a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
+- Task data counts toward disk pressure, and so does the audit log under `{data}/audit` (#798; `disk_pressure::node_data_bytes`). When they pass a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
 - Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. Ordinary app instances don't call it yet, so their route and journal files still outlive a deleted app.
 
 ### 7.4 Process Workload Binary Missing
@@ -1507,7 +1518,7 @@ join = ["10.0.1.5:9443"]
 
 **What happens:** The new binary fails to start after the upgrade exec.
 
-**Detection:** The new Bun exits within 30 seconds, or fails to rejoin gossip within 60 seconds.
+**Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)).
 
 **Impact:** This node is temporarily unable to accept new work. Running containers are unaffected (containerd manages them independently).
 

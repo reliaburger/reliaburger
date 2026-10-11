@@ -52,28 +52,48 @@ impl std::fmt::Display for QueryProgress {
     }
 }
 
-/// Run only bytes whose release signature has already been verified by the caller.
-/// A private copy keeps the probe independent of a mutable download path.
-pub(super) async fn check_binary(bytes: Vec<u8>, directory: &Path) -> Result<(), UpgradeError> {
-    let directory = directory.to_path_buf();
-    let executable = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(&directory)?;
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        file.write_all(&bytes)?;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
-        // Close the writable file before exec (Linux refuses ETXTBSY otherwise).
-        Ok(file.into_temp_path())
-    })
-    .await
-    .map_err(|e| UpgradeError::IncompatibleBinary(e.to_string()))??;
+/// A private, executable copy of a candidate binary, written for one
+/// compatibility query. Dropping it deletes the file.
+pub(super) struct Probe(tempfile::TempPath);
+
+/// Write a private copy of verified bytes that [`query_probe`] can run.
+///
+/// This writes the whole binary, so it blocks: call it on the blocking
+/// pool, next to the signature check that read the same bytes (#794). A
+/// private copy keeps the probe independent of a mutable download path.
+pub(super) fn write_probe(bytes: &[u8], directory: &Path) -> Result<Probe, UpgradeError> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(bytes)?;
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    // Close the writable file before exec (Linux refuses ETXTBSY otherwise).
+    Ok(Probe(file.into_temp_path()))
+}
+
+/// Run a probe whose bytes were signature-checked before it was written,
+/// and check that it reads and writes this build's formats.
+///
+/// The probe is deleted afterwards on the blocking pool: unlinking a
+/// release-sized file frees all of its pages, which on a busy disk took
+/// longer than a Raft heartbeat on the caller's worker (#794).
+pub(super) async fn query_probe(probe: Probe) -> Result<(), UpgradeError> {
+    let answer = query(&probe.0).await;
+    // A delete that fails leaves a stray temporary file behind, as
+    // `TempPath`'s own drop would; the answer is what the caller needs.
+    let _ = tokio::task::spawn_blocking(move || probe.0.close()).await;
+    answer
+}
+
+/// Ask the executable at `executable` which formats it uses.
+async fn query(executable: &Path) -> Result<(), UpgradeError> {
     let started = tokio::time::Instant::now();
     let deadline = started + QUERY_DEADLINE;
     let mut progress = QueryProgress::default();
     let mut child = loop {
-        match tokio::process::Command::new(&executable)
+        match tokio::process::Command::new(executable)
             .arg("--compatibility")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -148,8 +168,8 @@ pub(super) async fn check_binary(bytes: Vec<u8>, directory: &Path) -> Result<(),
     let status = match outcome {
         Ok(status) => status,
         Err(reason) => {
-            // Reap before dropping the temporary executable; cancellation also
-            // kills the child through Command::kill_on_drop.
+            // Reap before the caller deletes the temporary executable;
+            // cancellation also kills the child through Command::kill_on_drop.
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(UpgradeError::IncompatibleBinary(format!(

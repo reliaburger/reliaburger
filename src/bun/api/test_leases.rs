@@ -147,11 +147,9 @@ pub(super) async fn test_lease_create_handler(
         .as_ref()
         .is_some_and(|namespaces| !namespaces.contains(&namespace))
     {
-        return (
-            StatusCode::FORBIDDEN,
+        return crate::sesame::auth::scope_refusal(
             "token scope does not allow the requested test namespace",
-        )
-            .into_response();
+        );
     }
     crate::bun::audit::annotate(crate::bun::audit::AuditNote {
         app: None,
