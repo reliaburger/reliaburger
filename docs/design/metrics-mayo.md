@@ -328,7 +328,7 @@ Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the
 
 ### 5.6 Alert Evaluation
 
-The alert loop runs when `metrics.alerts_enabled` is set (default true), every `alerts.evaluation_interval_secs` (default **30**, not 15). Each tick, `gather_latest_values` reads the last 120 seconds of metrics, keeps the newest reading per `(metric_name, labels)` series, drops any reading older than a 90-second freshness bound, derives the memory/disk usage percentages *within* a label set, then collapses to one value per metric name (freshest series wins, deterministic tie-break). The evaluator (`src/mayo/alert.rs`) applies each rule to that value.
+The alert loop runs when `metrics.alerts_enabled` is set (default true), every `alerts.evaluation_interval_secs` (default **30**, not 15). Each tick, the loop reads the clock once and `gather_latest_values(store, now)` reads the metrics from 120 seconds before that instant onwards, keeps the newest reading per `(metric_name, labels)` series, drops any reading older than a 90-second freshness bound, derives the memory/disk usage percentages *within* a label set, then collapses to one value per metric name (freshest series wins, deterministic tie-break). The evaluator (`src/mayo/alert.rs`) applies each rule to that value.
 
 **Built-in alert rules (5, always active, node-scoped):**
 

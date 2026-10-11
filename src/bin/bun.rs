@@ -1020,6 +1020,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
             Err(e) => eprintln!("bun: warning: upgrade startup recovery failed: {e}"),
         }
+        // Hash our own binary now, off the request path. `/v1/version`
+        // reports the digest, and a joiner's compatibility check gives up
+        // after 10 s; hashing a debug Bun on that first request took longer
+        // on a loaded host (#765). The task ends once the digest is cached.
+        manager.spawn_running_binary_hash();
     }
 
     // Debug-only test hook: a `{exe}.fail-boot` sidecar next to the resolved
@@ -3076,8 +3081,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = eval_shutdown.cancelled() => break,
                     _ = tick.tick() => {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
                         let store = eval_mayo.read().await;
-                        let latest = gather_latest_values(&store).await;
+                        let latest = gather_latest_values(&store, now_secs).await;
                         drop(store);
 
                         let transitions = {
