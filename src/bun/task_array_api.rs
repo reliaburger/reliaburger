@@ -755,6 +755,11 @@ fn node_error(error: TaskArrayNodeError) -> Response {
         TaskArrayNodeError::UnknownArray { .. } | TaskArrayNodeError::NoOutput { .. } => {
             self::error(StatusCode::NOT_FOUND, error.to_string())
         }
+        // Gone, not missing: the task failed, but its chunk had already
+        // kept its share of failure output.
+        TaskArrayNodeError::OutputNotKept { .. } => {
+            self::error(StatusCode::GONE, error.to_string())
+        }
         other => self::error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }
@@ -1109,7 +1114,13 @@ pub async fn logs_handler(
     };
     let output = match url {
         None => match &state.task_arrays.node {
-            Some(node) => node.task_output_grant(batch_id, index, grant).await.ok(),
+            Some(node) => match node.task_output_grant(batch_id, index, grant).await {
+                Ok(bytes) => Some(bytes),
+                Err(error @ TaskArrayNodeError::OutputNotKept { .. }) => {
+                    return node_error(error);
+                }
+                Err(_) => None,
+            },
             None => None,
         },
         Some(url) => {
@@ -1120,6 +1131,9 @@ pub async fn logs_handler(
                     response.bytes().await.ok().map(|bytes| bytes.to_vec())
                 }
                 Ok(response) if response.status() == StatusCode::NOT_FOUND => None,
+                Ok(response) if response.status() == StatusCode::GONE => {
+                    return node_error(TaskArrayNodeError::OutputNotKept { index });
+                }
                 _ => {
                     return error(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1223,6 +1237,8 @@ mod tests {
             namespace: None,
             exec: Some("/usr/bin/true".into()),
             script: None,
+            firewall: None,
+            egress: None,
         }
     }
 

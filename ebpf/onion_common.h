@@ -88,6 +88,27 @@ struct firewall_value {
     __u32 action;  /* FIREWALL_DENY or FIREWALL_ALLOW */
 };
 
+/* ---------- destination_map --------------------------------------------- */
+
+/* Who owns a real destination: a backend's container address and port, a
+ * published node address and host port, or (port 0) every port of a
+ * container address. The connect hooks hold a non-VIP destination to the
+ * same namespace rules as a VIP. */
+
+#define DESTINATION_ANY_PORT   0
+#define NAMESPACE_CONTESTED    0xFFFFFFFF  /* two owners claim it: deny all */
+
+struct destination_key {
+    __u32 ip;     /* network byte order */
+    __u16 port;   /* network byte order; DESTINATION_ANY_PORT for any */
+    __u16 _pad;
+};
+
+struct destination_value {
+    __u32 app_id;        /* the firewall_map destination identity */
+    __u32 namespace_id;  /* owning namespace, or NAMESPACE_CONTESTED */
+};
+
 /* ---------- cgroup_namespace_map ---------------------------------------- */
 
 struct cgroup_ns_key {

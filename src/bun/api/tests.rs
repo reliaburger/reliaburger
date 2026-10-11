@@ -6655,6 +6655,8 @@ async fn version_endpoint_reports_the_build_commit() {
         json["version"],
         crate::upgrade::version::compiled_version().to_string()
     );
+    // relish picks each node's release artefact by this, not by its own host.
+    assert_eq!(json["platform"], crate::upgrade::metadata::platform_key());
     shutdown.cancel();
 }
 

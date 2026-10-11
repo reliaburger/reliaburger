@@ -23,6 +23,12 @@ impl BinaryVersion {
     pub fn file_name(&self, stem: &str) -> String {
         format!("{stem}-{self}")
     }
+
+    /// Whether this is a pre-release (`v0.2.0-dev`, `v1.0.0-rc.1`): a build
+    /// from main or a candidate, not a published release.
+    pub fn is_pre_release(&self) -> bool {
+        !self.0.pre.is_empty()
+    }
 }
 
 impl FromStr for BinaryVersion {

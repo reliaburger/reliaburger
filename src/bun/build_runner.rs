@@ -130,6 +130,11 @@ pub struct BuildRecord {
     pub state: BuildState,
     /// Registration time as seconds since the Unix epoch.
     pub created_at_epoch_secs: u64,
+    /// The destination repository (`<namespace>/<app>`) the build pushes to.
+    /// `GET /v1/build/{id}` holds a scoped caller to it, so a tenant can't
+    /// read another tenant's build.
+    #[serde(default)]
+    pub repository: Option<String>,
 }
 
 /// Why a build state update was rejected.
@@ -1480,6 +1485,27 @@ pub async fn build_submit_handler(
             ) {
                 return (StatusCode::FORBIDDEN, denied.to_string()).into_response();
             }
+            // Under a `[permission]` block, pushing an app's image is a
+            // deploy of that app (D5). A repository that names no namespace
+            // could be anyone's, so only a cluster-wide grant covers it.
+            let permissions = super::api::permission_map(&state).await;
+            let granted = match crate::pickle::registry_auth::repository_namespace(&repository) {
+                Some((namespace, app)) => crate::sesame::auth::authorize_permission(
+                    auth.as_deref(),
+                    crate::config::PermissionAction::Deploy,
+                    app,
+                    namespace,
+                    &permissions,
+                ),
+                None => crate::sesame::auth::authorize_cluster_permission(
+                    auth.as_deref(),
+                    crate::config::PermissionAction::Deploy,
+                    &permissions,
+                ),
+            };
+            if let Err(resp) = granted {
+                return resp;
+            }
         }
         Err(e) => {
             return (
@@ -1607,6 +1633,7 @@ pub async fn build_submit_handler(
                 remote_id,
             },
             created_at_epoch_secs: epoch_now_secs(),
+            repository: crate::pickle::build::destination_repository(&request.spec).ok(),
         };
         return match register_build_record(&state, record).await {
             Ok(build_id) => (
@@ -1754,6 +1781,7 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
         runner_node: state.node_name.clone(),
         state: BuildState::Running,
         created_at_epoch_secs: epoch_now_secs(),
+        repository: crate::pickle::build::destination_repository(&request.spec).ok(),
     };
     let build_id = match register_build_record(state, record).await {
         Ok(id) => id,
@@ -1782,12 +1810,32 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
         .into_response()
 }
 
+/// Hold a scoped caller to the build's destination repository: a token
+/// confined to some apps or namespaces may read only the builds that push
+/// into them. A build whose repository names no namespace belongs to no
+/// tenant, so only an unscoped caller may read it.
+#[allow(clippy::result_large_err)]
+fn authorize_build_read(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    record: &BuildRecord,
+) -> Result<(), Response> {
+    match record
+        .repository
+        .as_deref()
+        .and_then(crate::pickle::registry_auth::repository_namespace)
+    {
+        Some((namespace, app)) => crate::sesame::auth::authorize_scoped(auth, app, namespace),
+        None => crate::sesame::auth::require_unscoped(auth),
+    }
+}
+
 /// `GET /v1/build/{id}`: local state, or a proxy read for delegated
 /// builds. A `Running` record whose runner is this node but has no
 /// live runner task means the node restarted mid-build: the record is
 /// terminated honestly rather than reading `Running` forever (JOB4).
 pub async fn build_status_handler(
     State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     AxumPath(build_id): AxumPath<u64>,
 ) -> Response {
     let Some(record) = lookup_build(&state, build_id).await else {
@@ -1797,6 +1845,9 @@ pub async fn build_status_handler(
         )
             .into_response();
     };
+    if let Err(resp) = authorize_build_read(auth.as_deref(), &record) {
+        return resp;
+    }
 
     match record.state {
         BuildState::Delegated { url, remote_id } => {
@@ -2106,6 +2157,7 @@ mod tests {
             runner_node: Some("n1".to_string()),
             state: BuildState::Running,
             created_at_epoch_secs: 1_000_000,
+            repository: None,
         }
     }
 
@@ -2281,6 +2333,7 @@ mod tests {
                 remote_id: 4,
             },
             created_at_epoch_secs: 1_000_000,
+            repository: None,
         });
         let err = state
             .update(
