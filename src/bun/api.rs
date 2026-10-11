@@ -417,6 +417,9 @@ pub struct ApiState {
     /// Task arrays: this node's executor, the standalone store and the
     /// leader's latest view of every node (0.2.0, million jobs).
     pub task_arrays: Arc<super::task_array_leader::TaskArrayService>,
+    /// Which refused requests the audit log records one by one, and how
+    /// many it has suppressed per source (#798).
+    pub refusals: Arc<tokio::sync::Mutex<crate::bun::audit::refusals::RefusalLimiter>>,
 }
 
 /// Build the API router.
@@ -551,9 +554,13 @@ pub fn router_with_upgrade(
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         task_arrays: task_arrays
             .unwrap_or_else(|| Arc::new(super::task_array_leader::TaskArrayService::new(None))),
+        refusals: Arc::new(tokio::sync::Mutex::new(
+            crate::bun::audit::refusals::RefusalLimiter::new(),
+        )),
     };
 
     spawn_node_fault_reaper(state.clone());
+    audit::spawn_refusal_sweeper(state.clone());
     super::task_array_leader::spawn_leader_loop(state.clone());
 
     let mut auth_state = crate::sesame::auth::AuthState::new(
@@ -846,6 +853,12 @@ pub fn router_with_upgrade(
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::sesame::auth::auth_middleware,
+        ))
+        // Outside the auth layer, so it sees the 401s that layer answers
+        // as well as the 403s handlers do (#798).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            audit::refusal_layer,
         ))
         .with_state(state.clone());
 
