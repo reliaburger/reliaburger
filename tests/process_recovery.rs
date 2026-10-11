@@ -7,6 +7,9 @@ use reliaburger::grill::process::ProcessGrill;
 use reliaburger::grill::state::ContainerState;
 use reliaburger::grill::{Grill, InstanceId};
 
+#[path = "support/first_launch.rs"]
+mod first_launch;
+
 fn runtime(directory: &Path) -> ProcessGrill {
     ProcessGrill::with_owner(directory.to_path_buf(), env!("CARGO_BIN_EXE_bun").into())
 }
@@ -447,7 +450,6 @@ fn redacted_owner_phase(directory: &Path, id: &InstanceId) -> String {
 
 #[tokio::test]
 async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let launched = directory.path().join("helper-started");
     let release = directory.path().join("release-helper");
@@ -456,11 +458,16 @@ async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
     // wrapper gated forever. It signals a file, never an unverified PID.
     let _release_on_failure = ReleaseOwnedHelper(release.clone());
     let wrapper = directory.path().join("delayed-bun");
-    std::fs::write(&wrapper, format!(
-        "#!/bin/sh\ntouch '{}'\ndeadline=$(( $(date +%s) + 15 ))\nwhile [ ! -f '{}' ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\ntouch '{}'\nexec '{}' \"$@\"\n",
-        launched.display(), release.display(), released.display(), env!("CARGO_BIN_EXE_bun")
-    )).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // One shared, already-launched wrapper (#582): it finds this test's
+    // marker files beside the link it was started as, so the 15-second wait
+    // for `helper-started` no longer includes macOS assessing a new file.
+    first_launch::install_script(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\ndir=${{0%/*}}\ntouch \"$dir/helper-started\"\ndeadline=$(( $(date +%s) + 15 ))\nwhile [ ! -f \"$dir/release-helper\" ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\ntouch \"$dir/helper-released\"\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_bun")
+        ),
+    );
     let grill = ProcessGrill::with_owner(directory.path().to_path_buf(), wrapper);
     let id = InstanceId("default__cancelled-caller-0".into());
     grill.create(&id, &spec("sleep 30")).await.unwrap();

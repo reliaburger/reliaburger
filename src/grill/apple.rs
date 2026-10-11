@@ -671,11 +671,11 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_inspection_times_out_and_reaps_the_cli() {
-        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("container-fixture");
-        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A shared, already-launched script, so the two-second bound times
+        // the inspection rather than macOS assessing a new file (#582).
+        crate::first_launch::install_script(&program, "#!/bin/sh\nexec sleep 60\n");
         let mut grill = AppleContainerGrill::new();
         grill.container_program = program;
         // Observe the real child even if its first shell instruction has not
