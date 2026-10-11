@@ -111,6 +111,7 @@ impl Harness {
         let runner = agent.delegated_task_runner(job_data.path()).unwrap();
         let node = reliaburger::bun::task_array_node::TaskArrayNode::new(
             reliaburger::bun::task_array_node::TaskArrayNodeConfig {
+                audit_dir: None,
                 root: job_data.path().join("task-arrays"),
                 policy: process_policy,
                 default_concurrency: 8,
