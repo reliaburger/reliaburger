@@ -489,9 +489,11 @@ pub struct UpgradeSection {
     /// Defaults to the directory of the resolved current executable.
     pub binary_dir: Option<PathBuf>,
     /// Seconds the new binary must survive after an upgrade before the
-    /// swap counts as verified.
+    /// swap counts as verified, counted from when it can answer
+    /// `/v1/version` (its own binary hash is ready).
     pub boot_grace_secs: u64,
-    /// Seconds the new binary has to rejoin gossip (cluster mode only).
+    /// Seconds the new binary has to rejoin gossip (cluster mode only),
+    /// counted from the same moment as `boot_grace_secs`.
     /// Requires a direct peer acknowledgement from the replacement process;
     /// isolated cluster nodes revert even when their local API is healthy.
     pub gossip_rejoin_secs: u64,
