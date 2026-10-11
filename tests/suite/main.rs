@@ -13,6 +13,8 @@
 mod bun_process;
 #[path = "../support/cluster.rs"]
 mod cluster_support;
+#[path = "../support/first_launch.rs"]
+mod first_launch;
 // `cluster.rs` already includes the task harness; loading the file a second
 // time would compile two distinct `TestTasks` types.
 use cluster_support::task_harness;
