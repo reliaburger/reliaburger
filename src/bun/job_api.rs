@@ -113,17 +113,19 @@ pub(crate) async fn admit_definition(
     Ok(())
 }
 
-/// Why this node would refuse the definition's tasks, when it is the only
-/// node that could run them (standalone: no council, no gossip peers).
-/// Admitting work nobody can run would leave the run queued for ever; in
-/// a cluster the leader fails such a run once every node has refused it.
+/// Why this node would refuse the definition's host tasks, when it is the
+/// only node that could run them (standalone: no council, no gossip peers).
+/// Admitting host work nobody can run (most often under `mount_isolation`,
+/// #714) would only fail a second later; refusing it names the reason at
+/// once. Container work and clusters are left to the leader, which fails a
+/// run once every node has refused it.
 fn sole_node_refusal(
     state: &ApiState,
     name: &str,
     namespace: &str,
     definition: &JobDefinition,
 ) -> Option<String> {
-    if state.council.is_some() || state.membership.is_some() {
+    if state.council.is_some() || state.membership.is_some() || !definition.template.is_host() {
         return None;
     }
     let node = state.task_arrays.node.as_ref()?;

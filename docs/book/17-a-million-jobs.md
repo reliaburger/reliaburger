@@ -975,10 +975,19 @@ requeued first, as before, and the run fails on the next tick.
 
 A standalone node has no one else to ask, so it doesn't wait for a tick. The
 common admission path, `admit_definition`, asks the node's executor the same
-`admit` question before writing anything, and a refusal comes back as HTTP
-422 with the reason. A council could do the same if every node advertised
-what it can run, but that's another piece of gossiped state to keep honest.
+`admit` question about host work before writing anything, and a refusal comes
+back as HTTP 422 with the reason. We kept it to host work, the case #777 is
+about; a container run on a node without a container runtime still goes
+through the tick, a second later. A council could do the same if every node
+advertised what it can run, but that's another piece of gossiped state to keep honest.
 A second of delay in a cluster is a fair price for not having it.
+
+One more thing was quietly wrong. A node's capability report said it ran
+process workloads whenever its allowlist wasn't empty, even with
+`mount_isolation` on, when it refuses every one of them. `relish test`
+believed it and ran the host cases into the wall. The report now says no
+unless the allowlist is set *and* isolation is off, so those cases skip with a
+reason instead. A capability report that lies is worse than none.
 
 ## Short jobs without fresh containers
 

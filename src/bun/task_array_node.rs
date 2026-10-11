@@ -568,6 +568,12 @@ impl TaskArrayNode {
                 });
                 continue;
             }
+            // Too big for this node isn't too big for every node: a larger
+            // one may join, so the run waits rather than failing.
+            if let Err(reason) = self.fits(assignment) {
+                response.arrays.push(refused(assignment.batch_id, reason));
+                continue;
+            }
             let run = match arrays.entry(assignment.batch_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => match self.open(assignment).await {
@@ -603,7 +609,39 @@ impl TaskArrayNode {
         self.admit(assignment).err()
     }
 
-    /// Whether this node may run the array's binary at all.
+    /// Whether the array's tasks, with any executor helper, fit inside this
+    /// node's allocatable resources at all.
+    fn fits(&self, assignment: &ArrayAssignment) -> Result<(), String> {
+        let capacity = self.budget.capacity();
+        if !capacity.fits(&assignment.resources) {
+            return Err("task requests exceed this node's allocatable resources".into());
+        }
+        let Some(template) = assignment.template.as_ref() else {
+            return Ok(());
+        };
+        let helper = match (template.runtime, self.runner.as_ref()) {
+            (crate::config::job::JobRuntime::SharedRunc, _) => {
+                Some("reusable profile plus helper exceeds node capacity")
+            }
+            (_, NodeRunner::Owned(runner))
+                if template.image.is_none() && runner.supports_host_limits() =>
+            {
+                Some("host profile plus helper exceeds node capacity")
+            }
+            _ => None,
+        };
+        if let Some(reason) = helper
+            && let Ok(profile) = super::reusable_executor::ExecutorProfile::new(template)
+            && !capacity.fits(&profile.reservation)
+        {
+            return Err(reason.into());
+        }
+        Ok(())
+    }
+
+    /// Whether this node may run the array's binary at all, whatever its
+    /// size: a refusal here holds for every attempt ([`Self::fits`] covers
+    /// size).
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
         if let Some(template) = assignment.template.as_ref() {
             template.validate_runtime().map_err(str::to_owned)?;
@@ -639,17 +677,11 @@ impl TaskArrayNode {
                     .into(),
             );
         }
-        if !self.budget.capacity().fits(&assignment.resources) {
-            return Err("task requests exceed this node's allocatable resources".into());
-        }
         if let Some(template) = assignment.template.as_ref()
             && template.runtime == crate::config::job::JobRuntime::SharedRunc
         {
-            let profile = super::reusable_executor::ExecutorProfile::new(template)
+            super::reusable_executor::ExecutorProfile::new(template)
                 .map_err(|error| error.to_string())?;
-            if !self.budget.capacity().fits(&profile.reservation) {
-                return Err("reusable profile plus helper exceeds node capacity".into());
-            }
             return match self.runner.as_ref() {
                 NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
                 NodeRunner::Fake(_) => Ok(()),
@@ -695,11 +727,8 @@ impl TaskArrayNode {
             && runner.supports_host_limits()
             && let Some(template) = assignment.template.as_ref()
         {
-            let profile = super::reusable_executor::ExecutorProfile::new(template)
+            super::reusable_executor::ExecutorProfile::new(template)
                 .map_err(|error| error.to_string())?;
-            if !self.budget.capacity().fits(&profile.reservation) {
-                return Err("host profile plus helper exceeds node capacity".into());
-            }
         }
         if !self.config.policy.is_binary_allowed(&assignment.program) {
             return Err(format!(
@@ -1685,6 +1714,21 @@ mod tests {
         let progress = sync_until_finished(&node, &regranted, 1).await;
         assert_eq!(progress.finished.len(), 1);
         assert_eq!(progress.finished[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn tasks_too_big_for_this_node_are_refused_but_not_for_good() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let mut greedy = assignment(1, 20, &[]);
+        greedy.resources.cpu_millicores = u64::MAX;
+        let progress = node.sync(&request(vec![greedy])).await.arrays.remove(0);
+        assert_eq!(progress.slots, 0);
+        assert!(
+            !progress.unrunnable,
+            "a bigger node may still take it, so the run must wait"
+        );
+        assert!(progress.refused.unwrap().contains("allocatable"));
     }
 
     #[tokio::test]

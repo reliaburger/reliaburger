@@ -2745,13 +2745,13 @@ async fn conflicting_namespaces_are_rejected_at_submit() {
     assert_eq!(response.status().as_u16(), 400);
 }
 
-/// JOB3: unschedulable jobs appear in the batch result and its summary
-/// instead of being silently omitted.
+/// JOB3: a job this node can never run isn't silently queued. Its binary
+/// is off the only node's allowlist, so the batch is refused at admission
+/// with that reason and nothing in it is admitted (#777).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unschedulable_jobs_appear_in_the_batch() {
+async fn a_batch_with_a_job_no_node_can_run_is_refused_with_the_reason() {
     let harness = Harness::start().await;
 
-    // A job demanding more CPU than the fallback capacity can ever hold.
     let response = reqwest::Client::new()
         .post(format!("{}/v1/batch", harness.base_url))
         .json(&serde_json::json!({
@@ -2761,44 +2761,22 @@ async fn unschedulable_jobs_appear_in_the_batch() {
                     "spec": { "runtime":"process","exec":"/bin/echo", "command": ["ok"] },
                 },
                 {
-                    "name": "greedy",
-                    "spec": {
-                        "runtime":"process","exec":"/bin/echo",
-                        "command": ["never"],
-                        // More millicores than the fallback capacity
-                        // (u64::MAX / 2) can ever satisfy.
-                        "cpu": "9999999999999999999m",
-                    },
+                    "name": "forbidden",
+                    "spec": { "runtime":"process","exec":"/bin/ls", "command": ["never"] },
                 },
             ],
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status().as_u16(), 202);
+    let status = response.status().as_u16();
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["assigned"].as_u64(), Some(2), "{body}");
-    assert_eq!(body["unschedulable"], serde_json::json!([]), "{body}");
-    let batch_id = body["batch_id"].as_u64().unwrap();
-    let summary = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let summary = harness.client.batch_status(batch_id).await.unwrap();
-            if summary["succeeded"] == 1 {
-                break summary;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(summary["done"], false, "{summary}");
-    assert_eq!(summary["queued"], 1, "{summary}");
-    assert_eq!(summary["failed"], 0, "{summary}");
-    harness.client.cancel_batch(batch_id).await.unwrap();
-    let summary = harness.wait_done(batch_id, 10).await;
-    assert_eq!(summary["succeeded"], 1, "{summary}");
-    assert_eq!(summary["not_run"], 1, "{summary}");
-    assert_eq!(summary["total"], 2, "{summary}");
+    assert_eq!(status, 422, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("forbidden"), "{error}");
+    assert!(error.contains("allowed_binaries"), "{error}");
+    let jobs = harness.client.job_summaries(false).await.unwrap();
+    assert_eq!(jobs["batches"], serde_json::json!([]), "{jobs}");
 }
 
 /// The node-to-node half of dispatch: `/v1/batch/run` accepts a job

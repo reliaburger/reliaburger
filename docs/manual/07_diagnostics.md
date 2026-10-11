@@ -157,7 +157,11 @@ Group names are `scheduling`, `service-discovery`, `deployments`,
 `health-checks`, `secrets-config`, `firewall`, `workload-identity`, `ingress`,
 `volumes`, `process-workloads`, `jobs`, `image-registry` and
 `cluster-coordination`. The default `development` profile accepts a skip with
-a known reason, such as a capability this node lacks. The full profiles
+a known reason, such as a capability this node lacks. A node with
+`[process_workloads] mount_isolation` on, the Linux default, doesn't advertise
+host workloads, because it refuses them until #714 lands; its host
+`process-workloads` and `jobs` cases skip with that reason rather than
+waiting for work that never starts. The full profiles
 (`full-runc`, `process-grill`) fail on required skips, unknown evidence,
 timeouts and unconfirmed cleanup. The server must grant
 `provision_isolated_workloads`. Any failure exits non-zero. `--chaos` runs the
