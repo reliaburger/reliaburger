@@ -779,6 +779,7 @@ impl UpgradeManager {
             node: "this node".to_string(),
             version: self.running_version.clone(),
             sha256,
+            platform: None,
         };
         match super::plan::check_target(
             &directive.target_version,

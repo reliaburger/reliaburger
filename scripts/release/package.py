@@ -114,6 +114,14 @@ def guest_image_metadata(directory, version, key, pins):
     return {"schema": 1, "version": version, "images": images}
 
 
+def compatibility_pair(source):
+    """The cluster formats (protocol, state) in `CURRENT` of src/compatibility.rs."""
+    match = re.search(r"pub const CURRENT: Compatibility = Compatibility \{\s*protocol: (\d+),\s*state: (\d+),", source)
+    if not match:
+        raise ValueError("cannot find CURRENT in src/compatibility.rs")
+    return {"protocol": int(match.group(1)), "state": int(match.group(2))}
+
+
 def package_release(directory, version, repository, key, trusted_keys, pins):
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("release tag must be a version prefixed with v")
@@ -135,6 +143,11 @@ def package_release(directory, version, repository, key, trusted_keys, pins):
     encoded = "ed25519:" + base64.b64encode(public[12:]).decode("ascii")
     if encoded not in trusted_keys:
         raise ValueError("signing key is not trusted by the release binaries")
+
+    # Published per release so `relish upgrade check` can tell an operator
+    # that a release with other formats needs a fresh cluster.
+    root = Path(__file__).resolve().parents[2]
+    compatibility = compatibility_pair((root / "src/compatibility.rs").read_text())
 
     outputs = {}
     checksums = []
@@ -159,7 +172,8 @@ def package_release(directory, version, repository, key, trusted_keys, pins):
             }
             checksums.append(f"{digest}  {path.name}\n")
         name = "metadata.json" if binary == "bun" else "cli-metadata.json"
-        outputs[name] = {"schema": 1, "latest": version, "releases": [{"version": version, "platforms": artifacts}]}
+        release = {"version": version, "compatibility": compatibility, "platforms": artifacts}
+        outputs[name] = {"schema": 1, "latest": version, "releases": [release]}
     outputs[GUEST_METADATA] = guest_image_metadata(directory, version, key, pins)
     for image in outputs[GUEST_METADATA]["images"].values():
         checksums.append(f"{image['sha256']}  {image['asset']}\n")
