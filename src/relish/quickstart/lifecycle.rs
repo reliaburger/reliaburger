@@ -377,7 +377,6 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
 mod tests {
     use super::*;
     use crate::relish::quickstart::state::ClusterSpec;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A stand-in `limactl`: it appends each argument list to `calls.log`
     /// and answers `list --json` from `list.json`.
@@ -390,18 +389,12 @@ mod tests {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
             let script = directory.path().join("limactl");
-            let log = directory.path().join("calls.log");
-            let list = directory.path().join("list.json");
-            std::fs::write(
+            // One shared, already-launched script for every test (#582): it
+            // finds this test's files beside the link it was started as.
+            crate::first_launch::install_script(
                 &script,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = list ]; then cat '{}'; fi\n",
-                    log.display(),
-                    list.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                "#!/bin/sh\ndir=${0%/*}\nprintf '%s\\n' \"$*\" >> \"$dir/calls.log\"\nif [ \"$1\" = list ]; then cat \"$dir/list.json\"; fi\n",
+            );
             let lima = Lima::new(script, Duration::from_secs(5));
             Self { directory, lima }
         }
