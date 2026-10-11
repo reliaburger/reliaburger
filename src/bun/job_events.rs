@@ -321,6 +321,7 @@ mod tests {
                         failed_indices: IndexRangeSet::from_range(range),
                         not_run: 0,
                         retried: 0,
+                        retry_causes: Default::default(),
                     },
                 )
             })

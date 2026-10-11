@@ -288,10 +288,11 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
     /* After exit, drain to EOF: a command may enlarge its pipe (F_SETPIPE_SZ)
      * and exit with far more than one pass buffered. EOF is immediate unless
      * a descendant still holds the pipe; then stop once it stays silent for
-     * 10 ms, or at a cap, saying so in the output rather than dropping bytes
-     * silently. */
+     * 10 ms, or at a cap. Either way the output says so rather than dropping
+     * bytes silently: silence is no proof the descendant has finished, since
+     * one descheduled for 10 ms on a busy CPU looks exactly like one that
+     * went quiet, and whatever it writes after we stop is lost (#715). */
     size_t drained_after_exit = 0;
-    int truncated = 0;
     for (;;) {
         if (failed) break;
         /* Both streams already at EOF when the exit is seen is the normal
@@ -329,7 +330,7 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
         if (failed) break;
         if (exited) {
             if (!progressed) break;
-            if (drained_after_exit >= DRAIN_AFTER_EXIT_LIMIT) { truncated = 1; break; }
+            if (drained_after_exit >= DRAIN_AFTER_EXIT_LIMIT) break;
             continue;
         }
 #ifdef RB_EXECUTOR_HOST
@@ -345,8 +346,9 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
         else if (waited < 0 && errno != EINTR) { failed = 1; break; }
 #endif
     }
+    int truncated = 0;
     for (unsigned stream = 0; stream < 2; ++stream)
-        if (outputs[stream][0] >= 0) close(outputs[stream][0]);
+        if (outputs[stream][0] >= 0) { close(outputs[stream][0]); truncated = 1; }
     if (truncated && !failed) {
         char marker[] = "\n[reliaburger: output written after exit truncated]\n";
         unsigned char source = 2;

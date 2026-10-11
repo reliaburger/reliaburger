@@ -341,3 +341,22 @@ included once at the suite root and reached through `crate::`.
 Multi-node tests start their clusters through `tests/support/cluster.rs`: the fully wired
 `bun --cluster` node, the in-memory five-node council, `local`, `wait_until` and the leader
 waits all live there, so include it rather than copying another start-up helper.
+
+A cluster test shares nothing with another test or with an earlier run. `make test-cluster`
+runs its binaries side by side, and #721 found two ways that went wrong in
+`cluster_failover`: a fixed port block that `placement` also used (node `fo3`'s reporting
+port was `wk1`'s Raft port, so whichever started second failed with "Address already in
+use"), and a fixed data directory that a killed root run left with a `reliaburger-identity`
+tmpfs still mounted, which `start_wired_node` failed to remove and then reused. So:
+
+- lease each node's port block with `reserve_port_block_lease` from
+  `tests/support/bun_process.rs` and hold it until the test ends;
+- give each test its own temporary `data_root`; `start_wired_node` clears a node's directory
+  with `clear_fixture_dir`, which unmounts anything beneath it on Linux and fails the test
+  rather than starting on what it couldn't remove;
+- ask the cluster which node leads before writing, reading the leader's aggregated reports
+  or killing it. Leadership can move under load, and a write to a follower returns
+  `ForwardToLeader`.
+
+Older suites (`placement`, `cluster_task_arrays`, `council_disaster_recovery`) still use
+fixed blocks below the leased 27000–30000 range; keep new fixed ports out of that range.
