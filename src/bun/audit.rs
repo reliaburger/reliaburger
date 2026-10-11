@@ -32,6 +32,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::events::{AuditEvent, EventKind, EventSeverity};
 
+pub mod refusals;
+
 /// Default bound on the whole audit log of one node: 64 MiB.
 pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 

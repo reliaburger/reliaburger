@@ -57,6 +57,7 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
                 interval: Duration::from_millis(20),
                 max_records: 4096,
             },
+            audit_dir: None,
         },
         // A small delay per task keeps chunks in flight long enough for
         // the killed node to be holding some.
@@ -553,6 +554,7 @@ async fn start_common_node(
             default_concurrency: 2,
             backoff: (Duration::from_millis(1), Duration::from_millis(5)),
             group_commit: GroupCommit::default(),
+            audit_dir: None,
         },
         NodeRunner::Fake(FakeRunner::new(delay, |_| AttemptOutcome::Exited {
             code: 0,
@@ -1079,6 +1081,7 @@ async fn start_hung_node(
                 interval: Duration::from_millis(20),
                 max_records: 4096,
             },
+            audit_dir: None,
         },
         // Slow enough that sixteen arrays are all still running while one
         // worker hangs.
@@ -1379,6 +1382,7 @@ async fn shared_budget_node(
                     default_concurrency: 8,
                     backoff: (Duration::from_millis(1), Duration::from_millis(5)),
                     group_commit: GroupCommit::default(),
+                    audit_dir: None,
                 },
                 // Each attempt holds its lease long enough to fill the node.
                 NodeRunner::Fake(FakeRunner::new(Duration::from_secs(120), |_| {

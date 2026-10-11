@@ -4606,6 +4606,19 @@ does. The slow-disk scenario stays at 250 ms, and it now waits for the
 `discovery:startup-cleanup` readiness to turn ready before judging, because
 the port goes back a tick before the last writes.
 
+Driving turns by hand has its own trap, which a loaded laptop found weeks
+later (#761). The test ran ten ticks back to back. The first asks the leader,
+a little HTTP server on the test's own runtime, to confirm the release, and
+waits only until the turn's deadline. When the machine was busy enough that
+the answer came later than that, the next nine ticks each found the request
+still in flight and returned at once, as they should, and all ten were over
+in microseconds: `[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]`, "never finished". The live
+loop runs a health tick a second, and the leader's answer arrives in the gap.
+So the test now leaves a gap too, 100 ms between ticks, and keeps going until
+the retirement finishes or 20 seconds pass. It still counts per tick, which
+is the promise. A second test makes the leader answer after 750 ms, past the
+turn, so the slow case runs every time instead of only on a busy machine.
+
 #### One write a turn
 
 Two writes a tick held for a week. Then the 0.1.4 candidate's compressed

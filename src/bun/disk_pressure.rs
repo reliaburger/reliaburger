@@ -94,6 +94,14 @@ pub fn dir_total_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// The node data that counts against task-data pressure: everything under
+/// `task_root` plus the audit log in `audit_dir`, when the node keeps one.
+/// The audit log stays within `[storage] audit_max_bytes`, but it shares the
+/// data filesystem with task data, so it counts too (#798).
+pub fn node_data_bytes(task_root: &Path, audit_dir: Option<&Path>) -> u64 {
+    dir_total_size(task_root).saturating_add(audit_dir.map_or(0, dir_total_size))
+}
+
 /// Whether a worker holding `task_bytes` of task data on `filesystem` must
 /// stop taking new task grants: the data is over `max_percent` of the
 /// filesystem, or less than [`TASK_GRANT_MIN_FREE_BYTES`] is free.
@@ -389,6 +397,36 @@ mod tests {
             available_bytes: 100,
         };
         assert!(task_data_pressured(0, full, 25));
+    }
+
+    #[test]
+    fn audit_log_counts_toward_disk_pressure() {
+        let data = tempfile::tempdir().unwrap();
+        let tasks = data.path().join("task-arrays");
+        let audit = data.path().join(crate::bun::audit::AUDIT_DIRECTORY);
+        std::fs::create_dir_all(tasks.join("7")).unwrap();
+        std::fs::create_dir_all(&audit).unwrap();
+        std::fs::write(tasks.join("7/ledger"), vec![0xab; 100_000]).unwrap();
+        let filesystem = FilesystemUsage {
+            total_bytes: 1_000_000,
+            available_bytes: TASK_GRANT_MIN_FREE_BYTES,
+        };
+        let tasks_only = node_data_bytes(&tasks, Some(&audit));
+        assert!(!task_data_pressured(tasks_only, filesystem, 25));
+
+        std::fs::write(
+            audit.join("audit-00000000000000000001.jsonl"),
+            vec![b'x'; 200_000],
+        )
+        .unwrap();
+        let bytes = node_data_bytes(&tasks, Some(&audit));
+        assert!(
+            bytes >= tasks_only + 200_000,
+            "the audit log is node data too"
+        );
+        assert!(task_data_pressured(bytes, filesystem, 25));
+        // A node that keeps no audit log counts task data alone.
+        assert_eq!(node_data_bytes(&tasks, None), tasks_only);
     }
 
     #[tokio::test]

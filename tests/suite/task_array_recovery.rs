@@ -26,6 +26,7 @@ fn record(index: u32) -> TaskRecord {
 fn node(root: &Path, delay: Duration, concurrency: u32) -> TaskArrayNode {
     TaskArrayNode::new(
         TaskArrayNodeConfig {
+            audit_dir: None,
             root: root.into(),
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/review/task".into()],
@@ -334,6 +335,7 @@ async fn output_storage_failure_refuses_work_and_never_acknowledges_the_chunk() 
     let directory = tempfile::tempdir().unwrap();
     let failing = TaskArrayNode::new(
         TaskArrayNodeConfig {
+            audit_dir: None,
             root: directory.path().into(),
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/review/task".into()],

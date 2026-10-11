@@ -592,3 +592,203 @@ fn every_mutating_route_is_audited_or_exempt() {
         );
     }
 }
+
+/// A Deployer token confined to namespace `a`.
+fn scoped_token(name: &str) -> (crate::sesame::types::ApiToken, String) {
+    let created = crate::sesame::token::create_token(
+        name,
+        ApiRole::Deployer,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    (created.token, created.plaintext)
+}
+
+/// A standalone router with `tokens` and the durable log of `audit`.
+async fn refusing_router(
+    tokens: Vec<crate::sesame::types::ApiToken>,
+    audit: &Audited,
+) -> (Router, tokio_util::sync::CancellationToken) {
+    setup_with_auth_readiness_leases_and_events(
+        tokens,
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        Some(Arc::clone(&audit.events)),
+    )
+    .await
+}
+
+fn detail<'a>(record: &'a AuditRecord, key: &str) -> Option<&'a str> {
+    record.details.get(key).map(String::as_str)
+}
+
+#[tokio::test]
+async fn a_refused_apply_is_audited_with_its_reason() {
+    let (scoped, scoped_key) = scoped_token("tenant-a");
+    let scoped_principal = principal_of(&scoped, &scoped_key);
+    let (reader, reader_key) = named_user_token("viewer", ApiRole::ReadOnly);
+    let audit = audited();
+    let (app, shutdown) = refusing_router(vec![scoped, reader], &audit).await;
+
+    // A scoped token reaching another namespace.
+    let manifest = "[app.web]\nimage = \"test:v1\"\nnamespace = \"b\"\n";
+    let (status, _) = call(&app, "POST", "/v1/apply", &scoped_key, manifest).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A role that may not apply at all.
+    let (status, _) = call(&app, "POST", "/v1/apply", &reader_key, manifest).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // No credential the node knows.
+    let (status, _) = call(&app, "POST", "/v1/delete/web/b", "rbrg_wrong", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Nothing happened, so nothing is recorded as done.
+    assert!(audit.records("app.applied").await.is_empty());
+
+    let records = audit.records("api.refused").await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    let scope = &records[0];
+    assert_eq!(scope.principal, scoped_principal);
+    assert_eq!(detail(scope, "reason"), Some("scope"));
+    assert_eq!(detail(scope, "route"), Some("POST /v1/apply"));
+    assert_eq!(detail(scope, "attempted"), Some("app.applied"));
+    assert_eq!(detail(scope, "token_name"), Some("tenant-a"));
+    assert_eq!(scope.namespace.as_deref(), Some("b"));
+    assert_eq!(
+        scope.source_address.as_deref(),
+        Some(caller().to_string().as_str())
+    );
+    assert_eq!(scope.severity, crate::bun::events::EventSeverity::Warning);
+
+    let role = &records[1];
+    assert_eq!(detail(role, "reason"), Some("forbidden"));
+    assert_eq!(detail(role, "token_name"), Some("viewer"));
+
+    let anonymous = &records[2];
+    assert_eq!(anonymous.principal, "anonymous");
+    assert_eq!(detail(anonymous, "reason"), Some("unauthenticated"));
+    assert_eq!(
+        detail(anonymous, "route"),
+        Some("POST /v1/delete/{app}/{namespace}")
+    );
+    assert_eq!(anonymous.app.as_deref(), Some("web"));
+    assert_eq!(anonymous.namespace.as_deref(), Some("b"));
+    assert!(!anonymous.details.contains_key("token_name"));
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_burst_of_refusals_is_not_stored_one_by_one() {
+    let (token, _) = named_user_token("alice", ApiRole::Deployer);
+    let audit = audited();
+    let (app, shutdown) = refusing_router(vec![token], &audit).await;
+    for _ in 0..30 {
+        let (status, _) = call(&app, "POST", "/v1/delete/web/b", "rbrg_wrong", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let records = audit.records("api.refused").await;
+    assert_eq!(
+        records.len(),
+        crate::bun::audit::refusals::REFUSALS_PER_WINDOW as usize
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn refusals_of_unaudited_routes_are_not_recorded() {
+    let (token, _) = named_user_token("alice", ApiRole::Deployer);
+    let audit = audited();
+    let (app, shutdown) = refusing_router(vec![token], &audit).await;
+    let (status, _) = call(&app, "GET", "/v1/status", "rbrg_wrong", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(audit.records("api.refused").await.is_empty());
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn refused_requests_never_write_a_token_plaintext() {
+    let (scoped, scoped_key) = scoped_token("tenant-a");
+    let audit = audited();
+    let (app, shutdown) = refusing_router(vec![scoped], &audit).await;
+    // A well-formed token the node doesn't know, and a real one refused by
+    // its scope.
+    let unknown = format!("rbrg_{}", "ab".repeat(32));
+    let (status, _) = call(&app, "POST", "/v1/apply", &unknown, "[app.x]\n").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let manifest = "[app.web]\nimage = \"test:v1\"\nnamespace = \"b\"\n";
+    let (status, _) = call(&app, "POST", "/v1/apply", &scoped_key, manifest).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(audit.records("api.refused").await.len(), 2);
+    let on_disk: String = std::fs::read_dir(audit.log.directory())
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    assert!(on_disk.contains("api.refused"));
+    for secret in [&unknown, &scoped_key] {
+        assert!(
+            !on_disk.contains(secret.as_str()),
+            "the audit log holds a token"
+        );
+    }
+    assert!(
+        !on_disk.contains("test:v1"),
+        "the audit log holds a request body"
+    );
+    shutdown.cancel();
+}
+
+#[test]
+fn a_suppressed_refusal_summary_says_how_many_and_from_whom() {
+    use crate::bun::audit::refusals::{RefusalSource, SuppressedRefusals};
+    let event = super::audit::suppressed_refusals_event(
+        SuppressedRefusals {
+            source: RefusalSource::Caller {
+                address: Some("203.0.113.9".parse().unwrap()),
+                principal: "anonymous".to_string(),
+            },
+            suppressed: 45,
+            window_start: 1_800_000_000,
+        },
+        "node-1".to_string(),
+        1_800_000_060,
+    );
+    assert_eq!(event.action, "api.refusals_suppressed");
+    assert_eq!(event.principal, "anonymous");
+    assert_eq!(
+        event.details.get("suppressed").map(String::as_str),
+        Some("45")
+    );
+    assert_eq!(
+        event.details.get("source").map(String::as_str),
+        Some("203.0.113.9")
+    );
+    assert_eq!(
+        event.details.get("window_start").map(String::as_str),
+        Some("1800000000")
+    );
+    assert!(
+        event.message.contains("45 more refused requests"),
+        "{}",
+        event.message
+    );
+
+    let overflow = super::audit::suppressed_refusals_event(
+        SuppressedRefusals {
+            source: RefusalSource::Overflow,
+            suppressed: 7,
+            window_start: 1_800_000_000,
+        },
+        "node-1".to_string(),
+        1_800_000_060,
+    );
+    assert_eq!(overflow.principal, "*");
+    assert!(
+        overflow.message.contains("other sources"),
+        "{}",
+        overflow.message
+    );
+}
