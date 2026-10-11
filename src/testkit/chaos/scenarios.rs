@@ -655,6 +655,7 @@ mod tests {
                 id: 7,
                 fault_type: "node-kill".to_string(),
                 target_service: String::new(),
+                namespace: None,
                 target_instance: None,
                 target_node: request.target_node,
                 remaining_secs: 30,

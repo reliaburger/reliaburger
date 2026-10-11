@@ -700,6 +700,11 @@ pub struct FaultSummary {
     pub fault_type: String,
     /// Target service.
     pub target_service: String,
+    /// Namespace of the target service; `None` for a node fault, which
+    /// targets no workload. Scoped callers see only their own namespaces'
+    /// faults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Target instance, if scoped.
     pub target_instance: Option<String>,
     /// Target node, for routed node faults.
@@ -724,6 +729,7 @@ impl From<&FaultRule> for FaultSummary {
             id: rule.id.0,
             fault_type: rule.fault_type.to_string(),
             target_service: rule.target_service.clone(),
+            namespace: rule.namespace.clone(),
             target_instance: rule.target_instance.clone(),
             target_node: rule.target_node.clone(),
             remaining_secs: rule.remaining().as_secs(),

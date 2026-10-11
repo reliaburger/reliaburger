@@ -764,6 +764,7 @@ async fn interrupted_build_reports_an_honest_failure() {
                 runner_node: Some("n1".to_string()),
                 state: reliaburger::bun::build_runner::BuildState::Running,
                 created_at_epoch_secs: reliaburger::meat::batch_ids::epoch_now_secs(),
+                repository: None,
             },
         })
         .await
@@ -823,6 +824,7 @@ async fn cli_build_wait_times_out_with_the_last_known_state() {
                 runner_node: Some("somewhere-else".to_string()),
                 state: reliaburger::bun::build_runner::BuildState::Running,
                 created_at_epoch_secs: reliaburger::meat::batch_ids::epoch_now_secs(),
+                repository: None,
             },
         })
         .await
@@ -1384,6 +1386,7 @@ async fn register_build(
                 runner_node: Some("node-2".to_string()),
                 state,
                 created_at_epoch_secs: reliaburger::meat::batch_ids::epoch_now_secs(),
+                repository: None,
             },
         })
         .await

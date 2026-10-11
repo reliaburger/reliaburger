@@ -856,6 +856,19 @@ async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys(
     );
     recovered.client.stop(&name, "default").await.unwrap();
     recovered.crash().await;
+    // A helper Bun started just before the crash (an `nft` apply, say)
+    // outlives it briefly in the service cgroup; wait for it to leave.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !std::fs::read_to_string(cgroup.join("cgroup.procs"))
+            .unwrap()
+            .trim()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     std::fs::remove_dir(&cgroup).unwrap();
     retire_kernel(&root);
 }
@@ -1176,6 +1189,9 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     config.storage = base.storage;
     config.images = base.images;
     config.ebpf = base.ebpf;
+    // `relish init` enables DNS on a rootful runc host, and nodes sharing one
+    // host can't all bind the gateway's port 53.
+    config.dns = base.dns;
     config.network.advertise_address = Some("127.0.0.1".into());
     let gossip = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1417,6 +1433,9 @@ async fn enrolled_upgrade_fixture(
     config.storage = base.storage;
     config.images = base.images;
     config.ebpf = base.ebpf;
+    // `relish init` enables DNS on a rootful runc host, and nodes sharing one
+    // host can't all bind the gateway's port 53.
+    config.dns = base.dns;
     config.network.advertise_address = Some("127.0.0.1".into());
     // Council discovery requires the same gossip-to-Raft offset on every node.
     let (gossip, raft, reporting) = loop {

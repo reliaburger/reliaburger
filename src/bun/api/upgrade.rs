@@ -301,10 +301,8 @@ pub(super) async fn upgrade_start_handler(
     #[derive(serde::Deserialize)]
     struct StartRequest {
         target_version: crate::upgrade::BinaryVersion,
-        binary_sha256: String,
-        embedded_signature: String,
-        #[serde(default)]
-        external_signature: Option<String>,
+        /// One build per platform the nodes run on.
+        binaries: Vec<crate::upgrade::types::PlatformBinary>,
         #[serde(default = "default_parallel")]
         parallel: u32,
         /// Registry the nodes fetch the binary from (the leader's Pickle).
@@ -356,6 +354,13 @@ pub(super) async fn upgrade_start_handler(
         )
             .into_response();
     }
+    if request.binaries.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "binaries list must not be empty" })),
+        )
+            .into_response();
+    }
 
     // Derive each node's authoritative role + address server-side from
     // gossip membership and the Raft voter set, then validate the client's
@@ -375,7 +380,7 @@ pub(super) async fn upgrade_start_handler(
             role: node.role,
         })
         .collect();
-    let derived_nodes = match crate::upgrade::plan::derive_upgrade_nodes(&requested, |id| {
+    let mut derived_nodes = match crate::upgrade::plan::derive_upgrade_nodes(&requested, |id| {
         authoritative.get(id).cloned()
     }) {
         Ok(nodes) => nodes,
@@ -390,6 +395,16 @@ pub(super) async fn upgrade_start_handler(
     // recorded: once in Raft, a same-version run would "complete" without
     // swapping a single byte.
     let (running, readiness) = probe_running_binaries(&state, &derived_nodes).await;
+    // Record each node's platform now, so the orchestrator hands it the
+    // build for its own architecture. A node that didn't answer gets its
+    // platform from the orchestrator's first poll.
+    for record in &mut derived_nodes {
+        let name = format!("node {}", record.node_id);
+        record.platform = running
+            .iter()
+            .find(|node| node.node == name)
+            .and_then(|node| node.platform.clone());
+    }
     let direction = request
         .direction
         .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade);
@@ -397,10 +412,12 @@ pub(super) async fn upgrade_start_handler(
     // signature. A run the nodes will refuse would only pause and then block
     // every later start, so refuse it here instead.
     if direction == crate::upgrade::types::UpgradeDirection::Upgrade
-        && let Err(e) = crate::upgrade::plan::check_network_prerequisites(
-            request.external_signature.as_deref(),
-            &readiness,
-        )
+        && let Err(e) = request.binaries.iter().try_for_each(|binary| {
+            crate::upgrade::plan::check_network_prerequisites(
+                binary.external_signature.as_deref(),
+                &readiness,
+            )
+        })
     {
         return (
             StatusCode::CONFLICT,
@@ -408,9 +425,9 @@ pub(super) async fn upgrade_start_handler(
         )
             .into_response();
     }
-    match crate::upgrade::plan::check_target(
+    match crate::upgrade::plan::check_platform_targets(
         &request.target_version,
-        &request.binary_sha256,
+        &request.binaries,
         request.allow_downgrade,
         &running,
     ) {
@@ -452,9 +469,7 @@ pub(super) async fn upgrade_start_handler(
     let upgrade = crate::upgrade::types::ClusterUpgradeState {
         upgrade_id: upgrade_id.clone(),
         target_version: request.target_version,
-        binary_sha256: request.binary_sha256,
-        embedded_signature: request.embedded_signature,
-        external_signature: request.external_signature,
+        binaries: request.binaries,
         parallel: request.parallel.max(1),
         direction,
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
@@ -462,11 +477,15 @@ pub(super) async fn upgrade_start_handler(
         allow_downgrade: request.allow_downgrade,
         nodes: derived_nodes,
     };
-    // Check the directive every node will get here, before anything is
-    // recorded: a candidate with other formats would otherwise pause the
-    // run on the first node it reached.
-    let directive = crate::upgrade::orchestrator::build_directive(&upgrade);
-    if let Err(resp) = check_candidate_on_leader(&state, &directive).await {
+    // Check the directive this node's platform gets here, before anything
+    // is recorded: a candidate with other formats would otherwise pause the
+    // run on the first node it reached. Another platform's build can't run
+    // here; each of those nodes checks its own when directed.
+    if let Ok(directive) = crate::upgrade::orchestrator::directive_for(
+        &upgrade,
+        Some(&crate::upgrade::metadata::platform_key()),
+    ) && let Err(resp) = check_candidate_on_leader(&state, &directive).await
+    {
         return resp;
     }
 
@@ -509,6 +528,7 @@ pub(super) async fn probe_running_binaries(
                     node: node.clone(),
                     version: probe.version,
                     sha256: probe.binary_sha256,
+                    platform: probe.platform,
                 },
                 crate::upgrade::plan::NetworkReadiness {
                     node,
@@ -730,7 +750,7 @@ pub(super) async fn upgrade_cluster_handler(
     let Some(council) = &state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no council on this node" })),
+            Json(serde_json::json!({ "error": crate::upgrade::NO_COUNCIL })),
         )
             .into_response();
     };
@@ -755,7 +775,7 @@ pub(super) async fn upgrade_resume_handler(
     let Some(council) = &state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no council on this node" })),
+            Json(serde_json::json!({ "error": crate::upgrade::NO_COUNCIL })),
         )
             .into_response();
     };
@@ -824,7 +844,7 @@ pub(super) async fn upgrade_abort_handler(
     let Some(council) = &state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no council on this node" })),
+            Json(serde_json::json!({ "error": crate::upgrade::NO_COUNCIL })),
         )
             .into_response();
     };
@@ -888,7 +908,7 @@ pub(super) async fn upgrade_cluster_rollback_handler(
     let Some(council) = &state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no council on this node" })),
+            Json(serde_json::json!({ "error": crate::upgrade::NO_COUNCIL })),
         )
             .into_response();
     };
@@ -987,9 +1007,7 @@ pub(super) async fn upgrade_cluster_rollback_handler(
     let upgrade = crate::upgrade::types::ClusterUpgradeState {
         upgrade_id: upgrade_id.clone(),
         target_version: request.target_version,
-        binary_sha256: String::new(),
-        embedded_signature: String::new(),
-        external_signature: None,
+        binaries: Vec::new(),
         parallel: 1,
         direction: crate::upgrade::types::UpgradeDirection::Rollback,
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,

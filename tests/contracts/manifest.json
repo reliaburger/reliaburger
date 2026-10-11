@@ -4408,6 +4408,72 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-cross_namespace_connect_to_container_ip_is_denied",
+          "binary": "reliaburger::ebpf",
+          "test": "cross_namespace_connect_to_container_ip_is_denied",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-cross_namespace_connect_to_node_host_port_is_denied",
+          "binary": "reliaburger::ebpf",
+          "test": "cross_namespace_connect_to_node_host_port_is_denied",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-allow_from_opens_the_real_address_path_too",
+          "binary": "reliaburger::ebpf",
+          "test": "allow_from_opens_the_real_address_path_too",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-exec_workload_is_held_to_its_namespace",
+          "binary": "reliaburger::ebpf",
+          "test": "exec_workload_is_held_to_its_namespace",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-egress_allowlist_still_resolves_dns",
+          "binary": "reliaburger::ebpf",
+          "test": "egress_allowlist_still_resolves_dns",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-job_egress_allowlist_is_enforced",
+          "binary": "reliaburger::ebpf",
+          "test": "job_egress_allowlist_is_enforced",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-dns_responder_resolves_internal_name",
           "binary": "reliaburger::ebpf",
           "test": "dns_responder_resolves_internal_name",
@@ -6936,6 +7002,61 @@
             "tests/support/cluster.rs"
           ]
         }
+      ]
+    },
+    {
+      "id": "issue-678-runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
+      "issue": 678,
+      "promise": "Retired shared-runc executors across namespaces leave no runtime journals, identities or route files behind.",
+      "supported_paths": [
+        "Rootful Linux shared-runc executors"
+      ],
+      "cases": [
+        {
+          "id": "storage-runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "An identity that might still own a live executor keeps its metadata."
+      ],
+      "boundaries": [
+        "Real runtime regression; ordinary app instances are not collected."
+      ]
+    },
+    {
+      "id": "issue-687-version-form-upgrades-with-the-nodes-platform-build",
+      "issue": 687,
+      "promise": "relish upgrade start <version> downloads the release build for the platform the nodes report, countersigns it with the operator's external key, and the rolling upgrade completes; a release with other cluster formats is refused before anything is recorded.",
+      "supported_paths": [
+        "Cluster upgrades started from relish against release metadata"
+      ],
+      "cases": [
+        {
+          "id": "self-upgrade-cluster-version_form_rolls_the_nodes_platform_build_countersigned_by_relish",
+          "binary": "reliaburger::self_upgrade_cluster",
+          "test": "version_form_rolls_the_nodes_platform_build_countersigned_by_relish",
+          "requires": [
+            "upgrade-cluster"
+          ],
+          "sources": [
+            "tests/self_upgrade_cluster.rs",
+            "src/relish/upgrade.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A release whose metadata names another protocol or state pair is refused with a fresh-cluster message and no run is recorded."
+      ],
+      "boundaries": [
+        "Every node in the harness runs on the test host's platform, so mixed-architecture selection is covered by the relish, orchestrator and plan unit tests."
       ]
     }
   ]

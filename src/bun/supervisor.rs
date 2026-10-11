@@ -247,8 +247,30 @@ impl<G: Grill> WorkloadSupervisor<G> {
             spec.egress.as_ref(),
             spec.exec.is_some() || spec.script.is_some(),
         )?;
+        self.admit_allow_from(app_name, spec.firewall.as_ref())?;
         self.admit_dns(app_name)?;
         Ok(())
+    }
+
+    /// Refuse `allow_from` on a node that can't enforce namespace isolation.
+    /// Without the eBPF hooks every namespace already reaches every other,
+    /// so a grant would describe a boundary that isn't there; refusing it
+    /// is the same fail-closed rule an egress allowlist follows.
+    fn admit_allow_from(
+        &self,
+        name: &str,
+        firewall: Option<&crate::config::app::FirewallSpec>,
+    ) -> Result<(), BunError> {
+        if firewall.is_none_or(|firewall| firewall.allow_from.is_empty())
+            || self.capabilities.egress.can_enforce_isolation()
+        {
+            return Ok(());
+        }
+        Err(BunError::DeployFailed {
+            app_name: name.to_string(),
+            reason: "allow_from requires namespace isolation, which needs the eBPF connect and sendmsg hooks and a runtime that binds the namespace before start (rootful Linux runc with [ebpf] enabled)"
+                .to_string(),
+        })
     }
 
     /// A DNS-enabled node may not create workloads until the resolver is both
@@ -1474,6 +1496,45 @@ mod tests {
             .expect("all required hooks are live");
 
         assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn allow_from_refused_when_isolation_cannot_be_enforced() {
+        let firewall = crate::config::app::FirewallSpec {
+            allow_from: vec!["frontend/web".to_string()],
+        };
+        let mut sup = test_supervisor();
+        let mut app = basic_app_spec(None);
+        app.firewall = Some(firewall.clone());
+        let err = sup
+            .deploy_app("api", "default", &app, Instant::now())
+            .await
+            .expect_err("a node without the eBPF hooks can't open a cross-namespace path");
+        assert!(
+            matches!(&err, BunError::DeployFailed { reason, .. } if reason.contains("allow_from")),
+            "{err}"
+        );
+        assert!(sup.list_instances().is_empty());
+
+        // An empty allow_from asks for nothing beyond default isolation.
+        app.firewall = Some(crate::config::app::FirewallSpec {
+            allow_from: Vec::new(),
+        });
+        sup.deploy_app("api", "default", &app, Instant::now())
+            .await
+            .unwrap();
+
+        sup.set_egress_capability(crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        });
+        app.firewall = Some(firewall.clone());
+        sup.deploy_app("db", "default", &app, Instant::now())
+            .await
+            .expect("an enforcing node admits allow_from");
     }
 
     #[tokio::test]
