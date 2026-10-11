@@ -1393,6 +1393,38 @@ gets the runtime's reason after exactly two starts, with the budget returned
 and nothing left running. Against the old pool it fails with the same
 `SpawnFailed` CI saw.
 
+**A failed task that said nothing.** The leader-loss test with shared-runc
+executors then failed in the Lima VM: one task out of 3,000 ended `Failed` on
+its first attempt after 7.8 seconds, with no exit code and no output. That test
+stops the leader's control plane halfway through the array, so we suspected a
+task lost to leader loss. It wasn't. The task ran on a surviving node, in a
+chunk the lost leader never held. Logging the pool's errors showed what had
+happened. Before a cold executor starts, the pool pulls its image to resolve
+the command, and runc pulls it again to build the bundle. The image is pinned
+by digest and already unpacked, but each pull still reads its manifest from
+the registry. The VM ran the test straight from `cargo test`, without the
+local mirror that `make test-linux` puts in front of the pinned images, so
+dozens of cold executors read manifests from `public.ecr.aws` at once. Its
+anonymous rate limit answered `TOOMANYREQUESTS`. The registry client retried
+that four times with backoff, which is the 7.8 seconds, and then gave up. An
+image that can't be pulled is a `SpawnFailed`, so the task failed for good.
+
+The test now refuses to start without the mirror and says why. The real bug
+was that nobody could see any of this. The pool's `SpawnFailed` carried its
+reason in the outcome, but the task records only output for a failed task,
+and the pool left that empty. A failed shared-runc task showed no reason in
+`relish batch logs`. Now the pool writes the reason into the task's output, as
+the fresh-launch path always did. The unit test
+`a_command_that_never_starts_says_why_in_its_output` asks the pool for more
+than its node can hold and checks that the refusal is the task's output.
+
+The failed run also left executor network namespaces behind. A test that
+panics drops its nodes without retiring their executors, and the next runc
+test in the VM failed with `RTNETLINK answers: File exists`. Rust runs `Drop`
+while a panic unwinds, so the test now holds a guard that kills the fixture's
+runc containers and deletes their namespaces, host veths and cgroups. On a
+pass it also asserts that retirement had already removed every namespace.
+
 Retirement can't wait forever either. A process stuck in an uninterruptible
 kernel wait, say on a hung NFS mount, ignores `SIGKILL` until the kernel lets
 go. `RETIREMENT_DEADLINE` gives up after ten seconds: the caller gets its
