@@ -15,7 +15,7 @@ By the end of this chapter, a fresh Reliaburger cluster will have:
 - **Join tokens** so new nodes prove their right to join
 - **API authentication** with scoped, time-limited tokens
 - **Secret encryption** so `ENC[AGE:...]` values in your config are decrypted only at runtime
-- **Raft log encryption** at rest, so even physical disk access doesn't reveal cluster state
+- **Raft log encryption** at rest, so a stolen disk doesn't reveal the log's entries
 - **eBPF firewall rules** enforcing which apps can talk to which
 
 Zero configuration required. You get all of it by default.
@@ -707,22 +707,30 @@ Namespaces can have their own `age` keypairs, so team A's secrets can't be decry
 
 ## Raft log encryption at rest
 
-The Raft log contains everything: CA keys, API token hashes, scheduling state, app configs. Even with key wrapping, we want another layer of protection for the log itself.
+The Raft log contains almost everything: wrapped CA keys, API token hashes, scheduling state, app configs. Even with key wrapping, we want another layer of protection for the log itself.
 
-Every Raft entry is encrypted with AES-256-GCM before writing to disk. The encryption key is derived from the node's certificate private key via HKDF:
+Every Raft entry is encrypted with AES-256-GCM before it's written to disk. Each entry's key is derived with HKDF from the cluster master key and a fresh random salt:
 
 ```rust
 const RAFT_LOG_HKDF_INFO: &str = "reliaburger-raft-log-encryption-v1";
 
 pub fn derive_log_encryption_key(
-    node_private_key_der: &[u8],
+    master_key: &[u8],
     salt: &[u8; 32],
 ) -> Result<[u8; 32], RaftEncryptionError> {
-    crypto::hkdf_derive_key(node_private_key_der, salt, RAFT_LOG_HKDF_INFO)
+    Ok(crypto::hkdf_derive_key(
+        master_key,
+        salt,
+        RAFT_LOG_HKDF_INFO,
+    )?)
 }
 ```
 
-Each entry gets a fresh random salt, so identical entries produce different ciphertext. If someone steals the disk, they need the node's private key to decrypt anything.
+The `?` converts a `CryptoError` into a `RaftEncryptionError` on the way out, through the `From` impl that `#[from]` generates. The fresh salt means identical entries produce different ciphertext.
+
+Be clear about what this buys. The master key lives on the node, in `master.key`, because every node needs it to unwrap CA keys and authenticate gossip. So the encryption protects a stolen disk, a copied `log.redb` or a careless backup of the data directory. It doesn't protect against someone with root on a running node: they can read the master key as easily as Bun can. And it only covers log entries. The Raft snapshot, `snapshot.redb`, which holds token hashes, wrapped keys and the whole desired state, is written in plaintext, and so are Raft's vote and log-position records. A cluster started without a master key writes a plaintext log too.
+
+We decided to say exactly that rather than extend the encryption now. The snapshot would need the same key, which sits on the same host, so encrypting it with the master key would add work without changing who can read it. The real fix is a key the host's root account can't simply read, sealed to a TPM or derived from the node's hardware identity, and that's 0.3.0 appliance work ([#402](https://github.com/reliaburger/reliaburger/issues/402)).
 
 ## eBPF firewall wiring
 

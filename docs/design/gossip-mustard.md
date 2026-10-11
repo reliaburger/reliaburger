@@ -31,7 +31,7 @@ Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a de
 
 | Dependency | Component | Why |
 |------------|-----------|-----|
-| **Sesame** (Security/mTLS) | All inter-node communication | Mustard gossip messages are authenticated with an HMAC-SHA256 key derived (HKDF) from the cluster master key, when one is configured. Raft log entries are encrypted at rest. The reporting tree uses mTLS channels signed by the Node CA. Recovery candidate notifications are sent over mTLS. |
+| **Sesame** (Security/mTLS) | All inter-node communication | Mustard gossip messages are authenticated with an HMAC-SHA256 key derived (HKDF) from the cluster master key, when one is configured. Raft log entries (not the snapshot) are encrypted at rest under a key derived from the same master key. The reporting tree uses mTLS channels signed by the Node CA. Recovery candidate notifications are sent over mTLS. |
 | **Bun** (Agent) | Every node | Bun is the host process. Mustard, Raft, and the reporting tree all run as async tasks within the Bun process. Bun owns the node lifecycle (join, leave, shutdown) that Mustard reacts to. |
 | **Meat** (Scheduler) | Leader only | The leader runs Meat. Council selection criteria (resource availability, stability) are evaluated using data that Meat also consumes. The leader's scheduling decisions are replicated via Raft. |
 | **Lettuce** (GitOps) | Council coordinator | When GitOps is enabled, the Lettuce engine provides the authoritative desired state. During state reconstruction, the new leader loads desired state from the git repository via Lettuce. |
@@ -1119,7 +1119,7 @@ The council's shared age keypair is generated during `relish init` and stored en
 
 ### 8.3 Raft Log Encryption
 
-Raft log entries are encrypted at rest on disk using age encryption with a key derived from the Node CA certificate. This protects secrets stored in the Raft log (encrypted environment variables, API tokens, etc.) from disk access by an attacker who gains physical or root access to a council node without valid cluster credentials.
+Raft log entries are encrypted at rest with AES-256-GCM under a key derived (HKDF) from the cluster master key, which is stored on the node. This protects the log's entries from someone who copies the disk or the log file; it doesn't protect against root on a running node, which can read the master key. The Raft snapshot (`snapshot.redb`) is not encrypted. See [security-sesame.md](security-sesame.md) §5.6.
 
 In transit, Raft messages are protected by mTLS (all inter-council communication uses TLS 1.3 with mutual certificate authentication via Sesame).
 

@@ -388,14 +388,16 @@ mod tests {
     impl FakeLima {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
-            let script = directory.path().join("limactl");
-            // One shared, already-launched script for every test (#582): it
-            // finds this test's files beside the link it was started as.
-            crate::first_launch::install_script(
+            let script = directory.path().join("limactl.sh");
+            // Run through `/bin/sh`, so no new executable is launched and
+            // macOS has nothing to assess inside the deadline (#762). The
+            // script finds this test's files beside itself.
+            std::fs::write(
                 &script,
-                "#!/bin/sh\ndir=${0%/*}\nprintf '%s\\n' \"$*\" >> \"$dir/calls.log\"\nif [ \"$1\" = list ]; then cat \"$dir/list.json\"; fi\n",
-            );
-            let lima = Lima::new(script, Duration::from_secs(5));
+                "dir=${0%/*}\nprintf '%s\\n' \"$*\" >> \"$dir/calls.log\"\nif [ \"$1\" = list ]; then cat \"$dir/list.json\"; fi\n",
+            )
+            .unwrap();
+            let lima = Lima::shell_script(script, Duration::from_secs(5));
             Self { directory, lima }
         }
 

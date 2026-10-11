@@ -7,6 +7,9 @@ use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 #[derive(Clone)]
 pub struct Lima {
     executable: PathBuf,
+    /// A script `executable` reads before each command's own arguments.
+    /// Only test stand-ins set it, through `Lima::shell_script`.
+    script: Option<PathBuf>,
     timeout: Duration,
     home: Option<PathBuf>,
     /// Shared by every clone, so only one VM restarts at a time; see `restart`.
@@ -18,9 +21,24 @@ impl Lima {
     pub fn new(executable: PathBuf, timeout: Duration) -> Self {
         Self {
             executable,
+            script: None,
             timeout,
             home: None,
             restarts: Arc::default(),
+        }
+    }
+
+    /// A test stand-in for `limactl`: every command runs `/bin/sh script
+    /// <args>`, so the script is read as data and never launched itself.
+    /// macOS assesses each newly written executable on its first launch, one
+    /// at a time across the whole host, so a fresh script can wait behind
+    /// another process's large binary for over a minute (#762). `/bin/sh` is
+    /// part of the system and never waits.
+    #[cfg(test)]
+    pub(crate) fn shell_script(script: PathBuf, timeout: Duration) -> Self {
+        Self {
+            script: Some(script),
+            ..Self::new(PathBuf::from("/bin/sh"), timeout)
         }
     }
 
@@ -43,6 +61,9 @@ impl Lima {
 
     async fn run(&self, args: &[&str], stdin: std::process::Stdio) -> Result<String> {
         let mut command = tokio::process::Command::new(&self.executable);
+        if let Some(script) = &self.script {
+            command.arg(script);
+        }
         if let Some(home) = &self.home {
             command.env("LIMA_HOME", home);
         }
@@ -580,6 +601,20 @@ mod tests {
                 .await
                 .unwrap(),
             "secret-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_script_stand_in_runs_without_being_executable() {
+        // Mode 0644: executing the file itself would fail, so a pass shows
+        // the shell reads it as data and no new executable is launched.
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("limactl.sh");
+        std::fs::write(&script, "printf '%s|' \"$0\" \"$@\"\n").unwrap();
+        let lima = Lima::shell_script(script.clone(), Duration::from_secs(2));
+        assert_eq!(
+            lima.command(&["stop", "rb-laptop-1"]).await.unwrap(),
+            format!("{}|stop|rb-laptop-1|", script.display())
         );
     }
 
