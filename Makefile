@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -26,8 +26,12 @@ build: ## Compile all crates (debug)
 release: ## Compile all crates (optimised release)
 	$(CARGO) build --release
 
-test: ## Run the portable suite with nextest (ignored suites are separate)
+test: warm-executables ## Run the portable suite with nextest (ignored suites are separate)
 	$(NEXTEST)
+
+warm-executables: ## Build the binaries and run each once, so macOS assesses them before any test is timed
+	$(CARGO) build --bins
+	python3 scripts/ci/warm_executables.py
 
 test-cargo: ## Run the portable suite with Cargo's built-in runner
 	$(CARGO) test

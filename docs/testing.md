@@ -29,6 +29,23 @@ owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
+`make test` first runs `make warm-executables`: it builds the `[[bin]]`
+targets (`bun`, `relish`, `testapp`) and, on macOS, runs each once with
+`--help` ([`warm_executables.py`](../scripts/ci/warm_executables.py)). macOS
+assesses the first exec of every new executable before it runs, one file at a
+time across the host, and outside a terminal with the Developer Tools
+permission (a CI runner, a launchd service, a sandboxed agent) that costs
+about a second for a release `bun` and several seconds for a debug build.
+Without the warm-up, a test that launches a freshly built binary under a
+deadline waits in that queue. nextest already runs each test binary once to
+list its tests, so those are warm by then. Tests that write their own new
+executables, such as the upgrade probe's private copy of a candidate, still
+pay for one assessment each ([#722](https://github.com/reliaburger/reliaburger/issues/722)).
+To reproduce the CI context on a Mac, start the command from a process that
+disclaims responsibility (`posix_spawn` with
+`responsibility_spawnattrs_setdisclaim`); the measurements are in the book's
+[Chapter 14](book/14-changing-the-tyres.md#the-deadline-was-timing-macos-not-the-candidate).
+
 ## The agent loop's turn budget
 
 Each node's agent runs one loop that owns all of the node's state, one turn at
