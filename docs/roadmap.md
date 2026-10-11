@@ -384,6 +384,22 @@ what's shipped and what's scheduled.
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
   F06, F09, F11, and the rest of F03–F05).
+- **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
+  marks each of these as planned where it describes them: the reporting tree,
+  resource-aware council selection, per-app rollups and remote-read
+  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); node-by-node
+  rollouts ([#692](https://github.com/reliaburger/reliaburger/issues/692));
+  GitOps config in Raft ([#693](https://github.com/reliaburger/reliaburger/issues/693));
+  a real live-voter guard and odd council sizes
+  ([#694](https://github.com/reliaburger/reliaburger/issues/694)); faults that
+  revert after a Bun crash ([#699](https://github.com/reliaburger/reliaburger/issues/699));
+  OOM protection and host resolvers ([#700](https://github.com/reliaburger/reliaburger/issues/700));
+  init-container images and GPU refusal ([#701](https://github.com/reliaburger/reliaburger/issues/701));
+  selector-based Kubernetes import ([#703](https://github.com/reliaburger/reliaburger/issues/703));
+  an offline root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
+  static builds ([#401](https://github.com/reliaburger/reliaburger/issues/401));
+  Raft snapshot encryption ([#402](https://github.com/reliaburger/reliaburger/issues/402));
+  keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619)).
 - **Known bugs and flakes.** The open one, the `oci_crash` flake
   ([#526](https://github.com/reliaburger/reliaburger/issues/526)), is in
   [0.2.0](https://github.com/reliaburger/reliaburger/milestone/3); the open
