@@ -744,7 +744,7 @@ A node already running the daemon's committed copy doesn't need room for a secon
 
 ### 5.2 Batch Job Allocation (Delegated Model)
 
-> **Status (Phase 12).** The allocator itself ships — `meat::batch::schedule_batch` bin-packs an instance count across eligible nodes weighted by free capacity. The full delegated pipeline (dispatch via the reporting tree, per-node execution, then `BatchCompletionReport` aggregation and lifecycle) is a Phase 12 deliverable and isn't wired end to end yet. Read this section as the target design for high-throughput batch, not as an operable path today. On-demand and scheduled Jobs (the non-batch path) do run.
+> **Status (0.2.0).** This section is the original Phase 12 target. What shipped instead is the [delegated task-array implementation](#delegated-task-array-implementation-020) below: the leader grants chunks of indexed runs and accepts aggregate outcomes, and every job (apply, batch, cron) takes that one lifecycle. The Phase 12 pieces that approximated this section (the `meat::batch::schedule_batch` allocator, the leader's `BatchTracker` with its `BatchRegister` reservations in Raft, node-to-node `/v1/batch/run` dispatch and completion callbacks) were retired in 0.2.0 (#681). Read the rest of this section as background.
 
 The 100M jobs/day target (approximately 1,150 jobs/sec sustained) requires a fundamentally different approach than scheduling each job individually through Raft.
 
@@ -1058,7 +1058,7 @@ Admission caps sit in the replicated store (`src/meat/task_array_store.rs`, deci
 
 A run's trigger decides its class: `Cron` and `Hook` triggers are *triggered*, everything else is *bulk*. A cron `Fire` refused even with the headroom is recorded rather than failed: the cursor advances, the definition keeps `skipped: {minute, reason: capacity}` and a count, and the leader emits a `job-skipped` event. `control_state_stays_within_budget_at_the_global_cap` justifies 128: at the cap, with the largest template and saturated failure ranges, job state stays under 32 MiB (half a Raft frame) and one node's sync call under its 8 MiB body limit. 256 would not.
 
-Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop filters schedules blocked by a pending deployment before taking its sixteen per tick, and starts each tick after the last one it fired, so a long list takes turns.
+Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop takes at most sixteen due schedules per tick and starts each tick after the last one it fired, so a long list takes turns.
 
 #### The task-array leader loop at scale
 
@@ -1558,6 +1558,18 @@ prevents starvation by repeated small requests, with a head-of-line utilisation
 trade-off. It is not tenant DRF, and running jobs do not automatically yield to
 a new app deployment. Provision service/rollout headroom. A profile larger than
 a node's allocatable capacity is refused; temporary fullness queues work.
+
+App placement sees what jobs hold. Each `StateReport` carries the node's
+`job_reservations` (the budget's task-attempt and executor leases, quarantined
+ones included) apart from `resource_usage`, which sums app requests per
+instance. `build_cluster_cache` adds both into the node's `allocated` total,
+so `reserve_commitments` only reconciles committed app placements and never
+counts an app twice. A placement can still lose the race to attempts that start
+after the pass: `try_acquire` doesn't queue, so the agent records a
+`CapacityRefusal` for that app and the next report carries it. The leader then
+stops treating the placement as held (`Liveness::keeps`) and places the replica
+elsewhere; a managed-volume app still waits for its home node. Refusals lapse
+after a minute or on the app's next successful deploy.
 
 Workers persist control provenance (recovery epoch, leadership term, committed
 log index) and highest chunk generation. Task outcomes stream into checksummed

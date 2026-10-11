@@ -456,6 +456,22 @@ it expires after a second and yields to waiting profiles. Native host jobs keep
 host filesystem access and Bun's user. The raw VM baseline bypasses admission,
 resource limits, durable ownership and task outcomes.
 
+### Apps and jobs share each node
+
+Jobs and applications draw on the same per-node execution budget. App
+replicas, running task attempts and reusable executors each lease their CPU
+and memory requests from it; a queued chunk, a retry waiting out its backoff
+and an idle schedule hold nothing. Each node's state report carries what its
+task attempts and executors hold, separately from its app requests, and the
+leader counts both when it places an app replica. A node full of job work
+looks full, so the replica goes to a node with room.
+
+Placement and attempts can still race: jobs may take a node's room between the
+leader placing a replica and the node starting it. The agent doesn't wait or
+preempt running attempts. It reports the refusal, and the leader moves that
+replica to another node. Capacity a job held returns to the budget only once
+its attempt has positively retired.
+
 
 ## Reusable containers
 

@@ -115,16 +115,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         for inst in self.supervisor.list_instances() {
             let Some(ref identity) = inst.identity else {
-                // Apps only: job containers don't mount an identity dir.
-                if retry_missing
-                    && !inst.is_job
-                    && inst.state == crate::grill::state::ContainerState::Running
-                {
+                if retry_missing && inst.state == crate::grill::state::ContainerState::Running {
                     needs_rotation.push((
                         inst.id.clone(),
                         inst.app_name.clone(),
                         inst.namespace.clone(),
-                        inst.is_job,
                     ));
                 }
                 continue;
@@ -136,7 +131,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         inst.id.clone(),
                         inst.app_name.clone(),
                         inst.namespace.clone(),
-                        inst.is_job,
                     ));
                 }
                 crate::sesame::identity::RotationState::Expired => {
@@ -157,8 +151,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Only start the signings here: they finish on the loop when their
         // tasks report back, and one already running for an instance is joined.
-        for (id, app, ns, is_job) in needs_rotation {
-            self.begin_identity_provision(&app, &ns, &id, is_job, None);
+        for (id, app, ns) in needs_rotation {
+            self.begin_identity_provision(&app, &ns, &id, None);
         }
     }
 }

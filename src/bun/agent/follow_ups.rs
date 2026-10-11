@@ -182,7 +182,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor
             .list_instances()
             .into_iter()
-            .filter(|instance| !instance.is_job && instance.state == ContainerState::Running)
+            .filter(|instance| instance.state == ContainerState::Running)
             .map(|instance| InventoryEntry {
                 id: instance.id.clone(),
                 namespace: instance.namespace.clone(),

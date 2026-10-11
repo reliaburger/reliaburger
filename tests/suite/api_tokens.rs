@@ -82,6 +82,8 @@ fn router_for_council(
                 },
                 event_log: vec![],
                 has_buildah: false,
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         let (publisher, receiver) = tokio::sync::watch::channel(state);
@@ -104,20 +106,8 @@ fn router_for_council(
     tokio::spawn(async move {
         let _capacity_publisher = capacity_publisher;
         while let Some(command) = rx.recv().await {
-            match command {
-                reliaburger::bun::agent::AgentCommand::RunJobsWithLabels {
-                    config,
-                    execution_labels,
-                    response,
-                    ..
-                } => {
-                    assert_eq!(config.job.len(), execution_labels.len());
-                    let _ = response.send(Ok(BTreeMap::new()));
-                }
-                reliaburger::bun::agent::AgentCommand::Status { response } => {
-                    let _ = response.send(Vec::new());
-                }
-                _ => {}
+            if let reliaburger::bun::agent::AgentCommand::Status { response } = command {
+                let _ = response.send(Vec::new());
             }
         }
     });
@@ -303,7 +293,7 @@ async fn batch_submission_enforces_deploy_and_host_execution_permissions() {
         request.extensions_mut().insert(owner());
         let response = router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(council.desired_state().await.batch_state.get(1).is_none());
+        assert!(council.desired_state().await.task_arrays.ids().is_empty());
     }
     council
         .write(reliaburger::council::types::RaftRequest::PermissionSpec {
@@ -922,6 +912,8 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             },
             event_log: vec![],
             has_buildah: false,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         },
     );
     let (reports, report_rx) = tokio::sync::watch::channel(report);
@@ -933,25 +925,8 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
         loop {
             let command = tokio::select! { _ = actor_shutdown.cancelled() => break, command = incoming.recv() => command };
             match command {
-                Some(AgentCommand::BatchOwnedExecutions { response, .. }) => {
-                    let _ = response.send(Default::default());
-                }
                 Some(AgentCommand::Status { response }) => {
                     let _ = response.send(Vec::new());
-                }
-                Some(AgentCommand::RunJobsWithLabels {
-                    config,
-                    execution_labels,
-                    events,
-                    response,
-                    ..
-                }) => {
-                    counted_dispatches.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(config.job.len(), execution_labels.len());
-                    // Finite command/authority ACK, not a real child exit.
-                    let terminal = config.job.keys().map(|name| (name.clone(), 0)).collect();
-                    response.send(Ok(terminal)).unwrap();
-                    drop(events);
                 }
                 Some(_) => {
                     counted_dispatches.fetch_add(1, Ordering::SeqCst);
@@ -1156,10 +1131,7 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
                 let after = leader.desired_state().await;
                 assert_eq!(after.last_applied_log, before.last_applied_log);
                 assert_eq!(after.apps, before.apps);
-                assert_eq!(
-                    serde_json::to_value(after.batch_state).unwrap(),
-                    serde_json::to_value(before.batch_state).unwrap()
-                );
+                assert_eq!(after.task_arrays, before.task_arrays);
                 assert_eq!(
                     dispatches.load(Ordering::SeqCst),
                     dispatched_before,

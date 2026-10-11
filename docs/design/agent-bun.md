@@ -1267,6 +1267,13 @@ Three decisions shape everything that follows, and each earns its keep against t
 4. Stage the binary and its detached signature under the version store,
    then flip the current symlink atomically to the new version.
 
+   The hashing and signature checks in 3 and the staging in 4 read, hash
+   and write the whole binary: seconds for a large build. They run on
+   Tokio's blocking pool (`spawn_blocking`), never on a runtime worker.
+   Done in place they starved the node's Raft core, which missed the
+   leader's heartbeats and called an election just before the exec,
+   deposing a healthy leader on every voter swap (#783).
+
 5. Exec the new binary in place (execve). The PID does not change; running
    containers keep serving. On startup the new Bun ADOPTS its still-running
    workloads from on-disk instance records (see 5.1 reconnect / grill
