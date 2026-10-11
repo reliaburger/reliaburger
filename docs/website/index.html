@@ -28,11 +28,12 @@
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
           <div class="eyebrow">RUST · APACHE 2.0 · 0.1.6 PROTOTYPE</div>
-          <h1 id="title">One binary.<br>A complete container platform. Zero assembly required.</h1>
-          <p class="lede">Kubernetes gave us container orchestration, but gave every team an accidental 
-            platform engineering department. Reliaburger gives you the full production platform — scheduling, 
-            mTLS, ingress, registry, metrics, logs, GitOps, and chaos testing — compiled into a single, 
-            lightning-fast Rust binary that runs anywhere in under five minutes.</p>
+          <h1 id="title">One binary.<br>A container platform with nothing to assemble.</h1>
+          <p class="lede">Kubernetes gave us container orchestration, and gave every team an accidental
+            platform engineering department. Reliaburger compiles the platform into one Rust agent:
+            scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing.
+            It’s a prototype. Try it on a laptop cluster, on macOS or on Linux with KVM; five
+            minutes from install to cluster is the target.</p>
           <div class="intro-links">
             <a class="primary-link" href="#install">Install 0.1.6 <span aria-hidden="true">↓</span></a>
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
@@ -77,25 +78,41 @@
         </div>
       </section>
 
-      <aside class="status" aria-label="Release status">
-        <strong>0.1.6 (Prototype)</strong>
-        <p>Released on 7 October 2026: operations security. Images bound to a digest
-          when you apply them, CA backup and intermediate rotation, tokens that expire
+      <!-- Release cards use the roadmap's release names (docs/roadmap.md); a date
+           appears only where the roadmap states one. tests/suite/website.rs checks both. -->
+      <aside class="status" aria-label="Release status: what the installer fetches">
+        <strong>0.1.6: Operations security</strong>
+        <p>The prototype you install today, released on 7 October 2026. Images bound to a
+          digest when you apply them, CA backup and intermediate rotation, tokens that expire
           and rotate, and per-namespace secret keys. Signed binaries for Linux and macOS, and a
-          one-line installer that builds a laptop cluster from them. Five minutes is the target; the documentation lists what 0.1.6 doesn’t do yet.</p>
+          one-line installer that builds a laptop cluster from them. The documentation lists
+          what 0.1.6 doesn’t do yet.</p>
         <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
-      <aside class="status" aria-label="Release status">
-        <strong>0.3.0 (MVP)</strong>
-        <p>Minimum viable product with core features implemented and tested.</p>
-        <p>In planning (1Q2027).<span aria-hidden="true">↗</span></p>
+      <aside class="status" aria-label="Release status: in development">
+        <strong>0.2.0: A million jobs</strong>
+        <p>In development, not released. One-off jobs, cron, deployment hooks and task arrays
+          (a template and a count, not a record per task) share one durable lifecycle,
+          packed onto nodes beside your apps. Each job picks its isolation: a fresh
+          container, a reused container or an allowlisted host command. The million-task gate and the sustained daily rate are
+          still being qualified.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/3">Milestone <span aria-hidden="true">↗</span></a>
       </aside>
 
-      <aside class="status" aria-label="Release status">
-        <strong>0.7.0 (MDE)</strong>
-        <p>Minimum delightful experience with polished features and user experience.</p>
-        <p>Devising (4Q2027).<span aria-hidden="true">↗</span></p>
+      <aside class="status" aria-label="Release status: planned">
+        <strong>0.3.0: Bare metal in an hour</strong>
+        <p>Planned. An appliance OS, netbooting and claiming machines over
+          the LAN, and signed A/B OS updates. The exit test: Dell Wyse
+          thin clients from power-on to a cluster.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/6">Milestone <span aria-hidden="true">↗</span></a>
+      </aside>
+
+      <aside class="status" aria-label="Release status: planned">
+        <strong>0.4.0: Full container migration</strong>
+        <p>Planned. Cordon, drain and uncordon, cold moves that carry volumes, and
+          checkpoint moves that keep memory while connections reconnect.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/7">Milestone <span aria-hidden="true">↗</span></a>
       </aside>
 
       <section id="tour" class="section" aria-labelledby="tour-title">
@@ -245,12 +262,14 @@
       <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">03 /</span>
-          <h2 id="job-throughput-title">Run millions of jobs. Choose your isolation.
+          <h2 id="job-throughput-title">Coming in 0.2.0: a million jobs, your choice of isolation
             <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
         </div>
         <div class="tour">
-        <p class="tour-note">Four ways to run the same command, measured on the same
-          VM with the same concurrency. Pick the isolation your work needs.</p>
+        <p class="tour-note">Everything in this section is 0.2.0, not in 0.1.6: a development
+          build, not what the installer fetches yet. It runs the same command four ways,
+          on the same VM with the same concurrency, so you can see what each kind of
+          isolation costs.</p>
         <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:258.78089525790324">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
@@ -273,8 +292,8 @@
         </figure>
         <details class="tour-commands" id="job-throughput-commands">
           <summary>Show the commands <span class="tour-commands-note">run the four scenarios on your own setup</span></summary>
-          <p>These commands need the 0.2.0 development build shown above; the current
-            0.1.6 installer doesn't include them. Each defaults to 60 seconds and
+          <p>These commands are 0.2.0, not in 0.1.6: they need the development build shown
+            above, and the installer doesn’t fetch it yet. Each defaults to 60 seconds and
             concurrency 27 per node. The public scenarios use your configured
             cluster endpoint, token and CA. They submit real work, so use a test cluster.</p>
           <ol class="tour-steps">
@@ -324,6 +343,8 @@
           would dominate the work. Choose host jobs for maximum speed with no isolation,
           using an explicit allowlisted binary. All three use built-in resource
           admission, durable ownership, retries and accepted outcomes.</p>
+        <!-- TODO(#688): these figures come from development build 006aca5f. Re-measure on
+             the 0.2.0 release candidate at promotion, with #668's qualification and #640. -->
         <div class="throughput-comparison" role="region" aria-label="Measured job runtimes" tabindex="0">
         <table><caption>Four scenarios, 60 seconds each. Same VM, BusyBox command
           and concurrency cap of 27. Daily figures are extrapolated.</caption>
