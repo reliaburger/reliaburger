@@ -1467,7 +1467,13 @@ machines.
   receipts never satisfy GitHub CI aggregation. With `GITHUB_ACTIONS=true`,
   the command requires trusted current checkout/run/attempt/output inputs
   and refuses manual options. The same build and isolated groups run once in
-  both modes; compiler overrides require a separate audit.
+  both modes; compiler overrides require a separate audit. Each of its three
+  test binaries gets 420 s: one still running then gets SIGTERM, and SIGKILL
+  30 s later, so a hung test fails the run with its log kept. In CI the step
+  also has its own 25-minute limit. A watcher records free disk and memory
+  while it runs, and the step after it prints the low-water marks and, when
+  the step didn't pass, every process left running with its kernel stacks
+  ([#800](https://github.com/reliaburger/reliaburger/issues/800)).
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
   after the new kernel boot, including address retention until explicit
