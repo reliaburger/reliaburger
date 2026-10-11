@@ -289,6 +289,8 @@ mod tests {
             namespace: None,
             exec: Some(PathBuf::from("/usr/local/bin/rb-task")),
             script: None,
+            firewall: None,
+            egress: None,
             max_attempts: None,
             task_timeout_secs: None,
             overlap: None,

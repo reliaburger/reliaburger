@@ -153,6 +153,8 @@ impl JobBenchArgs {
             run_before: vec![],
             env: Default::default(),
             script: None,
+            firewall: None,
+            egress: None,
             max_attempts: None,
             task_timeout_secs: None,
             overlap: None,

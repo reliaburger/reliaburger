@@ -40,6 +40,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_certificates(inputs, &mut report);
         check_registry(inputs, &mut report);
         check_tokens(inputs, &mut report);
+        check_isolation(inputs, &mut report);
     }
     record_application_unknowns(&inputs.applications, inputs.app.as_deref(), &mut report);
     check_crashloops(inputs, &mut report);
@@ -82,6 +83,7 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("certificates", &evidence.certificates, "cluster", report);
     record_unknown("registry", &evidence.registry, "cluster", report);
     record_unknown("tokens", &evidence.tokens, "cluster", report);
+    record_unknown("isolation", &evidence.isolation, "cluster", report);
 }
 
 fn record_application_unknowns(
@@ -1187,6 +1189,47 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// With more than one namespace, every node must keep them apart. A node
+/// without the eBPF data path lets any namespace reach any other, and
+/// refuses `allow_from`, so the tenant boundary doesn't exist there.
+fn check_isolation(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(isolation) = inputs.cluster.isolation.value() else {
+        return;
+    };
+    if isolation.namespaces.len() < 2 {
+        report.ok.push(WtfOk {
+            id: "namespace-isolation".to_string(),
+            description: "one namespace in use; nothing to keep apart".to_string(),
+        });
+        return;
+    }
+    let mut found = false;
+    for node in isolation.nodes.iter().filter(|node| !node.enforced) {
+        found = true;
+        report.warnings.push(WtfFinding {
+            id: "namespace-isolation".to_string(),
+            title: format!(
+                "node {} can't keep its {} namespaces apart",
+                node.node_id,
+                isolation.namespaces.len()
+            ),
+            details: vec![
+                format!("namespaces: {}", isolation.namespaces.join(", ")),
+                "without the eBPF hooks, a workload there reaches every namespace's services and allow_from is refused".to_string(),
+            ],
+            suggestion: "run the node as rootful Linux runc with [ebpf] enabled = true (relish init writes it), or keep tenants on nodes that enforce isolation".to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", node.node_id),
+        });
+    }
+    if !found {
+        report.ok.push(WtfOk {
+            id: "namespace-isolation".to_string(),
+            description: "every reporting node enforces namespace isolation".to_string(),
+        });
+    }
+}
+
 fn app_matches(scope: Option<&str>, app: &str) -> bool {
     scope.is_none_or(|scope| scope == app)
 }
@@ -1211,9 +1254,9 @@ mod tests {
     use super::*;
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
-        DeployObservation, DiskObservation, FaultObservation, LogObservation, NodeObservation,
-        RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
-        TokenObservation,
+        DeployObservation, DiskObservation, FaultObservation, IsolationObservation, LogObservation,
+        NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
+        RestartObservation, ServiceObservation, TokenObservation,
     };
 
     const NOW: u64 = 2_000_000;
@@ -1273,6 +1316,13 @@ mod tests {
                     token("admin", "admin", NOW - 10 * DAY, None),
                     token("ci", "deployer", NOW - 10 * DAY, Some(NOW + 80 * DAY)),
                 ]),
+                isolation: available(IsolationObservation {
+                    namespaces: vec!["default".to_string()],
+                    nodes: vec![NodeIsolation {
+                        node_id: "node-1".to_string(),
+                        enforced: false,
+                    }],
+                }),
             },
             applications: ApplicationEvidence {
                 restarts: available(Vec::new()),
@@ -1824,6 +1874,49 @@ mod tests {
         let report = diagnose(&inputs);
 
         assert!(report.warnings.iter().any(|item| item.id == "deploy-stuck"));
+    }
+
+    #[test]
+    fn warns_when_namespaces_exist_but_a_node_cannot_enforce_isolation() {
+        let mut inputs = healthy_inputs();
+        let isolation = |enforced: [bool; 2]| IsolationObservation {
+            namespaces: vec!["default".to_string(), "tenant-b".to_string()],
+            nodes: vec![
+                NodeIsolation {
+                    node_id: "node-1".to_string(),
+                    enforced: enforced[0],
+                },
+                NodeIsolation {
+                    node_id: "node-2".to_string(),
+                    enforced: enforced[1],
+                },
+            ],
+        };
+        inputs.cluster.isolation = available(isolation([true, false]));
+        let report = diagnose(&inputs);
+        assert_eq!(
+            warning_ids(&report)
+                .into_iter()
+                .filter(|(id, _)| *id == "namespace-isolation")
+                .collect::<Vec<_>>(),
+            vec![("namespace-isolation", "node.node-2")]
+        );
+
+        // Every node enforcing is fine; so is one namespace on any node.
+        inputs.cluster.isolation = available(isolation([true, true]));
+        assert!(
+            !warning_ids(&diagnose(&inputs))
+                .iter()
+                .any(|(id, _)| *id == "namespace-isolation")
+        );
+        let mut single = isolation([false, false]);
+        single.namespaces.truncate(1);
+        inputs.cluster.isolation = available(single);
+        assert!(
+            !warning_ids(&diagnose(&inputs))
+                .iter()
+                .any(|(id, _)| *id == "namespace-isolation")
+        );
     }
 
     #[test]

@@ -782,9 +782,15 @@ enum UpgradeAction {
         /// Local binary to upgrade from instead (expects {path}.sig).
         #[arg(long)]
         binary: Option<std::path::PathBuf>,
-        /// Signature envelope path (default: {binary}.sig).
+        /// Signature envelope path: the countersigned `.sig` for --binary
+        /// (default: {binary}.sig), or for the version form when the nodes
+        /// share one platform.
         #[arg(long)]
         sig: Option<std::path::PathBuf>,
+        /// Your external (operator) private key: countersign each downloaded
+        /// release binary with it before pushing (version form).
+        #[arg(long, conflicts_with = "sig")]
+        external_key: Option<std::path::PathBuf>,
         /// Worker upgrade parallelism.
         #[arg(long, default_value = "1")]
         parallel: u32,
@@ -2226,6 +2232,7 @@ async fn main() -> ExitCode {
                     version,
                     binary,
                     sig,
+                    external_key,
                     parallel,
                     registry,
                     url,
@@ -2238,6 +2245,7 @@ async fn main() -> ExitCode {
                             version,
                             binary,
                             sig,
+                            external_key,
                             parallel,
                             registry,
                             metadata_url: url,

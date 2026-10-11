@@ -168,6 +168,8 @@ struct CreateInput {
     /// The app's deployed spec: whether it holds an address, and the egress
     /// allowlist the loop will program before the start.
     app_spec: Option<AppSpec>,
+    /// A job's egress allowlist; a job has no app spec to carry one.
+    job_egress: Option<Vec<String>>,
     egress: EgressResolver,
 }
 
@@ -199,7 +201,13 @@ async fn run_step<G: Grill>(
                     } else {
                         Ok(None)
                     };
-                    let egress = create.egress.resolve(create.app_spec.as_ref()).await;
+                    let egress = match create.job_egress {
+                        Some(allow) => super::launch_evidence::EgressResolution {
+                            destinations: create.egress.resolve_allowlist(&allow).await,
+                            allow,
+                        },
+                        None => create.egress.resolve(create.app_spec.as_ref()).await,
+                    };
                     return StepResult::Created {
                         retained,
                         egress: Box::new(egress),
@@ -243,6 +251,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .deployed_specs
                     .get(&(launch.app_name.clone(), launch.namespace.clone()))
                     .cloned(),
+                job_egress: self
+                    .recorded_jobs
+                    .get(&id.0)
+                    .and_then(|job| job.spec.egress.as_ref())
+                    .map(|policy| policy.allow.clone()),
                 egress: self.egress_resolver(),
             }),
             _ => None,

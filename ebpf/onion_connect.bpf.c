@@ -11,7 +11,10 @@
  *    this node once the lease has lapsed
  * 5. Rewrites the destination address and port
  *
- * Non-VIP connections pass through untouched.
+ * A non-VIP destination is never rewritten, but namespace isolation still
+ * applies when destination_map says a workload owns it (a backend's real
+ * address, a published host port, a container address), and then the
+ * calling cgroup's egress allowlist does.
  */
 #include "onion_common.h"
 #include "smoker_common.h"
@@ -44,6 +47,15 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
     RELIABURGER_MAP_PINNING
 } cgroup_namespace_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 131072);
+    __type(key, struct destination_key);
+    __type(value, struct destination_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
+} destination_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -106,6 +118,69 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
     RELIABURGER_MAP_PINNING
 } egress_enabled_map SEC(".maps");
+
+/* ---------- Namespace isolation helpers ---------------------------------- */
+
+/* The calling process's namespace: its own cgroup's binding, or else the
+ * binding of its /reliaburger/<namespace> ancestor, which delegated job
+ * runtimes and host process workloads inherit. NULL means the caller sits
+ * outside Reliaburger's workload cgroups (host daemons, Bun itself) and
+ * namespace policy does not apply to it. */
+static __always_inline struct cgroup_ns_value *source_namespace(__u64 cg)
+{
+    struct cgroup_ns_key key = { .cgroup_id = cg };
+    struct cgroup_ns_value *ns = bpf_map_lookup_elem(&cgroup_namespace_map, &key);
+    if (!ns) {
+        key.cgroup_id = bpf_get_current_ancestor_cgroup_id(2);
+        ns = bpf_map_lookup_elem(&cgroup_namespace_map, &key);
+    }
+    return ns;
+}
+
+/* Does namespace isolation refuse this caller a destination owned by
+ * (namespace_id, app_id)? Same namespace passes; another namespace needs an
+ * explicit firewall_map grant from allow_from. */
+static __always_inline int isolation_denies(__u64 cg, __u32 namespace_id, __u32 app_id)
+{
+    struct cgroup_ns_value *src = source_namespace(cg);
+    if (!src || src->namespace_id == namespace_id)
+        return 0;
+    struct firewall_key fw_key = {
+        .src_cgroup_id = cg,
+        .dst_app_id    = app_id,
+        ._pad          = 0,
+    };
+    struct firewall_value *fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
+    return !fw || fw->action == FIREWALL_DENY;
+}
+
+/* Is this real IPv4 destination owned by a workload the caller may not
+ * reach? An exact (address, port) entry wins over the address's any-port
+ * entry. An address nothing owns passes to the egress check. */
+static __always_inline int real_destination_denied(__u64 cg, __u32 ip_be, __u16 port_be)
+{
+    struct destination_key key = {
+        .ip   = ip_be,
+        .port = port_be,
+        ._pad = 0,
+    };
+    struct destination_value *owner = bpf_map_lookup_elem(&destination_map, &key);
+    if (!owner) {
+        key.port = DESTINATION_ANY_PORT;
+        owner = bpf_map_lookup_elem(&destination_map, &key);
+    }
+    return owner && isolation_denies(cg, owner->namespace_id, owner->app_id);
+}
+
+/* The IPv4 address inside a v4-mapped IPv6 destination, or 0 when the
+ * destination is native IPv6. Workload addresses are IPv4 only. */
+static __always_inline __u32 mapped_ipv4(struct bpf_sock_addr *ctx)
+{
+    if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
+        ctx->user_ip6[2] == bpf_htonl(0x0000FFFF))
+        return ctx->user_ip6[3];
+    return 0;
+}
 
 /* ---------- Egress policy helpers ---------------------------------------- */
 
@@ -224,11 +299,16 @@ int onion_connect(struct bpf_sock_addr *ctx)
 
     /* Only intercept VIPs in the 127.128.0.0/16 range */
     if ((dst_ip & VIP_MASK) != VIP_PREFIX) {
-        /* Not a VIP — check egress allowlist.
-         * If the calling cgroup has egress enforcement enabled and
-         * the destination is neither an exact allow entry nor inside
-         * an allowed CIDR, deny the connection. */
+        /* Not a VIP. A workload's real address (container address, or a
+         * node address and published host port) belongs to its namespace
+         * exactly as its VIP does. */
         __u64 eg_cgroup = bpf_get_current_cgroup_id();
+        if (real_destination_denied(eg_cgroup, ctx->user_ip4, ctx->user_port))
+            return 0;  /* EPERM: another namespace's workload */
+
+        /* Then the egress allowlist: if the calling cgroup has egress
+         * enforcement enabled and the destination is neither an exact
+         * allow entry nor inside an allowed CIDR, deny the connection. */
         __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &eg_cgroup);
         if (enforced && *enforced == 1 &&
             !egress4_allowed(eg_cgroup, ctx->user_ip4, ctx->user_port))
@@ -312,33 +392,11 @@ no_fault:
     if (!val || val->count == 0)
         return 0;  /* deny -> EPERM: no backends registered */
 
-    /* --- Firewall: namespace isolation --- */
-    __u64 src_cgroup = bpf_get_current_cgroup_id();
-
-    struct cgroup_ns_key ns_key = { .cgroup_id = src_cgroup };
-    struct cgroup_ns_value *src_ns = bpf_map_lookup_elem(
-        &cgroup_namespace_map, &ns_key);
-
-    /* Delegated executors inherit a bound /reliaburger/<namespace> ancestor.
-     * App-specific source bindings take precedence. The namespace binding is
-     * installed before any delegated descendant can start. */
-    if (!src_ns) {
-        ns_key.cgroup_id = bpf_get_current_ancestor_cgroup_id(2);
-        src_ns = bpf_map_lookup_elem(&cgroup_namespace_map, &ns_key);
-    }
-
-    if (src_ns && src_ns->namespace_id != val->namespace_id) {
-        /* Cross-namespace connection. Check firewall_map for allow. */
-        struct firewall_key fw_key = {
-            .src_cgroup_id = src_cgroup,
-            .dst_app_id    = val->app_id,
-            ._pad          = 0,
-        };
-        struct firewall_value *fw = bpf_map_lookup_elem(
-            &firewall_map, &fw_key);
-        if (!fw || fw->action == FIREWALL_DENY)
-            return 0;  /* deny -> EPERM: cross-namespace denied */
-    }
+    /* --- Firewall: namespace isolation. App-specific source bindings take
+     * precedence over the inherited /reliaburger/<namespace> binding, which
+     * is installed before any delegated descendant can start. --- */
+    if (isolation_denies(bpf_get_current_cgroup_id(), val->namespace_id, val->app_id))
+        return 0;  /* deny -> EPERM: cross-namespace denied */
 
     /* --- Backend selection: round-robin among healthy (and, once the
      * lease has lapsed, local) backends --- */
@@ -381,8 +439,9 @@ no_fault:
 
 /* ---------- Connect6 hook ------------------------------------------------ */
 
-/* IPv6 egress policy. Without this hook a dual-stack workload bypasses the
- * whole allowlist by connecting over IPv6 (NET7). VIP rewrite stays
+/* IPv6 policy. Without this hook a dual-stack workload bypasses the whole
+ * allowlist by connecting over IPv6 (NET7), and could reach another
+ * namespace's workload through its v4-mapped address. VIP rewrite stays
  * v4-only: VIPs live in 127.128.0.0/16 and the service map never hands out
  * IPv6 backends, so this program is pure policy — no rewriting.
  */
@@ -390,6 +449,9 @@ SEC("cgroup/connect6")
 int onion_connect6(struct bpf_sock_addr *ctx)
 {
     __u64 cg = bpf_get_current_cgroup_id();
+    __u32 v4 = mapped_ipv4(ctx);
+    if (v4 && real_destination_denied(cg, v4, ctx->user_port))
+        return 0;
     __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &cg);
     if (!enforced || *enforced != 1)
         return 1;  /* no enforcement for this cgroup */
@@ -399,15 +461,17 @@ int onion_connect6(struct bpf_sock_addr *ctx)
 
 /* Unconnected UDP uses sendmsg()/sendto() without invoking connect hooks.
  * Mirror the same policy at both sendmsg hooks so protocol choice cannot
- * bypass a declared allowlist. */
+ * bypass namespace isolation or a declared allowlist. */
 SEC("cgroup/sendmsg4")
 int onion_sendmsg4(struct bpf_sock_addr *ctx)
 {
     __u64 cg = bpf_get_current_cgroup_id();
+    if ((bpf_ntohl(ctx->user_ip4) & VIP_MASK) == VIP_PREFIX)
+        return 1;
+    if (real_destination_denied(cg, ctx->user_ip4, ctx->user_port))
+        return 0;
     __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &cg);
     if (!enforced || *enforced != 1)
-        return 1;
-    if ((bpf_ntohl(ctx->user_ip4) & VIP_MASK) == VIP_PREFIX)
         return 1;
     return egress4_allowed(cg, ctx->user_ip4, ctx->user_port);
 }
@@ -416,6 +480,9 @@ SEC("cgroup/sendmsg6")
 int onion_sendmsg6(struct bpf_sock_addr *ctx)
 {
     __u64 cg = bpf_get_current_cgroup_id();
+    __u32 v4 = mapped_ipv4(ctx);
+    if (v4 && real_destination_denied(cg, v4, ctx->user_port))
+        return 0;
     __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &cg);
     if (!enforced || *enforced != 1)
         return 1;

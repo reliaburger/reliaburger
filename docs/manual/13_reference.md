@@ -122,6 +122,8 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `namespace` | Namespace; `default` when omitted |
 | `schedule` | Cron schedule in UTC: five fields or a macro such as `@daily` |
 | `run_before` | `["app.NAME"]`: run as a hook before that app publishes |
+| `firewall` | Apps in other namespaces allowed to connect to the job, as for an app's `[firewall]`; container jobs only |
+| `egress` | Outside destinations the job may reach, as for an app's `[egress]`; container jobs only |
 | `max_attempts` | 1–10. Default 4, or 1 for a hook |
 | `task_timeout_secs` | 0–86400 per attempt; 0 means no deadline. Default none, or 600 for a hook |
 | `overlap` | Cron only: `forbid` (default) skips an occurrence while a run is active; `allow` starts another |
