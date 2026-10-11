@@ -53,6 +53,11 @@ zero (both default to 0, and memory stops at 90%). Clearing needs the same role
 and grant, but no acknowledgement. Bun takes the audit identity from the
 authenticated credential, not `$USER` or the request body.
 
+A token with a `[permission]` block (see `security`) also needs the `fault`
+action. On one app it covers injecting and clearing that app's faults. A node
+fault targets no app, and `relish fault clear` with no service reaches every
+tenant, so those need `fault` with `apps = ["*"]` and no `namespaces`.
+
 `[testing] safety_class` is `development`, `staging`, `production` or, when
 unset, `unknown`. On `production` and `unknown` clusters every injection also
 needs `allow_protected_mutation = true`, a second switch you flip on purpose.
@@ -82,7 +87,9 @@ command prints each one. `relish fault list` shows every node's faults with a
 `NODE` column, and `relish fault clear <id>` finds the node that holds that
 id (pass `--node` if two nodes happen to use the same number). `relish fault
 clear` with no id, or with a service name, clears on every node; clearing
-everything needs an unscoped token.
+everything needs an unscoped token. So does `relish fault list`: a token
+scoped to some apps or namespaces sees only its own apps' faults on the node
+it asks, and the cluster-wide list refuses it.
 
 Network faults (`delay`, `drop`, `dns`, `partition`) are the other way round.
 They change what happens when something *calls* the target, and that happens

@@ -817,6 +817,53 @@ pub fn authorize_user(ctx: Option<&AuthContext>, required: ApiRole) -> Result<()
 
 Now a stolen service token can still do a node's job (that's unavoidable — the node has to do its job) but can't mint credentials or touch key material. The blast radius of one compromised node shrinks from "the whole cluster" to "one node's workloads".
 
+### A cookie is not a node
+
+The service token has one more way out, and it's through the dashboard. `POST /ui/session` swaps a token for a browser cookie, and it accepts the service token too, so an operator on a node can paste it in and look around. The session it makes is read-only, like every session: the middleware builds its `AuthContext` with role `ReadOnly` and a principal id of `session:__system`. But it keeps the token's *name*, `__system`, and `require_system`, the gate on every node-to-node route, compared only the name:
+
+```rust
+match ctx {
+    Some(ctx) if ctx.token_name == SYSTEM_PRINCIPAL => Ok(()),
+    _ => Err(/* 403 */),
+}
+```
+
+So that "read-only" cookie could post to `/v1/batch/run` and run any job on a node, start a privileged Buildah build through `/v1/build/run`, reserve chaos experiments and renew node certificates. One cross-site scripting bug in the dashboard, or one cookie lifted off a laptop, and the documented rule that a stolen cookie "can read the dashboard but never mutate" was simply false.
+
+The fix is one more comparison, given a name so nobody has to remember it:
+
+```rust
+pub fn is_system_principal(ctx: &AuthContext) -> bool {
+    ctx.token_name == SYSTEM_PRINCIPAL && ctx.principal_id == SYSTEM_PRINCIPAL
+}
+```
+
+Only a bearer that matched the service token gets both fields. A session's principal id always starts `session:`, so it can never pass, whatever token it came from. The token-list handler already had exactly this check inline; now both use the helper. The regression, `require_system_refuses_a_session_made_from_the_service_token`, builds the session context with the middleware's own function rather than by hand, so a later change to what a session looks like can't quietly make the test pass. `service_token_cookie_cannot_run_a_batch_on_a_node` in the integration suite does the whole thing from the outside: log in with the service token, take the cookie, post a batch, get a 403, and check the agent never heard about it.
+
+### Every row, every caller
+
+How did that survive the route matrix? Because the matrix's principal column was documentation. We had tests that every mounted route has a row, that every per-app route checks scope, and that every permission-gated route names its action. None of them sent a request as somebody too small and checked the door shut.
+
+`every_route_refuses_callers_below_its_principal` does. It walks every row of `ROUTE_MATRIX` and plays seven callers against it: a read-only token, a user's dashboard session, a service-token session, a Deployer token scoped to some other namespace, a plain Deployer, an Admin and the system principal. Each caller has a rank (any token, Deployer, Admin, System), and every caller ranked below the row must get a 401 or 403. Then a second router, this time with a real token in its store, takes a request with no credentials at all for each row: everything but the `Public` rows must get the middleware's own 401, and the `Public` rows must not.
+
+Put the old `require_system` back and it fails on five routes, one line each for the service-token session. It also catches two rows that had been wrong all along, in opposite directions. The GitOps webhook was listed as needing a token, but it's mounted public, because GitHub signs the body and never sends a bearer. `/v1/placements/{node_id}` was listed as open to any token, while its handler wants the service token. So the test checks the open rows from the other side too: a read-only token must get *in* to every `AnyToken` route.
+
+One thing about axum made this harder than a loop. A handler's arguments are extractors, and they all run before the body does: `Json<RenewalRequest>` rejects a request that doesn't parse with a 415 or a 422, before the handler gets to ask who's calling. Send junk to `/v1/cluster/renew` as a read-only token and you learn nothing about its gate. So the probe carries a real body for each route that parses one first. For a dozen node-to-node routes whose message types are elaborate (a CSR, a Raft proposal), the test records them as unreached, compares that list against an exact expected set, and leaves them to a static check, `every_system_route_requires_the_system_principal`, which reads each handler's source and insists it calls `require_system`. If a route leaves the unreached list, the assertion says so, and somebody gets to delete a line.
+
+### A block means what it says
+
+The manual says a `[permission]` block limits a token to what it lists. Four kinds of route didn't ask the block anything. A Deployer token whose block granted only `logs` on `db` could still restore an old snapshot over `db`'s volume, or delete its snapshots, because the snapshot handlers checked the role and the scope and stopped. Builds, fault injection and test leases had the same gap.
+
+We could have documented the exceptions. We gated them instead (decision D5 in the [0.2.0 audit](https://github.com/reliaburger/reliaburger/issues/674)). Snapshot create, restore and delete and `POST /v1/build` need `deploy` on the app; for a build, that's the app the destination repository names, through the same `repository_namespace` the registry uses, and a destination that names no namespace needs `deploy` across the whole cluster. Test leases need `admin` across the cluster. Faults got an action of their own, `PermissionAction::Fault`, written `fault` in a block, because "may break this app on purpose" is a different grant from "may deploy it". Adding a variant to the enum is a one-line change, and the compiler then points at every `match` that has to say how the new action is spelled.
+
+Faults are the interesting one, because not every fault names an app. A workload fault names its target service in the request body, so the check is `fault` on that service. A node drain names a node, which belongs to no tenant, so it needs `fault` everywhere. Clearing a fault by id is worse: the request is just `DELETE /v1/fault/7`. The handler asks the agent for its fault list, finds fault 7, and judges the caller against whatever that fault targets. It only does the lookup for a caller with a scope or a block; everyone else is governed by their role, as before.
+
+The matrix rows changed to match (`App(DEPLOY)` on the snapshot routes, `Body(FAULT)` on the fault routes, `Cluster(ADMIN)` on the lease routes), so `every_gated_route_checks_its_permission_action` now holds these handlers to the action too. That static check used to pair a path with every handler mounted on it, whatever the method, so `GET /v1/snapshots/...` (the list) was being blamed for not checking `deploy`. It now reads the method off each `get(...)` or `post(...)` call. The behaviour tests (`logs_only_block_cannot_create_restore_or_delete_snapshots`, `logs_only_block_cannot_submit_a_build`, `fault_needs_the_fault_permission_action`, `test_leases_need_admin_permission`) check the response says *which* grant was missing, because a later check (the cluster's test policy, an agent that isn't there) can also answer 403, and a test that accepts any 403 can't tell the two apart.
+
+Reads had a version of the same problem. Every container gets a JWT, and the manual calls it confined to the workload's own app and namespace. But `/v1/resolve`, `/v1/routes`, `/v1/fault` and `/v1/build/{id}` took no auth context at all, so one compromised container could list every service VIP, every ingress route and every fault in the cluster. They now filter like `/v1/status` does, with `authorize_scoped(...).is_ok()` in a `filter`. That needed a namespace on two wire types that only carried an app name (`RouteInfo` and `FaultSummary`), and a destination repository on each build record. `GET /v1/fault?cluster=true` refuses a scoped caller outright, as the events listing does, because node faults belong to no tenant. The legacy batch status branch got the scope check its task-array neighbour already had.
+
+Three smaller holes went in the same change. The node relay forwards only an allowlist of paths, but it built a URL from the path, and a URL resolves `..` away: `v1/exec/../apply` matched the exec rule and left as `POST /v1/apply`. The target re-authorised, so it wasn't an escalation, but an allowlist you can walk around isn't one. The relay now refuses any `.` or `..` segment, percent-encoded or not. The session cookie gets `Secure` when the API serves TLS, which the handler learns from the `TlsTransport` extension the TLS listener puts on every request. And the registry, which used to fall back to plaintext when its TLS configuration failed to build, now fails to start, as the API always did.
+
 ### Don't hash under a lock
 
 The last gap is a performance-and-availability one, and it's a nice illustration of how a lock in the wrong place turns a slow function into a denial of service.

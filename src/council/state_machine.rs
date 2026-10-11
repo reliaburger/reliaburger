@@ -7636,6 +7636,7 @@ mod tests {
             runner_node: Some("n1".to_string()),
             state: crate::bun::build_runner::BuildState::Running,
             created_at_epoch_secs: 1_000_000,
+            repository: None,
         }
     }
 

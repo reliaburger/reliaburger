@@ -112,10 +112,9 @@ pub(super) async fn token_list_handler(
     // service token. That principal stays off user management (AUTH4), so
     // it may read only this node's answer, never start a cluster-wide one.
     let system_reads_local = query.local
-        && auth.as_deref().is_some_and(|ctx| {
-            ctx.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL
-                && ctx.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL
-        });
+        && auth
+            .as_deref()
+            .is_some_and(crate::sesame::auth::is_system_principal);
     if !system_reads_local {
         if let Err(resp) = crate::sesame::auth::authorize_user(
             auth.as_deref(),
