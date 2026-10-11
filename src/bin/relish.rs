@@ -49,7 +49,7 @@ fn parse_endpoint(value: &str) -> Result<String, String> {
 #[derive(clap::Args)]
 struct BenchOptions {
     /// Timed job scenario instead of the ordinary suite (60s, concurrency 27).
-    #[arg(long, value_enum, conflicts_with_all = ["quick", "compare", "capacity", "disruptive", "yes"])]
+    #[arg(long, value_enum, conflicts_with_all = ["quick", "capacity", "disruptive", "yes"])]
     scenario: Option<reliaburger::relish::bench_jobs::JobScenario>,
     /// Measurement window for job scenarios; positive drain follows it.
     #[arg(long, default_value_t = 60, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=86400))]
@@ -75,9 +75,13 @@ struct BenchOptions {
     /// Abbreviated suite for development and CI.
     #[arg(long)]
     quick: bool,
-    /// Compare with a previous JSON benchmark report.
+    /// Compare with a previous JSON benchmark report (a suite report, or a
+    /// `--report` file from the same job scenario).
     #[arg(long)]
     compare: Option<PathBuf>,
+    /// Largest drop in a job scenario's rate, in percent, that `--compare` passes.
+    #[arg(long, default_value_t = reliaburger::relish::bench_jobs::DEFAULT_TOLERANCE_PERCENT, requires_all = ["scenario", "compare"], value_parser = clap::value_parser!(u32).range(1..=90))]
+    tolerance: u32,
     /// Deliberately schedule minimal workloads until the cluster is full.
     #[arg(long, requires = "yes")]
     capacity: bool,
@@ -2434,6 +2438,7 @@ async fn main() -> ExitCode {
                 report,
                 quick,
                 compare,
+                tolerance,
                 capacity,
                 disruptive,
                 yes,
@@ -2450,6 +2455,8 @@ async fn main() -> ExitCode {
                             exec,
                             namespace,
                             report,
+                            compare,
+                            tolerance_percent: tolerance,
                             output: cli.output,
                         },
                     )
@@ -3090,7 +3097,9 @@ mod tests {
             vec!["--cpu-request", "0"],
             vec!["--cpu-request", "1001"],
             vec!["--quick"],
-            vec!["--compare", "old.json"],
+            vec!["--tolerance", "0"],
+            vec!["--tolerance", "91"],
+            vec!["--tolerance", "20"],
             vec!["--capacity", "--yes"],
             vec!["--disruptive", "--yes"],
         ] {
@@ -3099,6 +3108,39 @@ mod tests {
             assert!(parse(&command).is_err(), "{command:?}");
         }
         assert!(parse(&["relish", "bench", "--seconds", "20"]).is_err());
+        assert!(
+            parse(&[
+                "relish",
+                "bench",
+                "--compare",
+                "old.json",
+                "--tolerance",
+                "20"
+            ])
+            .is_err()
+        );
+        let cli = parse(&[
+            "relish",
+            "bench",
+            "--scenario",
+            "jobs-host-processes",
+            "--compare",
+            "baseline.json",
+            "--tolerance",
+            "15",
+        ])
+        .unwrap();
+        let Command::Bench(options) = cli.command else {
+            panic!("expected bench");
+        };
+        assert!(matches!(
+            *options,
+            BenchOptions {
+                compare: Some(ref path),
+                tolerance: 15,
+                ..
+            } if path == std::path::Path::new("baseline.json")
+        ));
         let cli = parse(&[
             "relish",
             "bench",

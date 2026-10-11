@@ -363,9 +363,11 @@ their rates, each run raises one event, and a failed run pages through the
 alert webhooks. The [job manual](docs/manual/14_batch-jobs.md) explains it
 all; the [throughput demo](https://reliaburger.com/#job-throughput) and its
 [qualification record](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
-show what each kind of isolation costs per job. The sustained target of
-100 million jobs a day isn't qualified yet
-([#668](https://github.com/reliaburger/reliaburger/issues/668)).
+show what each kind of isolation costs per job; `relish bench --scenario
+jobs-shared-containers` and its siblings rerun them on your own cluster, and
+`--compare OLD.json` fails on a drop against an earlier report. The sustained
+target of 100 million jobs a day needs a 24-hour qualification that hasn't
+passed yet ([#668](https://github.com/reliaburger/reliaburger/issues/668)).
 
 **Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
 at a real address, unless an app or job's `allow_from` lets a named caller
