@@ -320,6 +320,7 @@ fn refuses_system_principal(path: &str) -> bool {
             | "/v1/ca/rotation/begin"
             | "/v1/ca/rotation/finalize"
             | "/v1/nodes/decommission"
+            | "/v1/audit"
     )
 }
 

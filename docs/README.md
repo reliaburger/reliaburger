@@ -126,6 +126,14 @@ idempotency key before sending. If a submission times out, retry with
 Manifests and JSON `tasks` refuse unknown fields, so a typo fails at
 `--dry-run` rather than falling back to defaults.
 
+Each job definition keeps its last ten run outcomes after a run's own detail
+is pruned (`relish jobs --definitions`, and the dashboard's job card). The
+leader records one event per run, never per task, and sends failed and
+unknown-outcome runs to the alert webhooks. Every node exports `job_*`
+counters, a duration histogram and task CPU and memory, labelled only by
+namespace, definition, profile and node, and `relish top` lists running array
+tasks. See [job history, metrics and events](manual/14_batch-jobs.md#job-history-metrics-and-events).
+
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations; keep using the same node endpoint for a
 lease's lifetime. Creation needs an unscoped credential and the server's
@@ -419,9 +427,13 @@ make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
 
-CI runs both on pushes to `main`, nightly, and on pull requests that touch
-`src/mustard/` or `benches/`. Nothing gates on the numbers yet, so other pull
-requests skip the release build.
+CI runs all three on pushes to `main` and nightly. A pull request runs the
+gossip benchmarks when it touches `src/mustard/` or the gossip benches, and the
+task-array benchmarks when it touches the task-array leader, node pool,
+executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
+nothing; the task-array job fails only on a benchmark more than twice as slow
+as main's last baseline, and keeps its Criterion output for 90 days
+([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
 
@@ -1172,6 +1184,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
 | `GET` | `/v1/chaos/status` | Show the replicated node-experiment reservation, if any |
+| `GET` | `/v1/audit` | Read the node's durable audit log (`since`, `until`, `action`, `principal`, `namespace`, `limit`; `cluster=true` merges every node). Unscoped Admin with cluster-wide `admin`, never the service principal |
 
 The CLI uses this API internally. You can also call it directly:
 

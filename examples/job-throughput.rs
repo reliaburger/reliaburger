@@ -172,6 +172,7 @@ mod linux {
                             .collect(),
                         stopping: false,
                         replay_unknown: false,
+                        labels: Default::default(),
                     }],
                 };
                 loop {
