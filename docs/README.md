@@ -419,9 +419,13 @@ make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
 
-CI runs both on pushes to `main`, nightly, and on pull requests that touch
-`src/mustard/` or `benches/`. Nothing gates on the numbers yet, so other pull
-requests skip the release build.
+CI runs all three on pushes to `main` and nightly. A pull request runs the
+gossip benchmarks when it touches `src/mustard/` or the gossip benches, and the
+task-array benchmarks when it touches the task-array leader, node pool,
+executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
+nothing; the task-array job fails only on a benchmark more than twice as slow
+as main's last baseline, and keeps its Criterion output for 90 days
+([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
 

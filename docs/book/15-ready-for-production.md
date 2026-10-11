@@ -615,8 +615,11 @@ their snippets and the manual is compiled into `relish`. A pull request stacked 
 branch skips the acceptance suites unless someone labels it `full-ci`; it gets them when it
 targets `main`, or a release's merge-train branch: from 0.1.4 on, each release collects its
 pull requests on one `release-*` branch, and those are the release's changes, so they get the
-whole of CI. Benchmarks run on `main`, nightly, and on changes to the gossip protocol,
-since nothing gates on their numbers yet.
+whole of CI. Benchmarks run on `main`, nightly, and on changes to the code they measure.
+The gossip numbers gate nothing. The task-array benchmarks gate on one thing: a benchmark
+more than twice as slow as the baseline the last `main` run saved. Why twice, and not
+Criterion's own few per cent? Because a hosted runner is a different machine every night, and
+a gate that trips on the runner's mood is just another flake.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
@@ -625,6 +628,14 @@ the seven we chased down, three were product races, not test problems: a node ba
 fault spread stale suspicions about healthy peers, a rollout interrupted by a crash dropped the
 reservation its own retirement needed, and a two-second kill deadline was too short for a busy
 host. We fixed those in the product. Pressing re-run would have hidden all three.
+
+A register rots too. By 0.2.0, fourteen open rows pointed at one issue that had closed a week
+earlier, so nobody owned them. Now a nightly job reads each open row, asks GitHub whether its
+issue is still open, and fails when one isn't. Closing an issue no longer quietly orphans
+its flakes: either the row says Fixed (with a loop that used to fail and now passes), or it
+links a successor. Re-running those loops for the register paid for itself straight away:
+one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
+races the child's own exit on macOS.
 
 ## Dependencies are code too
 
@@ -5377,6 +5388,13 @@ been told, every few milliseconds, that it had a backup. After a power cut it
 had nothing to restore from. With the shared helper, the fixture passes. The
 [qualification record](../qualification/2026-09-25-v02-power-cut.md) has both
 sets of runs.
+
+Then we stopped running them. They need a VM you're willing to switch off, so no
+workflow could, and nothing on the release checklist said to. By 0.2.0 the last
+record was a fortnight older than the change that rerouted every file lock in the
+programme. Nothing had broken, as it turned out: the [rerun](../qualification/2026-10-11-power-cut-reboot.md)
+passed 25 power cuts per lane. But a check that only runs when someone remembers
+it isn't a gate. Now it's a numbered step of the release runbook.
 
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
