@@ -1662,11 +1662,14 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        matches!(result.outcome, AttemptOutcome::SpawnFailed { .. }),
-        "queued command used a revoked decryption snapshot: {result:?}"
-    );
-    assert_eq!(result.output.total_bytes, 0);
+    let AttemptOutcome::SpawnFailed { reason } = &result.outcome else {
+        panic!("queued command used a revoked decryption snapshot: {result:?}");
+    };
+    // The command never ran: its only output is the refusal (#786), never
+    // anything the revoked secret's command printed.
+    let output = String::from_utf8_lossy(&result.output.head);
+    assert_eq!(output, format!("{reason}\n"));
+    assert!(!output.contains("revoked-secret-launched"), "{output}");
     tokio::time::timeout(Duration::from_secs(10), async {
         while budget.available() != capacity {
             tokio::time::sleep(Duration::from_millis(20)).await
@@ -2835,6 +2838,113 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
 const LEADER_LOSS_SCRIPT: &str = "sleep 0.05; [ \"$RELIABURGER_TASK_ATTEMPT\" -gt 1 ] || [ $((RELIABURGER_TASK_INDEX % 100)) -ne 7 ]";
 const LEADER_LOSS_TASKS: u64 = 3000;
 
+/// The kernel resources a fixture's executors may hold: runc containers,
+/// network namespaces with their host veths, and executor cgroups. A run
+/// that fails before its executors retire must still release them, or the
+/// next runc test on the host meets `RTNETLINK answers: File exists` (#786).
+struct ExecutorResidue {
+    root: std::path::PathBuf,
+}
+
+impl ExecutorResidue {
+    /// The instance-name stem of every node's executors under `root`.
+    fn stems(&self) -> Vec<String> {
+        let nodes = std::fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten();
+        nodes
+            .filter_map(|node| std::fs::read_to_string(node.path().join("batch-executor-id")).ok())
+            .map(|prefix| format!("executor-{}-", prefix.trim()))
+            .collect()
+    }
+
+    /// The network namespaces those executors still hold.
+    fn namespaces(&self) -> Vec<String> {
+        let stems = self.stems();
+        std::fs::read_dir("/var/run/netns")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| stems.iter().any(|stem| name.contains(stem.as_str())))
+            .collect()
+    }
+
+    /// Kill the containers, then delete the namespaces, veths and cgroups.
+    fn release(&self) {
+        let state = self.root.join("state");
+        if let Ok(listed) = std::process::Command::new("runc")
+            .arg("--root")
+            .arg(&state)
+            .args(["list", "--quiet"])
+            .output()
+        {
+            for id in String::from_utf8_lossy(&listed.stdout).lines() {
+                let _ = std::process::Command::new("runc")
+                    .arg("--root")
+                    .arg(&state)
+                    .args(["delete", "--force", id])
+                    .output();
+            }
+        }
+        for namespace in self.namespaces() {
+            if let Some(instance) = namespace.strip_prefix("rb-") {
+                let veth = reliaburger::grill::netns::host_veth_name(
+                    &reliaburger::grill::InstanceId(instance.to_owned()),
+                );
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "del", &veth])
+                    .output();
+            }
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", &namespace])
+                .output();
+        }
+        let stems = self.stems();
+        let cgroups = std::fs::read_dir("/sys/fs/cgroup/reliaburger")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|namespace| std::fs::read_dir(namespace.path()).into_iter().flatten())
+            .flatten()
+            .map(|app| app.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| stems.iter().any(|stem| name.starts_with(stem.as_str())))
+            });
+        for cgroup in cgroups {
+            remove_cgroup_tree(&cgroup);
+        }
+    }
+}
+
+impl Drop for ExecutorResidue {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Kill every process in a cgroup subtree, then remove it bottom-up.
+fn remove_cgroup_tree(path: &std::path::Path) {
+    if !path.join("cgroup.procs").exists() {
+        return;
+    }
+    let _ = std::fs::write(path.join("cgroup.kill"), "1");
+    for child in std::fs::read_dir(path).into_iter().flatten().flatten() {
+        if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_cgroup_tree(&child.path());
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::remove_dir(path).is_err_and(|error| {
+        error.kind() != std::io::ErrorKind::NotFound && std::time::Instant::now() < deadline
+    }) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Three in-process nodes with the same gossip, Raft, HTTP API and leader
 /// loop as `bun --cluster`, each with its own real executor (distinct
 /// executor identities over one host runtime). The leader is a worker too;
@@ -2854,12 +2964,25 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
     assert!(nix::unistd::geteuid().is_root());
+    if template["runtime"] != "process" {
+        // Every cold executor reads the image's manifest. Straight from the
+        // public registry, dozens of them trip its anonymous rate limit and
+        // fail tasks that leader loss never touched (#786).
+        let mirror = reliaburger::testkit::pinned_images::TEST_IMAGE_MIRROR_ENV;
+        assert!(
+            std::env::var_os(mirror).is_some(),
+            "{mirror} is unset: run with make test-linux, which serves the pinned images locally"
+        );
+    }
     let root = tempfile::Builder::new()
         .prefix("rb-leader-loss-")
         .tempdir()
         .unwrap()
         .keep();
     eprintln!("leader-loss fixture: {}", root.display());
+    // Declared before the runtime and nodes, so it drops after them: on a
+    // failed assertion as on a pass.
+    let residue = ExecutorResidue { root: root.clone() };
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -3061,6 +3184,33 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     let flaky = LEADER_LOSS_TASKS / 100;
+    if last["failed"] != 0 {
+        // Say why each failed task failed before the assertions below stop.
+        let base = format!("http://127.0.0.1:{}", nodes[new_leader].api_port);
+        let failed: Value = match http
+            .get(format!("{base}/v1/batch/{batch_id}/results?failed=true"))
+            .send()
+            .await
+        {
+            Ok(response) => response.json().await.unwrap_or_default(),
+            Err(_) => Value::Null,
+        };
+        eprintln!("failed tasks: {failed}");
+        for row in failed["rows"].as_array().into_iter().flatten() {
+            let logs = match http
+                .get(format!(
+                    "{base}/v1/batch/{batch_id}/tasks/{}/logs",
+                    row["index"]
+                ))
+                .send()
+                .await
+            {
+                Ok(response) => response.text().await.unwrap_or_default(),
+                Err(error) => error.to_string(),
+            };
+            eprintln!("task {} output: {logs}", row["index"]);
+        }
+    }
     assert_eq!(last["status"], "Succeeded", "{last}");
     assert_eq!(last["succeeded"], LEADER_LOSS_TASKS, "{last}");
     assert_eq!(last["failed"], 0, "{last}");
@@ -3128,6 +3278,9 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    // Retirement tears each executor's network down with it (#786).
+    assert_eq!(residue.namespaces(), Vec::<String>::new());
+    drop(residue);
     std::fs::remove_dir_all(root).unwrap();
 }
 
