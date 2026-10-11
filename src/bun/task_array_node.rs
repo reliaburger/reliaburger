@@ -157,6 +157,12 @@ pub struct ArrayProgress {
     /// Why `slots` is zero, if it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+    /// Whether `refused` comes from this node's configuration or runtime
+    /// (its allowlist, `mount_isolation`, what it can enforce), so it will
+    /// refuse the array every time, rather than from a passing fault. The
+    /// leader fails a run every node refuses this way (#777).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unrunnable: bool,
     /// Chunks finished at the attempt the leader asked for, not yet
     /// retired. Sent on every sync until the leader stops listing them.
     pub finished: Vec<ChunkResult>,
@@ -556,7 +562,10 @@ impl TaskArrayNode {
         let mut response = NodeSyncResponse::default();
         for assignment in &request.arrays {
             if let Err(reason) = self.admit(assignment) {
-                response.arrays.push(refused(assignment.batch_id, reason));
+                response.arrays.push(ArrayProgress {
+                    unrunnable: true,
+                    ..refused(assignment.batch_id, reason)
+                });
                 continue;
             }
             let run = match arrays.entry(assignment.batch_id) {
@@ -585,6 +594,13 @@ impl TaskArrayNode {
         let default = self.config.default_concurrency.max(1);
         spec.per_node_concurrency
             .map_or(default, |cap| cap.min(default).max(1))
+    }
+
+    /// Why this node can never run `assignment`, if it can't: the same
+    /// check every sync makes, for the leader's admission of a run when
+    /// this node is the only one that could take it.
+    pub fn refusal(&self, assignment: &ArrayAssignment) -> Option<String> {
+        self.admit(assignment).err()
     }
 
     /// Whether this node may run the array's binary at all.
@@ -695,7 +711,10 @@ impl TaskArrayNode {
             // TODO(#714): run tasks inside the mount namespace
             // the ordinary process workloads use.
             return Err(
-                "task arrays don't run under [process_workloads] mount_isolation yet".to_string(),
+                "host jobs don't run under [process_workloads] mount_isolation yet \
+                 (on by default on Linux); set mount_isolation = false to run them \
+                 unisolated on the host, or give the job an image"
+                    .to_string(),
             );
         }
         Ok(())
@@ -973,6 +992,7 @@ impl TaskArrayNode {
                     .min(cap)
             },
             refused: None,
+            unrunnable: false,
             finished,
             counters: NodeArrayCounters {
                 running: counters.running.load(Ordering::Relaxed),
@@ -1162,6 +1182,7 @@ fn refused(batch_id: u64, reason: String) -> ArrayProgress {
         batch_id,
         slots: 0,
         refused: Some(reason),
+        unrunnable: false,
         finished: Vec::new(),
         counters: NodeArrayCounters::default(),
     }
@@ -1679,6 +1700,7 @@ mod tests {
             .arrays
             .remove(0);
         assert_eq!(progress.slots, 0);
+        assert!(progress.unrunnable);
         assert!(progress.refused.unwrap().contains("allowed_binaries"));
         assert!(progress.finished.is_empty());
     }
@@ -1696,6 +1718,10 @@ mod tests {
             .arrays
             .remove(0);
         assert_eq!(progress.slots, 0);
+        assert!(
+            progress.unrunnable,
+            "the node's configuration refuses it every time"
+        );
         assert!(progress.refused.unwrap().contains("mount_isolation"));
     }
 

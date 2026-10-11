@@ -601,6 +601,7 @@ pub fn array_summary(
         "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
         "quota_blocked": record.quota_blocked,
         "quota_blocked_reason": record.quota_blocked.as_ref().map(ToString::to_string),
+        "unrunnable_reason": record.unrunnable,
     })
 }
 
@@ -1367,6 +1368,7 @@ mod tests {
             state,
             terminal_at_epoch_secs: Some(1),
             quota_blocked: None,
+            unrunnable: None,
         };
         let (start, end, owners) = result_window(&record, &ResultsQuery::default());
         assert_eq!(
@@ -1489,6 +1491,7 @@ mod tests {
         TaskArrayRecord {
             terminal_at_epoch_secs: None,
             quota_blocked: None,
+            unrunnable: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: template(),
@@ -1583,6 +1586,7 @@ mod tests {
             state,
             terminal_at_epoch_secs: Some(1),
             quota_blocked: None,
+            unrunnable: None,
         };
         let (_, _, owners) = result_window(&record, &ResultsQuery::default());
         assert_eq!(owners, None, "every node is asked");
@@ -1727,6 +1731,7 @@ mod tests {
             state,
             terminal_at_epoch_secs: Some(1),
             quota_blocked: None,
+            unrunnable: None,
         };
         let summary = array_summary(9, &record, &[]);
         assert_eq!(summary["retried"], 3);

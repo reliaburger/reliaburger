@@ -907,6 +907,79 @@ the one entry now dominates. With the tick at one entry a
 second plus a cron observation a minute, the leader stays inside the 0.2.0
 budget of three Raft entries a second (#668).
 
+### A run nobody can take
+
+Linux turns `[process_workloads] mount_isolation` on by default, and host
+tasks don't run under it yet (that's #714). So what happened when you
+submitted `runtime = "process"` work to a default Linux node? The node said
+no, politely, every second, in its sync answer. The leader noted the refusal,
+granted nothing, and moved on. The run sat in `Running` with every task
+queued until its deadline, or for ever if it had none. `relish test`'s job
+cases hung the same way (#777).
+
+Nothing was wrong with any single piece. The node was right to refuse, and
+the leader was right not to grant work to a node that refused it. What was
+missing was anyone asking the obvious question: can *any* node run this?
+
+Not every refusal answers that question, though. A node that can't open its
+task ledger because the disk hiccuped might be fine next second. A node whose
+allowlist lacks the binary, or whose `mount_isolation` is on, will say the
+same thing until someone edits its config. So the node's answer now says
+which kind it is:
+
+```rust
+pub struct ArrayProgress {
+    // ...
+    pub refused: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unrunnable: bool,
+    // ...
+}
+```
+
+`std::ops::Not::not` is the `!` operator as a function, so serde leaves the
+field out whenever it's `false`. Only refusals from `admit` (the checks of the
+node's own configuration and runtime) set it.
+
+The leader decides in `unrunnable_reason`. A run fails when nothing holds its
+chunks, something is still queued, and every *eligible* node answered about
+it this tick with an unrunnable refusal. Eligible means every node the leader
+syncs whose last call didn't fail. A node whose call is still out keeps the
+run open until it answers or times out (three seconds at most), and a dead
+node falls out of gossip membership. The check reads like this:
+
+```rust
+for node in eligible {
+    let (_, progress) = answers.iter().find(|(answered, _)| answered == node)?;
+    if !progress.unrunnable {
+        return None;
+    }
+    reasons.insert(progress.refused.as_deref()?);
+}
+```
+
+The `?` here works on `Option`, not `Result`. In a function that returns
+`Option`, `x?` means "if `x` is `None`, return `None` now". A node that didn't
+answer about this run, or one that refused without a reason, ends the check
+the same way: not yet. Go has no equivalent; you'd write the `if` by hand
+twice.
+
+When the check passes, the tick carries one new write,
+`TaskArrayWrite::Unrunnable`, instead of that run's sync. It stops the run with
+a new `StopReason::Unrunnable`, counts every queued task as not run, and keeps
+the reason on the record, so `relish batch-status` can print it long after
+the nodes have stopped talking about the run. The status is plain `Failed`,
+which means the alert webhook and the job's history treat it like any other
+failure. A holder that starts refusing (its allowlist changed mid-run) is
+requeued first, as before, and the run fails on the next tick.
+
+A standalone node has no one else to ask, so it doesn't wait for a tick. The
+common admission path, `admit_definition`, asks the node's executor the same
+`admit` question before writing anything, and a refusal comes back as HTTP
+422 with the reason. A council could do the same if every node advertised
+what it can run, but that's another piece of gossiped state to keep honest.
+A second of delay in a cluster is a fair price for not having it.
+
 ## Short jobs without fresh containers
 
 What does a job that runs for five milliseconds cost? Until now, a whole

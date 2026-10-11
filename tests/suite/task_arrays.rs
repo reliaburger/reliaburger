@@ -49,6 +49,9 @@ struct Options {
     allowed: Vec<&'static str>,
     slots: u32,
     retention: Duration,
+    /// `[process_workloads] mount_isolation`, which keeps host arrays off
+    /// the node (#714). Off unless a test is about it.
+    mount_isolation: bool,
 }
 
 impl Options {
@@ -59,6 +62,7 @@ impl Options {
             allowed: vec![SHELL],
             slots: 8,
             retention: RETENTION,
+            mount_isolation: false,
         }
     }
 }
@@ -152,7 +156,7 @@ impl Harness {
                 root: data.path().join("task-arrays"),
                 policy: ProcessWorkloadsConfig {
                     allowed_binaries: options.allowed.iter().map(PathBuf::from).collect(),
-                    mount_isolation: false,
+                    mount_isolation: options.mount_isolation,
                     ..ProcessWorkloadsConfig::default()
                 },
                 default_concurrency: options.slots,
@@ -387,6 +391,7 @@ async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
         allowed: vec![SHELL],
         slots: 64,
         retention: RETENTION,
+        mount_isolation: false,
     })
     .await;
     let council = harness.council.clone().unwrap();
@@ -433,6 +438,7 @@ async fn cancelling_an_array_stops_it() {
         allowed: vec![SHELL],
         slots: 4,
         retention: RETENTION,
+        mount_isolation: false,
     })
     .await;
     let batch_id = harness.submit_ok(shell_array(1000, 100, "exit 0")).await;
@@ -486,27 +492,78 @@ async fn a_bad_submission_is_refused_with_the_reason() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_that_may_not_run_the_binary_says_why() {
+async fn a_run_no_node_may_run_fails_with_the_nodes_reason() {
     let harness = Harness::start(Options {
         allowed: vec!["/usr/bin/true"],
         ..Options::processes(true)
     })
     .await;
     let batch_id = harness.submit_ok(shell_array(20, 10, "exit 0")).await;
-    let summary = harness
-        .wait_until(batch_id, 30, |s| s["nodes"][0]["refused"].is_string())
-        .await;
+    let summary = harness.wait_done(batch_id, 10).await;
+    assert_eq!(summary["status"], "Failed", "{summary}");
+    assert_eq!(summary["not_run"], 20, "nothing ran: {summary}");
+    assert!(
+        summary["unrunnable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("allowed_binaries"),
+        "{summary}"
+    );
     assert!(
         summary["nodes"][0]["refused"]
             .as_str()
             .unwrap()
             .contains("allowed_binaries")
     );
-    assert_eq!(summary["status"], "Running");
-    assert_eq!(
-        summary["queued"], 20,
-        "nothing is granted to a node that can't run it"
+}
+
+/// Linux turns `mount_isolation` on by default and task arrays can't run
+/// host commands under it yet (#714). A host run must be refused at once,
+/// with the reason, instead of sitting "running" until its deadline (#777).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_runs_under_mount_isolation_are_refused_with_the_reason() {
+    // Standalone: this node is the only one, so admission refuses outright.
+    let standalone = Harness::start(Options {
+        mount_isolation: true,
+        ..Options::processes(false)
+    })
+    .await;
+    let started = tokio::time::Instant::now();
+    let (status, answer) = standalone.submit(shell_array(20, 10, "exit 0")).await;
+    assert_eq!(status, 422, "{answer}");
+    let error = answer["error"].as_str().unwrap();
+    assert!(error.contains("mount_isolation"), "{error}");
+    let response = standalone
+        .http
+        .post(format!("{}/v1/jobs/runs", standalone.base_url))
+        .json(&json!({"name":"single","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+    let answer: Value = response.json().await.unwrap();
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("mount_isolation"),
+        "{answer}"
     );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // With a council other nodes might run it, so the run is admitted and
+    // the leader fails it once every node has refused it.
+    let clustered = Harness::start(Options {
+        mount_isolation: true,
+        ..Options::processes(true)
+    })
+    .await;
+    let batch_id = clustered.submit_ok(shell_array(20, 10, "exit 0")).await;
+    let summary = clustered.wait_done(batch_id, 10).await;
+    assert_eq!(summary["status"], "Failed", "{summary}");
+    assert_eq!(summary["not_run"], 20, "{summary}");
+    let reason = summary["unrunnable_reason"].as_str().unwrap();
+    assert!(reason.contains("mount_isolation"), "{reason}");
 }
 
 /// One Raft submission accepts all profiles; the summary list never expands indexes.
@@ -522,6 +579,7 @@ async fn mixed_manifest_has_atomic_identity_histograms_and_indexed_pages() {
         allowed: vec![SHELL],
         slots: 16,
         retention: RETENTION,
+        mount_isolation: false,
     })
     .await;
     let cohort = |name: &str, count: u32, cpu: &str, memory: &str| json!({"name":name,"count":count,"chunk_size":256,"max_attempts":1,"template":{"image":"fixture:v1","command":["worker","{index}"],"cpu":cpu,"memory":memory}});
@@ -580,6 +638,7 @@ async fn invalid_profile_refuses_the_whole_manifest_and_parent_cancel_drains_all
         allowed: vec![SHELL],
         slots: 2,
         retention: RETENTION,
+        mount_isolation: false,
     })
     .await;
     let profile = |name: &str, count: u32| json!({"name":name,"count":count,"chunk_size":10,"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]}});
@@ -667,6 +726,7 @@ async fn manifest_admission_and_summary_views_honour_the_callers_scope() {
             allowed: vec![SHELL],
             slots: 2,
             retention: RETENTION,
+            mount_isolation: false,
         },
         Some(tokens),
     )
@@ -1321,6 +1381,7 @@ async fn quota_blocked_job_shows_its_reason_in_status() {
         allowed: vec![SHELL],
         slots: 4,
         retention: RETENTION,
+        mount_isolation: false,
     })
     .await;
     let council = harness.council.clone().unwrap();
@@ -1375,6 +1436,7 @@ async fn retrying_a_submission_with_the_same_key_creates_one_array() {
         allowed: vec![SHELL],
         slots: 8,
         retention: RETENTION,
+        mount_isolation: false,
     })
     .await;
     let post = |path: &str, key: &str, body: &Value| {
