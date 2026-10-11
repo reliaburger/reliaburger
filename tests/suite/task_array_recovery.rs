@@ -62,6 +62,7 @@ fn assignment(id: u64, count: u32, attempt: u64) -> ArrayAssignment {
         }],
         stopping: false,
         replay_unknown: true,
+        labels: Default::default(),
     }
 }
 fn request(arrays: Vec<ArrayAssignment>) -> NodeSyncRequest {

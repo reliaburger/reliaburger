@@ -93,6 +93,35 @@ struct BenchOptions {
     yes: bool,
 }
 
+// Its own parser, boxed, like `BenchOptions`: inline fields would grow the
+// generated `Command` parser past the test-thread stack.
+// Filters for `relish audit`.
+#[derive(clap::Args)]
+struct AuditOptions {
+    /// Records at or after this time: epoch seconds, or a duration
+    /// before now (e.g. "30m", "2h", "7d").
+    #[arg(long)]
+    since: Option<String>,
+    /// Records at or before this time, in the same forms as --since.
+    #[arg(long)]
+    until: Option<String>,
+    /// One action (e.g. "app.deleted"), or a family ("fault.*").
+    #[arg(long)]
+    action: Option<String>,
+    /// A token name or principal id.
+    #[arg(long)]
+    principal: Option<String>,
+    /// Only actions on this namespace.
+    #[arg(long)]
+    namespace: Option<String>,
+    /// How many of the newest records to show (default 100, at most 10000).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Read every node's log, not just this node's, merged by time.
+    #[arg(long)]
+    cluster: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Launch the interactive terminal UI.
@@ -314,6 +343,9 @@ enum Command {
         #[command(subcommand)]
         action: FaultAction,
     },
+    /// Show who did what: the durable audit log of applies, deletes, execs,
+    /// upgrades, faults, tokens and the other changes to the cluster.
+    Audit(Box<AuditOptions>),
     /// Manage volume snapshots (Btrfs-backed volumes only).
     Snapshot {
         #[command(subcommand)]
@@ -411,7 +443,7 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
-    /// List bounded job run summaries and rates, or durable schedule definitions.
+    /// List bounded job run summaries and rates, or durable definitions with their last outcomes.
     Jobs {
         #[arg(long)]
         definitions: bool,
@@ -1749,6 +1781,30 @@ async fn main() -> ExitCode {
                 volume,
             } => commands::snapshot_delete(app, namespace, name, volume.as_deref()).await,
         },
+        Command::Audit(options) => {
+            let AuditOptions {
+                since,
+                until,
+                action,
+                principal,
+                namespace,
+                limit,
+                cluster,
+            } = *options;
+            reliaburger::relish::audit_cmd::audit(
+                reliaburger::relish::audit_cmd::AuditFlags {
+                    since,
+                    until,
+                    action,
+                    principal,
+                    namespace,
+                    limit,
+                    cluster,
+                },
+                cli.output,
+            )
+            .await
+        }
         Command::Fault { ref action } => match action {
             FaultAction::Delay {
                 target,
@@ -2844,6 +2900,44 @@ mod tests {
         assert!(bare.command.is_none());
         let tui = Cli::try_parse_from(["relish", "tui"]).unwrap();
         assert!(matches!(tui.command, Some(Command::Tui)));
+    }
+
+    #[test]
+    fn audit_flags_parse() {
+        let cli = parse(&[
+            "relish",
+            "audit",
+            "--since",
+            "2h",
+            "--action",
+            "fault.*",
+            "--principal",
+            "alice",
+            "--namespace",
+            "team-a",
+            "--limit",
+            "50",
+            "--cluster",
+        ])
+        .unwrap();
+        let Command::Audit(options) = cli.command else {
+            panic!("expected relish audit");
+        };
+        let AuditOptions {
+            since,
+            action,
+            principal,
+            namespace,
+            limit,
+            cluster,
+            ..
+        } = *options;
+        assert_eq!(since.as_deref(), Some("2h"));
+        assert_eq!(action.as_deref(), Some("fault.*"));
+        assert_eq!(principal.as_deref(), Some("alice"));
+        assert_eq!(namespace.as_deref(), Some("team-a"));
+        assert_eq!(limit, Some(50));
+        assert!(cluster);
     }
 
     #[test]
