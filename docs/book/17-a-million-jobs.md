@@ -301,6 +301,22 @@ and state formats, so it needs matching binaries and a fresh cluster
 qualification and resident model workers remain separate issues; these semantics
 don't establish 100m accepted successes/day.
 
+The cron regression on a real three-node cluster was flaky for a while, and the
+product wasn't to blame. The test fires a cron occurrence, moves leadership and
+checks the new leader keeps the same run. It moved leadership with one
+`trigger().elect()` on a follower, which is the trap chapter 14 describes. The
+test called the election the moment the run appeared, which is exactly when the
+leader writes the next entries for that run. So the campaign often started a few
+milliseconds before the follower received the latest entry, and the leader and
+the other follower refused a candidate with a shorter log. Its higher term still deposed the leader, but the next election
+favours the longest log, so the old leader won it a second later and the test
+waited 30 seconds for a handover that never came. Now the helper switches off
+the old leader's elections (openraft's `runtime_config().elect(false)`) and has
+the most up-to-date other voter campaign every 3 seconds until one of them
+leads. The test also registers its schedule early in a minute: the minute a
+schedule lands in counts as already seen, so a request sent at 59 seconds could
+miss the occurrence it was waiting for.
+
 ### A contract you can retry, and can't misspell
 
 The run identities above were only half the story. The server read an
