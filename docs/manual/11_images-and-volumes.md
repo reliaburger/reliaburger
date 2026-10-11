@@ -281,6 +281,17 @@ container. Two gates stand in the way:
   the directories holding the master key and the security bootstrap. So is a
   path that contains one of them, such as `/var/lib`. A refused app fails its
   deploy on that node, and `relish apply` names the path and the reason.
+
+  The node checks each `source` again just before it builds every container,
+  including the replacements of a rolling or blue-green deploy, and mounts the
+  resolved path it checked, not the path as written. A `source` of
+  `/srv/import/current` that is a symlink to `/srv/import/releases/v2` mounts
+  `/srv/import/releases/v2`, and swapping the link afterwards doesn't change
+  what's mounted, until the next deploy checks it again. One race remains:
+  runc mounts the resolved path by name, so anyone who can write under a
+  listed prefix can still replace a directory on that path with a symlink
+  between the check and the mount (or a later restart). Only list
+  directories whose contents you trust to that extent.
 - **A token with a `[permission]` block needs `host-exec`** as well as
   `deploy` for an app with any `source` (see `security`).
 

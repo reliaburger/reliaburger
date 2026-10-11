@@ -58,11 +58,9 @@ pub(super) async fn secret_public_key_handler(
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(namespace))
     {
-        return (
-            StatusCode::FORBIDDEN,
-            format!("this token is not scoped to namespace {namespace}"),
-        )
-            .into_response();
+        return crate::sesame::auth::scope_refusal(format!(
+            "this token is not scoped to namespace {namespace}"
+        ));
     }
     let Some(council) = &state.council else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();

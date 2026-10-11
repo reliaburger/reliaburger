@@ -404,8 +404,8 @@ A worker holds at most 50 bytes of disk per accepted task while the cluster
 lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
 million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
 about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
-tasks' head and tail per chunk. All of it goes when the run retires. Task data
-counts toward disk pressure: past a quarter of the filesystem, or with less
+tasks' head and tail per chunk. All of it goes when the run retires. Task data,
+together with the node's audit log, counts toward disk pressure: past a quarter of the filesystem, or with less
 than 1 GiB free, a worker finishes the chunks it holds but advertises no
 free slots, so it takes no new grants until retention frees space.
 
@@ -439,6 +439,26 @@ Host commands still need the executable allowlist and
 Ordinary `[job]` host commands, and every host command on other platforms, use
 the original owned process backend and refuse explicit limits. Containers and native jobs
 keep separate execution capabilities.
+
+Linux turns `[process_workloads] mount_isolation` on by default, and host jobs
+don't run under it yet (#714). Until they do, every node that should run host
+jobs needs this in its config:
+
+```toml
+[process_workloads]
+mount_isolation = false
+```
+
+Forget it and the cluster says so straight away. A standalone node refuses the
+submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
+and the reason. In a cluster the run is admitted, because some other node might
+take it, and the leader fails it within a sync or two once every node it can
+reach has refused it. `relish batch-status` and `relish jobs` then show
+`Failed`, every task not run, and a `refused:` line quoting the nodes' reason;
+the JSON summary carries it as `unrunnable_reason`. The same rule catches any
+refusal that comes from a node's own configuration, such as a binary missing
+from every node's `allowed_binaries`. A run that only some nodes refuse keeps
+going on the others.
 
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
 

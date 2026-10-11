@@ -1754,3 +1754,45 @@ The cluster test's assertions stay as they were. (Its harness now strips local s
 We didn't stop a node from campaigning while it prepares a swap. Switching its elections off (`raft.runtime_config().elect(false)`) would hide this symptom, but the cause was a starved runtime, and a starved runtime also delays the node's API answers and gossip. Moving the blocking work off the workers fixes all three.
 
 We didn't lengthen the election timeout either. One to two seconds is what lets the cluster notice a dead leader quickly, and a node that blocks its own workers for ten seconds would still outlast any sensible value.
+
+### The stalls the first fix left behind
+
+The new test then failed in CI, twice, but only in the coverage run: "prepare held the runtime for 291 ms of its 3.28 s" ([#794](https://github.com/reliaburger/reliaburger/issues/794)). Coverage instrumentation makes everything slower, so it's tempting to call that noise and raise the bound. But the ticker doesn't measure how slow `prepare` is. It measures how long the worker went without running anything else, and the hashing and staging were already elsewhere. So something else was still on the worker.
+
+We reproduced it on a Mac by running the test 200 times under `cargo llvm-cov nextest --stress-count 200` while two loops wrote and synced 512 MB files and four more spun the CPU, with other agents' builds running beside them (load average 55 to 70 on 12 cores). Four runs failed, with stalls of 251 to 416 ms. Recording a timestamp at each step and lining the timestamps up against the ticker's gaps found three culprits, none of them hashing:
+
+- **The marker's syncs.** `UpgradeMarker::store` writes the `Staged` marker, syncs it, renames it and syncs the directory. That's a few hundred bytes, but a sync waits for the disk, and on a disk that has just taken 96 MB of staged binary it waited up to 516 ms.
+- **The probe's delete.** The compatibility probe runs a private copy of the candidate. That copy is a `tempfile::TempPath`, which deletes its file when it's dropped, and it was dropped at the end of `check_binary`, on the worker. Deleting a 96 MB file frees every page of it: up to 230 ms.
+- **The copy of the bytes.** `check_binary` took its own `Vec<u8>`, so `fetch_verified` called `bytes.clone()` on the worker, a 96 MB allocation and copy.
+
+The second one is worth a moment, because it's the Rust one. `Drop` is Rust's destructor: a type can implement it, and the compiler calls it wherever a value goes out of scope, with nothing in the source to mark the spot. That's what makes `TempPath` tidy (you can't forget to delete the file), and it's also why blocking work can hide behind a closing brace. In async code, ask where the drop happens, not just where the work starts.
+
+The fix moves each of the three to the blocking pool. The verification closure now writes the probe's copy too, from the bytes it has just checked, so there's no second copy at all:
+
+```rust
+let (bytes, probe) = tokio::task::spawn_blocking(move || {
+    let probe = signing::verify_binary(
+        &bytes,
+        &checked,
+        &release_keys,
+        external_key.as_ref(),
+        is_network,
+    )
+    .and_then(|()| super::compatibility::write_probe(&bytes, &probe_directory));
+    (bytes, probe)
+})
+.await
+.map_err(std::io::Error::other)?;
+```
+
+`Result::and_then` runs its closure only when the result is `Ok`, so a candidate that fails its signature check is never written anywhere executable. The closure's parameter is `()`, the unit value an `Ok(())` carries, written as a pattern. `write_probe` returns a `Probe`, a newtype around the `TempPath`, and `query_probe` takes it by value, launches it, and hands it to the blocking pool to be deleted:
+
+```rust
+let answer = query(&probe.0).await;
+let _ = tokio::task::spawn_blocking(move || probe.0.close()).await;
+answer
+```
+
+Taking `Probe` by value means the caller can't keep it, so the delete can only happen in one place. `close()` is `TempPath`'s explicit delete. It returns the I/O error that `Drop` would have swallowed, and we ignore it the same way: the answer is what the caller needs, and a stray temporary file doesn't change it. Staging got the marker. The manager builds the `UpgradeMarker` first, moves it into the staging closure, and the closure stores it after the binary and hands it back, as the verification closure hands back the bytes. The rollback path had the same delete and the same syncs on its worker, so it got the same treatment.
+
+How we measured mattered too. The first timestamps went out with `eprintln!`, and on the loaded Mac a line to the log file sometimes took 270 ms by itself, which looked like yet another stall. The fixture's own `upgrade-fixture phase=...` lines do the same under `--no-capture`. Pushing the timestamps onto an in-memory list and printing it once at the end gave clean readings. (CI captures each test's output through a pipe, so it doesn't pay this; the timestamps did.) Two control tests, a ticker beside a bare two-second sleep and a ticker beside a blocking-pool hash of 96 MB, never saw more than 25 ms on the same loaded machine. So the bound wasn't too tight for the machine, and it stayed at 250 ms. After the fix the same 200-run loop, under the same load, passed 200 times out of 200.
