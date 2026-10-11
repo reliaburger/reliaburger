@@ -112,7 +112,45 @@ pub(crate) async fn admit_definition(
         }
     }
     super::task_array_api::admit_template_image(state, binder, &mut definition.template).await?;
+    if let Some(reason) = sole_node_refusal(state, name, namespace, definition) {
+        return Err(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("no node can run job {namespace}/{name}: {reason}"),
+        ));
+    }
     Ok(())
+}
+
+/// Why this node would refuse the definition's host tasks, when it is the
+/// only node that could run them (standalone: no council, no gossip peers).
+/// Admitting host work nobody can run (most often under `mount_isolation`,
+/// #714) would only fail a second later; refusing it names the reason at
+/// once. Container work and clusters are left to the leader, which fails a
+/// run once every node has refused it.
+fn sole_node_refusal(
+    state: &ApiState,
+    name: &str,
+    namespace: &str,
+    definition: &JobDefinition,
+) -> Option<String> {
+    if state.council.is_some() || state.membership.is_some() || !definition.template.is_host() {
+        return None;
+    }
+    let node = state.task_arrays.node.as_ref()?;
+    let record = crate::meat::task_array_store::TaskArrayRecord {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        template: definition.template.clone(),
+        state: crate::meat::task_array_state::TaskArrayState::new(definition.tasks.clone(), 0)
+            .ok()?,
+        terminal_at_epoch_secs: None,
+        quota_blocked: None,
+        unrunnable: None,
+    };
+    let self_node = crate::meat::NodeId::new(state.node_name.as_deref().unwrap_or("local"));
+    node.refusal(&super::task_array_leader::assignment_for(
+        0, &record, &self_node,
+    ))
 }
 
 /// `POST /v1/jobs/runs`: manual singleton/array run or durable cron registration.

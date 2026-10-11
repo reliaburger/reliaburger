@@ -440,6 +440,26 @@ Ordinary `[job]` host commands, and every host command on other platforms, use
 the original owned process backend and refuse explicit limits. Containers and native jobs
 keep separate execution capabilities.
 
+Linux turns `[process_workloads] mount_isolation` on by default, and host jobs
+don't run under it yet (#714). Until they do, every node that should run host
+jobs needs this in its config:
+
+```toml
+[process_workloads]
+mount_isolation = false
+```
+
+Forget it and the cluster says so straight away. A standalone node refuses the
+submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
+and the reason. In a cluster the run is admitted, because some other node might
+take it, and the leader fails it within a sync or two once every node it can
+reach has refused it. `relish batch-status` and `relish jobs` then show
+`Failed`, every task not run, and a `refused:` line quoting the nodes' reason;
+the JSON summary carries it as `unrunnable_reason`. The same rule catches any
+refusal that comes from a node's own configuration, such as a binary missing
+from every node's `allowed_binaries`. A run that only some nodes refuse keeps
+going on the others.
+
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
 
 ```sh

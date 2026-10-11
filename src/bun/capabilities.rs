@@ -510,7 +510,7 @@ impl ClusterCapabilities {
         add(
             Capability::ProcessRuntime,
             known(self.container_runtime == "process" && statics.process_workloads),
-            "legacy process catalogue needs dedicated ProcessGrill with an executable allowlist"
+            "legacy process catalogue needs dedicated ProcessGrill with an executable allowlist and mount_isolation off"
                 .to_string(),
         );
         add(
@@ -691,7 +691,7 @@ impl ClusterCapabilities {
         add(
             Capability::ProcessWorkloads,
             known(statics.process_workloads),
-            "host executable allowlist is non-empty".to_string(),
+            "host executable allowlist is non-empty and mount_isolation is off".to_string(),
         );
         add(
             Capability::CgroupFaults,

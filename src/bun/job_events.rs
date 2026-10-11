@@ -51,6 +51,8 @@ pub struct RunTransition {
     pub not_run: u64,
     /// Nodes whose outcome is unknown (only for [`RunChange::UnknownOutcome`]).
     pub unknown_owners: Vec<String>,
+    /// Why the run failed without starting, when no node could run it.
+    pub unrunnable: Option<String>,
 }
 
 impl RunTransition {
@@ -73,17 +75,18 @@ impl RunTransition {
     /// A one-line description for the event log and the webhook.
     pub fn message(&self) -> String {
         let job = format!("job {}/{} run {}", self.namespace, self.name, self.run);
-        match self.change {
-            RunChange::Succeeded => format!("{job} succeeded: {} tasks", self.succeeded),
-            RunChange::Failed => format!(
+        match (self.change, &self.unrunnable) {
+            (RunChange::Succeeded, _) => format!("{job} succeeded: {} tasks", self.succeeded),
+            (RunChange::Failed, Some(reason)) => format!("{job} failed without running: {reason}"),
+            (RunChange::Failed, None) => format!(
                 "{job} failed: {} succeeded, {} failed, {} not run; see relish batch results {} --failed",
                 self.succeeded, self.failed, self.not_run, self.run
             ),
-            RunChange::Cancelled => format!(
+            (RunChange::Cancelled, _) => format!(
                 "{job} cancelled: {} succeeded, {} failed, {} not run",
                 self.succeeded, self.failed, self.not_run
             ),
-            RunChange::UnknownOutcome => format!(
+            (RunChange::UnknownOutcome, _) => format!(
                 "{job} has an unknown outcome on {}; check side effects, then relish batch replay",
                 self.unknown_owners.join(", ")
             ),
@@ -177,6 +180,7 @@ fn runs(arrays: &TaskArrays) -> Vec<RunView> {
                 failed: 0,
                 not_run: 0,
                 unknown_owners: Vec::new(),
+                unrunnable: None,
             },
             terminal: Some(RunChange::Succeeded),
         };
@@ -192,6 +196,9 @@ fn runs(arrays: &TaskArrays) -> Vec<RunView> {
             view.transition
                 .unknown_owners
                 .extend(unknown_owners(arrays, *child));
+            if view.transition.unrunnable.is_none() {
+                view.transition.unrunnable = record.unrunnable.clone();
+            }
             view.terminal = worst(view.terminal, change_of(summary.status));
         }
         views.push(view);
@@ -211,6 +218,7 @@ fn runs(arrays: &TaskArrays) -> Vec<RunView> {
                 failed: summary.failed,
                 not_run: summary.not_run,
                 unknown_owners: unknown_owners(arrays, id),
+                unrunnable: record.unrunnable.clone(),
             },
             terminal: change_of(summary.status),
         });
@@ -362,6 +370,32 @@ mod tests {
         );
         assert!(change.message().contains("ops/nightly"));
         assert!(tracker.observe(&arrays).is_empty(), "reported once");
+    }
+
+    #[test]
+    fn a_run_no_node_could_run_says_why_in_its_event() {
+        let mut arrays = TaskArrays::default();
+        let mut tracker = JobEventTracker::default();
+        register(&mut arrays, 1, 4, 4);
+        assert!(tracker.observe(&arrays).is_empty(), "still running");
+        let reason = "no node can run it: host jobs don't run under mount_isolation yet";
+        arrays
+            .apply(
+                &TaskArrayWrite::Unrunnable {
+                    batch_id: 1,
+                    reason: reason.into(),
+                    now_epoch_secs: 3,
+                },
+                || 0,
+            )
+            .unwrap();
+        let changes = tracker.observe(&arrays);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change, RunChange::Failed);
+        assert!(changes[0].notifies());
+        let message = changes[0].message();
+        assert!(message.contains("ops/nightly"), "{message}");
+        assert!(message.contains(reason), "{message}");
     }
 
     #[test]

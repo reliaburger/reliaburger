@@ -3655,11 +3655,15 @@ fn create_runc_runtime(
     )?)
 }
 
+// Host workloads are refused under mount isolation until #714 implements it,
+// so a node with it on doesn't advertise them.
 fn host_workloads_enabled(
     runtime: &str,
     policy: &reliaburger::config::process_workloads::ProcessWorkloadsConfig,
 ) -> bool {
-    matches!(runtime, "process" | "runc+process") && !policy.allowed_binaries.is_empty()
+    matches!(runtime, "process" | "runc+process")
+        && !policy.allowed_binaries.is_empty()
+        && !policy.mount_isolation
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -3897,6 +3901,7 @@ mod tests {
             assert!(runtime.supports_runtime(RuntimeKind::Runc));
             let policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/true".into()],
+                mount_isolation: false,
                 ..Default::default()
             };
             let name = if host { "runc+process" } else { "runc" };
@@ -3991,6 +3996,21 @@ mod tests {
         assert!(error.contains("configured"));
         assert!(error.contains("fallback"));
         assert!(error.contains("metrics"));
+    }
+
+    #[test]
+    fn host_workloads_are_not_advertised_under_mount_isolation() {
+        // Host apps and jobs are refused under mount isolation (#714), so
+        // `relish test` must skip their cases instead of waiting on them (#777).
+        let mut policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/true".into()],
+            mount_isolation: false,
+            ..Default::default()
+        };
+        assert!(host_workloads_enabled("process", &policy));
+        policy.mount_isolation = true;
+        assert!(!host_workloads_enabled("process", &policy));
+        assert!(!host_workloads_enabled("runc+process", &policy));
     }
 
     #[test]

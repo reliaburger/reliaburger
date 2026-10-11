@@ -7254,6 +7254,70 @@
       "boundaries": [
         "Test-harness cleanup only; production retirement of rootless helpers is covered by the owned_rootless cases."
       ]
+    },
+    {
+      "id": "issue-777-unrunnable-runs-fail-fast",
+      "issue": 777,
+      "promise": "A job run no node can run (host commands under mount_isolation, a binary on no node's allowlist) is refused at standalone admission, or failed by the leader with the nodes' reason, instead of staying queued until its deadline.",
+      "supported_paths": [
+        "Standalone nodes and councils on every platform"
+      ],
+      "cases": [
+        {
+          "id": "issue-777-host_runs_under_mount_isolation_are_refused_with_the_reason",
+          "binary": "reliaburger::suite",
+          "test": "task_arrays::host_runs_under_mount_isolation_are_refused_with_the_reason",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-777-a_run_no_node_may_run_fails_with_the_nodes_reason",
+          "binary": "reliaburger::suite",
+          "test": "task_arrays::a_run_no_node_may_run_fails_with_the_nodes_reason",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-777-a_run_every_eligible_node_refuses_for_good_fails_with_the_reason",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::a_run_every_eligible_node_refuses_for_good_fails_with_the_reason",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-777-a_run_waits_while_any_eligible_node_could_still_take_it",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::a_run_waits_while_any_eligible_node_could_still_take_it",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A run that one eligible node can still take, or that a node refuses only for a passing fault, keeps waiting."
+      ],
+      "boundaries": [
+        "Running host tasks under mount isolation is #714; until then host jobs need mount_isolation = false."
+      ]
     }
   ]
 }
