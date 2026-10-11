@@ -2037,6 +2037,62 @@ concurrency makes the verdict informational, because comparing unlike runs is
 how the misleading numbers above happened. The five-round rerun's forty reports
 are committed as the first baselines.
 
+## Telling visitors what they can actually run
+
+All of this lives on the development branch, while the one-line installer
+still fetches 0.1.6. For a while the README listed `relish jobs` and
+`relish run --batch` next to the install line, and the tour's last bullet sent
+people to `relish bench --scenario jobs-shared-containers`. Follow it on a
+fresh install and you got an unknown-subcommand error. The existing website
+test couldn't see the problem: it parsed every advertised command with the CLI
+built from the same checkout, which of course had them all.
+
+So the check needs the *released* command line, not ours. We don't want
+CI to download and run a binary, so `scripts/release/released_cli.py` does
+that once per promotion: it walks the published `relish`'s own `-h` pages
+and writes every command, positional and option (with its aliases and the
+values clap lists) to `scripts/release/released-cli.tsv`. A tab-separated row
+per fact keeps the diff readable when the next release adds a command.
+
+`src/relish/released_cli.rs` reads it back and models just enough of clap to
+judge a line. Parsing each row is a `match` on a slice:
+
+```rust
+let fields: Vec<&str> = line.split('\t').collect();
+match fields.as_slice() {
+    ["version", value] => version = Some(value.to_string()),
+    ["command", path] => {
+        commands.insert(path.to_string());
+    }
+    ["option", path, aliases, value, choices] => { /* … */ }
+    _ => return Err(ReleasedCliError::Malformed { /* … */ }),
+}
+```
+
+A *slice pattern* matches on length and contents at once: `["command", path]`
+only fits a two-element slice whose first element is `"command"`, and binds
+the second to `path`. In C you'd check `argc`, then `strcmp`, then index;
+here the compiler won't let you read `path` from a row too short to have one.
+
+`ReleasedCli::check` then walks a line's words the way clap would: descend
+into a subcommand while one matches, look each `--flag` up on that command or
+the root (clap repeats global options on every page, so the snapshot keeps
+them once), check a value against the listed choices, and count positionals.
+That last part catches the sneakiest case. 0.1.6's `batch` takes a manifest
+path, so `relish batch submit jobs.toml` reads to it as the path `submit`
+followed by a stray argument. That's a rejection, not a pass.
+
+Two tests use it. `every_advertised_command_exists_in_the_installed_release`
+lets the tour use only released commands; everything else on the homepage,
+in the README and in the tour chapter must carry "0.2.0, not in 0.1.6" in the
+same paragraph or section. The README's generated command list adds that
+label by itself, because `command_reference::render` now takes the snapshot.
+And `the_tour_recording_matches_the_installer_version` reads the version that
+`scripts/demo/tour.sh` writes into the recording's title, so the next
+promotion can't skip the re-record the way 0.1.5 and 0.1.6 did. It caught
+something on its first run, too: the new 0.3.0 card on the homepage said
+`relish netboot`, a command no release has yet.
+
 ## What 0.2.0 doesn't do yet
 
 An audit of the job path before the release

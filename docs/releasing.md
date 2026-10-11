@@ -724,8 +724,16 @@ the real `curl … | sh` install against it on every host we advertise.
    re-record `docs/website/assets/tour.cast` against the published install
    with `scripts/demo/tour.sh --record … --install vX.Y.Z`
    ([how](website/README.md#re-recording-the-tour)), and move the poster time
-   in `index.html` if its moment moved. The website deploys from `main`, so
-   merge that change after promotion, not before.
+   in `index.html` if its moment moved. The recording's title and the caption
+   under it name the installed version, and `tests/suite/website.rs` fails
+   until they match the bootstrap's default. Regenerate the released-CLI
+   snapshot with `scripts/release/released_cli.py vX.Y.Z >
+   scripts/release/released-cli.tsv` and run `make readme-commands`: commands
+   labelled "X.Y.Z, not in" the old release lose their labels, and the same test
+   flags any label the docs no longer need
+   ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
+   website deploys from `main`, and publishes `/demo/*` from the tag the
+   bootstrap installs, so merge that change after promotion, not before.
 
 ## Soaking a candidate in CI
 

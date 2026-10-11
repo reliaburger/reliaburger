@@ -164,9 +164,15 @@ if [[ "${MODE}" == "record" ]]; then
     fi
     inner="${inner}${SETUP_PORTS}"
     if [[ "${JOBS}" == 1 ]]; then inner="${inner} --jobs"; fi
+    # The title names the release the recording installed, so
+    # tests/suite/website.rs can check it against install.sh's default.
+    TITLE_VERSION="development build"
+    if [[ -n "${INSTALL_VERSION}" && -z "${SETUP_BINARIES}" ]]; then
+        TITLE_VERSION="${INSTALL_VERSION#v}"
+    fi
     TOUR_RECORDING=1 asciinema rec --headless --overwrite --return \
         --window-size 110x32 --idle-time-limit "${IDLE_LIMIT}" \
-        --title "Reliaburger: the five-minute tour" -c "${inner}" "${CAST}"
+        --title "Reliaburger ${TITLE_VERSION}: the five-minute tour" -c "${inner}" "${CAST}"
     # Play setup faster: divide the gaps between its first and last lines.
     # asciicast v3 stores each event's gap since the previous one.
     python3 - "${CAST}" "${SETUP_SPEEDUP}" <<'PYTHON'
