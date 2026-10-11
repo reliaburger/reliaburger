@@ -1020,6 +1020,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
             Err(e) => eprintln!("bun: warning: upgrade startup recovery failed: {e}"),
         }
+        // Hash our own binary now, off the request path. `/v1/version`
+        // reports the digest, and a joiner's compatibility check gives up
+        // after 10 s; hashing a debug Bun on that first request took longer
+        // on a loaded host (#765). The task ends once the digest is cached.
+        manager.spawn_running_binary_hash();
     }
 
     // Debug-only test hook: a `{exe}.fail-boot` sidecar next to the resolved
@@ -2702,9 +2707,38 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     )
     .await
     .map_err(|error| anyhow::anyhow!("failed to open test lease store: {error}"))?;
+    // Delegated tasks share the agent runtime and resource commitments;
+    // detailed outcomes remain in durable worker ledgers.
+    let task_arrays = Arc::new(
+        reliaburger::bun::task_array_leader::TaskArrayService::new(Some(Arc::new(
+            reliaburger::bun::task_array_node::TaskArrayNode::new(
+                reliaburger::bun::task_array_node::TaskArrayNodeConfig::for_data_dir(
+                    &data_base,
+                    config.process_workloads.clone(),
+                ),
+                reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
+            )
+            .with_budget(execution_budget)
+            .with_telemetry(Arc::clone(&job_telemetry)),
+        )))
+        .with_job_notifier(WebhookDispatcher::new(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+            config.alerts.destinations.clone(),
+            config.cluster.name.clone(),
+        ))
+        .with_trust_policy(config.images.trust_policy.clone())
+        .with_signature_source(signature_source.clone())
+        .with_storage(&data_base)
+        .await?,
+    );
+    // A job lease's cleanup stops and forgets its jobs in these arrays.
     let local_lease_reaper = reliaburger::testkit::lease::spawn_local_lease_reaper(
         local_test_leases.clone(),
         cmd_tx.clone(),
+        Some(Arc::clone(&task_arrays)),
         shutdown.clone(),
     );
     let cluster_lease_reaper = api_council.as_ref().map(|council| {
@@ -2890,33 +2924,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases.clone()),
         jwt_verifier,
         Some(status_reader),
-        // Delegated tasks share the agent runtime and resource commitments;
-        // detailed outcomes remain in durable worker ledgers.
-        Some(Arc::new(
-            reliaburger::bun::task_array_leader::TaskArrayService::new(Some(Arc::new(
-                reliaburger::bun::task_array_node::TaskArrayNode::new(
-                    reliaburger::bun::task_array_node::TaskArrayNodeConfig::for_data_dir(
-                        &data_base,
-                        config.process_workloads.clone(),
-                    ),
-                    reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
-                )
-                .with_budget(execution_budget)
-                .with_telemetry(Arc::clone(&job_telemetry)),
-            )))
-            .with_job_notifier(WebhookDispatcher::new(
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_default(),
-                config.alerts.destinations.clone(),
-                config.cluster.name.clone(),
-            ))
-            .with_trust_policy(config.images.trust_policy.clone())
-            .with_signature_source(signature_source.clone())
-            .with_storage(&data_base)
-            .await?,
-        )),
+        Some(Arc::clone(&task_arrays)),
     );
     let app = match &registry_forwarder {
         Some(forwarder) => app.layer(axum::Extension(
@@ -3076,8 +3084,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = eval_shutdown.cancelled() => break,
                     _ = tick.tick() => {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
                         let store = eval_mayo.read().await;
-                        let latest = gather_latest_values(&store).await;
+                        let latest = gather_latest_values(&store, now_secs).await;
                         drop(store);
 
                         let transitions = {
@@ -3643,11 +3655,15 @@ fn create_runc_runtime(
     )?)
 }
 
+// Host workloads are refused under mount isolation until #714 implements it,
+// so a node with it on doesn't advertise them.
 fn host_workloads_enabled(
     runtime: &str,
     policy: &reliaburger::config::process_workloads::ProcessWorkloadsConfig,
 ) -> bool {
-    matches!(runtime, "process" | "runc+process") && !policy.allowed_binaries.is_empty()
+    matches!(runtime, "process" | "runc+process")
+        && !policy.allowed_binaries.is_empty()
+        && !policy.mount_isolation
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -3885,6 +3901,7 @@ mod tests {
             assert!(runtime.supports_runtime(RuntimeKind::Runc));
             let policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/true".into()],
+                mount_isolation: false,
                 ..Default::default()
             };
             let name = if host { "runc+process" } else { "runc" };
@@ -3979,6 +3996,21 @@ mod tests {
         assert!(error.contains("configured"));
         assert!(error.contains("fallback"));
         assert!(error.contains("metrics"));
+    }
+
+    #[test]
+    fn host_workloads_are_not_advertised_under_mount_isolation() {
+        // Host apps and jobs are refused under mount isolation (#714), so
+        // `relish test` must skip their cases instead of waiting on them (#777).
+        let mut policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/true".into()],
+            mount_isolation: false,
+            ..Default::default()
+        };
+        assert!(host_workloads_enabled("process", &policy));
+        policy.mount_isolation = true;
+        assert!(!host_workloads_enabled("process", &policy));
+        assert!(!host_workloads_enabled("runc+process", &policy));
     }
 
     #[test]

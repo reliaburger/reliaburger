@@ -848,6 +848,8 @@ The fix works at three layers, because each one can be reached without the other
 
 - **The binary store** refuses to put different bytes under an existing version (`VersionContentConflict`). Identical bytes are accepted and left alone.
 - **Nodes report what they run.** `/v1/version` gains `binary_sha256`. Hashing a whole bun is CPU work, so the manager does it once, on the blocking pool, and caches it in a `tokio::sync::OnceCell`. `OnceCell::get_or_try_init` takes an async closure; the first caller runs it and everyone else awaits the same result. If the closure fails, the cell stays empty and the next caller tries again, which is what you want for an I/O error.
+
+  Doing it on the first request turned out to be a mistake. A debug bun is over 500 MB, and on a loaded host the first `/v1/version` took longer than the 10 s a joining `relish` allows for its compatibility check, so `relish join` failed with "failed to reach cluster member" against an API that was up ([#765](https://github.com/reliaburger/reliaburger/issues/765)). Bun now calls `spawn_running_binary_hash` at boot, which `tokio::spawn`s a task that fills the same cell, and the hash reads the file in 1 MiB chunks instead of loading it whole. The `OnceCell` makes the change small: a request that arrives while the boot task is still hashing awaits that attempt instead of starting a second one.
 - **One pure gate, `upgrade::plan::check_target`,** compares the target with what every node runs. Same version and different (or unknown) bytes: `SameVersionDifferentBinary`, which tells the operator to give the candidate a new version. Same version and identical bytes everywhere: `TargetCheck::AlreadyRunning`, and relish prints "nothing to do" and exits cleanly. The leader runs the gate in `/v1/upgrade/start` after probing every planned node, before anything goes into Raft. Each node runs it again in `prepare`. And the orchestrator re-checks the digest when a node reports the target version, so a node that changed underneath the walk fails the run instead of passing it.
 
 The API handler maps "already running" to a 200 rather than an error, with a match arm that binds and filters at once:
@@ -1686,3 +1688,63 @@ We didn't make the leader download the release. It would know every node's platf
 We didn't let `--binary` cover a mixed cluster. One file is one architecture's build. Taking a `--binary` per platform would be possible, but the version form already does that job with less to get wrong.
 
 And we didn't sign the metadata. It's still a list of things that exist, and the binary signatures are still the trust anchor. The new `compatibility` field can at worst make `check` give wrong advice; the nodes' own `--compatibility` probe is what actually refuses.
+
+
+## A swap that deposed the leader
+
+The cluster suite's `paused_upgrade_can_be_aborted_or_replaced_by_a_rollback` poisons one node's v0.2.0, lets the run pause, aborts it and starts another one that should pause on the same node ([#783](https://github.com/reliaburger/reliaburger/issues/783)). On a second laptop it failed three times in a row. Twice the second run didn't pause first: it upgraded other nodes, then paused on the poisoned one, and the test timed out waiting for every node to be back on v0.1.0.
+
+The test plans each run from the current leader: the leader goes last, and the first other node in its list goes first. That's the node it poisoned. So if leadership moved between the two runs, the poisoned node was no longer first in the walk. Both bad version maps fit exactly that. Why would leadership move, though? Nothing in the test kills the leader.
+
+So we watched it. A task in the test polled every node's `/v1/cluster/council` every 100 ms and printed the leader and term whenever they changed, and the upgrade manager printed a timestamp at each step of `prepare`. Five of six voter swaps took leadership away from a healthy leader, on a Mac where the test still passed:
+
+```text
+fetch-end    776345
+verified     782992    6.6 s of signature checks
+probe-end    787097
+n1: down     787683    n1's API stops answering
+stage-end    796895    9.8 s of staging
+exec         796929
+n0: leader=null term=2   797114
+```
+
+The node being upgraded (n1) did seconds of synchronous work inside an `async fn`. `verify_binary` hashes the whole binary with SHA-256 and checks two Ed25519 signatures over it, and `stage` reads the copy already on disk, hashes both, writes and syncs. On a 590 MB debug build that's the better part of 16 s. A Tokio worker that's busy in plain code can't run anything else, and tasks queued behind it on that worker wait too. The council's Raft core was one of them. It missed the leader's heartbeats, so when staging finished its election timer had long expired, and it called an election at term 2 just before it exec'd. The leader saw the higher term and stepped down. The cluster elected someone again about two seconds later, usually the old leader. Sometimes not.
+
+The rollback path already did this right: `prepare_rollback` reads and verifies the stored binary inside `tokio::task::spawn_blocking`. The upgrade path now does the same. Here's the signature check:
+
+```rust
+let release_keys = self.release_keys.clone();
+let external_key = self.external_key;
+let checked = envelope.clone();
+let (bytes, verified) = tokio::task::spawn_blocking(move || {
+    let verified = signing::verify_binary(
+        &bytes,
+        &checked,
+        &release_keys,
+        external_key.as_ref(),
+        is_network,
+    );
+    (bytes, verified)
+})
+.await
+.map_err(std::io::Error::other)?;
+verified?;
+```
+
+`spawn_blocking` runs the closure on Tokio's separate pool of threads that are allowed to block, so the workers stay free for heartbeats and API calls. The closure must be `'static`: it can outlive the function that started it, so it can't borrow anything from it. The `move` keyword moves the 590 MB `Vec<u8>` into the closure, which costs nothing (a `Vec` is a pointer, a length and a capacity). Then we need the bytes back for the compatibility probe and for staging, so the closure returns them in a tuple next to the result. That's the usual way to lend owned data to another thread in Rust: hand it over and get it back, instead of sharing it behind a lock. `external_key` is an `Option<[u8; 32]>`, which is `Copy`, so assigning it copies it and there's nothing to clone.
+
+The `.await` gives a `Result<(Vec<u8>, Result<(), UpgradeError>), JoinError>`: the outer error means the closure panicked. `std::io::Error::other` turns that into an I/O error, and `UpgradeError`'s `#[from] std::io::Error` lets `?` convert it the rest of the way. The inner result is the verification itself, checked with `verified?` once we have the bytes back.
+
+Staging does the same with the store. `BinaryStore` is a directory path and a file name stem, so cloning it is cheap, and the clone moves into the closure with the bytes and the envelope. The first-upgrade bootstrap that copies the running executable into the store when it isn't there yet went in with it. It used to be a method on the manager, and a closure that called it would have had to borrow `self`, which a `'static` closure can't. Now it's a free function that takes the store and the running version, so the closure can own what it needs.
+
+### Tests
+
+`upgrade::manager`'s `preparing_a_large_binary_leaves_the_runtime_free` runs `prepare` on a single-threaded runtime with a 96 MB candidate (a shell script that answers `--compatibility`, exits, and then carries 96 MB of padding it never reads). Beside it, a ticker task sleeps 5 ms at a time and records the longest gap between wake-ups. With one runtime thread, any work done in place stops the ticker for exactly as long as it takes. Before the change the longest gap was 489 ms of a 1.36 s `prepare`; the test allows 250 ms, a quarter of Raft's shortest election timeout.
+
+The cluster test's assertions stay as they were. (Its harness now strips local symbols as well as debug ones from the candidate it pushes: on the Mac the build had grown to 540 MB with debug symbols gone, past the registry's 512 MiB upload cap, and the suite couldn't start.) Its plan depends on who leads, and that dependence is what caught a bug that would otherwise only have shown up as a leader election per upgraded node in production logs. With the change, the leader-and-term poller showed term 1 and the same leader through all four voter swaps of two runs.
+
+### What we decided not to do
+
+We didn't stop a node from campaigning while it prepares a swap. Switching its elections off (`raft.runtime_config().elect(false)`) would hide this symptom, but the cause was a starved runtime, and a starved runtime also delays the node's API answers and gossip. Moving the blocking work off the workers fixes all three.
+
+We didn't lengthen the election timeout either. One to two seconds is what lets the cluster notice a dead leader quickly, and a node that blocks its own workers for ten seconds would still outlast any sensible value.

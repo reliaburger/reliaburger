@@ -28,6 +28,13 @@ pub struct StateReport {
     pub cached_specs: Vec<CachedSpec>,
     /// Current resource usage.
     pub resource_usage: ResourceUsage,
+    /// Capacity task attempts and reusable executors hold in this node's
+    /// execution budget. `resource_usage` counts only app requests, so the
+    /// leader adds this before it places a replica here.
+    pub job_reservations: JobReservations,
+    /// Apps this node was asked to run but couldn't fit, so the leader
+    /// places them somewhere else instead of waiting here.
+    pub capacity_refusals: Vec<CapacityRefusal>,
     /// Recent event log (bounded to last N events).
     pub event_log: Vec<NodeEvent>,
     /// Whether this node can run image builds (`buildah` on PATH,
@@ -167,6 +174,25 @@ pub struct ResourceUsage {
     pub memory_total_mb: u32,
 }
 
+/// Capacity held by job work in a node's execution budget: task attempts
+/// and reusable executors, never app replicas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobReservations {
+    /// CPU in millicores.
+    pub cpu_millicores: u64,
+    /// Memory in bytes.
+    pub memory_bytes: u64,
+}
+
+/// An app whose placement on the reporting node failed for lack of capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityRefusal {
+    /// Name of the app.
+    pub app_name: String,
+    /// Namespace the app belongs to.
+    pub namespace: String,
+}
+
 /// Per-instance resource usage.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct AppResourceUsage {
@@ -260,6 +286,8 @@ mod tests {
                 kind: EventKind::ContainerStart,
                 detail: "started web-0".to_string(),
             }],
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 

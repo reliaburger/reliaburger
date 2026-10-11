@@ -1208,8 +1208,7 @@ The state machine compares that position with its previous applied entry
 before changing either placements or batches. If another admission got there
 first, the candidate is refused and the leader plans again. This is a
 compare-and-swap operation: Rust's `Option<LogId>` represents either the exact
-position we read or the absence of any applied entry. After a bounded number
-of competing writes, submission returns a retryable error. The entire placement
+position we read or the absence of any applied entry. The entire placement
 pass is one guarded transaction: an invalid later decision can't leave earlier
 apps committed. The old unguarded placement request is refused.
 
@@ -1222,12 +1221,20 @@ gap before the aggregator's next publication. These checks stay on the leader;
 Raft application never depends on a replica's clock. Missing evidence doesn't
 turn a cluster into an unlimited standalone node.
 
-Batch planning and registration have a five-second overall deadline and at
-most eight attempts after competing writes. If the acknowledgement is lost,
-submission returns 503 without dispatching. A late committed allocation stays
-reserved because timing out the caller doesn't prove Raft refused the write.
-The ordinary scheduler bounds its whole-pass proposal too and replans from
-committed state on the next tick.
+Nothing in production plans and registers a batch this way any more. Public
+jobs are admitted as runs in the job store (Chapter 17), and the guarded
+`BatchRegister` survives only to seed the retained ownership fixtures. A late
+committed reservation still stays reserved, because timing out the caller
+doesn't prove Raft refused the write. The ordinary scheduler bounds its
+whole-pass proposal and replans from committed state on the next tick.
+
+The fixtures taught us that "nobody else is writing" is never a safe
+assumption. A leader's job loop commits entries of its own, a cron observation
+on its first tick and again every minute. A fixture that read the position
+and then wrote now and then lost that race and was refused with "admission
+revision changed" ([#735](https://github.com/reliaburger/reliaburger/issues/735)).
+The state machine was right. The fixture now replans on that refusal, as the
+scheduler does.
 
 Durable retirement excludes a worker even while gossip and reports still call
 it alive. The planner filters it, and Raft refuses a registration assigned to
@@ -1247,7 +1254,7 @@ shared council, keep reports behind committed app placements, and lose a
 runner beyond the observation deadline. Each case checks the public outcome
 and the replicated state.
 
-The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
+The `BatchTracker` handled the async side until 0.2.0, which replaced it with task arrays and the common job lifecycle (Chapter 12, "One budget, two schedulers"). Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
 
 Each job name must be unique within its batch, including jobs in different namespaces. Submission builds a map keyed by that label before assigning execution identities. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.
 

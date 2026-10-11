@@ -18,25 +18,25 @@ async fn process_job_with_exit_zero_succeeds(ctx: TestContext) -> Result<(), Str
     let job = "job-ok";
     ctx.apply(&ctx.process_job_spec(job, &["/bin/sh", "-c", "exit 0"]))
         .await?;
-    // A successful job settles at "stopped"; exit 0 (or None on runtimes that
-    // don't track exit codes) distinguishes it from failure-in-backoff.
-    ctx.wait_for_cluster(job, "stopped with exit 0", |instances| {
-        instances
-            .iter()
-            .any(|i| i.state == "stopped" && matches!(i.exit_code, Some(0) | None))
+    // A run is "stopped" only once its task exited zero; one that failed
+    // says "failed".
+    ctx.wait_for_job_runs(job, "a run stopped with exit 0", |rows| {
+        rows.iter()
+            .any(|row| row.instance_id.starts_with("run-") && row.state == "stopped")
     })
     .await
 }
 
 /// A job that keeps exiting non-zero eventually reaches the terminal failed
-/// state (retry-count is not TOML-configurable, so this rides the agent's
-/// default backoff).
+/// state (retry-count is not TOML-configurable, so this rides the run's
+/// default attempts).
 async fn failing_job_retries_then_fails(ctx: TestContext) -> Result<(), String> {
     let job = "job-fail";
     ctx.apply(&ctx.process_job_spec(job, &["/bin/sh", "-c", "exit 1"]))
         .await?;
-    ctx.wait_for_cluster(job, "failed", |instances| {
-        instances.iter().any(|i| i.state == "failed")
+    ctx.wait_for_job_runs(job, "a failed run", |rows| {
+        rows.iter()
+            .any(|row| row.instance_id.starts_with("run-") && row.state == "failed")
     })
     .await
 }

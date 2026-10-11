@@ -211,7 +211,7 @@ What that means in practice:
 schema migration in the manual (`docs/manual/01_deploy-an-app.md`), the
 Kubernetes importer prints a "migration report", and the cluster apply plan for
 prerequisite jobs is called cluster migration
-([plan](2026-10-04-cluster-migration-prerequisites.md)). Adding a fourth would
+([plan](archive/2026-10-04-cluster-migration-prerequisites.md)). Adding a fourth would
 make `relish test --filter migration` and every error message ambiguous.
 
 So everything the operator types or reads says **move**:

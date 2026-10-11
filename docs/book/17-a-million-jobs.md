@@ -490,9 +490,7 @@ which runs in the portable suite. A CI test reads the system-only routes out of
 
 Jobs are the 0.2.0 headline workload, and for most of the release they couldn't say where they were allowed to connect. An app could carry `[egress] allow = [...]` and `[firewall] allow_from = [...]`; a `JobSpec` had neither, so a million crawler tasks ran with the network wide open. Decision D26 gave jobs both, with the same types and the same validation as apps (`validate_network_policy` now checks either kind: every egress entry parses without a DNS lookup, every `allow_from` source is `app` or `namespace/app`).
 
-Programming them was the interesting part, because a job runs in three different places.
-
-A job the agent runs directly goes through the same create → program → start path as an app. `apply_network_pre_start` used to take its allowlist from the app spec, and a job has none, so the job's start now prepares the allowlist itself and the loop takes it from that resolution when there's no app spec. A retry does the same from the recorded job spec.
+Programming them was the interesting part, because a job runs in two different places. (There was a third, a job the agent ran directly through the app's create → program → start path, until the old batch engine was retired; see "Retiring the batch engine from Chapter 12" below.)
 
 A fresh task attempt holds a `NamespaceLease` from the delegated runtime. The lease grew two methods: `enforce_egress` programs the task cgroup after `runc create` and before `start`, while runc holds the process, and `publish_address` records that the task's container address belongs to the job's namespace on every port, with its `allow_from`. Both are undone in `retired()`, which only runs once the runtime has proven the attempt gone. A name that doesn't resolve within five seconds refuses the attempt. Apps start deny-all and let the re-resolver fill in the allowlist later; a short task has no later, so refusing is the honest answer.
 
@@ -500,7 +498,7 @@ A reusable executor is the subtle one. Its commands all land in the executor's `
 
 The agent's kernel reconciliation has to know about all of this, or its sweep would scrub a task's allowlist as an orphan and its reconcile would forget a task's address. So the agent owns a small `DelegatedNetwork` that the runtimes write into: the task cgroups holding an allowlist, and the task addresses with their owners. A runtime claims a cgroup *before* writing it, and the sweep reads the claims *after* reading the kernel, so anything the kernel showed is already claimed. An `AtomicBool` change flag makes the agent's next tick reconcile when a task's address appears, which is how a job's `allow_from` grant reaches the kernel.
 
-A node that can't enforce either refuses the whole array at admission instead of failing every attempt, and `runtime = "process"` refuses both: a host task shares the node's network and runs as root, so an allowlist or a grant there would promise a boundary the task can step out of. `job_egress_allowlist_is_enforced` runs both the agent path and a task lease in the Lima VM.
+A node that can't enforce either refuses the whole array at admission instead of failing every attempt, and `runtime = "process"` refuses both: a host task shares the node's network and runs as root, so an allowlist or a grant there would promise a boundary the task can step out of. `job_egress_allowlist_is_enforced` runs a task lease in the Lima VM.
 
 ### Where the bytes went
 
@@ -634,11 +632,11 @@ const _: () = assert!(
 `const _` is an unnamed constant evaluated by the compiler, so a future change
 to either bound that breaks the inequality fails the build, not a cluster.
 
-Finally, the cron loop used to take sixteen due schedules and *then* skip the
-ones a pending deployment blocked, so sixteen blocked schedules could starve
-the rest every tick. `due_schedules` now filters first and starts after the last
-key it fired, wrapping round with `iter().cycle().skip(start).take(n)`, so a
-long list takes turns. The tests read like the issue: one namespace can't take
+Finally, the cron loop takes at most sixteen due schedules a tick, and always
+from the front of the list, so the same sixteen could fire every minute while
+the rest waited. `due_schedules` now starts after the last key it fired,
+wrapping round with `iter().cycle().skip(start).take(n)`, so a long list takes
+turns. The tests read like the issue: one namespace can't take
 every active run, a cron fire uses the reserved headroom, a refused one is
 recorded as skipped, daily named arrays keep working past the definition cap,
 and on a real three-node cluster a cron job fires while other tenants fill
@@ -908,6 +906,88 @@ the one-task-chunk tick about 160 µs, against a one-second budget; the fsync of
 the one entry now dominates. With the tick at one entry a
 second plus a cron observation a minute, the leader stays inside the 0.2.0
 budget of three Raft entries a second (#668).
+
+### A run nobody can take
+
+Linux turns `[process_workloads] mount_isolation` on by default, and host
+tasks don't run under it yet (that's #714). So what happened when you
+submitted `runtime = "process"` work to a default Linux node? The node said
+no, politely, every second, in its sync answer. The leader noted the refusal,
+granted nothing, and moved on. The run sat in `Running` with every task
+queued until its deadline, or for ever if it had none. `relish test`'s job
+cases hung the same way (#777).
+
+Nothing was wrong with any single piece. The node was right to refuse, and
+the leader was right not to grant work to a node that refused it. What was
+missing was anyone asking the obvious question: can *any* node run this?
+
+Not every refusal answers that question, though. A node that can't open its
+task ledger because the disk hiccuped might be fine next second. A node whose
+allowlist lacks the binary, or whose `mount_isolation` is on, will say the
+same thing until someone edits its config. So the node's answer now says
+which kind it is:
+
+```rust
+pub struct ArrayProgress {
+    // ...
+    pub refused: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unrunnable: bool,
+    // ...
+}
+```
+
+`std::ops::Not::not` is the `!` operator as a function, so serde leaves the
+field out whenever it's `false`. Only refusals from `admit` (the checks of the
+node's own configuration and runtime) set it.
+
+The leader decides in `unrunnable_reason`. A run fails when nothing holds its
+chunks, something is still queued, and every *eligible* node answered about
+it this tick with an unrunnable refusal. Eligible means every node the leader
+syncs whose last call didn't fail. A node whose call is still out keeps the
+run open until it answers or times out (three seconds at most), and a dead
+node falls out of gossip membership. The check reads like this:
+
+```rust
+for node in eligible {
+    let (_, progress) = answers.iter().find(|(answered, _)| answered == node)?;
+    if !progress.unrunnable {
+        return None;
+    }
+    reasons.insert(progress.refused.as_deref()?);
+}
+```
+
+The `?` here works on `Option`, not `Result`. In a function that returns
+`Option`, `x?` means "if `x` is `None`, return `None` now". A node that didn't
+answer about this run, or one that refused without a reason, ends the check
+the same way: not yet. Go has no equivalent; you'd write the `if` by hand
+twice.
+
+When the check passes, the tick carries one new write,
+`TaskArrayWrite::Unrunnable`, instead of that run's sync. It stops the run with
+a new `StopReason::Unrunnable`, counts every queued task as not run, and keeps
+the reason on the record, so `relish batch-status` can print it long after
+the nodes have stopped talking about the run. The status is plain `Failed`,
+which means the alert webhook and the job's history treat it like any other
+failure. A holder that starts refusing (its allowlist changed mid-run) is
+requeued first, as before, and the run fails on the next tick.
+
+A standalone node has no one else to ask, so it doesn't wait for a tick. The
+common admission path, `admit_definition`, asks the node's executor the same
+`admit` question about host work before writing anything, and a refusal comes
+back as HTTP 422 with the reason. We kept it to host work, the case #777 is
+about; a container run on a node without a container runtime still goes
+through the tick, a second later. A council could do the same if every node
+advertised what it can run, but that's another piece of gossiped state to keep honest.
+A second of delay in a cluster is a fair price for not having it.
+
+One more thing was quietly wrong. A node's capability report said it ran
+process workloads whenever its allowlist wasn't empty, even with
+`mount_isolation` on, when it refuses every one of them. `relish test`
+believed it and ran the host cases into the wall. The report now says no
+unless the allowlist is set *and* isolation is off, so those cases skip with a
+reason instead. A capability report that lies is worse than none.
 
 ## Short jobs without fresh containers
 
@@ -2152,6 +2232,190 @@ concurrency makes the verdict informational, because comparing unlike runs is
 how the misleading numbers above happened. The five-round rerun's forty reports
 are committed as the first baselines.
 
+## One budget, two schedulers
+
+Here's a cluster that looks healthy and isn't. Three nodes, 8000 millicores
+each. Someone submits a task array, and the leader grants its chunks to the
+first node, whose executor fills its CPU with eight one-core attempts. A minute
+later you deploy an app with three one-core replicas. The leader spreads them
+one per node, the first node's agent tries to start its replica, and the
+execution budget says no. Every few seconds the node's reconciler retries,
+the budget says no again, and the leader, seeing a ready node with an app
+placed on it, keeps the placement exactly where it is. One replica stays down
+for as long as the array runs, beside two nodes with seven spare cores each.
+
+Nothing in that story is a crash. Each piece did what it was built to do.
+The node had *one* ledger, the `ExecutionBudget` from earlier in this chapter,
+shared by app replicas, task attempts and reusable executors. The cluster had
+*two* schedulers: the leader's app scheduler and the task-array grant loop.
+And only one of them could see the ledger. A node's `StateReport` summed the
+CPU and memory requests of its app instances, nothing else, so to the app
+scheduler a node full of job attempts looked empty.
+
+### Reporting what jobs hold, and only that
+
+The obvious fix is to report the whole budget: "this node has 8000 millicores
+used". That would count apps twice. The leader already reconciles app
+placements against reports one instance at a time (`reserve_commitments` adds
+only the part of each committed placement that a report hasn't accounted for),
+and that per-instance view is what lets it resize a replica in place or tell a
+placement that's started from one that hasn't. So the report keeps app
+requests where they were and grows a second, separate figure:
+
+```rust
+/// Capacity held by job work in a node's execution budget: task attempts
+/// and reusable executors, never app replicas.
+pub struct JobReservations {
+    pub cpu_millicores: u64,
+    pub memory_bytes: u64,
+}
+```
+
+The budget has to know which of its leases are which. Each `ResourceLease`
+now carries a tag:
+
+```rust
+enum LeaseOwner {
+    Application,
+    Job,
+}
+```
+
+That's a *fieldless enum*: the Rust version of a C enum, two named values and
+no data, which we can compare with `==` because it derives `PartialEq`.
+`try_acquire` and `adopt`, the paths the supervisor uses for app replicas,
+create `Application` leases; `acquire` and `try_acquire_executor`, the task
+executor's and the executor pool's paths, create `Job` leases and add to a
+separate `job_used` total. The lease's `Drop` (the destructor Rust runs when a
+value goes out of scope) subtracts from `job_used` only for a `Job` lease. A
+quarantined attempt, whose retirement nobody has proved, never runs that
+subtraction, so its capacity stays counted on both totals, which is the point
+of quarantine.
+
+On the leader, `build_cluster_cache` adds the two figures before planning:
+
+```rust
+allocated: Resources {
+    cpu_millicores: u64::from(usage.cpu_used_millicores)
+        .saturating_add(report.job_reservations.cpu_millicores),
+    memory_bytes: (u64::from(usage.memory_used_mb) * 1024 * 1024)
+        .saturating_add(report.job_reservations.memory_bytes),
+    gpus: 0,
+},
+```
+
+`saturating_add` stops at `u64::MAX` instead of wrapping round to zero, which
+in a capacity sum would turn "impossibly full" into "empty".
+
+### When the race goes the wrong way
+
+Reports are seconds old by the time the leader reads them, and attempts start
+whenever the grant loop says so. A replica can still be placed on a node that
+had room at planning time and doesn't by the time its agent tries. Holding
+that placement is the bug from the opening paragraph, just rarer.
+
+`try_acquire` doesn't queue (an app replica waiting behind task attempts would
+just be the same outage, slower), so the agent turns the refusal into
+evidence. When a fresh deploy fails with `BunError::Capacity`, it records the
+app's name and namespace with a timestamp; a successful deploy clears the
+entry, and an entry older than a minute drops out of the reports. The next
+`StateReport` carries a `CapacityRefusal`, `build_cluster_cache` copies it into
+the scheduler's cache, and the rule that decides whether a committed placement
+stays put learns one more reason to say no:
+
+```rust
+if keeps_volume_home(placement, spec, self.retired) {
+    return true;
+}
+if cache.capacity_refused(&placement.node_id, app_id) {
+    return false;
+}
+```
+
+The order matters. An app with a managed volume still waits for the node that
+holds its data, refusal or not: moving it would start it on an empty volume,
+and that's the #423 bug we already paid for once. Everything else moves, and
+because the node now reports what its jobs hold, the scheduler doesn't put the
+replica straight back. Running attempts are never stopped to make room. A job
+is somebody's work in progress; an app replica can start somewhere else.
+
+We tested this the way the bug report described it. One test hands an
+in-process leader scheduler two reports, one node full of job reservations and
+one idle, and checks where the app lands. Another starts a real three-node
+cluster whose executors share their agents' budgets, fills one node with an
+array, and deploys a three-replica app. Both tests fail without the fix,
+which we checked by switching the addition off and watching the replica land
+on the full node, and pass with it.
+
+### Retiring the batch engine from Chapter 12
+
+[Chapter 12](12-squeezing-every-drop.md) wired a batch engine: a leader-side `BatchTracker`,
+node-to-node `/v1/batch/run` dispatch, completion callbacks, a pull watcher as
+a backstop, and `batch_state` in Raft with its `BatchRegister` reservations.
+Then task arrays arrived, every job became a task array, and `relish batch`
+moved to the common lifecycle. The old engine didn't go away. Leased test
+applies still used it, so the tracker, the routes, the watcher and the agent's
+own job ledger stayed live beside the "one job lifecycle" this release is
+about.
+
+Two ways to run a job are one too many. They don't just cost code: each one
+has its own capacity view, its own failure modes and its own audit findings.
+So 0.2.0 deletes the old one. The tracker, the two routes, the watcher,
+`batch_state`, `BatchRegister` and the allocator are gone. The one thing worth
+keeping was the id counter, because arrays, runs and manifests share one id
+space so that `relish batch-status 12` names exactly one thing. That counter
+is now a type of its own, `BatchIds`, and lives in `DesiredState` on its own.
+
+The agent stopped running jobs altogether. Its job ledger, cron schedules,
+batch executions and prerequisite runner existed for the node-local path; with
+every job on the common lifecycle, a deploy that names a job is refused before
+it touches a runtime. That removed about seventeen thousand lines, most of
+them tests for states that can no longer happen, which is the cheapest kind of
+bug fix there is.
+
+The prerequisite claims went with them. A leased apply with jobs used to write
+a claim to Raft, holding its manifest and the leadership term that admitted it,
+until the jobs settled. A claim from an earlier term could never be released,
+there could be at most 64, and each one reserved its jobs' resources on every
+candidate node. A few leader changes during leased applies and capacity
+quietly leaked away. We could have added `relish council release-claim` for an
+operator to clear them. Instead leased applies now go through `JobApplyCommit`,
+the same deployment record every other apply uses, which already survives
+leader changes, so the claims, their state field and their four Raft request
+types simply don't exist any more.
+
+### Test leases for jobs
+
+That left the leases themselves. `relish test`'s job cases hold a *job lease*,
+and until now it lived only on the node that issued it, because that was the
+node that would run the jobs. On the common lifecycle the leader admits the
+jobs, so the leader has to be able to check the lease. With a council, a job
+lease is now a Raft record like an application lease.
+
+The ordering is what keeps cleanup honest. A leased job apply first writes
+`TestLeaseJobs`, which attaches the jobs to the lease, and only then writes the
+deployment. The state machine refuses a job in a test lease namespace unless an
+active job lease owns it, so there's no way to create work a lease's cleanup
+can't find. Cleanup cancels any unsettled deployment that owns a leased job and
+forgets its definition, then waits until the leader has settled the cancelled
+deployment before it removes the lease record. Standalone nodes keep the lease
+in their own store and do the same through the node's task arrays.
+
+### Lessons
+
+**Two schedulers sharing a ledger must share a view of it.** The budget was
+correct, the scheduler was correct, and the cluster still left a replica
+down. Whenever two decision-makers spend the same resource, ask what each of
+them can see.
+
+**Report the part the reader can't reconcile, not the total.** Summing
+everything would have looked simpler and counted every app twice.
+
+**When the new path lands, delete the old one.** The old batch engine survived
+because one caller still used it, and it kept collecting findings for the
+whole time it was alive. Moving that last caller was most of the work; the
+deletion itself was the easy part.
+
 ## Telling visitors what they can actually run
 
 All of this lives on the development branch, while the one-line installer
@@ -2221,11 +2485,6 @@ should shrink to nothing before the release ships.
   accepted task leaves a little behind on the node: ledger entries, captured
   output, executor metadata. At 0.2.0 rates that adds up to a full disk within
   hours, and nothing reclaims it between runs.
-- **App placement that sees jobs**
-  ([#681](https://github.com/reliaburger/reliaburger/issues/681)). Job attempts
-  reserve CPU and memory in each node's own budget, which the leader's app
-  scheduler can't see. It can place a replica on a node that jobs have already
-  filled.
 
 ## Lessons
 

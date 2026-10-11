@@ -167,24 +167,6 @@ async fn status_answers_while_the_tick_reads_every_app_state() {
         .await;
 }
 
-/// `check_jobs` does the same for every running job.
-#[tokio::test]
-async fn status_answers_while_the_tick_reads_every_job_state() {
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    let jobs: String = (0..10)
-        .map(|index| format!("[job.batch{index}]\nimage = 'batch:v1'\ncommand = ['sleep', '60']\n"))
-        .collect();
-    expect_complete(&drain_deploy(&mut agent, Config::parse(&jobs).unwrap()).await);
-    let running = RunningAgent::start(agent, tx, shutdown);
-    let before = calls_of(&grill, "state");
-    running.measure_from_here();
-    grill.set_call_delay(MockCall::State, Some(STALL / 10));
-    wait_for_calls(&grill, "state", before, 1).await;
-    running
-        .assert_responsive("check_jobs read ten job states at 250 ms each")
-        .await;
-}
-
 /// A restart first kills what's left of the old container and waits for the
 /// runtime to confirm, inline, before the tick's restart budget is checked.
 #[tokio::test]
@@ -216,55 +198,6 @@ async fn status_answers_while_a_restart_creates_and_starts() {
     wait_for_calls(&grill, "create", before, 1).await;
     running
         .assert_responsive("a restart created and started its replacement")
-        .await;
-}
-
-/// `relish apply --rerun-jobs` kills the job's previous run and waits for
-/// the runtime to confirm the exit before the rerun may start. The kill runs
-/// off the loop, and the deploy worker asks again until it's confirmed; the
-/// rerun still starts, once.
-#[tokio::test]
-async fn status_answers_while_a_job_rerun_kills_its_previous_run() {
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    let job =
-        || Config::parse("[job.batch]\nimage = 'batch:v1'\ncommand = ['sleep', '60']\n").unwrap();
-    expect_complete(&drain_deploy(&mut agent, job()).await);
-    let running = RunningAgent::start(agent, tx.clone(), shutdown);
-    // Past the turn budget, inside the test agent's 2 s kill confirmation.
-    grill.set_call_delay(MockCall::Kill, Some(std::time::Duration::from_millis(1500)));
-    let kills_before = calls_of(&grill, "kill");
-    let starts_before = calls_of(&grill, "start");
-    running.measure_from_here();
-    let (events, mut progress) = mpsc::channel(64);
-    tx.send(AgentCommand::RerunJobs {
-        config: job(),
-        events,
-    })
-    .await
-    .unwrap();
-    wait_for_calls(&grill, "kill", kills_before, 1).await;
-    let mid_kill = running.status_latency().await;
-    let last_event = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut last = None;
-        while let Some(event) = progress.recv().await {
-            last = Some(event);
-        }
-        last
-    })
-    .await
-    .expect("the rerun never finished");
-    expect_complete(&last_event.into_iter().collect::<Vec<_>>());
-    assert_eq!(
-        calls_of(&grill, "start"),
-        starts_before + 1,
-        "the rerun started its job once"
-    );
-    assert!(
-        mid_kill.is_some_and(|latency| latency < TURN_BUDGET),
-        "status took {mid_kill:?} while the previous run's kill was confirmed"
-    );
-    running
-        .assert_responsive("a job rerun killed its previous run")
         .await;
 }
 
@@ -649,104 +582,6 @@ async fn status_answers_while_an_upgrade_fetches_from_a_silent_registry() {
 // retirement ones.
 
 // ---- disk, kernel and subprocesses -------------------------------------------
-
-/// The most fsync'd persists one turn may make. Two writes at the 250 ms a
-/// loaded coverage runner measured (#421) leave half the budget; four would
-/// pass it, which is why a startup retirement splits its four (#422).
-const MOST_PERSISTS_IN_A_TURN: usize = 2;
-
-/// fsync'd persists may stay inline (#351, decision 2), as long as a slow disk
-/// can't stretch a turn past the budget. With every persist slowed to 150 ms,
-/// a deploy of three replicas, a job and a restart must make no more than
-/// [`MOST_PERSISTS_IN_A_TURN`] in any one turn, and status must still answer.
-///
-/// The verdict counts persists instead of timing turns. A turn also pays for
-/// the host's real fsyncs, which the slowed persist stands in for and the
-/// test can't control: on a hosted macOS runner, one restart turn with a
-/// single persist in it took 1109 ms (#508).
-#[tokio::test]
-async fn status_answers_while_every_persist_waits_on_a_slow_disk() {
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    let records = tempfile::tempdir().unwrap();
-    // A durable record needs a live process identity; this one is ours.
-    grill.set_pid(std::process::id());
-    agent.set_records_dir(records.path().to_path_buf());
-    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
-    let running = RunningAgent::start(agent, tx.clone(), shutdown);
-    running
-        .stalls
-        .set(LoopStall::Persist, std::time::Duration::from_millis(150));
-    running.measure_from_here();
-    let persists_before = running.stalls.reached(LoopStall::Persist);
-
-    let deploy = Config::parse(
-        "[app.api]\nimage = 'api:v1'\nport = 9090\nreplicas = 3\n\n\
-         [job.report]\nimage = 'report:v1'\ncommand = ['true']\n",
-    )
-    .unwrap();
-    let starts_before = calls_of(&grill, "start");
-    let (events, mut progress) = mpsc::channel(64);
-    tx.send(AgentCommand::Deploy {
-        config: deploy,
-        events,
-    })
-    .await
-    .unwrap();
-    let crashed_at = std::time::SystemTime::now();
-    crash(&grill);
-    let mid_deploy = running.status_latency().await;
-    let last_event = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut last = None;
-        while let Some(event) = progress.recv().await {
-            last = Some(event);
-        }
-        last
-    })
-    .await
-    .expect("the deploy never finished");
-    expect_complete(&last_event.into_iter().collect::<Vec<_>>());
-    // Three api replicas, the job, and web's restart all started.
-    wait_for_calls(&grill, "start", starts_before, 5).await;
-    for id in ["default__api-0", "default__api-1", "default__api-2"] {
-        assert!(
-            crate::grill::records::record_path(records.path(), id).exists(),
-            "{id} was never persisted"
-        );
-    }
-    // The restart records its replacement in the turn after the start call.
-    let restarted = crate::grill::records::record_path(records.path(), "default__web-0");
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !std::fs::metadata(&restarted)
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|modified| modified > crashed_at)
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("web's restart was never persisted");
-    let after_deploy = running.status_latency().await;
-    let persists = running.stalls.reached(LoopStall::Persist) - persists_before;
-    let most_in_a_turn = running.stalls.most_in_a_turn(LoopStall::Persist);
-    let worst = running.meter.worst_turn();
-    stop(running).await;
-
-    assert!(mid_deploy.is_some(), "status went unanswered mid-deploy");
-    assert!(
-        after_deploy.is_some(),
-        "status went unanswered after the deploy"
-    );
-    // Three api records, the job's ledger and web's restart record at least.
-    assert!(
-        persists >= 5,
-        "only {persists} persists reached the slow disk"
-    );
-    assert!(
-        most_in_a_turn <= MOST_PERSISTS_IN_A_TURN,
-        "one turn made {most_in_a_turn} persists to a slow disk (the worst turn was \
-         {worst:?}); a turn may make {MOST_PERSISTS_IN_A_TURN}"
-    );
-}
 
 /// Retiring an instance removes its identity directory and record inline.
 #[tokio::test]

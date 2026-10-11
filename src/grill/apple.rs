@@ -604,7 +604,7 @@ mod tests {
         let record = serde_json::from_value(serde_json::json!({
             "schema": crate::grill::records::RECORD_SCHEMA, "instance_id": id.0, "namespace": "default",
             "app_name": "apple-evidence", "replica_index": 0,
-            "is_job": false, "image": "unused", "runtime": "Apple",
+            "image": "unused", "runtime": "Apple",
             "pid": 0, "pid_started_at": 0,
             "oci_spec": {
                 "root": {"path": "unused", "readonly": true},
@@ -671,11 +671,11 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_inspection_times_out_and_reaps_the_cli() {
-        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("container-fixture");
-        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A shared, already-launched script, so the two-second bound times
+        // the inspection rather than macOS assessing a new file (#582).
+        crate::first_launch::install_script(&program, "#!/bin/sh\nexec sleep 60\n");
         let mut grill = AppleContainerGrill::new();
         grill.container_program = program;
         // Observe the real child even if its first shell instruction has not
@@ -1060,7 +1060,6 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "apple-adopt".to_string(),
             replica_index: 0,
-            is_job: false,
             image: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
             runtime: crate::grill::records::RuntimeKind::Apple,
             pid: 0,

@@ -326,6 +326,15 @@ pub enum MembershipSource {
 }
 
 /// How to start one fully wired node.
+/// Builds a node's task-array service on its agent's execution budget, so
+/// task attempts and app replicas share one ledger as they do in Bun.
+pub type TaskArraysOnBudget = Box<
+    dyn FnOnce(
+            Arc<reliaburger::bun::execution_budget::ExecutionBudget>,
+        ) -> Arc<reliaburger::bun::task_array_leader::TaskArrayService>
+        + Send,
+>;
+
 pub struct WiredNodeOptions {
     pub name: String,
     /// First port of the node's block: gossip, +1 Raft, +2 reporting, +3 API.
@@ -365,6 +374,9 @@ pub struct WiredNodeOptions {
     /// Task arrays: the executor and leader timings. `None` gives the API
     /// the default service with no executor.
     pub task_arrays: Option<Arc<reliaburger::bun::task_array_leader::TaskArrayService>>,
+    /// Task arrays built on the agent's own execution budget. Takes
+    /// precedence over `task_arrays`.
+    pub task_arrays_on_agent_budget: Option<TaskArraysOnBudget>,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -415,6 +427,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         labels,
         keep_data_dir,
         task_arrays,
+        task_arrays_on_agent_budget,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -501,6 +514,10 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // Several agents share this host; don't spawn nft against the real
     // host firewall (`with_cluster` enables it by default on Linux).
     agent.set_perimeter_enabled(false);
+    let task_arrays = match task_arrays_on_agent_budget {
+        Some(build) => Some(build(agent.execution_budget())),
+        None => task_arrays,
+    };
     // The API answers status from the loop's published snapshot, and reads
     // the agent's event ring and deploy history, as Bun does.
     let status_reader = agent.status_reader();

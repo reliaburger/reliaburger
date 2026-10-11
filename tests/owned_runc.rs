@@ -256,7 +256,6 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
         namespace: "default".into(),
         app_name: "owned-runc".into(),
         replica_index: 0,
-        is_job: false,
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
@@ -316,7 +315,6 @@ async fn a_stale_adoption_record_retires_its_generation_and_others_still_adopt()
             namespace: "default".into(),
             app_name: "owned-runc".into(),
             replica_index: 0,
-            is_job: false,
             image: "/empty-fixture".into(),
             runtime: RuntimeKind::Runc,
             pid,
@@ -854,7 +852,6 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
         namespace: "default".into(),
         app_name: "owned-runc".into(),
         replica_index: 0,
-        is_job: false,
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
@@ -1229,7 +1226,6 @@ async fn owned_runc_unit_stop_fixture() {
         namespace: "default".into(),
         app_name: "owned-runc".into(),
         replica_index: 0,
-        is_job: false,
         image: "/empty-fixture".into(),
         runtime: RuntimeKind::Runc,
         pid,
@@ -1359,6 +1355,8 @@ mod capacity_contract {
                         },
                         event_log: Vec::new(),
                         has_buildah: false,
+                        job_reservations: Default::default(),
+                        capacity_refusals: Vec::new(),
                     },
                 )]
                 .into_iter()
@@ -1754,10 +1752,6 @@ mod capacity_contract {
                 .run(ordinary_id)
                 .unwrap()
                 .replay_unknown
-        );
-        assert!(
-            desired.prerequisite_claims.is_empty(),
-            "ordinary work must not use the old dispatcher"
         );
 
         let probe = |name: &str, cpu: &str, memory: &str| {

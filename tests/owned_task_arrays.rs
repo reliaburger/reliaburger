@@ -3049,6 +3049,7 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
                     Duration::from_millis(200),
                     Duration::from_secs(3),
                 ))),
+                task_arrays_on_agent_budget: None,
             })
             .await,
         );

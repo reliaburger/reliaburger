@@ -2551,6 +2551,9 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     if let Some(reason) = summary["quota_blocked_reason"].as_str() {
         output.push_str(&format!(" | quota blocked: {reason}"));
     }
+    if let Some(reason) = summary["unrunnable_reason"].as_str() {
+        output.push_str(&format!(" | refused: {reason}"));
+    }
     let failure_rate = summary["rates"]["failures_per_second"]
         .as_f64()
         .map_or("unknown".into(), |r| format!("{r:.1}/s"));
@@ -2582,6 +2585,14 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
             cohort["cpu_request_millicores"],
             cohort["memory_request_bytes"].as_u64().unwrap_or(0) / (1024 * 1024)
         ));
+    }
+    for cohort in summary["cohorts"].as_array().into_iter().flatten() {
+        if let Some(reason) = cohort["unrunnable_reason"].as_str() {
+            output.push_str(&format!(
+                "\n  array {} refused: {reason}",
+                cohort["batch_id"]
+            ));
+        }
     }
     for profile in
         std::iter::once(summary).chain(summary["cohorts"].as_array().into_iter().flatten())
@@ -2801,6 +2812,9 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
     ));
     if let Some(reason) = summary["quota_blocked_reason"].as_str() {
         out.push_str(&format!("  waiting for quota: {reason}\n"));
+    }
+    if let Some(reason) = summary["unrunnable_reason"].as_str() {
+        out.push_str(&format!("  refused: {reason}\n"));
     }
     if let Some(ranges) = summary["failed_indices"].as_array()
         && !ranges.is_empty()
@@ -4742,6 +4756,20 @@ mod task_array_tests {
         }
         let unknown = format_batch_watch(&serde_json::json!({"kind":"array"}));
         assert!(unknown.contains("unknown active commands"));
+    }
+
+    #[test]
+    fn status_says_why_no_node_could_run_a_failed_run() {
+        let reason =
+            "no node can run it: host jobs don't run under [process_workloads] mount_isolation yet";
+        let run = serde_json::json!({"kind":"array","batch_id":4,"status":"Failed","not_run":20,"unrunnable_reason":reason});
+        assert!(format_batch_watch(&run).contains(&format!("refused: {reason}")));
+        assert!(format_array_summary(4, &run).contains(&format!("  refused: {reason}\n")));
+        // A manifest names the profile no node could run.
+        let manifest = serde_json::json!({"kind":"manifest","batch_id":5,"status":"Failed","cohorts":[
+            {"profile":"small","batch_id":6,"succeeded":1,"total":1},
+            {"profile":"host","batch_id":7,"succeeded":0,"total":4,"unrunnable_reason":reason}]});
+        assert!(format_batch_watch(&manifest).contains(&format!("array 7 refused: {reason}")));
     }
 
     #[test]

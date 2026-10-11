@@ -1818,7 +1818,7 @@ That bound still had a hole: it assumed nothing else held the owner's reconcile 
 
 What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
 
-Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 run on the node that received them, so their leases live on that node (`scope = "node_jobs"`) and a local reaper retires both running jobs and cron registrations that haven't fired yet. Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
+Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 ran on the node that received them, so their leases lived on that node (`scope = "node_jobs"`) and a local reaper retired both running jobs and cron registrations that hadn't fired yet. In 0.2.0 every job takes the common job lifecycle, so a job lease lives in Raft with a council and its cleanup cancels the jobs' runs and forgets their definitions (Chapter 12). Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
 
 One last trap. The reaper used to wait on each lease's operation lock in turn, so a single lease still being deployed stopped every other expired lease from being cleaned. It now asks without queueing:
 
@@ -5559,7 +5559,6 @@ agent/networking.rs      network references and egress enforcement
 agent/routing.rs         eBPF maps, the service catalogue, the routing table
 agent/faults.rs          chaos faults on this node
 agent/trace.rs           `relish trace`
-agent/job_runs.rs        the job ledger and cron jobs
 agent/records.rs         durable instance records and adoption
 agent/health_checks.rs   probes and the exits the tick notices
 agent/retirement.rs      killing, cleaning up, shutting down
@@ -5817,6 +5816,26 @@ has already assessed; a copy would be a new file. Before any deadline starts,
 together and waits for both, with its own 45-second bound that says what it was
 waiting for. The 15 seconds now measure `relish`, which is what they were
 written for.
+
+The managed-status test wasn't alone. Six `relish local` lifecycle tests,
+an owned-launch cancellation test and a handful of others all wrote a fake tool
+of their own just before timing it
+([#582](https://github.com/reliaburger/reliaburger/issues/582)). nextest runs
+every test in a separate process, so "write it once" can't mean once per
+process. Under the same launcher, with fresh binaries alongside, the six
+lifecycle tests failed their five-second Lima deadline in every one of ten runs,
+and the cancellation test missed its 15-second wrapper marker in nine.
+
+So the helper keeps one copy of each distinct script for the whole machine.
+`install_script(path, body)` names the copy after the SHA-256 of its body, puts
+it in a directory only you can write, launches it once with an argument that
+makes it exit straight away, and hard-links it to `path`. The fake `limactl`
+used to have its log and state paths baked in, which made every test's body
+different. Now it starts with `dir=${0%/*}`: the shell's `$0` is the name it was
+started as, so `${0%/*}` (strip the shortest suffix matching `/*`) is the test's
+own directory, and one body serves every test. The shared copy is read-only, and
+the helper checks its bytes against the digest each time, so a test that wrote
+through its link would fail loudly instead of changing everyone else's tool.
 
 The helper remembers what it has launched in a process-wide set:
 

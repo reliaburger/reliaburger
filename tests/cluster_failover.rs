@@ -158,6 +158,7 @@ impl Fixture {
             labels: Default::default(),
             keep_data_dir: false,
             task_arrays: None,
+            task_arrays_on_agent_budget: None,
         })
         .await
     }

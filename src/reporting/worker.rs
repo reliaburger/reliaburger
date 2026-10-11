@@ -16,9 +16,9 @@ use crate::meat::NodeId;
 use super::assignment::assign_parent;
 use super::transport::ReportingTransport;
 use super::types::{
-    AppResourceUsage, EgressAffectedWorkload, EgressEnforcementEvidence, EgressEnforcementStatus,
-    NodeCapabilityReport, NodeReadinessReport, ReportHealthStatus, ReportingMessage, ResourceUsage,
-    RunningApp, StateReport,
+    AppResourceUsage, CapacityRefusal, EgressAffectedWorkload, EgressEnforcementEvidence,
+    EgressEnforcementStatus, JobReservations, NodeCapabilityReport, NodeReadinessReport,
+    ReportHealthStatus, ReportingMessage, ResourceUsage, RunningApp, StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -73,6 +73,11 @@ pub struct AgentSnapshot {
     pub egress_degraded: bool,
     /// Workloads fenced during the active incident.
     pub egress_affected_workloads: Vec<EgressAffectedWorkload>,
+    /// Execution-budget capacity held by task attempts and reusable
+    /// executors (app replicas excluded).
+    pub job_reservations: JobReservations,
+    /// Apps whose placement here failed for lack of capacity.
+    pub capacity_refusals: Vec<CapacityRefusal>,
 }
 
 /// How many stale windows (`stale_report_timeout_secs`) a busy agent loop
@@ -399,6 +404,8 @@ impl<T: ReportingTransport> ReportWorker<T> {
                 cpu_total_millicores: snapshot.capacity_cpu_millicores,
                 memory_total_mb: snapshot.capacity_memory_mb,
             },
+            job_reservations: snapshot.job_reservations,
+            capacity_refusals: snapshot.capacity_refusals,
             event_log: vec![],
             has_buildah: self.has_buildah,
         }
@@ -497,6 +504,8 @@ mod tests {
             allocated_ports: vec![8080],
             capacity_cpu_millicores: 7500,
             capacity_memory_mb: 15_872,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 
@@ -825,8 +834,53 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         });
         assert_eq!(report.running_apps[0].execution, Some(execution));
+    }
+
+    #[tokio::test]
+    async fn state_report_carries_task_and_executor_reservations() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let (snapshot_tx, _snapshot_rx) = mpsc::channel(16);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let worker = ReportWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        );
+        let jobs = JobReservations {
+            cpu_millicores: 3000,
+            memory_bytes: 6 << 30,
+        };
+        let refusal = CapacityRefusal {
+            app_name: "api".to_string(),
+            namespace: "default".to_string(),
+        };
+
+        let report = worker.build_report(AgentSnapshot {
+            instances: vec![instance("web", ContainerState::Running, 250, 128)],
+            capabilities: Default::default(),
+            readiness: None,
+            egress_degraded: false,
+            egress_affected_workloads: vec![],
+            allocated_ports: vec![],
+            capacity_cpu_millicores: 8000,
+            capacity_memory_mb: 16384,
+            job_reservations: jobs,
+            capacity_refusals: vec![refusal.clone()],
+        });
+
+        assert_eq!(report.job_reservations, jobs);
+        assert_eq!(report.capacity_refusals, vec![refusal]);
+        // App requests stay separate: admission reconciles those per instance.
+        assert_eq!(report.resource_usage.cpu_used_millicores, 250);
+        assert_eq!(report.resource_usage.memory_used_mb, 128);
     }
 
     #[tokio::test]
@@ -863,6 +917,8 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         };
         let report = worker.build_report(snapshot);
 
@@ -903,6 +959,8 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         };
         let report = worker.build_report(snapshot);
         // A draining instance still holds its resources.

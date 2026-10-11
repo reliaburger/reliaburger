@@ -312,7 +312,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// For tests that drive the agent without running its loop.
     #[cfg(test)]
     pub(super) async fn check_apps(&mut self) {
-        let reads = self.plan_state_reads(|instance| !instance.is_job);
+        let reads = self.plan_state_reads(|_| true);
         let grill = self.supervisor.grill().clone();
         let sweep = state_sweep::sweep_states(grill, reads).await;
         self.apply_state_sweep(Ok(sweep)).await;

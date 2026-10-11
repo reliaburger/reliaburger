@@ -51,6 +51,7 @@ pub(crate) async fn admit_definition(
     name: &str,
     namespace: &str,
     definition: &mut JobDefinition,
+    lease: Option<&crate::testkit::lease::TestLease>,
 ) -> Result<(), Response> {
     if !crate::config::valid_workload_label(name) || !crate::config::valid_workload_label(namespace)
     {
@@ -70,14 +71,21 @@ pub(crate) async fn admit_definition(
             "definition namespace disagrees with submission",
         ));
     }
-    if crate::testkit::lease::valid_test_namespace(namespace) {
+    // A test lease namespace belongs to its lease; only that lease's jobs
+    // may run there, and only they may use the lease's own images.
+    if crate::testkit::lease::valid_test_namespace(namespace)
+        && lease.is_none_or(|lease| lease.namespace != namespace)
+    {
         return Err(error(
             StatusCode::CONFLICT,
             "common jobs cannot use test lease namespaces without lease ownership",
         ));
     }
-    crate::testkit::lease::authorise_image_references(definition.template.image.as_deref(), None)
-        .map_err(|e| error(StatusCode::CONFLICT, e.to_string()))?;
+    crate::testkit::lease::authorise_image_references(
+        definition.template.image.as_deref(),
+        lease.map(|lease| (lease, crate::testkit::lease::now_unix_millis())),
+    )
+    .map_err(|e| error(StatusCode::CONFLICT, e.to_string()))?;
     definition.template.namespace = Some(namespace.into());
     definition
         .validate()
@@ -104,7 +112,45 @@ pub(crate) async fn admit_definition(
         }
     }
     super::task_array_api::admit_template_image(state, binder, &mut definition.template).await?;
+    if let Some(reason) = sole_node_refusal(state, name, namespace, definition) {
+        return Err(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("no node can run job {namespace}/{name}: {reason}"),
+        ));
+    }
     Ok(())
+}
+
+/// Why this node would refuse the definition's host tasks, when it is the
+/// only node that could run them (standalone: no council, no gossip peers).
+/// Admitting host work nobody can run (most often under `mount_isolation`,
+/// #714) would only fail a second later; refusing it names the reason at
+/// once. Container work and clusters are left to the leader, which fails a
+/// run once every node has refused it.
+fn sole_node_refusal(
+    state: &ApiState,
+    name: &str,
+    namespace: &str,
+    definition: &JobDefinition,
+) -> Option<String> {
+    if state.council.is_some() || state.membership.is_some() || !definition.template.is_host() {
+        return None;
+    }
+    let node = state.task_arrays.node.as_ref()?;
+    let record = crate::meat::task_array_store::TaskArrayRecord {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        template: definition.template.clone(),
+        state: crate::meat::task_array_state::TaskArrayState::new(definition.tasks.clone(), 0)
+            .ok()?,
+        terminal_at_epoch_secs: None,
+        quota_blocked: None,
+        unrunnable: None,
+    };
+    let self_node = crate::meat::NodeId::new(state.node_name.as_deref().unwrap_or("local"));
+    node.refusal(&super::task_array_leader::assignment_for(
+        0, &record, &self_node,
+    ))
 }
 
 /// `POST /v1/jobs/runs`: manual singleton/array run or durable cron registration.
@@ -162,6 +208,7 @@ pub async fn submit_handler(
         &request.name,
         &namespace,
         &mut request.definition,
+        None,
     )
     .await
     {
@@ -174,7 +221,7 @@ pub async fn submit_handler(
     };
     let count = request.definition.tasks.count;
     let chunks = request.definition.tasks.chunk_count();
-    match write_task_array(&state, TaskArrayWrite::Job(Box::new(JobWrite::Put { name: request.name.clone(), namespace: namespace.clone(), definition: Box::new(request.definition), trigger, now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs() }))).await {
+    match write_task_array(&state, TaskArrayWrite::Job(Box::new(JobWrite::Put { name: request.name.clone(), namespace: namespace.clone(), definition: Box::new(request.definition), trigger, now_epoch_secs: crate::meat::batch_ids::epoch_now_secs() }))).await {
         Ok(id) => (StatusCode::ACCEPTED, Json(serde_json::json!({"batch_id":id,"name":request.name,"namespace":namespace,"count":count,"chunks":chunks}))).into_response(),
         Err(e) => write_error(e),
     }
@@ -248,7 +295,7 @@ pub async fn replay_handler(
             batch_id: id,
             node: request.node,
             grant_digest: request.grant_digest,
-            now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+            now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
         },
     )
     .await
@@ -327,7 +374,7 @@ pub async fn disable_schedule_handler(
             namespace,
             definition: Box::new(definition),
             trigger: None,
-            now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+            now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
         })),
     )
     .await
@@ -373,7 +420,7 @@ pub(crate) async fn stop_definition(
     } else {
         None
     };
-    Some(match write_task_array(state, TaskArrayWrite::StopDefinition { name: name.into(), namespace: namespace.into(), forget, now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs() }).await {
+    Some(match write_task_array(state, TaskArrayWrite::StopDefinition { name: name.into(), namespace: namespace.into(), forget, now_epoch_secs: crate::meat::batch_ids::epoch_now_secs() }).await {
         Ok(_) => (StatusCode::ACCEPTED, Json(serde_json::json!({"name":name,"namespace":namespace,"schedule_disabled":true,"runs_stopping":true}))).into_response(), Err(error) => write_error(error),
     })
 }
