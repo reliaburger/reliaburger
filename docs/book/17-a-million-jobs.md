@@ -838,6 +838,24 @@ blocks reading it, then checks that the leader still hears from the healthy
 node several times a second and that every array still finishes with each task
 counted once.
 
+That test passed on Linux and hung on macOS, and the hang wasn't in Reliaburger.
+Each sync the leader gives up on drops its HTTP request, the worker's handler
+is dropped with it, and the blocking thread reading the FIFO carries on. The
+next sync then blocks on the FIFO too, so by the time the test lets go, two
+threads are stuck there. The test released them by opening the FIFO's write end
+once and closing it. On Linux that wakes every reader and each read sees end of
+file. On macOS a reader could stay blocked in `read` for ever. A small Python
+script reproduces it: one reader was always freed, but with two readers one
+open and close freed both in only 11 runs out of 20. Dropping a tokio runtime
+waits for its blocking threads to return, so the test's assertions all passed in
+about 65 seconds, and then the process never exited until nextest killed it at
+120 seconds. Now the test renames the
+FIFO aside first, so the worker's next sync finds no fence file. Then it keeps
+opening and closing the write end until opening without blocking fails with
+`ENXIO`, which means no reader holds the FIFO any more. The arrays also shrank
+from 6,000 tasks to 4,000. Twenty milliseconds a task on 48 slots still takes at
+least 27 seconds, three times longer than the hung window needs work running.
+
 The third cost was copying. `desired_state()` clones the whole replicated
 state, apps and all, and the leader called it four times a tick. The tick now
 reads through `read_control`, which runs a closure against the state under its
