@@ -1,0 +1,36 @@
+name: Flakes register
+
+# Every open row of docs/flakes.md must link an issue that is still open
+# (scripts/ci/flakes_register.py). Issues close without anyone editing the
+# register, so this runs nightly, and on pull requests that edit it.
+#
+# It is its own workflow because it reads issues: ci.yml is also called from
+# ci-retarget.yml and build.yml, which grant only `contents: read`, and a
+# called job may not ask for more than its caller grants.
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  pull_request:
+    branches: [main, "codex/**", "fix/**", "release-*"]
+    paths:
+      - docs/flakes.md
+      - scripts/ci/flakes_register.py
+      - .github/workflows/flakes.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  register:
+    name: every open flake links an open issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check each linked issue's state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/flakes_register.py check
