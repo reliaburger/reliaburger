@@ -279,7 +279,24 @@ jobs:
           retention-days: 14
       - name: Qualify actual Bun OCI interruptions
         id: oci_interruptions
+        # Normally five minutes; the driver allows each of its three binaries
+        # 420 s. Fail the step well inside the job limit, so a hang keeps its
+        # log, its evidence and the dump below (#800).
+        timeout-minutes: 25
         run: scripts/release/qualify-oci-interruptions.sh
+      - name: Show what the OCI interruptions left running
+        if: failure()
+        timeout-minutes: 3
+        run: |
+          ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
+          # Kernel stacks of every uninterruptible task, and of every thread
+          # of a test binary or Bun that outlived the step.
+          for pid in $(ps -eo pid=,stat=,args= | awk '$2 ~ /^D/ || /target\/debug\/(deps\/|bun)/ {print $1}'); do
+            for task in /proc/"$pid"/task/*; do
+              echo "== $task ($(sudo cat "$task"/comm 2>/dev/null), $(sudo cat "$task"/wchan 2>/dev/null))"
+              sudo cat "$task"/stack 2>/dev/null || true
+            done
+          done
       - name: Retain oci-interruptions current execution envelope
         if: always()
         uses: actions/upload-artifact@v4

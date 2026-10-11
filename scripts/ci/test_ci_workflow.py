@@ -247,6 +247,57 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(change=changed), self.assertRaises(AssertionError):
                 self.assert_root_storage_evidence_restored_for_upload(dict(self.jobs, linux=changed))
 
+    def assert_oci_interruptions_bounded(self, workflow_jobs):
+        """A hung OCI test fails its own step, leaving job time to keep its evidence (#800)."""
+        job = workflow_jobs['linux']
+        job_limit = re.search(r'^    timeout-minutes: (\d+)$', job, re.M)
+        self.assertIsNotNone(job_limit)
+        blocks = steps(job)
+        producers = [index for index, step in enumerate(blocks)
+                     if 'run: scripts/release/qualify-oci-interruptions.sh' in step]
+        self.assertEqual(len(producers), 1)
+        producer = blocks[producers[0]]
+        step_limit = re.search(r'^        timeout-minutes: (\d+)$', producer, re.M)
+        self.assertIsNotNone(step_limit)
+        # The steps before it take about nine minutes; the rest of the margin
+        # is for the leftover-process dump and the evidence upload.
+        self.assertLessEqual(int(step_limit.group(1)) + 15, int(job_limit.group(1)))
+        dumps = [index for index, step in enumerate(blocks)
+                 if 'name: Show what the OCI interruptions left running' in step]
+        uploads = [index for index, step in enumerate(blocks)
+                   if 'name: contract-linux-oci-interruptions\n' in step]
+        self.assertEqual(len(dumps), 1)
+        self.assertEqual(len(uploads), 1)
+        self.assertLess(producers[0], dumps[0])
+        self.assertLess(dumps[0], uploads[0])
+        dump = blocks[dumps[0]]
+        self.assertIn('if: failure()', dump)
+        self.assertIn('timeout-minutes:', dump)
+        self.assertIn('ps -eo', dump)
+        self.assertIn('/stack', dump)
+
+    def test_a_hung_oci_interruption_test_fails_its_step_and_keeps_its_evidence(self):
+        self.assert_oci_interruptions_bounded(self.jobs)
+
+    def test_an_unbounded_or_undiagnosed_oci_step_is_detected(self):
+        self.assert_oci_interruptions_bounded(self.jobs)
+        original = self.jobs['linux']
+        blocks = steps(original)
+        producer = next(step for step in blocks
+                        if 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+        dump = next(step for step in blocks
+                    if 'name: Show what the OCI interruptions left running' in step)
+        unbounded = re.sub(r'\n        timeout-minutes: \d+', '', producer)
+        changes = [
+            original.replace(producer, unbounded),
+            original.replace(producer, re.sub(r'timeout-minutes: \d+', 'timeout-minutes: 39', producer)),
+            original.replace(dump, ''),
+            original.replace(dump, dump.replace('if: failure()', 'if: success()')),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_oci_interruptions_bounded(dict(self.jobs, linux=changed))
+
     def test_every_suite_keeps_its_own_junit_report(self):
         self.assert_owner_artifacts(self.jobs)
 
