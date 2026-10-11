@@ -242,8 +242,10 @@ old voters if they return; `relish council status` shows every node's view.
 
 **Service discovery in the kernel.** Every app gets a stable virtual IP and,
 with DNS enabled, a `.internal` name. An eBPF connect hook sends each
-connection straight to a healthy backend, and per-app firewall rules decide
-who may connect at all.
+connection straight to a healthy backend. Namespaces can't reach each other,
+at a VIP or at a real address, unless an app or job's `allow_from` lets a
+named caller in, and egress allowlists hold apps and jobs to the hosts they
+list.
 
 **Ingress with TLS.** Host-based HTTP and HTTPS routing, with certificates signed
 by the cluster's own ingress CA or files you provide. WebSockets and streaming

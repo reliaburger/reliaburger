@@ -322,6 +322,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> Result<(), BunError> {
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.oci_spec = Some(oci_spec);
+            // A job publishes no service, but its own address still belongs
+            // to its namespace on every port.
+            instance.container_ip = evidence.container_ip;
         }
         self.spawn_log_forwarder(instance_id, job_name, namespace);
         self.persist_instance_record(instance_id, evidence).await?;
@@ -335,6 +338,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             instance.state = instance.state.transition_to(ContainerState::HealthWait)?;
             instance.state = instance.state.transition_to(ContainerState::Running)?;
         }
+        // Its address and any allow_from grants join the kernel maps.
+        self.sync_firewall_ebpf().await;
         Ok(())
     }
 

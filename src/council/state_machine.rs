@@ -7655,6 +7655,8 @@ mod tests {
                     namespace: None,
                     exec: Some("/usr/bin/true".into()),
                     script: None,
+                    firewall: None,
+                    egress: None,
                 }),
                 spec: crate::meat::task_array::TaskArraySpec {
                     chunk_size: 4,

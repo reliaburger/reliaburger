@@ -576,7 +576,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 .into_owned(),
         ];
         spec.process.overrides = None;
-        let mut connection = self.launch(&context.id, &spec, &listener, stop).await?;
+        let mut connection = self.launch(context, &spec, &listener, stop, None).await?;
         let peer = connection.peer_cred()?;
         let peer_pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
         let Runtime::Host(runtime) = &self.runtime else {
@@ -611,22 +611,36 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     /// Create and start the helper, then wait for it to connect. `stop`
     /// is checked between runtime calls, never during one, and interrupts
     /// the wait for the connection.
+    /// Create and start the executor container. Between the two, while
+    /// runc holds it, its address joins its namespace with the template's
+    /// `allow_from`.
     async fn launch(
         &self,
-        id: &InstanceId,
+        context: &mut Context,
         spec: &crate::grill::oci::OciSpec,
         listener: &UnixListener,
         stop: &CancellationToken,
+        allow_from: Option<Vec<String>>,
     ) -> Result<UnixStream, ExecutorError> {
         let interrupted = || ExecutorError::Configuration("executor preparation interrupted");
         if stop.is_cancelled() {
             return Err(interrupted());
         }
-        self.lifecycle.create(id, spec).await?;
+        self.lifecycle.create(&context.id, spec).await?;
+        #[cfg(feature = "ebpf")]
+        if let Some(address) = self.lifecycle.container_ip(&context.id).await
+            && let Some(lease) = context.namespace.as_mut()
+        {
+            lease
+                .publish_address(address, &context.id.0, allow_from)
+                .await?;
+        }
+        #[cfg(not(feature = "ebpf"))]
+        let _ = allow_from;
         if stop.is_cancelled() {
             return Err(interrupted());
         }
-        self.lifecycle.start(id).await?;
+        self.lifecycle.start(&context.id).await?;
         tokio::select! { biased;
             () = stop.cancelled() => Err(interrupted()),
             accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()) => {
@@ -711,6 +725,17 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         let base = context.base.clone();
         blocking(move || prepare_cgroups(&base, profile)).await?;
+        // Every command this executor runs lands in `task`, so the
+        // allowlist the profile key carries goes there before any does.
+        #[cfg(feature = "ebpf")]
+        if let Some(lease) = context.namespace.as_mut() {
+            lease
+                .enforce_egress(
+                    &context.base.join("task"),
+                    crate::bun::task_runtime::egress_allow(template),
+                )
+                .await?;
+        }
         let path = context.base.join("helper");
         let mut spec = crate::grill::oci::generate_job_oci_spec(
             "executor",
@@ -770,7 +795,15 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             });
         }
         spec.mounts.extend(scratch_mounts());
-        let mut connection = self.launch(&context.id, &spec, &listener, stop).await?;
+        let mut connection = self
+            .launch(
+                context,
+                &spec,
+                &listener,
+                stop,
+                crate::bun::task_runtime::allow_from(template),
+            )
+            .await?;
         let peer = connection.peer_cred()?;
         if peer.uid() != crate::grill::userns::EXECUTOR_HOST_UID {
             return Err(ExecutorError::Protocol(
