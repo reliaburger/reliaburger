@@ -319,36 +319,39 @@ impl UpgradeManager {
         // Hashing and checking two signatures over a release-sized binary is
         // seconds of CPU. Done in place it starved this worker's other tasks,
         // the council's Raft core among them, and a node being upgraded
-        // called an election that deposed a healthy leader (#783).
+        // called an election that deposed a healthy leader (#783). Writing
+        // the compatibility probe's private copy is the same size of work, so
+        // it runs here too, from the bytes just verified, instead of from a
+        // clone made on the worker (#794).
         let release_keys = self.release_keys.clone();
         let external_key = self.external_key;
         let checked = envelope.clone();
-        let (bytes, verified) = tokio::task::spawn_blocking(move || {
-            let verified = signing::verify_binary(
+        let probe_directory = self
+            .store
+            .symlink_path()
+            .parent()
+            .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))?
+            .to_path_buf();
+        let (bytes, probe) = tokio::task::spawn_blocking(move || {
+            let probe = signing::verify_binary(
                 &bytes,
                 &checked,
                 &release_keys,
                 external_key.as_ref(),
                 is_network,
-            );
-            (bytes, verified)
+            )
+            .and_then(|()| super::compatibility::write_probe(&bytes, &probe_directory));
+            (bytes, probe)
         })
         .await
         .map_err(std::io::Error::other)?;
-        verified?;
 
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=signature-verified-probe-begin elapsed={:?}",
             fixture_phase_started.elapsed()
         );
-        super::compatibility::check_binary(
-            bytes.clone(),
-            self.store.symlink_path().parent().ok_or_else(|| {
-                UpgradeError::IncompatibleBinary("binary directory is missing".into())
-            })?,
-        )
-        .await?;
+        super::compatibility::query_probe(probe?).await?;
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=compatibility-probe-end elapsed={:?}",
@@ -425,22 +428,43 @@ impl UpgradeManager {
 
         let (bytes, envelope) = self.fetch_verified(directive, Fetch::Retrying).await?;
 
+        let stem = self
+            .store
+            .symlink_path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("bun")
+            .to_string();
+        let marker = UpgradeMarker {
+            schema: 1,
+            upgrade_id: directive.upgrade_id.clone(),
+            previous_version: self.running_version.clone(),
+            previous_binary: self.running_version.file_name(&stem),
+            target_version: directive.target_version.clone(),
+            target_binary: directive.target_version.file_name(&stem),
+            phase: MarkerPhase::Staged,
+            boot_attempts: 0,
+            pre_upgrade_instances,
+        };
+
         #[cfg(test)]
         let fixture_stage_started = std::time::Instant::now();
         #[cfg(test)]
         eprintln!("upgrade-fixture phase=stage-begin");
         // Staging reads, hashes, writes and syncs the whole binary: blocking
         // work, kept off the runtime for the same reason as the signature
-        // check (#783).
+        // check (#783). The marker goes with it: its two syncs waited behind
+        // the binary's own on a busy disk, for up to half a second (#794).
         let store = self.store.clone();
         let running_version = self.running_version.clone();
-        let target_version = directive.target_version.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), UpgradeError> {
+        let marker_path = self.marker_path.clone();
+        let marker = tokio::task::spawn_blocking(move || -> Result<_, UpgradeError> {
             // First upgrade from an un-versioned install: adopt the running
             // binary into the store so rollback has something to return to.
             adopt_running_binary_if_missing(&store, &running_version)?;
-            store.stage(&target_version, &bytes, &envelope)?;
-            Ok(())
+            store.stage(&marker.target_version, &bytes, &envelope)?;
+            marker.store(&marker_path)?;
+            Ok(marker)
         })
         .await
         .map_err(std::io::Error::other)??;
@@ -449,31 +473,6 @@ impl UpgradeManager {
             "upgrade-fixture phase=stage-end elapsed={:?}",
             fixture_stage_started.elapsed()
         );
-
-        let marker = UpgradeMarker {
-            schema: 1,
-            upgrade_id: directive.upgrade_id.clone(),
-            previous_version: self.running_version.clone(),
-            previous_binary: self.running_version.file_name(
-                self.store
-                    .symlink_path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("bun"),
-            ),
-            target_version: directive.target_version.clone(),
-            target_binary: directive.target_version.file_name(
-                self.store
-                    .symlink_path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("bun"),
-            ),
-            phase: MarkerPhase::Staged,
-            boot_attempts: 0,
-            pre_upgrade_instances,
-        };
-        marker.store(&self.marker_path)?;
 
         Ok(Some(PreparedUpgrade { marker }))
     }
@@ -612,12 +611,17 @@ impl UpgradeManager {
         // An envelope with an external signature is verified as a network
         // artefact (both signatures required); otherwise just the embedded one.
         // Hashing a whole Bun binary is too slow for an async task, and one
-        // read serves both the signature check and the compatibility check.
+        // read serves both the signature check and the compatibility probe's
+        // private copy, written on the same blocking thread (#794).
         let binary = self.store.binary_path(&target);
         let envelope_path = self.store.envelope_path(&target);
+        let probe_directory = binary
+            .parent()
+            .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))?
+            .to_path_buf();
         let release_keys = self.release_keys.clone();
         let external_key = self.external_key;
-        let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, UpgradeError> {
+        let probe = tokio::task::spawn_blocking(move || {
             let bytes = std::fs::read(&binary)?;
             if let Ok(envelope) = SignatureEnvelope::load(&envelope_path)
                 && !envelope.embedded.is_empty()
@@ -630,17 +634,11 @@ impl UpgradeManager {
                     envelope.external.is_some(),
                 )?;
             }
-            Ok(bytes)
+            super::compatibility::write_probe(&bytes, &probe_directory)
         })
         .await
         .map_err(|error| UpgradeError::IncompatibleBinary(error.to_string()))??;
-        super::compatibility::check_binary(
-            bytes,
-            self.store.binary_path(&target).parent().ok_or_else(|| {
-                UpgradeError::IncompatibleBinary("binary directory is missing".into())
-            })?,
-        )
-        .await?;
+        super::compatibility::query_probe(probe).await?;
 
         let stem = self
             .store
@@ -649,13 +647,6 @@ impl UpgradeManager {
             .and_then(|n| n.to_str())
             .unwrap_or("bun")
             .to_string();
-        let store = self.store.clone();
-        let running_version = self.running_version.clone();
-        tokio::task::spawn_blocking(move || {
-            adopt_running_binary_if_missing(&store, &running_version)
-        })
-        .await
-        .map_err(std::io::Error::other)??;
         let marker = UpgradeMarker {
             schema: 1,
             upgrade_id: rollback_id(&target),
@@ -667,7 +658,18 @@ impl UpgradeManager {
             boot_attempts: 0,
             pre_upgrade_instances,
         };
-        marker.store(&self.marker_path)?;
+        // The bootstrap copies the running executable and the marker syncs
+        // twice: both block, as in `prepare` (#794).
+        let store = self.store.clone();
+        let running_version = self.running_version.clone();
+        let marker_path = self.marker_path.clone();
+        let marker = tokio::task::spawn_blocking(move || -> Result<_, UpgradeError> {
+            adopt_running_binary_if_missing(&store, &running_version)?;
+            marker.store(&marker_path)?;
+            Ok(marker)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         Ok(Some(PreparedUpgrade { marker }))
     }
 
