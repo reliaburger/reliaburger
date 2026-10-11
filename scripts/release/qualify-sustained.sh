@@ -39,6 +39,21 @@
 #   --resume                continue the run in --evidence after an interruption;
 #                           the gap is recorded as a pause of the soak clock
 #   --keep                  leave the cluster and the installation afterwards
+#   --job-load L            calibration (the release soak's conservative job
+#                           mix, the default) or target (#668: shared and host
+#                           runs become million-task arrays, and the run fails
+#                           unless jobs average --target-rate)
+#   --target-rate R         accepted successes a second for --job-load target
+#                           (default 1390: the 1,158 of 100 million a day, plus
+#                           20% headroom)
+#   --node-faults           add one node-level fault to every cycle, in
+#                           rotation: inter-node delay, a full disk, slow
+#                           fsync (#686); jobs must overlap each kind
+#   --plan                  print the fault schedule these options give and
+#                           exit, touching nothing
+#
+# scripts/release/qualify-jobs-sustained.sh runs the job qualification tiers
+# (D18-C) through this script.
 set -euo pipefail
 
 usage() { sed -n '3,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
@@ -68,6 +83,10 @@ record=
 home=
 resume=false
 keep=false
+job_load=
+target_rate=
+node_faults=
+plan=false
 while [ "$#" -gt 0 ]; do
     case $1 in
         --base-url) base_url=${2:-}; shift 2 ;;
@@ -81,6 +100,10 @@ while [ "$#" -gt 0 ]; do
         --home) home=${2:-}; shift 2 ;;
         --resume) resume=true; shift ;;
         --keep) keep=true; shift ;;
+        --job-load) job_load=${2:-}; shift 2 ;;
+        --target-rate) target_rate=${2:-}; shift 2 ;;
+        --node-faults) node_faults=true; shift ;;
+        --plan) plan=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "unknown argument: $1" ;;
     esac
@@ -92,7 +115,19 @@ if [ "$resume" = true ] && [ -f "${evidence:-.}/metadata.json" ]; then
     [ -n "$tier" ] || tier=$(started_with tier)
     [ -n "$schedule" ] || schedule=$(started_with schedule)
     [ -n "$duration_text" ] || { duration_text=$(started_with duration_target); duration_text=${duration_text:+$(( duration_text / 60 ))m}; }
+    # The job load and node faults are part of the campaign's identity.
+    [ -n "$job_load" ] || job_load=$(started_with job_load)
+    [ -n "$target_rate" ] || target_rate=$(started_with target_rate)
+    [ -n "$node_faults" ] || { [ "$(started_with node_faults)" != True ] || node_faults=true; }
 fi
+: "${job_load:=calibration}" "${node_faults:=false}"
+case $job_load in
+    calibration) [ -z "$target_rate" ] || fail '--target-rate needs --job-load target' ;;
+    target) : "${target_rate:=1390}"
+            [[ $target_rate =~ ^[0-9]+$ ]] && [ "$target_rate" -ge 1158 ] \
+                || fail '--target-rate must be a whole number of at least 1158 (100 million accepted jobs a day)' ;;
+    *) fail '--job-load must be calibration or target' ;;
+esac
 # The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
 case $tier in
     fast) : "${schedule:=compressed}" "${duration_text:=90m}" ;;
@@ -130,7 +165,7 @@ leaf_lifetime=3600
 
 if [ "$resume" = true ]; then
     [ -f "${evidence:-.}/metadata.json" ] || fail '--resume needs --evidence with an earlier run'
-else
+elif [ "$plan" = false ]; then
     [ -n "$base_url" ] || [ -n "$home" ] || { usage >&2; fail '--base-url (or --home) is required'; }
 fi
 if [ -n "$base_url" ]; then
@@ -162,7 +197,10 @@ real_home_state() {
 }
 real_before=$(real_home_state)
 
-if [ -z "$evidence" ]; then
+if [ "$plan" = true ]; then
+    # Only a scratch directory for run_cycle's own bookkeeping files.
+    evidence=$(mktemp -d "${TMPDIR:-/tmp}/reliaburger-plan.XXXXXX")
+elif [ -z "$evidence" ]; then
     evidence=$(mktemp -d /var/tmp/reliaburger-v02.XXXXXX)
 elif [ "$resume" = false ]; then
     mkdir -p "$evidence"
@@ -173,7 +211,7 @@ evidence=$(cd "$evidence" && pwd)
 [ ! -e "$record" ] || fail "$record already exists"
 mkdir -p "$evidence/snapshots" "$evidence/failures" "$evidence/tls" "$evidence/config"
 chmod 700 "$evidence"
-say "evidence: $evidence"
+[ "$plan" = true ] || say "evidence: $evidence"
 
 check() { python3 "$checker" "$@"; }
 event() { check event "$evidence" "$@" || true; }
@@ -730,7 +768,9 @@ GUEST
 }
 
 start_jobs() {
-    python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" > "$evidence/jobs/controller.log" 2>&1 &
+    local load=(--load "$job_load")
+    [ -z "$target_rate" ] || load+=(--target-rate "$target_rate")
+    python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" "${load[@]}" > "$evidence/jobs/controller.log" 2>&1 &
     jobs_pid=$!
 }
 job_mark_fault() {
@@ -753,6 +793,9 @@ echo "bun_pid $pid"
 if [ "${pid:-0}" -gt 0 ]; then
     echo "bun_fd $(ls /proc/"$pid"/fd | wc -l)"
     echo "bun_rss_kb $(awk '/^VmRSS/ {print $2}' /proc/"$pid"/status)"
+    # utime + stime: fields 14 and 15, counted after comm's closing parenthesis.
+    echo "bun_cpu_ticks $(sed 's/.*) //' /proc/"$pid"/stat | awk '{print $12 + $13}')"
+    echo "clk_tck $(getconf CLK_TCK)"
     # exec keeps the pid, but the kernel hands the new image a fresh
     # auxiliary vector whose addresses ASLR randomises: its checksum tells a
     # self-upgrade's exec apart from the process it replaced.
@@ -769,6 +812,11 @@ else
     [ ! -f "$leases" ] || python3 -c 'import json, sys; [print("lease", key) for key in json.load(open(sys.argv[1])).get("allocations", {})]' "$leases"
 fi
 find /sys/fs/bpf -mindepth 1 2>/dev/null | sed 's|^/sys/fs/bpf/|bpf |'
+# Executor helpers' own CPU, outside the commands they run (M8).
+find /sys/fs/cgroup/reliaburger -mindepth 4 -maxdepth 4 -type d -name helper -path '*/executor-*' 2>/dev/null \
+    | while read -r group; do
+        echo "executor_cpu ${group#/sys/fs/cgroup/reliaburger/} $(awk '/^usage_usec/ {print $2}' "$group/cpu.stat" 2>/dev/null)"
+    done
 ss -ltnH | awk '{print "listen " $4}'
 for directory in data images logs metrics volumes soak-export; do
     echo "disk $directory $(du -sk /var/lib/reliaburger/$directory 2>/dev/null | cut -f1)"
@@ -1047,6 +1095,47 @@ slot_power_off() {
     settle fault:power-off 480 || true
 }
 
+# Node-level faults for the job qualification (#686, D19-B). They need no
+# per-job targeting: the whole node slows down or runs out of disk while its
+# executors hold work. `delay` adds netem latency on the interface towards a
+# peer; `disk-full` leaves 64 MiB free on Bun's filesystem; `slow-fsync`
+# throttles Bun's own writes (Raft log, ledgers) to 20 IOPS and 1 MiB/s.
+node_fault_index=0
+node_fault_kind() { local kinds=(delay disk-full slow-fsync); echo "${kinds[$1 % 3]}"; }
+node_fault_script() {
+    case $1:$2 in
+        delay:start) printf '%s\n' 'dev=$(ip -o route get "$PEER" | sed -n "s/.* dev \([^ ]*\).*/\1/p"); [ -n "$dev" ] && tc qdisc replace dev "$dev" root netem delay 200ms 50ms && echo "$dev" > /run/soak-delay-dev' ;;
+        delay:stop) printf '%s\n' 'tc qdisc del dev "$(cat /run/soak-delay-dev)" root && rm -f /run/soak-delay-dev' ;;
+        disk-full:start) printf '%s\n' 'free=$(df --output=avail -B1 /var/lib/reliaburger | tail -n 1); [ "$free" -gt 134217728 ] && fallocate -l $(( free - 67108864 )) /var/lib/reliaburger/soak-disk-fill' ;;
+        disk-full:stop) printf '%s\n' 'rm -f /var/lib/reliaburger/soak-disk-fill' ;;
+        slow-fsync:start) printf '%s\n' 'source=$(findmnt -no SOURCE --target /var/lib/reliaburger); disk=$(lsblk -no PKNAME "$source" | head -n 1); disk=/dev/${disk:-${source#/dev/}}; systemctl set-property --runtime reliaburger.service "IOWriteIOPSMax=$disk 20" "IOWriteBandwidthMax=$disk 1M"' ;;
+        slow-fsync:stop) printf '%s\n' 'systemctl set-property --runtime reliaburger.service IOWriteIOPSMax= IOWriteBandwidthMax=' ;;
+    esac
+}
+slot_node_fault() {
+    local kind node peer hold result=0 log
+    kind=$(node_fault_kind "$node_fault_index")
+    # Each kind visits every node (the leader among them) every nine cycles.
+    node=$(( (node_fault_index / 3) % 3 + 1 ))
+    node_fault_index=$(( node_fault_index + 1 ))
+    [ "${down[node]}" = 0 ] || node=1
+    peer=$(( node % 3 + 1 ))
+    hold=$(random_between "$hold_min" "$hold_max")
+    log=$evidence/snapshots/node-$kind-$node_fault_index.log
+    say "fault: $kind on ${vm[node]} for $hold s"
+    open_window "node-$kind"
+    avoid=$node
+    job_mark_fault "$node" "${current_slot%%:*}:$kind"
+    gsh "$node" "PEER=${address[peer]}; $(node_fault_script "$kind" start)" > "$log" 2>&1 || result=$?
+    event --phase "fault:node-$kind" --target "${vm[node]}" --exit "$result" --command "$kind" --detail "held $hold s"
+    [ "$result" -eq 0 ] || record_failure "node-$kind" "could not inject $kind on ${vm[node]}; see ${log##*/}"
+    wait_until $(( $(date +%s) + hold ))
+    gsh "$node" "$(node_fault_script "$kind" stop)" >> "$log" 2>&1 \
+        || record_failure "node-$kind" "could not remove $kind from ${vm[node]}; see ${log##*/}"
+    settle "fault:node-$kind" 300 || true
+    avoid=0
+}
+
 # Every chaos kind against the rails: kill and pause meet the replica minimum,
 # so they aim at the three-replica frontend, one replica at a time; delay,
 # drop, partition and dns are network faults, which no replica rail guards;
@@ -1320,6 +1409,9 @@ run_cycle() {
         current_slot="$index:power-off"; wait_until $(( start + 3 * slot )); run_slot slot_power_off
         current_slot="$index:chaos"; wait_until $(( start + 4 * slot )); run_slot slot_chaos
     fi
+    if [ "$node_faults" = true ]; then
+        current_slot="$index:node-fault"; wait_until $(( start + 5 * slot )); run_slot slot_node_fault
+    fi
     current_slot="$index:settle"; wait_until $(( start + 5 * slot ))
     observe heavy || true
     next_heavy=$(( $(date +%s) + heavy_every ))
@@ -1427,6 +1519,9 @@ start_run() {
     meta evidence "\`$evidence\`"
     meta started_at "json:$(date +%s)"
     meta duration_target "json:$duration"
+    meta job_load "$job_load"
+    [ -z "$target_rate" ] || meta target_rate "$target_rate"
+    meta node_faults "json:$node_faults"
     meta ingress_rotation_secs "json:$rotation"
     [ -z "$base_url" ] || meta base_url "<$base_url>"
     meta candidate_digest "\`${qualified_digest:-not checked}\`"
@@ -1442,6 +1537,33 @@ start_run() {
         meta host "$(. /etc/os-release && printf '%s' "$PRETTY_NAME"), $(uname -srm), $(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo), $(nproc) CPUs, $(awk '/^MemTotal/ {print int($2 / 1048576); exit}' /proc/meminfo) GiB"
     fi
 }
+
+if [ "$plan" = true ]; then
+    # The schedule run_cycle follows, with every action replaced by a line.
+    wait_until() { :; }; observe() { :; }; registry() { :; }; event() { :; }; say() { :; }
+    run_slot() {
+        case $1 in
+            special_for_cycle) "$@" ;;
+            slot_bun_kill) printf 'plan: cycle %s %s-kill\n' "$index" "$2" ;;
+            slot_node_fault) printf 'plan: cycle %s node-fault %s\n' "$index" "$(node_fault_kind "$node_fault_index")"
+                             node_fault_index=$(( node_fault_index + 1 )) ;;
+            *) printf 'plan: cycle %s %s\n' "$index" "$(printf '%s' "${1#slot_}" | tr _ -)" ;;
+        esac
+    }
+    # shellcheck disable=SC2329  # special_for_cycle calls these by name
+    special_graceful() { printf 'plan: cycle %s special graceful-stop\n' "$index"; }
+    # shellcheck disable=SC2329
+    special_quorum_loss() { printf 'plan: cycle %s special quorum-loss\n' "$index"; }
+    # shellcheck disable=SC2329
+    special_all_off() { printf 'plan: cycle %s special all-off\n' "$index"; }
+    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s\n' \
+        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults"
+    plan_cycles=$(( (duration + cycle - 1) / cycle ))
+    [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
+    for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
+    rm -rf "$evidence"
+    exit 0
+fi
 
 trap finish EXIT
 trap 'exit 130' INT
@@ -1464,6 +1586,7 @@ if [ "$resume" = true ]; then
     # Carry on the chaos rotation and the walk count where the run left off.
     chaos_index=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase", "").startswith("fault:chaos-") and "exit" in e))' "$evidence/events.jsonl")
     upgrade_walks=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "upgrade:upgrade"))' "$evidence/events.jsonl")
+    node_fault_index=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase", "").startswith("fault:node-") and "exit" in e))' "$evidence/events.jsonl")
     ingress_rotations=$(find "$tls" -maxdepth 1 -name 'leaf-*' | wc -l | tr -d ' ')
     say "resuming at cycle $first_cycle after a $gap s gap"
     paused=$(python3 -c 'import json,sys; print(sum(e.get("duration", 0) for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "pause"))' "$evidence/events.jsonl")

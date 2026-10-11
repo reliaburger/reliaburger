@@ -9,7 +9,7 @@
 //! Indices are grouped into fixed-size *chunks*. The chunk, not the task,
 //! is what the leader allocates to nodes and records in Raft, so the
 //! control plane's cost grows with `count / chunk_size`; at a fixed
-//! chunk size it still grows with the task count. See `docs/plans/2026-09-28-plan-million-jobs.md`.
+//! chunk size it still grows with the task count. See `docs/plans/archive/2026-09-28-plan-million-jobs.md`.
 
 use std::ops::RangeInclusive;
 

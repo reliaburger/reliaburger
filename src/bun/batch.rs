@@ -1197,6 +1197,8 @@ pub async fn batch_status_handler(
                 let progress = record.state.summary();
                 let mut summary = super::task_array_api::array_summary(batch_id, record, &nodes);
                 super::task_array_api::enrich_summary(&mut summary, &arrays, batch_id);
+                summary["state_bytes"] =
+                    serde_json::json!(super::task_array_api::state_bytes([record]));
                 summary["rates"] = serde_json::to_value(
                     state
                         .task_arrays
@@ -1212,16 +1214,21 @@ pub async fn batch_status_handler(
                 {
                     return response;
                 }
-                return Json(
-                    super::task_array_api::manifest_summary(
-                        batch_id,
-                        manifest,
-                        &arrays,
-                        &state.task_arrays,
-                    )
-                    .await,
+                let mut summary = super::task_array_api::manifest_summary(
+                    batch_id,
+                    manifest,
+                    &arrays,
+                    &state.task_arrays,
                 )
-                .into_response();
+                .await;
+                let cohorts: Option<Vec<_>> = manifest
+                    .cohorts
+                    .iter()
+                    .map(|(_, id)| arrays.get(*id))
+                    .collect();
+                summary["state_bytes"] =
+                    serde_json::json!(cohorts.and_then(super::task_array_api::state_bytes));
+                return Json(summary).into_response();
             }
             (
                 StatusCode::NOT_FOUND,
