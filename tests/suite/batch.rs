@@ -1259,8 +1259,18 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
         config.app.insert("other-api".into(), app);
         config.job.get_mut("migrate").unwrap().run_before = vec!["app.other-api".into()];
     }
-    let retry =
-        tokio::time::timeout(Duration::from_secs(3), new_leader.client.apply(&config)).await;
+    // The harness's leader loop takes chunks back from a holder silent for
+    // three seconds (`with_timings` above), and node-1 never answers node-2.
+    // A conservative hook's lost holder is an unknown outcome, so the same
+    // operation first stays pending and then reports that outcome (#774).
+    // Wait well past the silence so "same" checks the settled answer instead
+    // of racing it; a conflicting claim must still refuse promptly.
+    let window = if mode == "same" {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(3)
+    };
+    let retry = tokio::time::timeout(window, new_leader.client.apply(&config)).await;
     // Release before assertions so even unchanged production's erroneous
     // second launch is cleaned up and the original process does not linger.
     std::fs::write(&release, b"release").unwrap();
@@ -1277,9 +1287,21 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
         council.shutdown().await.unwrap();
     }
     if mode == "same" {
+        // The repeat is the same durable operation, never a new attempt: it
+        // reports the original hook's unknown ownership rather than success.
+        let operations: Vec<String> = final_state
+            .task_arrays
+            .deployments()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        assert_eq!(operations.len(), 1, "{operations:?}");
+        let error = retry
+            .expect("the repeat must settle once node-1's silence makes its hook unknown")
+            .expect_err("an uncertain prerequisite was reported as applied");
+        let message = error.to_string();
         assert!(
-            retry.is_err(),
-            "an idempotent repeat must observe the same pending operation"
+            message.contains(&operations[0]) && message.contains("retains unknown hook ownership"),
+            "an idempotent repeat must observe the same operation's unknown hook: {message}"
         );
     } else {
         let error = retry
