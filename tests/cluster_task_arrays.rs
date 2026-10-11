@@ -784,7 +784,11 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
     let http = reqwest::Client::new();
     let api = |index: usize| format!("http://127.0.0.1:{}", nodes[index].api_port);
 
-    let next = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+    // The bulk submissions below take a few seconds and must all land before
+    // the occurrence fires, or it takes one of their slots. Skip to the minute
+    // after next when the next one is less than 30 seconds away.
+    let now = time::OffsetDateTime::now_utc();
+    let next = now + time::Duration::minutes(if now.second() >= 30 { 2 } else { 1 });
     let expression = format!(
         "{} {} {} {} *",
         next.minute(),
@@ -814,7 +818,13 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
     for i in 0..bulk {
         let namespace = format!("tenant-{}", i / MAX_ACTIVE_RUNS_PER_NAMESPACE);
         let response = submit(format!("bulk-{i}"), namespace).await;
-        assert_eq!(response.status(), 202, "bulk array {i}");
+        let status = response.status();
+        assert_eq!(
+            status,
+            202,
+            "bulk array {i}: {}",
+            response.text().await.unwrap_or_default()
+        );
     }
     let refused = submit("one-more".into(), "tenant-late".into()).await;
     assert!(refused.status().is_client_error(), "{}", refused.status());
@@ -826,7 +836,7 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
 
     wait_until(
         "the cron occurrence admitted into the reserved headroom",
-        Duration::from_secs(75),
+        Duration::from_secs(135),
         async || {
             nodes[leader]
                 .council
