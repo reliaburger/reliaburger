@@ -221,8 +221,9 @@ who changed trust: creating or revoking an API token (`token.created`,
 or finalising the secret key (`secret.rotated`, `secret.rotation_finalised`).
 Each names the credential that did it, as the token's name in its details and
 a stable `principal`, and never carries a secret. Events are kept per node, in
-memory (the newest 1024), so they're a recent record rather than a durable
-audit log.
+memory (the newest 1024), so they're a recent record. The durable record of
+who did what, which a restart or a busy job queue can't wipe, is the audit
+log: `relish audit` (see the audit log section of `security`).
 
 `relish dashboard` serves the web dashboard (Brioche) on a loopback port and
 opens a one-time link to it. It forwards read-only requests using the CLI's own

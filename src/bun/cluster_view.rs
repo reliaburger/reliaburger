@@ -260,6 +260,7 @@ mod tests {
             node: node.map(str::to_string),
             action: None,
             principal: None,
+            source_address: None,
             details: Default::default(),
             message: format!("event {sequence}"),
         }

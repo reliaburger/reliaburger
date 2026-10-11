@@ -1506,6 +1506,16 @@ pub async fn build_submit_handler(
             if let Err(resp) = granted {
                 return resp;
             }
+            let mut note = crate::bun::audit::AuditNote::default();
+            note.details
+                .insert("repository".to_string(), repository.to_string());
+            if let Some((namespace, app)) =
+                crate::pickle::registry_auth::repository_namespace(&repository)
+            {
+                note.app = Some(app.to_string());
+                note.namespace = Some(namespace.to_string());
+            }
+            crate::bun::audit::annotate(note);
         }
         Err(e) => {
             return (

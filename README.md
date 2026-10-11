@@ -180,6 +180,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
+- `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
@@ -258,6 +259,8 @@ cluster's public key. Workloads get SPIFFE certificates, API tokens carry
 roles and namespace scopes, and the registry can refuse unsigned images.
 Every apply binds image tags to digests, so a moved tag can't change what runs,
 and node config can limit which upstream registries images may come from.
+Each node keeps a durable, bounded audit log of who applied, deleted, exec'd,
+upgraded or broke what, from where (`relish audit`).
 
 **A registry on every node.** Pickle is an OCI registry built into the cluster.
 Push once and nodes pull layers from each other. It also caches upstream

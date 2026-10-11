@@ -133,6 +133,7 @@ pub async fn submit_handler(
     if let Err(response) = crate::sesame::auth::authorize_scoped(auth, &request.name, &namespace) {
         return response;
     }
+    crate::bun::audit::annotate_workload(&request.name, &namespace);
     if let Some(council) = &state.council
         && !council.is_leader().await
     {

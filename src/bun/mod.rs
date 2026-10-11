@@ -5,6 +5,7 @@
 /// backoff, detecting GPU hardware, and serving a local HTTP API.
 pub mod agent;
 pub mod api;
+pub mod audit;
 pub mod authz;
 pub mod batch;
 pub mod build_runner;

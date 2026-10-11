@@ -1176,6 +1176,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
 | `GET` | `/v1/chaos/status` | Show the replicated node-experiment reservation, if any |
+| `GET` | `/v1/audit` | Read the node's durable audit log (`since`, `until`, `action`, `principal`, `namespace`, `limit`; `cluster=true` merges every node). Unscoped Admin with cluster-wide `admin`, never the service principal |
 
 The CLI uses this API internally. You can also call it directly:
 

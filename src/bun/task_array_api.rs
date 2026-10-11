@@ -177,6 +177,7 @@ pub async fn submit_handler(
     if let Err(response) = crate::sesame::auth::authorize_scoped(auth, &request.name, &namespace) {
         return response;
     }
+    crate::bun::audit::annotate_workload(&request.name, &namespace);
     if let Some(council) = follower_council(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/array", body, &headers).await;
     }
@@ -287,6 +288,7 @@ pub async fn manifest_handler(
     {
         return response;
     }
+    crate::bun::audit::annotate_workload(&request.name, &request.namespace);
     for cohort in &mut request.cohort {
         let mut array = TaskArraySubmitRequest {
             name: request.name.clone(),
@@ -477,6 +479,7 @@ pub async fn cancel_handler(
             format!("task submission {batch_id} not found"),
         );
     };
+    crate::bun::audit::annotate_workload(name, namespace);
     if arrays
         .manifest(batch_id)
         .is_none_or(|manifest| !manifest.common_jobs)

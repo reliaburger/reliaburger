@@ -642,7 +642,9 @@ Reliaburger encrypts Raft log data with AES-256-GCM. The encryption key is deriv
 
 ### 11.5 Audit Logging
 
-Today, fault-injection operations emit a structured audit event attributed to the authenticated credential (not a client-supplied name), held in an in-memory bounded event history. **Status: comprehensive audit logging is planned — not yet implemented.** The full vision (an entry for every modifying API operation, with identity, source IP and timestamp, persisted via Ketchup and queryable from the CLI) is not what the current binary does: there is no source-IP capture, no Ketchup-backed audit store, and the events cover only fault injection.
+Every node keeps a durable, bounded audit log of the actions it served: applies, deletes, stops, execs, rollbacks, job, array and build submissions, upgrades, decommissions, elections, snapshots, test leases, fault injection, clearing and expiry, and every change to tokens, secrets and CAs. Each record carries the authenticated principal (never a client-supplied name), the app and namespace, the source address, a timestamp and the action's own facts, and never a secret. The node writes the record as a line of JSON under its data directory and syncs it before answering, so an acknowledged action survives a restart; the log rotates in segments and drops the oldest first, within a configurable bound (64 MiB by default). A write that fails is logged and counted but never fails the operator's action. `GET /v1/audit` and `relish audit` filter by time, action, principal and namespace, and `--cluster` merges every node's log. Only an unscoped Admin may read it, never the internal service principal. The in-memory event ring still shows audit records live, but no longer holds the only copy.
+
+**Status:** the log is per node. Central retention (shipping records off the node, so a lost or decommissioned node doesn't take its history with it) is planned, not implemented, as is tamper evidence (hash-chaining records).
 
 > For the full PKI model, API authentication, secret encryption, and threat model, see [design/security-sesame.md](design/security-sesame.md).
 
