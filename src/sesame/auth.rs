@@ -601,12 +601,41 @@ pub fn authorize_scoped(
     if scope.allows(app, namespace) {
         Ok(())
     } else {
-        Err((
-            StatusCode::FORBIDDEN,
-            format!("token scope does not allow {app} in namespace {namespace}"),
-        )
-            .into_response())
+        Err(scope_refusal(format!(
+            "token scope does not allow {app} in namespace {namespace}"
+        )))
     }
+}
+
+/// Why the API refused a request, as the audit log records it (#798).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// No credential, or one the node doesn't know (401).
+    Unauthenticated,
+    /// The caller's role or `[permission]` block doesn't allow it (403).
+    Forbidden,
+    /// A scoped token reached outside its apps or namespaces (403).
+    Scope,
+}
+
+impl RefusalReason {
+    /// The stable name the audit record carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::Forbidden => "forbidden",
+            Self::Scope => "scope",
+        }
+    }
+}
+
+/// A 403 for a token whose scope doesn't cover the target. The response
+/// carries [`RefusalReason::Scope`] as an extension, so the audit layer can
+/// tell it from a role refusal without parsing the message.
+pub fn scope_refusal(message: impl Into<String>) -> Response {
+    let mut response = (StatusCode::FORBIDDEN, message.into()).into_response();
+    response.extensions_mut().insert(RefusalReason::Scope);
+    response
 }
 
 /// Authorise one resolved workload before any desired write or dispatch.
@@ -748,11 +777,9 @@ pub fn require_unscoped(ctx: Option<&AuthContext>) -> Result<(), Response> {
     if ctx.scoped_apps.is_none() && ctx.scoped_namespaces.is_none() {
         return Ok(());
     }
-    Err((
-        StatusCode::FORBIDDEN,
+    Err(scope_refusal(
         "this endpoint requires cluster-wide authority; scoped tokens cannot use it",
-    )
-        .into_response())
+    ))
 }
 
 /// Require the internal **system principal** — the caller must have presented

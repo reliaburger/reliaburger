@@ -1261,6 +1261,7 @@ async fn setup_with_leases_council_and_arrays(
             default_concurrency: 8,
             backoff: (std::time::Duration::ZERO, std::time::Duration::ZERO),
             group_commit: Default::default(),
+            audit_dir: None,
         },
         crate::bun::task_array_node::NodeRunner::Fake(
             crate::bun::task_executor::FakeRunner::always_succeeds(),
@@ -4227,6 +4228,7 @@ async fn workload_admission_fixture(
             default_concurrency: 8,
             backoff: (std::time::Duration::ZERO, std::time::Duration::ZERO),
             group_commit: Default::default(),
+            audit_dir: None,
         },
         crate::bun::task_array_node::NodeRunner::Fake(
             crate::bun::task_executor::FakeRunner::always_succeeds(),

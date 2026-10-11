@@ -2890,6 +2890,7 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         let runner = OwnedRunner::for_data_dir(runtime.clone(), &data).unwrap();
         let executor = TaskArrayNode::new(
             TaskArrayNodeConfig {
+                audit_dir: None,
                 root: data.join("task-arrays"),
                 policy: ProcessWorkloadsConfig {
                     allowed_binaries: vec!["/bin/sh".into()],
