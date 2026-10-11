@@ -83,6 +83,34 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         result
     }
 
+    /// [`Self::prepare_network`] for a job: it publishes no address, so
+    /// nothing is retained, and its egress allowlist comes from the job.
+    pub(super) async fn prepare_job_network(
+        &self,
+        instance_id: &InstanceId,
+        job_name: &str,
+        spec: &JobSpec,
+        cgroup_path: &std::path::Path,
+    ) -> Result<(), BunError> {
+        let allow = spec
+            .egress
+            .as_ref()
+            .map(|policy| policy.allow.clone())
+            .unwrap_or_default();
+        let egress = launch_evidence::EgressResolution {
+            destinations: self.egress.resolve_allowlist(&allow).await,
+            allow,
+        };
+        let result = self
+            .ops
+            .apply_network_pre_start(instance_id, job_name, None, cgroup_path, Ok(None), egress)
+            .await;
+        if result.is_err() {
+            let _ = self.grill.stop(instance_id).await;
+        }
+        result
+    }
+
     pub(super) async fn report_cancellation(&self, events: &mpsc::Sender<ApplyEvent>) -> bool {
         if self
             .operation
@@ -670,8 +698,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
     }
 
-    /// Drive a job through create → source policy → start → Running.
-    /// Jobs have no external allowlist or health checks.
+    /// Drive a job through create → source and egress policy → start →
+    /// Running. Jobs have no health checks.
     pub(super) async fn drive_job(
         &self,
         instance_id: &InstanceId,
@@ -690,7 +718,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
         self.grill.create(instance_id, &oci_spec).await?;
         self.ops.store_oci_spec(instance_id, oci_spec.clone()).await;
-        self.prepare_network(instance_id, job_name, None, &cgroup_path)
+        self.prepare_job_network(instance_id, job_name, spec, &cgroup_path)
             .await?;
         self.ops
             .transition_state(instance_id, ContainerState::Starting)

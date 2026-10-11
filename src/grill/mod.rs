@@ -13,6 +13,8 @@ pub mod command;
 pub mod image;
 pub mod image_config;
 mod inventory;
+#[cfg(target_os = "linux")]
+pub mod kernel;
 pub mod mixed;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
@@ -399,6 +401,30 @@ pub trait Grill: Send + Sync {
         std::future::ready(Ok(None))
     }
 
+    /// Delete the durable metadata of an instance whose retirement is already
+    /// proven: its ownership journal, routing record and their lock files.
+    ///
+    /// Refuses, deleting nothing, while the instance may still own a process,
+    /// an address or any other resource. A later `create` of the same
+    /// identity starts from nothing, as it would on a fresh node. Runtimes
+    /// that keep no per-instance metadata do nothing.
+    fn forget_retired(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send {
+        let _ = instance;
+        std::future::ready(Ok(()))
+    }
+
+    /// Identities this runtime keeps metadata for although no backend has a
+    /// launch for them, so nothing they record can still run. Candidates for
+    /// [`Grill::forget_retired`] at startup; most runtimes have none.
+    fn unlaunched_metadata(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<InstanceId>, GrillError>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
     /// Hold a rootful address before discovery publication. Unsupported adapters
     /// return None; the production recovery profile must require this capability.
     fn retain_network_reference(
@@ -449,9 +475,21 @@ pub trait Grill: Send + Sync {
     fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
         self.runtime_kind() == kind
     }
-    /// Per-workload enforcement; host commands never occupy an OCI cgroup.
+    /// Per-workload enforcement: whether this workload's process will run in
+    /// the cgroup its spec names, so the agent can bind policy to it first.
     fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
-        !spec.host_process && self.honours_cgroup_path()
+        if spec.host_process {
+            self.places_host_processes()
+        } else {
+            self.honours_cgroup_path()
+        }
+    }
+
+    /// Whether host commands (`exec`/`script`) start inside the cgroup their
+    /// spec names, which lets namespace isolation hold them too. Only the
+    /// owned process runtime on rootful cgroup v2 Linux does.
+    fn places_host_processes(&self) -> bool {
+        false
     }
 
     /// Owned rootful host backend capable of bounded native command executors.
@@ -780,6 +818,26 @@ impl Grill for AnyGrill {
         }
     }
 
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.forget_retired(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.forget_retired(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.forget_retired(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.forget_retired(instance).await,
+        }
+    }
+
+    async fn unlaunched_metadata(&self) -> Result<Vec<InstanceId>, GrillError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.unlaunched_metadata().await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
     async fn retain_network_reference(
         &self,
         instance: &InstanceId,
@@ -860,6 +918,17 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.honours_cgroup_path(),
             #[cfg(target_os = "linux")]
             AnyGrill::Mixed(g) => g.honours_cgroup_path(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
+        }
+    }
+    fn places_host_processes(&self) -> bool {
+        match self {
+            AnyGrill::Process(g) => g.places_host_processes(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.places_host_processes(),
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => false,
         }

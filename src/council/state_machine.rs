@@ -7097,9 +7097,7 @@ mod tests {
         crate::upgrade::types::ClusterUpgradeState {
             upgrade_id: upgrade_id.to_string(),
             target_version: "v0.2.0".parse().unwrap(),
-            binary_sha256: "abc123".to_string(),
-            embedded_signature: "sig".to_string(),
-            external_signature: None,
+            binaries: Vec::new(),
             parallel: 1,
             direction: crate::upgrade::types::UpgradeDirection::Upgrade,
             phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
@@ -7636,6 +7634,7 @@ mod tests {
             runner_node: Some("n1".to_string()),
             state: crate::bun::build_runner::BuildState::Running,
             created_at_epoch_secs: 1_000_000,
+            repository: None,
         }
     }
 
@@ -7656,6 +7655,8 @@ mod tests {
                     namespace: None,
                     exec: Some("/usr/bin/true".into()),
                     script: None,
+                    firewall: None,
+                    egress: None,
                 }),
                 spec: crate::meat::task_array::TaskArraySpec {
                     chunk_size: 4,
@@ -7931,6 +7932,7 @@ mod tests {
                 tasks: spec,
                 cron: None,
                 replay_unknown: false,
+                hook: false,
             }),
             trigger: Some(RunTrigger::Manual {
                 request_id: request_id.into(),

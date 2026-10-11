@@ -117,14 +117,34 @@ backwards compatibility (maintainer decision, 28 September 2026). There are no
 migrations, no mixed-version clusters across a format change and no feature
 gates. Any incompatible wire or durable-state change bumps `protocol` or
 `state` in `src/compatibility.rs`; nodes then refuse old peers and old state,
-so an upgrade across that bump means starting a fresh cluster. Releases that
-don't bump still roll in place. The pre-1.0 rule for known harness artefacts in
+so an upgrade across that bump means starting a fresh cluster. So
+`relish upgrade` works only between builds of the same format (maintainer
+decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
+10 October 2026). Every release from 0.1.0 to 0.2.0 bumped a format, so no
+rolling upgrade between two published releases has run yet. A release that
+keeps 0.2.0's pair could roll in place, and qualifying a real
+published-to-published rolling walk on such a patch release is a goal, not a
+0.2.0 gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
 Leader-last upgrade ordering does not make an unknown Raft request safe during
 elections. Qualify the actual old/new binary pair before advertising it as
 supported.
+
+### Versions on main
+
+Once main changes a format after a release, its `Cargo.toml` moves to the next
+version with a `-dev` suffix (after 0.1.6's formats changed, main became
+`0.2.0-dev`). A build from main then can't pass for the release before it:
+its refusals name `reliaburger v0.2.0-dev`, its binaries don't collide with
+the real `bun-v0.1.6` in a binary store, and `relish setup --quickstart`
+refuses to download nodes for it, because no `v0.2.0-dev` release exists and
+the last published one speaks older formats. Pass `--development-binaries`
+(see the [quickstart](quickstart.md#development-qualification)) to run one.
+Drop the suffix in the change that prepares the release, before
+`build.yml` builds the candidate, since the build reads the tag from
+`Cargo.toml`.
 
 ### Upgrading from 0.1.0
 
@@ -281,6 +301,55 @@ Four things behave differently once you're on 0.1.6:
   with `relish secret pubkey --namespace X`, or the next apply puts the
   cluster-sealed ones back.
 
+### Upgrading from 0.1.6
+
+0.2.0 can't roll onto a 0.1.6 cluster. Its jobs live in the council:
+
+- task arrays replicate through Raft, with node ledgers on disk, recovery and
+  grant fences, ownership ranges and indexed result pages;
+- reusable job definitions, immutable run provenance and schedule
+  occurrence claims share one execution store;
+- every job names its runtime explicitly instead of having it inferred;
+- grant lookahead learns from a recent-duration histogram that travels in
+  Raft snapshots.
+
+So the protocol moved from 46 to 51 and the state format from 63 to 68. A
+0.1.6 leader refuses `relish upgrade start v0.2.0` before it records a run,
+with `found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63`.
+And a sealed council backup from 0.1.6 can't seed a 0.2.0 cluster:
+`relish council recover --from` refuses state of another generation. So the
+move is a fresh cluster, and nothing the old council held comes across:
+
+- **Secrets.** The new cluster has new keys, so values sealed to the old
+  cluster key or a namespace key don't decrypt. Re-encrypt each one with the
+  new cluster's `relish secret pubkey` (`--namespace X` for a namespace
+  with its own key) before re-applying.
+- **API and join tokens.** Create them again with `relish token create` and
+  update whatever holds them, such as CI secrets and GitOps webhooks.
+- **The CA.** `relish init` makes a new root and intermediates. Clients and
+  anything else that trusts the old root must trust the new one, and the new
+  root needs its own `relish ca backup`.
+- **Job history.** Runs, task arrays, schedules and their results lived in
+  Raft. Export anything you need (`relish jobs`, `relish batch results`)
+  before you stop the old cluster.
+- **Volumes.** Snapshot them with `relish snapshot` and restore them into the
+  new cluster; the data directories you move aside still hold them too.
+
+The steps:
+
+1. Export what you want to keep: secrets in your config are already there;
+   job results, token holders and volume snapshots are not.
+2. Stop bun on every node and move each data directory aside (or run
+   `relish local destroy --yes` for a laptop cluster).
+3. Install 0.2.0 on every node and create the cluster as you did the first
+   time (`relish init`, then join the other nodes).
+4. Re-create tokens, re-encrypt secrets to the new keys, restore volume
+   snapshots and re-apply your apps and jobs.
+5. Back up the new root CA with `relish ca backup`.
+
+`relish upgrade check` from 0.2.0 on reads each release's pair from the
+metadata and says when a release needs this instead of a rolling upgrade.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -369,7 +438,13 @@ GitHub documents the [default-branch requirement for manual workflows](https://d
 and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
 
 - `metadata.json` selects **Bun** by platform, preserving the existing schema
-  and upgrade reader.
+  and upgrade reader. From 0.2.0 each release entry also carries
+  `compatibility`, the `protocol` and `state` pair `package.py` reads from
+  `CURRENT` in `src/compatibility.rs`, so `relish upgrade check` and `start`
+  can tell a release that needs a fresh cluster from one that can roll.
+  `external_signature` is always `null` in published metadata: only the
+  operator holds that key, so `relish upgrade start <version>` takes
+  `--external-key` (or a countersigned `--sig`) and adds it.
 - `cli-metadata.json` uses the same schema to select **Relish**. Keeping the
   documents separate prevents an older agent from interpreting a CLI as an
   upgrade candidate.

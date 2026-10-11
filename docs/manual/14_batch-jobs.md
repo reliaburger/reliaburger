@@ -49,7 +49,11 @@ is `forbid`; JSON definitions can select `allow`. Both skip missed minutes, with
 no catch-up queue. Skipped overlapping occurrences advance the cursor too.
 Registration and observation cursors survive leader changes, result pruning and
 clock rollback. A conservative definition with unknown ownership skips new
-occurrences even when overlap is allowed.
+occurrences even when overlap is allowed. When every active-run slot is taken,
+reserved headroom included, the occurrence is skipped rather than lost:
+the cursor advances, the definition records `skipped: capacity` with the minute
+and a running count, and the leader emits one `job-skipped` event. `relish jobs`
+shows the latest skip beside the schedule.
 
 ```sh
 relish jobs
@@ -115,6 +119,14 @@ packing; rootful Linux container and native process jobs enforce limits. Omitted
 status. Images are bound to a digest at submission and must pass the cluster's Pickle
 and upstream trust policies, including required cosign signatures.
 
+Every name you submit is a job definition, and its runs are kept as receipts.
+A definition with no schedule and no `run_before` hook is a one-off: it expires
+in the same pruning step that drops its last run (see retention below). A
+daily `relish run --batch render-$DATE` therefore keeps working indefinitely.
+Schedules and deployment hooks stay until you stop or delete them. Disabling a
+schedule turns its definition into a one-off. Each namespace holds at most 64
+definitions and the cluster 1,024; the refusal names the namespace and the cap.
+
 `--count` defaults to one. Add `--schedule "0 3 * * *"` to register an array
 schedule without an immediate run. Every task receives `RELIABURGER_TASK_INDEX`, `RELIABURGER_TASK_COUNT`, `RELIABURGER_BATCH_ID` and `RELIABURGER_TASK_ATTEMPT`.
 Its identity is the array ID and index; retries keep that identity. The job image and command apply to
@@ -145,7 +157,8 @@ has a unique DNS-label `name`, `count`, optional array policies and a `[cohort.t
 job specification. There are at most 16 profiles and 16,777,216 total indexes
 per submission. Names and namespaces are DNS labels; each template is at most
 16 KiB. Use `relish batch submit burger/jobs.toml --dry-run` for local validation.
-The cluster admits at most 64 active profiles. Reduce chunk
+Each profile is one active run, so a manifest counts against the active-run
+limits under [Execution and capacity limits](#execution-and-capacity-limits). Reduce chunk
 size for expensive tasks and straggler tails; larger chunks amortise dispatch
 and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
 
@@ -178,17 +191,19 @@ Only the worker and grant whose completion was accepted can supply an outcome
 or retained task output. Unreachable workers are explicit. Singletons keep bounded successful output as
 well as failure output; larger arrays discard successful output. Control reports keep exact failure counts and at most 256 index
 ranges per chunk; indexed detail remains available beyond that preview.
-Retained output keeps a bounded head and tail. Singleton live stdout/stderr also
+Retained output keeps a bounded head and tail. Each chunk keeps the output
+of its first 16 failed tasks; later failures keep their exit code and attempts
+in the results, and `relish batch logs` says the output wasn't kept. Singleton live stdout/stderr also
 uses ordinary log capture under its logical name, namespace and `run-ID` selector. Never interpret
 missing detail as success. A missing or corrupt result index is an explicit
 error; rebuilding it is worker recovery, rather than an unbounded page read.
-Use the child array ID for results and logs. Each profile index has a 1 MiB
-cache budget; more detail traffic may require additional disk reads.
+Use the child array ID for results and logs.
 
-Detail remains on the worker disk. Later submissions prune detail older than
-one hour **after completion** and keep the newest 20 terminal submissions.
-This is pruning on registration, rather than a background expiry timer; detail
-can remain readable longer while no new work is submitted. For a mixed manifest,
+Detail remains on the worker disk for one hour **after completion**, and the
+cluster keeps at most the newest 20 terminal submissions. The leader checks
+every second and prunes expired runs with one replicated write, whether or not
+anyone submits new work; workers then delete the run's ledger, index and kept
+output on their next sync. For a mixed manifest,
 the clock starts when its last profile finishes; profiles are pruned together.
 Permanent worker or disk loss can lose
 individual results even when accepted aggregate counts remain replicated.
@@ -199,6 +214,34 @@ a dropped future cannot free an uncertain execution's request. Retries release
 capacity during backoff.
 
 ## Execution and capacity limits
+
+Every namespace shares the cluster, so no namespace may take all of it:
+
+| Limit | Value | What happens past it |
+|-------|-------|----------------------|
+| Active runs, whole cluster | 128 | Nothing new starts until a run finishes |
+| Reserved for cron fires and deployment jobs | 32 of the 128 | Arrays, batches, profiles and manual runs stop at 96 |
+| Active arrays, batches, profiles and manual runs per namespace | 64 | Refused, naming the namespace and the cap |
+| Job definitions per namespace | 64 | Refused; one-off definitions expire with their last run |
+| Job definitions, whole cluster | 1,024 | Refused |
+| Retained run receipts, whole cluster | 2,048 | Retention keeps it below this backstop |
+| Named jobs in one finite batch | 64 | Refused |
+
+Cron fires and deployment hooks never compete with bulk work for their
+headroom, so a tenant filling its arrays can't stop another tenant's nightly
+job or block an apply. A cron fire refused even then is recorded as a skipped
+occurrence (see above), not retried for the rest of the minute.
+
+Namespace quotas cover jobs too. When the leader grants chunks, it charges
+each attempt a chunk can start (no more than the node's slots for it) at the
+template's CPU, memory and GPU requests, after the namespace's apps. If the
+quota has no room, the run gets no more grants and its status says why:
+`relish batch-status ID` shows `waiting for quota: …`, and the JSON summary has
+`quota_blocked` and `quota_blocked_reason`. Running attempts are never
+cancelled; grants resume as they finish. Jobs use what apps leave: an app that
+fits its namespace quota is never displaced by that namespace's jobs. A chunk
+costs up to one node's slots at once, so set `--concurrency` (per-node
+concurrency) low enough for one node's share to fit the quota.
 
 Explicit bulk execution is at least once. Ordinary jobs and hooks use
 acknowledged replay for unknown outcomes. A lost worker or a crash before a durable outcome
@@ -213,6 +256,15 @@ commit incremental outcomes in groups and acknowledge chunks only after
 outcomes and their result index are durable. Standalone admission reserves sparse progress within its 64 MiB store before
 accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
+
+A worker holds at most 50 bytes of disk per accepted task while the cluster
+lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
+million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
+about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
+tasks' head and tail per chunk. All of it goes when the run retires. Task data
+counts toward disk pressure: past a quarter of the filesystem, or with less
+than 1 GiB free, a worker finishes the chunks it holds but advertises no
+free slots, so it takes no new grants until retention frees space.
 
 After council disaster recovery advances the recovery epoch, workers with old
 array directories stop their attempts and persist a refusal. Old results and
@@ -281,6 +333,10 @@ keeps at most 32 compatible containers. The compatibility key includes the
 pinned image, namespace, live credentials and resource profile. Each container
 runs one command at a time, as a separate process. Jobs, arrays, schedules and
 hooks keep their common run identities, retries and durable results.
+Once a container's retirement is proven, the worker deletes its runtime
+journal, bundle and route files, and at startup it sweeps any an interrupted
+retirement left behind, so executor metadata doesn't grow with every namespace
+that ever ran a job.
 
 The command is born in its task cgroup, with independent CPU and memory limits.
 It receives its own mount and IPC namespaces, empty environment before explicit
@@ -299,8 +355,15 @@ the helper. It yields to waiting requests and expires after one idle second.
 A timeout, cancellation, lost policy or uncertain receipt retires the whole
 container before its resources can be used again. Waiting for a compatible
 slot or resource admission does not consume the command's attempt timeout;
-cold preparation counts after the full profile is reserved. Abandoned ownership remains
-quarantined until recovery retires the original generation. Host execution,
+cold preparation counts after the full profile is reserved. Cancellation and
+the timeout interrupt cold preparation too: an attempt stuck behind a slow
+image pull or a helper that never connects stops there, and the half-started
+container is retired. The pull itself carries on in the background and warms
+the image cache. If the caller disappears in the middle of a command, the idle
+eviction loop retires its container and frees the slot and reservation without
+a restart. Only a container whose task cgroup never empties (a command stuck in
+an uninterruptible kernel wait) stays quarantined, holding its slot and
+reservation, until it finally retires. Host execution,
 rootless runtimes and GPU requests cannot select this mode. Kubernetes export
 turns it into an ordinary Job, which starts a fresh Pod for every attempt, and
 reports the reused container as unsupported: a Job cannot preserve this contract.
@@ -313,6 +376,23 @@ Host jobs report `process`. On rootful Linux runc, memory-limited image jobs dis
 in both fresh and reused execution. A job exceeding its RAM limit can be OOM-killed; it cannot silently
 spill into swap and consume unaccounted disk I/O. Choose the memory range for
 the actual working set, including model weights.
+
+Some limits are fixed rather than derived from the profile. Each command's
+task cgroup allows 256 processes and threads (`pids.max`); threads count, so a
+JVM or another heavily threaded command may need fresh containers instead. The
+helper's own cgroup allows 16, outside the command's limits. `/tmp` and
+`/dev/shm` are 16 MiB tmpfs mounts, and regular files written anywhere are
+capped at 1 MiB.
+
+Reusable executors need Linux 5.8 or later, the same minimum as the rest of
+the node. Bun checks the kernel the first time it is asked for an executor and
+logs what it found. On an older kernel the pools are off: `shared-runc` jobs
+fail with a reason, and host jobs use the original owned process backend,
+which refuses explicit CPU and memory ranges. A kernel without `cgroup.kill`
+(before 5.14, such as Debian 11's 5.10) keeps its pools: retirement freezes the
+task cgroup and kills each process in it instead. Native host executors also
+need `CONFIG_PROC_CHILDREN`, which every mainstream distribution kernel
+enables; without it host jobs take the fallback path too.
 
 Compare accepted-success rates over the whole run and service
 latency alongside launch rates; container reuse alone does not qualify the
@@ -340,12 +420,36 @@ GPU placement is tracked separately in #359. Test-lease workloads retain their
 lease-aware admission; unowned lease namespaces and images are refused here.
 
 With eBPF enabled, image tasks inherit their namespace before starting. They
-may reach services in that namespace; cross-namespace services are refused.
-Batch templates currently have no explicit cross-namespace grant or egress
-allowlist fields. Without eBPF, namespace network enforcement is unavailable,
-as it is for ordinary apps. The worker caches at most 256 namespace bindings,
-evicts only idle bindings, and journals them for cleanup after old executors
-retire at startup. Losing the source binding stops its original runtime owner.
+may reach services in that namespace; cross-namespace services are refused,
+at their VIPs and their real addresses alike. A job, or a batch template,
+takes the same network policy an app does:
+
+```toml
+[job.crawl]
+image = "registry.example.com/crawler@sha256:..."
+runtime = "shared-runc"
+
+[job.crawl.egress]
+allow = ["api.example.com:443"]
+
+[job.crawl.firewall]
+allow_from = ["frontend/dashboard"]
+```
+
+The egress allowlist goes into the task's cgroup before its command runs, and
+always permits the node's DNS responder on port 53. A name that doesn't
+resolve within five seconds refuses the attempt rather than starting it
+without its allowlist. Reused executors run commands with the same allowlist
+only: the policy is part of the executor profile, so two templates that differ
+in `egress` or `firewall` never share a container. A job publishes no service,
+so `allow_from` names the apps in other namespaces that may reach the task's
+own container address. Both need a container task on rootful Linux runc with
+eBPF: nodes that can't enforce them refuse the array, and `runtime =
+"process"` refuses both. Without eBPF, namespace network enforcement is
+unavailable, as it is for ordinary apps. The worker caches at most 256
+namespace bindings, evicts only idle bindings, and journals them for cleanup
+after old executors retire at startup. Losing the source binding stops its
+original runtime owner.
 
 Local packing is non-preemptive. Existing applications have reserved requests;
 new deployments and rolling replacements also need free capacity. There is no
@@ -364,10 +468,10 @@ app scheduler. Set requests for services sharing a node with batch work, and
 leave capacity for rollouts. Admission protects requests; it cannot guarantee
 latency when workloads burst up to their limits.
 
-Namespace app quotas currently govern ordinary app placement, not delegated
-array resource usage. Scope checks still apply to submission and reads. Use
-admission limits and dedicated capacity for mutually untrusted batch tenants
-until tenant resource allocation is added.
+Namespace quotas govern both app placement and job grants (see
+[Execution and capacity limits](#execution-and-capacity-limits)); scope checks
+still apply to submission and reads. Quotas cap what each tenant holds. They
+don't share spare capacity fairly between tenants: there is no DRF.
 
 ## API admission shapes
 

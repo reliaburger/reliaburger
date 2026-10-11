@@ -8,6 +8,14 @@ use reliaburger::grill::{ContainerState, Grill, ImageStore};
 use std::path::Path;
 use std::time::Duration;
 
+/// Retired, and then forgotten once that retirement is proven (#678).
+async fn assert_retired(runtime: &impl Grill, id: &reliaburger::grill::InstanceId) {
+    match runtime.state(id).await {
+        Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. }) => {}
+        other => panic!("{} has not retired: {other:?}", id.0),
+    }
+}
+
 /// Real isolated attempts reuse a bounded owner pool, without losing app capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
@@ -83,7 +91,8 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
                 .starts_with("rbtest-batch__executor-")
         })
         .count();
-    assert_eq!(retained, 2, "retired runtime metadata grew with task count");
+    // Retired executors are forgotten (#678): nothing remains, at any task count.
+    assert_eq!(retained, 0, "retired runtime metadata was kept");
     let inventory = runtime.launch_inventory().await.unwrap().unwrap();
     assert!(
         inventory.len() <= 2,
@@ -179,7 +188,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     let kernel = Arc::new(tokio::sync::Mutex::new(
         OnionEbpf::load_embedded(Path::new("/sys/fs/cgroup")).unwrap(),
     ));
-    let policy = TaskNamespacePolicy::recover(kernel.clone(), root)
+    let policy = TaskNamespacePolicy::recover(kernel.clone(), root, Default::default(), None)
         .await
         .unwrap();
     let runner = Arc::new(
@@ -390,7 +399,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     // The startup pass clears only recorded, same-boot ancestry after owners retire.
     drop(runner);
     drop(policy);
-    TaskNamespacePolicy::recover(kernel.clone(), root)
+    TaskNamespacePolicy::recover(kernel.clone(), root, Default::default(), None)
         .await
         .unwrap();
     assert!(
@@ -854,7 +863,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     })
     .await
     .unwrap();
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     // Explicit environment values and escaped process groups cannot survive
     // a command boundary inside the retained PID namespace.
     let mut transient = task.clone();
@@ -927,7 +936,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
             .outcome,
         AttemptOutcome::TimedOut
     );
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     assert!(!base.exists(), "timeout must remove the killed task cgroup");
     assert_eq!(budget.available(), Resources::new(500, 64 << 20, 0));
 
@@ -960,7 +969,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     let cancelled = active.await.unwrap();
     assert_eq!(runner.active_commands(42, Some(&template)).await, Some(0));
     assert_eq!(cancelled.outcome, AttemptOutcome::Cancelled);
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     assert!(
         !base.exists(),
         "cancellation must remove the killed task cgroup"
@@ -970,7 +979,25 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     // 64 MiB. Compatible waiters must reuse it instead of churning containers.
     use reliaburger::bun::task_executor::{ChunkWork, PoolConfig, TaskPool};
     use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
-    let before = runtime.launch_inventory().await.unwrap().unwrap().len();
+    // Retired executors are forgotten (#678), so the inventory cannot count
+    // churn after the fact. Sample the generations that ever existed instead.
+    let sampling = CancellationToken::new();
+    let generations = tokio::spawn({
+        let runtime = runtime.clone();
+        let sampling = sampling.clone();
+        async move {
+            let mut seen = std::collections::HashSet::new();
+            while !sampling.is_cancelled() {
+                for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+                    if launch.instance_id.0.starts_with("rbtest-reuse__") {
+                        seen.insert(launch.generation);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            seen.len()
+        }
+    });
     let concurrent =
         Arc::new(OwnedRunner::with_slot_count(runtime.clone(), 8).with_budget(budget.clone()));
     let pool = TaskPool::with_node_slots(
@@ -992,9 +1019,9 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     };
     let completed = pool.run_chunk(&work, &cancel).await;
     assert_eq!(completed.result.succeeded, 16, "{:?}", completed.records);
-    let after = runtime.launch_inventory().await.unwrap().unwrap().len();
+    sampling.cancel();
     assert_eq!(
-        after - before,
+        generations.await.unwrap(),
         1,
         "compatible resource waiters churned owned containers instead of reusing the one profile that fits"
     );
@@ -1677,16 +1704,17 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         reliaburger::bun::task_executor::AttemptOutcome::Cancelled
     ));
     eprintln!("native cancellation returned {outcome:?}");
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     assert_eq!(budget.available(), budget.capacity());
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Dropping a caller closes its private connection; recovery reuses only an
-/// originally retired slot identity, never a recovered numeric PID.
+/// Dropping a caller hands its executor to the eviction loop, which retires
+/// it and returns the reservation without a restart. A restart afterwards
+/// reuses only the originally retired slot identity, never a recovered PID.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root and cgroup v2; run with make test-linux"]
-async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dropped_caller() {
+async fn cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart() {
     use reliaburger::bun::{
         execution_budget::ExecutionBudget,
         task_executor::{TaskInvocation, TaskRunner},
@@ -1753,10 +1781,13 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
     })
     .await
     .expect("dropped connection did not retire the original subtree");
-    assert!(
-        budget.available() != budget.capacity(),
-        "lost caller released its quarantined reservation"
-    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while budget.available() != budget.capacity() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the dropped caller's reservation waited for a restart");
     drop(runner);
     let recovered_budget = ExecutionBudget::new(budget.capacity());
     let recovered = OwnedRunner::for_data_dir(AnyGrill::Process(runtime.clone()), &root)
@@ -1784,7 +1815,7 @@ async fn cgroup_host_executor_recovery_waits_for_original_retirement_after_a_dro
     })
     .await
     .unwrap();
-    assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_retired(&runtime, &id).await;
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1914,7 +1945,6 @@ async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
 #[ignore = "requires root and cgroup v2; run with make test-linux"]
 async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
     use reliaburger::bun::task_executor::{AttemptOutcome, TaskRunner};
-    use std::sync::atomic::{AtomicBool, Ordering};
     let root = tempfile::Builder::new()
         .prefix("rb-native-stuck-")
         .tempdir()
@@ -1930,27 +1960,23 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
         .await;
     assert!(first.outcome.succeeded(), "{first:?}");
     let task = task_cgroup(&first.output.head);
-    // Keep the task group populated faster than cgroup.kill can empty it.
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let refill = std::thread::spawn({
-        let stop = stop.clone();
-        let procs = task.join("cgroup.procs");
-        move || {
-            let mut children = Vec::new();
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok(child) = std::process::Command::new("/bin/sleep").arg("60").spawn() {
-                    let _ = std::fs::write(&procs, child.id().to_string());
-                    children.push(child);
-                }
-                children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            for mut child in children {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    });
+    // The warm executor runs the next command in this same task group. Make
+    // the group report itself populated forever, as a task in uninterruptible
+    // sleep would: bind a file saying "populated 1" over its cgroup.events.
+    // Racing real processes against cgroup.kill can't do this reliably: a fast
+    // kernel empties the group between respawns, and retirement rightly
+    // succeeds.
+    let fake = root.path().join("populated");
+    std::fs::write(&fake, "populated 1\nfrozen 0\n").unwrap();
+    let events = task.join("cgroup.events");
+    nix::mount::mount(
+        Some(&fake),
+        &events,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .unwrap();
     let started = std::time::Instant::now();
     let stuck = tokio::time::timeout(
         Duration::from_secs(30),
@@ -1972,8 +1998,7 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
         budget.capacity(),
         "a quarantined executor released its reservation"
     );
-    stop.store(true, Ordering::Relaxed);
-    refill.join().unwrap();
+    nix::mount::umount(&events).unwrap();
     wait_until("the eviction loop retires the quarantined executor", || {
         budget.available() == budget.capacity()
     })
@@ -2328,4 +2353,118 @@ async fn cgroup_host_executor_adds_no_drain_wait_to_quiet_commands() {
         budget.available() == budget.capacity()
     })
     .await;
+}
+
+/// Every namespace that ever ran a shared-runc array used to leave executor
+/// identities, journals and route files behind for good (#678). Once the
+/// executors retire, nothing of them remains, and a restart sweep finds
+/// nothing more to collect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement() {
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
+    use reliaburger::bun::{execution_budget::ExecutionBudget, task_runtime::OwnedRunner};
+    use reliaburger::grill::AnyGrill;
+    use reliaburger::meat::Resources;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-678-metadata-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("executor metadata fixture: {}", root.display());
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = AnyGrill::with_host_processes(
+        RuncGrill::new(
+            root.join("bundles"),
+            images,
+            false,
+            root.join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap(),
+        &root.join("instances"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    );
+    let budget = ExecutionBudget::new(Resources::new(2000, 512 << 20, 0));
+    let runner = Arc::new(
+        OwnedRunner::for_data_dir(runtime.clone(), &root)
+            .unwrap()
+            .with_budget(budget.clone()),
+    );
+    let cancel = CancellationToken::new();
+    let namespaces = ["rbtest-tenant-a", "rbtest-tenant-b", "rbtest-tenant-c"];
+    for namespace in namespaces {
+        let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+            "image='{image}'\nnamespace='{namespace}'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+        ))
+        .unwrap();
+        let task = TaskInvocation {
+            template: Some(Box::new(template)),
+            index: 0,
+            attempt: 1,
+            program: "/unused".into(),
+            args: vec!["/bin/sh".into(), "-c".into(), "printf ran".into()],
+            env: vec![
+                ("RELIABURGER_TASK_COUNT".into(), "1".into()),
+                ("RELIABURGER_BATCH_ID".into(), "7".into()),
+            ],
+            run: Some(reliaburger::bun::task_executor::RunIdentity {
+                batch_id: 7,
+                task_count: 1,
+                job_name: None,
+            }),
+        };
+        let outcome = runner.run(&task, Duration::from_secs(30), &cancel).await;
+        assert_eq!(
+            outcome.outcome,
+            AttemptOutcome::Exited { code: 0 },
+            "{outcome:?}"
+        );
+    }
+    let executors = |inventory: Vec<reliaburger::grill::RuntimeLaunch>| {
+        inventory
+            .into_iter()
+            .filter(|launch| launch.instance_id.0.contains("__executor-"))
+            .count()
+    };
+    // Idle executors retire about a second after their last command.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while budget.available() != budget.capacity()
+            || executors(runtime.launch_inventory().await.unwrap().unwrap()) != 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("idle executors were not retired and forgotten");
+    let leftovers = |directory: &std::path::Path| -> Vec<String> {
+        match std::fs::read_dir(directory) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.contains("__executor-"))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("{}: {error}", directory.display()),
+        }
+    };
+    for directory in [
+        root.join("instances/runtime-routes"),
+        root.join("bundles/.intents/records"),
+        root.join("bundles/.intents/locks"),
+        root.join("bundles"),
+        root.join("state"),
+    ] {
+        let kept = leftovers(&directory);
+        assert!(kept.is_empty(), "{} kept {kept:?}", directory.display());
+    }
+    assert_eq!(runner.forget_retired_executors().await, 0);
+    drop(runner);
+    std::fs::remove_dir_all(root).unwrap();
 }

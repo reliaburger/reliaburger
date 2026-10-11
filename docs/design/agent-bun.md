@@ -210,7 +210,7 @@ cgroup path rather than fabricating a path runc cannot write.
 |-----------|----------------|-----|
 | **runc** | Runtime (external binary, Linux) | Low-level OCI container execution (namespaces, cgroups, seccomp). Grill writes the OCI bundle and calls `runc` directly; its `state` persists container liveness across Bun restarts. No containerd. |
 | **Apple Container** | Runtime (external, macOS) | OCI container lifecycle on macOS. Grill re-adopts a running workload via `container inspect` after a Bun exec. |
-| **Linux kernel 5.7+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE |
+| **Linux kernel 5.8+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE, the boot-time clock helper. Reusable job executors need `clone3(CLONE_INTO_CGROUP)` (5.7) and the cgroup v2 freezer (5.2), inside the same minimum; they use `cgroup.kill` (5.14) when present and otherwise freeze and kill each task. Bun turns the executor pools off on an older kernel, and the native host pool off without `CONFIG_PROC_CHILDREN` (`src/grill/kernel.rs`) |
 | **Mustard (gossip)** | Internal subsystem | Failure detection, leader discovery, cluster membership, metadata propagation (protocol version, node labels) |
 | **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
 | **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Worker nodes receive state via the reporting tree, not directly from Raft. |
@@ -1276,11 +1276,24 @@ Three decisions shape everything that follows, and each earns its keep against t
 The whole rolling walk lives in Raft under `DesiredState.active_upgrade`, so a leader change mid-run is a *resume*, not a restart: whichever node holds leadership drives the loop from the replicated state. Each tick polls reality first (`GET /v1/version` per node) and takes at most one round of actions, which makes every directive idempotent by observation.
 
 ```
-1. Start: relish verifies the binary (SHA-256 + dual signatures) and pushes
-   it to the leader's Pickle. The leader records the plan in Raft. The plan's
-   per-node ROLE and ADDRESS are derived server-side from gossip membership
-   and the Raft voter set — a client can't upgrade a node under a false
-   identity (a spoofed address or a mislabelled leader is rejected).
+1. Start: relish asks every node its platform (`platform` in
+   GET /v1/version, through the connected node's relay), downloads one
+   release build per platform present, checks each against the metadata's
+   SHA-256, adds the operator's signature (--external-key, or a countersigned
+   --sig) and pushes each to the connected node's Pickle. The start request
+   carries `binaries`, one PlatformBinary { platform, sha256, signatures }
+   per platform. The leader records the plan in Raft with each node's
+   platform; the orchestrator directs every node to its own platform's build
+   and refuses a node whose platform has none. The plan's per-node ROLE and
+   ADDRESS are derived server-side from gossip membership and the Raft voter
+   set — a client can't upgrade a node under a false identity (a spoofed
+   address or a mislabelled leader is rejected).
+
+   relish takes the single-node path only on the node's explicit 503
+   "no council on this node" from GET /v1/upgrade/cluster; any other error
+   stops the command. Until 1.0 a rolling upgrade works only between builds
+   with the same protocol and state pair; `metadata.json` names each
+   release's pair, and relish refuses a release with another one.
 
 2. Workers, in batches of --parallel (default 1):
    direct each, then wait until it polls back healthy at the target AND
@@ -1446,6 +1459,14 @@ join = ["10.0.1.5:9443"]
 - `volumes` full: Application writes fail with EDQUOT (Btrfs) or ENOSPC (loop mount).
 
 **Recovery:** Bun triggers garbage collection on the affected path. For images, unreferenced layers are removed. For logs and metrics, retention policies are enforced aggressively. For volumes, the operator must increase the volume size or delete data.
+
+**Bounds that keep it from happening (#678):**
+
+- `[logs]` and `[metrics]` default to `max_storage_mb = 2048` and `1024`. `0` is an explicit opt-out, and Bun refuses at startup a cap larger than the filesystem holding its data directory.
+- Task data under `<data>/task-arrays/<id>/` is a 22-byte-per-task ledger, a dense result index of 24-byte slots (a sparse file, so a worker pays only for the tasks it ran) and kept failure output: one append-only segment per chunk grant, holding the head and tail of the first 16 failed tasks, written with one fsync per batch. A million tasks measure about 47 bytes per task (`make bench-task-arrays` fails above 50). The index replaced a redb B-tree that measured 87 bytes per task, four times the ledger; ledger plus index, about 109 bytes per task, is the same order as the 82 bytes per accepted task the October qualification rig lost, and nothing else on the task path grows per task.
+- The leader prunes finished runs an hour after they finish with a replicated `Prune` write on its one-second tick, not only on the next registration, and each worker deletes a run's directory once the leader stops listing it. An idle cluster therefore returns to its baseline disk use.
+- Task data counts toward disk pressure. When it passes a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
+- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. Ordinary app instances don't call it yet, so their route and journal files still outlive a deleted app.
 
 ### 7.4 Process Workload Binary Missing
 
@@ -1871,7 +1892,7 @@ Bun Restart
 
 ### 12.2 Evaluation Notes
 
-**`libbpf-rs` vs `aya`:** Both provide eBPF support in Rust. `libbpf-rs` wraps the C `libbpf` library and provides CO-RE support, meaning eBPF programs compiled once run on different kernel versions without recompilation. `aya` is a pure Rust implementation that avoids the C dependency but is younger and has less battle-tested kernel compatibility. For a system that must run on kernel 5.7+ across diverse distributions, `libbpf-rs`'s maturity and CO-RE support are the safer choice. Revisit if `aya` matures to equivalent kernel coverage.
+**`libbpf-rs` vs `aya`:** Both provide eBPF support in Rust. `libbpf-rs` wraps the C `libbpf` library and provides CO-RE support, meaning eBPF programs compiled once run on different kernel versions without recompilation. `aya` is a pure Rust implementation that avoids the C dependency but is younger and has less battle-tested kernel compatibility. For a system that must run on kernel 5.8+ across diverse distributions, `libbpf-rs`'s maturity and CO-RE support are the safer choice. Revisit if `aya` matures to equivalent kernel coverage.
 
 **`nftnl` GPL concern:** The `nftnl` crate has a GPL-2.0 license. If this is incompatible with the project's licensing, the alternative is to invoke the `nft` CLI as a subprocess for nftables management. This is slightly less performant (process spawn per rule change) but avoids the license issue. Atomic rule application is still possible via `nft -f <file>`.
 

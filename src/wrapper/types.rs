@@ -143,6 +143,9 @@ pub struct RouteInfo {
     pub host: String,
     pub path: String,
     pub app_name: String,
+    /// Namespace that owns the route; a scoped caller sees only its own.
+    #[serde(default)]
+    pub namespace: String,
     pub healthy_backends: usize,
     pub total_backends: usize,
     pub websocket: bool,

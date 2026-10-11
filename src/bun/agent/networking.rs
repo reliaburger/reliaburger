@@ -114,7 +114,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// unresolvable, map programming failed).
     ///
     /// `egress` is the allowlist whoever prepared the start resolved, off
-    /// the loop (#419).
+    /// the loop (#419). An app's allowlist comes from `spec`; a job has no
+    /// app spec, so its allowlist is the one in `egress`.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn apply_network_pre_start(
         &mut self,
@@ -129,9 +130,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await?;
         use crate::sesame::egress::{self, PreStartEgress};
 
-        let has_allowlist = spec
-            .and_then(|spec| spec.egress.as_ref())
-            .is_some_and(|e| !e.allow.is_empty());
+        let has_allowlist = !declared_allowlist(spec, &egress).is_empty();
+        // Whether the workload's process will run in the cgroup its runtime
+        // input names: containers on rootful runc, and host commands the
+        // owned process runtime places there.
+        let runs_in_cgroup = match self
+            .supervisor
+            .get_instance(instance_id)
+            .and_then(|instance| instance.oci_spec.as_ref())
+        {
+            Some(original) => self.supervisor.grill().honours_cgroup_path_for(original),
+            None => {
+                self.supervisor.grill().honours_cgroup_path()
+                    && !spec.is_some_and(|s| s.exec.is_some() || s.script.is_some())
+            }
+        };
         let capability = match self.onion_ebpf.as_ref() {
             Some(handle) => {
                 let handle = handle.lock().await;
@@ -140,8 +153,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     connect_ipv6: handle.connect6_attached(),
                     udp_ipv4: handle.sendmsg4_attached(),
                     udp_ipv6: handle.sendmsg6_attached(),
-                    pre_start: self.supervisor.grill().honours_cgroup_path()
-                        && !spec.is_some_and(|s| s.exec.is_some() || s.script.is_some()),
+                    pre_start: runs_in_cgroup,
                 }
             }
             None => Default::default(),
@@ -159,9 +171,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             None
         };
 
-        let require_source = self.onion_ebpf.is_some()
-            && self.supervisor.grill().honours_cgroup_path()
-            && !spec.is_some_and(|s| s.exec.is_some() || s.script.is_some());
+        let require_source = self.onion_ebpf.is_some() && runs_in_cgroup;
         match egress::plan_pre_start_egress(has_allowlist, capability, cgroup_id) {
             PreStartEgress::NoPolicy if require_source => {
                 let cgroup_id = cgroup_id.ok_or_else(|| BunError::DeployFailed {
@@ -360,14 +370,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: Option<&AppSpec>,
         _cgroup_path: &std::path::Path,
         retained: Result<Option<crate::grill::runc_intent::NetworkReference>, BunError>,
-        _egress: launch_evidence::EgressResolution,
+        egress: launch_evidence::EgressResolution,
     ) -> Result<(), BunError> {
         self.retain_network_reference(instance_id, spec, retained)
             .await?;
-        if spec
-            .and_then(|spec| spec.egress.as_ref())
-            .is_some_and(|e| !e.allow.is_empty())
-        {
+        if !declared_allowlist(spec, &egress).is_empty() {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
                 reason: "egress allowlist requires an eBPF-enabled binary".to_string(),
@@ -395,11 +402,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         cgroup_id: u64,
         egress: launch_evidence::EgressResolution,
     ) -> Result<(), BunError> {
-        let allow = spec
-            .and_then(|spec| spec.egress.as_ref())
-            .map(|policy| policy.allow.as_slice())
-            .unwrap_or_default();
-        if egress.allow.as_slice() != allow {
+        let allow = declared_allowlist(spec, &egress).to_vec();
+        if egress.allow != allow {
             return Err(BunError::DeployFailed {
                 app_name: app_name.into(),
                 reason: format!(
@@ -451,7 +455,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 phase: PolicyPhase::Owned,
                 cgroup_id,
                 source_namespace: Some(source_namespace),
-                allow: allow.to_vec(),
+                allow: allow.clone(),
                 resolved,
                 original_spec: original_spec.clone(),
                 runtime: self.supervisor.grill().runtime_kind_for(&original_spec),
@@ -624,6 +628,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let union: Vec<_> = survivors
             .iter()
             .flat_map(|binding| binding.resolved.iter().copied())
+            .chain(egress::implicit_destinations(self.workload_dns))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -1155,7 +1160,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             };
             (enforced, entries)
         };
-        let plan = egress::plan_egress_sweep(&expected, &kernel_enforced, &kernel_entries);
+        // Read after the kernel: a task claims its cgroup before writing it,
+        // so every task allowlist the kernel showed is claimed by now.
+        // LOOP-INLINE: in-memory lock held only to copy a small set, no I/O
+        let delegated = self.delegated_network.snapshot().await.egress_cgroups;
+        let owned: std::collections::HashSet<u64> =
+            expected.iter().copied().chain(delegated).collect();
+        let plan = egress::plan_egress_sweep(&owned, &kernel_enforced, &kernel_entries);
         if !plan.stale.is_empty() {
             let mut ebpf = handle.lock().await;
             for cgroup_id in &plan.stale {
@@ -1167,7 +1178,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
         }
-        for cgroup_id in &plan.repair {
+        // A task's allowlist is its runtime's to repair; the task stops when
+        // its namespace check fails.
+        for cgroup_id in plan.repair.iter().filter(|id| expected.contains(id)) {
             eprintln!("sesame: sweep restoring egress enforcement for cgroup {cgroup_id}");
         }
         // Rewrite every live cgroup's entries: idempotent inserts, and the
@@ -1188,4 +1201,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// No-op without the eBPF data path.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn sweep_kernel_networking(&mut self) {}
+}
+
+/// The egress allowlist a start must enforce. An app declares it in its
+/// spec; a job has no app spec, so the allowlist its start prepared and
+/// resolved is the declaration.
+fn declared_allowlist<'a>(
+    spec: Option<&'a AppSpec>,
+    egress: &'a launch_evidence::EgressResolution,
+) -> &'a [String] {
+    match spec {
+        Some(spec) => spec
+            .egress
+            .as_ref()
+            .map_or(&[][..], |policy| policy.allow.as_slice()),
+        None => &egress.allow,
+    }
 }

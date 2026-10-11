@@ -340,6 +340,13 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
             record.phase = OwnerPhase::Retiring { exit_code: code };
             persist(directory, record)?;
             drop(listener);
+            // Every process has gone, so the cgroup is empty. Remove it
+            // before publishing Retired: the next generation's directory,
+            // which the agent creates and binds once it sees Retired, must
+            // never be the one removed here. A busy one stays for reuse.
+            if let Some(cgroup) = workload_cgroup(&record.launch.spec) {
+                let _ = std::fs::remove_dir(cgroup);
+            }
             complete_retirement(directory, record)?;
             return Ok(());
         }
@@ -405,6 +412,33 @@ pub(crate) fn remove_socket(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The workload cgroup a host command joins: the one its spec names under
+/// Reliaburger's own hierarchy, on rootful cgroup v2 Linux. The agent binds
+/// that cgroup to the workload's namespace before start, which is how
+/// namespace isolation holds host commands too. `None` elsewhere.
+fn workload_cgroup(spec: &super::oci::OciSpec) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux")
+        || !nix::unistd::geteuid().is_root()
+        || !Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+    {
+        return None;
+    }
+    spec.linux
+        .host_cgroup_path()
+        .filter(|path| path.starts_with("/sys/fs/cgroup/reliaburger"))
+}
+
+/// Move the calling process into its workload cgroup before user code runs.
+/// Writing `0` to `cgroup.procs` moves the writer itself.
+fn enter_workload_cgroup(spec: &super::oci::OciSpec) -> io::Result<()> {
+    let Some(cgroup) = workload_cgroup(spec) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&cgroup)?;
+    std::fs::write(cgroup.join("cgroup.procs"), "0")
+        .map_err(|error| io::Error::other(format!("cannot join workload cgroup: {error}")))
+}
+
 /// Run the child's internal gate and replace it with the foreground command.
 ///
 /// EOF, malformed activation or a mismatched durable child identity refuses
@@ -423,6 +457,7 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
             "execution activation has no matching durable owner",
         ));
     }
+    enter_workload_cgroup(&record.launch.spec)?;
     let error = Command::new(&record.command[0])
         .args(&record.command[1..])
         .env_clear()
