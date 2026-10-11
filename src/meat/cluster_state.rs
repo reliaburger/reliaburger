@@ -82,6 +82,7 @@ impl SchedulerNodeState {
 pub struct ClusterStateCache {
     nodes: HashMap<NodeId, SchedulerNodeState>,
     accounted_instances: HashMap<(NodeId, AppId, u32), Resources>,
+    capacity_refusals: HashSet<(NodeId, AppId)>,
 }
 
 impl ClusterStateCache {
@@ -90,7 +91,20 @@ impl ClusterStateCache {
         Self {
             nodes: HashMap::new(),
             accounted_instances: HashMap::new(),
+            capacity_refusals: HashSet::new(),
         }
+    }
+
+    /// Record that `node_id` reported it couldn't fit `app_id`'s replicas.
+    pub fn record_capacity_refusal(&mut self, node_id: &NodeId, app_id: &AppId) {
+        self.capacity_refusals
+            .insert((node_id.clone(), app_id.clone()));
+    }
+
+    /// Whether `node_id` reported it couldn't fit `app_id`'s replicas.
+    pub fn capacity_refused(&self, node_id: &NodeId, app_id: &AppId) -> bool {
+        self.capacity_refusals
+            .contains(&(node_id.clone(), app_id.clone()))
     }
 
     /// Add or replace a node's state.

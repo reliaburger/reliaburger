@@ -250,14 +250,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         // LOOP-INLINE: in-memory lock held only to copy a small map, no I/O
         let delegated = self.delegated_network.snapshot().await;
-        let mut jobs = self.isolated_jobs();
-        jobs.extend(delegated.addresses.values().filter_map(|task| {
-            Some((
-                task.namespace.clone(),
-                task.owner.clone(),
-                task.allow_from.clone()?,
-            ))
-        }));
+        // Every job runs as a delegated task, so its address and grants live
+        // in the delegated network.
+        let jobs: Vec<(String, String, Vec<String>)> = delegated
+            .addresses
+            .values()
+            .filter_map(|task| {
+                Some((
+                    task.namespace.clone(),
+                    task.owner.clone(),
+                    task.allow_from.clone()?,
+                ))
+            })
+            .collect();
         let destinations: Vec<_> = services
             .iter()
             .map(crate::sesame::firewall::IsolatedDestination::from)
@@ -316,19 +321,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.namespace_firewall_stale = false;
         }
         self.apply_isolation_rules(isolation);
-    }
-
-    /// Jobs on this node that open their addresses to named sources in
-    /// other namespaces: `(namespace, name, allow_from)`.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    fn isolated_jobs(&self) -> Vec<(String, String, Vec<String>)> {
-        self.recorded_jobs
-            .values()
-            .filter_map(|job| {
-                let allow_from = job.spec.firewall.as_ref()?.allow_from.clone();
-                Some((job.namespace.clone(), job.name.clone(), allow_from))
-            })
-            .collect()
     }
 
     /// Every local workload address and its owner: each instance with its

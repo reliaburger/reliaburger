@@ -10,7 +10,7 @@
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::{BunAgent, BunError, Grill, InstanceId, tail_lines};
+use super::{BunAgent, BunError, Grill, InstanceId, LogExecutionSelection, tail_lines};
 
 /// Every instance's capture, one after another. More than one instance gets
 /// a `==> id <==` header each, like `tail` over several files.
@@ -85,6 +85,42 @@ async fn send_tail_then_follow<G: Grill + Clone + 'static>(
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// The local capture files behind `app`'s logs: every instance of the
+    /// app in `namespace`, or the one `selected` instance after checking it
+    /// belongs to that app.
+    pub(super) fn resolve_execution_logs(
+        &self,
+        app: &str,
+        namespace: &str,
+        selected: Option<&str>,
+    ) -> Result<LogExecutionSelection, BunError> {
+        let instances = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|i| i.namespace == namespace && i.app_name == app)
+            .map(|i| i.id.0.clone());
+        if let Some(instance) = selected {
+            if !instances.clone().any(|id| id == instance) {
+                return Err(BunError::DeployFailed {
+                    app_name: app.into(),
+                    reason: "instance does not belong to the requested namespace and workload"
+                        .into(),
+                });
+            }
+            return Ok(LogExecutionSelection {
+                logical_name: app.into(),
+                instances: vec![instance.into()],
+                selected_instance: Some(instance.into()),
+            });
+        }
+        Ok(LogExecutionSelection {
+            logical_name: app.into(),
+            instances: instances.collect(),
+            selected_instance: None,
+        })
+    }
+
     /// Instances of `app_name` in `namespace`, or `AppNotFound`.
     fn app_instance_ids(
         &self,

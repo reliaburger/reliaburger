@@ -34,7 +34,7 @@ def shared_rule(source):
 def caller_rule(source, kind):
     if kind == 'apply':
         start = source.index('    for (app_name, namespace, host_execution) in targets {')
-        end = source.index('    let identities:', start)
+        end = source.index('    // Every job, leased or not, takes the common job lifecycle', start)
         expected = '''crate::sesame::auth::authorize_workload(
             auth.as_deref(), app_name, namespace, host_execution, &permissions,
         )'''

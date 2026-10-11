@@ -1500,6 +1500,11 @@ reading its results. The [burger manifest](../examples/demo/burger/jobs.toml)
 gives you mixed-size work to run beside a service. 0.2.0 changes the cluster's
 formats, so build matching development binaries and start a fresh cluster.
 
+Apps and jobs share each node's execution budget. State reports carry what a
+node's task attempts and executors hold, and the leader counts it when it
+places app replicas; a node that can't fit a placement reports the refusal and
+the replica moves.
+
 Image jobs run in a fresh container per attempt by default. Linux image jobs
 can set `runtime = "shared-runc"` to reuse a small pool of containers, with
 each command still in its own process under its own limits. Host jobs

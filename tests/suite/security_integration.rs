@@ -531,22 +531,17 @@ async fn service_token_cookie_cannot_run_a_batch_on_a_node() {
         .unwrap()
         .to_string();
 
-    let run = serde_json::json!({
-        "batch_id": 1,
-        "callback_base_url": null,
-        "jobs": [{
-            "name": "stolen",
-            "namespace": "default",
-            "spec": { "image": "busybox", "command": ["true"] },
-        }],
-    });
+    // The leader's sync call is how a node receives job work, so it is the
+    // node-to-node route a stolen cookie would try.
+    let run = serde_json::to_string(&reliaburger::bun::task_array_node::NodeSyncRequest::default())
+        .unwrap();
     let response = app
         .clone()
         .oneshot(
-            axum::http::Request::post("/v1/batch/run")
+            axum::http::Request::post("/v1/batch/array/sync")
                 .header("cookie", &cookie)
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(run.to_string()))
+                .body(axum::body::Body::from(run))
                 .unwrap(),
         )
         .await

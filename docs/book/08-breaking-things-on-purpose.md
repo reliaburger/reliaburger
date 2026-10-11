@@ -1247,7 +1247,7 @@ shared council, keep reports behind committed app placements, and lose a
 runner beyond the observation deadline. Each case checks the public outcome
 and the replicated state.
 
-The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
+The `BatchTracker` handled the async side until 0.2.0, which replaced it with task arrays and the common job lifecycle (Chapter 12, "One budget, two schedulers"). Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
 
 Each job name must be unique within its batch, including jobs in different namespaces. Submission builds a map keyed by that label before assigning execution identities. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.
 

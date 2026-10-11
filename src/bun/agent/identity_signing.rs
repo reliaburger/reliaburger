@@ -56,7 +56,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         namespace: &str,
         instance_id: &InstanceId,
-        is_job: bool,
         reply: Option<oneshot::Sender<()>>,
     ) {
         let Some(council) = self
@@ -76,13 +75,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
 
-        let workload_type = if is_job {
-            WorkloadType::Job
-        } else {
-            WorkloadType::App
-        };
         let spiffe_uri =
-            super::workload_spiffe_uri(&self.trust_domain, namespace, app_name, workload_type);
+            super::workload_spiffe_uri(&self.trust_domain, namespace, app_name, WorkloadType::App);
         let (csr_der, private_key_der) =
             match crate::sesame::identity::create_workload_csr(&spiffe_uri) {
                 Ok(pair) => pair,
@@ -99,7 +93,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_domain: self.trust_domain.clone(),
             spiffe_uri: spiffe_uri.clone(),
             instance_id: instance_id.0.clone(),
-            workload_type,
+            workload_type: WorkloadType::App,
             csr_der,
         };
         let task = self

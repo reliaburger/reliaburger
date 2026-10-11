@@ -28,11 +28,12 @@ pub enum LeaseScope {
     /// Applications and their namespace or scoped credentials.
     #[default]
     Applications,
-    /// Jobs on the receiving node, including cron registrations.
+    /// Jobs and their cron registrations. They run through the common job
+    /// lifecycle, so with a council the lease lives in Raft like any other.
     NodeJobs,
 }
 
-/// Reserve node-job identifiers even when malformed; never forward them to Raft.
+/// Whether `lease_id` names a job lease (its id says so even when malformed).
 pub fn is_node_job_lease(lease_id: &str) -> bool {
     lease_id.starts_with("node-jobs-")
 }
@@ -43,7 +44,7 @@ pub fn is_node_job_lease(lease_id: &str) -> bool {
 pub enum LeasedResource {
     /// A declarative or local application.
     App { app_id: AppId },
-    /// A node-local batch job or cron registration.
+    /// A job definition (and its runs) or cron registration.
     Job { job_id: AppId },
     /// A declarative namespace created for an owned app.
     Namespace { name: String },
@@ -1003,16 +1004,31 @@ pub fn now_unix_millis() -> u64 {
 pub async fn cleanup_local_lease(
     store: &LocalLeaseStore,
     cmd_tx: &tokio::sync::mpsc::Sender<crate::bun::agent::AgentCommand>,
+    jobs: Option<&crate::bun::task_array_leader::TaskArrayService>,
     lease_id: &str,
     owner_id: Option<&str>,
 ) -> Result<(), LeaseError> {
     let (lease, _operation) = store.begin_cleanup_operation(lease_id, owner_id).await?;
     for resource in lease.resources {
         match resource {
-            LeasedResource::App { app_id } | LeasedResource::Job { job_id: app_id } => {
-                // A cron firing can start a deploy of a leased job just before
-                // cleanup. The agent refuses to stop a workload a deploy still
-                // owns, so wait for that deploy inside the step's budget.
+            LeasedResource::Job { job_id } => {
+                let result = match jobs {
+                    Some(service) => tokio::time::timeout(
+                        CLEANUP_STEP_TIMEOUT,
+                        retire_local_job(service, &job_id),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("job cleanup timed out".into())),
+                    None => Err("job cleanup needs this node's task arrays".into()),
+                };
+                if let Err(reason) = result {
+                    store.cleanup_failed(lease_id, &reason).await?;
+                    return Err(LeaseError::Cleanup(reason));
+                }
+            }
+            LeasedResource::App { app_id } => {
+                // The agent refuses to stop a workload a deploy still owns,
+                // so wait for that deploy inside the step's budget.
                 let cleanup = async {
                     loop {
                         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1071,6 +1087,61 @@ pub async fn cleanup_local_lease(
     store.finish_cleanup(lease_id).await
 }
 
+/// The writes that stop a leased job for good: cancel every unsettled
+/// deployment that owns it (which cancels its runs), then stop and forget its
+/// definition (which cancels any later runs and its schedule).
+fn job_retirement_writes(
+    arrays: &crate::meat::task_array_store::TaskArrays,
+    job_id: &AppId,
+    now_epoch_secs: u64,
+) -> Vec<crate::meat::task_array_store::TaskArrayWrite> {
+    use crate::meat::task_array_store::TaskArrayWrite;
+    let mut writes: Vec<_> = arrays
+        .deployments()
+        .filter(|(_, record)| {
+            !record.completed
+                && !record.cancelled
+                && record.config.job.get(&job_id.name).is_some_and(|spec| {
+                    spec.namespace.as_deref().unwrap_or("default") == job_id.namespace
+                })
+        })
+        .map(|(operation_id, _)| TaskArrayWrite::DeployCancel {
+            operation_id: operation_id.to_string(),
+            now_epoch_secs,
+        })
+        .collect();
+    if arrays
+        .jobs()
+        .definition(&job_id.namespace, &job_id.name)
+        .is_some()
+    {
+        writes.push(TaskArrayWrite::StopDefinition {
+            name: job_id.name.clone(),
+            namespace: job_id.namespace.clone(),
+            forget: true,
+            now_epoch_secs,
+        });
+    }
+    writes
+}
+
+/// Stop and forget one leased job on a standalone node.
+async fn retire_local_job(
+    service: &crate::bun::task_array_leader::TaskArrayService,
+    job_id: &AppId,
+) -> Result<(), String> {
+    // Admission, cancellation and stops share the standalone apply gate.
+    let _gate = service.apply_gate.clone().lock_owned().await;
+    let arrays = crate::bun::task_array_leader::read_standalone(service).await;
+    let now = crate::meat::batch_ids::epoch_now_secs();
+    for write in job_retirement_writes(&arrays, job_id, now) {
+        crate::bun::task_array_leader::write_standalone(service, write)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// Reclaim one replicated lease through Raft. Every step is idempotent; a
 /// leader failure leaves `Cleaning` plus the complete resource list for its
 /// successor to resume.
@@ -1118,7 +1189,21 @@ pub async fn cleanup_cluster_lease(
     };
     for resource in &resources {
         match resource {
-            LeasedResource::Job { .. } => return Err(LeaseError::InvalidScope),
+            LeasedResource::Job { job_id } => {
+                let arrays = council.desired_state().await.task_arrays;
+                let now = crate::meat::batch_ids::epoch_now_secs();
+                for write in job_retirement_writes(&arrays, job_id, now) {
+                    if let Err(error) = write_cluster_lease_request(
+                        council,
+                        crate::council::RaftRequest::TaskArray(Box::new(write)),
+                    )
+                    .await
+                    {
+                        record_cluster_cleanup_failure(council, lease_id, &error).await;
+                        return Err(error);
+                    }
+                }
+            }
             LeasedResource::ApiToken { name, fingerprint } => {
                 if let Err(error) = write_cluster_lease_request(
                     council,
@@ -1167,6 +1252,26 @@ pub async fn cleanup_cluster_lease(
         .get(lease_id)
         .is_some_and(|lease| !lease.placements.is_empty())
     {
+        return Err(LeaseError::CleanupPending);
+    }
+    // A cancelled deployment still owns its job until the leader settles it,
+    // and one that committed after the read above has a definition to stop.
+    // Either way a later attempt finishes the job.
+    let settled = council.desired_state().await;
+    if resources.iter().any(|resource| match resource {
+        LeasedResource::Job { job_id } => {
+            settled
+                .task_arrays
+                .deployment_owner(&job_id.name, &job_id.namespace)
+                .is_some()
+                || settled
+                    .task_arrays
+                    .jobs()
+                    .definition(&job_id.namespace, &job_id.name)
+                    .is_some()
+        }
+        _ => false,
+    }) {
         return Err(LeaseError::CleanupPending);
     }
     if council
@@ -1253,6 +1358,7 @@ async fn write_cluster_lease_request(
 pub fn spawn_local_lease_reaper(
     store: LocalLeaseStore,
     cmd_tx: tokio::sync::mpsc::Sender<crate::bun::agent::AgentCommand>,
+    jobs: Option<Arc<crate::bun::task_array_leader::TaskArrayService>>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1264,7 +1370,9 @@ pub fn spawn_local_lease_reaper(
                 _ = interval.tick() => {}
             }
             for lease_id in store.due_for_cleanup(now_unix_millis()).await {
-                if let Err(error) = cleanup_local_lease(&store, &cmd_tx, &lease_id, None).await {
+                if let Err(error) =
+                    cleanup_local_lease(&store, &cmd_tx, jobs.as_deref(), &lease_id, None).await
+                {
                     eprintln!("bun: test lease {lease_id} cleanup deferred: {error}");
                 }
             }
@@ -1476,56 +1584,125 @@ mod tests {
         assert!(matches!(record.validate(), Err(LeaseError::InvalidScope)));
     }
 
+    /// A volatile standalone task-array service holding one leased job's
+    /// definition and an unsettled deployment of another.
+    async fn leased_job_arrays(
+        namespace: &str,
+    ) -> std::sync::Arc<crate::bun::task_array_leader::TaskArrayService> {
+        use crate::bun::task_array_leader::{TaskArrayService, write_standalone};
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let service = std::sync::Arc::new(TaskArrayService::with_timings(
+            None,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(30),
+        ));
+        let spec: crate::config::job::JobSpec =
+            toml::from_str("image = 'proc-grill:image-ignored'\ncommand = ['true']\n").unwrap();
+        let mut definition = crate::meat::job::JobDefinition::from_spec(spec.clone());
+        definition.template.namespace = Some(namespace.into());
+        write_standalone(
+            &service,
+            TaskArrayWrite::Job(Box::new(crate::meat::job::JobWrite::Put {
+                name: "cron".into(),
+                namespace: namespace.into(),
+                definition: Box::new(definition),
+                trigger: None,
+                now_epoch_secs: 1,
+            })),
+        )
+        .await
+        .unwrap();
+        let mut config = crate::config::Config::default();
+        let mut queued = spec;
+        queued.namespace = Some(namespace.into());
+        config.job.insert("queued".into(), queued);
+        write_standalone(
+            &service,
+            TaskArrayWrite::DeployBegin {
+                operation_id: "a".repeat(32),
+                config: Box::new(config),
+                now_epoch_secs: 1,
+            },
+        )
+        .await
+        .unwrap();
+        service
+    }
+
+    /// A job lease's cleanup stops its jobs on the common lifecycle: the
+    /// unsettled deployment is cancelled and the definition forgotten, so
+    /// nothing in the lease namespace can start again.
     #[tokio::test]
-    async fn node_job_cleanup_waits_for_a_deploy_that_still_owns_the_job() {
-        use crate::bun::agent::AgentCommand;
+    async fn node_job_cleanup_stops_and_forgets_its_jobs_in_the_task_arrays() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalLeaseStore::open(dir.path().join("node-test-leases.json"))
             .await
             .unwrap();
         let record = node_job_lease(10, 100);
         let id = record.lease_id.clone();
-        let job_id = AppId::new("cron", &record.namespace);
+        let namespace = record.namespace.clone();
         store.create(record).await.unwrap();
         drop(
             store
-                .begin_job_operation(&id, "token:ci", vec![job_id.clone()], 20)
+                .begin_job_operation(
+                    &id,
+                    "token:ci",
+                    vec![
+                        AppId::new("cron", &namespace),
+                        AppId::new("queued", &namespace),
+                    ],
+                    20,
+                )
                 .await
                 .unwrap(),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let cleanup = tokio::spawn({
-            let store = store.clone();
-            let id = id.clone();
-            async move { cleanup_local_lease(&store, &tx, &id, None).await }
-        });
-        let Some(AgentCommand::RetireTestResources { response, .. }) = rx.recv().await else {
-            panic!("expected retirement")
-        };
-        response
-            .send(Err(crate::bun::BunError::WorkloadBusy {
-                app_name: job_id.name.clone(),
-                namespace: job_id.namespace.clone(),
-                operation_id: "deploy-1".into(),
-            }))
+        let service = leased_job_arrays(&namespace).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        cleanup_local_lease(&store, &tx, Some(&service), &id, None)
+            .await
             .unwrap();
-        let Some(AgentCommand::RetireTestResources { response, .. }) = rx.recv().await else {
-            panic!("expected a retry once the deploy finished")
-        };
-        response.send(Ok(())).unwrap();
-        cleanup.await.unwrap().unwrap();
+
         assert!(store.get(&id).await.is_none());
+        let arrays = crate::bun::task_array_leader::read_standalone(&service).await;
+        assert!(arrays.jobs().definition(&namespace, "cron").is_none());
+        let (_, deployment) = arrays.deployments().next().unwrap();
+        assert!(deployment.cancelled);
+    }
+
+    /// Without the task arrays a job lease can't prove its jobs stopped, so
+    /// its record stays for a later attempt.
+    #[tokio::test]
+    async fn node_job_cleanup_without_task_arrays_keeps_the_lease() {
+        let store = LocalLeaseStore::in_memory();
+        let record = node_job_lease(10, 100);
+        let id = record.lease_id.clone();
+        let namespace = record.namespace.clone();
+        store.create(record).await.unwrap();
+        drop(
+            store
+                .begin_job_operation(&id, "token:ci", vec![AppId::new("cron", &namespace)], 20)
+                .await
+                .unwrap(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        assert!(matches!(
+            cleanup_local_lease(&store, &tx, None, &id, None).await,
+            Err(LeaseError::Cleanup(_))
+        ));
+        assert!(store.get(&id).await.is_some());
     }
 
     #[tokio::test]
-    async fn node_job_lease_reaper_recovers_after_restart_and_lost_retirement_reply() {
-        use crate::bun::agent::AgentCommand;
+    async fn node_job_lease_reaper_recovers_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node-test-leases.json");
         let store = LocalLeaseStore::open(path.clone()).await.unwrap();
         let record = node_job_lease(10, 100);
         let id = record.lease_id.clone();
-        let job_id = AppId::new("cron", &record.namespace);
+        let namespace = record.namespace.clone();
+        let job_id = AppId::new("cron", &namespace);
         store.create(record).await.unwrap();
         assert!(matches!(
             store
@@ -1550,46 +1727,11 @@ mod tests {
         drop(operation);
         drop(store);
         let store = LocalLeaseStore::open(path.clone()).await.unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let service = leased_job_arrays(&namespace).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let reaper = spawn_local_lease_reaper(store.clone(), tx, shutdown.clone());
-        let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let AgentCommand::RetireTestResources {
-            app_name,
-            namespace,
-            response,
-        } = first
-        else {
-            panic!("expected retirement")
-        };
-        assert_eq!(
-            (app_name, namespace),
-            (job_id.name.clone(), job_id.namespace.clone())
-        );
-        drop(response);
-        let retry = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let persisted = LocalLeaseStore::open(path.clone())
-            .await
-            .unwrap()
-            .get(&id)
-            .await
-            .unwrap();
-        assert!(matches!(persisted.state, TestLeaseState::Cleaning { .. }));
-        assert!(
-            persisted
-                .resources
-                .contains(&LeasedResource::Job { job_id })
-        );
-        let AgentCommand::RetireTestResources { response, .. } = retry else {
-            panic!("expected retry")
-        };
-        response.send(Ok(())).unwrap();
+        let reaper =
+            spawn_local_lease_reaper(store.clone(), tx, Some(service.clone()), shutdown.clone());
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while store.get(&id).await.is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1599,6 +1741,13 @@ mod tests {
         .unwrap();
         shutdown.cancel();
         reaper.await.unwrap();
+        assert!(
+            crate::bun::task_array_leader::read_standalone(&service)
+                .await
+                .jobs()
+                .definition(&namespace, "cron")
+                .is_none()
+        );
         assert!(
             LocalLeaseStore::open(path)
                 .await
@@ -1755,7 +1904,7 @@ mod tests {
             .unwrap();
         let (commands, _receiver) = tokio::sync::mpsc::channel(1);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let reaper = spawn_local_lease_reaper(store.clone(), commands, shutdown.clone());
+        let reaper = spawn_local_lease_reaper(store.clone(), commands, None, shutdown.clone());
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while store.get("b").await.is_some() {
                 tokio::task::yield_now().await;
@@ -1873,7 +2022,7 @@ mod tests {
         let reopened = LocalLeaseStore::open(path).await.unwrap();
         let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = spawn_local_lease_reaper(reopened.clone(), command_tx, shutdown.clone());
+        let task = spawn_local_lease_reaper(reopened.clone(), command_tx, None, shutdown.clone());
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if reopened.get("abc").await.is_none() {

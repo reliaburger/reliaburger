@@ -1818,7 +1818,7 @@ That bound still had a hole: it assumed nothing else held the owner's reconcile 
 
 What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
 
-Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 run on the node that received them, so their leases live on that node (`scope = "node_jobs"`) and a local reaper retires both running jobs and cron registrations that haven't fired yet. Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
+Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 ran on the node that received them, so their leases lived on that node (`scope = "node_jobs"`) and a local reaper retired both running jobs and cron registrations that hadn't fired yet. In 0.2.0 every job takes the common job lifecycle, so a job lease lives in Raft with a council and its cleanup cancels the jobs' runs and forgets their definitions (Chapter 12). Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
 
 One last trap. The reaper used to wait on each lease's operation lock in turn, so a single lease still being deployed stopped every other expired lease from being cleaned. It now asks without queueing:
 
@@ -5559,7 +5559,6 @@ agent/networking.rs      network references and egress enforcement
 agent/routing.rs         eBPF maps, the service catalogue, the routing table
 agent/faults.rs          chaos faults on this node
 agent/trace.rs           `relish trace`
-agent/job_runs.rs        the job ledger and cron jobs
 agent/records.rs         durable instance records and adoption
 agent/health_checks.rs   probes and the exits the tick notices
 agent/retirement.rs      killing, cleaning up, shutting down
