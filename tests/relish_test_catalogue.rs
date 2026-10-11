@@ -64,6 +64,9 @@ fn start_secure_process_node(root: &std::path::Path) -> SecureNode {
     node.images.registry_port = 0;
     node.process_workloads.allowed_binaries =
         vec!["/bin/sh".into(), "/bin/sleep".into(), "/bin/true".into()];
+    // Host jobs run as task arrays, which refuse to start under mount
+    // isolation (on by default on Linux), so the jobs group runs unisolated.
+    node.process_workloads.mount_isolation = false;
     node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
     node.testing
         .allowed_operations
