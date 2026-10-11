@@ -1,4 +1,4 @@
-{"version": 3, "term": {"cols": 110, "rows": 32}, "timestamp": 1791053374, "idle_time_limit": 2.0, "title": "Reliaburger: the five-minute tour"}
+{"version": 3, "term": {"cols": 110, "rows": 32}, "timestamp": 1791053374, "idle_time_limit": 2.0, "title": "Reliaburger 0.1.4: the five-minute tour"}
 [0.019, "o", "\u001b[2m# The five-minute tour from reliaburger.com, on a real three-node laptop cluster,\u001b[0m\r\n"]
 [0.0, "o", "\u001b[2m# run by scripts/demo/tour.sh. It waits on the cluster's real state where the tour\u001b[0m\r\n\u001b[2m# says to wait, and says how long each wait took.\u001b[0m\r\n"]
 [0.0, "o", "\u001b[2m# This recording cuts idle time to 2 s, so those numbers are the real ones.\u001b[0m\r\n"]
