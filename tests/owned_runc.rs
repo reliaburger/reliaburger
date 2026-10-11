@@ -1776,7 +1776,7 @@ mod capacity_contract {
             fresh_capacity(&harness, council.current_term());
             let response = harness
                 .client
-                .submit_batch(&probe(name, cpu, memory))
+                .submit_batch(&probe(name, cpu, memory), None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1823,7 +1823,7 @@ mod capacity_contract {
             Duration::from_secs(20),
             harness
                 .client
-                .submit_batch(&probe("full-after-terminal", "8", "16Gi")),
+                .submit_batch(&probe("full-after-terminal", "8", "16Gi"), None),
         )
         .await
         .expect("released capacity admission did not settle")

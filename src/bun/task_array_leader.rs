@@ -1134,6 +1134,10 @@ mod tests {
                 script: None,
                 firewall: None,
                 egress: None,
+                max_attempts: None,
+                task_timeout_secs: None,
+                overlap: None,
+                replay_unknown: false,
             },
             state: TaskArrayState::new(
                 TaskArraySpec {

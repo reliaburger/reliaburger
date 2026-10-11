@@ -855,7 +855,10 @@ pub async fn batch_submit_handler(
         {
             return response;
         }
-        job.spec = definition.template;
+        // Admission binds the image and settles the namespace. Copy only
+        // those back: the run policy stays on the spec for `RegisterJobs`.
+        job.spec.image = definition.template.image;
+        job.spec.namespace = definition.template.namespace;
     }
     let request_id = match headers.get("idempotency-key") {
         Some(key) => match key.to_str() {
