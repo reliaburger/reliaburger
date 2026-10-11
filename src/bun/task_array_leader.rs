@@ -103,6 +103,8 @@ pub struct TaskArrayService {
     pub retention: Duration,
     /// Standalone copy of the arrays (unused with a council).
     local: Mutex<TaskArrays>,
+    /// The id counter for `local`. With a council the counter lives in Raft.
+    local_ids: Mutex<crate::meat::batch_ids::BatchIds>,
     /// What each node last said about each array, by batch id.
     views: Mutex<HashMap<u64, BTreeMap<NodeId, NodeView>>>,
     rates: Mutex<HashMap<u64, super::task_rates::RateSample>>,
@@ -164,6 +166,7 @@ impl TaskArrayService {
             silence_timeout,
             retention: Duration::from_secs(crate::meat::task_array_store::TERMINAL_RETENTION_SECS),
             local: Mutex::new(TaskArrays::default()),
+            local_ids: Mutex::new(crate::meat::batch_ids::BatchIds::default()),
             views: Mutex::new(HashMap::new()),
             rates: Mutex::new(HashMap::new()),
             job_notifier: None,
@@ -295,69 +298,9 @@ async fn commit_task_array(
     state: &ApiState,
     mut write: TaskArrayWrite,
 ) -> Result<Committed, TaskArrayWriteError> {
-    write.stamp(crate::meat::batch_tracker::epoch_now_secs());
+    write.stamp(crate::meat::batch_ids::epoch_now_secs());
     let Some(council) = &state.council else {
-        if state.task_arrays.require_council {
-            return Err(TaskArrayWriteError::Unavailable(
-                "delegated arrays require a council for durable definitions and identities".into(),
-            ));
-        }
-        if let Some(store) = &state.task_arrays.standalone {
-            if state
-                .task_arrays
-                .storage_fenced
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(TaskArrayWriteError::Unavailable(
-                    "standalone publication timed out; restart and reconcile".into(),
-                ));
-            }
-            let store = Arc::clone(store);
-            let publication = tokio::task::spawn_blocking(move || {
-                let mut store = store.lock().map_err(|_| {
-                    TaskArrayWriteError::Unavailable("job store lock poisoned".into())
-                })?;
-                store.apply(&write).map(Committed::from).map_err(|error| {
-                    if store.ready() {
-                        TaskArrayWriteError::Refused(error)
-                    } else {
-                        TaskArrayWriteError::Unavailable(error)
-                    }
-                })
-            });
-            return match tokio::time::timeout(WRITE_TIMEOUT, publication).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    state
-                        .task_arrays
-                        .storage_fenced
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Err(TaskArrayWriteError::Unavailable(error.to_string()))
-                }
-                Err(_) => {
-                    state
-                        .task_arrays
-                        .storage_fenced
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Err(TaskArrayWriteError::Unavailable(
-                        "standalone publication timed out; admission and dispatch are fenced"
-                            .into(),
-                    ))
-                }
-            };
-        }
-        let mut tracker = state.batch_tracker.lock().await;
-        let mut arrays = state.task_arrays.local.lock().await;
-        let ids = arrays
-            .planned_ids(&write)
-            .map_err(|error| TaskArrayWriteError::Refused(error.to_string()))?;
-        tracker
-            .preflight_ids(ids)
-            .map_err(TaskArrayWriteError::Refused)?;
-        return arrays
-            .apply(&write, || tracker.allocate_id())
-            .map(Committed::from)
-            .map_err(|error| TaskArrayWriteError::Refused(error.to_string()));
+        return commit_standalone(&state.task_arrays, write).await;
     };
     let written = tokio::time::timeout(
         WRITE_TIMEOUT,
@@ -376,6 +319,96 @@ async fn commit_task_array(
         Ok(_) => Ok(TaskArrayApplied::JobRecorded.into()),
         Err(error) => Err(TaskArrayWriteError::Unavailable(error.to_string())),
     }
+}
+
+/// Commit a write to a standalone node's own arrays. Returns the new id for
+/// a registration.
+pub(crate) async fn write_standalone(
+    service: &TaskArrayService,
+    write: TaskArrayWrite,
+) -> Result<Option<u64>, TaskArrayWriteError> {
+    Ok(commit_standalone(service, write).await?.registered)
+}
+
+async fn commit_standalone(
+    service: &TaskArrayService,
+    mut write: TaskArrayWrite,
+) -> Result<Committed, TaskArrayWriteError> {
+    write.stamp(crate::meat::batch_ids::epoch_now_secs());
+    if service.require_council {
+        return Err(TaskArrayWriteError::Unavailable(
+            "delegated arrays require a council for durable definitions and identities".into(),
+        ));
+    }
+    if let Some(store) = &service.standalone {
+        if service
+            .storage_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(TaskArrayWriteError::Unavailable(
+                "standalone publication timed out; restart and reconcile".into(),
+            ));
+        }
+        let store = Arc::clone(store);
+        let publication = tokio::task::spawn_blocking(move || {
+            let mut store = store
+                .lock()
+                .map_err(|_| TaskArrayWriteError::Unavailable("job store lock poisoned".into()))?;
+            store.apply(&write).map(Committed::from).map_err(|error| {
+                if store.ready() {
+                    TaskArrayWriteError::Refused(error)
+                } else {
+                    TaskArrayWriteError::Unavailable(error)
+                }
+            })
+        });
+        return match tokio::time::timeout(WRITE_TIMEOUT, publication).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                service
+                    .storage_fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Err(TaskArrayWriteError::Unavailable(error.to_string()))
+            }
+            Err(_) => {
+                service
+                    .storage_fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Err(TaskArrayWriteError::Unavailable(
+                    "standalone publication timed out; admission and dispatch are fenced".into(),
+                ))
+            }
+        };
+    }
+    let mut batch_ids = service.local_ids.lock().await;
+    let mut arrays = service.local.lock().await;
+    let ids = arrays
+        .planned_ids(&write)
+        .map_err(|error| TaskArrayWriteError::Refused(error.to_string()))?;
+    batch_ids
+        .preflight(ids)
+        .map_err(TaskArrayWriteError::Refused)?;
+    arrays
+        .apply(&write, || batch_ids.allocate())
+        .map(Committed::from)
+        .map_err(|error| TaskArrayWriteError::Refused(error.to_string()))
+}
+
+/// A standalone node's arrays.
+pub(crate) async fn read_standalone(service: &TaskArrayService) -> TaskArrays {
+    if let Some(store) = &service.standalone {
+        let store = Arc::clone(store);
+        return tokio::task::spawn_blocking(move || {
+            store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .arrays()
+                .clone()
+        })
+        .await
+        .unwrap_or_default();
+    }
+    service.local.lock().await.clone()
 }
 
 /// The current arrays, copied: the replicated copy with a council, the
@@ -710,15 +743,12 @@ pub struct DueSchedule {
 }
 
 /// The schedules that match `at` (UTC minute `minute`) and haven't fired
-/// for it yet, at most [`MAX_FIRES_PER_TICK`]. Schedules a pending
-/// deployment `blocked` are left out *before* the limit, so they can't use
-/// up the places. The list starts after `cursor` (the last key fired) and
+/// for it yet, at most [`MAX_FIRES_PER_TICK`]. The list starts after `cursor` (the last key fired) and
 /// wraps round, so a long list takes turns instead of starving its tail.
 pub fn due_schedules(
     arrays: &TaskArrays,
     at: time::OffsetDateTime,
     minute: i64,
-    blocked: impl Fn(&str, &str) -> bool,
     cursor: Option<&str>,
 ) -> Vec<DueSchedule> {
     let due: Vec<DueSchedule> = arrays
@@ -733,7 +763,7 @@ pub fn due_schedules(
         })
         .filter_map(|(key, record)| {
             let (namespace, name) = key.split_once('/')?;
-            (!blocked(name, namespace)).then(|| DueSchedule {
+            Some(DueSchedule {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
                 revision: record.revision,
@@ -786,6 +816,57 @@ pub fn refusing_holders(
         })
         .map(|(node, _)| node.clone())
         .collect()
+}
+
+/// Most distinct node reasons an unrunnable run's reason quotes.
+const MAX_UNRUNNABLE_REASONS: usize = 3;
+
+/// Why `record` should fail now because no node can run it, or `None`
+/// while some node still might. That is when nothing holds its chunks,
+/// something is still queued, and every node in `eligible` answered about
+/// it this tick with a refusal from its own configuration
+/// ([`ArrayProgress::unrunnable`]), such as a host array on nodes with
+/// `mount_isolation` on (#714). Without this the run would stay queued
+/// until its deadline, or for ever if it has none.
+pub fn unrunnable_reason(
+    record: &TaskArrayRecord,
+    answers: &[(NodeId, &ArrayProgress)],
+    eligible: &BTreeSet<NodeId>,
+) -> Option<String> {
+    if eligible.is_empty()
+        || record.state.stop_reason().is_some()
+        || record.state.queued().is_empty()
+        || record.state.holders().next().is_some()
+    {
+        return None;
+    }
+    let mut reasons = BTreeSet::new();
+    for node in eligible {
+        let (_, progress) = answers.iter().find(|(answered, _)| answered == node)?;
+        if !progress.unrunnable {
+            return None;
+        }
+        reasons.insert(progress.refused.as_deref()?);
+    }
+    let mut quoted: Vec<String> = reasons
+        .iter()
+        .take(MAX_UNRUNNABLE_REASONS)
+        .map(|reason| {
+            // Keep the write under the store's limit whatever a node says.
+            let mut end = reason.len().min(256);
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason[..end].to_string()
+        })
+        .collect();
+    if reasons.len() > MAX_UNRUNNABLE_REASONS {
+        quoted.push(format!(
+            "and {} more",
+            reasons.len() - MAX_UNRUNNABLE_REASONS
+        ));
+    }
+    Some(format!("no node can run it: {}", quoted.join("; ")))
 }
 
 /// One node's answer to a sync call, with the `known` list it was sent.
@@ -850,12 +931,17 @@ pub struct TickInputs<'a> {
     pub silence: Duration,
     /// The leader's wall clock, for the writes.
     pub now_epoch_secs: u64,
+    /// Nodes that could take work: every node the leader syncs whose last
+    /// call didn't fail. A run fails as unrunnable only once each of them
+    /// has refused it for good.
+    pub eligible: BTreeSet<NodeId>,
 }
 
 /// Every progress write one tick makes, for every running array, in the
 /// order they must apply: a lost holder's `Requeue` (or `Unknown`, for runs
 /// that need acknowledged replay) first, then the array's `Sync`, then its
-/// quota note. [`tick_entries`] commits them as one entry. With `budget`,
+/// quota note. A run no eligible node can run gets one `Unrunnable` write
+/// instead (see [`unrunnable_reason`]). [`tick_entries`] commits them as one entry. With `budget`,
 /// grants stay within namespace quotas (see [`GrantBudget`]).
 pub fn plan_tick(
     arrays: &TaskArrays,
@@ -875,6 +961,14 @@ pub fn plan_tick(
                     .map(|progress| (node.clone(), progress))
             })
             .collect();
+        if let Some(reason) = unrunnable_reason(record, &for_array, &inputs.eligible) {
+            writes.push(TaskArrayWrite::Unrunnable {
+                batch_id,
+                reason,
+                now_epoch_secs: inputs.now_epoch_secs,
+            });
+            continue;
+        }
         let run = arrays.jobs().run(batch_id);
         let replay_unknown = run.is_none_or(|run| run.replay_unknown);
         let mut lost = silent_holders(
@@ -954,7 +1048,7 @@ async fn report_run_changes(state: &ApiState, tracker: &mut super::job_events::J
     if changes.is_empty() {
         return;
     }
-    let now = crate::meat::batch_tracker::epoch_now_secs();
+    let now = crate::meat::batch_ids::epoch_now_secs();
     for change in changes {
         let message = change.message();
         let (kind, severity) = change.event_kind();
@@ -1042,7 +1136,7 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
 }
 
 async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
-    let now = crate::meat::batch_tracker::epoch_now_secs();
+    let now = crate::meat::batch_ids::epoch_now_secs();
     let Ok(minute) = i64::try_from(now / 60) else {
         return;
     };
@@ -1052,20 +1146,7 @@ async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
     };
     let after = cursor.clone();
     let Some((observed, due)) = read_control(state, move |view| {
-        let due = due_schedules(
-            view.arrays,
-            at,
-            minute,
-            |name, namespace| {
-                view.desired.is_some_and(|desired| {
-                    desired
-                        .prerequisite_claims
-                        .values()
-                        .any(|claim| claim.blocks(name, namespace))
-                })
-            },
-            after.as_deref(),
-        );
+        let due = due_schedules(view.arrays, at, minute, after.as_deref());
         (view.arrays.cron_observed_minute(), due)
     })
     .await
@@ -1212,7 +1293,7 @@ fn sync_round(view: ControlView<'_>, targets: Vec<(NodeId, Option<String>)>) -> 
 /// idle cluster forgets them too. Workers delete a run's files once the
 /// leader stops listing it. Nothing is written while nothing is due.
 async fn prune_retired_runs(state: &ApiState) {
-    let now = crate::meat::batch_tracker::epoch_now_secs();
+    let now = crate::meat::batch_ids::epoch_now_secs();
     let retention_secs = state.task_arrays.retention.as_secs();
     let expired = read_control(state, move |view| {
         view.arrays.has_expired(now, retention_secs)
@@ -1243,6 +1324,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     let now = Instant::now();
     let since = *memory.since.get_or_insert(now);
     let targets = sync_targets(state).await;
+    let target_nodes: Vec<NodeId> = targets.iter().map(|(node, _)| node.clone()).collect();
     let Some(mut round) = read_control(state, move |view| sync_round(view, targets)).await else {
         return;
     };
@@ -1318,9 +1400,16 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                 .map(|(node, view)| ((*batch_id, node.clone()), view.slots))
         })
         .collect();
+    // A node whose calls fail can't take work, so it doesn't hold a run
+    // open; one whose call is merely still out does, until it answers or
+    // times out.
+    let eligible: BTreeSet<NodeId> = target_nodes
+        .into_iter()
+        .filter(|node| !memory.failing.contains(node))
+        .collect();
     let last_heard = memory.last_heard.clone();
     let silence = state.task_arrays.silence_timeout;
-    let now_epoch_secs = crate::meat::batch_tracker::epoch_now_secs();
+    let now_epoch_secs = crate::meat::batch_ids::epoch_now_secs();
     // Plan under the state's read lock: nothing is copied but each array's
     // state, and only for arrays that finished a chunk.
     let Some(writes) = read_control(state, move |view| {
@@ -1339,6 +1428,7 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             now,
             silence,
             now_epoch_secs,
+            eligible,
         };
         plan_tick(view.arrays, budget.as_mut(), &inputs)
     })
@@ -1436,6 +1526,7 @@ mod tests {
         TaskArrayRecord {
             terminal_at_epoch_secs: None,
             quota_blocked: None,
+            unrunnable: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: JobSpec {
@@ -1477,6 +1568,7 @@ mod tests {
             batch_id: 1,
             slots,
             refused: None,
+            unrunnable: false,
             finished,
             counters: NodeArrayCounters::default(),
         }
@@ -1734,27 +1826,17 @@ mod tests {
     }
 
     #[test]
-    fn blocked_schedules_do_not_starve_later_ones() {
-        let (arrays, at) = twenty_schedules();
-        // A pending deployment blocks the first sixteen. Picking sixteen
-        // before checking would leave nothing to fire all minute.
-        let blocked = |name: &str, _: &str| name < "job-16";
-        let due = due_schedules(&arrays, at, 3, blocked, None);
-        assert_eq!(names(&due), ["job-16", "job-17", "job-18", "job-19"]);
-    }
-
-    #[test]
     fn due_schedules_take_turns_after_the_last_one_fired() {
         let (arrays, at) = twenty_schedules();
-        let first = due_schedules(&arrays, at, 3, |_, _| false, None);
+        let first = due_schedules(&arrays, at, 3, None);
         assert_eq!(first.len(), MAX_FIRES_PER_TICK);
         assert_eq!(first[0].name, "job-00");
-        let next = due_schedules(&arrays, at, 3, |_, _| false, Some("default/job-15"));
+        let next = due_schedules(&arrays, at, 3, Some("default/job-15"));
         assert_eq!(
             names(&next[..6]),
             ["job-16", "job-17", "job-18", "job-19", "job-00", "job-01"]
         );
-        assert!(due_schedules(&arrays, at, 2, |_, _| false, None).is_empty());
+        assert!(due_schedules(&arrays, at, 2, None).is_empty());
     }
 
     fn quota_namespaces(cpu: &str) -> BTreeMap<String, crate::config::NamespaceSpec> {
@@ -1854,6 +1936,7 @@ mod tests {
                     batch_id,
                     slots,
                     refused: None,
+                    unrunnable: false,
                     finished: record
                         .state
                         .held_by(node)
@@ -1879,7 +1962,135 @@ mod tests {
             now,
             silence: SILENCE_TIMEOUT,
             now_epoch_secs: 7,
+            eligible: answers.iter().map(|(node, _)| node.clone()).collect(),
         }
+    }
+
+    /// A node's answer refusing every running array for `reason`;
+    /// `for_good` says whether the refusal is the node's configuration.
+    fn refusal_for(arrays: &TaskArrays, reason: &str, for_good: bool) -> NodeSyncResponse {
+        NodeSyncResponse {
+            arrays: arrays
+                .active()
+                .map(|(batch_id, _)| ArrayProgress {
+                    unrunnable: for_good,
+                    ..refused_progress(batch_id, reason)
+                })
+                .collect(),
+        }
+    }
+
+    fn refused_progress(batch_id: u64, reason: &str) -> ArrayProgress {
+        ArrayProgress {
+            batch_id,
+            slots: 0,
+            refused: Some(reason.to_string()),
+            unrunnable: false,
+            finished: Vec::new(),
+            counters: NodeArrayCounters::default(),
+        }
+    }
+
+    const ISOLATION: &str = "task arrays don't run under [process_workloads] mount_isolation yet";
+
+    #[test]
+    fn a_run_every_eligible_node_refuses_for_good_fails_with_the_reason() {
+        let mut arrays = running_arrays(1);
+        let answers = [
+            (node("a"), refusal_for(&arrays, ISOLATION, true)),
+            (node("b"), refusal_for(&arrays, ISOLATION, true)),
+        ];
+        let heard = HashMap::new();
+        let writes = plan_tick(&arrays, None, &inputs(&answers, &heard));
+        let [
+            TaskArrayWrite::Unrunnable {
+                batch_id: 1,
+                reason,
+                now_epoch_secs: 7,
+            },
+        ] = &writes[..]
+        else {
+            panic!("expected one unrunnable write, got {writes:?}");
+        };
+        assert!(reason.starts_with("no node can run it"), "{reason}");
+        assert_eq!(reason.matches(ISOLATION).count(), 1, "{reason}");
+        for entry in tick_entries(writes) {
+            arrays.apply(&entry, || 0).unwrap();
+        }
+        let record = arrays.get(1).unwrap();
+        assert_eq!(
+            record.state.status(),
+            crate::meat::task_array_state::TaskArrayStatus::Failed
+        );
+        assert!(record.unrunnable.as_deref().unwrap().contains(ISOLATION));
+    }
+
+    #[test]
+    fn a_run_waits_while_any_eligible_node_could_still_take_it() {
+        let arrays = running_arrays(1);
+        let heard = HashMap::new();
+        let unrunnable = |writes: &[TaskArrayWrite]| {
+            writes
+                .iter()
+                .any(|write| matches!(write, TaskArrayWrite::Unrunnable { .. }))
+        };
+        // One node refuses, another offers slots.
+        let answers = [
+            (node("a"), refusal_for(&arrays, ISOLATION, true)),
+            (node("b"), answer_for(&arrays, &node("b"), 4)),
+        ];
+        assert!(!unrunnable(&plan_tick(
+            &arrays,
+            None,
+            &inputs(&answers, &heard)
+        )));
+        // One node refuses, another hasn't answered yet.
+        let answers = [(node("a"), refusal_for(&arrays, ISOLATION, true))];
+        let mut tick = inputs(&answers, &heard);
+        tick.eligible.insert(node("slow"));
+        assert!(!unrunnable(&plan_tick(&arrays, None, &tick)));
+        // A passing fault, not the node's configuration.
+        let answers = [(
+            node("a"),
+            refusal_for(&arrays, "can't open the task ledger", false),
+        )];
+        assert!(!unrunnable(&plan_tick(
+            &arrays,
+            None,
+            &inputs(&answers, &heard)
+        )));
+        // Nobody answered at all.
+        assert!(!unrunnable(&plan_tick(&arrays, None, &inputs(&[], &heard))));
+    }
+
+    #[test]
+    fn a_refusing_holder_is_requeued_before_its_run_is_failed() {
+        let mut arrays = running_arrays(1);
+        let heard = HashMap::new();
+        let first = [(node("a"), answer_for(&arrays, &node("a"), 10))];
+        for entry in tick_entries(plan_tick(&arrays, None, &inputs(&first, &heard))) {
+            arrays.apply(&entry, || 0).unwrap();
+        }
+        // "a" now holds chunks, then its allowlist changes.
+        let answers = [(node("a"), refusal_for(&arrays, ISOLATION, true))];
+        let writes = plan_tick(&arrays, None, &inputs(&answers, &heard));
+        assert!(
+            matches!(&writes[..], [TaskArrayWrite::Requeue { .. }, ..]),
+            "{writes:?}"
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|write| matches!(write, TaskArrayWrite::Unrunnable { .. }))
+        );
+        for entry in tick_entries(writes) {
+            arrays.apply(&entry, || 0).unwrap();
+        }
+        let writes = plan_tick(&arrays, None, &inputs(&answers, &heard));
+        assert!(
+            matches!(&writes[..], [TaskArrayWrite::Unrunnable { .. }]),
+            "{writes:?}"
+        );
     }
 
     #[test]

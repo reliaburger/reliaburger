@@ -1611,13 +1611,17 @@ async fn exec_workload_is_held_to_its_namespace() {
             path = results.display()
         )
     };
-    // A run-to-completion host job, so no owned process outlives the test.
-    let script = format!("{}; {}", probe(foreign, "foreign"), probe(own, "own"));
+    // A host app the agent deploys itself (jobs run as task arrays). It
+    // probes, then idles until the test stops it.
+    let script = format!(
+        "{}; {}; exec sleep 300",
+        probe(foreign, "foreign"),
+        probe(own, "own")
+    );
     let config = Config::parse(&format!(
         r#"
-        [job.{name}]
+        [app.{name}]
         namespace = "tenant"
-        runtime = "process"
         exec = "/bin/bash"
         command = ["-c", {script:?}]
     "#
@@ -1642,6 +1646,17 @@ async fn exec_workload_is_held_to_its_namespace() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    // Stop the app before the agent, so no owned process outlives the test.
+    let (reply, stopped) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::Stop {
+            app_name: name.clone(),
+            namespace: "tenant".into(),
+            response: reply,
+        })
+        .await
+        .unwrap();
+    stopped.await.unwrap().unwrap();
     shutdown.cancel();
     {
         let mut e = ebpf.lock().await;
@@ -1756,80 +1771,19 @@ async fn egress_allowlist_still_resolves_dns() {
     assert!(denied(&elsewhere), "unlisted destination: {elsewhere:?}");
 }
 
-/// D26: a job's allowlist is programmed before it starts, like an app's, on
-/// both the agent's job path and a delegated task's lease, and retiring the
-/// task lifts it.
+/// D26: a job's allowlist is programmed on its delegated task's lease before
+/// the task starts, and retiring the task lifts it. Every job runs as a task
+/// array, so there is no separate agent job path to check.
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn job_egress_allowlist_is_enforced() {
-    use reliaburger::bun::agent::AgentCommand;
     use reliaburger::bun::task_namespace::{DelegatedNetwork, TaskNamespacePolicy};
-    use reliaburger::config::Config;
-    use reliaburger::grill::mock::MockGrill;
-    use reliaburger::grill::port::PortAllocator;
     use reliaburger::sesame::egress::{self, exact_v4_key};
     use std::sync::Arc;
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::Mutex;
 
     let ebpf = Arc::new(Mutex::new(load_ebpf()));
     let allowed = Ipv4Addr::new(203, 0, 113, 9);
-
-    // A job the agent runs.
-    let grill = MockGrill::new();
-    grill.set_honours_cgroup_path(true);
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let shutdown = CancellationToken::new();
-    let volumes = TestVolumes::new();
-    let name = root_app_name("fetch", volumes.path());
-    let _cgroups = AppCgroups::new("default", &name);
-    let mut agent = test_agent(
-        grill.clone(),
-        PortAllocator::new(42800, 42900),
-        cmd_rx,
-        shutdown.clone(),
-        volumes.path(),
-    );
-    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
-    tokio::spawn(async move { agent.run().await });
-    let config = Config::parse(&format!(
-        r#"
-        [job.{name}]
-        image = "mock:image"
-        command = ["fetch"]
-
-        [job.{name}.egress]
-        allow = ["{allowed}:443"]
-    "#
-    ))
-    .unwrap();
-    let (events, mut event_rx) = mpsc::channel(64);
-    cmd_tx
-        .send(AgentCommand::Deploy { config, events })
-        .await
-        .unwrap();
-    while let Some(event) = event_rx.recv().await {
-        assert!(
-            !matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }),
-            "job deploy failed: {event:?}"
-        );
-    }
-    let job_cgroup = egress::cgroup_id_of_path(&reliaburger::grill::cgroup::cgroup_path(
-        "default", &name, 0,
-    ))
-    .expect("the agent prepared the job's cgroup before start");
-    {
-        let mut e = ebpf.lock().await;
-        let enforced = egress::egress_enforced(&mut e.bpf, job_cgroup).unwrap();
-        let listed =
-            egress::egress_allowed(&mut e.bpf, exact_v4_key(job_cgroup, allowed, 443)).unwrap();
-        egress::delete_cgroup_egress_state(&mut e.bpf, job_cgroup).unwrap();
-        assert!(enforced && listed, "the job started without its allowlist");
-    }
-    let calls = grill.calls();
-    let created = calls.iter().position(|(op, _)| op == "create");
-    let started = calls.iter().position(|(op, _)| op == "start");
-    assert!(created.is_some() && created < started);
-    shutdown.cancel();
 
     // A delegated task: its lease programs the task cgroup and lifts it.
     let data = tempfile::tempdir().unwrap();
@@ -4196,14 +4150,14 @@ async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership()
     assert!(backend.is_none());
 }
 
-async fn assert_source_policy_precedes_start(job: bool) {
+async fn assert_source_policy_precedes_start() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
     use reliaburger::grill::{mock::MockGrill, port::PortAllocator};
     use reliaburger::sesame::{egress, firewall};
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc, oneshot};
     assert!(ebpf_tests_enabled());
-    let kind = if job { "job" } else { "app" };
+    let kind = "app";
     let root = tempfile::tempdir().unwrap();
     let name = root_app_name(&format!("source-before-{kind}"), root.path());
     let target_name = root_app_name(&format!("source-target-{kind}"), root.path());
@@ -4356,13 +4310,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn source_policy_precedes_portless_application_start() {
-    assert_source_policy_precedes_start(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
-async fn source_policy_precedes_job_start() {
-    assert_source_policy_precedes_start(true).await;
+    assert_source_policy_precedes_start().await;
 }
 
 #[tokio::test]

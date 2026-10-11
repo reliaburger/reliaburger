@@ -23,14 +23,12 @@ pub mod gpu;
 pub mod health;
 pub mod host_paths;
 pub mod job_events;
-pub(crate) mod jobs;
 pub mod loop_meter;
 pub mod namespace_keys;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
 pub mod reusable_executor;
-mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod task_array_api;
@@ -233,9 +231,6 @@ pub enum BunError {
     #[error("self-upgrade is not available on this node (no upgrade manager)")]
     UpgradesUnavailable,
 }
-
-#[cfg(test)]
-mod job_lifecycle_tests;
 
 pub mod job_api;
 /// Common deployment admission and durable hook settlement.

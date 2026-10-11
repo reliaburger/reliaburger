@@ -57,6 +57,9 @@ pub const MAX_ACTIVE_RUNS_PER_NAMESPACE: usize = 64;
 /// the leader splits a larger one across entries.
 pub const MAX_TICK_WRITES: usize = 1024;
 
+/// Longest reason an [`TaskArrayWrite::Unrunnable`] write may record.
+pub const MAX_UNRUNNABLE_REASON_BYTES: usize = 1024;
+
 /// Most named jobs in one finite batch (`relish batch` with several jobs).
 pub const MAX_FINITE_BATCH_JOBS: usize = 64;
 
@@ -77,6 +80,10 @@ pub struct TaskArrayRecord {
     /// is used up. Cleared once a grant fits again or the run finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_blocked: Option<crate::meat::quota::QuotaError>,
+    /// Why the run failed without starting: every node refused it for
+    /// good (see [`TaskArrayWrite::Unrunnable`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrunnable: Option<String>,
 }
 
 /// One homogeneous resource profile in a mixed submission.
@@ -284,8 +291,17 @@ pub enum TaskArrayWrite {
         batch_id: u64,
         reason: Option<crate::meat::quota::QuotaError>,
     },
+    /// Every node the leader can reach refused the array for good (its
+    /// allowlist, runtime or `mount_isolation`): fail it now, every queued
+    /// task not run, instead of leaving it queued until someone notices.
+    /// A run that has already stopped is left as it is.
+    Unrunnable {
+        batch_id: u64,
+        reason: String,
+        now_epoch_secs: u64,
+    },
     /// One leader tick's progress for every array, in one entry: `Sync`,
-    /// `Requeue`, `Unknown` and `QuotaBlocked` writes, at most
+    /// `Requeue`, `Unknown`, `Unrunnable` and `QuotaBlocked` writes, at most
     /// [`MAX_TICK_WRITES`]. Each applies on its own, so one refused array
     /// doesn't drop the others.
     Tick { writes: Vec<TaskArrayWrite> },
@@ -298,6 +314,7 @@ impl TaskArrayWrite {
             Self::Sync { batch_id, .. }
             | Self::Requeue { batch_id, .. }
             | Self::Unknown { batch_id, .. }
+            | Self::Unrunnable { batch_id, .. }
             | Self::QuotaBlocked { batch_id, .. } => Some(*batch_id),
             _ => None,
         }
@@ -310,6 +327,7 @@ impl TaskArrayWrite {
             Self::Sync { now_epoch_secs, .. }
             | Self::Cancel { now_epoch_secs, .. }
             | Self::Requeue { now_epoch_secs, .. }
+            | Self::Unrunnable { now_epoch_secs, .. }
             | Self::Replay { now_epoch_secs, .. }
             | Self::CancelManifest { now_epoch_secs, .. }
                 if *now_epoch_secs == 0 =>
@@ -827,6 +845,7 @@ impl TaskArrays {
                             state,
                             terminal_at_epoch_secs: None,
                             quota_blocked: None,
+                            unrunnable: None,
                         },
                     );
                     identities.push((cohort.name.clone(), id));
@@ -883,6 +902,7 @@ impl TaskArrays {
                     TaskArrayRecord {
                         terminal_at_epoch_secs: None,
                         quota_blocked: None,
+                        unrunnable: None,
                         name: name.clone(),
                         namespace: namespace.clone(),
                         template: (**template).clone(),
@@ -924,6 +944,24 @@ impl TaskArrays {
                 now_epoch_secs,
             } => {
                 self.record_mut(*batch_id)?.state.cancel();
+                self.mark_terminal(*batch_id, *now_epoch_secs)?;
+                Ok(TaskArrayApplied::Cancelled)
+            }
+            TaskArrayWrite::Unrunnable {
+                batch_id,
+                reason,
+                now_epoch_secs,
+            } => {
+                if reason.len() > MAX_UNRUNNABLE_REASON_BYTES {
+                    return Err(TaskArrayStoreError::Job(format!(
+                        "an unrunnable reason is at most {MAX_UNRUNNABLE_REASON_BYTES} bytes"
+                    )));
+                }
+                let record = self.record_mut(*batch_id)?;
+                if record.state.stop_reason().is_none() {
+                    record.state.refuse_unrunnable();
+                    record.unrunnable = Some(reason.clone());
+                }
                 self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Cancelled)
             }
@@ -1252,6 +1290,7 @@ impl TaskArrays {
                         state,
                         terminal_at_epoch_secs: None,
                         quota_blocked: None,
+                        unrunnable: None,
                     },
                 );
                 jobs.record_run(batch_id, run);
@@ -2246,6 +2285,68 @@ mod tests {
         assert_eq!(arrays.get(id).unwrap().quota_blocked, None);
     }
 
+    #[test]
+    fn a_run_no_node_can_run_fails_with_the_reason_in_one_tick() {
+        let mut arrays = TaskArrays::default();
+        let id = registered(&mut arrays, &register(4, 4, 1), 1);
+        let reason = "no node can run it: task arrays don't run under mount_isolation yet";
+        let applied = arrays
+            .apply(
+                &TaskArrayWrite::Tick {
+                    writes: vec![TaskArrayWrite::Unrunnable {
+                        batch_id: id,
+                        reason: reason.to_string(),
+                        now_epoch_secs: 7,
+                    }],
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(applied, TaskArrayApplied::Ticked { refused: vec![] });
+        let record = arrays.get(id).unwrap();
+        assert_eq!(record.state.status(), TaskArrayStatus::Failed);
+        assert_eq!(record.state.summary().not_run, 4);
+        assert_eq!(record.unrunnable.as_deref(), Some(reason));
+        assert_eq!(record.terminal_at_epoch_secs, Some(7));
+        let reopened: TaskArrays =
+            serde_json::from_value(serde_json::to_value(&arrays).unwrap()).unwrap();
+        assert_eq!(reopened, arrays);
+        // A repeat (a second leader's tick) changes nothing.
+        arrays
+            .apply(
+                &TaskArrayWrite::Unrunnable {
+                    batch_id: id,
+                    reason: "something else".into(),
+                    now_epoch_secs: 9,
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(arrays.get(id).unwrap().unrunnable.as_deref(), Some(reason));
+        assert_eq!(arrays.get(id).unwrap().terminal_at_epoch_secs, Some(7));
+    }
+
+    #[test]
+    fn an_unrunnable_write_with_an_oversized_reason_is_refused() {
+        let mut arrays = TaskArrays::default();
+        let id = registered(&mut arrays, &register(4, 4, 1), 1);
+        let error = arrays
+            .apply(
+                &TaskArrayWrite::Unrunnable {
+                    batch_id: id,
+                    reason: "x".repeat(MAX_UNRUNNABLE_REASON_BYTES + 1),
+                    now_epoch_secs: 7,
+                },
+                || 0,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("reason"), "{error}");
+        assert_eq!(
+            arrays.get(id).unwrap().state.status(),
+            TaskArrayStatus::Running
+        );
+    }
+
     /// The largest template admission accepts: big argv and environment.
     fn largest_template() -> JobSpec {
         let mut template = *template();
@@ -2315,6 +2416,7 @@ mod tests {
                 requested: u64::MAX,
                 limit: u64::MAX,
             }),
+            unrunnable: None,
         }
     }
 

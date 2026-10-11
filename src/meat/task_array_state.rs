@@ -55,6 +55,9 @@ pub enum StopReason {
     Cancelled,
     /// More indices failed for good than `max_failed_indexes` allows.
     TooManyFailures,
+    /// No node in the cluster can run it (its runtime, allowlist or
+    /// `mount_isolation` refuses the array), so it would never start.
+    Unrunnable,
 }
 
 /// Lifecycle of a task array, derived from its chunks and counts.
@@ -672,6 +675,12 @@ impl TaskArrayState {
         self.stop(StopReason::Cancelled);
     }
 
+    /// Fail the array because no node can run it: no more grants, queued
+    /// chunks count as not run. Keeps an earlier stop's reason.
+    pub fn refuse_unrunnable(&mut self) {
+        self.stop(StopReason::Unrunnable);
+    }
+
     fn stop(&mut self, reason: StopReason) {
         if self.stopped.is_some() {
             return;
@@ -705,7 +714,9 @@ impl TaskArrayState {
         match (self.stopped, drained) {
             (Some(_), false) => TaskArrayStatus::Stopping,
             (Some(StopReason::Cancelled), true) => TaskArrayStatus::Cancelled,
-            (Some(StopReason::TooManyFailures), true) => TaskArrayStatus::Failed,
+            (Some(StopReason::TooManyFailures | StopReason::Unrunnable), true) => {
+                TaskArrayStatus::Failed
+            }
             (None, false) => TaskArrayStatus::Running,
             (None, true) if self.failed == 0 => TaskArrayStatus::Succeeded,
             (None, true) => TaskArrayStatus::CompletedWithFailures,
@@ -1754,6 +1765,19 @@ mod tests {
         assert_eq!(state.stop_reason(), Some(StopReason::TooManyFailures));
         assert_eq!(state.status(), TaskArrayStatus::Failed);
         assert_eq!(state.summary().not_run, 900);
+    }
+
+    #[test]
+    fn an_array_no_node_can_run_fails_with_every_queued_task_not_run() {
+        let mut state = TaskArrayState::new(spec(250, 100), 1).unwrap();
+        state.refuse_unrunnable();
+        assert_eq!(state.stop_reason(), Some(StopReason::Unrunnable));
+        assert_eq!(state.status(), TaskArrayStatus::Failed);
+        assert_eq!(state.summary().not_run, 250);
+        assert!(state.queued().is_empty());
+        // A later cancel keeps the first reason.
+        state.cancel();
+        assert_eq!(state.stop_reason(), Some(StopReason::Unrunnable));
     }
 
     #[test]

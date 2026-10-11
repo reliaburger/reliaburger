@@ -349,7 +349,7 @@ async fn delegated_submissions_bind_before_registration_and_refuse_unresolved_im
                 );
             } else {
                 assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}: {body}");
-                assert_eq!(desired.batch_state.next_batch_id, 1);
+                assert_eq!(desired.batch_ids.next_batch_id, 1);
                 assert_eq!(desired.task_arrays.iter().count(), 0);
             }
             shutdown.cancel();
@@ -388,7 +388,7 @@ async fn delegated_submissions_honour_upstream_allowlist_before_registration() {
         let (status, body) = post(app, uri, &request.to_string()).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
         let desired = council.desired_state().await;
-        assert_eq!(desired.batch_state.next_batch_id, 1);
+        assert_eq!(desired.batch_ids.next_batch_id, 1);
         assert_eq!(desired.task_arrays.iter().count(), 0);
         shutdown.cancel();
         council.raft().shutdown().await.unwrap();
@@ -438,7 +438,7 @@ async fn delegated_submissions_refuse_a_required_cosign_check_without_a_signatur
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
         assert!(body.contains("cosign"), "{body}");
         let desired = council.desired_state().await;
-        assert_eq!(desired.batch_state.next_batch_id, 1);
+        assert_eq!(desired.batch_ids.next_batch_id, 1);
         assert_eq!(desired.task_arrays.iter().count(), 0);
         shutdown.cancel();
         council.raft().shutdown().await.unwrap();

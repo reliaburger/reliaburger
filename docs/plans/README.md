@@ -28,8 +28,6 @@ the detail is in the GitHub milestones and issues.
 | [Managed volume image identities](2026-10-03-managed-volume-image-identities.md) | Preserve full volume filenames and refuse overlapping storage artifacts. | #528 |
 | [Batch duplicate identities](2026-10-03-batch-duplicate-identities.md) | Refuse ambiguous duplicate labels before any batch dispatch. | #542 |
 | [Batch workload admission](2026-10-03-batch-workload-admission.md) | Enforce workload validation, scope and host-execution grants on batch submission. | #530 |
-| [Cluster migration prerequisites](2026-10-04-cluster-migration-prerequisites.md) | Execute migration gates before app desired-state writes, retaining operation ownership and refusing uncertain handovers. | [#534](https://github.com/reliaburger/reliaburger/issues/534) |
-| [Batch capacity reservations](2026-10-04-batch-capacity-reservations.md) | Shared, committed admission for app placements and batch executions, with unknown outcomes fenced across leader handover. | [#543](https://github.com/reliaburger/reliaburger/issues/543) |
 | [Persistent host job executors](2026-10-09-plan-host-job-executors.md) | Matched measurements, bounded native executors, event-driven cleanup and resource limits. | #640 |
 | [Reusable containers and throughput](2026-10-07-plan-reusable-executors-and-throughput.md) | Built-in command executors, matched throughput measurements, a prominent demo and sustained qualification. | [#639](https://github.com/reliaburger/reliaburger/issues/639), [#640](https://github.com/reliaburger/reliaburger/issues/640) |
 | [Common job lifecycle](2026-10-07-plan-common-job-lifecycle.md) | One durable definition/run/task/attempt path for singleton jobs, batches, cron and deployment hooks. | [#638](https://github.com/reliaburger/reliaburger/issues/638), implementation and validation |
@@ -59,3 +57,5 @@ is the summary of how that ended.
 
 - [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)
 - [A million jobs, the September design](archive/2026-09-28-plan-million-jobs.md): superseded by the October plans; its M8 targets are recorded, not gated, by every job qualification run (D18-C)
+- [Cluster migration prerequisites](archive/2026-10-04-cluster-migration-prerequisites.md): superseded in 0.2.0 when leased applies moved to the common job lifecycle and the prerequisite claims were retired (#681)
+- [Batch capacity reservations](archive/2026-10-04-batch-capacity-reservations.md): superseded in 0.2.0 when the leader's batch reservations were retired and app placement started counting job leases (#681)

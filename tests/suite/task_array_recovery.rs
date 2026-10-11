@@ -205,6 +205,7 @@ fn failed_only_results_discard_a_superseded_failure() {
     let record = TaskArrayRecord {
         terminal_at_epoch_secs: None,
         quota_blocked: None,
+        unrunnable: None,
         name: "review".into(),
         namespace: "default".into(),
         template,

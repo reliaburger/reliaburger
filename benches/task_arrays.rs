@@ -167,6 +167,7 @@ fn answers(arrays: &TaskArrays, nodes: usize) -> Vec<(NodeId, NodeSyncResponse)>
                         batch_id,
                         slots: 16,
                         refused: None,
+                        unrunnable: false,
                         finished: record
                             .state
                             .held_by(&node)
@@ -210,6 +211,7 @@ fn tick(arrays: &mut TaskArrays, answers: &[(NodeId, NodeSyncResponse)]) -> usiz
         now,
         silence: Duration::from_secs(30),
         now_epoch_secs: 2,
+        eligible: answers.iter().map(|(node, _)| node.clone()).collect(),
     };
     let entries = tick_entries(plan_tick(arrays, None, &inputs));
     for entry in &entries {

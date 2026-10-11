@@ -26,7 +26,7 @@ use super::task_array_leader::{NodeView, TaskArrayWriteError, read_task_arrays, 
 use super::task_array_node::{MAX_RESULT_ROWS, NodeSyncRequest, TaskArrayNodeError, TaskResultRow};
 use crate::config::job::JobSpec;
 use crate::meat::NodeId;
-use crate::meat::batch_tracker::epoch_now_secs;
+use crate::meat::batch_ids::epoch_now_secs;
 use crate::meat::task_array::{TaskArraySpec, validate_template};
 use crate::meat::task_array_store::{TaskArrayRecord, TaskArrayWrite};
 
@@ -202,6 +202,7 @@ pub async fn submit_handler(
         &request.name,
         &namespace,
         &mut definition,
+        None,
     )
     .await
     {
@@ -319,6 +320,7 @@ pub async fn manifest_handler(
             &request.name,
             &request.namespace,
             &mut definition,
+            None,
         )
         .await
         {
@@ -457,7 +459,7 @@ pub async fn cancel_handler(
             &record.name,
             &record.namespace,
             TaskArrayWrite::Cancel {
-                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
                 batch_id,
             },
         )
@@ -601,6 +603,7 @@ pub fn array_summary(
         "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
         "quota_blocked": record.quota_blocked,
         "quota_blocked_reason": record.quota_blocked.as_ref().map(ToString::to_string),
+        "unrunnable_reason": record.unrunnable,
     })
 }
 
@@ -1367,6 +1370,7 @@ mod tests {
             state,
             terminal_at_epoch_secs: Some(1),
             quota_blocked: None,
+            unrunnable: None,
         };
         let (start, end, owners) = result_window(&record, &ResultsQuery::default());
         assert_eq!(
@@ -1489,6 +1493,7 @@ mod tests {
         TaskArrayRecord {
             terminal_at_epoch_secs: None,
             quota_blocked: None,
+            unrunnable: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: template(),
@@ -1583,6 +1588,7 @@ mod tests {
             state,
             terminal_at_epoch_secs: Some(1),
             quota_blocked: None,
+            unrunnable: None,
         };
         let (_, _, owners) = result_window(&record, &ResultsQuery::default());
         assert_eq!(owners, None, "every node is asked");
@@ -1727,6 +1733,7 @@ mod tests {
             state,
             terminal_at_epoch_secs: Some(1),
             quota_blocked: None,
+            unrunnable: None,
         };
         let summary = array_summary(9, &record, &[]);
         assert_eq!(summary["retried"], 3);

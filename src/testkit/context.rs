@@ -352,20 +352,23 @@ impl TestContext {
     }
 
     /// TOML for a run-to-completion job in this test's namespace, running
-    /// `command` as a process workload (no image). Needs the `process`
-    /// runtime, same as [`Self::testapp_spec`].
+    /// `command` as a host process: its first element is the binary, the
+    /// rest its arguments. Jobs take the common job lifecycle, whose task
+    /// runners start host commands on any node but need runc for images.
     ///
     /// `JobSpec` has no `retries` field, so retry-count is not something a case
-    /// can configure — the agent's default backoff applies.
+    /// can configure; the run's default attempts apply.
     pub fn process_job_spec(&self, job: &str, command: &[&str]) -> String {
-        let argv = command
+        let (binary, arguments) = command.split_first().unwrap_or((&"/bin/true", &[]));
+        let argv = arguments
             .iter()
             .map(|arg| format!("\"{arg}\""))
             .collect::<Vec<_>>()
             .join(", ");
         format!(
             "[job.{job}]\n\
-             image = \"proc-grill:image-ignored\"\n\
+             runtime = \"process\"\n\
+             exec = \"{binary}\"\n\
              command = [{argv}]\n\
              namespace = \"{ns}\"\n",
             ns = self.namespace,
@@ -494,13 +497,19 @@ impl TestContext {
                 .status()
                 .await
                 .map_err(|error| format!("could not inspect cleanup on node {node}: {error}"))?;
-            all.extend(
-                statuses
-                    .into_iter()
-                    .filter(|instance| instance.namespace == self.namespace),
-            );
+            all.extend(statuses.into_iter().filter(|instance| {
+                instance.namespace == self.namespace && !Self::is_finished_run(instance)
+            }));
         }
         Ok(all)
+    }
+
+    /// A job run that has finished is retained history, not a live
+    /// workload: the cluster keeps its record for `relish batch` until
+    /// pruning, after its lease's cleanup has stopped it.
+    fn is_finished_run(instance: &InstanceStatus) -> bool {
+        instance.id.starts_with("run-")
+            && matches!(instance.state.as_str(), "stopped" | "failed" | "cancelled")
     }
 
     /// Wait until `app` has at least `replicas` running instances *anywhere in
@@ -544,6 +553,52 @@ impl TestContext {
             let waiting = format!(
                 "waiting for {app} to reach {what} cluster-wide; \
                  last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
+                last.len()
+            );
+            if self.deadline.remaining().is_zero() {
+                return Err(format!("timed out after {:?} {waiting}", self.timeout));
+            }
+            self.wait_note.record(waiting).await;
+            tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
+        }
+    }
+
+    /// Poll the cluster's job runs (`/v1/jobs?cluster=true`) until
+    /// `predicate` holds for `job`'s rows in this test's namespace.
+    ///
+    /// Jobs run through the common job lifecycle, so their runs are cluster
+    /// records the leader keeps, not instances in any one node's status.
+    pub async fn wait_for_job_runs<F>(
+        &self,
+        job: &str,
+        what: &str,
+        predicate: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(&[crate::bun::agent::JobStatus]) -> bool,
+    {
+        let mut last: Vec<crate::bun::agent::JobStatus> = Vec::new();
+        loop {
+            let last_error = match self.client.jobs().await {
+                Ok(view) => {
+                    last = view
+                        .jobs
+                        .into_iter()
+                        .map(|tagged| tagged.row)
+                        .filter(|row| row.name == job && row.namespace == self.namespace)
+                        .collect();
+                    if predicate(&last) {
+                        self.wait_note.clear().await;
+                        return Ok(());
+                    }
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            let seen: Vec<&str> = last.iter().map(|row| row.state.as_str()).collect();
+            let waiting = format!(
+                "waiting for job {job} to reach {what}; last saw {} row(s): {seen:?}; \
+                 last query error: {last_error:?}",
                 last.len()
             );
             if self.deadline.remaining().is_zero() {
