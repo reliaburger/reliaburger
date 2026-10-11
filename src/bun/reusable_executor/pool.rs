@@ -871,12 +871,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         F: std::future::Future<Output = Result<JobSpec, String>> + Send,
     {
         let CommandReporting { sink, singletons } = reporting;
-        let failed = |error: ExecutorError| Attempt {
-            outcome: AttemptOutcome::SpawnFailed {
-                reason: error.to_string(),
-            },
-            output: CapturedOutput::default(),
-            ran: None,
+        // The command never ran, so the reason is the only output the task
+        // keeps: without it a failed task shows nothing at all (#786).
+        let failed = |error: ExecutorError| {
+            let reason = error.to_string();
+            let mut output = CapturedOutput::default();
+            output.push(reason.as_bytes());
+            output.push(b"\n");
+            Attempt {
+                outcome: AttemptOutcome::SpawnFailed { reason },
+                output,
+                ran: None,
+            }
         };
         let key = match ExecutorKey::new(&template) {
             Ok(key) => key,
@@ -2454,6 +2460,52 @@ mod tests {
         assert!(pool.slots.lock().await[0].context.is_none());
         assert_eq!(budget.available(), budget.capacity());
         attempt
+    }
+
+    #[tokio::test]
+    async fn a_command_that_never_starts_says_why_in_its_output() {
+        let root = tempfile::Builder::new()
+            .prefix("rb-spawn-reason-")
+            .tempdir()
+            .unwrap();
+        let process = ProcessGrill::with_owner(root.path().join("owners"), "/bin/false".into());
+        // Smaller than any profile plus its helper, so the pool refuses it.
+        let budget = ExecutionBudget::new(Resources::new(100, 64 << 20, 0));
+        let pool = pool(&process, HangingKill::default(), &budget);
+        let template: JobSpec =
+            toml::from_str("runtime='process'\nexec='/bin/true'\ncpu='1000m'\nmemory='32Mi'")
+                .unwrap();
+        let task = TaskInvocation {
+            template: Some(Box::new(template.clone())),
+            index: 0,
+            attempt: 1,
+            program: "/bin/true".into(),
+            args: vec![],
+            env: vec![],
+            run: None,
+        };
+        let singletons = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let attempt = pool
+            .run(
+                &task,
+                template,
+                Duration::from_secs(10),
+                &CancellationToken::new(),
+                None::<fn() -> std::future::Ready<Result<JobSpec, String>>>,
+                CommandReporting {
+                    sink: None,
+                    singletons: &singletons,
+                },
+            )
+            .await;
+        let AttemptOutcome::SpawnFailed { reason } = &attempt.outcome else {
+            panic!("expected a spawn failure: {attempt:?}");
+        };
+        // The task's kept output is all an operator sees of a failed task.
+        assert_eq!(
+            String::from_utf8_lossy(&attempt.output.head),
+            format!("{reason}\n")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

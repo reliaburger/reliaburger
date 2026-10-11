@@ -119,7 +119,9 @@ alias by resemblance.
 
 The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
 run through `make test-linux`, where the warmed digest-pinned mirror remains
-reachable. Two of them start three in-process nodes (gossip, Raft, the API
+reachable. The shared-runc leader-loss case refuses to start without it: its
+cold executors read the image manifest dozens of times, which trips the public
+registry's anonymous rate limit (#786). Two of them start three in-process nodes (gossip, Raft, the API
 and the leader loop, as `bun --cluster` wires them) with real shared-runc or
 cgroup host executors, and stop the leader's control plane while it runs its
 own share of an array: no accepted outcome may be lost or counted twice, and
