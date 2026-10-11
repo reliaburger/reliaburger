@@ -3025,6 +3025,118 @@ async fn deploy_leaves_hostpath_volumes_alone() {
     let _ = handle.await;
 }
 
+/// #797: the OCI spec a fresh instance is created from mounts the path the
+/// host-path policy approved, with the symlink in the written source
+/// already resolved, so runc mounts exactly what the node checked.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fresh_instance_mounts_the_resolved_host_path_not_the_symlink() {
+    let (mut agent, _tx, _shutdown) = test_agent();
+    let import = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(import.path().join("releases/v2")).unwrap();
+    std::os::unix::fs::symlink(
+        import.path().join("releases/v2"),
+        import.path().join("current"),
+    )
+    .unwrap();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![import.path().to_path_buf()],
+        Vec::new(),
+    ));
+    let config = Config::parse(&format!(
+        "[app.web]\nimage = 'web:v1'\n[[app.web.volumes]]\npath = '/data'\nsource = '{}'\n",
+        import.path().join("current").display()
+    ))
+    .unwrap();
+    let spec = config.app["web"].clone();
+    let ids = agent
+        .supervisor
+        .deploy_app("web", "default", &spec, Instant::now())
+        .await
+        .unwrap();
+    let prepared = loop {
+        match agent
+            .prepare_fresh_instance(&ids[0], "web", "default", &spec)
+            .await
+        {
+            Err(BunError::StillRunning { .. }) => {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            outcome => break outcome.unwrap(),
+        }
+    };
+    let data = prepared
+        .oci_spec
+        .mounts
+        .iter()
+        .find(|mount| mount.destination == std::path::Path::new("/data"))
+        .unwrap();
+    assert_eq!(
+        data.source.as_deref(),
+        Some(
+            std::fs::canonicalize(import.path().join("releases/v2"))
+                .unwrap()
+                .as_path()
+        )
+    );
+}
+
+/// #797: a redeploy that replaces running replicas checks host paths too.
+/// Adding an unlisted `source` to an app that already runs is refused, and
+/// no replacement is created with it.
+#[tokio::test]
+async fn a_rolling_redeploy_refuses_a_host_path_the_node_does_not_allow() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let unlisted = tempfile::tempdir().unwrap();
+    let first = Config::parse("[app.web]\nimage = 'web:v1'\n").unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(256);
+    agent.deploy(first, &ev_tx).await;
+    drop(ev_tx);
+    let mut events = Vec::new();
+    while let Some(event) = ev_rx.recv().await {
+        events.push(event);
+    }
+    expect_complete(&events);
+
+    let creates_before = grill
+        .calls()
+        .iter()
+        .filter(|(call, _)| call == "create")
+        .count();
+    let second = Config::parse(&format!(
+        "[app.web]\nimage = 'web:v2'\n[[app.web.volumes]]\npath = '/steal'\nsource = '{}'\n",
+        unlisted.path().display()
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(256);
+    agent.deploy(second, &ev_tx).await;
+    drop(ev_tx);
+    let mut events = Vec::new();
+    while let Some(event) = ev_rx.recv().await {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ApplyEvent::Error { message } if message.contains("allowed_host_paths")
+        )),
+        "{events:?}"
+    );
+    let creates_after = grill
+        .calls()
+        .iter()
+        .filter(|(call, _)| call == "create")
+        .count();
+    assert_eq!(creates_before, creates_after, "{:?}", grill.calls());
+    assert!(agent.supervisor.list_instances().iter().all(|instance| {
+        instance.oci_spec.as_ref().is_none_or(|oci| {
+            oci.mounts
+                .iter()
+                .all(|mount| mount.source.as_deref() != Some(unlisted.path()))
+        })
+    }));
+}
+
 /// Phase 12 E2: restoring a snapshot under a running app is
 /// refused — the guard fires before any filesystem checks, so this
 /// tests on every platform.

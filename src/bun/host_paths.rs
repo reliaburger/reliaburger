@@ -8,8 +8,15 @@
 //! operator lists a prefix that covers it in `[storage] allowed_host_paths`,
 //! and it always refuses the node's own storage and security directories,
 //! even when a listed prefix contains them.
+//!
+//! The check resolves symlinks, and the node then mounts the resolved path
+//! the check approved ([`ApprovedHostPath`]), not the path as written. A
+//! symlink swapped after the check therefore can't redirect the mount (#797).
 
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
+
+use crate::config::app::AppSpec;
 
 /// Why the node refused a host-path `source`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -32,6 +39,23 @@ pub enum HostPathRefusal {
          which no workload may mount"
     )]
     Protected { path: PathBuf, directory: PathBuf },
+    /// A config-file source is a string, and the path its symlinks resolve
+    /// to isn't valid UTF-8, so it can't be carried as one.
+    #[error("host path {path:?} resolves to {resolved:?}, which isn't valid UTF-8")]
+    NotUnicode { path: PathBuf, resolved: PathBuf },
+}
+
+/// A host path this node's policy approved: absolute, with every symlink in
+/// the part of it that exists resolved. Only [`HostPathPolicy::admit`] makes
+/// one, so holding one means the check passed for exactly this path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedHostPath(PathBuf);
+
+impl ApprovedHostPath {
+    /// The path to bind-mount.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
 }
 
 /// Which host paths this node lets a workload bind-mount.
@@ -87,12 +111,13 @@ impl HostPathPolicy {
         Self::new(storage.allowed_host_paths.clone(), protected)
     }
 
-    /// Admit or refuse one host-path `source`.
+    /// Admit or refuse one host-path `source`, returning the resolved path to
+    /// mount in its place.
     ///
     /// Prefixes match by whole path components after symlinks are resolved,
     /// so `/srv/import-evil` is not under `/srv/import`. A source must not be,
     /// sit under, or contain a protected directory.
-    pub fn admit(&self, source: &Path) -> Result<(), HostPathRefusal> {
+    pub fn admit(&self, source: &Path) -> Result<ApprovedHostPath, HostPathRefusal> {
         if !source.is_absolute() {
             return Err(HostPathRefusal::NotAbsolute {
                 path: source.to_path_buf(),
@@ -119,12 +144,43 @@ impl HostPathPolicy {
             .iter()
             .any(|prefix| resolved.starts_with(prefix))
         {
-            Ok(())
+            Ok(ApprovedHostPath(resolved))
         } else {
             Err(HostPathRefusal::NotAllowed {
                 path: source.to_path_buf(),
             })
         }
+    }
+
+    /// Admit every host-path `source` of `spec`, or refuse the app with the
+    /// first refusal.
+    ///
+    /// On success the result is the spec to build the container from: a copy
+    /// whose volume and config-file sources are the approved, resolved paths.
+    /// An app with no host-path source comes back borrowed, uncopied.
+    pub fn approve_app<'a>(&self, spec: &'a AppSpec) -> Result<Cow<'a, AppSpec>, HostPathRefusal> {
+        if spec.host_path_sources().next().is_none() {
+            return Ok(Cow::Borrowed(spec));
+        }
+        let mut approved = spec.clone();
+        for volume in &mut approved.volumes {
+            if let Some(source) = &mut volume.source {
+                *source = self.admit(source)?.0;
+            }
+        }
+        for file in &mut approved.config_file {
+            if let Some(source) = &mut file.source {
+                let resolved = self.admit(Path::new(source.as_str()))?.0;
+                *source = resolved
+                    .to_str()
+                    .ok_or_else(|| HostPathRefusal::NotUnicode {
+                        path: PathBuf::from(source.as_str()),
+                        resolved: resolved.clone(),
+                    })?
+                    .to_string();
+            }
+        }
+        Ok(Cow::Owned(approved))
     }
 }
 
@@ -252,6 +308,113 @@ mod tests {
         assert!(matches!(
             policy.admit(&import.join("link/team-b")),
             Err(HostPathRefusal::Protected { .. })
+        ));
+    }
+
+    /// #797: what the node mounts is what it checked. A symlink inside a
+    /// listed prefix is approved as the directory it points at, so swapping
+    /// the link after the check can't change what gets mounted.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_a_listed_prefix_is_approved_as_its_resolved_target() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("srv/import");
+        std::fs::create_dir_all(import.join("releases/v2/data")).unwrap();
+        std::os::unix::fs::symlink(import.join("releases/v2"), import.join("current")).unwrap();
+        let policy = policy(&[&import], &root.path().join("volumes"));
+        let approved = policy.admit(&import.join("current/data")).unwrap();
+        let target = std::fs::canonicalize(import.join("releases/v2/data")).unwrap();
+        assert_eq!(approved.as_path(), target);
+        // A source that doesn't exist yet keeps its missing tail as written,
+        // under the resolved part.
+        let pending = policy.admit(&import.join("current/later.csv")).unwrap();
+        assert_eq!(
+            pending.as_path(),
+            std::fs::canonicalize(import.join("releases/v2"))
+                .unwrap()
+                .join("later.csv")
+        );
+    }
+
+    /// #797: the copy of the app the node builds its mounts from names the
+    /// resolved volume and config-file sources, never the symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn an_approved_app_mounts_the_resolved_volume_and_config_file_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("srv/import");
+        std::fs::create_dir_all(import.join("releases/v2")).unwrap();
+        std::fs::write(import.join("releases/v2/app.yaml"), "a: 1").unwrap();
+        std::os::unix::fs::symlink(import.join("releases/v2"), import.join("current")).unwrap();
+        let app: crate::config::app::AppSpec = toml::from_str(&format!(
+            r#"
+            image = "web:v1"
+
+            [[volumes]]
+            source = "{current}"
+            path = "/data"
+
+            [[volumes]]
+            path = "/cache"
+
+            [[config_file]]
+            source = "{current}/app.yaml"
+            path = "/etc/app.yaml"
+            "#,
+            current = import.join("current").display()
+        ))
+        .unwrap();
+        let policy = policy(&[&import], &root.path().join("volumes"));
+        let approved = policy.approve_app(&app).unwrap();
+
+        let resolved = std::fs::canonicalize(import.join("releases/v2")).unwrap();
+        let oci = crate::grill::oci::generate_oci_spec(
+            "web",
+            "default",
+            &approved,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(&root.path().join("volumes")),
+            None,
+        );
+        let source_of = |destination: &str| {
+            oci.mounts
+                .iter()
+                .find(|mount| mount.destination == Path::new(destination))
+                .and_then(|mount| mount.source.clone())
+                .unwrap()
+        };
+        assert_eq!(source_of("/data"), resolved);
+        assert_eq!(source_of("/etc/app.yaml"), resolved.join("app.yaml"));
+        // A managed volume is untouched: it never had a host-path source.
+        assert_eq!(
+            source_of("/cache"),
+            root.path().join("volumes/default/web/cache")
+        );
+    }
+
+    /// The policy hands back a refusal for the whole app if any source is
+    /// refused, and borrows an app with no host paths rather than copying it.
+    #[test]
+    fn approve_app_refuses_any_unlisted_source_and_borrows_an_app_without_one() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("srv/import");
+        std::fs::create_dir_all(&import).unwrap();
+        let policy = policy(&[&import], &root.path().join("volumes"));
+        let mut app: crate::config::app::AppSpec = toml::from_str("image = \"web:v1\"").unwrap();
+        assert!(matches!(
+            policy.approve_app(&app).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        app.config_file = vec![crate::config::types::ConfigFileSpec {
+            path: "/etc/app.yaml".into(),
+            content: None,
+            source: Some(root.path().join("elsewhere/app.yaml").display().to_string()),
+        }];
+        assert!(matches!(
+            policy.approve_app(&app),
+            Err(HostPathRefusal::NotAllowed { .. })
         ));
     }
 

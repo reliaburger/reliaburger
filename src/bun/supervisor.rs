@@ -267,15 +267,26 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// `[storage] allowed_host_paths` doesn't cover, or one that overlaps the
     /// node's own storage and security directories.
     fn admit_host_paths(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
-        for source in spec.host_path_sources() {
-            self.host_paths
-                .admit(source)
-                .map_err(|refusal| BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!("host path refused: {refusal}"),
-                })?;
-        }
-        Ok(())
+        self.approve_host_paths(app_name, spec).map(|_| ())
+    }
+
+    /// Check every host-path `source` of `spec` again, just before its
+    /// container is built, and return the spec to build it from: one whose
+    /// sources are the resolved paths the check approved (#797). Every path
+    /// that builds an OCI spec for an app (a fresh instance, a rolling or
+    /// blue-green replacement) goes through this, so what runc mounts is what
+    /// the policy checked, not whatever a symlink points at by then.
+    pub(crate) fn approve_host_paths<'a>(
+        &self,
+        app_name: &str,
+        spec: &'a AppSpec,
+    ) -> Result<std::borrow::Cow<'a, AppSpec>, BunError> {
+        self.host_paths
+            .approve_app(spec)
+            .map_err(|refusal| BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!("host path refused: {refusal}"),
+            })
     }
 
     /// Refuse `allow_from` on a node that can't enforce namespace isolation.

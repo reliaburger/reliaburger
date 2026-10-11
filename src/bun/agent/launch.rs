@@ -467,10 +467,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             eprintln!("bun: warning: {e}");
         }
 
+        // Mount the host paths the policy approves now, resolved (#797).
+        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
-            spec,
+            &spec,
             &instance_id.0,
             host_port,
             &cgroup_str,
@@ -636,10 +638,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         let cgroup_path =
             crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
+        // A replacement never went through `admit_app`, so this is its host
+        // path check as well as the resolution of what to mount (#797).
+        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
-            spec,
+            &spec,
             &instance_id.0,
             host_port,
             &cgroup_path.to_string_lossy(),
