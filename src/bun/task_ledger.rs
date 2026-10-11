@@ -685,12 +685,29 @@ mod tests {
             ledger.append(&shifted);
             ledger.flush().unwrap();
         }
-        // Allocated bytes, per component: what the disk actually pays.
+        let tasks = 245 * 4096u64;
+        // The format, to the byte: a header per block plus 22-byte records,
+        // and one 24-byte index slot per task. Logical lengths don't depend
+        // on the filesystem, so these are exact on every run.
+        let length = |path: &Path| std::fs::metadata(path).unwrap().len();
+        assert_eq!(
+            length(&path_in(&dir)),
+            (MAGIC.len() + 245 * BLOCK_HEADER_BYTES) as u64 + tasks * RECORD_BYTES as u64
+        );
+        assert_eq!(
+            length(&path_in(&dir).with_extension("index")),
+            tasks * super::super::task_result_index::SLOT_BYTES as u64
+        );
+        // Allocated bytes: what the disk actually pays. The filesystem, not
+        // the format, decides these. APFS keeps up to about 1 MiB allocated
+        // past the end of a file grown by fsynced appends, a different amount
+        // each run (#717), so only the whole budget, which leaves room for
+        // that, bounds them. Production-sized blocks keep the measurement
+        // honest: written as one block, the same records allocate no slack.
         let allocated = |path: &Path| {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(path).unwrap().blocks() * 512
         };
-        let tasks = 245 * 4096u64;
         let bytes = allocated(&path_in(&dir));
         let indexed = allocated(&path_in(&dir).with_extension("index"));
         eprintln!(
@@ -698,8 +715,6 @@ mod tests {
             bytes as f64 / tasks as f64,
             indexed as f64 / tasks as f64,
         );
-        assert!(bytes <= tasks * 23, "{bytes} ledger bytes");
-        assert!(indexed <= tasks * 26, "{indexed} index bytes");
         let bound = super::super::task_array_node::STORAGE_BYTES_PER_TASK;
         assert!(
             bytes + indexed <= tasks * bound,
