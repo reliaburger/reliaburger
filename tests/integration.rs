@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 #[path = "support/cluster_harness.rs"]
 mod cluster_harness;
-use cluster_harness::TestHarness;
+use cluster_harness::{JOB_COMPLETION_WAIT, TestHarness};
 
 // ---------------------------------------------------------------------------
 // Integration tests
@@ -208,7 +208,7 @@ async fn job_runs_to_completion() {
     harness.client.apply(&config).await.unwrap();
 
     let status = harness
-        .wait_for_instance("migrate", Duration::from_secs(3), |status| {
+        .wait_for_instance("migrate", JOB_COMPLETION_WAIT, |status| {
             status.state == "stopped"
         })
         .await;
@@ -631,7 +631,7 @@ async fn logs_follow_returns_output_for_completed_job() {
     harness.client.apply(&config).await.unwrap();
 
     harness
-        .wait_for_instance("echoer2", Duration::from_secs(3), |status| {
+        .wait_for_instance("echoer2", JOB_COMPLETION_WAIT, |status| {
             status.state == "stopped"
         })
         .await;
@@ -1044,7 +1044,7 @@ async fn selected_common_run_logs_are_available_without_a_log_store() {
     .unwrap();
     harness.client.apply(&config).await.unwrap();
     let run = harness
-        .wait_for_instance("selected", Duration::from_secs(5), |row| {
+        .wait_for_instance("selected", JOB_COMPLETION_WAIT, |row| {
             row.state == "stopped"
         })
         .await;
@@ -1085,7 +1085,7 @@ async fn standalone_apps_and_common_definitions_cannot_share_a_logical_identity(
         .await
         .unwrap();
     harness
-        .wait_for_instance("job-first", Duration::from_secs(5), |row| {
+        .wait_for_instance("job-first", JOB_COMPLETION_WAIT, |row| {
             row.state == "stopped"
         })
         .await;

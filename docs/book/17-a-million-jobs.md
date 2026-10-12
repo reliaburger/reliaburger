@@ -532,6 +532,66 @@ Failed tasks were the other leak. Each kept its output in its own fsynced file, 
 
 Last, task data now counts toward disk pressure. Past a quarter of the filesystem, or with less than a gibibyte free, a worker finishes and reports what it holds but advertises no free slots, so it stops attracting grants before it fails rather than after. Our first version said "95% full", the council's resignation threshold, and promptly stopped every job test on a laptop with 28 GiB free on a 926 GiB disk. On a big disk 5% is millions of tasks of headroom, so the floor is absolute. And `[logs]` and `[metrics]` finally ship size caps (2 GiB and 1 GiB) instead of "unlimited", with `0` kept as a deliberate opt-out. Bun refuses a cap bigger than the filesystem, since that's just "unlimited" in a costume.
 
+### Thirty flushes for one echo
+
+`integration::job_runs_to_completion` applies a job that runs `/bin/echo` and
+waits three seconds for it to stop. Alone it needs about a quarter of one. On
+11 October it missed the three seconds in a `make test` beside four other
+builds, and passed straight afterwards (#809). The three seconds dated from
+when the agent ran a job itself. Since then a job takes the common lifecycle,
+and nobody had asked what that costs.
+
+So we timed it. A temporary probe in the leader's tick and the node's sync
+gave the steps, and a small C library loaded with `DYLD_INSERT_LIBRARIES`
+counted every `fcntl(F_FULLFSYNC)` the test process made, with its path and
+duration. One echo took about 40 of them, one after another: the apply, the
+settlement, the grant, the node's control fence and grant files, the ledger
+and its index, the output segment and the result, each a file and then its
+directory. On macOS each is a whole-device flush. With 32 copies of the
+test, 100 busy loops and twelve loops flushing 1 MiB at a time on a 12-core
+Mac (load average about 90), the flushes took 10 to 45 ms each, and a create
+or rename queued behind other processes' flushes could take 500 ms. No single
+step was slow. All of them were, a little, and in a row: 64 of 128 runs
+missed the three seconds.
+
+Ten of them were waste. Every sync, and the leader syncs each node every
+tick, fsynced the task directory's parent so the directory's own entry was
+durable before the fence could be. That entry only changes when the directory
+is created. Now the node flushes it once per process (a previous process may
+have crashed before its flush) and again only if the directory had to be
+made:
+
+```rust
+if !existed || !root_durable.load(Ordering::Acquire) {
+    std::fs::File::open(parent)?.sync_all()?;
+    syncs.fetch_add(1, Ordering::Relaxed);
+    root_durable.store(true, Ordering::Release);
+}
+```
+
+`root_durable` is an `Arc<AtomicBool>`, because this runs inside
+`spawn_blocking`, on another thread, after the closure has taken (`move`d) its
+own handle. The `Ordering` arguments say what other memory the flag
+publishes. `Release` on the store and `Acquire` on the load mean a thread that
+sees `true` also sees everything written before the store, here the finished
+flush; `Relaxed` on the counter promises nothing beyond the count itself, and
+a count is all the test reads. An idle tick now flushes nothing, on every
+node, every second. The test
+`a_sync_flushes_the_disk_only_when_the_fence_changes` counts them: three for a
+new fence, none to repeat it, two for the next one, three again when the
+directory disappears underneath.
+
+It didn't fix the test, and the numbers said so before we tried. With the
+flush gone, the same load gave the same median: the per-tick flush ran while
+the leader was waiting for something else. The rest of the path is the
+design. Each step is made durable before the next one may act on it, and
+that is what lets a node crash anywhere without a task running twice or an
+outcome getting lost. So the wait changed instead. Job tests now share
+`JOB_COMPLETION_WAIT`, thirty seconds, the bound a real Bun already gets, and
+on a miss the harness names the state the job was stuck in. A job that never
+runs (one on a disk with less than a gibibyte free, say) still fails. Under
+the same load, 128 of 128 runs passed, the slowest whole run in 13.3 s.
+
 ### Fair shares: one tenant can't starve the rest
 
 The whitepaper promises that one team can't starve the cluster. For apps that
