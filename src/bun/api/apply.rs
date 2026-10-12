@@ -660,10 +660,21 @@ pub(super) async fn cluster_apply(
         }
     }
 
+    // A manual apply of a GitOps-managed resource goes ahead, with a warning
+    // that the next sync puts back what git declares (#693).
+    let gitops_warnings: Vec<String> = council
+        .desired_state()
+        .await
+        .gitops_owned
+        .managed_in(&config)
+        .iter()
+        .map(|resource| crate::lettuce::types::managed_apply_warning(resource))
+        .collect();
+
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     tokio::spawn(async move {
         let mut config = config;
-        for message in host_path_notes(&config) {
+        for message in gitops_warnings.into_iter().chain(host_path_notes(&config)) {
             let _ = event_tx.send(ApplyEvent::Progress { message }).await;
         }
         // Bind inside the stream, so a slow registry shows as a wait in

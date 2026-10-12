@@ -84,6 +84,10 @@ pub struct Compatibility {
 /// 0.2.1, cluster safety (52/69): one bump for the whole release, made when
 /// the train opened. Each 0.2.1 change to the wire or durable state adds its
 /// line below this one, not another bump.
+/// GitOps ownership and configuration in Raft (`DesiredState::gitops_owned`
+/// and `gitops_config`, `SyncState::warnings`, and the `GitOpsWrite`,
+/// `GitOpsConfigSet`, `TestLeaseAppDelete` and `TestLeaseNamespaceDelete`
+/// requests, #693).
 /// Recovery ids (#694): `DesiredState::recovery_id` in snapshots, the
 /// fence record's `recovery_id` and `split_with`, `sender_recovery_id` on
 /// every Raft RPC and `recovery_id` in its fenced reply, and the gossip

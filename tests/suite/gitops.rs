@@ -138,7 +138,7 @@ async fn sync_loop_applies_repo_apps_to_raft() {
     let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
     spawn_gitops_sync(
         Arc::clone(&council),
-        config,
+        Some(config),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -188,7 +188,7 @@ async fn webhook_triggers_immediate_sync() {
     let config = repo_config(&repo_dir.path().to_string_lossy(), 3600);
     spawn_gitops_sync(
         Arc::clone(&council),
-        config,
+        Some(config),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -286,7 +286,7 @@ async fn sync_loop_applies_every_supported_declarative_kind() {
     let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
     spawn_gitops_sync(
         Arc::clone(&council),
-        config,
+        Some(config),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -321,14 +321,13 @@ async fn sync_loop_applies_every_supported_declarative_kind() {
     council.shutdown().await.ok();
 }
 
-/// D12 atomicity: when a write in the change set fails, `apply_changes`
-/// stops and reports the failure so the caller does NOT advance
+/// D12 atomicity: a node that isn't the leader abandons the sync rather
+/// than reporting it applied, so the caller does NOT advance
 /// `last_applied_commit`. A council that was never initialised isn't the
-/// leader, so every `write` is refused — a faithful stand-in for a mid-
-/// sync failure. Before the fix, the runner advanced the commit
-/// regardless, marking a failed write "applied" so it never retried.
+/// leader, so every `write` would be refused — a faithful stand-in for a
+/// leadership change mid-sync (#693, finding 7).
 #[tokio::test]
-async fn apply_changes_stops_and_reports_on_write_failure() {
+async fn apply_changes_on_a_node_that_is_not_leader_abandons_the_sync() {
     use reliaburger::lettuce::diff::{ChangePayload, ResourceChange};
     use reliaburger::lettuce::runner::apply_changes;
 
@@ -359,10 +358,10 @@ async fn apply_changes_stops_and_reports_on_write_failure() {
         spec: ChangePayload::App(Box::new(spec)),
     }];
 
-    let result = apply_changes(&node, &changes, None).await;
+    let report = apply_changes(&node, node.current_term(), &changes, None).await;
     assert!(
-        matches!(result, Err(ref id) if id == "app.default/web"),
-        "a failed write must be reported, not swallowed: {result:?}"
+        report.abandoned.is_some() && report.applied == 0,
+        "a sync on a non-leader must be abandoned, not reported applied: {report:?}"
     );
     // And the app never reached desired state.
     assert!(node.desired_state().await.apps.is_empty());
@@ -393,10 +392,11 @@ async fn apply_changes_reports_a_refused_write_as_a_failure() {
         spec: ChangePayload::App(Box::new(spec)),
     }];
 
-    let result = apply_changes(&council, &changes, None).await;
+    let report = apply_changes(&council, council.current_term(), &changes, None).await;
     assert!(
-        matches!(result, Err(ref id) if id == "app.rbtest-lease/web"),
-        "a refused write must be reported as unapplied: {result:?}"
+        report.applied == 0
+            && matches!(&report.refused[..], [refused] if refused.starts_with("app.rbtest-lease/web")),
+        "a refused write must be reported as unapplied: {report:?}"
     );
     assert!(council.desired_state().await.apps.is_empty());
     council.shutdown().await.ok();
@@ -467,14 +467,15 @@ async fn apply_changes_binds_an_apps_image_to_a_digest() {
         reliaburger::pickle::types::Digest::new(&format!("sha256:{}", "7".repeat(64))).unwrap();
     let binder = ImageBinder::with_upstream(Arc::new(FixedRegistry(Some(digest.clone()))));
 
-    let result = reliaburger::lettuce::runner::apply_changes(
+    let report = reliaburger::lettuce::runner::apply_changes(
         &council,
+        council.current_term(),
         &[web_change("nginx:1.27")],
         Some(&binder),
     )
     .await;
 
-    assert_eq!(result.unwrap(), 1);
+    assert_eq!(report.applied, 1, "{report:?}");
     let image = council.desired_state().await.apps[&AppId::new("web", "default")]
         .image
         .clone();
@@ -491,16 +492,17 @@ async fn apply_changes_fails_a_change_whose_image_cannot_be_bound() {
     let council = single_node_leader().await;
     let binder = ImageBinder::with_upstream(Arc::new(FixedRegistry(None)));
 
-    let result = reliaburger::lettuce::runner::apply_changes(
+    let report = reliaburger::lettuce::runner::apply_changes(
         &council,
+        council.current_term(),
         &[web_change("nginx:1.27")],
         Some(&binder),
     )
     .await;
 
     assert!(
-        matches!(&result, Err(message) if message.starts_with("app.default/web") && message.contains("nginx:1.27")),
-        "{result:?}"
+        matches!(&report.refused[..], [message] if message.starts_with("app.default/web") && message.contains("nginx:1.27")),
+        "{report:?}"
     );
     assert!(council.desired_state().await.apps.is_empty());
     council.shutdown().await.ok();
@@ -522,8 +524,9 @@ async fn sync_deletes_the_namespaced_app_not_the_default_one() {
 
     let council = single_node_leader().await;
 
-    // Seed two same-named apps in different namespaces directly into Raft,
-    // as if a previous sync (or manual apply) had created them.
+    // Seed two same-named apps in different namespaces into Raft, as if a
+    // previous sync had created them: GitOps owns both (#693), so either
+    // may be pruned.
     for namespace in ["prod", "default"] {
         let spec = Config::parse("[app.web]\nimage = \"web:v1\"\n")
             .unwrap()
@@ -531,9 +534,12 @@ async fn sync_deletes_the_namespaced_app_not_the_default_one() {
             .remove("web")
             .unwrap();
         council
-            .write(RaftRequest::AppSpec {
-                app_id: AppId::new("web", namespace),
-                spec: Box::new(spec),
+            .write(RaftRequest::GitOpsWrite {
+                term: council.current_term(),
+                change: Box::new(RaftRequest::AppSpec {
+                    app_id: AppId::new("web", namespace),
+                    spec: Box::new(spec),
+                }),
             })
             .await
             .unwrap();
@@ -555,7 +561,7 @@ async fn sync_deletes_the_namespaced_app_not_the_default_one() {
     let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
     spawn_gitops_sync(
         Arc::clone(&council),
-        config,
+        Some(config),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -601,7 +607,7 @@ async fn a_failed_sync_is_recorded_in_sync_state() {
     let config = repo_config("/nonexistent/repo/does/not/exist.git", 1);
     spawn_gitops_sync(
         Arc::clone(&council),
-        config,
+        Some(config),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -666,7 +672,7 @@ async fn an_unchanged_commit_still_repairs_manual_drift() {
     let config = repo_config(&repo_dir.path().to_string_lossy(), 1);
     spawn_gitops_sync(
         Arc::clone(&council),
-        config,
+        Some(config),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -799,7 +805,7 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
     let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
     let handle = spawn_gitops_sync(
         Arc::clone(&council),
-        repo_config(&url, 1),
+        Some(repo_config(&url, 1)),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -815,7 +821,7 @@ async fn shutdown_during_a_stuck_fetch_stops_the_loop_promptly() {
     let pid = read_pid(&pid_file).expect("the pid file was complete a moment ago");
 
     shutdown.cancel();
-    let stopped = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), handle.task).await;
     assert!(
         stopped.is_ok(),
         "the sync loop kept waiting on a stuck fetch after shutdown"
@@ -875,7 +881,7 @@ async fn job_refusal_keeps_the_last_applied_commit_and_all_desired_resources() {
     let data_dir = tempfile::tempdir().unwrap();
     spawn_gitops_sync(
         Arc::clone(&council),
-        repo_config(&repo_dir.path().to_string_lossy(), 1),
+        Some(repo_config(&repo_dir.path().to_string_lossy(), 1)),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),
@@ -963,5 +969,343 @@ async fn job_refusal_keeps_the_last_applied_commit_and_all_desired_resources() {
                     reliaburger::lettuce::types::SyncResult::Failure { .. }
                 )),
         "refused commit missing from history"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #693: GitOps owns only what it wrote, and its configuration lives in Raft.
+// ---------------------------------------------------------------------------
+
+fn app_spec(image: &str) -> Box<reliaburger::config::app::AppSpec> {
+    Box::new(
+        reliaburger::config::Config::parse(&format!("[app.x]\nimage = \"{image}\"\n"))
+            .unwrap()
+            .app
+            .remove("x")
+            .unwrap(),
+    )
+}
+
+/// Write `app_id` the way a GitOps sync does, so GitOps owns it.
+async fn gitops_owned_app(council: &CouncilNode, app_id: &AppId) {
+    use reliaburger::council::types::{CouncilResponse, RaftRequest};
+    let response = council
+        .write(RaftRequest::GitOpsWrite {
+            term: council.current_term(),
+            change: Box::new(RaftRequest::AppSpec {
+                app_id: app_id.clone(),
+                spec: app_spec("git:v1"),
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !matches!(response, CouncilResponse::Refused { .. }),
+        "{response:?}"
+    );
+}
+
+/// The council's API, with no agent behind it.
+fn api_router(council: &Arc<CouncilNode>) -> axum::Router {
+    let (tx, _rx) = mpsc::channel(8);
+    reliaburger::bun::api::router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(council)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    )
+}
+
+async fn post(router: &axum::Router, uri: &str, body: &str) -> (axum::http::StatusCode, String) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::post(uri)
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Wait until a sync has recorded an applied commit.
+async fn wait_for_applied_commit(council: &Arc<CouncilNode>) -> bool {
+    let council = Arc::clone(council);
+    wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&council);
+        Box::pin(async move {
+            c.desired_state()
+                .await
+                .gitops_sync_state
+                .is_some_and(|s| s.last_applied_commit.is_some())
+        })
+    })
+    .await
+}
+
+/// D9: turning GitOps on in a working cluster leaves the apps and
+/// namespaces `relish apply` created alone. Before #693 the first sync
+/// pruned everything the repository didn't declare.
+#[tokio::test]
+async fn enabling_gitops_keeps_manually_applied_apps() {
+    use reliaburger::council::types::RaftRequest;
+
+    let council = single_node_leader().await;
+    let manual = AppId::new("manual", "default");
+    council
+        .write(RaftRequest::AppSpec {
+            app_id: manual.clone(),
+            spec: app_spec("manual:v1"),
+        })
+        .await
+        .unwrap();
+    council
+        .write(RaftRequest::NamespaceSpec {
+            name: "team".into(),
+            spec: Box::new(toml::from_str("cpu = '1000m'").unwrap()),
+        })
+        .await
+        .unwrap();
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_repo(repo_dir.path(), "[app.fromgit]\nimage = 'git:v1'\n");
+    let shutdown = CancellationToken::new();
+    let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let data_dir = tempfile::tempdir().unwrap();
+    spawn_gitops_sync(
+        Arc::clone(&council),
+        Some(repo_config(&repo_dir.path().to_string_lossy(), 1)),
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+        None,
+    );
+    assert!(
+        wait_for_applied_commit(&council).await,
+        "sync never applied"
+    );
+    // A few more polls: none of them may prune the manual resources.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let state = council.desired_state().await;
+    shutdown.cancel();
+    council.shutdown().await.ok();
+    assert!(state.apps.contains_key(&AppId::new("fromgit", "default")));
+    assert!(state.apps.contains_key(&manual), "the manual app survives");
+    assert!(
+        state.namespaces.contains_key("team"),
+        "the manual namespace survives"
+    );
+    assert!(
+        state
+            .gitops_owned
+            .apps
+            .contains(&AppId::new("fromgit", "default"))
+    );
+    assert!(!state.gitops_owned.apps.contains(&manual));
+}
+
+/// A manual apply of a GitOps-managed app goes ahead, with a warning that
+/// the next sync puts back what git declares.
+#[tokio::test]
+async fn manual_apply_of_a_gitops_app_warns() {
+    let council = single_node_leader().await;
+    gitops_owned_app(&council, &AppId::new("web", "default")).await;
+    let router = api_router(&council);
+
+    let (status, body) = post(&router, "/v1/apply", "[app.web]\nimage = 'web:manual'\n").await;
+    council.shutdown().await.ok();
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(
+        body.contains(
+            "app 'web' in namespace 'default' is managed by GitOps; manual changes are \
+             reverted on the next sync"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("committed"),
+        "the apply still goes ahead: {body}"
+    );
+}
+
+/// `relish delete` of a GitOps-managed app is refused without `--force`,
+/// because the next sync would recreate it; with `--force` it goes ahead.
+#[tokio::test]
+async fn delete_of_a_gitops_app_refuses_without_force() {
+    let council = single_node_leader().await;
+    let web = AppId::new("web", "default");
+    gitops_owned_app(&council, &web).await;
+    let router = api_router(&council);
+
+    let (status, body) = post(&router, "/v1/delete/web/default", "").await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("managed by GitOps"), "{body}");
+    assert!(body.contains("--force"), "{body}");
+    assert!(council.desired_state().await.apps.contains_key(&web));
+
+    let (status, body) = post(&router, "/v1/delete/web/default?force=true", "").await;
+    let state = council.desired_state().await;
+    council.shutdown().await.ok();
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
+    assert!(!state.apps.contains_key(&web));
+    assert!(state.gitops_owned.apps.is_empty());
+}
+
+/// #693, finding 3: the configuration lives in Raft. A leader whose
+/// `node.toml` has no `[gitops]` keeps syncing the repository the cluster
+/// was configured with.
+#[tokio::test]
+async fn gitops_config_in_raft_survives_a_leader_without_local_config() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_repo(repo_dir.path(), "[app.first]\nimage = 'git:v1'\n");
+    let council = single_node_leader().await;
+
+    // The first leader has [gitops] and seeds the cluster from it.
+    let first = CancellationToken::new();
+    let (_first_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let first_dir = tempfile::tempdir().unwrap();
+    let sync = spawn_gitops_sync(
+        Arc::clone(&council),
+        Some(repo_config(&repo_dir.path().to_string_lossy(), 1)),
+        webhook_rx,
+        first_dir.path().to_path_buf(),
+        first.clone(),
+        None,
+    );
+    assert!(
+        wait_for_applied_commit(&council).await,
+        "first sync never applied"
+    );
+    assert!(council.desired_state().await.gitops_config.is_some());
+    first.cancel();
+    sync.task.await.unwrap();
+
+    // The repository moves on; the next leader has no [gitops] at all.
+    std::fs::write(
+        repo_dir.path().join("apps.toml"),
+        "[app.first]\nimage = 'git:v1'\n[app.second]\nimage = 'git:v1'\n",
+    )
+    .unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-q", "-m", "second"]);
+
+    let second = CancellationToken::new();
+    let (_second_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let second_dir = tempfile::tempdir().unwrap();
+    let sync = spawn_gitops_sync(
+        Arc::clone(&council),
+        None,
+        webhook_rx,
+        second_dir.path().to_path_buf(),
+        second.clone(),
+        None,
+    );
+    let check = Arc::clone(&council);
+    let synced = wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&check);
+        Box::pin(async move {
+            c.desired_state()
+                .await
+                .apps
+                .contains_key(&AppId::new("second", "default"))
+        })
+    })
+    .await;
+    let local = sync.local_check.borrow().clone();
+    second.cancel();
+    council.shutdown().await.ok();
+    assert!(
+        synced,
+        "a leader without [gitops] must keep syncing the cluster's repository"
+    );
+    assert_eq!(
+        local,
+        reliaburger::lettuce::types::LocalConfigCheck::NoLocalConfig
+    );
+}
+
+/// #693, finding 3: a node whose `[gitops]` names another repository
+/// reports the difference and syncs the cluster's repository, never its
+/// own.
+#[tokio::test]
+async fn differing_local_gitops_config_is_reported_not_used() {
+    use reliaburger::council::types::RaftRequest;
+    use reliaburger::lettuce::types::{LocalConfigCheck, StoredGitOpsConfig};
+
+    let cluster_repo = tempfile::tempdir().unwrap();
+    make_repo(
+        cluster_repo.path(),
+        "[app.from-cluster]\nimage = 'git:v1'\n",
+    );
+    let local_repo = tempfile::tempdir().unwrap();
+    make_repo(local_repo.path(), "[app.from-local]\nimage = 'git:v1'\n");
+
+    let council = single_node_leader().await;
+    let stored = StoredGitOpsConfig::seal(
+        &repo_config(&cluster_repo.path().to_string_lossy(), 1),
+        None,
+    )
+    .unwrap();
+    council
+        .write(RaftRequest::GitOpsConfigSet {
+            config: Some(Box::new(stored)),
+            seed: false,
+        })
+        .await
+        .unwrap();
+
+    let shutdown = CancellationToken::new();
+    let (_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let data_dir = tempfile::tempdir().unwrap();
+    let sync = spawn_gitops_sync(
+        Arc::clone(&council),
+        Some(repo_config(&local_repo.path().to_string_lossy(), 1)),
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+        None,
+    );
+    assert!(
+        wait_for_applied_commit(&council).await,
+        "sync never applied"
+    );
+    let state = council.desired_state().await;
+    let local = sync.local_check.borrow().clone();
+    shutdown.cancel();
+    council.shutdown().await.ok();
+
+    assert!(
+        state
+            .apps
+            .contains_key(&AppId::new("from-cluster", "default"))
+    );
+    assert!(
+        !state
+            .apps
+            .contains_key(&AppId::new("from-local", "default")),
+        "the node's own [gitops] must not be synced"
+    );
+    assert_eq!(
+        state.gitops_config.unwrap().config.repo,
+        cluster_repo.path().to_string_lossy(),
+        "the node's own [gitops] must not replace the cluster's"
+    );
+    assert_eq!(
+        local,
+        LocalConfigCheck::Differs {
+            fields: vec!["repo".into()]
+        }
     );
 }

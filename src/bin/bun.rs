@@ -2647,37 +2647,48 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .with_policy(config.images.trust_policy.clone())
     });
 
-    // GitOps (L13): if [gitops] is configured on a cluster node, spawn
-    // the leader-only sync loop and hand the API a webhook sender that
-    // nudges it. The webhook endpoint returns 503 without this.
+    // GitOps (L13, #693): every cluster node runs the sync loop. The
+    // configuration lives in Raft, so a leader without its own [gitops]
+    // still syncs the cluster's repository; a node's [gitops] only seeds
+    // Raft when the cluster has none. The API gets a webhook sender that
+    // nudges the loop, and this node's local-config check for `relish wtf`.
     // The webhook validator authenticates public webhook POSTs by the
-    // `[gitops] webhook_secret` HMAC (GIT3). Without a secret it stays
-    // `None`, and the public route fails closed.
+    // cluster's `webhook_secret` HMAC (GIT3), taken from Raft on each
+    // request; with no secret anywhere the public route fails closed.
     let mut gitops_webhook_validator = None;
-    let gitops_webhook_tx =
-        if let (Some(gitops), Some(council)) = (config.gitops.clone(), api_council.clone()) {
-            let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
-            if let Some(secret) = gitops.webhook_secret.as_deref() {
-                gitops_webhook_validator = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                    reliaburger::lettuce::webhook::WebhookValidator::new(
-                        secret,
-                        gitops.webhook_rate_limit,
-                    ),
-                )));
-            }
-            reliaburger::lettuce::runner::spawn_gitops_sync(
-                council,
-                gitops,
-                webhook_rx,
-                config.storage.data.clone(),
-                shutdown.clone(),
-                image_binder.clone(),
-            );
-            println!("bun: gitops sync loop started");
-            Some(webhook_tx)
-        } else {
-            None
+    let mut gitops_local_check = None;
+    let gitops_webhook_tx = if let Some(council) = api_council.clone() {
+        let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
+        let local = config.gitops.clone();
+        let validator = match &local {
+            Some(gitops) => match gitops.webhook_secret.as_deref() {
+                Some(secret) => reliaburger::lettuce::webhook::WebhookValidator::new(
+                    secret,
+                    gitops.webhook_rate_limit,
+                ),
+                None => reliaburger::lettuce::webhook::WebhookValidator::unkeyed(
+                    gitops.webhook_rate_limit,
+                ),
+            },
+            None => reliaburger::lettuce::webhook::WebhookValidator::unkeyed(10),
         };
+        gitops_webhook_validator = Some(std::sync::Arc::new(tokio::sync::Mutex::new(validator)));
+        let sync = reliaburger::lettuce::runner::spawn_gitops_sync(
+            council,
+            local,
+            webhook_rx,
+            config.storage.data.clone(),
+            shutdown.clone(),
+            image_binder.clone(),
+        );
+        gitops_local_check = Some(sync.local_check);
+        println!(
+            "bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)"
+        );
+        Some(webhook_tx)
+    } else {
+        None
+    };
 
     // The upgrade verification below starts after the API task, by which
     // point `cmd_tx` has moved into the API state. Only a replacement that
@@ -2929,6 +2940,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match image_binder {
         Some(binder) => app.layer(axum::Extension(binder)),
+        None => app,
+    };
+    let app = match gitops_local_check {
+        Some(check) => app.layer(axum::Extension(api::GitOpsLocalCheck(check))),
         None => app,
     };
     let app = match api_known_members {

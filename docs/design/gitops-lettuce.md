@@ -16,7 +16,7 @@ Lettuce isn't a separate daemon, sidecar, or CRD controller. It's a module withi
 - **Autoscaler-aware.** The `replicas` field is treated independently. Lettuce never resets autoscaler overrides unless the `replicas` value itself changes in git.
 - **Script-aware security.** Any commit that adds or modifies an inline `script` field automatically requires a signed commit, regardless of the global `require_signed_commits` setting.
 - **Minimal blast radius.** Only changed resources are applied. Unchanged apps, jobs, and namespaces aren't touched.
-- **Coexistence with manual operations.** GitOps can manage production while developers use `relish apply` for staging. The two modes coexist without conflict.
+- **Coexistence with manual operations.** GitOps can manage production while developers use `relish apply` for staging. The two modes coexist without conflict. *Status: implemented in 0.2.1 (#693, D9 option B).* Raft holds `DesiredState.gitops_owned`, the apps, namespaces and permissions a sync wrote, and the diff removes only those. Before that, every resource missing from git was pruned, manual ones included.
 
 ---
 
@@ -108,6 +108,24 @@ coordinator election (the old `select_coordinator`, which named a non-leader tha
 actually synced, is no longer called). A reused local clone is verified against the configured
 remote URL and branch and re-cloned on drift, so a stale clone left by a leadership change
 never syncs the wrong repository.
+
+**Configuration in Raft (0.2.1, #693).** The `[gitops]` configuration the leader syncs is
+`DesiredState.gitops_config`, a `StoredGitOpsConfig`, not the leader's own `node.toml`. Every
+cluster node runs the loop; only the leader goes past the first step. A leader that finds no
+configuration in Raft seeds it from its own `[gitops]` with `GitOpsConfigSet { seed: true }`,
+which the state machine ignores once a configuration exists. After that a node's section is
+only compared: the loop publishes a `LocalConfigCheck` (`Matches`, `NoLocalConfig`,
+`Differs { fields }`, `Unreadable`) that `GET /v1/gitops` serves and `relish wtf` reports.
+`relish gitops set` and `relish gitops disable` (`POST /v1/gitops/config`, Admin, audited)
+replace or clear it. The webhook validator takes its secret and rate limit from the same copy
+on every request, so every node checks a delivery against the same secret.
+
+**Term fence (finding 7).** The loop reads the Raft term before the desired-state snapshot and
+stamps every write with it (`RaftRequest::GitOpsWrite { term, change }`). The state machine
+compares it with the term of the log entry carrying the write and refuses a mismatch, so a
+leader that lost and regained leadership while git was busy can't apply the stale diff. The
+runner checks the term before each write too, and abandons the sync at the first sign the
+term moved.
 
 ### 3.3 TOML Parsing Pipeline
 
@@ -616,6 +634,8 @@ The diff engine compares two `DesiredState` trees: one from the parsed git TOML,
 
 **Complexity:** The diff is O(n * m) where n is the number of resources and m is the average number of fields per resource. For a typical cluster (hundreds of resources, tens of fields each), this completes in sub-millisecond time.
 
+**Ownership (implemented, 0.2.1, #693).** Step 3 above applies only to resources in `DesiredState.gitops_owned`: a resource in Raft but not in git is removed only when GitOps wrote it. A resource present in both that matches git but isn't owned produces a `ResourceChange::Adopt` carrying the spec the cluster already runs (bound image digest included), so the write changes nothing but records ownership. Everything in an `rbtest-*` test-lease namespace is left out of both sides. The output is ordered: adds, updates and adoptions as namespaces, permissions, apps, the order `config_to_desired_writes` uses, then removals as apps, permissions, namespaces.
+
 ### 5.5 Selective Apply
 
 Only changed resources are written to Raft. The apply phase:
@@ -626,6 +646,8 @@ Only changed resources are written to Raft. The apply phase:
 4. All writes are batched into a single Raft proposal to ensure atomicity. Either all changes from a single commit are applied, or none are.
 
 **Partial failure handling:** If the Raft write fails (e.g., leader step-down during apply), the entire batch is retried on the next sync cycle. The `SyncState` isn't updated, so the next poll or webhook re-processes the same commit.
+
+**As implemented (0.2.1, #693).** Step 4 isn't how it works: each change is its own `GitOpsWrite` entry, which applies the change and updates the ownership set together. `apply_changes` tries every change; a refusal (an image that won't bind, an identity a job holds, a delete of something GitOps doesn't own) is collected rather than stopping the run, so one bad app no longer blocks every removal behind it. A sync with refusals is recorded as `SyncResult::PartialSuccess { errors }`, naming each offender in `last_error` and the history, and `last_applied_commit` stays put (D12), so the next tick retries the rest. Writes are idempotent, so re-applying the ones that succeeded is harmless.
 
 ### 5.6 Autoscaler Replica Interaction
 
@@ -752,6 +774,8 @@ https_token = "ENC[AGE:Z2hwX3Rva2VuX3ZhbHVl...]"
 
 The coordinator loads credentials from its local `node.toml`. On failover, the new coordinator loads credentials from its own `node.toml`. All council members must have valid git credentials configured if they may become the GitOps coordinator.
 
+**As implemented (0.2.1, #693).** There's no `[gitops.credentials]` table. Credentials travel inside the configuration (`user:token@` in the repository URL, and `webhook_secret`), and `StoredGitOpsConfig::seal` lifts them out before the configuration reaches Raft. They're sealed with HKDF + AES-256-GCM under a key derived from the cluster master key (`wrap_key`, info `reliaburger-gitops-credentials-wrap-v1`), the same wrapping the CA keys use, so every council member with the master key can unseal them and the Raft log never holds them in clear. A configuration with a credential and no master key is refused. An SSH key on disk still works as before, through the node's own SSH configuration.
+
 ### 6.3 Validation
 
 `relish lint` validates the `[gitops]` configuration:
@@ -830,6 +854,8 @@ The coordinator loads credentials from its local `node.toml`. On failover, the n
 
 **Mitigation:** `relish apply` warns when GitOps is enabled for the target namespace: `"Warning: namespace 'production' is managed by GitOps. Manual changes will be reverted on the next sync cycle."`
 
+*Status: implemented in 0.2.1 (#693), per resource rather than per namespace.* `cluster_apply` checks each resource in the applied config against `gitops_owned` and streams `warning: namespace 'production' is managed by GitOps; manual changes are reverted on the next sync` before writing. `relish delete` and `relish rollback` of a GitOps-owned app return `409 Conflict` without `--force` (`?force=true`), since the next sync would undo them. A forced delete removes the app from the ownership set too; while git still declares it, the next sync recreates and re-owns it.
+
 ---
 
 ## 8. Security Considerations
@@ -859,6 +885,8 @@ Lettuce auto-detects the provider from the headers present in the request.
 ### 8.3 Git Credential Storage
 
 Git credentials (SSH keys, HTTPS tokens) are stored on each council member node in `node.toml` or as files on disk. They are never stored in the Raft log or the git repository itself.
+
+*As implemented (0.2.1, #693):* HTTPS tokens in the repository URL and the webhook secret are stored in Raft, sealed under the master-key-derived wrapping key (Section 6.2), never in clear.
 
 **SSH keys:** The SSH private key should be readable only by the Bun process user. Lettuce verifies the file permissions at startup and warns if the key is world-readable.
 
@@ -1125,3 +1153,5 @@ In `alert-only` mode, `relish diff` shows the drift, and `relish gitops sync --a
 **Open question:** Should Lettuce support re-encryption? If a secret is encrypted with an old key, should Lettuce detect this and trigger re-encryption with the current key?
 
 **Status:** Deferred. The current model (age-encrypted secrets, decrypted by Bun at runtime) works for v1.
+
+**Plaintext secrets (decided, D8, implemented in 0.2.1, #693).** Lettuce warns about a plaintext secret in git and applies it anyway. An `env` key that contains `PASSWORD`, `SECRET`, `TOKEN` or `CREDENTIAL`, or ends in `_KEY` (case-insensitive), with a value that isn't `ENC[AGE:...]`, produces a warning naming the app and the key (never the value). `plaintext_secret_warnings` computes them in `execute_sync`; the runner logs them when they change, records them in `SyncState.warnings`, and `relish wtf` reports each as a `gitops-plaintext-secret` warning. Refusing was rejected: it would break existing repositories with no way to migrate them.
