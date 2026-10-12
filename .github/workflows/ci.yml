@@ -569,13 +569,13 @@ jobs:
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
           python3 scripts/ci/every_job.py --needs target/workflow-needs.json --event "$GITHUB_EVENT_NAME"
       - uses: actions/download-artifact@v4
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
         with:
           pattern: contract-*
           path: incoming
           merge-multiple: false
       - name: Every selected owner and exact required case completed this run
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
         run: |
           python3 scripts/ci/workflow_adapter.py aggregate --root . \
             --manifest tests/contracts/manifest.json --directory incoming \
