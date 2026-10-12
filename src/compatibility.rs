@@ -81,9 +81,12 @@ pub struct Compatibility {
 /// isolation (50/67, #639). The decaying recent-duration histogram that grant
 /// lookahead learns from (`TaskArrayState::recent_duration_counts`), which
 /// travels in Raft snapshots as well as on disk (51/68).
+/// 0.2.1, cluster safety (52/69): one bump for the whole release, made when
+/// the train opened. Each 0.2.1 change to the wire or durable state adds its
+/// line below this one, not another bump.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 51,
-    state: 68,
+    protocol: 52,
+    state: 69,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
