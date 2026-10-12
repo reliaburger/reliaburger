@@ -427,7 +427,9 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertNotIn("if:", blocks[first])
         self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[first])
         self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[aggregate])
-        self.assertIn("if: needs.changes.outputs.code == 'true'", blocks[aggregate])
+        # The owner check still reports when another job failed, so one red
+        # job doesn't hide whether the evidence was complete.
+        self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
 
     def test_macos_runs_when_selected_and_splits_the_once_only_steps(self):
         macos = self.jobs["macos"]
