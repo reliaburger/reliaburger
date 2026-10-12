@@ -172,8 +172,8 @@ jobs. What else runs depends on where the change is going:
 | Run | Jobs | Typical wall time |
 |---|---|---|
 | Pull request into a merge train (`release-*`, e.g. `release-0-2-1`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, portable Linux (with coverage and doctests) and the optimised contract boundaries | 15–20 minutes |
-| The same, labelled `full-ci`; any pull request whose head is a train (the gate PR into `main`); any pull request into `main` | Everything the change touches: the light set plus three macOS shards, privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks | about 45 minutes |
-| Merge-queue group on a train (`merge_group`), push to a train or to `main`, nightly, manual | Everything | about 45 minutes |
+| The same, labelled `full-ci`; any pull request whose head is a train (the gate PR into `main`); any pull request into `main` | Everything the change touches: the light set plus three macOS shards, privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks | about 45 minutes, plus any wait for macOS runners |
+| Merge-queue group on a train (`merge_group`), push to a train or to `main`, nightly, manual | Everything | about 45 minutes, plus any wait for macOS runners |
 | Pull request stacked on any other branch | The light set plus macOS; the heavy suites only with `full-ci` | 40 minutes |
 
 The light set exists because macOS was the critical path of almost every run:
@@ -212,9 +212,13 @@ The portable suite on macOS runs as three parallel jobs, `portable macOS
 A hash partition keeps each test in the same shard whatever else is added, so
 a failure in shard 2 reproduces locally with
 `cargo nextest run --partition hash:2/3`. Each shard compiles the suite
-itself: compiling takes most of a macOS job, and a shared build would sit on
-the critical path just the same. One shard runs `make lint-macos` and another
-the doctests.
+itself, and compiling is most of a macOS job: on the first sharded run each
+shard spent about 38 minutes compiling and under 3 testing (7 unsharded), so
+a shard takes 42–44 minutes, level with acceptance. Building once and sharing
+a nextest archive would take the compile off two of the three runners, but not
+off the critical path. One shard runs `make lint-macos` and another the
+doctests. A shard re-run on its own keeps its own attempt; the evidence gate
+treats each shard as its own job when it checks attempts.
 
 Each shard seals its own envelope (`contract-darwin-portable-darwin-K`) and
 sets only its own output. A nextest list under a partition still names every

@@ -678,10 +678,18 @@ skip the same test would each look complete. The merge closes it. A partitioned
 mismatch with reason `partition`, so each shard's list carries the whole suite. The gate
 checks that the three lists name the same tests, that no test ran in two shards, that every
 test ran in one, and that the required cases add up. Each shard's seal names its shard, so one
-envelope can't be uploaded under another's name. Each shard still compiles the suite itself,
-so splitting saves the test time, not the compile time. A full run is now as slow as
-acceptance, not macOS, and a pull request into a train hears back in 15 to 20 minutes instead
-of about 50.
+envelope can't be uploaded under another's name. A shard re-run on its own after a failure
+keeps the attempt number GitHub gave it, so the check that one job's owners share an attempt
+treats each shard as its own job.
+
+Did splitting pay? Less than we hoped. The first full run with shards ran 2,094 tests in
+under three minutes per shard instead of seven, but each shard still compiled the whole suite
+for 38 minutes, so a shard took 42 to 44 minutes against the 45 before. That's level with
+acceptance, so macOS is no longer the only critical path, and no further. Three macOS jobs
+also wait longer for runners: one shard queued for 28 minutes behind other pull requests.
+The real win is the light set. A pull request into a train no longer touches macOS at all,
+and hears back in 15 to 20 minutes instead of about 50. Making macOS itself faster means
+compiling once, not testing in parallel.
 
 ## Dependencies are code too
 
