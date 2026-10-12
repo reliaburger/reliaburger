@@ -30,8 +30,11 @@ use reliaburger::mustard::membership::MembershipSnapshot;
 use reliaburger::mustard::protocol::MustardNode;
 use reliaburger::mustard::transport::InMemoryNetwork;
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
+use bun_process::{PortBlockReservation, reserve_port_block_lease};
 use cluster_support::{
     NAMES, build_council, cluster_tests_enabled, fast_council_config, gossip_addr,
     heal_reconciler_config, initial_voter_leader_index, member, node_info, rid,
@@ -487,12 +490,31 @@ async fn full_council_loss_recovers_from_backup() {
 // Recovery-epoch fence: old voters returning after `council recover --force`.
 // ---------------------------------------------------------------------------
 
-/// First port of the split-brain test's blocks: gossip, +1 Raft, +2
-/// reporting, +3 API, one block of ten per node.
-const FENCE_BASE_PORT: u16 = 19710;
+/// Ports per fence node: gossip, +1 Raft, +2 reporting, +3 API.
+const FENCE_PORTS_PER_NODE: u16 = 4;
 
-fn fence_gossip(index: usize) -> std::net::SocketAddr {
-    std::net::SocketAddr::from(([127, 0, 0, 1], FENCE_BASE_PORT + (index as u16) * 10))
+/// Node slots across the fence tests: 0 to 2 for the split-brain test, 3
+/// to 5 for the regrowth test, 6 to 8 for the two-survivor test and 9 to
+/// 11 for the slow-gossip test, so their data directories stay apart when
+/// `cargo test` runs them in one process.
+const FENCE_SLOTS: u16 = 12;
+
+/// A fence test's leased ports, one four-port block per node slot. The test
+/// holds it until it ends, so no other fixture on the host binds a stopped
+/// node's ports before the node comes back on them (#744).
+struct FencePorts(PortBlockReservation);
+
+impl FencePorts {
+    fn lease() -> Self {
+        Self(reserve_port_block_lease(FENCE_PORTS_PER_NODE * FENCE_SLOTS))
+    }
+
+    fn gossip(&self, index: usize) -> std::net::SocketAddr {
+        std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            self.0.base + (index as u16) * FENCE_PORTS_PER_NODE,
+        ))
+    }
 }
 
 fn fence_data_dir(index: usize) -> std::path::PathBuf {
@@ -512,9 +534,9 @@ impl FenceNode {
     /// Start node `index` on its persistent data directory. A restarted node
     /// may find its previous incarnation's redb files still locked for a
     /// moment while the old tasks wind down, so retry for a few seconds.
-    async fn start(index: usize, seeds: Vec<std::net::SocketAddr>) -> Self {
+    async fn start(ports: &FencePorts, index: usize, seeds: Vec<std::net::SocketAddr>) -> Self {
         use reliaburger::cluster::runtime::{ClusterParams, start};
-        let gossip = fence_gossip(index);
+        let gossip = ports.gossip(index);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let shutdown = CancellationToken::new();
@@ -614,6 +636,7 @@ async fn old_voters_returning_after_recovery_cannot_form_a_quorum() {
         cluster_tests_enabled(),
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
+    let ports = FencePorts::lease();
     for index in 0..3 {
         let _ = std::fs::remove_dir_all(fence_data_dir(index));
         // Bun stamps the state format before it starts the runtime.
@@ -621,9 +644,9 @@ async fn old_voters_returning_after_recovery_cannot_form_a_quorum() {
     }
 
     // 1. A three-voter council on real transports and durable storage.
-    let n0 = FenceNode::start(0, Vec::new()).await;
-    let n1 = FenceNode::start(1, vec![fence_gossip(0)]).await;
-    let n2 = FenceNode::start(2, vec![fence_gossip(0)]).await;
+    let n0 = FenceNode::start(&ports, 0, Vec::new()).await;
+    let n1 = FenceNode::start(&ports, 1, vec![ports.gossip(0)]).await;
+    let n2 = FenceNode::start(&ports, 2, vec![ports.gossip(0)]).await;
     let all_ids: BTreeSet<u64> = (0..3)
         .map(|i| reliaburger::cluster::identity::raft_id_from_name(&format!("fence{i}")))
         .collect();
@@ -648,7 +671,7 @@ async fn old_voters_returning_after_recovery_cannot_form_a_quorum() {
     reliaburger::council::recovery::recover_data_dir(&fence_data_dir(0), backup, false).unwrap();
 
     // 3. The recovered survivor comes back alone on a new epoch and commits.
-    let recovered = FenceNode::start(0, Vec::new()).await;
+    let recovered = FenceNode::start(&ports, 0, Vec::new()).await;
     assert!(
         commit_on_any(&[&recovered], "after-recovery", Duration::from_secs(20))
             .await
@@ -658,8 +681,8 @@ async fn old_voters_returning_after_recovery_cannot_form_a_quorum() {
     assert_eq!(recovered.council.desired_state().await.recovery_epoch, 1);
 
     // 4. The two old voters return, with their pre-recovery data and seeds.
-    let old1 = FenceNode::start(1, vec![fence_gossip(0)]).await;
-    let old2 = FenceNode::start(2, vec![fence_gossip(0)]).await;
+    let old1 = FenceNode::start(&ports, 1, vec![ports.gossip(0)]).await;
+    let old2 = FenceNode::start(&ports, 2, vec![ports.gossip(0)]).await;
 
     // Between them they are two of the old membership's three voters, a
     // majority. They must never commit on it.
@@ -731,7 +754,7 @@ async fn old_voters_returning_after_recovery_cannot_form_a_quorum() {
 
     // The fence survives a restart: the old voter comes back still fenced.
     old2.stop().await;
-    let old2 = FenceNode::start(2, vec![fence_gossip(0)]).await;
+    let old2 = FenceNode::start(&ports, 2, vec![ports.gossip(0)]).await;
     assert_eq!(
         old2.council
             .recovery_fence()
@@ -770,14 +793,16 @@ async fn recovered_council_regrows_onto_a_fresh_node() {
         cluster_tests_enabled(),
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
-    // Node slots 3 to 5 of the fence port range, clear of the test above.
+    // Node slots 3 to 5, so this test's data directories stay clear of
+    // the test above's.
+    let ports = FencePorts::lease();
     for index in 3..6 {
         let _ = std::fs::remove_dir_all(fence_data_dir(index));
         reliaburger::compatibility::ensure_state_compatible(&fence_data_dir(index)).unwrap();
     }
 
     // A single-voter council, recovered offline from its own state.
-    let first = FenceNode::start(3, Vec::new()).await;
+    let first = FenceNode::start(&ports, 3, Vec::new()).await;
     assert!(
         commit_on_any(&[&first], "before-loss", Duration::from_secs(20))
             .await
@@ -789,7 +814,7 @@ async fn recovered_council_regrows_onto_a_fresh_node() {
     reliaburger::council::recovery::recover_data_dir(&fence_data_dir(3), backup, false).unwrap();
     // Its config still lists a join seed, as most nodes' do: recovery must
     // re-bootstrap it anyway.
-    let recovered = FenceNode::start(3, vec![fence_gossip(4)]).await;
+    let recovered = FenceNode::start(&ports, 3, vec![ports.gossip(4)]).await;
     assert!(
         commit_on_any(&[&recovered], "after-recovery", Duration::from_secs(20))
             .await
@@ -798,8 +823,8 @@ async fn recovered_council_regrows_onto_a_fresh_node() {
     );
 
     // Two fresh nodes join and the reconciler grows the council onto both.
-    let fresh = FenceNode::start(4, vec![fence_gossip(3)]).await;
-    let other = FenceNode::start(5, vec![fence_gossip(3)]).await;
+    let fresh = FenceNode::start(&ports, 4, vec![ports.gossip(3)]).await;
+    let other = FenceNode::start(&ports, 5, vec![ports.gossip(3)]).await;
     let fresh_id = reliaburger::cluster::identity::raft_id_from_name("fence4");
     let grew = wait_until(Duration::from_secs(60), || {
         recovered.voters().len() == 3
@@ -843,14 +868,14 @@ async fn recovered_council_regrows_onto_a_fresh_node() {
 
 /// Form a three-voter council on fence slots `slots`, commit a write, and
 /// stop every node, leaving three voters' data directories behind.
-async fn form_and_stop_council(slots: [usize; 3]) {
+async fn form_and_stop_council(ports: &FencePorts, slots: [usize; 3]) {
     for index in slots {
         let _ = std::fs::remove_dir_all(fence_data_dir(index));
         reliaburger::compatibility::ensure_state_compatible(&fence_data_dir(index)).unwrap();
     }
-    let first = FenceNode::start(slots[0], Vec::new()).await;
-    let second = FenceNode::start(slots[1], vec![fence_gossip(slots[0])]).await;
-    let third = FenceNode::start(slots[2], vec![fence_gossip(slots[0])]).await;
+    let first = FenceNode::start(ports, slots[0], Vec::new()).await;
+    let second = FenceNode::start(ports, slots[1], vec![ports.gossip(slots[0])]).await;
+    let third = FenceNode::start(ports, slots[2], vec![ports.gossip(slots[0])]).await;
     let ids: BTreeSet<u64> = slots
         .iter()
         .map(|i| reliaburger::cluster::identity::raft_id_from_name(&format!("fence{i}")))
@@ -904,7 +929,8 @@ async fn recovering_two_survivors_independently_fences_one() {
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
     // Fence slots 6 to 8, clear of the tests above.
-    form_and_stop_council([6, 7, 8]).await;
+    let ports = FencePorts::lease();
+    form_and_stop_council(&ports, [6, 7, 8]).await;
 
     // 1. Two operators each recover a different survivor from its own
     //    stores. Same epoch, different recovery ids.
@@ -917,8 +943,8 @@ async fn recovering_two_survivors_independently_fences_one() {
     );
 
     // 2. Both come up and see each other over gossip: a split. Both fence.
-    let a = FenceNode::start(6, vec![fence_gossip(7)]).await;
-    let b = FenceNode::start(7, vec![fence_gossip(6)]).await;
+    let a = FenceNode::start(&ports, 6, vec![ports.gossip(7)]).await;
+    let b = FenceNode::start(&ports, 7, vec![ports.gossip(6)]).await;
     let split = wait_until(Duration::from_secs(30), || {
         [&a, &b].iter().all(|node| {
             node.council
@@ -963,8 +989,8 @@ async fn recovering_two_survivors_independently_fences_one() {
     let kept = recover_from_own_stores(6, true).await.unwrap();
     assert_eq!(kept.epoch, a_claim.epoch + 1);
 
-    let a = FenceNode::start(6, vec![fence_gossip(7)]).await;
-    let b = FenceNode::start(7, vec![fence_gossip(6)]).await;
+    let a = FenceNode::start(&ports, 6, vec![ports.gossip(7)]).await;
+    let b = FenceNode::start(&ports, 7, vec![ports.gossip(6)]).await;
     assert!(
         commit_on_any(&[&a], "after-resolution", Duration::from_secs(20))
             .await
@@ -1010,7 +1036,8 @@ async fn slow_gossip_restart_never_acknowledges_on_the_old_epoch() {
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
     // Fence slots 9 to 11, clear of the tests above.
-    form_and_stop_council([9, 10, 11]).await;
+    let ports = FencePorts::lease();
+    form_and_stop_council(&ports, [9, 10, 11]).await;
     let backup = reliaburger::council::recovery::load_recovery_state(
         &reliaburger::council::recovery::RecoverySource::NodeDataDir(fence_data_dir(9)),
         None,
@@ -1021,15 +1048,15 @@ async fn slow_gossip_restart_never_acknowledges_on_the_old_epoch() {
 
     // The two old voters come back first, with the recovered node still
     // down: they can only hear each other.
-    let old1 = FenceNode::start(10, Vec::new()).await;
-    let old2 = FenceNode::start(11, Vec::new()).await;
+    let old1 = FenceNode::start(&ports, 10, Vec::new()).await;
+    let old2 = FenceNode::start(&ports, 11, Vec::new()).await;
 
     // Write against them for longer than the old fixed window, while the
     // recovered node returns eight seconds in. Its join list names an old
     // voter, as a real node's would, so gossip reaches them once it is up.
     let late_start = async {
         tokio::time::sleep(Duration::from_secs(8)).await;
-        FenceNode::start(9, vec![fence_gossip(10)]).await
+        FenceNode::start(&ports, 9, vec![ports.gossip(10)]).await
     };
     let old = [&old1, &old2];
     let (acknowledged, recovered) = tokio::join!(
