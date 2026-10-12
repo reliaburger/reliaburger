@@ -439,8 +439,12 @@ The sync loop:
 2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
 3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
 4. **Configuration tree.** Read the verified commit under the configured watch root. Resolve `_defaults.toml` inheritance and directory namespaces through the same resolver as CLI compilation. A malformed or ambiguous tree refuses the whole sync
-5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
-6. **Selective apply.** Only changed resources written to Raft
+5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware, and removals only for resources Lettuce itself wrote
+6. **Selective apply.** Only changed resources written to Raft, each with its ownership record in the same entry
+
+### Owning only what it wrote
+
+A GitOps engine that treats the repository as the whole truth deletes everything the repository doesn't mention. That's a fine rule for a cluster GitOps built from scratch and a terrible one for a cluster that already has workloads deployed by hand. Lettuce keeps an ownership set in Raft, `DesiredState.gitops_owned`, with the apps, namespaces and permissions it wrote. Each write goes in a `RaftRequest::GitOpsWrite` that applies the change and updates the set in one entry, so the two can't disagree after a crash. The diff removes only owned resources; a resource that already matches git is adopted on the first sync that sees it. So turning GitOps on next to `relish apply` leaves the manual resources alone, a manual apply of a GitOps-owned resource warns that the next sync reverts it, and `relish delete` or `relish rollback` of one needs `--force`. A running test's `rbtest-*` namespace is never in the diff at all. The configuration itself lives in Raft too, with its credentials sealed under the cluster master key, so a failover keeps syncing the same repository. Chapter 7 tells the whole story, including how a sync refuses to write in a Raft term other than the one it read the cluster in.
 
 ### Coordinator election
 

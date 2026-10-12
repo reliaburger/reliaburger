@@ -348,6 +348,39 @@ pub struct ClusterEvidence {
     pub tokens: Evidence<Vec<TokenObservation>>,
     /// Which namespaces exist and which nodes can keep them apart.
     pub isolation: Evidence<IsolationObservation>,
+    /// GitOps warnings and each node's view of the cluster's configuration.
+    pub gitops: Evidence<GitOpsObservation>,
+}
+
+/// What `relish wtf` checks about GitOps (#693).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitOpsObservation {
+    /// Whether the cluster has a GitOps configuration.
+    pub configured: bool,
+    /// The last sync's warnings: plaintext secrets in git (D8).
+    pub warnings: Vec<String>,
+    /// Nodes whose own `[gitops]` differs from the cluster's.
+    pub differing_nodes: Vec<NodeGitOpsDifference>,
+    /// Nodes that can't unseal the cluster's GitOps credentials.
+    pub unreadable_nodes: Vec<NodeGitOpsUnreadable>,
+}
+
+/// A node whose `[gitops]` differs from the cluster's, and is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeGitOpsDifference {
+    /// Node identifier.
+    pub node_id: String,
+    /// The settings that differ, by name.
+    pub fields: Vec<String>,
+}
+
+/// A node that can't read the cluster's GitOps configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeGitOpsUnreadable {
+    /// Node identifier.
+    pub node_id: String,
+    /// Why it can't.
+    pub reason: String,
 }
 
 /// Namespace isolation across the cluster.

@@ -501,17 +501,18 @@ async fn stop_with_client(
     Ok(())
 }
 
-/// Remove an app from the cluster.
-pub async fn delete(app: &str, namespace: &str) -> Result<(), RelishError> {
-    delete_with_client(app, namespace, &BunClient::default_local()).await
+/// Remove an app from the cluster. A GitOps-managed app needs `force`.
+pub async fn delete(app: &str, namespace: &str, force: bool) -> Result<(), RelishError> {
+    delete_with_client(app, namespace, force, &BunClient::default_local()).await
 }
 
 async fn delete_with_client(
     app: &str,
     namespace: &str,
+    force: bool,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    client.delete(app, namespace).await?;
+    client.delete_with_force(app, namespace, force).await?;
     println!("delete requested for {app}; check `relish status` for remaining instances");
     Ok(())
 }
@@ -1378,13 +1379,14 @@ fn render_history_table(
     table
 }
 
-/// Rollback an app to the previous version.
-pub async fn rollback(app: &str, namespace: &str) -> Result<(), RelishError> {
+/// Rollback an app to the previous version. A GitOps-managed app needs
+/// `force`.
+pub async fn rollback(app: &str, namespace: &str, force: bool) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
     // X3: rollback used to only print advice. It now calls the server,
     // which redeploys the previous successful spec.
-    client.rollback(app, namespace).await?;
+    client.rollback_with_force(app, namespace, force).await?;
     println!("rolled {app} back to its previous version");
     Ok(())
 }
@@ -1726,6 +1728,123 @@ fn format_memory(bytes: u64) -> String {
 
 /// Rotate or finalise the cluster's secret encryption key, or one
 /// namespace's.
+/// `relish gitops status`: the cluster's GitOps configuration (never its
+/// credentials), the last sync, what GitOps owns, and whether the answering
+/// node's own `[gitops]` differs (#693).
+pub async fn gitops_status(output: OutputFormat) -> Result<(), RelishError> {
+    let status = BunClient::default_local().gitops_status().await?;
+    match output {
+        OutputFormat::Human => print!("{}", render_gitops_status(&status)),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&status).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&status).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    Ok(())
+}
+
+/// The human view of `relish gitops status`.
+fn render_gitops_status(status: &crate::lettuce::types::GitOpsStatus) -> String {
+    use crate::lettuce::types::LocalConfigCheck;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let Some(config) = &status.config else {
+        out.push_str("GitOps is off for this cluster\n");
+        return out;
+    };
+    let _ = writeln!(out, "repository:   {}", config.repo);
+    let _ = writeln!(out, "branch:       {}", config.branch);
+    let _ = writeln!(out, "path:         {}", config.path);
+    let _ = writeln!(out, "poll:         every {}s", config.poll_interval_secs);
+    let _ = writeln!(
+        out,
+        "credentials:  {}",
+        if status.has_credentials {
+            "sealed in the cluster"
+        } else {
+            "none"
+        }
+    );
+    if let Some(sync) = &status.sync {
+        let commit = sync
+            .last_applied_commit
+            .as_ref()
+            .map_or("none yet", |commit| commit.sha.as_str());
+        let _ = writeln!(out, "applied:      {commit}");
+        if let Some(error) = &sync.last_error {
+            let _ = writeln!(out, "last error:   {error}");
+        }
+        for warning in &sync.warnings {
+            let _ = writeln!(out, "warning:      {warning}");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "owns:         {} app(s), {} namespace(s), {} permission(s)",
+        status.owned.apps.len(),
+        status.owned.namespaces.len(),
+        status.owned.permissions.len()
+    );
+    let local = match &status.local {
+        LocalConfigCheck::Differs { fields } => format!(
+            "differs from the cluster ({}); the cluster's is used",
+            fields.join(", ")
+        ),
+        LocalConfigCheck::Matches => "matches the cluster's".into(),
+        LocalConfigCheck::NoLocalConfig => "none; follows the cluster's".into(),
+        LocalConfigCheck::Unreadable { reason } => format!("can't read the cluster's: {reason}"),
+        LocalConfigCheck::NoClusterConfig | LocalConfigCheck::Unknown => "not checked yet".into(),
+    };
+    let _ = writeln!(out, "this node:    [gitops] {local}");
+    out
+}
+
+/// Read a `[gitops]` section from a TOML file: a node's `node.toml`, or a
+/// file holding just the section's keys.
+fn read_gitops_section(path: &Path) -> Result<crate::lettuce::types::GitOpsConfig, RelishError> {
+    let text = fs::read_to_string(path)?;
+    let mut value: toml::Table =
+        toml::from_str(&text).map_err(crate::config::ConfigError::TomlParse)?;
+    let section = match value.remove("gitops") {
+        Some(toml::Value::Table(section)) => section,
+        Some(_) => {
+            return Err(RelishError::InvalidFlag {
+                flag: "path".into(),
+                reason: format!("{}: [gitops] must be a table", path.display()),
+            });
+        }
+        None => value,
+    };
+    Ok(section
+        .try_into()
+        .map_err(crate::config::ConfigError::TomlParse)?)
+}
+
+/// `relish gitops set <file>`: replace the cluster's GitOps configuration.
+pub async fn gitops_set(path: &Path) -> Result<(), RelishError> {
+    let config = read_gitops_section(path)?;
+    BunClient::default_local()
+        .gitops_config_set(Some(config))
+        .await?;
+    println!(
+        "the cluster's GitOps configuration is now {}; the leader syncs it on its next tick",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `relish gitops disable`: turn GitOps off; what it wrote stays.
+pub async fn gitops_disable() -> Result<(), RelishError> {
+    BunClient::default_local().gitops_config_set(None).await?;
+    println!("GitOps is off; the apps, namespaces and permissions it wrote stay in place");
+    Ok(())
+}
+
 pub async fn secret_rotate(finalize: bool, namespace: Option<&str>) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.secret_rotate(finalize, namespace).await?;
