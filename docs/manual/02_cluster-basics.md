@@ -5,6 +5,23 @@ A Reliaburger cluster is the same `bun` binary on every node, started with
 agent, holds the desired state and schedules work; it starts on the first node
 and grows as nodes join, up to seven voters.
 
+The council always holds an odd number of voters: the largest odd number the
+live nodes allow, up to seven. An even council survives no more failures than
+the odd one below it and makes every write wait for one more acknowledgement.
+
+| Live nodes | Voters | Survives losing |
+|------------|--------|-----------------|
+| 1          | 1      | nothing         |
+| 2          | 1      | the other node, not the voter |
+| 3 or 4     | 3      | any one node    |
+| 5 or 6     | 5      | any two nodes   |
+| 7 or more  | 7      | any three nodes |
+
+A 2-node cluster has one voter. Losing the other node costs nothing; losing the
+voter stops scheduling and writes (apps keep running) until it comes back or
+you recover the council on the survivor. Raft can't do better with two
+machines. For high availability, run three nodes.
+
 A container cluster needs Linux with rootful runc and eBPF (kernel 5.8+,
 cgroup v2, bpffs at `/sys/fs/bpf`). Bun refuses `--cluster` under rootless
 runc. On a laptop, `relish setup --quickstart` builds exactly this inside VMs;
@@ -95,8 +112,8 @@ split, so it compares them all and calls out fenced nodes, two epochs or two
 leaders. `--output json` gives the same report to scripts. `relish status` opens
 with a one-line summary of it.
 
-The council heals itself: lose a voter and the reconciler promotes a caught-up
-node in its place. A voter whose disk is at least 95% full for ten minutes
+The council heals itself: lose a voter and the reconciler swaps a caught-up
+node in for it, in one membership change, so the voter count stays odd. A voter whose disk is at least 95% full for ten minutes
 (measured on the filesystem holding `<data>/raft`) asks to be replaced the same
 way, and a leader hands over first. The `max_storage_mb` caps on logs and
 metrics only decide what gets pruned; they never move a council seat. If a

@@ -8132,7 +8132,11 @@ fn council_metrics(
 }
 
 fn fence(state: crate::council::fence::FenceState) -> Option<crate::council::fence::FenceSnapshot> {
-    Some(crate::council::fence::FenceSnapshot { epoch: 0, state })
+    Some(crate::council::fence::FenceSnapshot {
+        epoch: 0,
+        recovery_id: None,
+        state,
+    })
 }
 
 #[test]
@@ -8162,6 +8166,14 @@ fn council_role_puts_the_fence_before_what_raft_says() {
     let stale_leader = council_metrics(1, &[1, 2, 3], &[], ServerState::Leader);
     assert_eq!(
         council_role(&stale_leader, fence(FenceState::Fenced { newer_epoch: 1 })),
+        CouncilRole::Fenced
+    );
+    // #694: a split fences the leader of either half just the same.
+    let split = FenceState::Split {
+        other_id: crate::council::types::RecoveryId(7),
+    };
+    assert_eq!(
+        council_role(&stale_leader, fence(split)),
         CouncilRole::Fenced
     );
     assert_eq!(

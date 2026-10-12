@@ -166,6 +166,11 @@ impl CouncilNode {
     /// The fence error, when this node is fenced.
     fn fenced_error(&self) -> Option<CouncilError> {
         let snapshot = self.recovery_fence()?.snapshot();
+        if snapshot.split_with().is_some() {
+            return Some(CouncilError::Split {
+                epoch: snapshot.epoch,
+            });
+        }
         snapshot
             .fenced_by()
             .map(|newer_epoch| CouncilError::Fenced {

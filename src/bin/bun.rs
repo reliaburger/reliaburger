@@ -246,6 +246,10 @@ fn cluster_params_from_config(
         // Wired in by the caller (run) once the disk-pressure channel exists.
         self_disk_pressured_rx: None,
         readiness: None,
+        recovery_probe_window: config
+            .cluster
+            .recovery_probe_window_secs
+            .map(std::time::Duration::from_secs),
     })
 }
 

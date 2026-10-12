@@ -478,6 +478,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             labels,
             self_disk_pressured_rx: None,
             readiness: Some(readiness.clone()),
+            recovery_probe_window: None,
         },
         shutdown.clone(),
     )

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
+use crate::council::types::RecoveryClaim;
 use crate::meat::NodeId;
 
 use super::message::{DirectoryExtension, LeaderHint};
@@ -40,9 +41,10 @@ pub struct NodeDirectory {
     /// replaced. A node drops out of the set the moment it re-advertises a
     /// healthy disk.
     pub disk_pressured: HashSet<NodeId>,
-    /// Each node's advertised recovery epoch (#424); `None` for a node that
-    /// holds none yet.
-    pub recovery_epochs: HashMap<NodeId, Option<u64>>,
+    /// Each node's advertised recovery epoch and recovery id (#424, #694);
+    /// `None` for a node that holds no epoch yet. The id is `None` at epoch
+    /// 0, which no recovery started.
+    pub recovery_claims: HashMap<NodeId, Option<RecoveryClaim>>,
     /// Best known leader: newest recovery epoch first, then highest term.
     pub leader: Option<LeaderHint>,
 }
@@ -83,10 +85,14 @@ impl NodeDirectory {
             self.disk_pressured.remove(&extension.node_id);
             changed = true;
         }
+        let claim = extension.recovery_epoch.map(|epoch| RecoveryClaim {
+            epoch,
+            id: extension.recovery_id,
+        });
         changed |= self
-            .recovery_epochs
-            .insert(extension.node_id.clone(), extension.recovery_epoch)
-            != Some(extension.recovery_epoch);
+            .recovery_claims
+            .insert(extension.node_id.clone(), claim)
+            != Some(claim);
         if let Some(hint) = &extension.leader {
             changed |= self.observe_hint(hint);
         }
@@ -145,7 +151,7 @@ impl NodeDirectory {
             self.endpoints.remove(node_id);
             self.labels.remove(node_id);
             self.disk_pressured.remove(node_id);
-            self.recovery_epochs.remove(node_id);
+            self.recovery_claims.remove(node_id);
         }
         self.endpoints.len() != before
     }
@@ -172,6 +178,7 @@ mod tests {
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
             hmac: [0u8; 32],
         }
     }
@@ -188,6 +195,7 @@ mod tests {
                 .collect(),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
             hmac: [0u8; 32],
         }
     }
@@ -201,6 +209,7 @@ mod tests {
             labels: BTreeMap::new(),
             disk_pressured: pressured,
             recovery_epoch: None,
+            recovery_id: None,
             hmac: [0u8; 32],
         }
     }
@@ -370,14 +379,24 @@ mod tests {
         let mut dir = NodeDirectory::default();
         let mut claimed = extension("n1", 9117, None);
         claimed.recovery_epoch = Some(1);
+        claimed.recovery_id = Some(crate::council::types::RecoveryId(7));
         assert!(dir.observe(&claimed));
         assert!(dir.observe(&extension("n2", 9127, None)));
-        assert_eq!(dir.recovery_epochs.get(&NodeId::new("n1")), Some(&Some(1)));
-        assert_eq!(dir.recovery_epochs.get(&NodeId::new("n2")), Some(&None));
+        assert_eq!(
+            dir.recovery_claims.get(&NodeId::new("n1")),
+            Some(&Some(RecoveryClaim {
+                epoch: 1,
+                id: Some(crate::council::types::RecoveryId(7))
+            }))
+        );
+        assert_eq!(dir.recovery_claims.get(&NodeId::new("n2")), Some(&None));
         // The same advertisement again changes nothing.
         assert!(!dir.observe(&claimed));
+        // A different recovery of the same epoch is news.
+        claimed.recovery_id = Some(crate::council::types::RecoveryId(8));
+        assert!(dir.observe(&claimed));
 
         dir.prune(&[NodeId::new("n1")]);
-        assert!(!dir.recovery_epochs.contains_key(&NodeId::new("n1")));
+        assert!(!dir.recovery_claims.contains_key(&NodeId::new("n1")));
     }
 }

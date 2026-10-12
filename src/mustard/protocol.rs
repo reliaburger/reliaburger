@@ -106,6 +106,9 @@ pub struct MustardNode<T: MustardTransport> {
     last_published_roster_digest: Vec<MembershipDigest>,
     /// Process-local proof that a peer has acknowledged our gossip.
     rejoin_watch: Option<watch::Sender<bool>>,
+    /// Flips to `true` the first time a peer's membership table arrives in
+    /// a `Sync` exchange: gossip has joined and synced (#694).
+    synced_watch: Option<watch::Sender<bool>>,
     /// Digest of the last-published membership. Used to publish on any content
     /// change (state/incarnation/council/leader), not just a count change.
     last_published_digest: Vec<MembershipDigest>,
@@ -173,6 +176,13 @@ impl<T: MustardTransport> MustardNode<T> {
         self.rejoin_watch = Some(sender);
     }
 
+    /// Publish `true` once a peer's table first arrives in a push-pull
+    /// exchange. The recovery fence opens its startup probe window then,
+    /// not at process start (#694).
+    pub fn set_synced_watch(&mut self, sender: watch::Sender<bool>) {
+        self.synced_watch = Some(sender);
+    }
+
     /// Maximum number of peers to notify during graceful leave.
     const MAX_LEAVE_FANOUT: usize = 10;
     const MAX_REJOIN_CONTACTS: usize = 16;
@@ -195,6 +205,7 @@ impl<T: MustardTransport> MustardNode<T> {
             roster_watch: None,
             last_published_roster_digest: Vec::new(),
             rejoin_watch: None,
+            synced_watch: None,
             last_published_digest: Vec::new(),
             left: false,
             seeds: Vec::new(),
@@ -323,10 +334,10 @@ impl<T: MustardTransport> MustardNode<T> {
             ),
             (a, b) => a.or(b),
         };
-        let recovery_epoch = self
+        let recovery_claim = self
             .recovery_fence_rx
             .as_ref()
-            .and_then(|rx| rx.borrow().claimed_epoch());
+            .and_then(|rx| rx.borrow().claim());
         let disk_pressured = self
             .disk_pressured_rx
             .as_ref()
@@ -339,7 +350,8 @@ impl<T: MustardTransport> MustardNode<T> {
             leader,
             labels: super::message::bounded_labels(&self.advertised_labels),
             disk_pressured,
-            recovery_epoch,
+            recovery_epoch: recovery_claim.map(|claim| claim.epoch),
+            recovery_id: recovery_claim.and_then(|claim| claim.id),
             hmac: [0u8; 32],
         })
     }
@@ -380,6 +392,11 @@ impl<T: MustardTransport> MustardNode<T> {
     /// of phantom entries even though we joined knowing only an address.
     pub fn set_seeds(&mut self, seeds: Vec<SocketAddr>) {
         self.seeds = seeds;
+    }
+
+    /// Whether this node has any seed to join through.
+    pub fn has_seeds(&self) -> bool {
+        !self.seeds.is_empty()
     }
 
     /// Probe configured seeds while isolated.
@@ -842,6 +859,11 @@ impl<T: MustardTransport> MustardNode<T> {
                 }
             }
             GossipPayload::Sync { wants_reply, .. } => {
+                if message.sender != self.node_id
+                    && let Some(sender) = &self.synced_watch
+                {
+                    sender.send_if_modified(|synced| !std::mem::replace(synced, true));
+                }
                 // The entries were merged above like any piggybacked update.
                 // Answer a request with our own table; never answer a reply,
                 // or two nodes would bounce their tables back and forth.
@@ -2249,12 +2271,19 @@ mod tests {
             joiner_transport,
         );
         joiner.add_seed(NodeId::new("seed"), addr(2));
+        let (synced_tx, synced_rx) = watch::channel(false);
+        joiner.set_synced_watch(synced_tx);
 
         let ((), requests) = tokio::join!(
             joiner.run_one_cycle(),
             serve(&mut seed, Duration::from_millis(100))
         );
         assert_eq!(requests, 1, "the first cycle must start a push-pull");
+        // #694: the recovery fence's probe window opens on this signal.
+        assert!(
+            *synced_rx.borrow(),
+            "the join sync did not report gossip as synced"
+        );
         for name in ["seed", "a", "b", "c"] {
             assert_eq!(
                 state_of(&joiner, name).map(|(state, _)| state),
@@ -2381,6 +2410,7 @@ mod tests {
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
             hmac: [0u8; 32],
         };
 
@@ -2438,6 +2468,7 @@ mod tests {
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
             hmac: [0u8; 32],
         });
         node.handle_message(addr(2), msg).await;

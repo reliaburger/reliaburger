@@ -369,16 +369,62 @@ fn check_council_split(council: &CouncilObservation, report: &mut WtfReport) -> 
     }
     let summary = crate::relish::council_view::summarise(&council.nodes);
     let mut healthy = true;
-    if !summary.fenced.is_empty() {
+    let (split, replaced): (Vec<_>, Vec<_>) = summary
+        .fenced
+        .iter()
+        .partition(|node| node.split_with.is_some());
+    if !split.is_empty() {
+        healthy = false;
+        report.critical.push(WtfFinding {
+            id: "council-recovery-split".to_string(),
+            title: "two recoveries landed on the same epoch: both councils fenced themselves"
+                .to_string(),
+            details: split
+                .iter()
+                .map(|node| {
+                    format!(
+                        "{}: recovery epoch {}, but another recovery ({}) claims it too; it \
+                         serves no Raft and refuses writes",
+                        node.node_id,
+                        node.epoch,
+                        node.split_with.as_deref().unwrap_or("unknown")
+                    )
+                })
+                .collect(),
+            suggestion: "pick the council to keep, stop one of its nodes and run `relish council \
+                         recover --force --data-dir <its data directory>` (it lands on a newer \
+                         epoch); then stop the other side's nodes and `relish council re-enrol` \
+                         each one"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    if !summary.fence_unpersisted.is_empty() {
+        report.warnings.push(WtfFinding {
+            id: "council-fence-unpersisted".to_string(),
+            title: "a recovery fence could not be written to disk".to_string(),
+            details: summary
+                .fence_unpersisted
+                .iter()
+                .map(|(node, error)| format!("{node}: {error}; retrying"))
+                .collect(),
+            suggestion: "free space or fix the data directory on each node named; until the \
+                         write lands, restarting that node would bring it back unfenced"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    if !replaced.is_empty() {
         healthy = false;
         report.critical.push(WtfFinding {
             id: "council-fenced".to_string(),
             title: format!(
                 "{} node(s) fenced out of a council that `relish council recover` replaced",
-                summary.fenced.len()
+                replaced.len()
             ),
-            details: summary
-                .fenced
+            details: replaced
                 .iter()
                 .map(|node| {
                     format!(
@@ -1606,6 +1652,8 @@ mod tests {
             role,
             recovery_epoch: Some(epoch),
             fenced_by,
+            split_with: None,
+            fence_persist_error: None,
             leader: leader.map(str::to_string),
             term: 3,
             last_applied: Some(10),
@@ -1664,6 +1712,41 @@ mod tests {
                 .any(|item| item.id == "council-epoch-split")
         );
         assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    /// #694: two recoveries on one epoch fence both halves. That is its own
+    /// critical finding, with a different way out than a replaced council.
+    #[test]
+    fn a_recovery_split_is_critical_and_names_both_halves() {
+        use crate::bun::agent::CouncilRole;
+        let mut a = council_node("node-1", CouncilRole::Fenced, 1, Some(1), None);
+        a.split_with = Some("bb".repeat(16));
+        let mut b = council_node("node-2", CouncilRole::Fenced, 1, Some(1), None);
+        b.split_with = Some("aa".repeat(16));
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = council_with_nodes(vec![a, b]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|item| item.id == "council-recovery-split")
+            .unwrap();
+        assert_eq!(finding.details.len(), 2);
+        assert!(finding.details[0].contains(&"bb".repeat(16)));
+        assert!(
+            finding
+                .suggestion
+                .contains("relish council recover --force")
+        );
+        assert!(
+            !report
+                .critical
+                .iter()
+                .any(|item| item.id == "council-fenced"),
+            "a split is not a replaced council"
+        );
     }
 
     /// #480: a voter whose Raft core stopped still answers its API, so the

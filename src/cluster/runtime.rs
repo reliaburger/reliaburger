@@ -125,6 +125,11 @@ pub struct ClusterParams {
     pub self_disk_pressured_rx: Option<watch::Receiver<bool>>,
     /// Process-wide critical-subsystem evidence owned by Bun.
     pub readiness: Option<crate::bun::readiness::ReadinessTracker>,
+    /// How long a restarted voter listens for its peers' recovery epochs
+    /// after gossip has synced, unless every persisted peer advertises
+    /// sooner (`[cluster] recovery_probe_window_secs`, #694). `None` uses
+    /// two anti-entropy intervals.
+    pub recovery_probe_window: Option<Duration>,
 }
 
 /// Open and validate the durable Raft stores under `raft_dir`.
@@ -233,10 +238,11 @@ pub async fn start(
     // node — chaos partitions populate it to silently drop datagrams.
     let gossip_blocklist = transport.blocklist();
 
+    let gossip_config = GossipConfig::default();
     let mut node = MustardNode::new(
         NodeId::new(&params.node_name),
         params.gossip_addr,
-        GossipConfig::default(),
+        gossip_config.clone(),
         transport,
     );
     node.set_node_gate(node_gate.clone());
@@ -248,6 +254,8 @@ pub async fn start(
     node.set_roster_watch(roster_tx);
     let (rejoin_tx, gossip_rejoined_rx) = watch::channel(false);
     node.set_rejoin_watch(rejoin_tx);
+    let (gossip_synced_tx, gossip_synced_rx) = watch::channel(false);
+    node.set_synced_watch(gossip_synced_tx.clone());
 
     // Control-plane directory (12b.2): every datagram this node sends
     // advertises its API and reporting endpoints, plus the best leader hint
@@ -353,7 +361,12 @@ pub async fn start(
     // seeds. Only an offline recovery snapshot counts (an epoch, but no log
     // position or membership); a joiner holding an installed snapshot from
     // the recovered council must never start a council of its own.
-    let snapshot_epoch = state_machine.desired_state().await.recovery_epoch;
+    let snapshot_claim = state_machine
+        .read_desired(|state| crate::council::types::RecoveryClaim {
+            epoch: state.recovery_epoch,
+            id: state.recovery_id,
+        })
+        .await;
     let recovered_bootstrap = state_machine.recovered_bootstrap_pending().await;
     let restored_security = state_machine
         .read_desired(|state| state.security_state.is_initialised())
@@ -367,7 +380,7 @@ pub async fn start(
     // admits it.
     let fence = crate::council::fence::RecoveryFence::load(
         &raft_dir,
-        snapshot_epoch,
+        snapshot_claim,
         !store_fresh,
         bootstrapping,
     )
@@ -436,6 +449,12 @@ pub async fn start(
             node.set_seeds(seeds);
         }
     }
+    // A node with nobody to sync with (a single-voter council restarting
+    // with no seeds) has had all the gossip it can get: its startup probe
+    // window runs from now.
+    if params.seeds.is_empty() && !node.has_seeds() {
+        gossip_synced_tx.send_replace(true);
+    }
 
     // Now start gossip.
     let gossip_shutdown = shutdown.clone();
@@ -460,10 +479,17 @@ pub async fn start(
         )
         .await;
     });
+    let probe_window = params
+        .recovery_probe_window
+        .unwrap_or_else(|| crate::cluster::recovery_fence::default_probe_window(&gossip_config));
     crate::cluster::recovery_fence::spawn_recovery_fence_supervisor(
         fence.clone(),
         Arc::clone(&council),
-        directory_rx.clone(),
+        crate::cluster::recovery_fence::FenceSupervisorInputs {
+            directory_rx: directory_rx.clone(),
+            gossip_synced_rx,
+            probe_window,
+        },
         params.node_name.clone(),
         shutdown.clone(),
     );
@@ -1497,18 +1523,20 @@ async fn execute_council_action(
                 tokio::time::timeout(op_timeout, council.add_learner(id, entry.info.clone())).await;
             log_membership_op(&format!("add_learner({id})"), result);
         }
-        CouncilAction::Promote(id) => {
-            let mut next = voters.clone();
-            next.insert(id);
+        CouncilAction::Promote(_) | CouncilAction::PromotePair(..) => {
+            let next = action.voters_after(voters);
             let result = tokio::time::timeout(op_timeout, council.change_membership(next)).await;
-            log_membership_op(&format!("promote({id})"), result);
+            log_membership_op(&format!("{action:?}"), result);
         }
-        CouncilAction::RemoveVoter(id) => {
-            let mut next = voters.clone();
-            next.remove(&id);
+        CouncilAction::Replace { .. }
+        | CouncilAction::RemoveVoter(_)
+        | CouncilAction::RemoveVoterPair(..) => {
+            // Leaving voters drop out of the membership entirely, so a dead
+            // one never lingers as a learner.
+            let next = action.voters_after(voters);
             let result =
                 tokio::time::timeout(op_timeout, council.change_membership_evicting(next)).await;
-            log_membership_op(&format!("remove_voter({id})"), result);
+            log_membership_op(&format!("{action:?}"), result);
         }
         CouncilAction::RemoveLearner(id) => {
             let result = tokio::time::timeout(op_timeout, council.remove_learner(id)).await;

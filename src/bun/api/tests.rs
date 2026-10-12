@@ -5997,7 +5997,58 @@ async fn health_endpoint_returns_200() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    // A standalone node has no council to vote in.
+    assert_eq!(json["council_voter"], false);
     shutdown.cancel();
+}
+
+/// #694: `relish council recover` asks each persisted voter's unauthenticated
+/// health endpoint whether it still serves a council.
+#[tokio::test]
+async fn health_says_whether_this_node_is_a_council_voter() {
+    use crate::council::fence::RecoveryFence;
+    use crate::council::log_store::MemLogStore;
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::state_machine::CouncilStateMachine;
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo, RecoveryClaim};
+
+    async fn council(initialised: bool, fence: RecoveryFence) -> crate::council::CouncilNode {
+        let router = InMemoryRaftRouter::new();
+        let node = crate::council::CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, node.raft().clone()).await;
+        if initialised {
+            let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
+            node.initialize(std::collections::BTreeMap::from([(1, info)]))
+                .await
+                .unwrap();
+        }
+        node.with_recovery_fence(fence)
+    }
+
+    let voter = council(true, RecoveryFence::serving(0)).await;
+    assert!(super::node_info::serves_as_council_voter(&voter));
+
+    let worker = council(false, RecoveryFence::serving(0)).await;
+    assert!(!super::node_info::serves_as_council_voter(&worker));
+
+    let fence = RecoveryFence::serving(0);
+    fence.observe_peer(RecoveryClaim { epoch: 1, id: None });
+    let fenced = council(true, fence).await;
+    assert!(!super::node_info::serves_as_council_voter(&fenced));
 }
 
 /// Parse SSE events from a response body. Each event is a line

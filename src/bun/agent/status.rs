@@ -191,9 +191,23 @@ pub struct CouncilStatus {
     /// council has admitted it (#424).
     #[serde(default)]
     pub recovery_epoch: Option<u64>,
-    /// The newer epoch that fenced the answering node, when it is fenced.
+    /// The epoch that fenced the answering node, when it is fenced: the
+    /// newer epoch that replaced its council, or its own epoch when a split
+    /// fenced it.
     #[serde(default)]
     pub fenced_by: Option<u64>,
+    /// The recovery that started the answering node's epoch (#694).
+    #[serde(default)]
+    pub recovery_id: Option<crate::council::types::RecoveryId>,
+    /// The other council's recovery id, when two recoveries landed on the
+    /// answering node's epoch and it fenced itself as a split (#694).
+    #[serde(default)]
+    pub split_with: Option<crate::council::types::RecoveryId>,
+    /// Why the answering node's last write of its recovery fence failed,
+    /// while it keeps retrying (#694). A fence that isn't on disk is lost
+    /// on restart.
+    #[serde(default)]
+    pub fence_persist_error: Option<String>,
     /// Index of the last entry in the answering node's log.
     #[serde(default)]
     pub last_log_index: Option<u64>,
@@ -206,7 +220,7 @@ pub fn council_role(
 ) -> CouncilRole {
     use crate::council::fence::FenceState;
     match fence.map(|fence| fence.state) {
-        Some(FenceState::Fenced { .. }) => return CouncilRole::Fenced,
+        Some(FenceState::Fenced { .. } | FenceState::Split { .. }) => return CouncilRole::Fenced,
         Some(FenceState::Probing) => return CouncilRole::Starting,
         _ => {}
     }
@@ -247,6 +261,9 @@ pub async fn council_status(
         })
         .collect();
     let fence = council.recovery_fence().map(|fence| fence.snapshot());
+    let fence_persist_error = council
+        .recovery_fence()
+        .and_then(|fence| fence.persist_failure());
 
     CouncilStatus {
         members,
@@ -257,6 +274,11 @@ pub async fn council_status(
         role: council_role(metrics, fence),
         recovery_epoch: fence.and_then(|fence| fence.claimed_epoch()),
         fenced_by: fence.and_then(|fence| fence.fenced_by()),
+        recovery_id: fence
+            .and_then(|fence| fence.claim())
+            .and_then(|claim| claim.id),
+        split_with: fence.and_then(|fence| fence.split_with()),
+        fence_persist_error,
         last_log_index: metrics.last_log_index,
     }
 }

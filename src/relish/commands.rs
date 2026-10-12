@@ -1021,34 +1021,30 @@ fn print_standalone_council(
 /// Offline by design: run it against a STOPPED node. It restores the desired
 /// state (from a sealed backup or the node's own snapshot and committed
 /// log), retires the dead cluster's Raft log, and stamps a fresh recovery
-/// epoch. The next start
-/// re-bootstraps a single-voter council the reconciler regrows.
+/// epoch and recovery id. The next start re-bootstraps a single-voter
+/// council the reconciler regrows.
+///
+/// Before it changes anything it asks every voter the restored state names,
+/// on `api_port`, whether it still serves a council, and refuses if one does
+/// or if the state names no voters (#694). It also refuses a data directory
+/// another recovery has already fenced. `force` overrides both.
 pub async fn council_recover(
     data_dir: &std::path::Path,
     from: Option<&str>,
     master_key_path: Option<&std::path::Path>,
+    api_port: u16,
     force: bool,
 ) -> Result<(), RelishError> {
-    use crate::council::recovery::{RecoverySource, load_recovery_state, recover_data_dir};
+    use crate::council::recovery::{
+        RecoverySource, load_recovery_state, persisted_voters, recover_data_dir,
+    };
+    use crate::relish::recover_guard::{VoterEndpoint, check_voters_gone, probe_client};
 
-    // Safety check: refuse if a live council still answers, unless forced. In a
-    // genuine full-council loss the local agent is down, so this check simply
-    // passes; it only bites when someone runs recovery against a healthy
-    // cluster by mistake.
-    if !force {
-        if let Ok(nodes) = BunClient::default_local().nodes().await {
-            let live_voter = nodes.iter().find(|n| n.is_council && !n.is_down());
-            if let Some(voter) = live_voter {
-                return Err(RelishError::Recovery(format!(
-                    "a live council voter ({}) is still reachable; stop the cluster or pass --force",
-                    voter.node_id
-                )));
-            }
-        }
-    } else {
+    if force {
         eprintln!(
-            "WARNING: --force skips the live-council check. Recovering a cluster that still has a \
-             quorum will split the brain. Continue only if every voter is truly gone."
+            "WARNING: --force skips the live-voter and fenced-directory checks. Recovering a \
+             cluster that still has a quorum will split the brain. Continue only if every voter \
+             is truly gone."
         );
     }
 
@@ -1080,12 +1076,32 @@ pub async fn council_recover(
     let token_count = state.security_state.api_tokens.len();
     let prior_epoch = state.recovery_epoch;
 
-    recover_data_dir(data_dir, state).map_err(|e| RelishError::Recovery(e.to_string()))?;
+    // The live-voter guard: every voter of the council this state came
+    // from must be gone, or recovery starts a second council next to it.
+    if !force {
+        let voters: Vec<VoterEndpoint> = persisted_voters(&state)
+            .iter()
+            .map(|info| VoterEndpoint::from_info(info, api_port))
+            .collect();
+        let client = probe_client()
+            .map_err(|e| RelishError::Recovery(format!("build the voter probe: {e}")))?;
+        check_voters_gone(&client, &voters)
+            .await
+            .map_err(|refusal| RelishError::Recovery(refusal.to_string()))?;
+    }
+
+    let claim = recover_data_dir(data_dir, state, force)
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    let recovery_id = claim
+        .id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "-".to_string());
 
     println!("Council recovery complete.");
     println!("  Restored apps:   {app_count}");
     println!("  API tokens:      {token_count}");
-    println!("  Recovery epoch:  {} -> {}", prior_epoch, prior_epoch + 1);
+    println!("  Recovery epoch:  {prior_epoch} -> {}", claim.epoch);
+    println!("  Recovery id:     {recovery_id}");
     println!("  Data directory:  {}", data_dir.display());
     println!();
     println!("Start this node to re-bootstrap a single-voter council; the reconciler");

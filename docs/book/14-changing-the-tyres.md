@@ -1584,6 +1584,10 @@ if quorum_ok || !voter_phase {
 
 We didn't let `abort` end a waiting run. A run waiting on quorum may already have moved its workers, and `abort` refuses once a node has moved for a good reason: it would leave the cluster on two versions. Refusing the run up front removes the one case with no exit, without loosening the rule for the cases that have one.
 
+### Two machines, one voter
+
+The table above has a second lesson in it, and 0.2.1 took it (D12, #694). A two-voter council can't survive losing either voter, and it can't upgrade, so why did the reconciler ever build one? It promoted every eligible node up to seven, and nothing kept the count odd. Now the council holds the largest odd number of voters the live nodes allow (chapter 2, "Odd numbers only"), so the pair of thin clients forms a one-voter council: the voter execs in place, the other machine upgrades as a worker, and the refusal never fires. The check stays anyway. A council an older release left at two voters, or one a decommission shrank to two, still has no way through, and the reconciler needs a tick or two to put it back to one. A guard that costs one comparison is cheap insurance for that window.
+
 We didn't upgrade the leader first on a two-voter council either. The leader execs in place in under a second, so in principle the pair would survive it. In practice that's a second upgrade order with its own failure modes, written for a cluster size that can't survive losing a machine anyway. Three is the smallest council that tolerates a failure, so it's the smallest one we roll.
 
 ### Tests

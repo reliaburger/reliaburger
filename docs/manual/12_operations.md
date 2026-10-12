@@ -354,7 +354,9 @@ That only works on a node that was a voter, and the log is encrypted, so pass
 exists). Entries the node hadn't seen committed are left out. It moves the dead
 council's Raft directory aside (to `.raft-recovery-*/previous` in the data
 directory, where you can delete it once the cluster is healthy) and stamps a
-new recovery epoch. It refuses while the node is still running, and the next
+new recovery epoch, with a random recovery id that tells this recovery apart
+from any other. The epoch lands above both the restored state's and any
+epoch the node's own fence record knows of. It refuses while the node is still running, and the next
 start finishes a recovery that crashed part-way. Starting the node brings up a
 one-voter council that grows again as nodes rejoin, even if its config still
 lists `cluster.join` seeds. New members receive the whole restored state.
@@ -366,15 +368,25 @@ catalogue than the backup holds still follow the recovered one, because each
 recovery starts a new range of catalogue generations; a leader of the replaced
 council stays refused.
 
-Before it starts, it asks the local agent whether any voter is still alive
-and refuses if one is; `--force` skips that check. The node is stopped by
-then, though, so in practice nothing answers and the check passes. Make sure
-yourself that the other voters are really gone: recovering a cluster that's
-still alive splits the brain.
+Before it changes anything, it reads the voters of the council the restored
+state came from (the data directory's last membership, or the backup's) and
+asks each one's `/v1/health` whether it still serves a council. It refuses,
+naming the voter, while any of them says yes, or answers in a way it can't
+read. A voter that doesn't answer at all counts as gone. Pass `--api-port` if
+your nodes' API doesn't listen on 9117. When the restored state names no
+voters, it can't check, so it refuses too. Recovering a cluster that's still
+alive splits the brain; `--force` skips the check once you're sure.
 
-You need `--force` when a majority is gone but not every voter, say two of
-three. The survivor can't regrow the council alone (changing membership needs
-a quorum too), so you stop it and recover it as above.
+It also refuses a data directory whose fence record says another recovery
+already replaced it (see below): recovering it would start a rival council
+next to the one that fenced it. Re-enrol that node instead. `--force`
+recovers it anyway, on an epoch above the one that fenced it, which in turn
+fences that newer council when the two meet.
+
+When a majority is gone but not every voter (two of three, say), the survivor
+can't regrow the council alone, because changing membership needs a quorum
+too. Stop it and recover it as above: the dead voters don't answer, so the
+check passes without `--force`.
 
 ### When the old voters come back
 
@@ -383,16 +395,32 @@ directories. Two of three old voters are a majority of it, so on their own
 they would elect a leader and take writes: a second council. The recovery
 epoch stops that, as long as they can reach the recovered side:
 
-- A restarted voter waits a few seconds for gossip to show its peers'
-  epochs before it serves Raft. If any peer holds a newer epoch, it fences
-  itself.
+- A restarted voter doesn't serve Raft until gossip has joined and synced,
+  and then for two anti-entropy intervals (20 seconds), unless every peer its
+  membership names has advertised an epoch sooner. If any peer holds a newer
+  epoch, it fences itself. On a network where gossip converges slowly, raise
+  `[cluster] recovery_probe_window_secs`. The node logs when the window runs
+  out without hearing from every peer. A single-voter council has no peers to
+  wait for and serves as soon as gossip is up.
 - A voter that talks to the recovered council, or to an already fenced
   peer, is refused with the newer epoch and fences itself on the spot.
 - A fenced node serves no Raft, refuses writes, claims no leader, and stays
-  fenced across restarts. It keeps running its workloads as a worker.
+  fenced across restarts. It keeps running its workloads as a worker. If the
+  fence can't be written to disk (a full disk), the node keeps retrying, and
+  `relish council status` and `relish wtf` warn that a restart would forget
+  it.
+- Two councils on the same epoch with different recovery ids came from two
+  separate recoveries, for example two survivors that two operators
+  recovered independently. Each side fences itself as a `split` when it
+  meets the other, because neither can tell which one is real. Pick the side
+  to keep, stop one of its nodes and run `relish council recover --force` on
+  it (its fence record says it's fenced, hence `--force`): it lands on a newer
+  epoch, and the other side's nodes fence themselves against it. Re-enrol
+  those.
 
-`relish council status` shows such a node as `fenced`, `relish status` prints
-a warning line, and `relish wtf` reports it as CRITICAL until you re-enrol it.
+`relish council status` shows such a node as `fenced` (its epoch column reads
+`0 < 1`, or `1 split` for a split), `relish status` prints a warning line, and
+`relish wtf` reports it as CRITICAL until you re-enrol it.
 Stop the node, then:
 
 ```sh
@@ -407,8 +435,8 @@ isn't fenced; `--force` overrides that for an old voter that never heard of the
 recovery.
 
 The fence has one gap. An old voter learns of the new epoch only from a node
-that holds it. **After `council recover --force`, don't start the old voters
-where they can reach each other but not the recovered side.** Wipe them with
+that holds it. **After `council recover`, don't start the old voters where
+they can reach each other but never the recovered side.** Wipe them with
 `relish council re-enrol` first, or keep them stopped until they can see the
 recovered council. If two of them do come back cut off from it, they form a
 council of their own; `relish council status` and `relish wtf` show it as two

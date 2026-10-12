@@ -249,8 +249,10 @@ a warning, `envFrom` is dropped, and their values have to move into `env` or
 `relish import` writes the equivalent TOML if you'd rather keep that.
 
 **Clustering without etcd.** Nodes find each other and detect failure with SWIM
-gossip. A small Raft council, embedded in the agent, holds cluster state. Lose
-a node and the scheduler moves its workloads to the survivors. Lose the whole
+gossip. A small Raft council, embedded in the agent, holds cluster state. It
+always has an odd number of voters, so two nodes run one voter and high
+availability starts at three. Lose a node and the scheduler moves its
+workloads to the survivors. Lose the whole
 council and `relish council recover` rebuilds it from a backup, fencing off the
 old voters if they return; `relish council status` shows every node's view.
 

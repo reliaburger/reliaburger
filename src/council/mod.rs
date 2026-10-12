@@ -88,6 +88,13 @@ pub enum CouncilError {
          epoch {newer_epoch}; re-enrol it with a fresh data directory"
     )]
     Fenced { epoch: u64, newer_epoch: u64 },
+    /// Two recoveries landed on this node's epoch (#694).
+    #[error(
+        "this node is fenced: another council claims its recovery epoch {epoch} from a different \
+         recovery (a split); recover one side again with `relish council recover` and re-enrol \
+         the other"
+    )]
+    Split { epoch: u64 },
 }
 
 #[cfg(test)]

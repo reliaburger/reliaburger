@@ -167,6 +167,17 @@ The leader selects council members from the general node pool. Selection criteri
 3. **Zone diversity.** If node labels include zone or region information, the leader maximizes geographic distribution among council members. A council where all members are in the same rack defeats the purpose of redundancy.
 4. **Random tiebreaker.** Among otherwise-equal candidates, selection is random (seeded by the leader's node ID + current term for reproducibility).
 
+**Odd voter counts (D12, #694).** The planner (`plan_council_action`) targets the largest odd number of voters not above the live nodes (live voters, live learners and live spare candidates) nor `max_council_size`. An even council tolerates no more failures than the odd one below it and adds a write acknowledgement, so no planner action ever lands on an even count:
+
+| Live nodes | Voters |
+|---|---|
+| 1-2 | 1 |
+| 3-4 | 3 |
+| 5-6 | 5 |
+| 7+ | 7 |
+
+Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Extra eligible nodes stay workers or learners. A two-node cluster therefore has one voter: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
+
 Council replacement flow:
 
 ```
@@ -187,7 +198,7 @@ Leader evaluates candidate pool via Mustard membership
 Leader selects replacement node R
      │
      ▼
-Leader issues Raft AddNode(R) log entry
+Leader adds R as a learner
      │
      ▼
 R receives Raft log snapshot + incremental entries
@@ -196,7 +207,7 @@ R receives Raft log snapshot + incremental entries
 R catches up to current log position
      │
      ▼
-Council returns to target size
+Leader swaps R in for C in one membership change (count stays odd)
 ```
 
 ### 3.5 Hierarchical Reporting Tree
@@ -712,6 +723,8 @@ With a council of 5, a majority is 3 votes. Even with one member down, 4 remaini
 
 ### 5.3 Council Selection Algorithm
 
+The candidate ranking below feeds the planner, which caps the voter count at the largest odd number the live nodes and `max_council_size` allow (§3.4, D12). `target_size` here is the cap; the planner never seats an even council even when more candidates rank.
+
 ```
 fn select_council_candidates(
     membership: &MembershipTable,
@@ -857,7 +870,7 @@ When a new leader is elected, it must rebuild its understanding of the cluster's
 
 > **Status — what ships vs what's proposed.** Full-council loss recovery ships as an **operator-triggered** flow, not the fully-automatic pre-seeded election described below. `relish council recover` runs against a stopped survivor (`src/council/recovery.rs`): it restores the desired state from the last sealed external backup (`src/council/backup.rs`) or the node's own durable snapshot and committed log, re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council from healthy members. Anything written after the last backup is lost, which is why a human confirms the restore. The pre-seeded recovery-candidate machinery in steps 1–5 below — priority-ordered candidates, the encrypted gossip candidate blob, and a survivor assuming leadership *without* an election — remains an **architecture proposal** (a later phase); it is documented here as the target design, not current behaviour. The learning period in §5.4, the backup/restore, and disk-pressure council step-down all ship today.
 >
-> **Recovery fence (#424).** The recovery epoch is per-node fence state (`src/council/fence.rs`), not just a filter on RPC pairs. Gossip extensions carry each node's claimed epoch and leader hints order by (epoch, term). A restarted voter probes its peers' gossiped epochs for up to five seconds before serving Raft (`src/cluster/recovery_fence.rs`); a node that learns of a newer epoch from gossip or from a peer's `Fenced` reply fences itself permanently (persisted in `raft/recovery-fence.json`), sends and serves no Raft, refuses writes and names no leader. A fresh data directory claims no epoch and adopts the first council that admits it, which is how the recovered council regrows and how `relish council re-enrol` brings a fenced voter back. The recovered council snapshots and purges its log after bootstrap so joiners receive the restored state by InstallSnapshot. Limit: old voters that reach only each other, never a newer-epoch node, can't learn of the recovery; operators re-enrol them first.
+> **Recovery fence (#424).** The recovery epoch is per-node fence state (`src/council/fence.rs`), not just a filter on RPC pairs. Gossip extensions carry each node's claimed epoch and leader hints order by (epoch, term). Each recovery also draws a random 128-bit recovery id (#694), stored with the epoch in the snapshot (`DesiredState::recovery_id`) and the fence record. The new epoch is `max(restored epoch, the recovering node's fence epoch, its fenced_by) + 1`, read before the old directory moves aside, and `relish council recover` refuses a data directory whose record says it's fenced unless `--force`. Raft envelopes carry `sender_recovery_id` and a `Fenced` reply carries the refusing node's own id; the gossip directory extension carries `recovery_epoch: Option<u64>` and `recovery_id: Option<RecoveryId>` side by side, folded into `NodeDirectory::recovery_claims: HashMap<NodeId, Option<RecoveryClaim>>`. A node that meets its own epoch with a different id moves to `FenceState::Split` and so does the other side, since neither can tell which recovery is real; `relish council status` and `relish wtf` report it as critical. A restarted voter doesn't serve Raft until gossip has joined and completed its first push-pull sync, then waits two anti-entropy intervals (20 s, overridable with `[cluster] recovery_probe_window_secs`) unless every peer its persisted membership names has advertised a claim sooner (`src/cluster/recovery_fence.rs`); a voter whose persisted membership names no other member has nobody to hear from and serves once gossip has synced (at once when it has no seeds), so a single-node cluster restarts as quickly as before. A failed fence write is retried every five seconds and reported in council status until it lands. Before it changes anything, `relish council recover` reads the persisted voter set (the data directory's or the backup's last membership) and asks each voter's `/v1/health` whether it is an unfenced council voter, refusing while one says yes or answers unreadably, and failing closed on an empty voter set; a node that learns of a newer epoch from gossip or from a peer's `Fenced` reply fences itself permanently (persisted in `raft/recovery-fence.json`), sends and serves no Raft, refuses writes and names no leader. A fresh data directory claims no epoch and adopts the first council that admits it, which is how the recovered council regrows and how `relish council re-enrol` brings a fenced voter back. The recovered council snapshots and purges its log after bootstrap so joiners receive the restored state by InstallSnapshot. Limit: old voters that reach only each other, never a newer-epoch node, can't learn of the recovery; operators re-enrol them first.
 
 When the entire Raft council is lost simultaneously (all 3-7 members fail at once), the *proposed* pre-seeded recovery mechanism activates as follows.
 
@@ -927,6 +940,8 @@ Split-brain can occur during a network partition where two groups each believe t
 
 **Determinism:** There is never ambiguity about which group leads. The priority order was established before the failure. Two groups cannot independently decide they should both lead. This is the primary advantage of the pre-seeded approach over any voting-based catastrophic recovery.
 
+**What ships today (operator-triggered recovery, #694).** Two operators can still recover two survivors independently. The recovery id is what keeps that from becoming two live councils: both land on the same epoch with different ids, and each fences itself as a split on first contact (gossip or a Raft refusal). Recovering a node whose fence record says it was fenced needs `--force` and lands above the fencing epoch, so the operator's second attempt resolves the split instead of repeating it. The live-voter probe in `relish council recover` refuses while any persisted voter still serves.
+
 **Read-only mode behaviour:**
 
 - Apps continue running and serving traffic.
@@ -965,7 +980,7 @@ In the implementation, promotion and eviction go through openraft's joint consen
 
 ## 6. Configuration
 
-There are **no `[mustard]` or `[raft]` TOML sections**. The SWIM and Raft protocol timings shown historically here (gossip interval, probe/suspicion timeouts, the 10 s anti-entropy push-pull interval, heartbeat and election timeouts, batch/snapshot sizes) are **compile-time constants**, not tunable config. What *is* configurable lives under `[cluster]` in `node.toml`, and it is essentially the three ports:
+There are **no `[mustard]` or `[raft]` TOML sections**. The SWIM and Raft protocol timings shown historically here (gossip interval, probe/suspicion timeouts, the 10 s anti-entropy push-pull interval, heartbeat and election timeouts, batch/snapshot sizes) are **compile-time constants**, not tunable config. What *is* configurable lives under `[cluster]` in `node.toml`: essentially the three ports, plus the recovery probe window (#694):
 
 ```toml
 [cluster]
@@ -983,6 +998,11 @@ raft_port = 9444
 
 # Reporting-tree state reports (TCP + mTLS). Default: 9445.
 reporting_port = 9445
+
+# How long a restarted voter keeps listening for its peers' recovery
+# epochs after gossip has synced, unless every peer advertises sooner.
+# Unset means two anti-entropy intervals (20 s).
+# recovery_probe_window_secs = 20
 ```
 
 (The old `7946`/`7947` gossip/raft ports never shipped; the real defaults are `9443`/`9444`/`9445`. The node HTTP API is a separate port, `9117`.)
@@ -993,9 +1013,9 @@ The council sizing constants below are compile-time defaults in `CouncilSelectio
 # Minimum council size (below this, the cluster enters degraded mode).
 min_council_size = 3
 
-# Maximum / steady-state target council size. The runtime passes
-# max_council_size as the selection target, so the council grows to 7,
-# not 5. There is no separate "target_size = 5".
+# Maximum council size. The council holds the largest odd number of
+# voters not above this nor the live node count (D12), so it grows
+# 1, 3, 5, 7. There is no separate "target_size = 5".
 max_council_size = 7
 
 # Minimum time a node must be alive before it can join the council.
