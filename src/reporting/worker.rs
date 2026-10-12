@@ -18,7 +18,7 @@ use super::transport::ReportingTransport;
 use super::types::{
     AppResourceUsage, CapacityRefusal, EgressAffectedWorkload, EgressEnforcementEvidence,
     EgressEnforcementStatus, JobReservations, NodeCapabilityReport, NodeReadinessReport,
-    ReportHealthStatus, ReportingMessage, ResourceUsage, RunningApp, StateReport,
+    ReportHealthStatus, ReportingMessage, ResourceUsage, RolloutReport, RunningApp, StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -78,6 +78,8 @@ pub struct AgentSnapshot {
     pub job_reservations: JobReservations,
     /// Apps whose placement here failed for lack of capacity.
     pub capacity_refusals: Vec<CapacityRefusal>,
+    /// The app versions the placement reconciler last finished deploying.
+    pub rollouts: Vec<RolloutReport>,
 }
 
 /// How many stale windows (`stale_report_timeout_secs`) a busy agent loop
@@ -395,6 +397,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
             timestamp: SystemTime::now(),
             running_apps,
             cached_specs: vec![],
+            rollouts: snapshot.rollouts,
             resource_usage: ResourceUsage {
                 cpu_used_millicores: cpu_used,
                 memory_used_mb: memory_used,
@@ -506,6 +509,7 @@ mod tests {
             capacity_memory_mb: 15_872,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         }
     }
 
@@ -836,6 +840,7 @@ mod tests {
             capacity_memory_mb: 16384,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         });
         assert_eq!(report.running_apps[0].execution, Some(execution));
     }
@@ -874,6 +879,7 @@ mod tests {
             capacity_memory_mb: 16384,
             job_reservations: jobs,
             capacity_refusals: vec![refusal.clone()],
+            rollouts: Vec::new(),
         });
 
         assert_eq!(report.job_reservations, jobs);
@@ -919,6 +925,7 @@ mod tests {
             capacity_memory_mb: 16384,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         };
         let report = worker.build_report(snapshot);
 
@@ -961,6 +968,7 @@ mod tests {
             capacity_memory_mb: 16384,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         };
         let report = worker.build_report(snapshot);
         // A draining instance still holds its resources.

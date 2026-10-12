@@ -93,6 +93,13 @@ namespace quota keeps unplaced gets a `Blocked:` line with the quota it would
 break (see `deploy-an-app`), and `wtf` reports it as a `quota-blocked` warning
 rather than a generic under-replication.
 
+An app whose current spec failed to roll out on a node is marked
+`RolloutFailed`: the leader holds its other nodes on the previous version and
+won't try the failed spec again. `wtf` reports it as a `rollout-failed`
+warning naming the node and the reason, and `relish status` prints the same
+line. Applying a different spec, or `relish rollback`, clears it; applying the
+same spec again doesn't (see `deploy-an-app`).
+
 ## `relish path`: can A reach B?
 
 `path` walks the network path between two apps hop by hop. It finds a running
