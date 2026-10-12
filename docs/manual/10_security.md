@@ -178,23 +178,29 @@ do only what the block lists:
 
 | Action | What it covers |
 |--------|----------------|
-| `deploy` | apply, delete and roll back the listed apps, cancel their deploys |
+| `deploy` | apply, delete and roll back the listed apps, cancel their deploys, create, restore and delete their volume snapshots, and `relish build` images that push to them |
 | `scale` | stop the listed apps |
 | `exec` | `relish exec` into the listed apps |
-| `host-exec` | jobs and process workloads that run host commands |
+| `host-exec` | jobs and process workloads that run host commands, and apps with a host-path `source` on a volume or `config_file` (each node also needs an allowlist entry, and mounts the resolved path it checked; see `images-and-volumes`) |
+| `fault` | `relish fault` inject and clear on the listed apps; node faults and clearing every fault need it with `apps = ["*"]` and no `namespaces` |
 | `logs` | the listed apps' logs: `relish logs`, follow, WebSocket stream, entries |
 | `metrics` | the listed apps' metrics and charts, and their rows in `relish top` |
 | `secret-write` | `relish secret rotate`, for the cluster or one namespace (needs `apps = ["*"]` and no `namespaces`) |
-| `admin` | every action above, plus tokens, join tokens, upgrades, elections, node decommissioning, image signing, log export and `[permission]`/`[namespace]` declarations |
+| `admin` | every action above, plus tokens, join tokens, upgrades, elections, node decommissioning, image signing, log export, test leases (`relish test`) and `[permission]`/`[namespace]` declarations |
 | `secret-read` | nothing yet: no API route returns a decrypted secret |
 
 Some reads span every app: `/v1/logs/sql`, the raw metric store, the cluster
 metric rollups and alerts. They need the action granted with `apps = ["*"]` and
-no `namespaces` list. So do the admin routes. A block that grants `metrics` on
+no `namespaces` list. So do the admin routes, test leases among them. A build
+whose destination names no namespace (`pickle://web:v1`) could belong to
+anyone, so it needs `deploy` granted the same way. A block that grants `metrics` on
 one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
-A browser session keeps its token's permissions. Nodes talking to each other
+A browser session keeps its token's permissions, and it's always read-only:
+a cookie can read the dashboard but never change anything. That holds for a
+session opened with the cluster's service token too. It reads everything, but
+it isn't a node, so the node-to-node routes refuse it. Nodes talking to each other
 use the cluster's internal identity, which no block can restrict, so
 `relish logs` and `relish top` still gather every node's answer; the
 node you asked filters it. `relish wtf` reads health, membership and
@@ -223,6 +229,89 @@ block.
 A new cluster starts with no tokens, and until the first one exists the API is
 open. Bun only allows that on a loopback listener, so mint the first admin
 token on the node itself before exposing the API (see `cluster-basics`).
+
+## Audit log
+
+Every node keeps a log of who changed what on it, on disk, so you can answer
+that after an incident:
+
+```sh
+relish audit                                   # the newest 100 records on this node
+relish audit --cluster --since 2h              # every node, the last two hours
+relish audit --cluster --action 'fault.*'      # every fault injected, cleared or expired
+relish audit --principal ci-deploy --namespace payments --output json
+```
+
+Each record has the time, the node that recorded it, the action, the
+credential (its `principal` id, and the token's name as `token_name`), the
+app and namespace it touched, the address the request came from, and the
+action's own facts (a fault's id and override flags, the node being
+decommissioned, the version an upgrade targets). A record never carries a
+secret: the log scrubs anything shaped like a token before writing it.
+
+What's recorded:
+
+| Area | Actions |
+|------|---------|
+| Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
+| Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
+| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
+| Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
+
+The cluster's own actions (a fault expiring, an expired token being swept)
+are recorded as `system`.
+
+Refused requests are recorded too, as `api.refused`, for every route in the
+table above: a missing or unknown token, a role or `[permission]` block that
+doesn't allow the call, or a scoped token reaching another namespace. The
+record names the principal (or `anonymous` when there was no valid token),
+the source address, the route, the app and namespace when they're known, and
+a `reason`: `unauthenticated`, `forbidden` or `scope`. It never holds the
+token or the request body.
+
+```sh
+relish audit --cluster --action api.refused --since 1h
+```
+
+A refused request costs the caller nothing, so a script with a wrong token
+could make thousands a second and push every real record out of the bounded
+log. To stop that, a node records at most five refusals a minute from one
+address and principal, and at most 100 a minute in all. It counts the rest,
+and when the minute is over it writes one `api.refusals_suppressed` record
+saying how many it suppressed and from whom. A node tracks at most 256
+sources at once; refusals from further sources are counted together, as
+`*` from "other sources".
+
+The log lives in `audit/` under `[storage] data`, as JSON Lines, one record
+per line. A node writes and syncs the record before it answers the request,
+so a record you saw acknowledged survives a crash or restart. If the write
+fails (a full or broken disk), the node logs it on stderr, counts it, and
+still carries out your action: an operator must be able to stop the app
+that's filling the disk. `relish audit` then warns that the node has lost
+records since it started.
+
+The log is bounded: 64 MiB per node by default, set with
+`[storage] audit_max_bytes` (at least 64 KiB). It's kept in eight segments,
+and when it reaches the bound the oldest segment is deleted, so you keep the
+most recent history. At a few hundred bytes a record, 64 MiB holds a couple
+of hundred thousand actions. The log counts toward the node's disk pressure
+alongside job data (see [Operations](12_operations.md)).
+
+Each node logs the requests it served. A request that a node forwards to the
+leader (an apply on a follower, say) appears twice: on the node you asked,
+with your address, and on the leader, with the forwarding node's address as
+the source. `--cluster` asks every live node under your own token and merges
+the answers by time; a node that doesn't answer is named on stderr, and its
+records are missing until it does. There's no central copy yet, so a node you
+decommission takes its log with it: read it first if you need it.
+
+Reading the log needs an Admin token that isn't scoped to some apps or
+namespaces, and that a `[permission]` block, if it has one, grants `admin`
+with `apps = ["*"]` and no `namespaces`. The cluster's internal service token
+can't read it. `relish events` still shows audit records as they happen,
+alongside deploys and health, but its memory holds only the newest 1024
+events, so use `relish audit` to look back.
 
 ## Secrets
 
@@ -422,7 +511,7 @@ certificate the old CA could have signed has expired: an hour for workloads,
 another. Running `rotate` again before it begins (say, after a typo in the
 passphrase) is fine; the cluster replaces the earlier request. Each step is
 an audit event (`ca.rotation_prepared`, `ca.rotation_begun`,
-`ca.rotation_finalised`) in `relish events`.
+`ca.rotation_finalised`) in `relish audit` (see Audit log, above).
 
 Rotating the root itself isn't supported yet.
 
@@ -437,7 +526,13 @@ Usually that's one of each, but while a Workload CA rotation is in progress it
 holds the old CA and the new one, so verify peers against the whole file, not
 just its first certificate.
 The JWT also works as a bearer token against the Reliaburger API, as a
-read-only credential confined to the workload's own app and namespace.
+read-only credential confined to the workload's own app and namespace. With it
+a workload can read its own status, logs, metrics, snapshots, batches and
+builds. The cluster-wide lists filter themselves to that app: `/v1/resolve`
+shows only its own service, `/v1/routes` only its own ingress routes, and
+`/v1/fault` only the faults on it. The routes that span every tenant refuse it
+outright: events, `/v1/logs/sql`, the raw metric store and
+`/v1/fault?cluster=true`, which also lists node faults.
 
 ## Signed images
 

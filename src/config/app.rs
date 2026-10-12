@@ -118,6 +118,19 @@ pub struct AppSpec {
 }
 
 impl AppSpec {
+    /// Whether this app needs a node that enforces network policy in the
+    /// kernel: an egress allowlist, or `allow_from` grants across namespaces.
+    /// Placement keeps such an app off nodes that would refuse it.
+    pub fn requires_network_policy(&self) -> bool {
+        self.egress
+            .as_ref()
+            .is_some_and(|egress| !egress.allow.is_empty())
+            || self
+                .firewall
+                .as_ref()
+                .is_some_and(|firewall| !firewall.allow_from.is_empty())
+    }
+
     /// The ordinals this node's replicas take: the ones the leader assigned,
     /// or `0..replicas` on a standalone node. A daemon set runs one replica
     /// per node, so without an assignment it is ordinal 0.
@@ -137,6 +150,26 @@ impl AppSpec {
             .iter()
             .map(String::as_str)
             .chain(self.init.iter().filter_map(|init| init.image.as_deref()))
+    }
+
+    /// Every host path this app bind-mounts from the node: each volume and
+    /// config-file `source`. Managed volumes and inline config files have none.
+    pub fn host_path_sources(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.volumes
+            .iter()
+            .filter_map(|volume| volume.source.as_deref())
+            .chain(
+                self.config_file
+                    .iter()
+                    .filter_map(|file| file.source.as_deref().map(std::path::Path::new)),
+            )
+    }
+
+    /// Whether deploying this app touches the host directly, so it needs the
+    /// `host-exec` permission as well as `deploy`: a host binary, an inline
+    /// script, or a host-path `source`.
+    pub fn needs_host_access(&self) -> bool {
+        self.exec.is_some() || self.script.is_some() || self.host_path_sources().next().is_some()
     }
 
     /// Where to scrape this app's Prometheus metrics inside each instance:
@@ -788,6 +821,47 @@ mod tests {
         assert_eq!(app.volumes[0].path, PathBuf::from("/data"));
         assert_eq!(app.volumes[0].source, Some(PathBuf::from("/host/data")));
         assert!(app.volumes[0].size.is_none());
+    }
+
+    #[test]
+    fn host_path_sources_name_volume_and_config_file_sources_only() {
+        let app = parse_app(
+            r#"
+            image = "redis:7-alpine"
+
+            [[volumes]]
+            source = "/srv/import"
+            path = "/import"
+
+            [[volumes]]
+            path = "/data"
+
+            [[config_file]]
+            path = "/etc/app.yaml"
+            source = "/srv/config/app.yaml"
+
+            [[config_file]]
+            path = "/etc/inline.yaml"
+            content = "a: 1"
+        "#,
+        );
+        let sources: Vec<_> = app.host_path_sources().collect();
+        assert_eq!(
+            sources,
+            [
+                std::path::Path::new("/srv/import"),
+                std::path::Path::new("/srv/config/app.yaml")
+            ]
+        );
+        assert!(app.needs_host_access());
+        let managed = parse_app(
+            r#"
+            image = "redis:7-alpine"
+            [[volumes]]
+            path = "/data"
+        "#,
+        );
+        assert!(!managed.needs_host_access());
     }
 
     #[test]

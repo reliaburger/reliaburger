@@ -103,10 +103,47 @@ and leaves anything else under `~/.reliaburger`.
 | `relish logs NAME --namespace NS --instance run-ID` | Singleton log stream selected by run |
 | `relish batch cancel ID` | Cancel one run or all profiles in its parent |
 | `relish batch replay ID --node NODE --grant-digest DIGEST --acknowledge-side-effects` | Acknowledge repeated effects for exact unknown grants |
+| `relish run --batch …`, `relish batch FILE`, `relish batch submit FILE` with `--idempotency-key KEY` | Retry an uncertain submission without admitting it twice |
 
-Use returned IDs; physical executor slots can be reused. Ordinary TOML jobs,
+Use returned IDs; physical executor slots can be reused.
+
+## Job fields
+
+A `[job.NAME]` table takes these fields. Unknown fields are refused.
+
+| Field | Meaning |
+|-------|---------|
+| `runtime` | `runc` (default), `shared-runc` or `process` |
+| `image` | OCI image, for `runc` and `shared-runc` |
+| `exec`, `script` | Host binary or inline script, for `process` only |
+| `command` | Command and arguments |
+| `cpu`, `memory` | Request–limit ranges, as for apps |
+| `env` | Environment variables, plain or encrypted |
+| `namespace` | Namespace; `default` when omitted |
+| `schedule` | Cron schedule in UTC: five fields or a macro such as `@daily` |
+| `run_before` | `["app.NAME"]`: run as a hook before that app publishes |
+| `firewall` | Apps in other namespaces allowed to connect to the job, as for an app's `[firewall]`; container jobs only |
+| `egress` | Outside destinations the job may reach, as for an app's `[egress]`; container jobs only |
+| `max_attempts` | 1–10. Default 4, or 1 for a hook |
+| `task_timeout_secs` | 0–86400 per attempt; 0 means no deadline. Default none, or 600 for a hook |
+| `overlap` | Cron only: `forbid` (default) skips an occurrence while a run is active; `allow` starts another |
+| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` | Ordinary TOML jobs,
 cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
 for retry, overlap, retention, supported runtimes and API shapes.
+
+Job limits, all enforced by the council:
+
+| Limit | Value |
+|-------|-------|
+| Active runs in the cluster | 128, of which 32 only cron fires and deployment jobs may use |
+| Active arrays, batches, profiles and manual runs per namespace | 64 |
+| Job definitions per namespace / in the cluster | 64 / 1,024 (one-off definitions expire with their last run) |
+| Retained run receipts in the cluster | 2,048 |
+| Named jobs in one finite batch | 64 |
+| Leader sync call accepted by a node | 8 MiB |
+
+Namespace `cpu`, `memory` and `gpu` quotas also bound the job attempts the
+leader grants; a run waiting on its quota shows `quota_blocked_reason`.
 
 ## Files on a node
 
@@ -123,6 +160,8 @@ under systemd or another supervisor yourself. Bun's own data goes where
 | `[storage] logs` | `/var/lib/reliaburger/logs` |
 | `[storage] metrics` | `/var/lib/reliaburger/metrics` |
 | `[storage] volumes` | `/var/lib/reliaburger/volumes` |
+| `[storage] allowed_host_paths` | `[]`: absolute prefixes a volume or `config_file` `source` may mount from; empty refuses every host path, and the directories above are always refused (see `images-and-volumes`) |
+| `[storage] audit_max_bytes` | `67108864` (64 MiB): the bound on the audit log in `{data}/audit`, which `relish audit` reads; at least 64 KiB (see `security`) |
 
 ## Node config sections
 
@@ -133,7 +172,7 @@ startup instead of being ignored.
 |---------|-----|
 | `[node]` | `name`, `labels` (matched by `placement`) |
 | `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
-| `[storage]` | data directories, `[storage.snapshots]` (see `images-and-volumes`) |
+| `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` |
 | `[security]` | master key, bootstrap and identity paths, `require_mtls`, `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |

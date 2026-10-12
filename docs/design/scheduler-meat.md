@@ -744,7 +744,7 @@ A node already running the daemon's committed copy doesn't need room for a secon
 
 ### 5.2 Batch Job Allocation (Delegated Model)
 
-> **Status (Phase 12).** The allocator itself ships — `meat::batch::schedule_batch` bin-packs an instance count across eligible nodes weighted by free capacity. The full delegated pipeline (dispatch via the reporting tree, per-node execution, then `BatchCompletionReport` aggregation and lifecycle) is a Phase 12 deliverable and isn't wired end to end yet. Read this section as the target design for high-throughput batch, not as an operable path today. On-demand and scheduled Jobs (the non-batch path) do run.
+> **Status (0.2.0).** This section is the original Phase 12 target. What shipped instead is the [delegated task-array implementation](#delegated-task-array-implementation-020) below: the leader grants chunks of indexed runs and accepts aggregate outcomes, and every job (apply, batch, cron) takes that one lifecycle. The Phase 12 pieces that approximated this section (the `meat::batch::schedule_batch` allocator, the leader's `BatchTracker` with its `BatchRegister` reservations in Raft, node-to-node `/v1/batch/run` dispatch and completion callbacks) were retired in 0.2.0 (#681). Read the rest of this section as background.
 
 The 100M jobs/day target (approximately 1,150 jobs/sec sustained) requires a fundamentally different approach than scheduling each job individually through Raft.
 
@@ -1039,6 +1039,39 @@ fn check_namespace_quota(
 ```
 
 The `default` namespace has no quotas unless explicitly configured, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
+
+#### Jobs: quotas at grant time and admission caps
+
+Jobs never pass through the app placement pass: every job is a task array, and the task-array leader (`leader_tick` in `src/bun/task_array_leader.rs`) hands out chunks once a second. So that is where job quotas are enforced (decision D20). Each tick, `GrantBudget::new` builds one `QuotaLedger` per namespace from `DesiredState::namespaces`, charges every app placement's reserved resources first, then every job attempt already in flight, and only then plans new grants, oldest run first. An attempt in flight on a node is `min(tasks it holds, its slots for that run)` (`TaskArrayState::in_flight_on`), because a node never runs more of an array at once than its slots. `fit_grants` trims each run's planned grants to the room that's left; a chunk that would start more attempts than fit stops the run's grants for that tick. Deeper chunks on a node already running a full round cost nothing extra, so lookahead survives.
+
+A run whose grants were held back gets a durable `quota_blocked` reason through a `TaskArrayWrite::QuotaBlocked` entry, written only when the limit it names changes (`same_limit` ignores the usage numbers, which move with every task). It clears when grants fit again or the run finishes. Running attempts are never cancelled. Apps go first in the ledger and the app pass doesn't count jobs, so a namespace's jobs can never displace an app that fits its quota. `max_apps` and `max_replicas` stay app-only.
+
+Admission caps sit in the replicated store (`src/meat/task_array_store.rs`, decision D21):
+
+| Constant | Value | Applies to |
+|----------|-------|------------|
+| `MAX_ACTIVE_ARRAYS` | 128 | every active run |
+| `RESERVED_TRIGGERED_RUNS` | 32 | kept for cron fires and deployment hooks; bulk stops at 96 |
+| `MAX_ACTIVE_RUNS_PER_NAMESPACE` | 64 | active arrays, profiles, finite batches and manual runs in one namespace |
+| `MAX_JOB_DEFINITIONS_PER_NAMESPACE` | 64 | job definitions in one namespace |
+| `MAX_JOB_DEFINITIONS` | 1,024 | job definitions in the cluster |
+
+A run's trigger decides its class: `Cron` and `Hook` triggers are *triggered*, everything else is *bulk*. A cron `Fire` refused even with the headroom is recorded rather than failed: the cursor advances, the definition keeps `skipped: {minute, reason: capacity}` and a count, and the leader emits a `job-skipped` event. `control_state_stays_within_budget_at_the_global_cap` justifies 128: at the cap, with the largest template and saturated failure ranges, job state stays under 32 MiB (half a Raft frame) and one node's sync call under its 8 MiB body limit. 256 would not.
+
+Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop takes at most sixteen due schedules per tick and starts each tick after the last one it fired, so a long list takes turns.
+
+#### The task-array leader loop at scale
+
+Each tick (`SYNC_INTERVAL`, one second) the leader:
+
+1. Reads the job control state in place with `read_control`, a closure run under the state machine's read lock, and builds each node's sync request. It never clones the whole `DesiredState`; `read_task_arrays` copies only `TaskArrays`, and only for callers that need an owned copy.
+2. Calls every node that isn't still answering an earlier call, and gathers answers until the tick's deadline, `sync_deadline(interval)` (half the interval). Calls that miss it stay in `SyncCalls` and are collected by a later tick; their node isn't called again meanwhile, and `NODE_SYNC_TIMEOUT` (3 s for the request, 3 s for the body) still bounds each one. A node that missed the deadline keeps its chunks and counts towards `SILENCE_TIMEOUT` (30 s) like any silent node, so a hung or slow node delays only its own grants.
+3. Plans every running array with `plan_tick`, again under the read lock: a lost holder's `Requeue` (or `Unknown`, for runs that need acknowledged replay), then the array's `Sync`, then its `QuotaBlocked` note when the limit changed. Planning copies an array's state only when a chunk finished (`Cow`).
+4. Commits the whole batch as one `TaskArrayWrite::Tick` entry (`tick_entries`; at most `MAX_TICK_WRITES` = 1,024 writes per entry, so more would split). The state machine refuses a `Tick` holding anything but those four progress writes, and otherwise applies each on its own: a refused write (an array pruned since planning, a stale `Unknown`) leaves its array unchanged and is reported by array in `TaskArrayApplied::Ticked` / `CouncilResponse::TaskArrayTicked`; the others apply.
+
+The dispatch loop therefore writes at most one Raft entry per tick, however many arrays run, plus a `CronObserve` once a minute and one entry per cron fire. The 0.2.0 budget (#668, D18) is at most three entries a second. `make bench-task-arrays` reports the tick's cost in the `leader_tick` group, with 64 arrays on three nodes (about 1.1 ms of planning and applying on the development laptop) and with one array of one-task chunks on ten nodes (about 160 µs).
+
+**Accepted-range bound.** `TaskArrayState` records the grant (`node → attempt → chunks`) whose report retired each chunk, so results and logs can be fetched from the node that ran it. One-task chunks finishing out of order across many nodes split that record into a range per chunk: 65,536 chunks on ten nodes reached 875 KiB of replicated state. Past `MAX_ACCEPTED_RANGES` (4,096) ranges the per-node record folds into `accepted_folded` (`attempt → chunks`), where the same chunks merge into a few ranges; the worst shape stays under 60 KiB. Folding drops the owner but keeps the attempt, which still fences a result row on its own because each attempt of a chunk is granted to exactly one node. `accepted_grant` returns `owner: None` for a folded chunk, and the results and logs endpoints then ask every node for that grant.
 
 ---
 
@@ -1525,6 +1558,18 @@ prevents starvation by repeated small requests, with a head-of-line utilisation
 trade-off. It is not tenant DRF, and running jobs do not automatically yield to
 a new app deployment. Provision service/rollout headroom. A profile larger than
 a node's allocatable capacity is refused; temporary fullness queues work.
+
+App placement sees what jobs hold. Each `StateReport` carries the node's
+`job_reservations` (the budget's task-attempt and executor leases, quarantined
+ones included) apart from `resource_usage`, which sums app requests per
+instance. `build_cluster_cache` adds both into the node's `allocated` total,
+so `reserve_commitments` only reconciles committed app placements and never
+counts an app twice. A placement can still lose the race to attempts that start
+after the pass: `try_acquire` doesn't queue, so the agent records a
+`CapacityRefusal` for that app and the next report carries it. The leader then
+stops treating the placement as held (`Liveness::keeps`) and places the replica
+elsewhere; a managed-volume app still waits for its home node. Refusals lapse
+after a minute or on the app's next successful deploy.
 
 Workers persist control provenance (recovery epoch, leadership term, committed
 log index) and highest chunk generation. Task outcomes stream into checksummed

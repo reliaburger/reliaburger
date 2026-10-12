@@ -1,8 +1,10 @@
 //! Raft log encryption at rest.
 //!
 //! Encrypts Raft log entries with AES-256-GCM before writing to disk
-//! and decrypts them on read. The encryption key is derived via HKDF
-//! from the node's certificate private key.
+//! and decrypts them on read. Each entry's key is derived via HKDF, with
+//! a fresh salt, from the cluster master key, which is stored on the node.
+//! The Raft snapshot and the vote and log-position metadata aren't
+//! encrypted.
 
 use super::crypto::{self, CryptoError};
 
@@ -34,18 +36,17 @@ pub struct EncryptedEntry {
     pub hkdf_salt: [u8; 32],
 }
 
-/// Derive the Raft log encryption key from a node's identity.
+/// Derive one entry's encryption key from the cluster master key.
 ///
-/// Uses HKDF-SHA256 with the node cert private key as IKM. Each node
-/// derives its own key, so Raft entries encrypted on one node cannot
-/// be decrypted on another (each node re-encrypts when receiving
-/// entries via replication).
+/// Uses HKDF-SHA256 with the master key as input keying material and the
+/// entry's own salt. Every node holds the same master key; each node
+/// encrypts the entries it writes to its own log.
 pub fn derive_log_encryption_key(
-    node_private_key_der: &[u8],
+    master_key: &[u8],
     salt: &[u8; 32],
 ) -> Result<[u8; 32], RaftEncryptionError> {
     Ok(crypto::hkdf_derive_key(
-        node_private_key_der,
+        master_key,
         salt,
         RAFT_LOG_HKDF_INFO,
     )?)
@@ -53,14 +54,14 @@ pub fn derive_log_encryption_key(
 
 /// Encrypt a serialised Raft log entry.
 ///
-/// The `node_private_key_der` is used as HKDF input key material.
+/// The `master_key` is used as HKDF input key material.
 /// A random salt is generated per-entry for key derivation.
 pub fn encrypt_entry(
     plaintext: &[u8],
-    node_private_key_der: &[u8],
+    master_key: &[u8],
 ) -> Result<EncryptedEntry, RaftEncryptionError> {
     let hkdf_salt: [u8; 32] = crypto::random_bytes()?;
-    let key = derive_log_encryption_key(node_private_key_der, &hkdf_salt)?;
+    let key = derive_log_encryption_key(master_key, &hkdf_salt)?;
     let (ciphertext, nonce) = crypto::aes_256_gcm_encrypt(&key, plaintext)?;
 
     Ok(EncryptedEntry {
@@ -73,9 +74,9 @@ pub fn encrypt_entry(
 /// Decrypt a Raft log entry.
 pub fn decrypt_entry(
     encrypted: &EncryptedEntry,
-    node_private_key_der: &[u8],
+    master_key: &[u8],
 ) -> Result<Vec<u8>, RaftEncryptionError> {
-    let key = derive_log_encryption_key(node_private_key_der, &encrypted.hkdf_salt)?;
+    let key = derive_log_encryption_key(master_key, &encrypted.hkdf_salt)?;
     crypto::aes_256_gcm_decrypt(&key, &encrypted.ciphertext, &encrypted.nonce)
         .map_err(|_| RaftEncryptionError::DecryptFailed)
 }

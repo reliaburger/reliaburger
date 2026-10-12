@@ -490,7 +490,7 @@ pub async fn auth_middleware(
 /// The originating token's **scope** is preserved (C3): a token confined to one
 /// app/namespace stays confined when it rides a session cookie, so exchanging
 /// it at `/ui/session` cannot widen it to cluster-wide reads.
-fn readonly_session_context(identity: &super::session::SessionIdentity) -> AuthContext {
+pub(crate) fn readonly_session_context(identity: &super::session::SessionIdentity) -> AuthContext {
     AuthContext {
         token_name: identity.token_name.clone(),
         principal_id: format!("session:{}", identity.token_name),
@@ -601,16 +601,46 @@ pub fn authorize_scoped(
     if scope.allows(app, namespace) {
         Ok(())
     } else {
-        Err((
-            StatusCode::FORBIDDEN,
-            format!("token scope does not allow {app} in namespace {namespace}"),
-        )
-            .into_response())
+        Err(scope_refusal(format!(
+            "token scope does not allow {app} in namespace {namespace}"
+        )))
     }
 }
 
+/// Why the API refused a request, as the audit log records it (#798).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// No credential, or one the node doesn't know (401).
+    Unauthenticated,
+    /// The caller's role or `[permission]` block doesn't allow it (403).
+    Forbidden,
+    /// A scoped token reached outside its apps or namespaces (403).
+    Scope,
+}
+
+impl RefusalReason {
+    /// The stable name the audit record carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::Forbidden => "forbidden",
+            Self::Scope => "scope",
+        }
+    }
+}
+
+/// A 403 for a token whose scope doesn't cover the target. The response
+/// carries [`RefusalReason::Scope`] as an extension, so the audit layer can
+/// tell it from a role refusal without parsing the message.
+pub fn scope_refusal(message: impl Into<String>) -> Response {
+    let mut response = (StatusCode::FORBIDDEN, message.into()).into_response();
+    response.extensions_mut().insert(RefusalReason::Scope);
+    response
+}
+
 /// Authorise one resolved workload before any desired write or dispatch.
-/// Scope is checked first, then Deploy, then HostExec for host binaries/scripts.
+/// Scope is checked first, then Deploy, then HostExec for host binaries,
+/// scripts and host-path sources.
 /// The caller supplies its authoritative permission snapshot and still owns
 /// role, lease, resource validation and transport admission.
 #[allow(clippy::result_large_err)]
@@ -747,11 +777,9 @@ pub fn require_unscoped(ctx: Option<&AuthContext>) -> Result<(), Response> {
     if ctx.scoped_apps.is_none() && ctx.scoped_namespaces.is_none() {
         return Ok(());
     }
-    Err((
-        StatusCode::FORBIDDEN,
+    Err(scope_refusal(
         "this endpoint requires cluster-wide authority; scoped tokens cannot use it",
-    )
-        .into_response())
+    ))
 }
 
 /// Require the internal **system principal** — the caller must have presented
@@ -762,17 +790,28 @@ pub fn require_unscoped(ctx: Option<&AuthContext>) -> Result<(), Response> {
 /// pass through on `None`: a request that arrives with no authenticated
 /// context (including the bootstrap window) is refused, because these routes
 /// are never part of first-run setup — they exist only once a cluster, and its
-/// service token, exist.
+/// service token, exist. A dashboard session made from the service token is
+/// refused as well (see [`is_system_principal`]): it is read-only.
 #[allow(clippy::result_large_err)]
 pub fn require_system(ctx: Option<&AuthContext>) -> Result<(), Response> {
     match ctx {
-        Some(ctx) if ctx.token_name == SYSTEM_PRINCIPAL => Ok(()),
+        Some(ctx) if is_system_principal(ctx) => Ok(()),
         _ => Err((
             StatusCode::FORBIDDEN,
             "internal endpoint: cluster node identity required",
         )
             .into_response()),
     }
+}
+
+/// Whether `ctx` is the internal system principal itself: a caller that
+/// presented the service token as a bearer.
+///
+/// Both fields must match. A browser session made from the service token
+/// keeps its *name* (`token_name == SYSTEM_PRINCIPAL`) but has a `session:`
+/// principal id and a read-only role, so it never counts as a cluster node.
+pub fn is_system_principal(ctx: &AuthContext) -> bool {
+    ctx.token_name == SYSTEM_PRINCIPAL && ctx.principal_id == SYSTEM_PRINCIPAL
 }
 
 /// Build a GET request builder, attaching a `Bearer` token when present.
@@ -1103,6 +1142,24 @@ mod tests {
         // The bootstrap window (no context) is refused too — internal
         // endpoints are never part of first-run setup.
         assert!(require_system(None).is_err());
+    }
+
+    /// The dashboard accepts the service token at `/ui/session`, and the
+    /// session it makes carries the service principal's *name*. That cookie is
+    /// read-only, so it must never pass a node-to-node gate: `require_system`
+    /// once checked only the name, and a stolen cookie could run jobs.
+    #[test]
+    fn require_system_refuses_a_session_made_from_the_service_token() {
+        let identity = super::super::session::SessionIdentity {
+            token_name: SYSTEM_PRINCIPAL.to_string(),
+            principal_id: SYSTEM_PRINCIPAL.to_string(),
+            scope: TokenScope::default(),
+        };
+        let session = readonly_session_context(&identity);
+        assert_eq!(session.token_name, SYSTEM_PRINCIPAL);
+        assert!(require_system(Some(&session)).is_err());
+        assert!(is_system_principal(&system_context()));
+        assert!(!is_system_principal(&session));
     }
 
     #[tokio::test]

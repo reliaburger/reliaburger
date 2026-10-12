@@ -247,6 +247,71 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(change=changed), self.assertRaises(AssertionError):
                 self.assert_root_storage_evidence_restored_for_upload(dict(self.jobs, linux=changed))
 
+    def assert_oci_interruptions_bounded(self, workflow_jobs):
+        """A hung OCI test fails its own step and leaves evidence behind (#800).
+
+        The step ends well inside the job's limit, so its log and envelope
+        are kept. A watcher records free disk and memory throughout, and a
+        report afterwards prints the low-water marks, plus every process the
+        step left running with its kernel stacks when it didn't succeed.
+        """
+        job = workflow_jobs['linux']
+        job_limit = re.search(r'^    timeout-minutes: (\d+)$', job, re.M)
+        self.assertIsNotNone(job_limit)
+        blocks = steps(job)
+
+        def only(predicate):
+            found = [index for index, step in enumerate(blocks) if predicate(step)]
+            self.assertEqual(len(found), 1)
+            return found[0]
+
+        producer = only(lambda step: 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+        watch = only(lambda step: 'name: Watch disk and memory during the OCI interruptions' in step)
+        report = only(lambda step: "name: Report the OCI interruptions' headroom and leftovers" in step)
+        upload = only(lambda step: 'name: contract-linux-oci-interruptions\n' in step)
+        self.assertLess(watch, producer)
+        self.assertLess(producer, report)
+        self.assertLess(report, upload)
+        step_limit = re.search(r'^        timeout-minutes: (\d+)$', blocks[producer], re.M)
+        self.assertIsNotNone(step_limit)
+        # The steps before it take about nine minutes; the rest of the margin
+        # is for the report and the evidence upload.
+        self.assertLessEqual(int(step_limit.group(1)) + 15, int(job_limit.group(1)))
+        # The watcher must not hold the step's output open, or the step
+        # itself would never finish.
+        for text in ('nohup ', '< /dev/null', 'MemAvailable', 'df ', '.pid'):
+            self.assertIn(text, blocks[watch])
+        for text in ('if: always()', 'timeout-minutes:', '.pid', 'steps.oci_interruptions.outcome',
+                     'ps -eo', '/stack'):
+            self.assertIn(text, blocks[report])
+
+    def test_a_hung_oci_interruption_test_fails_its_step_and_keeps_its_evidence(self):
+        self.assert_oci_interruptions_bounded(self.jobs)
+
+    def test_an_unbounded_or_unwatched_oci_step_is_detected(self):
+        self.assert_oci_interruptions_bounded(self.jobs)
+        original = self.jobs['linux']
+        blocks = steps(original)
+        producer = next(step for step in blocks
+                        if 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+        watch = next(step for step in blocks
+                     if 'name: Watch disk and memory during the OCI interruptions' in step)
+        report = next(step for step in blocks
+                      if "name: Report the OCI interruptions' headroom and leftovers" in step)
+        unbounded = re.sub(r'\n        timeout-minutes: \d+', '', producer)
+        changes = [
+            original.replace(producer, unbounded),
+            original.replace(producer, re.sub(r'timeout-minutes: \d+', 'timeout-minutes: 39', producer)),
+            original.replace(watch, ''),
+            original.replace(watch, watch.replace(' < /dev/null', '')),
+            original.replace(report, ''),
+            original.replace(report, report.replace('if: always()', 'if: failure()')),
+            original.replace(watch + '\n', '').replace(report, report + '\n' + watch),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_oci_interruptions_bounded(dict(self.jobs, linux=changed))
+
     def test_every_suite_keeps_its_own_junit_report(self):
         self.assert_owner_artifacts(self.jobs)
 
@@ -304,6 +369,46 @@ class EvidenceTests(unittest.TestCase):
                         acceptance.index('--gate standard-clients --host linux'))
         install = next(step for step in steps(acceptance) if "go-containerregistry" in step)
         self.assertIn("sha256sum --check", install)
+
+
+class BenchmarkTests(unittest.TestCase):
+    def setUp(self):
+        self.ci = (WORKFLOWS / "ci.yml").read_text()
+        self.jobs = jobs(self.ci)
+
+    def test_bench_task_arrays_is_run_by_a_workflow(self):
+        job = self.jobs["task-array-benchmarks"]
+        # select-jobs.sh sets task_arrays on schedules, so it runs nightly.
+        self.assertIn("needs.changes.outputs.task_arrays == 'true'", job)
+        self.assertIn("task_arrays: ${{ steps.select.outputs.task_arrays }}",
+                      self.jobs["changes"])
+        self.assertIn("run: make bench-task-arrays", job)
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertIn("--max-ratio", compare)
+
+    def test_only_main_saves_the_task_array_baseline(self):
+        job = self.jobs["task-array-benchmarks"]
+        restore = next(step for step in steps(job) if "actions/cache/restore@" in step)
+        self.assertIn("restore-keys: task-array-bench-", restore)
+        for marker in ("bench_baseline.py save", "actions/cache/save@"):
+            step = next(step for step in steps(job) if marker in step)
+            self.assertIn("if: github.ref == 'refs/heads/main'", step)
+
+    def test_the_task_array_criterion_output_is_kept_as_an_artefact(self):
+        job = self.jobs["task-array-benchmarks"]
+        upload = next(step for step in steps(job) if "actions/upload-artifact@" in step)
+        self.assertIn("if: always()", upload)
+        self.assertIn("target/criterion", upload)
+        self.assertIn("name: criterion-task-arrays", upload)
+
+    def test_every_benchmark_target_is_run_by_a_workflow(self):
+        makefile = (REPO / "Makefile").read_text()
+        targets = re.findall(r"(?m)^(bench[a-z-]*):", makefile)
+        self.assertIn("bench-task-arrays", targets)
+        workflows = "\n".join(path.read_text() for path in WORKFLOWS.glob("*.yml"))
+        for target in targets:
+            with self.subTest(target=target):
+                self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
 
 
 class RetargetTests(unittest.TestCase):

@@ -59,8 +59,6 @@ pub struct InstanceRecord {
     pub app_name: String,
     /// Replica index within the app (the `0` of `web-0`).
     pub replica_index: u32,
-    /// Job (run-to-completion) rather than long-running app.
-    pub is_job: bool,
     /// OCI image reference (informational; empty for process workloads).
     pub image: String,
     pub runtime: RuntimeKind,
@@ -384,7 +382,6 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "web".to_string(),
             replica_index: 0,
-            is_job: false,
             image: String::new(),
             runtime: RuntimeKind::Process,
             pid,

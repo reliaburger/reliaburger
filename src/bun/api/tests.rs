@@ -366,7 +366,7 @@ async fn setup_with_auth_readiness_and_leases(
     .await
 }
 
-async fn setup_with_auth_readiness_leases_and_events(
+pub(super) async fn setup_with_auth_readiness_leases_and_events(
     tokens: Vec<crate::sesame::types::ApiToken>,
     service_token: Option<String>,
     readiness: crate::bun::readiness::ReadinessTracker,
@@ -386,7 +386,7 @@ async fn setup_with_auth_readiness_leases_and_events(
     .await
 }
 
-async fn setup_with_auth_leases_events_and_council(
+pub(super) async fn setup_with_auth_leases_events_and_council(
     tokens: Vec<crate::sesame::types::ApiToken>,
     service_token: Option<String>,
     readiness: crate::bun::readiness::ReadinessTracker,
@@ -445,7 +445,7 @@ fn a_user_token(role: crate::sesame::types::ApiRole) -> (crate::sesame::types::A
     named_user_token("u", role)
 }
 
-fn named_user_token(
+pub(super) fn named_user_token(
     name: &str,
     role: crate::sesame::types::ApiRole,
 ) -> (crate::sesame::types::ApiToken, String) {
@@ -620,7 +620,7 @@ async fn protected_route_returns_200_with_a_valid_token() {
     shutdown.cancel();
 }
 
-fn lease_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+pub(super) fn lease_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
     crate::bun::capabilities::StaticCapabilities {
         test_policy: crate::testkit::safety::ClusterTestPolicy {
             safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
@@ -677,7 +677,7 @@ fn node_pressure_static_capabilities() -> crate::bun::capabilities::StaticCapabi
     }
 }
 
-fn workload_fault_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+pub(super) fn workload_fault_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
     crate::bun::capabilities::StaticCapabilities {
         test_policy: crate::testkit::safety::ClusterTestPolicy {
             safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
@@ -1228,21 +1228,101 @@ async fn lease_policy_denies_provisioning_by_default() {
     shutdown.cancel();
 }
 
+/// A router whose task arrays are volatile and in memory, so standalone job
+/// admission works without durable storage.
+async fn setup_with_leases_council_and_arrays(
+    tokens: Vec<crate::sesame::types::ApiToken>,
+    local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
+    council: Option<Arc<crate::council::CouncilNode>>,
+) -> (
+    Router,
+    Arc<crate::bun::task_array_leader::TaskArrayService>,
+    CancellationToken,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        MockGrill::new(),
+        PortAllocator::new(30000, 31000),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    tokio::spawn(async move {
+        agent.run().await;
+    });
+    let store = crate::sesame::auth::new_token_store();
+    *store.write().await = tokens;
+    // A fake executor that succeeds every task, so runs finish.
+    let directory = tempfile::tempdir().unwrap();
+    let node = crate::bun::task_array_node::TaskArrayNode::new(
+        crate::bun::task_array_node::TaskArrayNodeConfig {
+            root: directory.keep().join("tasks"),
+            policy: Default::default(),
+            default_concurrency: 8,
+            backoff: (std::time::Duration::ZERO, std::time::Duration::ZERO),
+            group_commit: Default::default(),
+            audit_dir: None,
+        },
+        crate::bun::task_array_node::NodeRunner::Fake(
+            crate::bun::task_executor::FakeRunner::always_succeeds(),
+        ),
+    );
+    let arrays = Arc::new(
+        crate::bun::task_array_leader::TaskArrayService::with_timings(
+            Some(Arc::new(node)),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(30),
+        ),
+    );
+    let app = router_with_upgrade(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        council,
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+        None,
+        None,
+        "default".to_string(),
+        None,
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        lease_static_capabilities(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        local_test_leases,
+        None,
+        None,
+        Some(Arc::clone(&arrays)),
+    );
+    (app, arrays, shutdown)
+}
+
+/// A job lease's apply takes the common job lifecycle. With a council the
+/// lease lives in Raft like any other, its jobs join it before their
+/// deployment is admitted, and nothing runs on the receiving node's agent.
 #[tokio::test]
-async fn node_job_lease_scope_is_fenced_and_stays_on_its_receiving_node() {
-    let council = seeded_council("node-jobs").await;
+async fn leased_apply_with_jobs_uses_the_common_job_lifecycle() {
+    let council = seeded_council("leased-common-jobs").await;
     let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
     let (other, other_text) = named_user_token("other", crate::sesame::types::ApiRole::Deployer);
     let (mut scoped, scoped_text) =
         named_user_token("scoped", crate::sesame::types::ApiRole::Deployer);
     scoped.scope.apps = Some(vec!["batch".into()]);
-    let tokens = vec![token, other, scoped];
-    let (app, shutdown) = setup_with_auth_leases_events_and_council(
-        tokens.clone(),
-        None,
-        crate::bun::readiness::ReadinessTracker::new(),
-        lease_static_capabilities(),
-        None,
+    let (app, _arrays, shutdown) = setup_with_leases_council_and_arrays(
+        vec![token, other, scoped],
         None,
         Some(Arc::clone(&council)),
     )
@@ -1258,21 +1338,14 @@ async fn node_job_lease_scope_is_fenced_and_stays_on_its_receiving_node() {
         post_authenticated(app.clone(), "/v1/test/leases", &plaintext, body, None).await;
     assert_eq!(status, StatusCode::CREATED);
     let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&bytes).unwrap();
-    assert!(council.desired_state().await.test_leases.is_empty());
-    for body in [
-        format!(
-            r#"{{"ttl_seconds":60,"scope":"node_jobs","namespace":"{}"}}"#,
-            lease.namespace
-        ),
-        format!(r#"{{"ttl_seconds":60,"namespace":"{}"}}"#, lease.namespace),
-    ] {
-        assert_eq!(
-            post_authenticated(app.clone(), "/v1/test/leases", &plaintext, &body, None)
-                .await
-                .0,
-            StatusCode::BAD_REQUEST
-        );
-    }
+    assert!(
+        council
+            .desired_state()
+            .await
+            .test_leases
+            .contains_key(&lease.lease_id),
+        "a job lease lives in Raft with a council"
+    );
     assert_eq!(
         post_authenticated(
             app.clone(),
@@ -1298,6 +1371,18 @@ async fn node_job_lease_scope_is_fenced_and_stays_on_its_receiving_node() {
         .0,
         StatusCode::FORBIDDEN
     );
+    // Without the lease, its namespace is closed to jobs.
+    let unleased = format!(
+        "[job.intruder]\nimage = 'test:v1'\nnamespace = '{}'",
+        lease.namespace
+    );
+    assert_eq!(
+        post_authenticated(app.clone(), "/v1/apply", &plaintext, &unleased, None)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+
     assert_eq!(
         post_authenticated(
             app.clone(),
@@ -1310,133 +1395,101 @@ async fn node_job_lease_scope_is_fenced_and_stays_on_its_receiving_node() {
         .0,
         StatusCode::OK
     );
-    let path = format!("/v1/test/leases/{}", lease.lease_id);
-    assert_eq!(
-        post_authenticated(
-            app.clone(),
-            &format!("{path}/renew"),
-            &other_text,
-            r#"{"ttl_seconds":60}"#,
-            None
-        )
-        .await
-        .0,
-        StatusCode::FORBIDDEN
+    let desired = council.desired_state().await;
+    let job_id = crate::meat::AppId::new("batch", &lease.namespace);
+    assert!(desired.test_leases[&lease.lease_id].resources.contains(
+        &crate::testkit::lease::LeasedResource::Job {
+            job_id: job_id.clone()
+        }
+    ));
+    assert!(
+        desired
+            .task_arrays
+            .deployment_owner("batch", &lease.namespace)
+            .is_some(),
+        "the leased job is a common deployment"
     );
+    // The run finishes through the executor before the lease is released.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let arrays = council.desired_state().await.task_arrays;
+            if arrays.jobs().runs().any(|(id, run)| {
+                run.name == "batch"
+                    && arrays.get(id).is_some_and(|record| {
+                        record.state.summary().status
+                            == crate::meat::task_array_state::TaskArrayStatus::Succeeded
+                    })
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the leased run never succeeded");
+
+    let path = format!("/v1/test/leases/{}", lease.lease_id);
     assert_eq!(
         delete_authenticated(app.clone(), &path, &other_text).await,
         StatusCode::FORBIDDEN
     );
-    assert_eq!(
-        post_authenticated(
-            app.clone(),
-            &format!("{path}/renew"),
-            &plaintext,
-            r#"{"ttl_seconds":60}"#,
-            None
-        )
-        .await
-        .0,
-        StatusCode::OK
+    // A cancelled deployment owns its job until the leader settles it, so a
+    // release can answer "pending" first; asking again finishes it, as the
+    // lease reaper would.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let released = delete_authenticated(app.clone(), &path, &plaintext).await;
+            match released {
+                StatusCode::NO_CONTENT => break,
+                StatusCode::ACCEPTED => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => panic!(
+                    "lease release answered {other}: {:?}",
+                    council
+                        .desired_state()
+                        .await
+                        .test_leases
+                        .get(&lease.lease_id)
+                        .map(|lease| lease.state.clone())
+                ),
+            }
+        }
+    })
+    .await
+    .expect("the job lease never finished cleaning up");
+    let desired = council.desired_state().await;
+    assert!(!desired.test_leases.contains_key(&lease.lease_id));
+    assert!(
+        desired
+            .task_arrays
+            .deployments()
+            .all(|(_, record)| record.cancelled || record.completed),
+        "cleanup cancels the leased deployment"
     );
-
-    // An uninitialised council has no leader to forward to. All node-job
-    // routes must still answer from this node's own store.
-    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
-    use crate::council::{CouncilNode, log_store::MemLogStore, state_machine::CouncilStateMachine};
-    let uninitialised = Arc::new(
-        CouncilNode::new(
-            2,
-            crate::council::types::CouncilConfig::default(),
-            InMemoryRaftNetworkFactory::new(2, InMemoryRaftRouter::new()),
-            MemLogStore::new(),
-            CouncilStateMachine::new(),
-            None,
-        )
-        .await
-        .unwrap(),
+    assert!(
+        desired
+            .task_arrays
+            .jobs()
+            .definition(&lease.namespace, "batch")
+            .is_none()
     );
-    let (wrong_node, wrong_shutdown) = setup_with_auth_leases_events_and_council(
-        tokens,
-        None,
-        crate::bun::readiness::ReadinessTracker::new(),
-        lease_static_capabilities(),
-        None,
-        None,
-        Some(Arc::clone(&uninitialised)),
-    )
-    .await;
-    assert_eq!(
-        get_authenticated(wrong_node.clone(), &path, &plaintext)
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        post_authenticated(
-            wrong_node.clone(),
-            &format!("{path}/renew"),
-            &plaintext,
-            r#"{"ttl_seconds":60}"#,
-            None
-        )
-        .await
-        .0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        delete_authenticated(wrong_node.clone(), &path, &plaintext).await,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        post_authenticated(
-            wrong_node.clone(),
-            "/v1/apply",
-            &plaintext,
-            job,
-            Some(&lease.lease_id)
-        )
-        .await
-        .0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        post_authenticated(wrong_node, "/v1/test/leases", &plaintext, body, None)
-            .await
-            .0,
-        StatusCode::CREATED
-    );
-    assert_eq!(
-        get_authenticated(app.clone(), &path, &plaintext).await.0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        delete_authenticated(app, &path, &plaintext).await,
-        StatusCode::NO_CONTENT
-    );
-    assert!(council.desired_state().await.test_leases.is_empty());
     shutdown.cancel();
-    wrong_shutdown.cancel();
     council.raft().shutdown().await.unwrap();
-    uninitialised.raft().shutdown().await.unwrap();
 }
 
+/// Standalone, the lease stays in the node's own store, and its cleanup
+/// stops and forgets the jobs in the node's task arrays.
 #[tokio::test]
-async fn node_job_lease_persists_jobs_and_reclaims_their_schedule() {
+async fn standalone_job_lease_owns_its_jobs_and_cleanup_forgets_them() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("leases.json");
     let store = crate::testkit::lease::LocalLeaseStore::open(path.clone())
         .await
         .unwrap();
     let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
-    let (app, shutdown) = setup_with_auth_readiness_and_leases(
-        vec![token],
-        None,
-        crate::bun::readiness::ReadinessTracker::new(),
-        lease_static_capabilities(),
-        Some(store),
-    )
-    .await;
+    let (app, arrays, shutdown) =
+        setup_with_leases_council_and_arrays(vec![token], Some(store), None).await;
     let (status, body) = post_authenticated(
         app.clone(),
         "/v1/test/leases",
@@ -1472,15 +1525,21 @@ schedule = "* * * * *"
         .await
         .unwrap();
     let owned = reopened.get(&lease.lease_id).await.unwrap();
-    let owned_json = serde_json::to_value(&owned).unwrap();
     assert_eq!(owned.resources.len(), 2);
     assert!(
-        owned_json["resources"]
-            .as_array()
-            .unwrap()
+        owned
+            .resources
             .iter()
-            .all(|resource| resource["kind"] == "job")
+            .all(|resource| matches!(resource, crate::testkit::lease::LeasedResource::Job { .. }))
     );
+    assert_eq!(
+        crate::bun::task_array_leader::read_standalone(&arrays)
+            .await
+            .deployments()
+            .count(),
+        1
+    );
+
     assert_eq!(
         delete_authenticated(
             app.clone(),
@@ -1490,12 +1549,15 @@ schedule = "* * * * *"
         .await,
         StatusCode::NO_CONTENT
     );
-    let (_, status) = get_authenticated(app.clone(), "/v1/status", &plaintext).await;
-    let instances: serde_json::Value = serde_json::from_slice(&status).unwrap();
+    let after = crate::bun::task_array_leader::read_standalone(&arrays).await;
     assert!(
-        !String::from_utf8_lossy(&status).contains(&lease.namespace),
-        "{instances}"
+        after
+            .deployments()
+            .all(|(_, record)| record.cancelled || record.completed)
     );
+    for name in ["batch", "scheduled"] {
+        assert!(after.jobs().definition(&lease.namespace, name).is_none());
+    }
     assert_eq!(
         get_authenticated(
             app,
@@ -1674,11 +1736,11 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
 }
 
 /// One request the fake leader received: path, bearer, loop marker, body.
-type SeenAtLeader = (String, Option<String>, bool, String);
+pub(super) type SeenAtLeader = (String, Option<String>, bool, String);
 
 /// Serve a fake leader API on `listener` that accepts every request and
 /// records what it saw.
-fn serve_recording_leader(
+pub(super) fn serve_recording_leader(
     listener: tokio::net::TcpListener,
 ) -> Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>> {
     let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -4149,9 +4211,7 @@ async fn workload_admission_fixture(
     let (mutations, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         while let Some(command) = incoming.recv().await {
-            if let AgentCommand::BatchOwnedExecutions { response, .. } = command {
-                let _ = response.send(Default::default());
-            } else if mutations.send(command).await.is_err() {
+            if mutations.send(command).await.is_err() {
                 break;
             }
         }
@@ -4168,6 +4228,7 @@ async fn workload_admission_fixture(
             default_concurrency: 8,
             backoff: (std::time::Duration::ZERO, std::time::Duration::ZERO),
             group_commit: Default::default(),
+            audit_dir: None,
         },
         crate::bun::task_array_node::NodeRunner::Fake(
             crate::bun::task_executor::FakeRunner::always_succeeds(),
@@ -4256,7 +4317,6 @@ async fn assert_authorised_job_dispatch_and_settlement(
     .await
     .expect("authorised work did not complete through the common executor");
     let desired = council.desired_state().await;
-    assert!(desired.prerequisite_claims.is_empty());
     for (name, spec) in &expected.job {
         let namespace = spec.namespace.as_deref().unwrap_or("default");
         let definition = &desired
@@ -4569,6 +4629,94 @@ async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and
         }
     }
     council.shutdown().await.unwrap();
+}
+
+/// Apply `manifest` as the `ci` deployer, whose permission block grants
+/// `actions` on every app, and return the status.
+async fn apply_under_permission_block(tag: &str, actions: &[&str], manifest: &str) -> StatusCode {
+    let (app, council, _commands) = workload_admission_fixture(tag).await;
+    council
+        .write(crate::council::RaftRequest::PermissionSpec {
+            name: "ci".into(),
+            spec: Box::new(crate::config::PermissionSpec {
+                actions: actions.iter().map(|action| action.to_string()).collect(),
+                apps: vec!["*".into()],
+                namespaces: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let status = apply_as_context(&app, deployer_context(), manifest).await;
+    if status == StatusCode::FORBIDDEN {
+        assert!(council.desired_state().await.apps.is_empty());
+    }
+    council.shutdown().await.unwrap();
+    status
+}
+
+const HOST_PATH_VOLUME: &str = "[app.thief]\nimage = \"test:v1\"\n\
+    [[app.thief.volumes]]\npath = \"/steal\"\n\
+    source = \"/var/lib/reliaburger/volumes/team-b/db\"\n";
+
+const HOST_PATH_CONFIG_FILE: &str = "[app.reader]\nimage = \"test:v1\"\n\
+    [[app.reader.config_file]]\npath = \"/etc/shadow-copy\"\nsource = \"/etc/shadow\"\n";
+
+#[tokio::test]
+async fn host_path_volume_needs_host_exec_under_a_permission_block() {
+    assert_eq!(
+        apply_under_permission_block("host-volume-deploy", &["deploy"], HOST_PATH_VOLUME).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_ne!(
+        apply_under_permission_block(
+            "host-volume-host-exec",
+            &["deploy", "host-exec"],
+            HOST_PATH_VOLUME
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn host_path_config_file_needs_host_exec_under_a_permission_block() {
+    assert_eq!(
+        apply_under_permission_block("host-config-deploy", &["deploy"], HOST_PATH_CONFIG_FILE)
+            .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_ne!(
+        apply_under_permission_block(
+            "host-config-host-exec",
+            &["deploy", "host-exec"],
+            HOST_PATH_CONFIG_FILE
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn managed_volume_needs_only_deploy() {
+    let manifest = "[app.db]\nimage = \"test:v1\"\n[[app.db.volumes]]\npath = \"/data\"\n";
+    assert_ne!(
+        apply_under_permission_block("managed-volume-deploy", &["deploy"], manifest).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[test]
+fn apply_notes_each_host_path_source_needs_a_node_allowlist_entry() {
+    let config = crate::config::Config::parse(HOST_PATH_VOLUME).unwrap();
+    let notes = super::apply::host_path_notes(&config);
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].contains("app.thief"), "{notes:?}");
+    assert!(notes[0].contains("allowed_host_paths"), "{notes:?}");
+    let managed = crate::config::Config::parse(
+        "[app.db]\nimage = \"test:v1\"\n[[app.db.volumes]]\npath = \"/data\"\n",
+    )
+    .unwrap();
+    assert!(super::apply::host_path_notes(&managed).is_empty());
 }
 
 /// A completed history entry for `web` in the `default` namespace; tests
@@ -5506,16 +5654,43 @@ async fn service_principal_is_refused_from_rotating_secrets() {
     shutdown.cancel();
 }
 
+/// The pre-0.2.0 node-to-node batch endpoints are gone: jobs reach nodes
+/// only as task-array grants, so even the service principal finds nothing
+/// to dispatch to or report into.
+#[tokio::test]
+async fn legacy_batch_routes_are_gone() {
+    let (app, shutdown, _council) = setup_with_service_token("legacy-batch-routes").await;
+    for uri in ["/v1/batch/run", "/v1/batch/1/report"] {
+        let status = post_status(
+            app.clone(),
+            uri,
+            "rbrg_service",
+            r#"{"batch_id":1,"jobs":[],"job_name":"x","namespace":"default","status":"completed"}"#,
+        )
+        .await;
+        // `/v1/batch/run` still matches the GET-only `/v1/batch/{id}` path,
+        // so axum answers 405 there; either way no handler takes the POST.
+        assert!(
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{uri}: {status}"
+        );
+    }
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn service_principal_is_accepted_on_a_system_route() {
     // AUTH4 must not weaken node-to-node fan-out: the service token still
-    // clears a System-tagged route (here batch/run). It passes the auth
-    // gate; the run itself may then fail on missing state, but not with a
-    // 403 (the authorisation refusal).
+    // clears a System-tagged route (here the leader's array sync). It passes
+    // the auth gate; the sync itself may then fail on its empty body, but not
+    // with a 403 (the authorisation refusal).
     let (app, shutdown, _council) = setup_with_service_token("role-system-run").await;
     let status = post_status(
         app,
-        "/v1/batch/run",
+        "/v1/batch/array/sync",
         "rbrg_service",
         &serde_json::json!({}).to_string(),
     )
@@ -6655,6 +6830,8 @@ async fn version_endpoint_reports_the_build_commit() {
         json["version"],
         crate::upgrade::version::compiled_version().to_string()
     );
+    // relish picks each node's release artefact by this, not by its own host.
+    assert_eq!(json["platform"], crate::upgrade::metadata::platform_key());
     shutdown.cancel();
 }
 
@@ -8004,138 +8181,6 @@ async fn common_apply_refuses_missing_durable_storage_before_agent_work() {
     );
 }
 
-#[tokio::test]
-async fn owned_internal_run_metadata_refuses_a_stalled_agent_before_writes_or_launch() {
-    let council = seeded_council("owned-metadata-bound").await;
-    let (tx, mut commands) = mpsc::channel(16);
-    let app = router(
-        tx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(council.clone()),
-        None,
-        None,
-        None,
-        None,
-        None,
-        0,
-        None,
-    );
-    let mut request = axum::http::Request::post("/v1/batch/run")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({
-                "batch_id": 1, "jobs": [{"name": "batch-bound", "spec": {"image": "test:v1"}}],
-                "execution_labels": {"batch-bound": {"name": "migration", "namespace": "default"}}
-            })
-            .to_string(),
-        ))
-        .unwrap();
-    let mut system = deployer_context();
-    system.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
-    system.principal_id = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
-    system.role = crate::sesame::types::ApiRole::Admin;
-    request.extensions_mut().insert(system);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request))
-        .await
-        .expect("owned internal metadata lookup did not end within its deadline")
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(AgentCommand::BatchOwnedExecutions { .. })
-    ));
-    assert!(
-        commands.try_recv().is_err(),
-        "timed-out admission enqueued a worker"
-    );
-    let desired = council.desired_state().await;
-    assert!(desired.apps.is_empty());
-    assert!(desired.batch_state.batches.is_empty());
-    assert!(desired.batch_state.execution_owners.is_empty());
-    assert_eq!(desired.batch_state.next_batch_id, 1);
-    council.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn owned_remote_log_metadata_bounds_the_local_collision_check() {
-    let council = seeded_council("owned-remote-metadata-bound").await;
-    let batch = serde_json::from_value(serde_json::json!({
-        "jobs": [{"name": "migration", "execution_name": "batch-remote-bound", "namespace": "default", "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64), "node": "remote-worker", "status": "Pending"}],
-        "submitted_at_epoch_secs": 1
-    })).unwrap();
-    write_admission_fixture(
-        &council,
-        crate::council::RaftRequest::BatchRegister {
-            expected_log_id: None,
-            batch,
-        },
-    )
-    .await
-    .unwrap();
-    let before = council.desired_state().await;
-    let (tx, mut commands) = mpsc::channel(16);
-    let app = router(
-        tx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(council.clone()),
-        None,
-        None,
-        None,
-        None,
-        None,
-        0,
-        None,
-    );
-    let mut request = axum::http::Request::get(
-        "/v1/logs/entries/batch-remote-bound/default?instance=default__batch-remote-bound-0",
-    )
-    .body(Body::empty())
-    .unwrap();
-    let mut reader = deployer_context();
-    reader.role = crate::sesame::types::ApiRole::ReadOnly;
-    reader.scoped_apps = Some(vec!["migration".into()]);
-    reader.scoped_namespaces = Some(vec!["default".into()]);
-    request.extensions_mut().insert(reader);
-    let (result, (_held_response, mut commands)) = tokio::join!(
-        tokio::time::timeout(std::time::Duration::from_secs(6), app.oneshot(request)),
-        async {
-            let Some(AgentCommand::ResolveExecutionLogs { response, .. }) = commands.recv().await
-            else {
-                panic!("first metadata phase must resolve the explicit selector");
-            };
-            response
-                .send(Err(crate::bun::BunError::BatchConflict(
-                    "no local owner".into(),
-                )))
-                .unwrap();
-            let Some(AgentCommand::Status { response }) = commands.recv().await else {
-                panic!("remote ownership needs a local ordinary collision check");
-            };
-            (response, commands)
-        }
-    );
-    assert!(
-        commands.try_recv().is_err(),
-        "metadata lookup enqueued work"
-    );
-    let after = council.desired_state().await;
-    assert_eq!(after.apps, before.apps);
-    assert_eq!(after.batch_state, before.batch_state);
-    council.shutdown().await.unwrap();
-    let response = result
-        .expect("remote collision metadata did not end within the overall deadline")
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-}
-
 // Durable admission owns a job name before an executor has dispatched it.
 #[tokio::test]
 async fn an_admitted_job_only_apply_owns_its_name_before_executor_dispatch() {
@@ -8159,13 +8204,8 @@ async fn an_admitted_job_only_apply_owns_its_name_before_executor_dispatch() {
         None,
     );
     let ownership = tokio::spawn(async move {
-        while let Some(command) = commands.recv().await {
-            match command {
-                AgentCommand::BatchOwnedExecutions { response, .. } => {
-                    let _ = response.send(Default::default());
-                }
-                _ => panic!("admission must not invoke a legacy executor"),
-            }
+        if commands.recv().await.is_some() {
+            panic!("admission must not invoke the agent");
         }
     });
     let response = app
@@ -8214,7 +8254,6 @@ async fn an_admitted_job_only_apply_owns_its_name_before_executor_dispatch() {
     let desired = council.desired_state().await;
     assert!(desired.apps.is_empty());
     assert_eq!(desired.task_arrays.jobs().runs().count(), 1);
-    assert!(desired.prerequisite_claims.is_empty());
     ownership.abort();
     drop(response);
     council.shutdown().await.unwrap();
@@ -8262,7 +8301,6 @@ async fn cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immedi
         "* * * * *"
     );
     assert_eq!(desired.task_arrays.jobs().runs().count(), 0);
-    assert!(desired.prerequisite_claims.is_empty());
     assert!(commands.try_recv().is_err());
     council.shutdown().await.unwrap();
 }
@@ -8331,6 +8369,7 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
                         },
                         not_run: 0,
                         retried: 0,
+                        retry_causes: Default::default(),
                         duration_counts: [0; 16],
                     },
                 )],
@@ -8346,9 +8385,6 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
     tokio::spawn(async move {
         while let Some(command) = incoming.recv().await {
             match command {
-                AgentCommand::BatchOwnedExecutions { response, .. } => {
-                    let _ = response.send(Default::default());
-                }
                 AgentCommand::DeployOperations { response } => {
                     let _ = response.send(crate::bun::deploy_operations::DeployOperationSnapshot {
                         active_deploys: Vec::new(),
@@ -8418,113 +8454,16 @@ async fn hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate() 
     assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::KnownFailed).await;
 }
 
-#[tokio::test]
-async fn hung_terminal_job_claim_settlement_exits_its_watcher_and_retains_claim() {
-    use crate::bun::agent::{ClusterJobExecution, ClusterJobReceipt, ClusterJobSettlement};
-    use crate::council::{CouncilResponse, RaftRequest};
-    use sha2::{Digest, Sha256};
-    let council = seeded_council("hung-terminal-job-settlement").await;
-    let config = crate::config::Config::parse("[job.work]\nimage='work:v1'\n").unwrap();
-    let operation_id = "55555555555555555555555555555555".to_string();
-    let begin = council
-        .write(RaftRequest::PrerequisiteBegin {
-            operation_id: operation_id.clone(),
-            term: council.current_term(),
-            config: Box::new(config.clone()),
-        })
-        .await
-        .unwrap();
-    assert!(!matches!(begin, CouncilResponse::Refused { .. }));
-    let commit = council
-        .write(RaftRequest::PrerequisiteCommit {
-            operation_id: operation_id.clone(),
-        })
-        .await
-        .unwrap();
-    assert!(!matches!(commit, CouncilResponse::Refused { .. }));
-    let before = council.desired_state().await;
-    let held = before.prerequisite_claims[&operation_id].clone();
-    assert!(held.apps_committed);
-    assert!(held.blocks("work", "default"));
-    let mut canonical = config.job["work"].clone();
-    canonical.namespace = Some("default".into());
-    let spec_digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&("default", "work", canonical)).unwrap(),
-    ));
-    let instance = crate::grill::InstanceIdentity::new("default", "work", 0).instance_id();
-    let receipt = Arc::new(ClusterJobReceipt {
-        executions: std::collections::BTreeMap::from([(
-            instance.0,
-            ClusterJobExecution {
-                name: "work".into(),
-                namespace: "default".into(),
-                generation: 1,
-                spec_digest,
-            },
-        )]),
-    });
-    let expected_receipt = receipt.clone();
-    let actor_council = council.clone();
-    let (commands, mut requests) = mpsc::channel(1);
-    let actor = tokio::spawn(async move {
-        let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
-            .await
-            .expect("watcher did not request finite local settlement evidence")
-            .unwrap();
-        let AgentCommand::ClusterJobsSettlement { receipt, response } = request else {
-            panic!("watcher requested the wrong settlement evidence")
-        };
-        assert!(Arc::ptr_eq(&receipt, &expected_receipt));
-        // The actor reply is a boundary input, not a claim of real execution.
-        // Only the subsequent actual JobApplyComplete write is made to hang.
-        actor_council.hang_writes();
-        response.send(ClusterJobSettlement::Terminal).unwrap();
-    });
-    let mut watcher = super::apply::spawn_job_apply_settlement(
-        commands,
-        council.clone(),
-        operation_id.clone(),
-        receipt,
-    );
-    let finished = tokio::time::timeout(std::time::Duration::from_secs(6), &mut watcher).await;
-    if finished.is_err() {
-        watcher.abort();
-        let _ = watcher.await;
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(5), actor)
-        .await
-        .expect("settlement actor failed to terminate")
-        .unwrap();
-    let after = council.desired_state().await;
-    council.shutdown().await.unwrap();
-    assert_eq!(after.apps, before.apps);
-    assert_eq!(after.prerequisite_claims.get(&operation_id), Some(&held));
-    assert!(
-        finished.is_ok(),
-        "known-terminal settlement left an unbounded Council watcher"
-    );
-    assert!(
-        finished.unwrap().is_ok(),
-        "bounded settlement watcher panicked"
-    );
-}
-
 async fn write_admission_fixture(
     council: &crate::council::CouncilNode,
     mut request: crate::council::RaftRequest,
 ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
     let previous = council.desired_state().await.last_applied_log;
-    match &mut request {
-        crate::council::RaftRequest::BatchRegister {
-            expected_log_id, ..
-        } => *expected_log_id = previous,
-        crate::council::RaftRequest::SchedulingDecision(decision) => {
-            request = crate::council::RaftRequest::SchedulingDecisions {
-                expected_log_id: previous,
-                decisions: vec![decision.clone()],
-            }
+    if let crate::council::RaftRequest::SchedulingDecision(decision) = &request {
+        request = crate::council::RaftRequest::SchedulingDecisions {
+            expected_log_id: previous,
+            decisions: vec![decision.clone()],
         }
-        _ => {}
     }
     council.write(request).await
 }

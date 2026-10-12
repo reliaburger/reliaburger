@@ -52,6 +52,29 @@ const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// Budget for everything after the downloads: VMs, nodes, quorum and demo.
 const CLUSTER_DEADLINE: Duration = Duration::from_secs(300);
 
+/// Refuse to fetch release binaries for a development build.
+///
+/// A build from main carries a `-dev` version (`0.2.0-dev`) and speaks
+/// main's cluster formats. No release of that version exists, and the last
+/// published one speaks older formats, so there is nothing right to
+/// download: such a build has to bring its own nodes. A pre-release from an
+/// explicit mirror (a release candidate) is fine.
+fn check_release_source(
+    version: &BinaryVersion,
+    development_binaries: bool,
+    release_mirror: bool,
+) -> Result<()> {
+    if version.is_pre_release() && !development_binaries && !release_mirror {
+        bail!(
+            "relish {version} is a development build, and no release of it exists to \
+             download; build Linux bun and relish and pass --development-binaries <dir> \
+             (see docs/quickstart.md, \"Development qualification\"), or install a \
+             released relish"
+        );
+    }
+    Ok(())
+}
+
 /// Create or resume a cluster, preserving checkpoints. Building the cluster
 /// has a five-minute deadline; downloads have their own, because their speed
 /// depends on the network rather than on us.
@@ -60,6 +83,11 @@ pub async fn run(options: Options) -> Result<()> {
         bail!("a release mirror cannot be combined with development binaries");
     }
     let version = env!("CARGO_PKG_VERSION").parse::<BinaryVersion>()?;
+    check_release_source(
+        &version,
+        options.development_binaries.is_some(),
+        options.release_mirror.is_some(),
+    )?;
     let mut downloader = Downloader::new(DOWNLOAD_STALL)?;
     if let Some(mirror) = &options.release_mirror {
         downloader = downloader.with_release_mirror(&version, mirror)?;
@@ -872,6 +900,22 @@ mod tests {
     use crate::bun::agent::{CouncilMemberInfo, CouncilStatus};
 
     #[test]
+    fn a_dev_version_without_development_binaries_is_refused() {
+        let dev: BinaryVersion = "0.2.0-dev".parse().unwrap();
+        let refused = check_release_source(&dev, false, false).unwrap_err();
+        assert!(
+            refused.to_string().contains("--development-binaries"),
+            "{refused}"
+        );
+        // With its own nodes, or a candidate mirror, it may go ahead.
+        assert!(check_release_source(&dev, true, false).is_ok());
+        assert!(check_release_source(&dev, false, true).is_ok());
+        // A release downloads its own release.
+        let release: BinaryVersion = "0.2.0".parse().unwrap();
+        assert!(check_release_source(&release, false, false).is_ok());
+    }
+
+    #[test]
     fn readiness_requires_every_owned_voter_and_an_owned_leader() {
         let names = vec!["one".into(), "two".into(), "three".into()];
         let mut council = CouncilStatus {
@@ -931,7 +975,9 @@ mod tests {
     }
 
     /// A stand-in `limactl` that logs its arguments; a create never returns,
-    /// and writes a console line first only when `boots` is true.
+    /// and writes a console line first only when `boots` is true. It runs
+    /// through `/bin/sh`, so no new executable waits for macOS's first-launch
+    /// assessment inside the watchdog (#517, #762).
     fn fake_lima(home: &Path, boots: bool) -> Lima {
         let script = home.join("limactl");
         let console = if boots {
@@ -939,38 +985,15 @@ mod tests {
         } else {
             "sleep 30"
         };
-        install_warm_executable(
+        std::fs::write(
             &script,
-            &format!(
+            format!(
                 "#!/bin/sh\necho \"$*\" >> \"$LIMA_HOME/calls\"\n\
                  case \"$3\" in --name=*) {console};; esac\n"
             ),
-        );
-        Lima::new(script, Duration::from_secs(5)).with_home(home.to_owned())
-    }
-
-    /// Write an executable script and run it once before the test starts.
-    ///
-    /// macOS checks a new executable file the first time it runs. The check
-    /// takes over 100 ms, and concurrent first runs of different new files
-    /// wait for each other (issue #517). Two tests that each start a fresh
-    /// fake `limactl` under a 200 ms watchdog therefore lost the race to each
-    /// other. Running the script once here pays for the check before the
-    /// timed part of the test; later runs start in a few milliseconds. The
-    /// warm-up's arguments go to a throwaway `LIMA_HOME`, not the test's.
-    fn install_warm_executable(path: &Path, script: &str) {
-        std::fs::write(path, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let throwaway = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(path)
-            .arg("--version")
-            .env("LIMA_HOME", throwaway.path())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "fake limactl failed its warm-up run");
+        )
+        .unwrap();
+        Lima::shell_script(script, Duration::from_secs(5)).with_home(home.to_owned())
     }
 
     #[tokio::test]
@@ -1005,7 +1028,7 @@ mod tests {
     /// from the first VM's start, as in issue #333.
     fn fake_lima_with_shared_network(home: &Path) -> Lima {
         let script = home.join("limactl");
-        install_warm_executable(
+        std::fs::write(
             &script,
             r#"#!/bin/sh
 echo "$*" >> "$LIMA_HOME/calls"
@@ -1033,8 +1056,9 @@ list)
   done;;
 esac
 "#,
-        );
-        Lima::new(script, Duration::from_secs(10)).with_home(home.to_owned())
+        )
+        .unwrap();
+        Lima::shell_script(script, Duration::from_secs(10)).with_home(home.to_owned())
     }
 
     #[tokio::test]
@@ -1065,7 +1089,10 @@ esac
         let lima = fake_lima(home.path(), true);
         let step = super::super::progress::tests_support::detached_step();
         let create = ["start", "--tty=false", "--name=vm", "vm.yaml"];
-        start_watched(&lima, "vm", &create, Duration::from_millis(200), &step)
+        // The create exits as soon as it has written its console line, so a
+        // long silence costs nothing here. 200 ms wasn't always enough for
+        // the shell and `mkdir` to run on a host at load average 40 (#762).
+        start_watched(&lima, "vm", &create, Duration::from_secs(10), &step)
             .await
             .unwrap();
         assert!(lima.console_started("vm").await);

@@ -260,6 +260,102 @@ Host-path volumes (`source = "/srv/import"`) get none of this. They're the opera
 
 The proof is a gated test that runs the real Redis image with `--appendonly yes` over a managed volume: first as uid 999 directly (so no entrypoint `chown` can paper over a missing hand-over), writes a key, restarts, reads it back, then restarts as image root and reads it again.
 
+### A host path is a tenant boundary
+
+That shared id range has a sharp edge, and the 0.2.0 audit found it. Every rootful container on a node maps into the same 2,000,000,000 range: that's what keeps the unpacked image cache shareable. Managed volumes are chowned into that range. So container root in team A's app and container root in team B's database are the same host uid. Now picture a deployer whose token only reaches namespace `team-a`:
+
+```toml
+[app.thief]
+image = "busybox:1.36"
+namespace = "team-a"
+
+[[app.thief.volumes]]
+path = "/steal"
+source = "/var/lib/reliaburger/volumes/team-b/db"
+```
+
+Apply checked only `deploy` in `team-a`, which the token has. The node bind-mounted `source` exactly as written, read-write, and the files were already owned by the uid container root runs as. Team B's database was team A's to read or rewrite. The namespace boundary held everywhere except on the disk.
+
+We closed it with two gates, because each covers a different hole. The first is at apply: an app with any `source` (on a volume or a `config_file`) now counts as host access, the same as an `exec` binary or an inline `script`, so a token with a `[permission]` block needs `host-exec` as well as `deploy`. `AppSpec` grew two small methods for it:
+
+```rust
+pub fn host_path_sources(&self) -> impl Iterator<Item = &std::path::Path> {
+    self.volumes
+        .iter()
+        .filter_map(|volume| volume.source.as_deref())
+        .chain(
+            self.config_file
+                .iter()
+                .filter_map(|file| file.source.as_deref().map(std::path::Path::new)),
+        )
+}
+
+pub fn needs_host_access(&self) -> bool {
+    self.exec.is_some() || self.script.is_some() || self.host_path_sources().next().is_some()
+}
+```
+
+`impl Iterator<Item = &Path>` in return position means "some iterator type I won't name". The real type is a long nest of `Chain<FilterMap<...>>` adaptors, and the caller doesn't care. Nothing runs until somebody pulls from it, so `needs_host_access` asks for one item with `.next()` and stops: it doesn't build a list just to check whether it's empty.
+
+Permissions are opt-in, though. A token with no `[permission]` block passes `authorize_permission` untouched, so the first gate does nothing for most clusters. The real default-deny is the second gate, on the node. `[storage] allowed_host_paths` in `node.toml` lists the prefixes a `source` may come from, empty by default, the way `[process_workloads] allowed_binaries` lists the host binaries an `exec` app may run. The supervisor checks every `source` before it creates an instance, through a `HostPathPolicy` built from the node config:
+
+```rust
+pub fn admit(&self, source: &Path) -> Result<ApprovedHostPath, HostPathRefusal> {
+    // ... refuse a relative path or any `..` component first ...
+    let resolved = resolve(source);
+    if let Some(directory) = self
+        .protected
+        .iter()
+        .find(|directory| resolved.starts_with(directory) || directory.starts_with(&resolved))
+    {
+        return Err(HostPathRefusal::Protected {
+            path: source.to_path_buf(),
+            directory: directory.clone(),
+        });
+    }
+    if self.allowed.iter().any(|prefix| resolved.starts_with(prefix)) {
+        Ok(ApprovedHostPath(resolved))
+    } else {
+        Err(HostPathRefusal::NotAllowed {
+            path: source.to_path_buf(),
+        })
+    }
+}
+```
+
+Three details carry the weight. `Path::starts_with` compares whole components, not bytes, so `/srv/import-evil` isn't under `/srv/import`; a string `starts_with` would have let it through, which is exactly the bug you'd write in C with `strncmp`. `resolve` canonicalises the longest part of the path that exists, so a symlink planted inside an allowed directory counts as the place it points at. And the protected check runs both ways. The node's own directories (the five `[storage]` ones, the identity and script directories, wherever the master key lives) are refused when the `source` sits under them, and also when the `source` *contains* them. An operator who lists `/var/lib` for convenience still can't hand anyone `/var/lib/reliaburger`.
+
+The first version stopped there: it checked the resolved path and then let runc mount `source` as written. Anyone who could write inside an allowlisted directory could point a symlink somewhere harmless, wait for the check, and swap it before the mount. So `admit` doesn't answer yes or no any more. It hands back the path it checked, wrapped in a newtype:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedHostPath(PathBuf);
+```
+
+The field is private to the module, so nothing outside `host_paths.rs` can build one. In C you'd pass a `char *` and trust a comment that it had been checked; here, holding an `ApprovedHostPath` is the proof, because `admit` is the only way to get one. `approve_app` runs `admit` over every `source` and returns the spec to build the container from:
+
+```rust
+pub fn approve_app<'a>(&self, spec: &'a AppSpec) -> Result<Cow<'a, AppSpec>, HostPathRefusal> {
+    if spec.host_path_sources().next().is_none() {
+        return Ok(Cow::Borrowed(spec));
+    }
+    let mut approved = spec.clone();
+    for volume in &mut approved.volumes {
+        if let Some(source) = &mut volume.source {
+            *source = self.admit(source)?.0;
+        }
+    }
+    // ... the same for each config_file source ...
+    Ok(Cow::Owned(approved))
+}
+```
+
+`Cow` ("clone on write", from `std::borrow`) is an enum holding either a borrow or an owned value. Most apps have no host path, so they come back as `Cow::Borrowed` and cost nothing; only an app with a `source` pays for a copy, whose sources are the resolved paths. The lifetime `'a` says the borrowed case lives as long as the `spec` passed in. A `Cow<AppSpec>` derefs to `&AppSpec`, so the caller hands `&spec` to the OCI builder whichever case it got. A config-file `source` is a `String`, so a resolved path that isn't valid UTF-8 is refused rather than mangled.
+
+The agent calls this through `WorkloadSupervisor::approve_host_paths` right before it builds each OCI spec: for a fresh instance, and for every rolling or blue-green replacement. That second call site fixed a hole of its own. Replacements never went through `admit_app`, so adding a `source` to an app that was already running skipped the allowlist entirely. Now there is one rule: no OCI spec for an app is built from a `source` the policy hasn't just approved.
+
+That shrinks the race without closing it. The mounted path has no symlinks when it's checked, but runc mounts it by name later, after the image pull, and again on every restart, which reuses the stored spec. If someone with write access to an allowlisted directory replaces a directory on the resolved path with a symlink in between (or creates a source that didn't exist yet as one), the kernel still follows it. Closing that would mean opening the source component by component without following links (`openat2` with `RESOLVE_NO_SYMLINKS`) and handing runc the open file descriptor instead of a name, which runc's bundle format doesn't offer. We accept the remainder: it needs write access inside a directory the operator chose to trust, and the refusals that matter, another tenant's volume and the node's own secrets, hold for the path that's checked.
+
 ## Under the hood: key patterns
 
 ### Validate at construction, not at use

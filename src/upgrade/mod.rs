@@ -10,7 +10,7 @@
 //! Detailed design: `docs/plans/archive/2026-07-06-plan-self-upgrade.md` and
 //! `docs/design/agent-bun.md` §5.5.
 
-mod compatibility;
+pub(crate) mod compatibility;
 pub mod error;
 pub mod keys;
 pub mod manager;
@@ -30,6 +30,11 @@ pub use version::{BinaryVersion, resolve_running_version};
 /// Pickle repository name for distributing reliaburger binaries
 /// (single path segment — the registry routes require it).
 pub const BINARY_BLOB_REPO: &str = "reliaburger-bun";
+
+/// The `error` a node without a council answers the cluster upgrade
+/// endpoints with, as a 503. It is the one answer that tells `relish upgrade`
+/// it is talking to a single node; every other failure is a failure.
+pub const NO_COUNCIL: &str = "no council on this node";
 
 /// Does this HTTP status mean "not right now" rather than "no"?
 ///

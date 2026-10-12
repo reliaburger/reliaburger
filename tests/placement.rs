@@ -62,13 +62,17 @@ impl NodeFaultAuth {
     }
 }
 
-/// Cut `node` off from `peers` on the gossip and Raft transports.
+/// Cut `node` off from `peers` on the gossip and Raft transports, sending
+/// the request to `node` itself. Retries (bounded) only the leader's exact
+/// "stable current council membership" refusal, in case the self-healing
+/// loop moves membership between the caller's wait and the request.
 async fn partition(
     node: &Node,
     peers: &[String],
 ) -> Result<reliaburger::smoker::types::FaultSummary, reliaburger::relish::RelishError> {
-    node.client
-        .inject_fault(&reliaburger::smoker::types::FaultRequest {
+    inject_node_fault_once_council_settles(
+        node,
+        &reliaburger::smoker::types::FaultRequest {
             fault_type: reliaburger::smoker::types::FaultType::CouncilPartition {
                 peers: peers.to_vec(),
             },
@@ -82,8 +86,9 @@ async fn partition(
             include_leader: true,
             override_safety: false,
             acknowledged: true,
-        })
-        .await
+        },
+    )
+    .await
 }
 
 async fn start_node(
@@ -175,6 +180,7 @@ async fn start_node_with(
         seeds,
         shutdown: shutdown.clone(),
         data_dir_prefix: "rb-placement",
+        data_root: None,
         stale_report_timeout_secs: 30,
         metrics_rollup: Some(Duration::from_millis(500)),
         // Fast learning period so the test doesn't wait long.
@@ -194,6 +200,7 @@ async fn start_node_with(
         labels,
         keep_data_dir,
         task_arrays: None,
+        task_arrays_on_agent_budget: None,
     })
     .await;
 
@@ -964,7 +971,8 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
     "#,
     )
     .unwrap();
-    let [n1, n2, n3] = start_autoscale_cluster(27341, &config, &shutdown).await;
+    // Below the 27000..30000 range other suites lease port blocks from.
+    let [n1, n2, n3] = start_autoscale_cluster(22341, &config, &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     for node in &nodes {
@@ -1032,24 +1040,26 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     })
     .await;
     assert!(ready, "no leader elected");
-    // Wait for the council to actually grow to 3 voters. The self-healing
-    // reconciler admits members one action per tick with a stability
-    // window, so growth takes several ticks rather than one.
+    // Wait until every node has applied the same uniform three-voter
+    // config. The self-healing reconciler admits members one action per
+    // tick, and each node's quorum rail reads its own Raft metrics: the
+    // first partition goes through a follower, which may not have appended
+    // the promotion yet and would still count two voters (max allowed 0).
     let grown = wait_until(Duration::from_secs(60), || {
-        nodes.iter().any(|n| {
-            n.handle.council.as_ref().is_some_and(|c| {
-                c.metrics()
-                    .borrow()
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .count()
-                    >= 3
-            })
-        })
+        council_membership_settled(&nodes, 3)
     })
     .await;
-    assert!(grown, "council did not grow to 3 voters");
+    assert!(
+        grown,
+        "council never settled on a uniform three-voter membership"
+    );
+    // The rail also subtracts the voters missing from the serving node's
+    // API membership table, so wait until every node's table lists all
+    // three; otherwise a late join reads as one voter already down.
+    assert!(
+        wait_until_api_views_list_all(&nodes, Duration::from_secs(30)).await,
+        "not every node's API membership listed all three members"
+    );
 
     let leader = nodes
         .iter()
@@ -1221,6 +1231,32 @@ async fn inject_node_fault_once_council_settles(
             }
             result => return result,
         }
+    }
+}
+
+/// Wait until every node's API membership table (what the fault safety
+/// rails read) lists every node in `nodes`.
+async fn wait_until_api_views_list_all(nodes: &[&Node], timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let mut all_listed = true;
+        for observer in nodes {
+            let table = observer.membership_table.read().await;
+            if !nodes
+                .iter()
+                .all(|node| table.iter().any(|member| member.node_id.0 == node.name))
+            {
+                all_listed = false;
+                break;
+            }
+        }
+        if all_listed {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -2718,6 +2754,128 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    shutdown.cancel();
+    for node in nodes {
+        node.handle.council.as_ref().unwrap().shutdown().await.ok();
+    }
+}
+
+/// `GET /v1/audit?cluster=true` asks every node for its own durable log
+/// and merges the answers by time (#685).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "multi-node audit query acceptance; run with make test-cluster"]
+async fn cluster_audit_query_merges_every_node() {
+    let auth = NodeFaultAuth::admin("audit-admin");
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("audit1", 20641, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "audit2",
+        20645,
+        vec![local(20641)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        "audit3",
+        20649,
+        vec![local(20641)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                let metrics = council.metrics().borrow().clone();
+                metrics.current_leader.is_some()
+                    && metrics.membership_config.membership().voter_ids().count() == 3
+            })
+        }))
+        .await
+    );
+    // One audited action through each node: each records it in its own log
+    // (and the leader again, for the ones forwarded to it).
+    for node in nodes {
+        let manifest = format!("[namespace.from-{}]\nmax_apps = 1\n", node.name);
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/apply", node.client.base_url()))
+            .bearer_auth(&auth.plaintext)
+            .body(manifest)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+    }
+    let filter = reliaburger::bun::audit::AuditFilter {
+        action: Some("app.applied".to_string()),
+        ..reliaburger::bun::audit::AuditFilter::default()
+    };
+    // Every node answers once gossip has shown the querying node all three.
+    let mut listing = reliaburger::bun::audit::AuditListing::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(answer) = n1.client.audit(&filter, true).await {
+            listing = answer;
+            let recorded_on: std::collections::BTreeSet<_> = listing
+                .records
+                .iter()
+                .filter_map(|record| record.node.clone())
+                .collect();
+            if listing.warnings.is_empty() && recorded_on.len() == 3 {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cluster audit query never merged all three nodes: {listing:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let names: std::collections::BTreeSet<_> = listing
+        .records
+        .iter()
+        .filter_map(|record| record.node.clone())
+        .collect();
+    assert_eq!(
+        names,
+        ["audit1", "audit2", "audit3"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+    // Merged oldest first.
+    assert!(
+        listing
+            .records
+            .windows(2)
+            .all(|pair| pair[0].timestamp <= pair[1].timestamp)
+    );
+    for node in nodes {
+        let namespace = format!("from-{}", node.name);
+        assert!(
+            listing
+                .records
+                .iter()
+                .any(|record| record.node.as_deref() == Some(node.name.as_str())
+                    && record.namespace.as_deref() == Some(namespace.as_str())),
+            "{} did not record its own apply: {listing:?}",
+            node.name
+        );
+    }
+    // Without `cluster`, a node answers from its own log only.
+    let local = n2.client.audit(&filter, false).await.unwrap();
+    assert!(!local.records.is_empty());
+    assert!(
+        local
+            .records
+            .iter()
+            .all(|record| record.node.as_deref() == Some("audit2"))
+    );
     shutdown.cancel();
     for node in nodes {
         node.handle.council.as_ref().unwrap().shutdown().await.ok();

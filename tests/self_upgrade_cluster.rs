@@ -23,6 +23,9 @@ use tokio::sync::watch;
 
 use reliaburger::upgrade::signing::{self, encode_public_key};
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
+
 /// Cluster operations are slow: convergence, four swaps, verification.
 const WAIT: Duration = Duration::from_secs(180);
 
@@ -54,26 +57,22 @@ struct ClusterHarness {
     release_pkcs8: Vec<u8>,
     external_pkcs8: Vec<u8>,
     service_token: String,
+    /// Every node's fixed ports, leased until the harness drops.
+    _held_ports: Vec<bun_process::PortBlockReservation>,
 }
 
-fn free_tcp_port(allocated: &mut HashSet<u16>) -> u16 {
-    loop {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        if allocated.insert(port) {
-            return port;
-        }
-    }
-}
-
-fn free_udp_port(allocated: &mut HashSet<u16>) -> u16 {
-    loop {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = socket.local_addr().unwrap().port();
-        if allocated.insert(port) {
-            return port;
-        }
-    }
+/// A TCP- and UDP-free port, leased in `held` for the harness's lifetime.
+///
+/// Every upgrade exec and respawn closes a node's sockets and binds the same
+/// ports again. A `bind(0)` port comes from the ephemeral range, where
+/// another test can take it in that gap (#734); the shared allocator's range
+/// lies below it, and a held lease keeps every other fixture, and this
+/// harness's other nodes, off it.
+fn free_port(held: &mut Vec<bun_process::PortBlockReservation>) -> u16 {
+    let reservation = bun_process::reserve_port_block_lease(1);
+    let port = reservation.base;
+    held.push(reservation);
+    port
 }
 
 /// How far above its gossip port each node's Raft port sits. Bun derives a
@@ -85,16 +84,20 @@ const RAFT_PORT_OFFSET: u16 = 1000;
 
 /// A free gossip (UDP) port whose Raft (TCP) port, [`RAFT_PORT_OFFSET`]
 /// above it, is free too.
-fn free_gossip_and_raft_ports(allocated: &mut HashSet<u16>) -> (u16, u16) {
+fn free_gossip_and_raft_ports(held: &mut Vec<bun_process::PortBlockReservation>) -> (u16, u16) {
     loop {
-        let gossip = free_udp_port(allocated);
-        let Some(raft) = gossip.checked_add(RAFT_PORT_OFFSET) else {
+        let gossip = bun_process::reserve_port_block_lease(1);
+        let Some(raft) = gossip
+            .base
+            .checked_add(RAFT_PORT_OFFSET)
+            .and_then(|port| bun_process::PortBlockReservation::try_reserve(port, 1))
+        else {
             continue;
         };
-        if !allocated.contains(&raft) && std::net::TcpListener::bind(("127.0.0.1", raft)).is_ok() {
-            allocated.insert(raft);
-            return (gossip, raft);
-        }
+        let ports = (gossip.base, raft.base);
+        held.push(gossip);
+        held.push(raft);
+        return ports;
     }
 }
 
@@ -135,13 +138,16 @@ impl ClusterHarness {
     async fn start_with_keyless(count: usize, keyless: &[usize]) -> Self {
         let root = tempfile::tempdir().unwrap();
         // The registry deliberately caps each upload at 512 MiB. Debug symbols
-        // can exceed that on CI; remove them from this private fixture only,
-        // before copying, hashing or signing any candidate. Cargo's executable
-        // stays intact for backtraces in the other suites.
+        // can exceed that on CI, and a macOS debug build's local symbols alone
+        // took it to 540 MB in October 2026 (#783); remove both from this
+        // private fixture only, before copying, hashing or signing any
+        // candidate. Cargo's executable stays intact for backtraces in the
+        // other suites.
         let source = root.path().join("bun-fixture");
         std::fs::copy(env!("CARGO_BIN_EXE_bun"), &source).unwrap();
         let stripped = std::process::Command::new("strip")
             .arg("-S")
+            .arg("-x")
             .arg(&source)
             .output()
             .expect("strip must be installed for cluster-upgrade acceptance");
@@ -172,11 +178,12 @@ impl ClusterHarness {
 
         let mut nodes = Vec::new();
         let mut seed_gossip: Option<u16> = None;
-        // Keep every endpoint numerically distinct for the lifetime of this
-        // harness. Binding port 0 and immediately dropping the socket can
-        // return the same number on the very next call; that made a node's
-        // registry collide with its API or Raft listener and crash-loop.
-        let mut allocated_ports = HashSet::new();
+        // Keep every endpoint numerically distinct and leased for the
+        // lifetime of this harness. Binding port 0 and immediately dropping
+        // the socket can return the same number on the very next call; that
+        // made a node's registry collide with its API or Raft listener and
+        // crash-loop.
+        let mut held_ports = Vec::new();
 
         for index in 0..count {
             let name = format!("n{index}");
@@ -187,10 +194,10 @@ impl ClusterHarness {
             install_version(&source, &bin_dir, "v0.2.0");
             std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
-            let api_port = free_tcp_port(&mut allocated_ports);
-            let (gossip_port, raft_port) = free_gossip_and_raft_ports(&mut allocated_ports);
-            let reporting_port = free_tcp_port(&mut allocated_ports);
-            let registry_port = free_tcp_port(&mut allocated_ports);
+            let api_port = free_port(&mut held_ports);
+            let (gossip_port, raft_port) = free_gossip_and_raft_ports(&mut held_ports);
+            let reporting_port = free_port(&mut held_ports);
+            let registry_port = free_port(&mut held_ports);
             let join = match seed_gossip {
                 Some(seed) => format!("join = [\"127.0.0.1:{seed}\"]"),
                 None => "join = []".to_string(),
@@ -310,6 +317,7 @@ retain_versions = 3
             release_pkcs8,
             external_pkcs8,
             service_token,
+            _held_ports: held_ports,
         };
 
         // Every node healthy, then a leader elected with a full council.
@@ -560,9 +568,12 @@ retain_versions = 3
 
         let request = serde_json::json!({
             "target_version": "v0.2.0",
-            "binary_sha256": sha256,
-            "embedded_signature": signing::sign(&self.release_pkcs8, &bytes).unwrap(),
-            "external_signature": signing::sign(&self.external_pkcs8, &bytes).unwrap(),
+            "binaries": [{
+                "platform": reliaburger::upgrade::metadata::platform_key(),
+                "sha256": sha256,
+                "embedded_signature": signing::sign(&self.release_pkcs8, &bytes).unwrap(),
+                "external_signature": signing::sign(&self.external_pkcs8, &bytes).unwrap(),
+            }],
             "parallel": 1,
             "registry_address": registry_address,
             "nodes": nodes,
@@ -742,6 +753,7 @@ retain_versions = 3
             version: None,
             binary: Some(binary),
             sig: None,
+            external_key: None,
             parallel: 1,
             registry: None,
             metadata_url: String::new(),
@@ -928,6 +940,146 @@ async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_addr
         "nodes must fetch from the leader's cluster registry address, not the forward"
     );
     let upgrade_id = active["upgrade_id"].as_str().unwrap().to_string();
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
+    assert_eq!(phase, "Completed");
+    harness.wait_for_versions("v0.2.0").await;
+
+    harness.shutdown().await;
+}
+
+/// Serve release metadata and binaries over HTTP the way a release host
+/// does. `/metadata.json` lists `bytes` for `platform` and `decoy` for
+/// another platform, at the given cluster formats; `/other-formats.json`
+/// is the same release one protocol generation on. Returns the origin.
+async fn serve_release(
+    release_pkcs8: &[u8],
+    platform: &str,
+    bytes: Vec<u8>,
+    decoy: Vec<u8>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let other = if platform == "linux-x86_64" {
+        "linux-aarch64"
+    } else {
+        "linux-x86_64"
+    };
+    let artefact = |name: &str, bytes: &[u8]| {
+        serde_json::json!({
+            "url": format!("{origin}/{name}"),
+            "sha256": signing::sha256_hex(bytes),
+            "embedded_signature": signing::sign(release_pkcs8, bytes).unwrap(),
+            // Public metadata never carries the operator's signature.
+            "external_signature": null,
+        })
+    };
+    let current = reliaburger::compatibility::CURRENT;
+    let metadata = |protocol: u32| {
+        serde_json::json!({
+            "schema": 1,
+            "latest": "v0.2.0",
+            "releases": [{
+                "version": "v0.2.0",
+                "compatibility": {"protocol": protocol, "state": current.state},
+                "platforms": {
+                    platform: artefact("bun", &bytes),
+                    other: artefact("decoy", &decoy),
+                },
+            }],
+        })
+    };
+    let (same, changed) = (metadata(current.protocol), metadata(current.protocol + 1));
+    let router = axum::Router::new()
+        .route(
+            "/metadata.json",
+            axum::routing::get(move || async move { axum::Json(same) }),
+        )
+        .route(
+            "/other-formats.json",
+            axum::routing::get(move || async move { axum::Json(changed) }),
+        )
+        .route("/bun", axum::routing::get(move || async move { bytes }))
+        .route("/decoy", axum::routing::get(move || async move { decoy }));
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    origin
+}
+
+/// `relish upgrade start v0.2.0` end to end (#687): relish reads the
+/// release metadata, picks the build for the platform the NODES report
+/// rather than its own, countersigns it with `--external-key`, and the
+/// rolling walk completes. Public metadata carries no external signature,
+/// so before #687 this form could never pass the nodes' checks.
+///
+/// Every node here runs on the test host's platform, so the mixed-platform
+/// choice itself is pinned by unit tests; this proves the decoy build for
+/// the other platform is left alone and that a release with other cluster
+/// formats is refused before anything is pushed.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host; run with make test-upgrade-cluster"]
+async fn version_form_rolls_the_nodes_platform_build_countersigned_by_relish() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(4).await;
+    let leader = harness.wait_for_idle_leader().await;
+    let leader_node = harness.node(&leader);
+    let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
+    let platform = reliaburger::upgrade::metadata::platform_key();
+    let origin = serve_release(
+        &harness.release_pkcs8,
+        &platform,
+        bytes.clone(),
+        b"another platform's bun".to_vec(),
+    )
+    .await;
+    let keys = tempfile::tempdir().unwrap();
+    let external_key = keys.path().join("operator.key");
+    std::fs::write(&external_key, &harness.external_pkcs8).unwrap();
+    let client = harness.relish_client(leader_node);
+    let args = |metadata: &str| reliaburger::relish::upgrade::StartArgs {
+        version: Some("v0.2.0".to_string()),
+        binary: None,
+        sig: None,
+        external_key: Some(external_key.clone()),
+        parallel: 1,
+        registry: None,
+        metadata_url: format!("{origin}/{metadata}"),
+        node_addresses: Vec::new(),
+        allow_downgrade: false,
+    };
+
+    let refused = reliaburger::relish::upgrade::start(&client, args("other-formats.json"))
+        .await
+        .expect_err("a release with other formats needs a fresh cluster");
+    assert!(refused.to_string().contains("fresh cluster"), "{refused}");
+    let state = harness
+        .cluster_state()
+        .await
+        .expect("cluster upgrade state");
+    assert!(state["active"].is_null(), "nothing recorded: {state}");
+
+    reliaburger::relish::upgrade::start(&client, args("metadata.json"))
+        .await
+        .expect("relish upgrade start v0.2.0");
+
+    let recorded = harness
+        .cluster_state()
+        .await
+        .expect("cluster upgrade state");
+    let binaries = recorded["active"]["binaries"].as_array().unwrap().clone();
+    assert_eq!(
+        binaries.len(),
+        1,
+        "one build per platform present: {binaries:?}"
+    );
+    assert_eq!(binaries[0]["platform"], platform);
+    assert_eq!(binaries[0]["sha256"], signing::sha256_hex(&bytes));
+    let upgrade_id = recorded["active"]["upgrade_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
     harness.wait_for_versions("v0.2.0").await;

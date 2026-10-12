@@ -141,6 +141,7 @@ const KNOWN_PERMISSION_ACTIONS: &[&str] = &[
     "metrics",
     "exec",
     "host-exec",
+    "fault",
     "admin",
     "secret-read",
     "secret-write",
@@ -248,6 +249,11 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             name: name.to_string(),
         });
     }
+    validate_network_policy(
+        &format!("app {name:?}"),
+        app.firewall.as_ref(),
+        app.egress.as_ref(),
+    )?;
 
     // Ordinals come from the leader's placements, never from a config file.
     if app.ordinals.is_some() {
@@ -427,8 +433,48 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     Ok(())
 }
 
+/// Check the network policy apps and jobs share: every egress entry parses
+/// (without resolving names), and every `allow_from` source is `app` or
+/// `namespace/app` made of workload labels.
+fn validate_network_policy(
+    context: &str,
+    firewall: Option<&super::app::FirewallSpec>,
+    egress: Option<&super::app::EgressSpec>,
+) -> Result<(), ConfigError> {
+    for entry in egress.map_or(&[][..], |egress| egress.allow.as_slice()) {
+        crate::sesame::egress::validate_egress_entry(entry).map_err(|error| {
+            ConfigError::Validation {
+                field: "egress".to_string(),
+                context: context.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    for source in firewall.map_or(&[][..], |firewall| firewall.allow_from.as_slice()) {
+        let valid = match source.split_once('/') {
+            Some((namespace, app)) => valid_workload_label(namespace) && valid_workload_label(app),
+            None => valid_workload_label(source),
+        };
+        if !valid {
+            return Err(ConfigError::Validation {
+                field: "firewall.allow_from".to_string(),
+                context: context.to_string(),
+                reason: format!(
+                    "{source:?} must be an app name or namespace/app, each a lowercase DNS label"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
     validate_label(name, "job", "name")?;
+    validate_network_policy(
+        &format!("job {name:?}"),
+        job.firewall.as_ref(),
+        job.egress.as_ref(),
+    )?;
     validate_label(
         job.namespace.as_deref().unwrap_or("default"),
         name,
@@ -482,7 +528,43 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
             field: "runtime".into(),
             context: format!("job {name:?}"),
             reason: reason.into(),
-        })
+        })?;
+    validate_job_policy(name, job)
+}
+
+/// Check a TOML job's run policy against the same limits a manifest has.
+fn validate_job_policy(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
+    let refuse = |field: &str, reason: String| ConfigError::Validation {
+        field: field.into(),
+        context: format!("job {name:?}"),
+        reason,
+    };
+    if job.overlap.is_some() && job.schedule.is_none() {
+        return Err(refuse(
+            "overlap",
+            "only applies to a job with a schedule".into(),
+        ));
+    }
+    if job.replay_unknown && !job.run_before.is_empty() {
+        return Err(refuse(
+            "replay_unknown",
+            "a run_before hook can't replay an unknown outcome automatically; acknowledge it with relish batch replay".into(),
+        ));
+    }
+    // The definition is where the policy lands, so its limits are the ones to check.
+    let tasks = crate::meat::job::JobDefinition::from_spec(job.clone()).tasks;
+    tasks.validate().map_err(|error| {
+        let field = match error {
+            crate::meat::task_array::TaskArraySpecError::AttemptsOutOfRange { .. } => {
+                "max_attempts"
+            }
+            crate::meat::task_array::TaskArraySpecError::TimeoutOutOfRange { .. } => {
+                "task_timeout_secs"
+            }
+            _ => "job",
+        };
+        refuse(field, error.to_string())
+    })
 }
 
 impl NodeConfig {
@@ -537,11 +619,16 @@ impl NodeConfig {
             ("storage.metrics", &self.storage.metrics),
             ("storage.volumes", &self.storage.volumes),
         ];
-        for (field, path) in &paths {
+        let allowed_host_paths = self
+            .storage
+            .allowed_host_paths
+            .iter()
+            .map(|path| ("storage.allowed_host_paths", path));
+        for (field, path) in paths.into_iter().chain(allowed_host_paths) {
             if !path.is_absolute() {
                 return Err(ConfigError::NonAbsolutePath {
-                    field: (*field).to_string(),
-                    path: (*path).clone(),
+                    field: field.to_string(),
+                    path: path.clone(),
                 });
             }
         }
@@ -591,6 +678,19 @@ impl NodeConfig {
             return Err(ConfigError::NonAbsolutePath {
                 field: "upgrades.binary_dir".to_string(),
                 path: dir.clone(),
+            });
+        }
+
+        // A log smaller than a few records would drop each record as soon
+        // as the next arrived, which is no audit trail at all (#685).
+        if self.storage.audit_max_bytes < crate::bun::audit::MIN_AUDIT_MAX_BYTES {
+            return Err(ConfigError::Validation {
+                field: "storage.audit_max_bytes".into(),
+                context: "node config".into(),
+                reason: format!(
+                    "must be at least {} bytes",
+                    crate::bun::audit::MIN_AUDIT_MAX_BYTES
+                ),
             });
         }
 
@@ -1146,6 +1246,22 @@ mod tests {
     }
 
     #[test]
+    fn audit_log_bound_has_a_floor() {
+        let mut nc = NodeConfig::default();
+        assert_eq!(
+            nc.storage.audit_max_bytes,
+            crate::bun::audit::DEFAULT_AUDIT_MAX_BYTES
+        );
+        nc.storage.audit_max_bytes = 1024;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.audit_max_bytes"), "{error}");
+        nc.storage.audit_max_bytes = crate::bun::audit::MIN_AUDIT_MAX_BYTES;
+        assert!(nc.validate().is_ok());
+        let parsed = NodeConfig::parse("[storage]\naudit_max_bytes = 1048576\n").unwrap();
+        assert_eq!(parsed.storage.audit_max_bytes, 1 << 20);
+    }
+
+    #[test]
     fn scheduled_snapshots_must_retain_at_least_one() {
         let mut nc = NodeConfig::default();
         nc.storage.snapshots.interval_secs = 3600;
@@ -1649,6 +1765,44 @@ mod tests {
     }
 
     #[test]
+    fn job_egress_is_validated_like_an_app() {
+        let invalid = [
+            ("egress", "allow = [\"no-port.example.com\"]", "egress"),
+            ("egress", "allow = [\"10.0.0.1/8:443\"]", "egress"),
+            ("egress", "allow = [\"2001:db8::1:443\"]", "egress"),
+            (
+                "firewall",
+                "allow_from = [\"Not_A_Label\"]",
+                "firewall.allow_from",
+            ),
+            (
+                "firewall",
+                "allow_from = [\"a/b/c\"]",
+                "firewall.allow_from",
+            ),
+        ];
+        for (table, body, field) in invalid {
+            for kind in ["app", "job"] {
+                let source =
+                    format!("[{kind}.work]\nimage = \"fixture:v1\"\n[{kind}.work.{table}]\n{body}");
+                let error = Config::parse(&source).unwrap().validate().unwrap_err();
+                assert!(
+                    matches!(&error, ConfigError::Validation { field: actual, .. } if actual == field),
+                    "{kind} accepted {table} {body:?}: {error}"
+                );
+            }
+        }
+        for kind in ["app", "job"] {
+            let source = format!(
+                "[{kind}.work]\nimage = \"fixture:v1\"\n\
+                 [{kind}.work.egress]\nallow = [\"api.example.com:443\", \"10.0.0.0/8:5432\", \"[2001:db8::1]:443\"]\n\
+                 [{kind}.work.firewall]\nallow_from = [\"web\", \"frontend/scraper\"]"
+            );
+            Config::parse(&source).unwrap().validate().unwrap();
+        }
+    }
+
+    #[test]
     fn validate_job_exec_only_passes() {
         let job: crate::config::job::JobSpec = toml::from_str(
             r#"runtime = "process"
@@ -1725,6 +1879,19 @@ exec = "/usr/bin/python3""#,
             matches!(err, ConfigError::Validation { ref field, .. } if field == "actions"),
             "unknown permission action must be rejected: {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_permission_accepts_the_fault_action() {
+        let config = Config::parse(
+            r#"
+            [permission.chaos]
+            actions = ["fault"]
+            apps = ["web"]
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
     }
 
     #[test]

@@ -37,6 +37,14 @@ pub(super) async fn fault_inject_handler(
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
+        // A node fault targets no app, so under a `[permission]` block only
+        // a cluster-wide `fault` grant covers it (D5).
+        if let Err(response) =
+            enforce_cluster_permission(&state, Some(auth), crate::config::PermissionAction::Fault)
+                .await
+        {
+            return response;
+        }
         let operation = if matches!(
             request.fault_type,
             crate::smoker::types::FaultType::NodePressure { .. }
@@ -98,6 +106,17 @@ pub(super) async fn fault_inject_handler(
             &request.target_service,
             &namespace,
         ) {
+            return response;
+        }
+        if let Err(response) = enforce_permission(
+            &state,
+            auth.as_deref(),
+            crate::config::PermissionAction::Fault,
+            &request.target_service,
+            &namespace,
+        )
+        .await
+        {
             return response;
         }
         let (principal, role) = auth
@@ -178,6 +197,9 @@ pub(super) async fn apply_fault_locally(
         .unwrap_or_else(|| request.fault_type.to_string());
     let audit_duration_seconds = request.duration.as_secs();
     let audit_reason = request.reason.clone();
+    let audit_namespace = request.namespace.clone();
+    let audit_include_leader = request.include_leader;
+    let audit_override_safety = request.override_safety;
     match ask_agent(&state.cmd_tx, |response| AgentCommand::InjectFault {
         reservation: reservation.map(Box::new),
         request,
@@ -187,44 +209,61 @@ pub(super) async fn apply_fault_locally(
     .await
     {
         Ok(Ok(summary)) => {
-            if let Some(events) = &state.events {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let mut details = std::collections::BTreeMap::from([
-                    ("fault_id".to_string(), summary.id.to_string()),
-                    ("fault_type".to_string(), audit_fault_type.clone()),
-                    (
-                        "duration_seconds".to_string(),
-                        audit_duration_seconds.to_string(),
-                    ),
-                ]);
-                if let Some(instance) = audit_target_instance {
-                    details.insert("target_instance".to_string(), instance);
-                }
-                if let Some(reason) = audit_reason {
-                    details.insert("reason".to_string(), reason);
-                }
-                events
-                    .write()
-                    .await
-                    .record_audit(crate::bun::events::AuditEvent {
-                        timestamp,
-                        kind: crate::bun::events::EventKind::Fault,
-                        severity: crate::bun::events::EventSeverity::Warning,
-                        action: "fault.injected".to_string(),
-                        principal: audit_principal.clone(),
-                        app: (!audit_target_service.is_empty()).then_some(audit_target_service),
-                        namespace: None,
-                        node: audit_target_node,
-                        details,
-                        message: format!(
-                            "fault {} ({}) injected for {}s by principal {}",
-                            summary.id, summary.fault_type, audit_duration_seconds, audit_principal
-                        ),
-                    });
+            let mut details = std::collections::BTreeMap::from([
+                ("fault_id".to_string(), summary.id.to_string()),
+                ("fault_type".to_string(), audit_fault_type.clone()),
+                (
+                    "duration_seconds".to_string(),
+                    audit_duration_seconds.to_string(),
+                ),
+            ]);
+            if let Some(instance) = audit_target_instance {
+                details.insert("target_instance".to_string(), instance);
             }
+            if let Some(reason) = audit_reason {
+                details.insert("reason".to_string(), reason);
+            }
+            // Design §6.3: an override is logged with extra prominence, so
+            // the flags are always present and the record is raised to
+            // Critical when either is set.
+            details.insert(
+                "include_leader".to_string(),
+                audit_include_leader.to_string(),
+            );
+            details.insert(
+                "override_safety".to_string(),
+                audit_override_safety.to_string(),
+            );
+            let overridden = audit_include_leader || audit_override_safety;
+            record_fault_audit(
+                state,
+                auth,
+                FaultAudit {
+                    action: "fault.injected",
+                    severity: if overridden {
+                        crate::bun::events::EventSeverity::Critical
+                    } else {
+                        crate::bun::events::EventSeverity::Warning
+                    },
+                    app: (!audit_target_service.is_empty()).then_some(audit_target_service),
+                    namespace: audit_namespace,
+                    node: audit_target_node,
+                    details,
+                    message: format!(
+                        "fault {} ({}) injected for {}s by principal {}{}",
+                        summary.id,
+                        summary.fault_type,
+                        audit_duration_seconds,
+                        audit_principal,
+                        if overridden {
+                            " with safety overrides"
+                        } else {
+                            ""
+                        }
+                    ),
+                },
+            )
+            .await;
             Ok(summary)
         }
         Ok(Err(e)) => Err((
@@ -236,39 +275,39 @@ pub(super) async fn apply_fault_locally(
     }
 }
 
+/// A fault action to audit, attributed to its caller by
+/// [`record_fault_audit`].
 pub(super) struct FaultAudit<'a> {
     pub(super) action: &'a str,
-    pub(super) principal: &'a str,
     pub(super) severity: crate::bun::events::EventSeverity,
     pub(super) app: Option<String>,
+    pub(super) namespace: Option<String>,
     pub(super) node: Option<String>,
     pub(super) details: std::collections::BTreeMap<String, String>,
     pub(super) message: String,
 }
 
-pub(super) async fn record_fault_audit(state: &ApiState, audit: FaultAudit<'_>) {
-    let Some(events) = &state.events else {
-        return;
-    };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    events
-        .write()
-        .await
-        .record_audit(crate::bun::events::AuditEvent {
-            timestamp,
+/// Record a fault action in the ring and the durable audit log.
+pub(super) async fn record_fault_audit(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    audit: FaultAudit<'_>,
+) {
+    record_caller_action(
+        state,
+        auth,
+        CallerAction {
             kind: crate::bun::events::EventKind::Fault,
             severity: audit.severity,
-            action: audit.action.to_string(),
-            principal: audit.principal.to_string(),
+            action: audit.action,
             app: audit.app,
-            namespace: None,
+            namespace: audit.namespace,
             node: audit.node,
             details: audit.details,
             message: audit.message,
-        });
+        },
+    )
+    .await;
 }
 
 /// Re-evaluate node safety from API-owned live cluster state before routing.
@@ -1156,6 +1195,16 @@ pub(super) async fn fault_clear_handler(
         } else {
             false
         };
+    if let Err(response) = authorize_on_fault(
+        &state,
+        auth.as_deref(),
+        id,
+        crate::config::PermissionAction::Fault,
+    )
+    .await
+    {
+        return response;
+    }
     let has_any_reversal_grant = allow_workload_fault || allow_node_fault || allow_node_pressure;
     if query.node.is_some() && !has_any_reversal_grant {
         return (
@@ -1212,11 +1261,12 @@ pub(super) async fn fault_clear_handler(
             }
             record_fault_audit(
                 &state,
+                auth.as_deref(),
                 FaultAudit {
                     action: "fault.cleared",
-                    principal,
                     severity: crate::bun::events::EventSeverity::Info,
                     app: None,
+                    namespace: None,
                     node: query.node,
                     details: std::collections::BTreeMap::from([(
                         "fault_id".to_string(),
@@ -1234,6 +1284,58 @@ pub(super) async fn fault_clear_handler(
         )
             .into_response(),
         Err(response) => response,
+    }
+}
+
+/// Hold an action on fault `id` (its clear) to the caller's scope and
+/// `[permission]` block, judged against the fault itself: `action` on its
+/// service, or across the whole cluster for a node fault, which targets no
+/// app.
+///
+/// A caller with neither a scope nor a block is governed by its role alone,
+/// so this asks the agent nothing for it. An id this node doesn't hold is
+/// left to the agent, which answers that it doesn't exist.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+pub(super) async fn authorize_on_fault(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    id: u64,
+    action: crate::config::PermissionAction,
+) -> Result<(), Response> {
+    let Some(ctx) = auth else {
+        return Ok(());
+    };
+    if crate::sesame::auth::is_system_principal(ctx) {
+        return Ok(());
+    }
+    let permissions = permission_map(state).await;
+    let scoped = ctx.scoped_apps.is_some() || ctx.scoped_namespaces.is_some();
+    if !scoped && !permissions.contains_key(&ctx.token_name) {
+        return Ok(());
+    }
+    let faults = ask_agent(&state.cmd_tx, |response| AgentCommand::ListFaults {
+        response,
+    })
+    .await?;
+    let Some(fault) = faults.into_iter().find(|fault| fault.id == id) else {
+        return Ok(());
+    };
+    match fault.namespace.as_deref() {
+        Some(namespace) if !fault.target_service.is_empty() => {
+            crate::sesame::auth::authorize_scoped(auth, &fault.target_service, namespace)?;
+            crate::sesame::auth::authorize_permission(
+                auth,
+                action,
+                &fault.target_service,
+                namespace,
+                &permissions,
+            )
+        }
+        _ => {
+            crate::sesame::auth::require_unscoped(auth)?;
+            crate::sesame::auth::authorize_cluster_permission(auth, action, &permissions)
+        }
     }
 }
 
@@ -1320,20 +1422,6 @@ pub(super) async fn fault_clear_all_handler(
     ) {
         return resp;
     }
-    let (principal, role) = auth
-        .as_deref()
-        .map(|auth| (auth.principal_id.as_str(), auth.role))
-        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
-    if let Err(error) = state.static_capabilities.test_policy.authorise_reversal(
-        crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
-        &crate::testkit::safety::OperationAuthorisation {
-            principal,
-            role,
-            acknowledged: false,
-        },
-    ) {
-        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
-    }
     // `?service=NAME` clears only that service's faults; no query clears all
     // workload faults. An *empty* `?service=` is neither: every node-class
     // fault carries an empty `target_service`, so it would match them all —
@@ -1359,6 +1447,17 @@ pub(super) async fn fault_clear_all_handler(
                 {
                     return response;
                 }
+                if let Err(response) = enforce_permission(
+                    &state,
+                    auth.as_deref(),
+                    crate::config::PermissionAction::Fault,
+                    service,
+                    namespace,
+                )
+                .await
+                {
+                    return response;
+                }
                 Some((service.clone(), Some(namespace.clone())))
             }
             // Cross-namespace clear: reversing a service's faults in every
@@ -1373,6 +1472,33 @@ pub(super) async fn fault_clear_all_handler(
         },
         None => None,
     };
+    // Every clear but one confined to a named service in a named namespace
+    // reaches across tenants, so a `[permission]` block must grant `fault`
+    // on the whole cluster for it.
+    if !matches!(target, Some((_, Some(_))))
+        && let Err(response) = enforce_cluster_permission(
+            &state,
+            auth.as_deref(),
+            crate::config::PermissionAction::Fault,
+        )
+        .await
+    {
+        return response;
+    }
+    let (principal, role) = auth
+        .as_deref()
+        .map(|auth| (auth.principal_id.as_str(), auth.role))
+        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
+    if let Err(error) = state.static_capabilities.test_policy.authorise_reversal(
+        crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+        &crate::testkit::safety::OperationAuthorisation {
+            principal,
+            role,
+            acknowledged: false,
+        },
+    ) {
+        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+    }
     let command = |response| match target {
         Some((service, namespace)) => AgentCommand::ClearFaultsByService {
             service,
@@ -1403,11 +1529,12 @@ pub(super) async fn fault_clear_all_handler(
             };
             record_fault_audit(
                 &state,
+                auth.as_deref(),
                 FaultAudit {
                     action,
-                    principal,
                     severity: crate::bun::events::EventSeverity::Info,
                     app: service,
+                    namespace: params.get("namespace").cloned(),
                     node: None,
                     details,
                     message: format!("{msg} by principal {principal}"),
@@ -1490,11 +1617,19 @@ pub struct ClusterFaultList {
 
 /// List active faults: this node's by default, every node's with
 /// `?cluster=true`.
+///
+/// A scoped caller (a workload's JWT, or a tenant token) sees only the faults
+/// on its own apps, and may not ask for the cluster-wide list, which also
+/// carries node faults that belong to no tenant.
 pub(super) async fn fault_list_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(query): Query<FaultListQuery>,
 ) -> Response {
     if query.cluster {
+        if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+            return response;
+        }
         let (faults, warnings) = collect_cluster_faults(&state, CLUSTER_STATUS_TIMEOUT).await;
         return Json(ClusterFaultList { faults, warnings }).into_response();
     }
@@ -1503,7 +1638,30 @@ pub(super) async fn fault_list_handler(
     })
     .await
     {
-        Ok(summaries) => Json(serde_json::json!(summaries)).into_response(),
+        Ok(summaries) => {
+            let visible: Vec<_> = summaries
+                .into_iter()
+                .filter(|fault| fault_visible_to(auth.as_deref(), fault))
+                .collect();
+            Json(serde_json::json!(visible)).into_response()
+        }
         Err(response) => response,
+    }
+}
+
+/// Whether `auth` may see `fault` in a list: always when unscoped, otherwise
+/// only a workload fault on an app in its scope.
+pub(super) fn fault_visible_to(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    fault: &crate::smoker::types::FaultSummary,
+) -> bool {
+    if crate::sesame::auth::require_unscoped(auth).is_ok() {
+        return true;
+    }
+    match fault.namespace.as_deref() {
+        Some(namespace) if !fault.target_service.is_empty() => {
+            crate::sesame::auth::authorize_scoped(auth, &fault.target_service, namespace).is_ok()
+        }
+        _ => false,
     }
 }

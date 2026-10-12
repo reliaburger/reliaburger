@@ -125,86 +125,24 @@ async fn resolve_log_path_inner(
         }
     })
     .await?;
-    let mut selection = match resolved {
-        Ok(selection) => selection,
-        Err(error) => {
-            // An explicit selector can refer to an execution on another node.
-            // Only retained committed ownership supplies that missing alias;
-            // a local ordinary owner must never acquire the requested batch label.
-            if let (Some(council), Some(instance)) = (&state.council, instance)
-                && let Some(identity) = crate::grill::InstanceIdentity::parse(instance)
-                && identity.namespace == namespace
-                && identity.instance_id().0 == instance
-            {
-                let desired = council.desired_state().await;
-                if let Some(owner) = desired.batch_state.execution_owners.get(instance)
-                    && (app == identity.app || app == owner.logical_name)
-                {
-                    let local = ask_agent_bounded(&state.cmd_tx, |response| AgentCommand::Status {
-                        response,
-                    })
-                    .await?;
-                    if !local.iter().any(|status| status.id == instance) {
-                        return Ok(crate::bun::agent::LogExecutionSelection {
-                            logical_name: owner.logical_name.clone(),
-                            instances: Vec::new(),
-                            selected_instance: Some(instance.to_string()),
-                        });
-                    }
-                }
-            }
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error.to_string()})),
-            )
-                .into_response());
-        }
-    };
-    // The retained cluster index also resolves structured log rows on a node
-    // that does not own the runtime. Never relabel a known local ordinary owner.
-    if let Some(council) = &state.council {
-        let desired = council.desired_state().await;
-        let direct = desired.batch_state.execution_owner(namespace, app);
-        if instance.is_none() && direct.is_some() {
-            let id = crate::grill::InstanceIdentity::new(namespace, app, 0).instance_id();
-            if desired
-                .batch_state
-                .execution_owners
-                .iter()
-                .any(|(other_id, owner)| {
-                    other_id != &id.0
-                        && owner.logical_name == app
-                        && crate::grill::InstanceIdentity::parse(other_id)
-                            .is_some_and(|identity| identity.namespace == namespace)
-                })
-            {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "ambiguous execution and logical label; select an explicit instance",
-                )
-                    .into_response());
-            }
-            if selection.instances.is_empty()
-                && let Some(owner) = direct
-            {
-                selection.logical_name = owner.logical_name.clone();
-                selection.selected_instance = Some(id.0);
-            }
-        }
+    match resolved {
+        Ok(selection) => Ok(selection),
+        Err(error) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response()),
     }
-    Ok(selection)
 }
 
-/// A selected batch stream belongs to its committed allocation, never an app
-/// placement with the same logical label. Retained replay ownership alone has
-/// no routing authority after tracker pruning.
+/// A selected run's stream belongs to the node its chunk was granted to,
+/// never an app placement with the same name.
 #[allow(clippy::result_large_err)]
 async fn owned_follow_node(
     state: &ApiState,
     app: &str,
     namespace: &str,
     instance: Option<&str>,
-    deadline: tokio::time::Instant,
 ) -> Result<Option<crate::meat::NodeId>, Response> {
     if let Some(id) = instance
         .and_then(|id| id.strip_prefix("run-"))
@@ -221,7 +159,7 @@ async fn owned_follow_node(
         let owner = record
             .state
             .accepted_grant(crate::meat::task_array::ChunkId(0))
-            .map(|(owner, _)| owner)
+            .and_then(|grant| grant.owner)
             .or_else(|| held.next().cloned())
             .ok_or_else(agent_unavailable)?;
         if !super::super::task_array_api::every_node(state)
@@ -233,72 +171,7 @@ async fn owned_follow_node(
         }
         return Ok(Some(owner));
     }
-    let Some(council) = &state.council else {
-        return Ok(None);
-    };
-    tokio::time::timeout_at(deadline, async {
-        let desired = council.desired_state().await;
-        let Some(instance) = instance else {
-            if desired
-                .batch_state
-                .execution_owners
-                .iter()
-                .any(|(id, owner)| {
-                    owner.logical_name == app
-                        && crate::grill::InstanceIdentity::parse(id)
-                            .is_some_and(|identity| identity.namespace == namespace)
-                })
-            {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "batch follow requires an explicit execution instance",
-                )
-                    .into_response());
-            }
-            return Ok(None);
-        };
-        let Some(owner) = desired.batch_state.execution_owners.get(instance) else {
-            return Ok(None);
-        };
-        let identity = crate::grill::InstanceIdentity::parse(instance)
-            .filter(|identity| {
-                identity.namespace == namespace
-                    && identity.instance_id().0 == instance
-                    && identity.ordinal == 0
-            })
-            .ok_or_else(agent_unavailable)?;
-        if owner.logical_name != app {
-            return Err(agent_unavailable());
-        }
-        let mut allocations = desired
-            .batch_state
-            .batches
-            .iter()
-            .filter(|(id, _)| *id == owner.batch_id)
-            .flat_map(|(_, batch)| &batch.jobs)
-            .filter(|job| job.execution_name == identity.app && job.namespace == namespace);
-        let allocation = allocations.next().ok_or_else(agent_unavailable)?;
-        if allocations.next().is_some()
-            || allocation.name != app
-            || allocation.spec_digest != owner.spec_digest
-        {
-            return Err(agent_unavailable());
-        }
-        let node = allocation.node.clone().ok_or_else(agent_unavailable)?;
-        let self_name = state.node_name.as_deref().ok_or_else(agent_unavailable)?;
-        if self_name != node.0 {
-            let membership = state.membership.as_ref().ok_or_else(agent_unavailable)?;
-            let members = membership.read().await;
-            let mut matching = members.iter().filter(|member| member.node_id == node);
-            let member = matching.next().ok_or_else(agent_unavailable)?;
-            if !member.api_advertised || matching.next().is_some() {
-                return Err(agent_unavailable());
-            }
-        }
-        Ok(Some(node))
-    })
-    .await
-    .unwrap_or_else(|_| Err(agent_unavailable()))
+    Ok(None)
 }
 
 /// Get logs for an app.
@@ -358,15 +231,7 @@ pub(super) async fn logs_handler(
         let owned_node = if query.local.unwrap_or(false) {
             None
         } else {
-            match owned_follow_node(
-                &state,
-                &app,
-                &namespace,
-                query.instance.as_deref(),
-                metadata_deadline,
-            )
-            .await
-            {
+            match owned_follow_node(&state, &app, &namespace, query.instance.as_deref()).await {
                 Ok(node) => node,
                 Err(response) => return response,
             }
@@ -534,10 +399,10 @@ pub(super) async fn follow_local_logs(
                     return;
                 };
                 if record.state.status().is_terminal() {
-                    if let Some((_, grant)) = record
+                    if let Some(accepted) = record
                         .state
                         .accepted_grant(crate::meat::task_array::ChunkId(0))
-                        && let Ok(bytes) = node.task_output_grant(id, 0, grant).await
+                        && let Ok(bytes) = node.task_output_grant(id, 0, accepted.attempt).await
                     {
                         let text = String::from_utf8_lossy(&bytes);
                         let text = tail.map_or_else(
@@ -926,15 +791,7 @@ pub(super) async fn ws_logs_handler(
     let owned_node = if query.local.unwrap_or(false) {
         None
     } else {
-        match owned_follow_node(
-            &state,
-            &app,
-            &namespace,
-            query.instance.as_deref(),
-            metadata_deadline,
-        )
-        .await
-        {
+        match owned_follow_node(&state, &app, &namespace, query.instance.as_deref()).await {
             Ok(node) => node,
             Err(response) => return response,
         }
@@ -1066,11 +923,9 @@ fn log_metadata_preflight(
             .as_ref()
             .is_some_and(|allowed| !allowed.iter().any(|value| value == namespace))
     {
-        return Err((
-            StatusCode::FORBIDDEN,
+        return Err(crate::sesame::auth::scope_refusal(
             "token scope does not allow this namespace",
-        )
-            .into_response());
+        ));
     }
     if let Some(grep) = &query.grep {
         crate::ketchup::log_store::validate_grep(grep).map_err(log_query_error)?;

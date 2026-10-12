@@ -7,6 +7,9 @@ use reliaburger::grill::process::ProcessGrill;
 use reliaburger::grill::state::ContainerState;
 use reliaburger::grill::{Grill, InstanceId};
 
+#[path = "support/first_launch.rs"]
+mod first_launch;
+
 fn runtime(directory: &Path) -> ProcessGrill {
     ProcessGrill::with_owner(directory.to_path_buf(), env!("CARGO_BIN_EXE_bun").into())
 }
@@ -447,7 +450,6 @@ fn redacted_owner_phase(directory: &Path, id: &InstanceId) -> String {
 
 #[tokio::test]
 async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let launched = directory.path().join("helper-started");
     let release = directory.path().join("release-helper");
@@ -456,11 +458,16 @@ async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
     // wrapper gated forever. It signals a file, never an unverified PID.
     let _release_on_failure = ReleaseOwnedHelper(release.clone());
     let wrapper = directory.path().join("delayed-bun");
-    std::fs::write(&wrapper, format!(
-        "#!/bin/sh\ntouch '{}'\ndeadline=$(( $(date +%s) + 15 ))\nwhile [ ! -f '{}' ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\ntouch '{}'\nexec '{}' \"$@\"\n",
-        launched.display(), release.display(), released.display(), env!("CARGO_BIN_EXE_bun")
-    )).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // One shared, already-launched wrapper (#582): it finds this test's
+    // marker files beside the link it was started as, so the 15-second wait
+    // for `helper-started` no longer includes macOS assessing a new file.
+    first_launch::install_script(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\ndir=${{0%/*}}\ntouch \"$dir/helper-started\"\ndeadline=$(( $(date +%s) + 15 ))\nwhile [ ! -f \"$dir/release-helper\" ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\ntouch \"$dir/helper-released\"\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_bun")
+        ),
+    );
     let grill = ProcessGrill::with_owner(directory.path().to_path_buf(), wrapper);
     let id = InstanceId("default__cancelled-caller-0".into());
     grill.create(&id, &spec("sleep 30")).await.unwrap();
@@ -759,87 +766,6 @@ async fn agent_retires_launches_that_have_no_adoption_record() {
     assert_eq!(result.unwrap(), 0);
     assert_eq!(live_state.unwrap(), ContainerState::Stopped);
     assert_eq!(prepared_state.unwrap(), ContainerState::Stopped);
-}
-
-fn write_job_checkpoint(directory: &Path, phase: &str) {
-    let config =
-        reliaburger::config::Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n")
-            .unwrap();
-    let job = serde_json::json!({
-        "name":"work", "namespace":"default", "spec": config.job["work"],
-        "runtime":"Process", "generation":1, "restart_count":1,
-        "phase":phase, "runtime_absent":false, "batch_execution":null,
-    });
-    std::fs::write(
-        directory.join("job-attempts.checkpoint"),
-        serde_json::to_vec(
-            &serde_json::json!({"schema":3, "jobs":[job], "retired_batch_executions":[]}),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-}
-
-fn recovered_job(directory: &Path) -> serde_json::Value {
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.join("job-attempts.checkpoint")).unwrap())
-            .unwrap();
-    value["jobs"][0].clone()
-}
-
-#[tokio::test]
-async fn agent_recovers_short_job_exit_without_an_adoption_record() {
-    let directory = tempfile::tempdir().unwrap();
-    let grill = runtime(directory.path());
-    let id = InstanceId("default__work-0".into());
-    grill.create(&id, &spec("exit 23")).await.unwrap();
-    write_job_checkpoint(directory.path(), "Launching");
-    grill.start(&id).await.unwrap();
-    stopped(&grill, &id).await;
-    recovery_agent(directory.path())
-        .adopt_recorded_instances()
-        .await
-        .unwrap();
-    let job = recovered_job(directory.path());
-    assert_eq!(job["phase"], serde_json::json!({"Exited":{"code":23}}));
-    assert_eq!(job["runtime_absent"], true);
-    assert_eq!(job["restart_count"], 1);
-}
-
-#[tokio::test]
-async fn preparing_retry_never_inherits_previous_generations_exit_code() {
-    for previous_launch in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let grill = runtime(directory.path());
-        let id = InstanceId("default__work-0".into());
-        if previous_launch {
-            grill.create(&id, &spec("exit 23")).await.unwrap();
-            grill.start(&id).await.unwrap();
-            stopped(&grill, &id).await;
-        }
-        write_job_checkpoint(directory.path(), "Preparing");
-        recovery_agent(directory.path())
-            .adopt_recorded_instances()
-            .await
-            .unwrap();
-        let job = recovered_job(directory.path());
-        assert_eq!(job["phase"], "Unknown");
-        assert_eq!(job["runtime_absent"], true);
-        assert_eq!(job["restart_count"], 1);
-    }
-}
-
-#[tokio::test]
-async fn authorised_job_without_runtime_intent_refuses_recovery() {
-    let directory = tempfile::tempdir().unwrap();
-    write_job_checkpoint(directory.path(), "Launching");
-    assert!(
-        recovery_agent(directory.path())
-            .adopt_recorded_instances()
-            .await
-            .is_err()
-    );
-    assert_eq!(recovered_job(directory.path())["phase"], "Launching");
 }
 
 #[tokio::test]

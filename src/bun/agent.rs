@@ -61,10 +61,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::config::app::AppSpec;
-use crate::config::job::JobSpec;
 use crate::council::node::CouncilNode;
 use crate::council::types::CouncilNodeInfo;
-use crate::grill::oci::generate_job_oci_spec;
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
 use crate::grill::{Grill, InstanceId};
@@ -80,9 +78,6 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
-mod batch_jobs;
-mod cluster_jobs;
-pub use cluster_jobs::{ClusterJobReceipt, ClusterJobSettlement};
 mod commands;
 mod consumer;
 mod council_requests;
@@ -98,10 +93,7 @@ mod follow_ups;
 mod health_checks;
 mod identity;
 mod identity_signing;
-mod job_runs;
 mod launch;
-#[cfg(test)]
-pub(crate) use cluster_jobs::ClusterJobExecution;
 mod launch_evidence;
 mod logs;
 mod networking;
@@ -131,7 +123,6 @@ use discovery_ownership::{DiscoveryOwnership, JournalReference};
 use faults::{InstalledNetworkFaults, NodeFaultFence};
 use health_checks::wait_instance_healthy;
 pub use identity::workload_spiffe_uri;
-use job_runs::ScheduledJob;
 use restarts::RestartRotation;
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 pub use status::{
@@ -157,10 +148,10 @@ const INIT_TIMEOUT_SECS: u64 = 300;
 /// in its last line or two, so a short tail says why without flooding logs.
 const INIT_FAILURE_STDERR_BYTES: u64 = 400;
 
-/// Maximum time a `run_before` prerequisite job may run before the gated
-/// deploy is aborted. Migrations are the classic case; a hung one must not
-/// wedge the deploy forever.
-const RUN_BEFORE_TIMEOUT_SECS: u64 = 600;
+/// How long a capacity refusal stays in this node's state reports. A
+/// failing deploy refreshes it on every retry; a deploy that succeeds, or a
+/// leader that moved the app away, lets it lapse.
+const CAPACITY_REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How many event-loop ticks (~1s each) between attempts to provision an
 /// identity for a running instance that has none — frequent enough to heal
@@ -381,9 +372,6 @@ enum LoopStall {
     /// A pre-start's DNS lookups for an egress allowlist. Whoever prepares
     /// the start does them now, off the loop (#419).
     EgressDns,
-    /// Validating and serialising the whole job inventory, off the loop
-    /// but awaited by it.
-    JobInventoryEncode,
     /// Reading the runtime's launch inventory: the runc intent journal,
     /// one file per launch, which after a restart comes off a cold disk.
     /// Only counted; `MockGrill::set_inventory_delay` makes it slow.
@@ -477,6 +465,16 @@ impl LoopStalls {
     }
 }
 
+/// The forward-path isolation ruleset (`crate::firewall::isolation`) `nft`
+/// holds, the task applying one, and the newest one waiting for it.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[derive(Debug, Default)]
+struct IsolationRules {
+    applied: Option<String>,
+    applying: Option<tokio::task::Id>,
+    waiting: Option<String>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
@@ -559,6 +557,22 @@ pub struct BunAgent<G: Grill> {
     /// reconcile-and-prune reason (NET5). eBPF only.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
+    /// `destination_map` keys (real workload addresses) this node has
+    /// written, so the reconcile deletes the departed ones. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    destination_bpf_keys: std::collections::HashSet<crate::onion::types::DestinationKey>,
+    /// Task addresses and allowlists the delegated job runtimes hold, which
+    /// the kernel reconciliation and sweep must keep. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    delegated_network: std::sync::Arc<crate::bun::task_namespace::DelegatedNetwork>,
+    /// Forward-path isolation ruleset `nft` last applied, the task applying
+    /// one, and the newest one waiting for it. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    isolation_rules: IsolationRules,
+    /// The address workloads resolve names through (the node's DNS
+    /// responder), which every egress allowlist implicitly permits on
+    /// port 53. `None` when `[dns]` is off.
+    workload_dns: Option<std::net::Ipv4Addr>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Exclusive publication checkpoint, or a fence after an uncertain write.
@@ -650,15 +664,15 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Apps whose last fresh deploy here failed because the execution
+    /// budget had no room (job leases may hold it), keyed by (app_name,
+    /// namespace), with when that happened. State reports carry recent ones
+    /// so the leader places the replicas elsewhere instead of holding them.
+    capacity_refusals: std::collections::HashMap<(String, String), tokio::time::Instant>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; reservations advance beyond both this counter and all restored owners.
     next_deploy_gen: u64,
-    /// Jobs carrying a `schedule`, registered on apply and fired by the cron
-    /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
-    scheduled_jobs: std::collections::HashMap<(String, String), ScheduledJob>,
-    /// A failed or cancelled write must be resolved by reloading at startup.
-    scheduled_jobs_store_uncertain: bool,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -685,9 +699,6 @@ pub struct BunAgent<G: Grill> {
     /// crash restart or a self-upgrade exec) can adopt them instead of
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
-    recorded_jobs: BTreeMap<String, super::jobs::RecordedJob>,
-    retired_batch_executions: BTreeMap<String, super::jobs::RetiredBatchExecution>,
-    job_store_uncertain: bool,
     /// Self-upgrade manager. `None` when upgrades are not configured
     /// (upgrade commands then answer with an error).
     upgrade: Option<crate::upgrade::manager::UpgradeManager>,
@@ -841,6 +852,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            destination_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            delegated_network: Default::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            isolation_rules: Default::default(),
+            workload_dns: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
@@ -880,9 +898,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             next_deploy_gen: 1,
-            scheduled_jobs: std::collections::HashMap::new(),
-            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             capture_offsets: Arc::default(),
             events: None,
@@ -891,9 +908,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             signature_source: None,
             records_dir: None,
-            recorded_jobs: BTreeMap::new(),
-            retired_batch_executions: BTreeMap::new(),
-            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -984,6 +998,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            destination_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            delegated_network: Default::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            isolation_rules: Default::default(),
+            workload_dns: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
@@ -1034,9 +1055,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             next_deploy_gen: 1,
-            scheduled_jobs: std::collections::HashMap::new(),
-            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             capture_offsets: Arc::default(),
             events: None,
@@ -1045,9 +1065,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             signature_source: None,
             records_dir: None,
-            recorded_jobs: BTreeMap::new(),
-            retired_batch_executions: BTreeMap::new(),
-            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -1201,6 +1218,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.set_process_config(config);
     }
 
+    /// Thread the host-path policy built from `node.toml` into the supervisor.
+    /// Without this every volume or config-file `source` is refused.
+    pub fn set_host_path_policy(&mut self, policy: super::host_paths::HostPathPolicy) {
+        self.supervisor.set_host_path_policy(policy);
+    }
+
     /// Thread the parsed `[smoker]` duration limits in, so faults are bounded
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
@@ -1285,6 +1308,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(runner)
     }
+    /// The network state delegated job runtimes share with this agent.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub fn delegated_network(
+        &self,
+    ) -> std::sync::Arc<crate::bun::task_namespace::DelegatedNetwork> {
+        self.delegated_network.clone()
+    }
+
+    /// The resolver every egress allowlist implicitly permits.
+    pub fn workload_dns(&self) -> Option<std::net::Ipv4Addr> {
+        self.workload_dns
+    }
+
     /// The same kernel owner used by apps, for delegated source ancestry.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn delegated_namespace_kernel(
@@ -1330,6 +1366,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
 
+    /// Record the DNS nameserver workloads use, so every egress allowlist
+    /// can resolve names through it. Call before recovery reprograms any
+    /// allowlist.
+    pub fn set_workload_dns(&mut self, nameserver: std::net::Ipv4Addr) {
+        self.workload_dns = Some(nameserver);
+    }
+
     /// Enable on-disk instance records under `dir` ({data_dir}/instances).
     /// Call before deploying anything; also enables `adopt_recorded_instances`.
     pub fn set_records_dir(&mut self, dir: PathBuf) {
@@ -1371,7 +1414,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let grill = self.supervisor.grill().clone();
         let id = instance_id.clone();
-        let app = self.logical_execution_name(instance_id, app_name);
+        let app = app_name.to_string();
         let namespace = namespace.to_string();
 
         let (line_tx, mut line_rx) = mpsc::channel::<crate::ketchup::types::CapturedLine>(256);
@@ -1587,7 +1630,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// The loop's periodic work: health probes, restarts, retirements, jobs,
+    /// The loop's periodic work: health probes, restarts, retirements,
     /// fault expiry, firewall reconciliation and identity rotation.
     async fn run_health_tick(&mut self) {
         self.reopen_uncertain_discovery().await;
@@ -1598,12 +1641,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.drive_deferred_retirements().await;
         self.refresh_egress_readiness().await;
         self.run_health_checks().await;
-        self.fire_due_jobs().await;
         self.begin_state_sweep();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall();
-        if self.namespace_firewall_stale {
+        if self.namespace_firewall_stale || self.delegated_network_changed() {
             self.sync_firewall_ebpf().await;
         }
         self.reresolve_egress();

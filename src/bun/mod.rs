@@ -5,6 +5,7 @@
 /// backoff, detecting GPU hardware, and serving a local HTTP API.
 pub mod agent;
 pub mod api;
+pub mod audit;
 pub mod authz;
 pub mod batch;
 pub mod build_runner;
@@ -20,14 +21,14 @@ pub mod events;
 pub mod execution_budget;
 pub mod gpu;
 pub mod health;
-pub(crate) mod jobs;
+pub mod host_paths;
+pub mod job_events;
 pub mod loop_meter;
 pub mod namespace_keys;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
 pub mod reusable_executor;
-mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod task_array_api;
@@ -37,6 +38,7 @@ pub mod task_executor;
 pub mod task_ledger;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod task_namespace;
+pub mod task_output;
 pub mod task_rates;
 pub mod task_result_index;
 pub mod task_runtime;
@@ -229,9 +231,6 @@ pub enum BunError {
     #[error("self-upgrade is not available on this node (no upgrade manager)")]
     UpgradesUnavailable,
 }
-
-#[cfg(test)]
-mod job_lifecycle_tests;
 
 pub mod job_api;
 /// Common deployment admission and durable hook settlement.

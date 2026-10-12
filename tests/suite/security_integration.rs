@@ -473,3 +473,225 @@ async fn incompatible_member_never_receives_the_join_token() {
         let _ = server.await;
     }
 }
+
+/// A dashboard session made from the service token is read-only. It used
+/// to carry the service principal's name, which was all the node-to-node
+/// gate checked, so a stolen cookie could run arbitrary jobs on a node.
+#[tokio::test]
+async fn service_token_cookie_cannot_run_a_batch_on_a_node() {
+    use tower::ServiceExt;
+
+    let service_token = format!("rbrg_{}", "5".repeat(64));
+    let user = reliaburger::sesame::token::create_token(
+        "operator",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let store = reliaburger::sesame::auth::new_token_store();
+    store.write().await.push(user.token);
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
+    let app = reliaburger::bun::api::router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(store),
+        Some(service_token.clone()),
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+
+    // Log in to the dashboard with the service token, as a browser would.
+    let login = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/ui/session")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(axum::body::Body::from(format!("token={service_token}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .expect("the service token opens a dashboard session")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // The leader's sync call is how a node receives job work, so it is the
+    // node-to-node route a stolen cookie would try.
+    let run = serde_json::to_string(&reliaburger::bun::task_array_node::NodeSyncRequest::default())
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/batch/array/sync")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(run))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // 403, not 401: the cookie is a live session, just not a cluster node.
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "the node's agent received work from a read-only session"
+    );
+}
+
+/// A single-node council that has elected itself leader.
+async fn single_node_leader() -> std::sync::Arc<reliaburger::council::node::CouncilNode> {
+    use reliaburger::council::log_store::MemLogStore;
+    use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use reliaburger::council::node::CouncilNode;
+    use reliaburger::council::state_machine::CouncilStateMachine;
+    use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
+
+    let router = InMemoryRaftRouter::new();
+    let node = CouncilNode::new(
+        1,
+        CouncilConfig {
+            heartbeat_interval_ms: 50,
+            election_timeout_min_ms: 150,
+            election_timeout_max_ms: 400,
+            ..CouncilConfig::default()
+        },
+        InMemoryRaftNetworkFactory::new(1, router.clone()),
+        MemLogStore::new(),
+        CouncilStateMachine::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    router.register(1, node.raft().clone()).await;
+    node.initialize(std::collections::BTreeMap::from([(
+        1u64,
+        CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
+    )]))
+    .await
+    .unwrap();
+    let node = std::sync::Arc::new(node);
+    for _ in 0..80 {
+        if node.is_leader().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    node
+}
+
+/// One run of a Bun's API: a router over `council` whose events go to the
+/// audit log in `audit_directory`, opened afresh as a starting Bun does.
+async fn bun_api_run(
+    council: &std::sync::Arc<reliaburger::council::node::CouncilNode>,
+    tokens: Vec<ApiToken>,
+    audit_directory: &std::path::Path,
+) -> axum::Router {
+    let log = reliaburger::bun::audit::AuditLog::open(
+        audit_directory.to_path_buf(),
+        reliaburger::bun::audit::AuditLimits::from_total(
+            reliaburger::bun::audit::DEFAULT_AUDIT_MAX_BYTES,
+        ),
+    )
+    .unwrap();
+    let mut events = reliaburger::bun::events::EventStore::new();
+    events.set_audit_log(log);
+    let store = reliaburger::sesame::auth::new_token_store();
+    *store.write().await = tokens;
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(16);
+    reliaburger::bun::api::router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(std::sync::Arc::clone(council)),
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        0,
+        Some(std::sync::Arc::new(tokio::sync::RwLock::new(events))),
+    )
+}
+
+/// The audit trail outlives the process that wrote it (#685): a token
+/// created before a Bun restart is still listed by `GET /v1/audit` after it,
+/// from the log on disk rather than the event ring that the restart emptied.
+#[tokio::test]
+async fn audit_log_lists_a_token_creation_after_a_bun_restart() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let admin = reliaburger::sesame::token::create_token(
+        "operator",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let council = single_node_leader().await;
+    council
+        .write(reliaburger::council::types::RaftRequest::CreateApiToken(
+            admin.token.clone(),
+        ))
+        .await
+        .unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let audit_directory = data.path().join("audit");
+
+    let before = bun_api_run(&council, vec![admin.token.clone()], &audit_directory).await;
+    let created = before
+        .oneshot(
+            axum::http::Request::post("/v1/token/create")
+                .header("authorization", format!("Bearer {}", admin.plaintext))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"name": "ci", "role": "deployer"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), axum::http::StatusCode::OK);
+
+    // The Bun restarts: a new event store, empty, and the log reopened.
+    let after = bun_api_run(&council, vec![admin.token.clone()], &audit_directory).await;
+    let listed = after
+        .oneshot(
+            axum::http::Request::get("/v1/audit?action=token.created")
+                .header("authorization", format!("Bearer {}", admin.plaintext))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), axum::http::StatusCode::OK);
+    let body = listed.into_body().collect().await.unwrap().to_bytes();
+    let listing: reliaburger::bun::audit::AuditListing = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing.records.len(), 1, "{listing:?}");
+    let record = &listing.records[0];
+    assert_eq!(record.action, "token.created");
+    assert_eq!(
+        record.details.get("token_name").map(String::as_str),
+        Some("operator")
+    );
+    council.shutdown().await.unwrap();
+}

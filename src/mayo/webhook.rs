@@ -112,6 +112,66 @@ pub fn verify_signature(secret: &str, body: &[u8], signature: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in job-run notifications
+// ---------------------------------------------------------------------------
+
+/// Which job-run notification this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobAlertKind {
+    /// A run finished with at least one task failed for good.
+    Failed,
+    /// A node holding a run's work went quiet, so nobody knows whether
+    /// those tasks ran.
+    UnknownOutcome,
+}
+
+/// A built-in notification about one job run. The leader sends one per run,
+/// never per task, to the same destinations as metric alerts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRunAlert {
+    /// What happened.
+    pub kind: JobAlertKind,
+    /// The run's namespace.
+    pub namespace: String,
+    /// The job or array name.
+    pub job: String,
+    /// The run's batch id.
+    pub run: u64,
+    /// One-line description.
+    pub message: String,
+}
+
+impl JobRunAlert {
+    /// The alert name destinations see.
+    pub fn rule_name(&self) -> &'static str {
+        match self.kind {
+            JobAlertKind::Failed => "job_run_failed",
+            JobAlertKind::UnknownOutcome => "job_run_unknown_outcome",
+        }
+    }
+
+    /// The same shape a metric alert takes, so Slack, PagerDuty and plain
+    /// webhooks all get their usual payload. The run id is a label, so each
+    /// run is its own PagerDuty incident.
+    pub fn transition(&self) -> AlertTransition {
+        let labels = BTreeMap::from([
+            ("job".to_string(), self.job.clone()),
+            ("namespace".to_string(), self.namespace.clone()),
+            ("run".to_string(), self.run.to_string()),
+        ]);
+        AlertTransition {
+            labels,
+            rule_name: self.rule_name().to_string(),
+            severity: AlertSeverity::Critical,
+            description: self.message.clone(),
+            kind: TransitionKind::Firing,
+            value: None,
+            fired_at: Some(SystemTime::now()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Webhook dispatcher
 // ---------------------------------------------------------------------------
 
@@ -160,6 +220,16 @@ impl WebhookDispatcher {
             };
             self.send_with_retry(dest, &body).await;
         }
+    }
+
+    /// Send a job-run notification to every matching destination.
+    pub async fn dispatch_job_run(&self, alert: &JobRunAlert) {
+        self.dispatch(&alert.transition()).await;
+    }
+
+    /// Whether any destination is configured.
+    pub fn has_destinations(&self) -> bool {
+        !self.destinations.is_empty()
     }
 
     /// Serialise the provider-specific payload body for a destination.
@@ -440,13 +510,17 @@ pub fn latest_series_values(
 ///
 /// Reads the recent window, preserving the newest value of each metric/label
 /// identity. Freshness and derived percentages use [`latest_series_values`].
+///
+/// `now` (Unix seconds) is the evaluation instant: the window reaches back
+/// from it and readings older than the freshness bound before it are
+/// dropped. The caller owns the clock, as with
+/// [`RollupGenerator::generate`](crate::mayo::rollup_generator::RollupGenerator::generate),
+/// so a caller that wrote its samples against one instant judges them
+/// against that same instant (#763).
 pub async fn gather_latest_values(
     store: &crate::mayo::store::MayoStore,
+    now: u64,
 ) -> HashMap<MetricKey, f64> {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let window_start = now.saturating_sub(QUERY_WINDOW_SECS);
 
     let mut series: HashMap<(String, String), (u64, f64)> = HashMap::new();
@@ -563,7 +637,11 @@ mod tests {
             );
         }
         store.flush().await.unwrap();
-        let values = gather_latest_values(&store).await;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let values = gather_latest_values(&store, now).await;
         assert_eq!(values.len(), 2);
         assert_eq!(
             values.get(&MetricKey::with_labels(
@@ -579,6 +657,30 @@ mod tests {
             )),
             Some(&10.0)
         );
+    }
+
+    /// #763: freshness is judged against the caller's clock, not a wall
+    /// clock read inside, so a reading stays fresh for exactly the bound
+    /// after the caller's `now`, however long the caller took to get here.
+    #[tokio::test]
+    async fn freshness_is_judged_against_the_callers_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = crate::mayo::store::MayoStore::new(directory.path().into());
+        let stamped = 1_700_000_000;
+        let key = MetricKey::with_labels("cpu", BTreeMap::from([("node".into(), "a".into())]));
+        store.insert(
+            &key,
+            crate::mayo::types::Sample {
+                timestamp: stamped,
+                value: 42.0,
+            },
+        );
+        store.flush().await.unwrap();
+
+        let fresh = gather_latest_values(&store, stamped + MAX_VALUE_AGE_SECS).await;
+        assert_eq!(fresh.get(&key), Some(&42.0));
+        let stale = gather_latest_values(&store, stamped + MAX_VALUE_AGE_SECS + 1).await;
+        assert!(stale.is_empty(), "{stale:?}");
     }
 
     #[test]
@@ -943,6 +1045,62 @@ mod tests {
         assert_eq!(payload["alert"]["name"], "cpu_throttle");
         assert_eq!(payload["alert"]["status"], "firing");
         assert_eq!(payload["cluster"], "test-cluster");
+    }
+
+    #[tokio::test]
+    async fn failed_job_run_sends_a_webhook_notification() {
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = Arc::clone(&received);
+        let app = Router::new().route(
+            "/hook",
+            post(move |body: axum::body::Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().await.push(body.to_vec());
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let dispatcher = WebhookDispatcher::new(
+            reqwest::Client::new(),
+            vec![AlertDestination {
+                dest_type: "webhook".to_string(),
+                url: format!("http://{addr}/hook"),
+                severity: vec!["critical".to_string()],
+                secret: None,
+            }],
+            "test-cluster".to_string(),
+        );
+        dispatcher
+            .dispatch_job_run(&JobRunAlert {
+                kind: JobAlertKind::Failed,
+                namespace: "ops".into(),
+                job: "nightly".into(),
+                run: 42,
+                message: "job ops/nightly run 42 failed".into(),
+            })
+            .await;
+
+        let bodies = received.lock().await;
+        assert_eq!(bodies.len(), 1);
+        let payload: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(payload["alert"]["name"], "job_run_failed");
+        assert_eq!(payload["alert"]["status"], "firing");
+        assert_eq!(payload["alert"]["severity"], "critical");
+        assert_eq!(payload["alert"]["labels"]["job"], "nightly");
+        assert_eq!(payload["alert"]["labels"]["namespace"], "ops");
+        assert_eq!(payload["alert"]["labels"]["run"], "42");
+        assert_eq!(payload["alert"]["message"], "job ops/nightly run 42 failed");
     }
 
     /// Integration test: HMAC header is set when secret is configured.

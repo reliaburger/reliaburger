@@ -117,14 +117,34 @@ backwards compatibility (maintainer decision, 28 September 2026). There are no
 migrations, no mixed-version clusters across a format change and no feature
 gates. Any incompatible wire or durable-state change bumps `protocol` or
 `state` in `src/compatibility.rs`; nodes then refuse old peers and old state,
-so an upgrade across that bump means starting a fresh cluster. Releases that
-don't bump still roll in place. The pre-1.0 rule for known harness artefacts in
+so an upgrade across that bump means starting a fresh cluster. So
+`relish upgrade` works only between builds of the same format (maintainer
+decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
+10 October 2026). Every release from 0.1.0 to 0.2.0 bumped a format, so no
+rolling upgrade between two published releases has run yet. A release that
+keeps 0.2.0's pair could roll in place, and qualifying a real
+published-to-published rolling walk on such a patch release is a goal, not a
+0.2.0 gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
 Leader-last upgrade ordering does not make an unknown Raft request safe during
 elections. Qualify the actual old/new binary pair before advertising it as
 supported.
+
+### Versions on main
+
+Once main changes a format after a release, its `Cargo.toml` moves to the next
+version with a `-dev` suffix (after 0.1.6's formats changed, main became
+`0.2.0-dev`). A build from main then can't pass for the release before it:
+its refusals name `reliaburger v0.2.0-dev`, its binaries don't collide with
+the real `bun-v0.1.6` in a binary store, and `relish setup --quickstart`
+refuses to download nodes for it, because no `v0.2.0-dev` release exists and
+the last published one speaks older formats. Pass `--development-binaries`
+(see the [quickstart](quickstart.md#development-qualification)) to run one.
+Drop the suffix in the change that prepares the release, before
+`build.yml` builds the candidate, since the build reads the tag from
+`Cargo.toml`.
 
 ### Upgrading from 0.1.0
 
@@ -281,6 +301,55 @@ Four things behave differently once you're on 0.1.6:
   with `relish secret pubkey --namespace X`, or the next apply puts the
   cluster-sealed ones back.
 
+### Upgrading from 0.1.6
+
+0.2.0 can't roll onto a 0.1.6 cluster. Its jobs live in the council:
+
+- task arrays replicate through Raft, with node ledgers on disk, recovery and
+  grant fences, ownership ranges and indexed result pages;
+- reusable job definitions, immutable run provenance and schedule
+  occurrence claims share one execution store;
+- every job names its runtime explicitly instead of having it inferred;
+- grant lookahead learns from a recent-duration histogram that travels in
+  Raft snapshots.
+
+So the protocol moved from 46 to 51 and the state format from 63 to 68. A
+0.1.6 leader refuses `relish upgrade start v0.2.0` before it records a run,
+with `found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63`.
+And a sealed council backup from 0.1.6 can't seed a 0.2.0 cluster:
+`relish council recover --from` refuses state of another generation. So the
+move is a fresh cluster, and nothing the old council held comes across:
+
+- **Secrets.** The new cluster has new keys, so values sealed to the old
+  cluster key or a namespace key don't decrypt. Re-encrypt each one with the
+  new cluster's `relish secret pubkey` (`--namespace X` for a namespace
+  with its own key) before re-applying.
+- **API and join tokens.** Create them again with `relish token create` and
+  update whatever holds them, such as CI secrets and GitOps webhooks.
+- **The CA.** `relish init` makes a new root and intermediates. Clients and
+  anything else that trusts the old root must trust the new one, and the new
+  root needs its own `relish ca backup`.
+- **Job history.** Runs, task arrays, schedules and their results lived in
+  Raft. Export anything you need (`relish jobs`, `relish batch results`)
+  before you stop the old cluster.
+- **Volumes.** Snapshot them with `relish snapshot` and restore them into the
+  new cluster; the data directories you move aside still hold them too.
+
+The steps:
+
+1. Export what you want to keep: secrets in your config are already there;
+   job results, token holders and volume snapshots are not.
+2. Stop bun on every node and move each data directory aside (or run
+   `relish local destroy --yes` for a laptop cluster).
+3. Install 0.2.0 on every node and create the cluster as you did the first
+   time (`relish init`, then join the other nodes).
+4. Re-create tokens, re-encrypt secrets to the new keys, restore volume
+   snapshots and re-apply your apps and jobs.
+5. Back up the new root CA with `relish ca backup`.
+
+`relish upgrade check` from 0.2.0 on reads each release's pair from the
+metadata and says when a release needs this instead of a rolling upgrade.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -369,7 +438,13 @@ GitHub documents the [default-branch requirement for manual workflows](https://d
 and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
 
 - `metadata.json` selects **Bun** by platform, preserving the existing schema
-  and upgrade reader.
+  and upgrade reader. From 0.2.0 each release entry also carries
+  `compatibility`, the `protocol` and `state` pair `package.py` reads from
+  `CURRENT` in `src/compatibility.rs`, so `relish upgrade check` and `start`
+  can tell a release that needs a fresh cluster from one that can roll.
+  `external_signature` is always `null` in published metadata: only the
+  operator holds that key, so `relish upgrade start <version>` takes
+  `--external-key` (or a countersigned `--sig`) and adds it.
 - `cli-metadata.json` uses the same schema to select **Relish**. Keeping the
   documents separate prevents an older agent from interpreting a CLI as an
   upgrade candidate.
@@ -518,6 +593,48 @@ the real `curl … | sh` install against it on every host we advertise.
    a mode. A local smoke check is not staged fast/final acceptance, and global
    storage bounds and the 24-hour job qualification remain #668.
 
+   **The 0.2.0 job gate (decision D18-C).** A release that claims sustained
+   job throughput also needs the job qualification: #668's list on at least
+   three nodes, which is 24 hours at 1,158 accepted successes a second or
+   more (100 million a day) plus headroom, with concurrent apps, several
+   resource profiles, worker and leader loss, delayed messages and disk
+   faults. `qualify-jobs-sustained.sh` runs it through the same soak, with the
+   job campaign at the target load and a node-level fault in every cycle
+   (inter-node delay, a full disk, slow fsync). Faults stay node-level in
+   0.2.0 (D19-B): nothing targets an individual job.
+
+   ```sh
+   # About 90 minutes, compressed: every fault kind on every node.
+   scripts/release/qualify-jobs-sustained.sh --tier fast \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST
+   # 24 hours on the full schedule: the #668 run, on the final candidate.
+   scripts/release/qualify-jobs-sustained.sh --tier final \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
+     --record docs/qualification/DATE-job-qualification.md
+   ```
+
+   `--target-rate` raises the rate above the default 1,390 a second (the
+   floor plus 20%); `--plan` prints the schedule without touching anything.
+   The record fails if any job runtime misses a fault kind, loses or
+   double-counts an accepted outcome, or averages less than the target rate.
+   Beside it, `DATE-job-qualification.jobs.json` holds the accepted rates,
+   per-runtime retry causes and the September plan's measurements: wall time
+   of a 1,048,576-task array, p99 start lag, Raft entries a second and run
+   state, Bun memory and CPU, executor overhead, task-array storage per
+   million tasks and retained logs. Those are recorded in every run and never
+   gate it. Commit both files. Bounded job storage
+   ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
+   pass before the 24-hour run: until it does, a full disk stops a worker
+   taking grants and fails the run.
+
+   Before release, re-record the published throughput table on the candidate
+   with `relish bench --scenario … --report FILE` on the same rig, and
+   compare it with the committed reports
+   (`relish bench --scenario jobs-host-processes --compare docs/qualification/…/r1-jobs-host-processes.json`);
+   `--compare` fails on a drop larger than `--tolerance` (10% by default).
+
    Either tier also fails on a slow agent loop. Every settle and heavy check
    reads each node's `bun_agent_loop_turn_seconds` histogram from
    `/v1/metrics`, and the checker fails the tier (`agent-loop-turn`) on any
@@ -546,24 +663,56 @@ the real `curl … | sh` install against it on every host we advertise.
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
-5. **Record it.** Copy each host's record into
+5. **Pull the plug.** Killing a process isn't a power cut: page-cache writes
+   survive one and not the other. Run the power-cut and reboot qualifications
+   ([what they prove](testing.md#pulling-the-plug)) on the candidate's commit,
+   against a disposable Lima VM. Never use the development VM; the drivers
+   refuse `reliaburger-test` by name. Create it from that VM's template with
+   4 vCPUs, 6 GiB of memory, 6 GiB of swap (so the linker isn't killed) and
+   only the checkout mounted, read-only. Then, from that checkout:
+
+   ```sh
+   for fixture in exporter leases backups; do
+     scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_VM \
+       --fixture "$fixture" --iterations 10 --record "power-cut-$fixture.md"
+   done
+   for i in $(seq 10); do scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_VM; done
+   for i in $(seq 10); do scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_VM; done
+   ```
+
+   Every iteration must pass. A row marked `PASS (VM start retried)` is the
+   known Lima start failure straight after a forced stop, not a product
+   failure; any other failure is a release blocker. Record the commit, the
+   VM, each lane's runs and its rule-of-three bound in
+   `docs/qualification/DATE-power-cut-reboot.md`, as the
+   [11 October record](qualification/2026-10-11-power-cut-reboot.md) does.
+   Ten clean runs only rule out failure rates above 30%, so this catches a
+   regression, not a rare race; a release that changes storage, locking or
+   ownership (as #613 did) runs 25.
+
+   Also link the candidate commit's `task-array benchmarks` run from the gate
+   issue. It runs nightly on `main` and fails only on a regression of more
+   than 2x against main's last baseline; its `criterion-task-arrays` artefact
+   is the cost evidence for bounded-cost claims such as 0.2.0's (#668).
+
+6. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest, and link them from the release's milestone or
    gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
 
-6. **Clean up the staging pre-releases.** Delete them before promotion so the
+7. **Clean up the staging pre-releases.** Delete them before promotion so the
    release page and the release notes' "previous tag" don't pick them up:
 
    ```sh
    gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
    ```
 
-7. **Promote** as described above, with the same run ID and digest. The
+8. **Promote** as described above, with the same run ID and digest. The
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
 
-8. **Update the docs** once the release is public: the release date in the
+9. **Update the docs** once the release is public: the release date in the
    [roadmap](roadmap.md) (tick the release) and the homepage
    (`docs/website/index.html`), and the bootstrap's default version if it
    changed. Grep for the previous version to find the other "current
@@ -575,8 +724,16 @@ the real `curl … | sh` install against it on every host we advertise.
    re-record `docs/website/assets/tour.cast` against the published install
    with `scripts/demo/tour.sh --record … --install vX.Y.Z`
    ([how](website/README.md#re-recording-the-tour)), and move the poster time
-   in `index.html` if its moment moved. The website deploys from `main`, so
-   merge that change after promotion, not before.
+   in `index.html` if its moment moved. The recording's title and the caption
+   under it name the installed version, and `tests/suite/website.rs` fails
+   until they match the bootstrap's default. Regenerate the released-CLI
+   snapshot with `scripts/release/released_cli.py vX.Y.Z >
+   scripts/release/released-cli.tsv` and run `make readme-commands`: commands
+   labelled "X.Y.Z, not in" the old release lose their labels, and the same test
+   flags any label the docs no longer need
+   ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
+   website deploys from `main`, and publishes `/demo/*` from the tag the
+   bootstrap installs, so merge that change after promotion, not before.
 
 ## Soaking a candidate in CI
 

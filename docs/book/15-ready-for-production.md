@@ -615,8 +615,11 @@ their snippets and the manual is compiled into `relish`. A pull request stacked 
 branch skips the acceptance suites unless someone labels it `full-ci`; it gets them when it
 targets `main`, or a release's merge-train branch: from 0.1.4 on, each release collects its
 pull requests on one `release-*` branch, and those are the release's changes, so they get the
-whole of CI. Benchmarks run on `main`, nightly, and on changes to the gossip protocol,
-since nothing gates on their numbers yet.
+whole of CI. Benchmarks run on `main`, nightly, and on changes to the code they measure.
+The gossip numbers gate nothing. The task-array benchmarks gate on one thing: a benchmark
+more than twice as slow as the baseline the last `main` run saved. Why twice, and not
+Criterion's own few per cent? Because a hosted runner is a different machine every night, and
+a gate that trips on the runner's mood is just another flake.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
@@ -625,6 +628,14 @@ the seven we chased down, three were product races, not test problems: a node ba
 fault spread stale suspicions about healthy peers, a rollout interrupted by a crash dropped the
 reservation its own retirement needed, and a two-second kill deadline was too short for a busy
 host. We fixed those in the product. Pressing re-run would have hidden all three.
+
+A register rots too. By 0.2.0, fourteen open rows pointed at one issue that had closed a week
+earlier, so nobody owned them. Now a nightly job reads each open row, asks GitHub whether its
+issue is still open, and fails when one isn't. Closing an issue no longer quietly orphans
+its flakes: either the row says Fixed (with a loop that used to fail and now passes), or it
+links a successor. Re-running those loops for the register paid for itself straight away:
+one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
+races the child's own exit on macOS.
 
 ## Dependencies are code too
 
@@ -1807,7 +1818,7 @@ That bound still had a hole: it assumed nothing else held the owner's reconcile 
 
 What if a worker will never come back? Waiting forever keeps the record honest but leaves the operator stuck. `relish decommission-node worker-a --workloads-stopped --reason "powered off"` is the escape hatch, and it's deliberately a *different* kind of evidence. Only an unscoped Admin can submit it. Raft records who said it, why and when, releases that node's outstanding placements, and permanently retires the node identity, so an old disk can't come back with an old certificate and resume work the cluster has already forgotten. Bun observing a process exit and an operator promising they've pulled the plug are both valid reasons to finish cleanup. They're not the same reason, and the audit record says which one it was.
 
-Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 run on the node that received them, so their leases live on that node (`scope = "node_jobs"`) and a local reaper retires both running jobs and cron registrations that haven't fired yet. Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
+Tokens, jobs and faults needed their own owners too. A test token is minted inside the lease, scoped to its namespace, never Admin, and it expires no later than the lease does. Jobs in 0.1 ran on the node that received them, so their leases lived on that node (`scope = "node_jobs"`) and a local reaper retired both running jobs and cron registrations that hadn't fired yet. In 0.2.0 every job takes the common job lifecycle, so a job lease lives in Raft with a council and its cleanup cancels the jobs' runs and forgets their definitions (Chapter 12). Chaos faults get a receipt *before* the request goes out, because the server may accept a fault whose response never reaches us; an unresolved receipt makes cleanup `Unknown` rather than `NotRequired`.
 
 One last trap. The reaper used to wait on each lease's operation lock in turn, so a single lease still being deployed stopped every other expired lease from being cleaned. It now asks without queueing:
 
@@ -3644,6 +3655,100 @@ that only holds the command channel. The loop answers it by publishing a fresh
 snapshot and spawning the runtime reads, so it costs a turn of microseconds,
 not the old 500 ms.
 
+The rootless test failed a fourth time, in a new way (#734): "owned runtime
+never settled on v0.1.0", 45 seconds after a rollback, with nothing else to go
+on. The settle loop only polled `upgrade_status`, so it couldn't tell a slow
+node from a dead one. Now it also asks the Bun child whether it has exited
+and, if so, fails at once with Bun's log. That log showed two different ways
+an exec'd Bun can die before it answers again.
+
+The first is in the test fixture. It chose Bun's fixed API port by binding
+port 0 and closing the socket. Every exec closes Bun's sockets too, and in
+that gap any other test on the runner can draw the same number from the
+ephemeral range. The new Bun then exits with "Address already in use".
+Chapter 14.7 tells that half; the fixtures now lease their ports.
+
+The second is in the product. Bun runs each short `runc` command for a
+container through an independent command owner, so a command outlives the
+process that asked for it. Before admitting the next command, the generation
+checks that every earlier one has retired, and it refused at once if one
+hadn't. Normally that never happens inside one process, because a command
+holds the generation's claim until it finishes. But an exec ends the old
+process mid-command: the state sweep's `runc state` keeps running under its
+owner, the new binary adopts its containers straight away, finds that command
+still running, and fails adoption, which stops Bun from starting. The owner
+retires the command a moment later by itself, so admission now waits up to
+five seconds for an earlier command to finish:
+
+```rust
+let deadline = tokio::time::Instant::now() + EARLIER_COMMAND_RETIREMENT;
+while !self.commands_terminal().await? {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(earlier_command_running());
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+```
+
+The `?` sits inside the loop condition. A failed status read returns the
+error from the whole function at once; only a clean "not yet" goes round the
+loop again. A command still running after five seconds is treated as stuck,
+and admission refuses as it always did, so a hung command still fences off
+everything after it. A test kills a process mid-command, the way an exec
+does, and claims the generation in a fresh one. That test failed with the
+exact error from the CI run before the change.
+
+Five seconds wasn't the whole story. The same test failed again a day later
+(#812), this time after the rollback, with the same message. Waiting only
+helps if somebody will finish the command, and there was a case where nobody
+would. A short command takes three steps: `prepare` writes its record as
+`Prepared`, `start` spawns the owner that flips it to `Running`, and the
+owner marks it `Retired` once it exits. The state sweep runs on other tasks
+while the agent's loop calls `execv`, so the exec can land between the first
+two steps. Then the record says `Prepared` forever: the process that would
+have started it no longer exists, and no owner was ever spawned. The new
+binary waited its five seconds for a command that could never run, gave up,
+and exited.
+
+The refusal now names the command and its state (`command-… is Prepared`),
+and admission cancels such a command instead of waiting for it:
+
+```rust
+if let (id, CommandState::Prepared) = &unretired
+    && self
+        .commands
+        .cancel_unstarted(id)
+        .await
+        .map_err(io::Error::other)?
+{
+    continue;
+}
+```
+
+That's a let chain again (Chapter 1): the cancel only runs when the pattern
+matched, and it can use the `id` the pattern bound. Matching against
+`&unretired`, a reference to the tuple, borrows `id` instead of moving it out,
+so the tuple is still whole for the error message further down.
+
+Why is cancelling safe? The generation's claim is exclusive, and every caller
+holds it from `prepare` right through `start`. So a `Prepared` command that
+admission finds has no caller left. The only thing that could still start it
+is a bootstrapper the dead process spawned a moment before the exec, and
+`cancel_unstarted` fences that: it takes the owner lock (which a live owner
+holds for its whole life) before writing `Cancelled`, and a late owner that
+then wakes up reloads the record, sees `Cancelled` and runs nothing. If the
+owner lock is already taken, an owner is starting right now, so admission
+leaves it alone and waits for it like any running command. It never sends a
+signal. A command that is really running still gets its five seconds, and a
+stuck one still fences everything after it.
+
+The new test prepares a command in the old process's collection, drops the
+claim the way an exec would, and admits a command in a fresh one. Before the
+change it failed after five seconds with `command-… is Prepared`, the same
+words a Lima loop of the rootless test printed three times in 29 rounds. With
+it, Bun logs `cancelled runtime command …` and carries on; the same loop
+passed every round, and caught the cancellation doing its job twice.
+
 #### The tick reads in parallel
 
 `check_apps` and `check_jobs` asked the runtime for every running instance's
@@ -4552,6 +4657,19 @@ does. The slow-disk scenario stays at 250 ms, and it now waits for the
 `discovery:startup-cleanup` readiness to turn ready before judging, because
 the port goes back a tick before the last writes.
 
+Driving turns by hand has its own trap, which a loaded laptop found weeks
+later (#761). The test ran ten ticks back to back. The first asks the leader,
+a little HTTP server on the test's own runtime, to confirm the release, and
+waits only until the turn's deadline. When the machine was busy enough that
+the answer came later than that, the next nine ticks each found the request
+still in flight and returned at once, as they should, and all ten were over
+in microseconds: `[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]`, "never finished". The live
+loop runs a health tick a second, and the leader's answer arrives in the gap.
+So the test now leaves a gap too, 100 ms between ticks, and keeps going until
+the retirement finishes or 20 seconds pass. It still counts per tick, which
+is the promise. A second test makes the leader answer after 750 ms, past the
+turn, so the slow case runs every time instead of only on a busy machine.
+
 #### One write a turn
 
 Two writes a tick held for a week. Then the 0.1.4 candidate's compressed
@@ -5378,6 +5496,13 @@ had nothing to restore from. With the shared helper, the fixture passes. The
 [qualification record](../qualification/2026-09-25-v02-power-cut.md) has both
 sets of runs.
 
+Then we stopped running them. They need a VM you're willing to switch off, so no
+workflow could, and nothing on the release checklist said to. By 0.2.0 the last
+record was a fortnight older than the change that rerouted every file lock in the
+programme. Nothing had broken, as it turned out: the [rerun](../qualification/2026-10-11-power-cut-reboot.md)
+passed 25 power cuts per lane. But a check that only runs when someone remembers
+it isn't a gate. Now it's a numbered step of the release runbook.
+
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
 that. The snapshot uploader still needs its own fixture: it needs Btrfs
@@ -5498,7 +5623,6 @@ agent/networking.rs      network references and egress enforcement
 agent/routing.rs         eBPF maps, the service catalogue, the routing table
 agent/faults.rs          chaos faults on this node
 agent/trace.rs           `relish trace`
-agent/job_runs.rs        the job ledger and cron jobs
 agent/records.rs         durable instance records and adoption
 agent/health_checks.rs   probes and the exits the tick notices
 agent/retirement.rs      killing, cleaning up, shutting down
@@ -5703,7 +5827,7 @@ runner's output path. Record the exact unchanged diagnostic separately, with
 zero retries and the original deadlines. Bounded phase labels, actual child
 observation and owned capture completion explain more than an arbitrary timeout
 increase. They mustn't print tokens, security files or secret arguments. The
-[dated qualification template](../qualification/2026-10-04-final-codebase-qualification.template.md)
+[dated qualification record](../qualification/2026-10-04-final-codebase-qualification.md)
 leaves actual Rust, coverage, OCI and current CI results pending until their
 matching execution records exist.
 
@@ -5725,3 +5849,109 @@ parsed profile after passthrough flags. The owner predicts that observed order
 exactly, including the manifest and instrumented target directory. A recorded
 command fixture checks the prediction; changing or omitting a selector still
 fails before discovery or execution.
+
+### The first launch belongs to the host
+
+`managed_status_fails_for_missing_stopped_and_unreachable_nodes` runs
+`relish local status` three times against a fake `limactl` and gives each run
+15 seconds. Under parallel load on macOS it sometimes ran out of time before
+`relish` had printed a byte, and the fake Lima had never been called. Alone it
+passed. The register said "cause unconfirmed" for a week, which was honest
+([#573](https://github.com/reliaburger/reliaburger/issues/573)).
+
+The cause turned out to be outside our code. On macOS the first `exec` of a
+newly written executable waits while `syspolicyd` assesses it. Your terminal
+probably has the Developer Tools permission, which skips the check, so you'll
+never see it there. A CI runner or an agent's shell has no such exemption. We
+reproduced that context with a short C launcher that starts the test through
+`posix_spawn` with `responsibility_spawnattrs_setdisclaim`, the call that makes
+the child responsible for itself. Two details matter. The wait happens in the
+child after `posix_spawn` has already returned, so it counts against whatever
+deadline the test set. And the host assesses one file at a time: a freshly
+linked 490 MB debug `relish` took 4 to 8 seconds alone, and with two other fresh
+binaries starting at the same moment the first status run failed its deadline
+15 times in 20.
+
+The test also wrote a new `limactl` script for each of its three runs, so each
+run queued once more. Now it writes the script once and hard-links it into each
+run's directory. A hard link is a second name for the same file, which the host
+has already assessed; a copy would be a new file. Before any deadline starts,
+`tests/support/first_launch.rs` launches `relish --version` and the script
+together and waits for both, with its own 45-second bound that says what it was
+waiting for. The 15 seconds now measure `relish`, which is what they were
+written for.
+
+The managed-status test wasn't alone. Six `relish local` lifecycle tests,
+an owned-launch cancellation test and a handful of others all wrote a fake tool
+of their own just before timing it
+([#582](https://github.com/reliaburger/reliaburger/issues/582)). nextest runs
+every test in a separate process, so "write it once" can't mean once per
+process. Under the same launcher, with fresh binaries alongside, the six
+lifecycle tests failed their five-second Lima deadline in every one of ten runs,
+and the cancellation test missed its 15-second wrapper marker in nine.
+
+So the helper keeps one copy of each distinct script for the whole machine.
+`install_script(path, body)` names the copy after the SHA-256 of its body, puts
+it in a directory only you can write, launches it once with an argument that
+makes it exit straight away, and hard-links it to `path`. The fake `limactl`
+used to have its log and state paths baked in, which made every test's body
+different. Now it starts with `dir=${0%/*}`: the shell's `$0` is the name it was
+started as, so `${0%/*}` (strip the shortest suffix matching `/*`) is the test's
+own directory, and one body serves every test. The shared copy is read-only, and
+the helper checks its bytes against the digest each time, so a test that wrote
+through its link would fail loudly instead of changing everyone else's tool.
+
+The helper remembers what it has launched in a process-wide set:
+
+```rust
+static LAUNCHED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+```
+
+A Rust `static` is one value for the whole program, like a C global, but its
+initialiser must be something the compiler can evaluate at build time: a
+`const fn`. `Mutex::new` and `BTreeSet::new` are both `const fn`. `HashSet::new`
+isn't, because it seeds its hasher with random keys when it runs, so the
+compiler refuses it and suggests `LazyLock`. A sorted set needs no seed, and it
+was the shorter fix. The mutex is `std::sync::Mutex`, held only for a lookup in
+a synchronous helper and never across an `.await`.
+
+That still left one launch per machine, and it wasn't enough. Six lifecycle
+tests kept failing on a Mac that three agents shared
+([#762](https://github.com/reliaburger/reliaburger/issues/762)), now with the
+helper's own 45-second bound instead of Lima's five. The shared script's single
+first launch was stuck in the queue. We timed a two-line script started one
+second after a fresh copy of the 800 MB library test binary: it waited 5 to 32
+seconds, and finished within 30 ms of the binary every time. With two copies at
+load average 50 to 180 it waited 75 to 94 seconds. The queue is host-wide, so
+another worktree's build being launched is enough. No bound we'd want to keep
+covers that.
+
+So the lifecycle fake doesn't get launched at all. The same script run as
+`/bin/sh limactl.sh` took 0.02 seconds in those rounds, because the only thing
+`exec`'d is `/bin/sh`, which is part of the system and never assessed. The shell
+reads the script as data. `Lima` gained a test-only constructor that does this:
+
+```rust
+#[cfg(test)]
+pub(crate) fn shell_script(script: PathBuf, timeout: Duration) -> Self {
+    Self {
+        script: Some(script),
+        ..Self::new(PathBuf::from("/bin/sh"), timeout)
+    }
+}
+```
+
+`..Self::new(...)` is the struct update syntax from Chapter 1: every field not
+named comes from a normal `Lima` for `/bin/sh`. `run` passes `script` as the
+first argument when it's set, and production never sets it. `$0` is now the
+script's path rather than a link's, so `${0%/*}` still finds the test's
+directory, and the file doesn't even need its execute bit. A unit test writes
+it with mode 0644 to prove that.
+
+The loop that proved it turned up two neighbours with the same problem. The VM
+runner's fake `limactl` moved to `shell_script` too, which dropped its own
+warm-up helper. The provisioning tests put stub `apt-get`, `systemctl`,
+`dpkg-query` and `install` files on `PATH`. They're now Bash functions defined
+ahead of the provision script (`apt-get() { echo "$*" >> "$APT_LOG"; }`), and a
+function wins over anything on `PATH`, so nothing new is ever launched. Fixtures
+whose caller can only take one executable path still use `install_script`.

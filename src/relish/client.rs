@@ -112,6 +112,12 @@ pub struct AgentVersion {
     /// its self-upgrade manager, which is what hashes it.
     #[serde(default)]
     pub binary_sha256: Option<String>,
+    /// `{os}-{arch}` the agent runs on: which release artefact fits it.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// The cluster formats the agent speaks.
+    #[serde(default)]
+    pub compatibility: Option<crate::compatibility::Compatibility>,
 }
 
 /// Client for the Bun agent HTTP API.
@@ -317,6 +323,17 @@ const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_m
 
 /// Classify a reqwest send error as either a timeout or a connection failure.
 /// A successful response's JSON body, or the API error it carried.
+/// Attach an `Idempotency-Key` header when the caller has one.
+fn with_idempotency_key(
+    request: reqwest::RequestBuilder,
+    key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match key {
+        Some(key) => request.header("Idempotency-Key", key),
+        None => request,
+    }
+}
+
 async fn json_or_api_error<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, RelishError> {
@@ -861,9 +878,9 @@ impl BunClient {
             .await
     }
 
-    /// Explicitly rerun unknown jobs on this node after retiring their old runtime.
+    /// Explicitly admit fresh runs of a manifest's jobs.
     pub async fn apply_rerunning_jobs(&self, config: &Config) -> Result<ApplyResult, RelishError> {
-        crate::bun::jobs::validate_rerun(config).map_err(|error| RelishError::ApiError {
+        crate::bun::job_apply::validate_rerun(config).map_err(|error| RelishError::ApiError {
             status: 400,
             body: error.into(),
         })?;
@@ -1091,6 +1108,17 @@ impl BunClient {
             .get_typed_json(&format!("/v1/events?limit={limit}&local=true"))
             .await?;
         Ok(view.events)
+    }
+
+    /// Read the audit log: the newest records matching `filter`, oldest
+    /// first, from the node this client talks to or, with `cluster`, from
+    /// every live node.
+    pub async fn audit(
+        &self,
+        filter: &crate::bun::audit::AuditFilter,
+        cluster: bool,
+    ) -> Result<crate::bun::audit::AuditListing, RelishError> {
+        self.get_typed_json(&audit_path(filter, cluster)).await
     }
 
     /// Ask a node what it has wired up (Phase 15).
@@ -2474,9 +2502,13 @@ impl BunClient {
     /// Submit a batch: full job specs travel with the request, so the
     /// cluster needs no prior deploy of them. Returns the response
     /// JSON (`batch_id`, `assigned`, `unschedulable`).
+    ///
+    /// `idempotency_key`, when given, travels as the `Idempotency-Key` header: a retry
+    /// with the same key and jobs returns the first attempt's runs.
     pub async fn submit_batch(
         &self,
         jobs: &std::collections::BTreeMap<String, crate::config::job::JobSpec>,
+        idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch", self.base_url);
         let payload = serde_json::json!({
@@ -2487,10 +2519,8 @@ impl BunClient {
                 })
                 .collect::<Vec<_>>(),
         });
-        let response = self
-            .http()?
-            .post(&url)
-            .json(&payload)
+        let request = self.http()?.post(&url).json(&payload);
+        let response = with_idempotency_key(request, idempotency_key)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2533,16 +2563,36 @@ impl BunClient {
         json_or_api_error(response).await
     }
 
-    /// Submit a task array (`POST /v1/batch/array`).
+    /// Submit a task array (`POST /v1/batch/array`). `idempotency_key`,
+    /// when given, travels as the `Idempotency-Key` header, so a retry after an
+    /// uncertain timeout returns the same run rather than a second array.
     pub async fn submit_task_array(
         &self,
         request: &crate::bun::task_array_api::TaskArraySubmitRequest,
+        idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch/array", self.base_url);
-        let response = self
+        let builder = self.http()?.post(&url).json(request);
+        let response = with_idempotency_key(builder, idempotency_key)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
+    /// Admit all manifest profiles through one durable request. A retry with
+    /// the same `idempotency_key` and manifest returns the existing runs;
+    /// without one, the cluster treats every request as new work.
+    pub async fn submit_task_manifest(
+        &self,
+        request: &crate::bun::task_array_api::TaskManifestRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<serde_json::Value, RelishError> {
+        let builder = self
             .http()?
-            .post(&url)
-            .json(request)
+            .post(format!("{}/v1/batch/manifest", self.base_url))
+            .json(request);
+        let response = with_idempotency_key(builder, idempotency_key)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2550,21 +2600,6 @@ impl BunClient {
     }
 
     /// Cancel a task array (`POST /v1/batch/{id}/cancel`).
-    /// Admit all manifest profiles through one durable request.
-    pub async fn submit_task_manifest(
-        &self,
-        request: &crate::bun::task_array_api::TaskManifestRequest,
-    ) -> Result<serde_json::Value, RelishError> {
-        let response = self
-            .http()?
-            .post(format!("{}/v1/batch/manifest", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .map_err(classify_error)?;
-        json_or_api_error(response).await
-    }
-
     pub async fn cancel_batch(&self, batch_id: u64) -> Result<(), RelishError> {
         let url = format!("{}/v1/batch/{batch_id}/cancel", self.base_url);
         let response = self
@@ -2826,6 +2861,33 @@ fn secret_public_key_path(namespace: Option<&str>) -> String {
         }
         None => "/v1/secret/public-key".to_string(),
     }
+}
+
+/// The `GET /v1/audit` path for `filter`.
+fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String {
+    let mut params = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(since) = filter.since {
+        params.append_pair("since", &since.to_string());
+    }
+    if let Some(until) = filter.until {
+        params.append_pair("until", &until.to_string());
+    }
+    if let Some(action) = &filter.action {
+        params.append_pair("action", action);
+    }
+    if let Some(principal) = &filter.principal {
+        params.append_pair("principal", principal);
+    }
+    if let Some(namespace) = &filter.namespace {
+        params.append_pair("namespace", namespace);
+    }
+    if let Some(limit) = filter.limit {
+        params.append_pair("limit", &limit.to_string());
+    }
+    if cluster {
+        params.append_pair("cluster", "true");
+    }
+    format!("/v1/audit?{}", params.finish())
 }
 
 #[cfg(test)]

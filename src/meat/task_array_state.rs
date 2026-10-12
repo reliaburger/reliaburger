@@ -25,6 +25,12 @@ use super::types::NodeId;
 pub const MAX_FAILED_RANGES: usize = 10_000;
 /// Bound sparse failures in each worker control report.
 pub const MAX_CHUNK_FAILED_RANGES: usize = 256;
+/// Most ranges the per-node accepted record may hold before it is folded
+/// into the owner-free record (see [`TaskArrayState::accepted_grant`]).
+/// About 60 KiB of JSON; friendly shapes (big chunks, few nodes) never
+/// reach it, and one-task chunks on many nodes fold every few thousand
+/// completions.
+pub const MAX_ACCEPTED_RANGES: usize = 4096;
 
 /// Fewest chunks the grant policy keeps queued on a node, so a node that
 /// finishes one chunk always has the next one ready.
@@ -49,6 +55,9 @@ pub enum StopReason {
     Cancelled,
     /// More indices failed for good than `max_failed_indexes` allows.
     TooManyFailures,
+    /// No node in the cluster can run it (its runtime, allowlist or
+    /// `mount_isolation` refuses the array), so it would never start.
+    Unrunnable,
 }
 
 /// Lifecycle of a task array, derived from its chunks and counts.
@@ -75,6 +84,43 @@ impl TaskArrayStatus {
     }
 }
 
+/// Why retried attempts failed: one count per extra attempt, by the failed
+/// attempt's outcome. A fixed set of counters, never a per-task log, so a
+/// recovered retry keeps its cause without per-success storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryCauses {
+    /// The command exited non-zero.
+    pub exit_code: u64,
+    /// The command was killed by a signal it didn't choose, including the
+    /// kernel's memory-limit kill.
+    pub signal: u64,
+    /// The attempt ran past the task timeout and was killed.
+    pub timeout: u64,
+    /// The attempt's exit status couldn't be established (replayable work).
+    pub unknown: u64,
+    /// Read back from a node's ledger after a restart, which keeps attempt
+    /// counts but not why the earlier attempts failed.
+    pub unrecorded: u64,
+}
+
+impl RetryCauses {
+    /// All counted retries, or `None` if the sum overflows.
+    pub fn total(&self) -> Option<u64> {
+        [self.signal, self.timeout, self.unknown, self.unrecorded]
+            .into_iter()
+            .try_fold(self.exit_code, u64::checked_add)
+    }
+
+    /// Add another set of counts, saturating rather than wrapping.
+    pub fn add(&mut self, other: &Self) {
+        self.exit_code = self.exit_code.saturating_add(other.exit_code);
+        self.signal = self.signal.saturating_add(other.signal);
+        self.timeout = self.timeout.saturating_add(other.timeout);
+        self.unknown = self.unknown.saturating_add(other.unknown);
+        self.unrecorded = self.unrecorded.saturating_add(other.unrecorded);
+    }
+}
+
 /// What a node reports when it has finished one chunk. Every task in the
 /// chunk is accounted for exactly once: succeeded, failed or not run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +141,18 @@ pub struct ChunkResult {
     pub not_run: u32,
     /// Extra attempts spent on retries across the chunk.
     pub retried: u32,
+    /// Why those extra attempts were needed; sums to `retried`.
+    #[serde(default)]
+    pub retry_causes: RetryCauses,
+}
+
+/// The grant whose report retired a chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedGrant {
+    /// The node that ran it, unless the record was compacted since.
+    pub owner: Option<NodeId>,
+    /// The grant attempt it ran at.
+    pub attempt: u64,
 }
 
 /// Outcome of a valid chunk completion.
@@ -137,6 +195,12 @@ pub enum TaskArrayError {
     Stopped,
     #[error("execution owner must contain 1–128 bytes without control characters")]
     InvalidOwner,
+    #[error("chunk {chunk} reports {retried} retries but retry causes for {causes}")]
+    RetryCauseMismatch {
+        chunk: u32,
+        retried: u64,
+        causes: u64,
+    },
 }
 
 /// Aggregate progress of one array, computed without touching tasks.
@@ -152,6 +216,8 @@ pub struct TaskArraySummary {
     pub not_run: u64,
     /// Extra attempts spent on retries.
     pub retried: u64,
+    /// Why the retried attempts failed; sums to `retried`.
+    pub retry_causes: RetryCauses,
     /// Tasks in chunks not yet granted.
     pub queued: u64,
     /// Tasks in chunks nodes hold (running or about to).
@@ -179,6 +245,10 @@ pub struct TaskArrayState {
     done: IndexRangeSet,
     /// Accepted terminal grant per chunk; cancelled unstarted chunks have none.
     accepted: BTreeMap<NodeId, BTreeMap<u64, IndexRangeSet>>,
+    /// Accepted chunks whose owner was folded away to bound the state, by
+    /// attempt. Past [`MAX_ACCEPTED_RANGES`], `accepted` moves here whole.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    accepted_folded: BTreeMap<u64, IndexRangeSet>,
     /// Indices that failed for good, up to [`MAX_FAILED_RANGES`] ranges.
     failed_indices: IndexRangeSet,
     /// Failed indices not stored because the range cap was reached.
@@ -187,6 +257,8 @@ pub struct TaskArrayState {
     failed: u64,
     not_run: u64,
     retried: u64,
+    #[serde(default)]
+    retry_causes: RetryCauses,
     stopped: Option<StopReason>,
     duration_counts: [u64; 16],
     /// [`Self::duration_counts`], decayed; grant lookahead learns from this.
@@ -237,7 +309,11 @@ impl TaskArrayState {
             return Err("invalid grant attempt".into());
         }
         let mut accepted = IndexRangeSet::new();
-        for grants in self.accepted.values() {
+        for grants in self
+            .accepted
+            .values()
+            .chain(std::iter::once(&self.accepted_folded))
+        {
             for (attempt, ranges) in grants {
                 if *attempt == 0
                     || ranges.is_empty()
@@ -283,6 +359,9 @@ impl TaskArrayState {
         if self.stopped.is_some() && !self.queued.is_empty() {
             return Err("stopped run retains queued work".into());
         }
+        if self.retry_causes.total() != Some(self.retried) {
+            return Err("retry causes disagree with the retry count".into());
+        }
         Ok(())
     }
 
@@ -301,12 +380,14 @@ impl TaskArrayState {
             attempts: BTreeMap::new(),
             done: IndexRangeSet::new(),
             accepted: BTreeMap::new(),
+            accepted_folded: BTreeMap::new(),
             failed_indices: IndexRangeSet::new(),
             failed_overflow: 0,
             succeeded: 0,
             failed: 0,
             not_run: 0,
             retried: 0,
+            retry_causes: RetryCauses::default(),
             stopped: None,
             duration_counts: [0; 16],
             recent_duration_counts: [0; 16],
@@ -323,14 +404,56 @@ impl TaskArrayState {
         &self.done
     }
 
-    /// Grant whose terminal report was accepted for this chunk.
-    pub fn accepted_grant(&self, chunk: ChunkId) -> Option<(NodeId, u64)> {
-        self.accepted.iter().find_map(|(node, generations)| {
-            generations
-                .iter()
-                .find(|(_, chunks)| chunks.contains(chunk.0))
-                .map(|(grant, _)| (node.clone(), *grant))
-        })
+    /// Grant whose terminal report was accepted for this chunk. The owner
+    /// is `None` once the record was folded to stay within
+    /// [`MAX_ACCEPTED_RANGES`]; the attempt is always kept. The attempt is
+    /// enough to fence a result: each attempt of a chunk is granted to
+    /// exactly one node, so only the owner's routing hint is lost.
+    pub fn accepted_grant(&self, chunk: ChunkId) -> Option<AcceptedGrant> {
+        self.accepted
+            .iter()
+            .find_map(|(node, generations)| {
+                generations
+                    .iter()
+                    .find(|(_, chunks)| chunks.contains(chunk.0))
+                    .map(|(attempt, _)| AcceptedGrant {
+                        owner: Some(node.clone()),
+                        attempt: *attempt,
+                    })
+            })
+            .or_else(|| {
+                self.accepted_folded
+                    .iter()
+                    .find(|(_, chunks)| chunks.contains(chunk.0))
+                    .map(|(attempt, _)| AcceptedGrant {
+                        owner: None,
+                        attempt: *attempt,
+                    })
+            })
+    }
+
+    /// Fold the per-node accepted record into the owner-free one once it
+    /// passes [`MAX_ACCEPTED_RANGES`]. One-task chunks spread over many
+    /// nodes split each node's record into a range per chunk; folded by
+    /// attempt alone, the same chunks merge back into a few ranges.
+    fn fold_accepted_when_full(&mut self) {
+        let ranges: usize = self
+            .accepted
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(IndexRangeSet::range_count)
+            .sum();
+        if ranges <= MAX_ACCEPTED_RANGES {
+            return;
+        }
+        for generations in std::mem::take(&mut self.accepted).into_values() {
+            for (attempt, chunks) in generations {
+                self.accepted_folded
+                    .entry(attempt)
+                    .or_default()
+                    .extend_from(&chunks);
+            }
+        }
     }
 
     /// Mergeable terminal-attempt duration distribution for accepted chunks.
@@ -453,6 +576,14 @@ impl TaskArrayState {
         {
             return Err(TaskArrayError::IndexOutsideChunk { chunk });
         }
+        let causes = result.retry_causes.total().unwrap_or(u64::MAX);
+        if causes != u64::from(result.retried) {
+            return Err(TaskArrayError::RetryCauseMismatch {
+                chunk,
+                retried: u64::from(result.retried),
+                causes,
+            });
+        }
 
         self.release(node, chunk);
         self.attempts.remove(&chunk);
@@ -463,6 +594,7 @@ impl TaskArrayState {
             .entry(result.attempt)
             .or_default()
             .insert(chunk);
+        self.fold_accepted_when_full();
         for (total, count) in self.duration_counts.iter_mut().zip(result.duration_counts) {
             *total += count;
         }
@@ -482,6 +614,7 @@ impl TaskArrayState {
         self.failed += failed;
         self.not_run += u64::from(result.not_run);
         self.retried += u64::from(result.retried);
+        self.retry_causes.add(&result.retry_causes);
         self.record_failures(&result.failed_indices);
         self.failed_overflow += failed - result.failed_indices.len();
         if let Some(limit) = self.spec.max_failed_indexes
@@ -542,6 +675,12 @@ impl TaskArrayState {
         self.stop(StopReason::Cancelled);
     }
 
+    /// Fail the array because no node can run it: no more grants, queued
+    /// chunks count as not run. Keeps an earlier stop's reason.
+    pub fn refuse_unrunnable(&mut self) {
+        self.stop(StopReason::Unrunnable);
+    }
+
     fn stop(&mut self, reason: StopReason) {
         if self.stopped.is_some() {
             return;
@@ -575,7 +714,9 @@ impl TaskArrayState {
         match (self.stopped, drained) {
             (Some(_), false) => TaskArrayStatus::Stopping,
             (Some(StopReason::Cancelled), true) => TaskArrayStatus::Cancelled,
-            (Some(StopReason::TooManyFailures), true) => TaskArrayStatus::Failed,
+            (Some(StopReason::TooManyFailures | StopReason::Unrunnable), true) => {
+                TaskArrayStatus::Failed
+            }
             (None, false) => TaskArrayStatus::Running,
             (None, true) if self.failed == 0 => TaskArrayStatus::Succeeded,
             (None, true) => TaskArrayStatus::CompletedWithFailures,
@@ -591,6 +732,7 @@ impl TaskArrayState {
             failed: self.failed,
             not_run: self.not_run,
             retried: self.retried,
+            retry_causes: self.retry_causes,
             queued: self.tasks_in(&self.queued),
             held,
             chunks_done: self.done.len(),
@@ -735,6 +877,79 @@ pub fn plan_grants(
         }
     }
     plan
+}
+
+impl TaskArrayState {
+    /// Attempts of this array `node` can have running at once with what it
+    /// holds now: no more than its held tasks, and no more than its slots.
+    /// This is what a namespace quota charges (D20).
+    pub fn in_flight_on(&self, node: &NodeId, slots: u32) -> u64 {
+        self.held_by(node)
+            .map_or(0, |chunks| self.tasks_in(chunks))
+            .min(u64::from(slots))
+    }
+}
+
+/// A grant plan trimmed to a namespace's remaining quota.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FittedGrants {
+    /// The grants that fit, in the order planned.
+    pub grants: Vec<(NodeId, IndexRangeSet)>,
+    /// Attempts these grants let start, beyond what nodes already ran.
+    pub started: u64,
+    /// Attempts the first chunk held back would have let start, if the
+    /// quota held any chunk back.
+    pub held_back: Option<u64>,
+}
+
+/// Keep the planned grants whose new attempts fit in `room` more. A grant
+/// raises a node's in-flight attempts to `min(held tasks, slots)`, so once a
+/// node holds a full round of its slots, deeper chunks cost nothing more
+/// and still go out. Chunks are tried lowest first; the first one that
+/// doesn't fit stops that node's grant, and every later node's too, so an
+/// older plan order can't be overtaken.
+pub fn fit_grants(
+    state: &TaskArrayState,
+    plan: Vec<(NodeId, IndexRangeSet)>,
+    nodes: &[NodeSlots],
+    mut room: u64,
+) -> FittedGrants {
+    let mut fitted = FittedGrants {
+        grants: Vec::new(),
+        started: 0,
+        held_back: None,
+    };
+    for (node, chunks) in plan {
+        if fitted.held_back.is_some() {
+            break;
+        }
+        let slots = nodes
+            .iter()
+            .find(|candidate| candidate.node == node)
+            .map_or(0, |candidate| candidate.slots);
+        let before = state.in_flight_on(&node, slots);
+        let mut held = state.held_by(&node).map_or(0, |held| state.tasks_in(held));
+        let mut kept = IndexRangeSet::new();
+        let mut added = 0;
+        for chunk in chunks.iter() {
+            let tasks = state.tasks_in(&IndexRangeSet::from_range(chunk..=chunk));
+            let after = held.saturating_add(tasks).min(u64::from(slots));
+            let cost = after.saturating_sub(before);
+            if cost > room {
+                fitted.held_back = Some(cost - added);
+                break;
+            }
+            kept.insert(chunk);
+            held = held.saturating_add(tasks);
+            added = cost;
+        }
+        room -= added;
+        fitted.started += added;
+        if !kept.is_empty() {
+            fitted.grants.push((node, kept));
+        }
+    }
+    fitted
 }
 
 #[cfg(test)]
@@ -1146,6 +1361,7 @@ mod tests {
                         failed_indices: failed,
                         not_run: 0,
                         retried: 0,
+                        retry_causes: RetryCauses::default(),
                     };
                     state.complete(&holder, &result).unwrap();
                 }
@@ -1164,6 +1380,93 @@ mod tests {
         assert!(rounds <= 977u64.div_ceil(per_round) + 2, "{rounds} rounds");
         let bytes = serde_json::to_vec(&state).unwrap().len();
         assert!(bytes <= 256 * 1024, "state is {bytes} bytes");
+    }
+
+    /// Run the worst shape for the accepted-range record: the most chunks
+    /// an array may have, one task each, on ten nodes that take two chunks
+    /// at a time and finish them out of order. `truth` collects who
+    /// finished each chunk at which attempt; a node is lost partway, so
+    /// some chunks are finished at attempt 2. Returns the largest
+    /// serialised size seen.
+    fn run_one_task_chunks_on_ten_nodes(
+        state: &mut TaskArrayState,
+        truth: &mut BTreeMap<u32, (NodeId, u64)>,
+    ) -> usize {
+        let names: Vec<String> = (0..10).map(|i| format!("node-{i}")).collect();
+        let entries: Vec<(&str, u32)> = names.iter().map(|name| (name.as_str(), 1)).collect();
+        let nodes = slots(&entries);
+        let mut largest = 0;
+        let mut round = 0u32;
+        while !state.status().is_terminal() {
+            round += 1;
+            if round == 200 {
+                state.requeue_node(&node("node-3"));
+            }
+            let holders: Vec<NodeId> = state.holders().cloned().collect();
+            for holder in holders {
+                // Finish the highest chunk held, leaving the lower one
+                // behind: completions land out of order across nodes.
+                let Some(chunk) = state.held_by(&holder).and_then(|held| held.iter().last()) else {
+                    continue;
+                };
+                let result = all_ok(state, chunk);
+                truth.insert(chunk, (holder.clone(), result.attempt));
+                state.complete(&holder, &result).unwrap();
+            }
+            let plan = plan_grants(state, &nodes, false);
+            apply(state, &plan);
+            if round.is_multiple_of(64) {
+                largest = largest.max(serde_json::to_vec(&*state).unwrap().len());
+            }
+            assert!(round < 100_000, "the array must finish");
+        }
+        largest.max(serde_json::to_vec(&*state).unwrap().len())
+    }
+
+    #[test]
+    fn accepted_state_stays_bounded_with_one_task_chunks_on_ten_nodes() {
+        let mut state =
+            TaskArrayState::new(spec(super::super::task_array::MAX_CHUNKS, 1), 1).unwrap();
+        let largest = run_one_task_chunks_on_ten_nodes(&mut state, &mut BTreeMap::new());
+        assert_eq!(state.status(), TaskArrayStatus::Succeeded);
+        assert!(
+            largest <= 256 * 1024,
+            "the state reached {largest} bytes on the way"
+        );
+        state.validate_snapshot().unwrap();
+    }
+
+    #[test]
+    fn compaction_keeps_accepted_grant_answers_correct() {
+        let mut state =
+            TaskArrayState::new(spec(super::super::task_array::MAX_CHUNKS, 1), 1).unwrap();
+        let mut truth = BTreeMap::new();
+        run_one_task_chunks_on_ten_nodes(&mut state, &mut truth);
+        assert_eq!(truth.len(), 1 << 16);
+        assert!(
+            truth.values().any(|(_, attempt)| *attempt == 2),
+            "the lost node's chunks were finished again at attempt 2"
+        );
+        // Round-trip first: a follower's copy must answer the same.
+        let state: TaskArrayState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        state.validate_snapshot().unwrap();
+        let (mut kept, mut forgotten) = (0, 0);
+        for (chunk, (owner, attempt)) in &truth {
+            let accepted = state.accepted_grant(ChunkId(*chunk)).unwrap();
+            // The attempt always survives, and fences results on its own:
+            // each attempt of a chunk is granted to exactly one node.
+            assert_eq!(accepted.attempt, *attempt, "chunk {chunk}");
+            match accepted.owner {
+                Some(recorded) => {
+                    assert_eq!(&recorded, owner, "chunk {chunk}");
+                    kept += 1;
+                }
+                None => forgotten += 1,
+            }
+        }
+        assert!(forgotten > 0, "the record was compacted");
+        assert!(kept > 0, "acceptances since the last fold keep their owner");
     }
 
     fn node(name: &str) -> NodeId {
@@ -1192,6 +1495,7 @@ mod tests {
             failed_indices: IndexRangeSet::new(),
             not_run: 0,
             retried: 0,
+            retry_causes: RetryCauses::default(),
         }
     }
 
@@ -1244,6 +1548,10 @@ mod tests {
         result.failed_count = 2;
         result.failed_indices = IndexRangeSet::from_range(2042..=2043);
         result.retried = 7;
+        result.retry_causes = RetryCauses {
+            exit_code: 7,
+            ..RetryCauses::default()
+        };
         assert_eq!(
             state.complete(&node("n1"), &result),
             Ok(CompletionOutcome::Applied)
@@ -1255,6 +1563,69 @@ mod tests {
         assert_eq!(summary.chunks_done, 1);
         assert_eq!(summary.held, 2000);
         assert_eq!(state.failed_indices(), &chunks(2042..=2043));
+    }
+
+    #[test]
+    fn retry_causes_accumulate_per_cause_across_chunks() {
+        let mut state = TaskArrayState::new(spec(2000, 1000), 1).unwrap();
+        state.grant(&node("n1"), &chunks(0..=1)).unwrap();
+        let mut first = all_ok(&state, 0);
+        first.retried = 3;
+        first.retry_causes = RetryCauses {
+            exit_code: 1,
+            signal: 2,
+            ..RetryCauses::default()
+        };
+        let mut second = all_ok(&state, 1);
+        second.retried = 4;
+        second.retry_causes = RetryCauses {
+            signal: 1,
+            timeout: 1,
+            unknown: 1,
+            unrecorded: 1,
+            ..RetryCauses::default()
+        };
+        state.complete(&node("n1"), &first).unwrap();
+        state.complete(&node("n1"), &second).unwrap();
+        let summary = state.summary();
+        assert_eq!(summary.retried, 7);
+        assert_eq!(
+            summary.retry_causes,
+            RetryCauses {
+                exit_code: 1,
+                signal: 3,
+                timeout: 1,
+                unknown: 1,
+                unrecorded: 1,
+            }
+        );
+        state.validate_snapshot().unwrap();
+    }
+
+    #[test]
+    fn a_report_whose_retry_causes_disagree_with_its_retries_is_refused() {
+        let mut state = TaskArrayState::new(spec(1000, 1000), 1).unwrap();
+        state.grant(&node("n1"), &chunks(0..=0)).unwrap();
+        let mut result = all_ok(&state, 0);
+        result.retried = 2;
+        result.retry_causes.exit_code = 1;
+        let before = state.clone();
+        assert_eq!(
+            state.complete(&node("n1"), &result),
+            Err(TaskArrayError::RetryCauseMismatch {
+                chunk: 0,
+                retried: 2,
+                causes: 1
+            })
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn a_snapshot_whose_retry_causes_disagree_is_refused() {
+        let mut state = TaskArrayState::new(spec(1000, 1000), 1).unwrap();
+        state.retry_causes.timeout = 1;
+        assert!(state.validate_snapshot().is_err());
     }
 
     #[test]
@@ -1397,6 +1768,19 @@ mod tests {
     }
 
     #[test]
+    fn an_array_no_node_can_run_fails_with_every_queued_task_not_run() {
+        let mut state = TaskArrayState::new(spec(250, 100), 1).unwrap();
+        state.refuse_unrunnable();
+        assert_eq!(state.stop_reason(), Some(StopReason::Unrunnable));
+        assert_eq!(state.status(), TaskArrayStatus::Failed);
+        assert_eq!(state.summary().not_run, 250);
+        assert!(state.queued().is_empty());
+        // A later cancel keeps the first reason.
+        state.cancel();
+        assert_eq!(state.stop_reason(), Some(StopReason::Unrunnable));
+    }
+
+    #[test]
     fn terminal_status_reflects_failures() {
         let mut state = TaskArrayState::new(spec(200, 100), 1).unwrap();
         state.grant(&node("n1"), &chunks(0..=1)).unwrap();
@@ -1438,6 +1822,7 @@ mod tests {
                 failed_indices: failures,
                 not_run: 0,
                 retried: 0,
+                retry_causes: Default::default(),
             };
             state.complete(&node("n1"), &result).unwrap();
         }
@@ -1454,5 +1839,70 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let back: TaskArrayState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, state);
+    }
+
+    fn cpu_quota(namespace: &str, millicores: u64) -> crate::meat::quota::QuotaLedger {
+        crate::meat::quota::QuotaLedger::new(std::collections::HashMap::from([(
+            namespace.to_string(),
+            crate::meat::quota::NamespaceQuota {
+                namespace: namespace.to_string(),
+                max_cpu_millicores: Some(millicores),
+                max_memory_bytes: None,
+                max_gpus: None,
+                max_apps: None,
+                max_replicas: None,
+            },
+        )]))
+    }
+
+    #[test]
+    fn grants_stop_when_namespace_cpu_quota_is_used() {
+        // 2 CPUs of quota and 500m per task: four attempts may run. Each
+        // chunk is two tasks, and the node could run eight at once.
+        let per_task = crate::meat::Resources::new(500, 0, 0);
+        let mut quota = cpu_quota("tenant", 2000);
+        let state = TaskArrayState::new(spec(100, 2), 1).unwrap();
+        let nodes = slots(&[("a", 8)]);
+        let plan = plan_grants(&state, &nodes, true);
+        assert_eq!(plan, vec![(node("a"), chunks(0..=7))]);
+
+        let room = quota.room_for_tasks("tenant", &per_task);
+        assert_eq!(room, 4);
+        let fitted = fit_grants(&state, plan, &nodes, room);
+        assert_eq!(fitted.grants, vec![(node("a"), chunks(0..=1))]);
+        assert_eq!(fitted.started, 4);
+        assert_eq!(fitted.held_back, Some(2));
+
+        // With the four charged, nothing more fits, and the refusal names CPU.
+        quota.charge_tasks("tenant", &per_task, fitted.started);
+        assert_eq!(quota.room_for_tasks("tenant", &per_task), 0);
+        assert!(matches!(
+            quota.task_quota_error("tenant", &per_task, 2),
+            Some(crate::meat::quota::QuotaError::CpuExceeded { limit: 2000, .. })
+        ));
+    }
+
+    #[test]
+    fn chunks_beyond_a_nodes_slots_cost_no_more_quota() {
+        // The node runs at most four at once, so after its first chunk of
+        // four, the deeper chunks start nothing new and still go out.
+        let state = TaskArrayState::new(spec(100, 4), 1).unwrap();
+        let nodes = slots(&[("a", 4)]);
+        let plan = plan_grants(&state, &nodes, true);
+        let fitted = fit_grants(&state, plan.clone(), &nodes, 4);
+        assert_eq!(fitted.grants, plan);
+        assert_eq!(fitted.started, 4);
+        assert_eq!(fitted.held_back, None);
+    }
+
+    #[test]
+    fn a_quota_held_chunk_stops_later_nodes_too() {
+        let state = TaskArrayState::new(spec(100, 2), 1).unwrap();
+        let nodes = slots(&[("a", 2), ("b", 2)]);
+        let plan = plan_grants(&state, &nodes, true);
+        assert_eq!(plan.len(), 2);
+        let fitted = fit_grants(&state, plan, &nodes, 1);
+        assert!(fitted.grants.is_empty());
+        assert_eq!(fitted.held_back, Some(2));
     }
 }

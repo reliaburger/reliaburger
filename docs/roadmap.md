@@ -302,8 +302,19 @@ migration and no feature gate
   [#640](https://github.com/reliaburger/reliaburger/issues/640). Sustained daily and
   storage-bound qualification [#668](https://github.com/reliaburger/reliaburger/issues/668)
   and resident model workers [#641](https://github.com/reliaburger/reliaburger/issues/641) remain.
-  The million-task release gate and sustained 100m/day claim still require
-  real-runtime qualification ([foundation evidence](qualification/2026-10-04-delegated-jobs/README.md)).
+  **Exit gate (decision D18-C, audit [#674](https://github.com/reliaburger/reliaburger/issues/674)):**
+  #668's list, on at least three nodes: 24 hours at 1,158 accepted successes a
+  second or more (100 million a day) plus headroom, with concurrent apps,
+  several resource profiles, worker and leader loss, delayed messages and disk
+  faults. `scripts/release/qualify-jobs-sustained.sh --tier final` runs it
+  ([#686](https://github.com/reliaburger/reliaburger/issues/686)); bounded job
+  storage ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has
+  to pass first. Every run records the September plan's measurements (wall
+  time of a million-task array, p99 start lag, Raft entries a second and
+  state, leader memory and CPU, executor overhead, ledger bytes, retained
+  logs) without gating on them; that plan is
+  [archived](plans/archive/2026-09-28-plan-million-jobs.md).
+  [Chapter 17](book/17-a-million-jobs.md).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
@@ -383,6 +394,22 @@ what's shipped and what's scheduled.
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
   F06, F09, F11, and the rest of F03–F05).
+- **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
+  marks each of these as planned where it describes them: the reporting tree,
+  resource-aware council selection, per-app rollups and remote-read
+  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); node-by-node
+  rollouts ([#692](https://github.com/reliaburger/reliaburger/issues/692));
+  GitOps config in Raft ([#693](https://github.com/reliaburger/reliaburger/issues/693));
+  a real live-voter guard and odd council sizes
+  ([#694](https://github.com/reliaburger/reliaburger/issues/694)); faults that
+  revert after a Bun crash ([#699](https://github.com/reliaburger/reliaburger/issues/699));
+  OOM protection and host resolvers ([#700](https://github.com/reliaburger/reliaburger/issues/700));
+  init-container images and GPU refusal ([#701](https://github.com/reliaburger/reliaburger/issues/701));
+  selector-based Kubernetes import ([#703](https://github.com/reliaburger/reliaburger/issues/703));
+  an offline root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
+  static builds ([#401](https://github.com/reliaburger/reliaburger/issues/401));
+  Raft snapshot encryption ([#402](https://github.com/reliaburger/reliaburger/issues/402));
+  keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619)).
 - **Known bugs and flakes.** The open one, the `oci_crash` flake
   ([#526](https://github.com/reliaburger/reliaburger/issues/526)), is in
   [0.2.0](https://github.com/reliaburger/reliaburger/milestone/3); the open

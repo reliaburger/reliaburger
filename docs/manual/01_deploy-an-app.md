@@ -111,6 +111,14 @@ council, so any node gives the same answer. Raise the budget, or shrink or
 delete other apps in the namespace, and the next scheduling pass (a few seconds
 later) places the app and clears the reason.
 
+The same budget covers jobs. The leader charges each job attempt it lets start
+against the namespace's `cpu`, `memory` and GPU budget, after the namespace's
+apps, so a job never displaces an app that fits. A job with no room waits
+instead of failing, and `relish batch-status ID` says why (`waiting for quota:
+namespace "shop" would exceed CPU quota: …`). Running attempts are never
+stopped; new ones start as old ones finish. `max_apps` and `max_replicas`
+count apps only. See "Execution and capacity limits" in the batch jobs chapter.
+
 A `[namespace]` block can also give the namespace its own secret key with
 `secret_key = true`, so its encrypted values don't decrypt anywhere else. See
 "A key per namespace" in the security chapter.
@@ -261,23 +269,41 @@ revision. A failed migration leaves the old revision in place and does not
 retry automatically. A corrected apply can start a new generation after a
 known failure is settled.
 
-Cluster migration cancellation is checked after job settlement and immediately before desired-state publication is proposed. A transaction already submitted to Raft may still commit. Ownership-write timeouts return uncertainty and retain the fence; they do not authorize automatic reruns or imply that the proposal was rejected.
+The apply is a durable deployment operation. If the client disconnects or the
+leader changes, the new leader resumes it from the same runs. Cancellation is
+checked after the migration settles and immediately before the new revision is
+published; a publication already submitted to Raft may still commit. A write
+timeout returns uncertainty rather than a refusal, and never authorises an
+automatic rerun.
 
-The cron example is for a standalone node. Cluster apply refuses any manifest
-containing recurring schedules before changing desired state or launching work.
-It also refuses an overlapping app or job while an earlier cluster job claim
-has an uncertain outcome. Leadership changes or recovery preserve that fence;
-there is no automatic expiry or replay of an uncertain migration.
+The cron example works on a cluster as well as a standalone node. Once the
+apply publishes its apps, the leader registers each schedule as a durable
+definition and claims every matching UTC minute itself, so a leader change
+neither loses nor repeats an occurrence. An app or job whose name an unsettled
+deployment still owns is refused until that deployment settles, and apply
+refuses an overlapping app or job while an earlier run of it still has an
+uncertain outcome. Leadership changes or recovery preserve that fence; there is no automatic expiry or replay of an
+uncertain migration.
 
-A failed ordinary job retries up to three times. A job whose exit Bun couldn't observe
-(say, the node crashed) is `unknown`, and an ordinary apply won't rerun it,
-because it may already have done its work. Check, then ask explicitly:
+A failed ordinary job gets four attempts in all, unless it sets `max_attempts`.
+A job whose exit Bun couldn't observe (say, the node crashed) is `unknown`, and
+nothing reruns it automatically, because it may already have done its work.
+Cron skips that job's occurrences until the outcome is settled. Check what the
+job did, then acknowledge the exact grant the status shows:
 
 ```sh
-relish apply jobs.toml --rerun-jobs
+relish --output json batch-status 42
+relish batch replay 42 --node worker-2 --grant-digest DIGEST --acknowledge-side-effects
 ```
 
-Cron doesn't catch up: firings missed while a node was down are skipped.
+`relish apply jobs.toml --rerun-jobs` is a different thing: it starts a fresh
+apply operation, so jobs that already succeeded run again. It doesn't clear an
+unknown outcome; while one remains, the cluster refuses the new run with
+"acknowledge replay before another admission".
+
+Cron doesn't catch up: firings missed while the cluster had no leader are
+skipped. The policy fields (`max_attempts`, `task_timeout_secs`, `overlap` and
+`replay_unknown`) and the cron dialect are in [Batch jobs](14_batch-jobs.md).
 
 ## Task arrays
 
@@ -317,53 +343,21 @@ lost with a worker's disk; accepted aggregate counts remain replicated.
   Batch jobs must be non-scheduled and have no `run_before` declarations. Use
   ordinary apply for cron schedules and jobs that gate apps in the same manifest.
 
-Repeated batches may reuse a logical job label; each gets a distinct execution
-identity. Status and logs retain the original namespace and label for token
-scope. Select an explicit instance to read one run, especially when a label also
-names an older opaque execution. The cluster retains execution ownership after
-terminal progress records expire, and each runner retains replay proof after
-retirement. This history is finite: the cluster index is limited to 131,072
-entries or 32 MiB, and each runner's checkpoint to 16 MiB. Full history refuses
-new admissions while preserving existing runs and their replay fences. Further
-admissions then require a fresh cluster.
+Every job, whether it comes from `relish apply`, `relish batch` or a cron
+schedule, runs through the same lifecycle: the leader records it as a run and
+grants its tasks to nodes with room. Repeated batches may reuse a job name;
+each submission gets its own run ID. Select `--instance run-ID` to read or
+follow one run's logs; a follow goes to the node that holds the run's task.
 
-Clustered batches require fresh capacity reports received in the current
-leadership term from a live report publisher. Batch reservations and committed
-app placements share one capacity budget, including work not yet reported by a
-worker. Missing or expired reports return 503 rather than assuming spare
-capacity. Durably retired workers cannot receive new assignments or delayed
-first launches.
-
-Planning and registration are bounded to five seconds. A registration timeout
-returns 503 without dispatching; a late committed reservation remains held.
-Unknown dispatch or runtime outcomes also retain capacity until positive exit
-evidence or explicit fenced retirement. Repeated public submissions receive
-new execution identities; a 503 does not prove an earlier reservation vanished.
-
-A batch admission response of 503 can mean its acknowledgement was lost after
-publication started. That original owned attempt may still run. Retrying the
-same internal dispatch preserves the attempt and cannot launch a second one.
-An ownership metadata timeout admits no work. OCI executions whose container
-resource absence is unproven retain their full replay record, using more of
-the finite node history than compact retirement proofs.
+Apps and jobs share each node's capacity. A node keeps one execution budget for
+its CPU and memory requests: app replicas, running task attempts and reusable
+executors all lease from it, and a queued task holds nothing until it starts.
+Each node's state report carries what its task attempts and executors hold,
+apart from its app requests, and the leader adds both together before it places
+a replica. So a node that jobs have filled looks full, and the leader puts the
+replica somewhere else. If jobs take the room after a replica was placed, the
+node can't start it: its agent reports the refusal, and the leader moves the
+replica to another node instead of waiting there. Running attempts are never
+stopped to make room for an app.
 
 Directory defaults support `image`, `memory`, `cpu`, `[env]` and `[deploy]`. Child directories override individual fields; environment and deployment tables merge by key, and explicit workload values win. Common fields apply to jobs too, while deployment strategies apply to apps. Unknown defaults keys fail compilation.
-
-For a batch log follow, select the execution's instance ID. A cluster reader
-checks the committed allocation and follows that worker, even when an ordinary
-app has the same submitted label. It refuses a missing or unadvertised worker,
-or an allocation whose progress record has already been pruned, before opening
-an SSE or WebSocket stream. Stored log queries still use the original logical
-label; retained replay ownership does not itself supply a remote follow route.
-Predictable node policy rejection happens before the whole group's checkpoint,
-so correcting a rejected member does not leave healthy jobs permanently fenced.
-
-Held migration and ordinary-job claims also protect placement capacity. These
-jobs run on the receiving leader; the claim records no authoritative worker
-assignment. Both app and batch planners therefore reserve the complete held
-CPU/memory request on every candidate, without crediting a guessed replica or
-an unrelated report. Before app publication this includes all jobs; afterwards
-it includes only the ordinary tail. This can over-reserve capacity, including
-capacity already reported locally. It prevents new placements from spending
-uncertain commitments; it does not add initial job capacity or quota admission.
-Positive terminal settlement releases the corresponding held request.

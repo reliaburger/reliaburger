@@ -95,36 +95,53 @@ Stopped.
 
 ### Jobs and cron
 
-Jobs record execution intent and their three-retry budget before launching, and
-Bun replacement restores that budget. An observed failure can retry after
-confirmed cleanup. An unknown exit status stays `unknown`, including across
-further restarts, and ordinary apply won't repeat it. After checking the job's
-external effects, explicitly request a new run on the same node:
+This section describes 0.2.0, not in 0.1.6: build matching development binaries
+and start a fresh cluster to try it. The [job manual](manual/14_batch-jobs.md)
+covers it in full.
+
+Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
+definition, a run with a trigger identity, and indexed tasks the leader hands to
+workers with room for them. A TOML job sets its policy with the manifest's field
+names: `max_attempts` (default 4, or 1 for a hook), `task_timeout_secs` (default
+no deadline, or 600 seconds for a hook), `overlap` for cron and
+`replay_unknown`. An observed failure can retry after confirmed cleanup. An
+unknown outcome stays `unknown` across restarts and is never replayed
+automatically unless the job set `replay_unknown = true`. After checking the
+job's external effects, acknowledge the exact grant:
 
 ```sh
-relish apply jobs.toml --rerun-jobs
+relish batch replay 42 --node worker-2 --grant-digest DIGEST --acknowledge-side-effects
 ```
 
-The manifest must contain only non-scheduled jobs. The API requires user
-deployment authority and workload scope; internal service credentials can't
-authorise a rerun. Explicit stop cancels pending retries but keeps an unknown
-outcome.
+`relish apply jobs.toml --rerun-jobs` only starts a fresh apply operation, so
+succeeded jobs run again; it doesn't clear an unknown outcome. The replay API
+requires user deployment authority and workload scope; internal service
+credentials can't authorise it.
 
-Cron registrations and their latest claimed UTC minute persist before apply,
-stop or launch is acknowledged, and Bun restores them before serving the API.
-Missed minutes are skipped, and a crash between recording a firing and launching
-it can skip that occurrence too. There's no catch-up and no exactly-once
-promise. If a cron checkpoint write fails, Bun fences further cron changes and
-firings until it restarts and reloads its state.
+Cron schedules are UTC and use the Kubernetes CronJob dialect, including names
+and `@daily`-style macros. Cluster and standalone apply both register them, and
+the leader claims each matching minute durably. Missed minutes are skipped;
+there's no catch-up and no exactly-once promise. A job with an unknown outcome
+skips later occurrences until it's settled.
+
+`relish run --batch`, `relish batch FILE` and `relish batch submit` print an
+idempotency key before sending. If a submission times out, retry with
+`--idempotency-key KEY` and the cluster returns the runs it already admitted.
+Manifests and JSON `tasks` refuse unknown fields, so a typo fails at
+`--dry-run` rather than falling back to defaults.
+
+Each job definition keeps its last ten run outcomes after a run's own detail
+is pruned (`relish jobs --definitions`, and the dashboard's job card). The
+leader records one event per run, never per task, and sends failed and
+unknown-outcome runs to the alert webhooks. Every node exports `job_*`
+counters, a duration histogram and task CPU and memory, labelled only by
+namespace, definition, profile and node, and `relish top` lists running array
+tasks. See [job history, metrics and events](manual/14_batch-jobs.md#job-history-metrics-and-events).
 
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations; keep using the same node endpoint for a
 lease's lifetime. Creation needs an unscoped credential and the server's
-isolated-workload test grant. Ordinary cluster apply forwards jobs to the
-leader and reserves their identities until positive terminal settlement;
-there is no ordinary job placement across workers. Leased test work stays on
-the receiving node. Cluster apply refuses recurring schedules; register cron
-on a standalone node.
+isolated-workload test grant. Leased test work stays on the receiving node.
 
 Apply `run_before` migrations and their dependent apps together in the same
 namespace. The cluster records ownership before execution and publishes app
@@ -401,7 +418,7 @@ selects ignored tests only and fails if its filter finds no tests. Target-specif
 macOS. Retries are disabled.
 
 The deferred Apple Container adapter has manual development tests on Apple silicon;
-these are not a 0.1.0 acceptance gate. See the [test harness design](design/test-harness.md)
+these aren't a release acceptance gate. See the [test harness design](design/test-harness.md)
 for the audit, exact suite contracts and CI mapping.
 
 ### Benchmarks
@@ -414,9 +431,13 @@ make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
 
-CI runs both on pushes to `main`, nightly, and on pull requests that touch
-`src/mustard/` or `benches/`. Nothing gates on the numbers yet, so other pull
-requests skip the release build.
+CI runs all three on pushes to `main` and nightly. A pull request runs the
+gossip benchmarks when it touches `src/mustard/` or the gossip benches, and the
+task-array benchmarks when it touches the task-array leader, node pool,
+executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
+nothing; the task-array job fails only on a benchmark more than twice as slow
+as main's last baseline, and keeps its Criterion output for 90 days
+([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
 
@@ -496,7 +517,7 @@ The agent prints its version, the commit it was built from, and the runtime
 it selected on startup:
 
 ```
-bun: reliaburger node agent v0.1.0 (3fcb1fd)
+bun: reliaburger node agent v0.2.0-dev (3fcb1fd)
 bun: auto-detected runtime: process
 bun: API server listening on 127.0.0.1:9117
 ```
@@ -528,11 +549,15 @@ lease ownership must also be unscoped, for both inspection and cleanup.
 configuration; no security switch needs hand-editing:
 
 ```sh
-target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
 sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
-The output directory is created if it doesn't exist. Leave Bun running and,
+The output directory is created if it doesn't exist. As root on Linux with
+`runc` installed, `relish init` also turns on `[ebpf]` and `[dns]`, so
+namespace isolation is enforced from the first deploy (build Bun with
+`--features ebpf`; it refuses to start a rootful runc node without the data
+path). Leave Bun running and,
 from another terminal, mint the first administrator token over the generated
 cluster CA before doing anything else:
 
@@ -719,16 +744,23 @@ Requirements:
 - **Signatures.** Network upgrades need two Ed25519 signatures over the
   binary: one from the release key set compiled into the running binary, and
   one from the operator key configured as `upgrades.external_signing_key` in
-  node.toml (generate one with `relish dev keygen`). Air-gapped
+  node.toml (generate one with `relish dev keygen`). Published metadata
+  carries only the release signature, so `relish upgrade start <version>`
+  countersigns each download with `--external-key` (or takes a countersigned
+  `--sig`), picking the build for the platform each node reports. Air-gapped
   `upgrade start --binary` needs only the release signature (expects
   `{binary}.sig` alongside the file — see `relish dev sign-binary`).
 - **A versioned binary directory** (default: the directory of the running
   executable): `bun` is a symlink to `bun-vX.Y.Z`; previous versions are
   retained for rollback (`upgrades.retain_versions`, default 3).
-- **Matching formats.** The leader runs `bun --compatibility` on a verified
-  candidate before recording a cluster upgrade and refuses one with a different
-  protocol or state format; a cluster rollback is refused when a node's binary
-  directory lacks the target (`installed_versions` in `GET /v1/version`).
+- **Matching formats.** Until 1.0 a rolling upgrade works only between builds
+  with the same protocol and state format, and every release so far changed
+  one, so moving between releases means a fresh cluster. `relish upgrade check`
+  reads each release's pair from the metadata and says so. The leader runs
+  `bun --compatibility` on a verified candidate before recording a cluster
+  upgrade and refuses one with a different protocol or state format; a cluster
+  rollback is refused when a node's binary directory lacks the target
+  (`installed_versions` in `GET /v1/version`).
 
 The release private key must live outside any repository. The project key's
 public half is compiled into `src/upgrade/keys.rs`; rotating it means shipping
@@ -944,6 +976,7 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
+| [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
 
 ### Images, the pull-through cache, and cluster registries (Phase 12)
 
@@ -1068,7 +1101,7 @@ path = "/import"
 source = "/srv/import"              # host path: never chowned by Bun
 ```
 
-A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning.
+A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning. A node mounts a host path only under a prefix in its `[storage] allowed_host_paths` (empty by default, so every host path is refused) and never its own storage or security directories; a token with a `[permission]` block also needs `host-exec` to deploy one.
 
 A managed volume stays on its node, and so does its app: restarting Bun, rebooting or losing the node from gossip never moves it to a node with an empty volume. While its node is away the app waits, `relish status` and `relish inspect` name the node, and `relish wtf` reports it as critical. `relish decommission-node <node> --workloads-stopped --reason <why>` (or new `placement.required` labels) is the explicit way to move it, onto a new, empty volume.
 
@@ -1155,6 +1188,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
 | `GET` | `/v1/chaos/status` | Show the replicated node-experiment reservation, if any |
+| `GET` | `/v1/audit` | Read the node's durable audit log (`since`, `until`, `action`, `principal`, `namespace`, `limit`; `cluster=true` merges every node). Unscoped Admin with cluster-wide `admin`, never the service principal |
 
 The CLI uses this API internally. You can also call it directly:
 
@@ -1258,7 +1292,10 @@ failures and the hard safety limit fail the suite.
 (60 seconds at concurrency 27 by default), with fresh-container, host-process
 and local Linux VM-baseline scenarios alongside. Each runs a no-op command, so
 it measures per-job overhead rather than real work; see the batch manual for
-prerequisites and resource profiles.
+prerequisites and resource profiles. `--compare OLD.json` checks a scenario
+against an earlier report of the same scenario and fails on a drop beyond
+`--tolerance` (10% by default). The 100-million-a-day claim itself needs the
+24-hour job qualification (`scripts/release/qualify-jobs-sustained.sh`).
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
@@ -1430,7 +1467,13 @@ machines.
   receipts never satisfy GitHub CI aggregation. With `GITHUB_ACTIONS=true`,
   the command requires trusted current checkout/run/attempt/output inputs
   and refuses manual options. The same build and isolated groups run once in
-  both modes; compiler overrides require a separate audit.
+  both modes; compiler overrides require a separate audit. Each of its three
+  test binaries gets 420 s: one still running then gets SIGTERM, and SIGKILL
+  30 s later, so a hung test fails the run with its log kept. In CI the step
+  also has its own 25-minute limit. A watcher records free disk and memory
+  while it runs, and the step after it prints the low-water marks and, when
+  the step didn't pass, every process left running with its kernel stacks
+  ([#800](https://github.com/reliaburger/reliaburger/issues/800)).
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
   after the new kernel boot, including address retention until explicit
@@ -1454,45 +1497,30 @@ machines.
 They're one part of a release's acceptance, not all of it; the
 [release runbook](releasing.md) lists the gates a candidate has to pass.
 
-Held cluster jobs conservatively reserve their CPU/memory requests on every app or batch placement candidate until positive settlement. This can over-reserve; it does not add initial node-local job capacity admission.
+### Running jobs on a development build
 
-### Delegated jobs (0.2.0 development preview)
+The job lifecycle here is 0.2.0, not in 0.1.6. [Batch jobs](manual/14_batch-jobs.md)
+explains it: one-off jobs, cron, deployment hooks and task arrays, how they share
+resources with apps, namespace quotas and caps, retries, watching a run, and
+reading its results. The [burger manifest](../examples/demo/burger/jobs.toml)
+gives you mixed-size work to run beside a service. 0.2.0 changes the cluster's
+formats, so build matching development binaries and start a fresh cluster.
 
-[Batch jobs](manual/14_batch-jobs.md) explains compact arrays, atomic mixed-profile
-manifests, app/job resource accounting, watch summaries, indexed detail, retries
-and retention. The [burger manifest](../examples/demo/burger/jobs.toml) provides
-mixed-resource work beside a service. The standalone landing-page job recording
-uses the built-in `relish bench` scenarios. Build matching development binaries
-and use a fresh cluster (protocol 51 / state 68). The
-[implementation plan](plans/2026-10-04-plan-delegated-jobs.md) tracks correctness
-and the still-unqualified 100m/day sustained throughput target.
+Apps and jobs share each node's execution budget. State reports carry what a
+node's task attempts and executors hold, and the leader counts it when it
+places app replicas; a node that can't fit a placement reports the refusal and
+the replica moves.
 
-The [common job lifecycle plan](plans/2026-10-07-plan-common-job-lifecycle.md)
-describes #638: ordinary singleton jobs, arrays, durable UTC cron and deployment
-hooks share the definition/run/task/attempt lifecycle, resource admission and
-accepted-result machinery. Standalone admission persists before acknowledgement;
-conservative jobs retain unknown ownership until acknowledged replay.
+Image jobs run in a fresh container per attempt by default. Linux image jobs
+can set `runtime = "shared-runc"` to reuse a small pool of containers, with
+each command still in its own process under its own limits. Host jobs
+(`runtime = "process"`) run an allowlisted command; Linux `bun --runtime
+mixed`, or `auto` with runc installed, accepts them alongside containers. On
+rootful Linux, host task arrays enforce CPU and memory limits; other host jobs
+refuse limits.
 
-Linux image jobs can choose `runtime = "shared-runc"` to retain bounded,
-compatible owned containers while starting a separate limited process for each
-command. Idle profiles and helper resources stay charged to the application/task
-budget; uncertain cleanup retires the whole container before reuse. Fresh
-containers remain the default. Linux `--runtime mixed`, or `auto` with runc
-installed, accepts explicit `runtime = "process"` jobs alongside containers;
-explicit `--runtime runc` stays container-only and `--runtime process` host-only.
-On rootful Linux, host batches use bounded native executors that enforce
-explicit CPU/memory limits before each fresh command starts; ordinary host jobs
-and other platforms refuse limits. Host applications retain their existing
-runtime contract. Verified duration summaries let fast workers queue bounded
-lookahead across control-report rounds; execution still waits for concurrency
-and resources.
-
-The [executor and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md)
-tracks reusable executors (#639), the demonstration (#640) and the
-still-unqualified sustained target (#668). The
-[timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
-record each runtime's per-job overhead for 60 seconds on a small VM, with the
-rig, profiles and limits, and four completed one-hour soaks beside a live
-application; global storage bounds and daily qualification remain in #668. The
-[earlier evidence](qualification/2026-10-08-job-measurements/README.md) keeps
-the recovery results. Resident model workers (#641) remain separate.
+The landing page's job recording uses the built-in `relish bench` scenarios.
+The [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
+record what each kind of job costs for 60 seconds on a small VM, with the rig
+and its limits. The sustained target of 100 million jobs a day isn't qualified
+yet (#668), and resident model workers (#641) are a separate, later feature.

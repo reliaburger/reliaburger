@@ -469,11 +469,16 @@ impl RuncGrill {
                 // The original launch is sealed and its entire descendant tree
                 // reaped. Retain intent until the independently limited sibling
                 // is empty; recovery must never clear this obligation early.
-                tokio::fs::write(task.join("cgroup.kill"), "1").await?;
-                let events = tokio::fs::read_to_string(task.join("cgroup.events")).await?;
-                if !events.lines().any(|line| line == "populated 0") {
-                    return Err(io::Error::other("reusable task cgroup has not retired"));
-                }
+                let group = task.clone();
+                tokio::task::spawn_blocking(move || {
+                    let method = crate::grill::kernel::executor_support().group_kill;
+                    crate::grill::kernel::kill_group(&group, method)
+                })
+                .await
+                .map_err(io::Error::other)?
+                .map_err(|error| {
+                    io::Error::other(format!("reusable task cgroup has not retired: {error}"))
+                })?;
                 tokio::fs::remove_dir(&task).await?;
             }
         }
@@ -942,6 +947,53 @@ impl RuncGrill {
     }
 
     /// Return original requests independently of agent adoption records.
+    /// Delete a retired instance's bundle, journal and lock file (#678).
+    /// Refuses, deleting nothing, while its generation is unretired, still
+    /// cached as live, holds an address or has OCI state or a mounted rootfs.
+    pub(super) async fn owned_forget_retired(&self, instance: &InstanceId) -> io::Result<()> {
+        let expected = self.intent_journal()?.observe(instance).await?;
+        let runtime = self.clone();
+        let id = instance.clone();
+        tokio::spawn(async move {
+            let _lifecycle = runtime.lock_lifecycle(&id).await;
+            let ownership = runtime.ownership()?;
+            if ownership.contexts.lock().await.contains_key(&id) {
+                return Err(io::Error::other("runtime generation still owns resources"));
+            }
+            let claim = runtime.intent_journal()?.claim(&id, expected).await?;
+            if claim
+                .record()
+                .is_some_and(|record| !matches!(record.phase, IntentPhase::Retired { .. }))
+            {
+                return Err(io::Error::other("runtime generation has not retired"));
+            }
+            let state = runtime.state_dir.join(&id.0);
+            let bundle = runtime.bundle_base.join(&id.0);
+            tokio::task::spawn_blocking(move || {
+                if std::fs::symlink_metadata(&state).is_ok() {
+                    return Err(io::Error::other("retired instance still has OCI state"));
+                }
+                match std::fs::symlink_metadata(&bundle) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
+                    Ok(_) => {}
+                }
+                // remove_dir_all would descend into a live overlay.
+                if crate::grill::rootfs::is_mountpoint(&bundle.join("rootfs")) {
+                    return Err(io::Error::other("retired instance still mounts its rootfs"));
+                }
+                std::fs::remove_dir_all(&bundle)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            claim.forget().await?;
+            runtime.forget_launcher(&id).await;
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     pub(super) async fn owned_inventory(
         &self,
     ) -> Result<Option<Vec<crate::grill::RuntimeLaunch>>, GrillError> {

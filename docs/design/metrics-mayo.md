@@ -282,6 +282,17 @@ Note: `node_memory_usage_percent` and `node_disk_usage_percent` (which the built
 
 Instances without a PID are skipped. There are no counters here, no restart/OOM/throttle metrics, and no cgroup-derived limits.
 
+**Job metrics: implemented (#684).** Array tasks and job singletons run in the task executor, outside the supervisor, so they have no instance status and no `process_*` samples. Instead each node's executor feeds a `JobTelemetry` (`src/mayo/job_metrics.rs`) every time the leader syncs it, with each run's live counters on that node, and the collection loop exports it. Labels are fixed: `namespace`, `definition` (job or array name), `profile` (a manifest's resource profile, `default` otherwise) and `node`, plus `le` on histogram buckets. A task index or run id is never a label, and a node keeps at most 1,024 label sets (the longest-idle set without running attempts goes first). The counters live on the node that ran the attempts, so a leader change doesn't reset them; a node restart does, like any Prometheus counter.
+
+| Metric | Kind |
+|--------|------|
+| `job_attempts_started_total`, `job_tasks_succeeded_total`, `job_tasks_failed_total`, `job_task_retries_total` | Counters |
+| `job_tasks_running` | Gauge: attempts holding a slot (busy executor slots for reusable runtimes) |
+| `job_task_duration_ms_bucket{le}`, `job_task_duration_ms_count` | Cumulative final-attempt duration buckets, 1 ms to 16,384 ms plus `+Inf` |
+| `job_cpu_percent`, `job_memory_bytes` | Gauges for the running attempts: each reusable executor's cgroup and each fresh runtime's cgroup on Linux (`cpu.stat` `usage_usec` deltas, `memory.current`); the process via `sysinfo` where the runtime has no cgroup |
+
+An executor's cgroup holds its helper as well as its task groups, so the sample includes the helper's small overhead. `relish top` reads the same telemetry for its job rows.
+
 **GPU metrics: none.** There is no `nvidia-smi` collection; no `*_gpu_*` metric is emitted.
 
 **Ingress metrics: implemented (counters), planned (durations).** The Wrapper proxy maintains a process-global `IngressMetrics` and Bun's collection loop emits `ingress_requests_total`, `ingress_responses_1xx`..`5xx`, and `ingress_requests_in_flight`. Per-route breakdowns and `ingress_request_duration_seconds` histograms remain **planned -- not yet implemented**.
@@ -317,7 +328,7 @@ Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the
 
 ### 5.6 Alert Evaluation
 
-The alert loop runs when `metrics.alerts_enabled` is set (default true), every `alerts.evaluation_interval_secs` (default **30**, not 15). Each tick, `gather_latest_values` reads the last 120 seconds of metrics, keeps the newest reading per `(metric_name, labels)` series, drops any reading older than a 90-second freshness bound, derives the memory/disk usage percentages *within* a label set, then collapses to one value per metric name (freshest series wins, deterministic tie-break). The evaluator (`src/mayo/alert.rs`) applies each rule to that value.
+The alert loop runs when `metrics.alerts_enabled` is set (default true), every `alerts.evaluation_interval_secs` (default **30**, not 15). Each tick, the loop reads the clock once and `gather_latest_values(store, now)` reads the metrics from 120 seconds before that instant onwards, keeps the newest reading per `(metric_name, labels)` series, drops any reading older than a 90-second freshness bound, derives the memory/disk usage percentages *within* a label set, then collapses to one value per metric name (freshest series wins, deterministic tie-break). The evaluator (`src/mayo/alert.rs`) applies each rule to that value.
 
 **Built-in alert rules (5, always active, node-scoped):**
 
@@ -363,6 +374,8 @@ Note the real shape: `severity`/`status` are lowercase strings; `value` is the n
 
 **Retry policy:** failed deliveries are retried 3 times with backoff (1s, 5s, 25s); after that the delivery is dropped with a log. There is no `mayo_alert_notification_failed_total` counter. Failure logs redact the URL to scheme+host so a Slack webhook path (which carries the secret) is never written to disk.
 
+**Job runs (#684).** The leader also sends a built-in notification through the same dispatcher for every job run that ends with a failed task (`job_run_failed`) or whose outcome becomes unknown after its owner went quiet (`job_run_unknown_outcome`). It's a critical, firing-only alert with labels `job`, `namespace` and `run`, so each run is its own PagerDuty incident; nothing resolves it. The leader derives these from the replicated job state, not from task results (`src/bun/job_events.rs`), so a million-task run sends one. A new leader takes a silent first snapshot, so a leader change never re-announces retained runs; a run that finishes in the second before the change can go unannounced, and its outcome stays in the definition's history.
+
 **HTTPS enforcement / `--allow-insecure-webhooks`: Status: planned -- not yet implemented.** HTTP webhook URLs are accepted; there is no scheme validation and no insecure-override flag.
 
 ### 5.8 Alert Suppression and Tuning Per-App
@@ -406,9 +419,10 @@ rollup_interval_secs = 60
 # Prunes rollups past this age on the disk-pressure tick (see §3.3).
 rollup_retention_hours = 24
 
-# Maximum local metrics Parquet storage (MB). 0 = unlimited (the default).
-# When exceeded, exported files are pruned oldest-first (see §7.1).
-max_storage_mb = 0
+# Maximum local metrics Parquet storage (MB). Default: 1024. 0 = unlimited.
+# When exceeded, files are pruned oldest-first (see §7.1). Bun refuses to
+# start with a cap larger than the filesystem holding its data directory.
+max_storage_mb = 1024
 
 # Optional export destination for metrics Parquet files
 # (local path, file://, s3://, gs://). Default: unset.
@@ -458,7 +472,7 @@ The push interval is `metrics.rollup_interval_secs` (§6.1). The consistent-hash
 **Behaviour (`src/bun/disk_pressure.rs`):**
 
 1. If `export_path` is set, un-exported Parquet files are shipped to the destination first (via `object_store`), and only files whose exact bytes are recorded in the export checkpoint become eligible for deletion.
-2. Files are then pruned **oldest-first by mtime** when either they are past `retention_days` or total size exceeds `max_storage_mb`. With `max_storage_mb = 0` (the default) only the retention cutoff prunes.
+2. Files are then pruned **oldest-first by mtime** when either they are past `retention_days` or total size exceeds `max_storage_mb`. The cap defaults to 1024 MB (#678); `max_storage_mb = 0` is an explicit opt-out, and then only the retention cutoff prunes.
 3. Ingestion is never blocked; there is no in-memory ring-buffer degraded mode and no dedicated `mayo_storage_exhausted` alert.
 
 **Recovery:** pruning is idempotent and runs each pressure check; once usage is back under the threshold nothing is deleted.

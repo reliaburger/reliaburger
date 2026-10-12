@@ -22,6 +22,16 @@ impl RuntimeRole {
     const ALL: [Self; 2] = [Self::Launcher, Self::RootlessNetwork];
 }
 
+/// How long admission waits for an earlier short command to retire.
+///
+/// The independent owner retires a command once it exits, whoever started
+/// it. A caller that went away (a dropped state read, or a Bun that exec'd
+/// into an upgrade) can leave one still finishing when the next caller is
+/// admitted, and refusing at once made a freshly exec'd Bun fail adoption
+/// and exit (#734). A command still running after this long is treated as
+/// stuck, and admission refuses as before.
+const EARLIER_COMMAND_RETIREMENT: Duration = Duration::from_secs(5);
+
 /// Command admission and retirement for one exclusively claimed OCI generation.
 ///
 /// Each operation retains the claim until its worker finishes, even when its
@@ -265,7 +275,7 @@ impl IntentCommands {
                 return Err(io::Error::other("runtime role admission is sealed"));
             }
             self.validate_roles().await?;
-            self.require_terminal_commands().await?;
+            self.await_terminal_commands().await?;
             if self
                 .record()
                 .ok_or_else(|| io::Error::other("missing runtime intent"))?
@@ -409,7 +419,7 @@ impl IntentCommands {
                 ));
             }
             self.validate_roles().await?;
-            self.require_terminal_commands().await?;
+            self.await_terminal_commands().await?;
             self.commands
                 .prune_retired()
                 .await
@@ -518,16 +528,65 @@ impl IntentCommands {
     }
 
     async fn require_terminal_commands(&self) -> io::Result<()> {
-        for id in self.commands.inventory().await.map_err(io::Error::other)? {
-            if !matches!(
-                self.commands.state(&id).await.map_err(io::Error::other)?,
-                CommandState::Cancelled | CommandState::Retired { .. }
-            ) {
-                return Err(io::Error::other(
-                    "an earlier runtime command has not retired",
-                ));
+        match self.unretired_command().await? {
+            None => Ok(()),
+            Some(unretired) => Err(earlier_command_running(&unretired)),
+        }
+    }
+
+    /// Admit new work once every earlier command has retired, waiting up to
+    /// [`EARLIER_COMMAND_RETIREMENT`] for one that is still finishing.
+    async fn await_terminal_commands(&self) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + EARLIER_COMMAND_RETIREMENT;
+        while let Some(unretired) = self.unretired_command().await? {
+            // This claim is exclusive and every caller keeps it from prepare
+            // through start, so a Prepared command here has no caller left:
+            // its process exec'd or failed before starting the owner. Nothing
+            // will ever start it, so waiting can't help (#812). Cancel it,
+            // which also fences a bootstrapper still on its way.
+            if let (id, CommandState::Prepared) = &unretired
+                && self
+                    .commands
+                    .cancel_unstarted(id)
+                    .await
+                    .map_err(io::Error::other)?
+            {
+                eprintln!(
+                    "bun: cancelled runtime command {} for {}: an earlier process prepared it but never started it",
+                    id.as_str(),
+                    self.claim.instance.0
+                );
+                continue;
             }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(earlier_command_running(&unretired));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok(())
     }
+
+    /// The first recorded short command that is not positively terminal,
+    /// with the state it was last seen in.
+    async fn unretired_command(&self) -> io::Result<Option<(CommandId, CommandState)>> {
+        for id in self.commands.inventory().await.map_err(io::Error::other)? {
+            let state = self.commands.state(&id).await.map_err(io::Error::other)?;
+            if !matches!(
+                state,
+                CommandState::Cancelled | CommandState::Retired { .. }
+            ) {
+                return Ok(Some((id, state)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Name the command that blocks admission and its state, so a refusal in a
+/// log says whether it was still running or never started.
+fn earlier_command_running((id, state): &(CommandId, CommandState)) -> io::Error {
+    io::Error::other(format!(
+        "an earlier runtime command has not retired ({} is {state:?})",
+        id.as_str()
+    ))
 }

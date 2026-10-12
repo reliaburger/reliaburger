@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 #[path = "support/cluster_harness.rs"]
 mod cluster_harness;
-use cluster_harness::TestHarness;
+use cluster_harness::{JOB_COMPLETION_WAIT, TestHarness};
 
 // ---------------------------------------------------------------------------
 // Integration tests
@@ -208,7 +208,7 @@ async fn job_runs_to_completion() {
     harness.client.apply(&config).await.unwrap();
 
     let status = harness
-        .wait_for_instance("migrate", Duration::from_secs(3), |status| {
+        .wait_for_instance("migrate", JOB_COMPLETION_WAIT, |status| {
             status.state == "stopped"
         })
         .await;
@@ -323,14 +323,20 @@ async fn tui_websocket_events_replay_deploy_event() {
         .await
         .unwrap();
     let mut socket = harness.client.ws_events().await.unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let event: reliaburger::bun::events::ClusterEvent =
-        serde_json::from_str(frame.to_text().unwrap()).unwrap();
-    assert_eq!(event.kind, reliaburger::bun::events::EventKind::Deploy);
+    // The apply's own audit record (`app.applied`) is replayed too, before
+    // or after the deploy event, so read until the deploy shows up.
+    let mut kinds = Vec::new();
+    while !kinds.contains(&reliaburger::bun::events::EventKind::Deploy) {
+        assert!(kinds.len() < 10, "no deploy event among {kinds:?}");
+        let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: reliaburger::bun::events::ClusterEvent =
+            serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        kinds.push(event.kind);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -610,8 +616,8 @@ async fn logs_json_field_filters_structured_lines() {
 async fn logs_follow_returns_output_for_completed_job() {
     let harness = TestHarness::start().await;
 
-    // Deploy a job (not an app) — the agent's check_jobs loop detects
-    // process exit and updates state, which lets follow_logs terminate.
+    // Deploy a job (not an app). Its run finishes on the common job
+    // lifecycle, which lets the follow terminate.
     let config = Config::parse(
         r#"
         [job.echoer2]
@@ -625,7 +631,7 @@ async fn logs_follow_returns_output_for_completed_job() {
     harness.client.apply(&config).await.unwrap();
 
     harness
-        .wait_for_instance("echoer2", Duration::from_secs(3), |status| {
+        .wait_for_instance("echoer2", JOB_COMPLETION_WAIT, |status| {
             status.state == "stopped"
         })
         .await;
@@ -1038,7 +1044,7 @@ async fn selected_common_run_logs_are_available_without_a_log_store() {
     .unwrap();
     harness.client.apply(&config).await.unwrap();
     let run = harness
-        .wait_for_instance("selected", Duration::from_secs(5), |row| {
+        .wait_for_instance("selected", JOB_COMPLETION_WAIT, |row| {
             row.state == "stopped"
         })
         .await;
@@ -1079,7 +1085,7 @@ async fn standalone_apps_and_common_definitions_cannot_share_a_logical_identity(
         .await
         .unwrap();
     harness
-        .wait_for_instance("job-first", Duration::from_secs(5), |row| {
+        .wait_for_instance("job-first", JOB_COMPLETION_WAIT, |row| {
             row.state == "stopped"
         })
         .await;

@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+TRUNCATED = b'\n[reliaburger: output written after exit truncated]\n'
 
 
 def text(value):
@@ -147,6 +148,19 @@ class ExecutorProtocol(unittest.TestCase):
     def test_embedded_nul_is_refused_without_executing(self):
         self.connection.sendall(command(1, ['/bin/true\0ignored']))
         self.assertEqual(self.connection.recv(1), b'')
+
+    def test_a_writer_paused_past_the_quiet_period_after_exit_gets_the_truncation_marker(self):
+        # #715: under CPU contention a flooding descendant can go unscheduled
+        # for longer than the helper's 10 ms quiet period after the command
+        # exits. SIGSTOP makes that pause deterministic. The helper stops
+        # reading while the descendant still holds the pipe, so whatever it
+        # writes once resumed is lost, and the output must say so.
+        code, output = self.execute(1, ['/bin/sh', '-c',
+            'while :; do echo flood; done & writer=$!; sleep 0.1; kill -STOP $writer; '
+            '(sleep 0.3; kill -CONT $writer) & exit 0'])
+        self.assertEqual(code, 0)
+        self.assertIn(b'flood', output[1])
+        self.assertTrue(output[2].endswith(TRUNCATED), output[2][-80:])
 
     def test_closed_connection_during_output_reaches_cleanup_instead_of_sigpipe(self):
         self.connection.sendall(command(1, ['/bin/sh', '-c', 'while :; do echo flood; done']))

@@ -233,19 +233,30 @@ impl UpgradeManager {
     /// different bytes under an existing version). A plain install with no
     /// store file yet falls back to the executable itself. Hashing a whole
     /// Bun binary is CPU work, so it runs on the blocking pool, once.
+    /// `bun` starts that work at boot with
+    /// [`UpgradeManager::spawn_running_binary_hash`]; a caller that arrives
+    /// while it is still running waits for the same result.
     pub async fn running_binary_sha256(&self) -> Option<String> {
+        hash_once(
+            &self.running_sha256,
+            self.store.binary_path(&self.running_version),
+        )
+        .await
+    }
+
+    /// Start hashing the running binary in the background, so the first
+    /// `/v1/version` request reads a cached digest instead of paying for it.
+    ///
+    /// A debug Bun is over 500 MB. Hashed on demand, the first request
+    /// waited seconds for it, longer than a joiner's deadline on a loaded
+    /// host (#765). The handle resolves once the cache is filled, or once
+    /// hashing has failed and the next caller will retry.
+    pub fn spawn_running_binary_hash(&self) -> tokio::task::JoinHandle<()> {
+        let cell = std::sync::Arc::clone(&self.running_sha256);
         let stored = self.store.binary_path(&self.running_version);
-        self.running_sha256
-            .get_or_try_init(|| async move {
-                tokio::task::spawn_blocking(move || hash_running_binary(&stored))
-                    .await
-                    .ok()
-                    .flatten()
-                    .ok_or(())
-            })
-            .await
-            .ok()
-            .cloned()
+        tokio::spawn(async move {
+            hash_once(&cell, stored).await;
+        })
     }
 
     /// Can this node accept a cluster (network) upgrade? Those directives
@@ -305,26 +316,42 @@ impl UpgradeManager {
         // when the bytes came from the network by either route (M5): a Pickle
         // fetch, or a single-node download staged as a local file.
         let is_network = directive.source.is_network() || directive.network_provenance;
-        signing::verify_binary(
-            &bytes,
-            &envelope,
-            &self.release_keys,
-            self.external_key.as_ref(),
-            is_network,
-        )?;
+        // Hashing and checking two signatures over a release-sized binary is
+        // seconds of CPU. Done in place it starved this worker's other tasks,
+        // the council's Raft core among them, and a node being upgraded
+        // called an election that deposed a healthy leader (#783). Writing
+        // the compatibility probe's private copy is the same size of work, so
+        // it runs here too, from the bytes just verified, instead of from a
+        // clone made on the worker (#794).
+        let release_keys = self.release_keys.clone();
+        let external_key = self.external_key;
+        let checked = envelope.clone();
+        let probe_directory = self
+            .store
+            .symlink_path()
+            .parent()
+            .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))?
+            .to_path_buf();
+        let (bytes, probe) = tokio::task::spawn_blocking(move || {
+            let probe = signing::verify_binary(
+                &bytes,
+                &checked,
+                &release_keys,
+                external_key.as_ref(),
+                is_network,
+            )
+            .and_then(|()| super::compatibility::write_probe(&bytes, &probe_directory));
+            (bytes, probe)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
 
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=signature-verified-probe-begin elapsed={:?}",
             fixture_phase_started.elapsed()
         );
-        super::compatibility::check_binary(
-            bytes.clone(),
-            self.store.symlink_path().parent().ok_or_else(|| {
-                UpgradeError::IncompatibleBinary("binary directory is missing".into())
-            })?,
-        )
-        .await?;
+        super::compatibility::query_probe(probe?).await?;
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=compatibility-probe-end elapsed={:?}",
@@ -401,46 +428,51 @@ impl UpgradeManager {
 
         let (bytes, envelope) = self.fetch_verified(directive, Fetch::Retrying).await?;
 
-        // First upgrade from an un-versioned install: adopt the running
-        // binary into the store so rollback has something to return to.
-        self.adopt_running_binary_if_missing()?;
+        let stem = self
+            .store
+            .symlink_path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("bun")
+            .to_string();
+        let marker = UpgradeMarker {
+            schema: 1,
+            upgrade_id: directive.upgrade_id.clone(),
+            previous_version: self.running_version.clone(),
+            previous_binary: self.running_version.file_name(&stem),
+            target_version: directive.target_version.clone(),
+            target_binary: directive.target_version.file_name(&stem),
+            phase: MarkerPhase::Staged,
+            boot_attempts: 0,
+            pre_upgrade_instances,
+        };
 
         #[cfg(test)]
         let fixture_stage_started = std::time::Instant::now();
         #[cfg(test)]
         eprintln!("upgrade-fixture phase=stage-begin");
-        self.store
-            .stage(&directive.target_version, &bytes, &envelope)?;
+        // Staging reads, hashes, writes and syncs the whole binary: blocking
+        // work, kept off the runtime for the same reason as the signature
+        // check (#783). The marker goes with it: its two syncs waited behind
+        // the binary's own on a busy disk, for up to half a second (#794).
+        let store = self.store.clone();
+        let running_version = self.running_version.clone();
+        let marker_path = self.marker_path.clone();
+        let marker = tokio::task::spawn_blocking(move || -> Result<_, UpgradeError> {
+            // First upgrade from an un-versioned install: adopt the running
+            // binary into the store so rollback has something to return to.
+            adopt_running_binary_if_missing(&store, &running_version)?;
+            store.stage(&marker.target_version, &bytes, &envelope)?;
+            marker.store(&marker_path)?;
+            Ok(marker)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=stage-end elapsed={:?}",
             fixture_stage_started.elapsed()
         );
-
-        let marker = UpgradeMarker {
-            schema: 1,
-            upgrade_id: directive.upgrade_id.clone(),
-            previous_version: self.running_version.clone(),
-            previous_binary: self.running_version.file_name(
-                self.store
-                    .symlink_path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("bun"),
-            ),
-            target_version: directive.target_version.clone(),
-            target_binary: directive.target_version.file_name(
-                self.store
-                    .symlink_path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("bun"),
-            ),
-            phase: MarkerPhase::Staged,
-            boot_attempts: 0,
-            pre_upgrade_instances,
-        };
-        marker.store(&self.marker_path)?;
 
         Ok(Some(PreparedUpgrade { marker }))
     }
@@ -579,12 +611,17 @@ impl UpgradeManager {
         // An envelope with an external signature is verified as a network
         // artefact (both signatures required); otherwise just the embedded one.
         // Hashing a whole Bun binary is too slow for an async task, and one
-        // read serves both the signature check and the compatibility check.
+        // read serves both the signature check and the compatibility probe's
+        // private copy, written on the same blocking thread (#794).
         let binary = self.store.binary_path(&target);
         let envelope_path = self.store.envelope_path(&target);
+        let probe_directory = binary
+            .parent()
+            .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))?
+            .to_path_buf();
         let release_keys = self.release_keys.clone();
         let external_key = self.external_key;
-        let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, UpgradeError> {
+        let probe = tokio::task::spawn_blocking(move || {
             let bytes = std::fs::read(&binary)?;
             if let Ok(envelope) = SignatureEnvelope::load(&envelope_path)
                 && !envelope.embedded.is_empty()
@@ -597,17 +634,11 @@ impl UpgradeManager {
                     envelope.external.is_some(),
                 )?;
             }
-            Ok(bytes)
+            super::compatibility::write_probe(&bytes, &probe_directory)
         })
         .await
         .map_err(|error| UpgradeError::IncompatibleBinary(error.to_string()))??;
-        super::compatibility::check_binary(
-            bytes,
-            self.store.binary_path(&target).parent().ok_or_else(|| {
-                UpgradeError::IncompatibleBinary("binary directory is missing".into())
-            })?,
-        )
-        .await?;
+        super::compatibility::query_probe(probe).await?;
 
         let stem = self
             .store
@@ -616,7 +647,6 @@ impl UpgradeManager {
             .and_then(|n| n.to_str())
             .unwrap_or("bun")
             .to_string();
-        self.adopt_running_binary_if_missing()?;
         let marker = UpgradeMarker {
             schema: 1,
             upgrade_id: rollback_id(&target),
@@ -628,7 +658,18 @@ impl UpgradeManager {
             boot_attempts: 0,
             pre_upgrade_instances,
         };
-        marker.store(&self.marker_path)?;
+        // The bootstrap copies the running executable and the marker syncs
+        // twice: both block, as in `prepare` (#794).
+        let store = self.store.clone();
+        let running_version = self.running_version.clone();
+        let marker_path = self.marker_path.clone();
+        let marker = tokio::task::spawn_blocking(move || -> Result<_, UpgradeError> {
+            adopt_running_binary_if_missing(&store, &running_version)?;
+            marker.store(&marker_path)?;
+            Ok(marker)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         Ok(Some(PreparedUpgrade { marker }))
     }
 
@@ -779,6 +820,7 @@ impl UpgradeManager {
             node: "this node".to_string(),
             version: self.running_version.clone(),
             sha256,
+            platform: None,
         };
         match super::plan::check_target(
             &directive.target_version,
@@ -891,28 +933,6 @@ impl UpgradeManager {
         Ok(bytes.to_vec())
     }
 
-    /// First-upgrade bootstrap: if the running version has no versioned
-    /// file in the store (plain `bun` install), copy the current
-    /// executable in so rollback has a target.
-    fn adopt_running_binary_if_missing(&self) -> Result<(), UpgradeError> {
-        let path = self.store.binary_path(&self.running_version);
-        if path.is_file() {
-            return Ok(());
-        }
-        let current = std::fs::canonicalize(std::env::current_exe()?)?;
-        let bytes = std::fs::read(&current)?;
-        // No signature envelope for a pre-existing binary; store a stub so
-        // the file pair stays consistent. It is never re-verified locally.
-        let envelope = SignatureEnvelope {
-            schema: 1,
-            sha256: signing::sha256_hex(&bytes),
-            embedded: String::new(),
-            external: None,
-        };
-        self.store.stage(&self.running_version, &bytes, &envelope)?;
-        Ok(())
-    }
-
     fn append_history(&self, entry: &UpgradeHistoryEntry) -> Result<(), UpgradeError> {
         use std::io::Write as _;
         if let Some(dir) = self.history_path.parent() {
@@ -945,12 +965,48 @@ impl UpgradeManager {
 
 /// Hash the running binary: the store's copy if present, else the
 /// executable this process was started from.
+/// Fill `cell` with the running binary's digest unless it already holds one.
+///
+/// `OnceCell::get_or_try_init` runs the closure for the first caller only;
+/// a concurrent caller awaits that same attempt rather than hashing again.
+async fn hash_once(cell: &tokio::sync::OnceCell<String>, stored: PathBuf) -> Option<String> {
+    cell.get_or_try_init(|| async move {
+        tokio::task::spawn_blocking(move || hash_running_binary(&stored))
+            .await
+            .ok()
+            .flatten()
+            .ok_or(())
+    })
+    .await
+    .ok()
+    .cloned()
+}
+
+/// How much of the binary [`hash_running_binary`] reads at a time.
+const HASH_CHUNK_BYTES: usize = 1024 * 1024;
+
 fn hash_running_binary(stored: &Path) -> Option<String> {
-    let bytes = match std::fs::read(stored) {
-        Ok(bytes) => bytes,
-        Err(_) => std::fs::read(running_executable()?).ok()?,
+    let file = match std::fs::File::open(stored) {
+        Ok(file) => file,
+        Err(_) => std::fs::File::open(running_executable()?).ok()?,
     };
-    Some(signing::sha256_hex(&bytes))
+    hash_file(file).ok()
+}
+
+/// SHA-256 of a whole file, read in fixed chunks so hashing a 500 MB debug
+/// binary doesn't first allocate 500 MB.
+fn hash_file(mut file: std::fs::File) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hex::encode(hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
+    }
 }
 
 /// The executable this process runs. On Linux `/proc/self/exe` opens the
@@ -969,6 +1025,31 @@ fn running_executable() -> Option<PathBuf> {
 /// The marker id of a rollback to `target`.
 fn rollback_id(target: &BinaryVersion) -> String {
     format!("rollback-to-{target}")
+}
+
+/// First-upgrade bootstrap: if the running version has no versioned file
+/// in the store (plain `bun` install), copy the current executable in so
+/// rollback has a target. Blocking: it reads and writes a whole binary.
+fn adopt_running_binary_if_missing(
+    store: &BinaryStore,
+    running_version: &BinaryVersion,
+) -> Result<(), UpgradeError> {
+    let path = store.binary_path(running_version);
+    if path.is_file() {
+        return Ok(());
+    }
+    let current = std::fs::canonicalize(std::env::current_exe()?)?;
+    let bytes = std::fs::read(&current)?;
+    // No signature envelope for a pre-existing binary; store a stub so
+    // the file pair stays consistent. It is never re-verified locally.
+    let envelope = SignatureEnvelope {
+        schema: 1,
+        sha256: signing::sha256_hex(&bytes),
+        embedded: String::new(),
+        external: None,
+    };
+    store.stage(running_version, &bytes, &envelope)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1089,6 +1170,51 @@ mod tests {
         }]
     }
 
+    /// #783: verifying and staging a release-sized binary took seconds of
+    /// synchronous hashing and disk work on a Tokio worker. The council's
+    /// Raft core on that worker missed its heartbeats, and the node being
+    /// upgraded called an election just before it exec'd, deposing a healthy
+    /// leader. On a one-thread runtime any work done in place stops every
+    /// other task, so a ticker beside `prepare` shows whether it was.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparing_a_large_binary_leaves_the_runtime_free() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        let fixture = fixture();
+        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
+        let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n").into_bytes();
+        binary.resize(binary.len() + 96 * 1024 * 1024, b'#');
+        let directive = directive_for(&fixture, &binary, "large");
+
+        let stop = CancellationToken::new();
+        let ticker = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let mut longest = Duration::ZERO;
+                let mut last = std::time::Instant::now();
+                while !stop.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    longest = longest.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                longest
+            }
+        });
+        let started = std::time::Instant::now();
+        let prepared = fixture.manager.prepare(&directive, vec![]).await;
+        let took = started.elapsed();
+        stop.cancel();
+        let longest = ticker.await.unwrap();
+
+        assert!(prepared.unwrap().is_some());
+        // Raft's shortest election timeout is a second; a quarter of that is
+        // far above scheduling noise and far below the stall this caught.
+        assert!(
+            longest < Duration::from_millis(250),
+            "prepare held the runtime for {longest:?} of its {took:?}"
+        );
+    }
+
     #[tokio::test]
     async fn signed_incompatible_binary_is_refused_before_staging() {
         let fixture = fixture();
@@ -1190,6 +1316,40 @@ mod tests {
         assert_eq!(
             fixture.manager.running_binary_sha256().await.as_deref(),
             Some(sha256_hex(b"old binary").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_boot_time_hash_answers_later_requests_without_hashing_again() {
+        // #765: `/v1/version` used to hash a 580 MB debug Bun on its first
+        // request, which took longer than a joiner's 10 s deadline under
+        // load. Bun now hashes at boot; a request afterwards reads the cache.
+        let fixture = fixture();
+        fixture.manager.spawn_running_binary_hash().await.unwrap();
+
+        // Change the stored bytes. A request that hashed now would see them.
+        let stored = fixture.manager.store().binary_path(&v("0.1.0"));
+        std::fs::write(&stored, b"bytes written after boot").unwrap();
+
+        assert_eq!(
+            fixture.manager.running_binary_sha256().await.as_deref(),
+            Some(sha256_hex(b"old binary").as_str())
+        );
+    }
+
+    #[test]
+    fn the_running_binary_hash_streams_a_file_larger_than_one_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bun");
+        // Not a multiple of the chunk size, so the last read is partial.
+        let bytes: Vec<u8> = (0..HASH_CHUNK_BYTES * 2 + 12_345)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            hash_running_binary(&path).as_deref(),
+            Some(sha256_hex(&bytes).as_str())
         );
     }
 
@@ -1303,19 +1463,39 @@ mod tests {
                 }
             }));
         }
-        let results = futures_util::future::join_all((0..32).map(|_| async {
-            let fixture = fixture();
-            let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
-            fixture
-                .manager
-                .prepare(&directive, vec![])
-                .await
-                .map(|prepared| {
-                    assert!(prepared.is_some());
-                    assert!(fixture.manager.upgrade_in_flight());
-                })
-        }))
-        .await;
+        // 32 probes, at most four in flight: they still overlap each other
+        // and the churn (the Linux `ETXTBSY` race needs a fork during a
+        // probe's write), but they don't queue 32 new executables at once.
+        // macOS assesses each new executable's first exec one at a time
+        // across the host, so 32 simultaneous probes measured that queue
+        // (12.9 s for 32 fresh scripts) rather than the probe (#722). A node
+        // runs one probe at a time.
+        use futures_util::StreamExt as _;
+        let probes: Vec<_> = (0..32)
+            .map(|_| {
+                let fixture = fixture();
+                let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
+                (fixture, directive)
+            })
+            .collect();
+        let results: Vec<_> = futures_util::stream::iter(probes)
+            .map(|(fixture, directive)| async move {
+                // Move the whole fixture in: the block only names its
+                // manager, and a field-by-field capture would drop the
+                // temporary directory before the probe runs.
+                let fixture = fixture;
+                fixture
+                    .manager
+                    .prepare(&directive, vec![])
+                    .await
+                    .map(|prepared| {
+                        assert!(prepared.is_some());
+                        assert!(fixture.manager.upgrade_in_flight());
+                    })
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
         shutdown.cancel();
         for task in churn {
             task.await.unwrap();
@@ -1578,16 +1758,25 @@ mod tests {
         let started = std::time::Instant::now();
         // The query deadline is a Tokio timer. With the clock paused it
         // expires as soon as the runtime idles on the silent candidate, so
-        // the test proves the bound without spending ten real seconds.
+        // the test proves the bound without spending a real minute.
         tokio::time::pause();
         let prepared = fixture.manager.prepare(&directive, vec![]).await;
         tokio::time::resume();
-        // Only the deadline yields `Elapsed`; a spawn or exit failure would
+        // Only the deadline says "timed out"; a spawn or exit failure would
         // be a different incompatibility and must not pass as a timeout.
+        // The message says how far the candidate got (#722): it was
+        // launched, said nothing, and was still running at the deadline.
+        let Err(UpgradeError::IncompatibleBinary(message)) = &prepared else {
+            panic!("expected a timed-out query, got {prepared:?}");
+        };
+        let bound = super::super::compatibility::QUERY_DEADLINE.as_secs();
         assert!(
-            matches!(&prepared, Err(UpgradeError::IncompatibleBinary(message)) if message.contains("Elapsed")),
-            "{prepared:?}"
+            message.contains(&format!("timed out after {bound}s")),
+            "{message}"
         );
+        assert!(message.contains("launched as pid "), "{message}");
+        assert!(message.contains("no output"), "{message}");
+        assert!(message.contains("still running"), "{message}");
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
         assert!(!fixture.manager.upgrade_in_flight());
         assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());

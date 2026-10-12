@@ -129,6 +129,11 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
     );
     let mut config = cluster_dir.join("reliaburger.toml");
     let mut node = reliaburger::config::NodeConfig::from_file(&config).unwrap();
+    // As root on a runc host, `relish init` enables eBPF and DNS. This
+    // fixture doesn't need them, and a durable eBPF owner it left
+    // behind would stay attached to the host's root cgroup.
+    node.ebpf.enabled = false;
+    node.dns.enabled = false;
     node.network.advertise_address = Some("127.0.0.1".into());
     node.storage.data = root.path().join("data");
     node.storage.images = root.path().join("images");

@@ -82,6 +82,7 @@ impl TestScenario {
                 host: "web.example.test".into(),
                 path: "/".into(),
                 app_name: "web".into(),
+                namespace: "default".into(),
                 healthy_backends: if matches!(self, Self::DegradedApp) {
                     1
                 } else {
@@ -144,6 +145,7 @@ impl TestScenario {
                     node: None,
                     action: None,
                     principal: None,
+                    source_address: None,
                     details: std::collections::BTreeMap::new(),
                     message: format!("fixture event {}", index + 1),
                 });

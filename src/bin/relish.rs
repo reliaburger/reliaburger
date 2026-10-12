@@ -49,7 +49,7 @@ fn parse_endpoint(value: &str) -> Result<String, String> {
 #[derive(clap::Args)]
 struct BenchOptions {
     /// Timed job scenario instead of the ordinary suite (60s, concurrency 27).
-    #[arg(long, value_enum, conflicts_with_all = ["quick", "compare", "capacity", "disruptive", "yes"])]
+    #[arg(long, value_enum, conflicts_with_all = ["quick", "capacity", "disruptive", "yes"])]
     scenario: Option<reliaburger::relish::bench_jobs::JobScenario>,
     /// Measurement window for job scenarios; positive drain follows it.
     #[arg(long, default_value_t = 60, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=86400))]
@@ -75,9 +75,13 @@ struct BenchOptions {
     /// Abbreviated suite for development and CI.
     #[arg(long)]
     quick: bool,
-    /// Compare with a previous JSON benchmark report.
+    /// Compare with a previous JSON benchmark report (a suite report, or a
+    /// `--report` file from the same job scenario).
     #[arg(long)]
     compare: Option<PathBuf>,
+    /// Largest drop in a job scenario's rate, in percent, that `--compare` passes.
+    #[arg(long, default_value_t = reliaburger::relish::bench_jobs::DEFAULT_TOLERANCE_PERCENT, requires_all = ["scenario", "compare"], value_parser = clap::value_parser!(u32).range(1..=90))]
+    tolerance: u32,
     /// Deliberately schedule minimal workloads until the cluster is full.
     #[arg(long, requires = "yes")]
     capacity: bool,
@@ -87,6 +91,35 @@ struct BenchOptions {
     /// Acknowledge capacity saturation and disruptive benchmark effects.
     #[arg(long)]
     yes: bool,
+}
+
+// Its own parser, boxed, like `BenchOptions`: inline fields would grow the
+// generated `Command` parser past the test-thread stack.
+// Filters for `relish audit`.
+#[derive(clap::Args)]
+struct AuditOptions {
+    /// Records at or after this time: epoch seconds, or a duration
+    /// before now (e.g. "30m", "2h", "7d").
+    #[arg(long)]
+    since: Option<String>,
+    /// Records at or before this time, in the same forms as --since.
+    #[arg(long)]
+    until: Option<String>,
+    /// One action (e.g. "app.deleted"), or a family ("fault.*").
+    #[arg(long)]
+    action: Option<String>,
+    /// A token name or principal id.
+    #[arg(long)]
+    principal: Option<String>,
+    /// Only actions on this namespace.
+    #[arg(long)]
+    namespace: Option<String>,
+    /// How many of the newest records to show (default 100, at most 10000).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Read every node's log, not just this node's, merged by time.
+    #[arg(long)]
+    cluster: bool,
 }
 
 #[derive(Subcommand)]
@@ -310,6 +343,9 @@ enum Command {
         #[command(subcommand)]
         action: FaultAction,
     },
+    /// Show who did what: the durable audit log of applies, deletes, execs,
+    /// upgrades, faults, tokens and the other changes to the cluster.
+    Audit(Box<AuditOptions>),
     /// Manage volume snapshots (Btrfs-backed volumes only).
     Snapshot {
         #[command(subcommand)]
@@ -407,7 +443,7 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
-    /// List bounded job run summaries and rates, or durable schedule definitions.
+    /// List bounded job run summaries and rates, or durable definitions with their last outcomes.
     Jobs {
         #[arg(long)]
         definitions: bool,
@@ -419,19 +455,28 @@ enum Command {
         action: Option<BatchAction>,
         /// Path to a TOML config file with [job.*] sections.
         path: Option<PathBuf>,
+        /// Reuse the key printed by an earlier submission that timed out, so
+        /// the retry returns its runs instead of admitting the jobs again.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
     },
     /// Run a resource-aware task array from an image or allowlisted host binary.
     ///
-    /// Every task runs the same binary with `{index}` in its arguments
+    /// Every task runs the same command with `{index}` in its arguments
     /// replaced by its own index, from 0 to COUNT-1, and gets
     /// RELIABURGER_TASK_INDEX, RELIABURGER_TASK_COUNT,
     /// RELIABURGER_TASK_ATTEMPT and RELIABURGER_BATCH_ID in its
-    /// environment. The binary must be in the nodes' [process_workloads]
-    /// allowed_binaries.
+    /// environment. With --image, the tasks run in containers; with
+    /// --runtime process --exec, the binary must be in the nodes'
+    /// [process_workloads] allowed_binaries.
     ///
     /// Tasks run at least once, not exactly once: a task that finished
     /// just before its node crashed can run again. Make tasks safe to
     /// repeat.
+    ///
+    /// Each submission prints an idempotency key before it is sent. If the
+    /// submission times out, retry with --idempotency-key KEY: the cluster
+    /// returns the run it already admitted rather than starting a second.
     Run {
         /// Name for the array (required: task arrays are the only kind of
         /// run so far).
@@ -440,7 +485,8 @@ enum Command {
         /// Number of tasks; one uses the same indexed executor.
         #[arg(long, default_value_t = 1)]
         count: u32,
-        /// Register a durable five-field UTC cron schedule instead of running now.
+        /// Register a durable UTC cron schedule (five fields, or a macro such
+        /// as @daily) instead of running now.
         #[arg(long)]
         schedule: Option<String>,
         /// Host binary every task runs.
@@ -467,7 +513,7 @@ enum Command {
         /// Stop the whole array once more than this many tasks have failed.
         #[arg(long)]
         max_failed: Option<u32>,
-        /// Per-attempt timeout, in seconds.
+        /// Per-attempt timeout, in seconds; 0 means no deadline.
         #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_TASK_TIMEOUT_SECS)]
         timeout: u32,
         /// Most tasks one node runs at once (default: 256, bounded by requests).
@@ -479,6 +525,9 @@ enum Command {
         /// An environment variable for every task (repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Reuse the key printed by an earlier submission that timed out.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
         /// Arguments after `--`; `{index}` becomes the task's index.
         #[arg(last = true)]
         args: Vec<String>,
@@ -491,8 +540,8 @@ enum Command {
         /// Poll until the batch reaches a terminal state.
         #[arg(long)]
         wait: bool,
-        /// Give up waiting after this many seconds (jobs time out
-        /// server-side after 3600s; the margin covers reporting).
+        /// Give up waiting after this many seconds. This only bounds the
+        /// wait: the run keeps going, under its own per-attempt timeout.
         #[arg(long, default_value_t = 3660)]
         timeout: u64,
     },
@@ -769,9 +818,15 @@ enum UpgradeAction {
         /// Local binary to upgrade from instead (expects {path}.sig).
         #[arg(long)]
         binary: Option<std::path::PathBuf>,
-        /// Signature envelope path (default: {binary}.sig).
+        /// Signature envelope path: the countersigned `.sig` for --binary
+        /// (default: {binary}.sig), or for the version form when the nodes
+        /// share one platform.
         #[arg(long)]
         sig: Option<std::path::PathBuf>,
+        /// Your external (operator) private key: countersign each downloaded
+        /// release binary with it before pushing (version form).
+        #[arg(long, conflicts_with = "sig")]
+        external_key: Option<std::path::PathBuf>,
         /// Worker upgrade parallelism.
         #[arg(long, default_value = "1")]
         parallel: u32,
@@ -926,6 +981,10 @@ enum BatchAction {
         /// Validate the manifest locally without submitting work.
         #[arg(long)]
         dry_run: bool,
+        /// Reuse the key printed by an earlier submission that timed out, so
+        /// the retry returns its runs instead of admitting the manifest again.
+        #[arg(long, value_name = "KEY", conflicts_with = "dry_run")]
+        idempotency_key: Option<String>,
     },
     /// Acknowledge repeating side effects for the exact unknown owner grants.
     Replay {
@@ -965,7 +1024,8 @@ enum BatchAction {
         #[arg(long, conflicts_with = "after")]
         index: Option<u32>,
     },
-    /// Print a failed task's output (the first and last 2 KiB).
+    /// Print a task's retained output (the first and last 2 KiB): any
+    /// singleton's, or a failed task's in a larger array.
     Logs {
         /// Batch id from `relish run --batch`.
         id: u64,
@@ -1721,6 +1781,30 @@ async fn main() -> ExitCode {
                 volume,
             } => commands::snapshot_delete(app, namespace, name, volume.as_deref()).await,
         },
+        Command::Audit(options) => {
+            let AuditOptions {
+                since,
+                until,
+                action,
+                principal,
+                namespace,
+                limit,
+                cluster,
+            } = *options;
+            reliaburger::relish::audit_cmd::audit(
+                reliaburger::relish::audit_cmd::AuditFlags {
+                    since,
+                    until,
+                    action,
+                    principal,
+                    namespace,
+                    limit,
+                    cluster,
+                },
+                cli.output,
+            )
+            .await
+        }
         Command::Fault { ref action } => match action {
             FaultAction::Delay {
                 target,
@@ -1920,10 +2004,19 @@ async fn main() -> ExitCode {
             registry_port,
             timeout,
         } => commands::build(path, registry_port, timeout).await,
-        Command::Batch { action, path } => match (action, path) {
-            (Some(BatchAction::Submit { path, dry_run }), _) => {
-                commands::submit_task_manifest(&path, cli.output, dry_run).await
-            }
+        Command::Batch {
+            action,
+            path,
+            idempotency_key,
+        } => match (action, path) {
+            (
+                Some(BatchAction::Submit {
+                    path,
+                    dry_run,
+                    idempotency_key,
+                }),
+                _,
+            ) => commands::submit_task_manifest(&path, cli.output, dry_run, idempotency_key).await,
             (Some(BatchAction::Watch { id, timeout }), _) => {
                 commands::watch_task_batch(id, timeout).await
             }
@@ -1950,7 +2043,7 @@ async fn main() -> ExitCode {
             (Some(BatchAction::Logs { id, index }), _) => {
                 commands::batch_task_logs(id, index).await
             }
-            (None, Some(path)) => commands::batch(&path).await,
+            (None, Some(path)) => commands::batch(&path, idempotency_key).await,
             (None, None) => Err(reliaburger::relish::RelishError::InvalidFlag {
                 flag: "file".to_string(),
                 reason: "give a [job.*] TOML file, or one of: cancel, results, logs".to_string(),
@@ -1973,6 +2066,7 @@ async fn main() -> ExitCode {
             concurrency,
             namespace,
             env,
+            idempotency_key,
             args,
         } => {
             commands::run_task_array(commands::TaskArrayRun {
@@ -1994,6 +2088,7 @@ async fn main() -> ExitCode {
                     task_timeout_secs: timeout,
                     per_node_concurrency: concurrency,
                 },
+                idempotency_key,
             })
             .await
         }
@@ -2197,6 +2292,7 @@ async fn main() -> ExitCode {
                     version,
                     binary,
                     sig,
+                    external_key,
                     parallel,
                     registry,
                     url,
@@ -2209,6 +2305,7 @@ async fn main() -> ExitCode {
                             version,
                             binary,
                             sig,
+                            external_key,
                             parallel,
                             registry,
                             metadata_url: url,
@@ -2341,6 +2438,7 @@ async fn main() -> ExitCode {
                 report,
                 quick,
                 compare,
+                tolerance,
                 capacity,
                 disruptive,
                 yes,
@@ -2357,6 +2455,8 @@ async fn main() -> ExitCode {
                             exec,
                             namespace,
                             report,
+                            compare,
+                            tolerance_percent: tolerance,
                             output: cli.output,
                         },
                     )
@@ -2516,12 +2616,26 @@ mod tests {
     fn readme_command_list_matches_the_cli() {
         use clap::CommandFactory;
         use reliaburger::relish::command_reference::{
-            GROUPS, REGENERATE_COMMAND, render, replace_region,
+            Availability, GROUPS, REGENERATE_COMMAND, render, replace_region,
         };
+        use reliaburger::relish::released_cli::ReleasedCli;
 
-        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme_path = repository.join("README.md");
         let readme = std::fs::read_to_string(&readme_path).unwrap();
-        let section = render(&Cli::command(), GROUPS).unwrap_or_else(|e| panic!("{e}"));
+        // Commands the installer's release lacks are labelled with this
+        // build's version (0.2.0-dev labels them "0.2.0").
+        let released = ReleasedCli::parse(
+            &std::fs::read_to_string(repository.join("scripts/release/released-cli.tsv")).unwrap(),
+        )
+        .unwrap();
+        let upcoming = env!("CARGO_PKG_VERSION").split('-').next().unwrap();
+        let availability = Availability {
+            released: &released,
+            label: released.unreleased_label(upcoming),
+        };
+        let section =
+            render(&Cli::command(), GROUPS, Some(&availability)).unwrap_or_else(|e| panic!("{e}"));
         let updated = replace_region(&readme, &section).unwrap_or_else(|e| panic!("{e}"));
 
         if std::env::var_os("RELIABURGER_UPDATE_README").is_some() {
@@ -2803,6 +2917,44 @@ mod tests {
     }
 
     #[test]
+    fn audit_flags_parse() {
+        let cli = parse(&[
+            "relish",
+            "audit",
+            "--since",
+            "2h",
+            "--action",
+            "fault.*",
+            "--principal",
+            "alice",
+            "--namespace",
+            "team-a",
+            "--limit",
+            "50",
+            "--cluster",
+        ])
+        .unwrap();
+        let Command::Audit(options) = cli.command else {
+            panic!("expected relish audit");
+        };
+        let AuditOptions {
+            since,
+            action,
+            principal,
+            namespace,
+            limit,
+            cluster,
+            ..
+        } = *options;
+        assert_eq!(since.as_deref(), Some("2h"));
+        assert_eq!(action.as_deref(), Some("fault.*"));
+        assert_eq!(principal.as_deref(), Some("alice"));
+        assert_eq!(namespace.as_deref(), Some("team-a"));
+        assert_eq!(limit, Some(50));
+        assert!(cluster);
+    }
+
+    #[test]
     fn fault_run_is_an_alias_for_scenario() {
         let via_alias = parse(&["relish", "fault", "run", "scenario.toml"]).unwrap();
         assert!(matches!(
@@ -2945,7 +3097,9 @@ mod tests {
             vec!["--cpu-request", "0"],
             vec!["--cpu-request", "1001"],
             vec!["--quick"],
-            vec!["--compare", "old.json"],
+            vec!["--tolerance", "0"],
+            vec!["--tolerance", "91"],
+            vec!["--tolerance", "20"],
             vec!["--capacity", "--yes"],
             vec!["--disruptive", "--yes"],
         ] {
@@ -2954,6 +3108,39 @@ mod tests {
             assert!(parse(&command).is_err(), "{command:?}");
         }
         assert!(parse(&["relish", "bench", "--seconds", "20"]).is_err());
+        assert!(
+            parse(&[
+                "relish",
+                "bench",
+                "--compare",
+                "old.json",
+                "--tolerance",
+                "20"
+            ])
+            .is_err()
+        );
+        let cli = parse(&[
+            "relish",
+            "bench",
+            "--scenario",
+            "jobs-host-processes",
+            "--compare",
+            "baseline.json",
+            "--tolerance",
+            "15",
+        ])
+        .unwrap();
+        let Command::Bench(options) = cli.command else {
+            panic!("expected bench");
+        };
+        assert!(matches!(
+            *options,
+            BenchOptions {
+                compare: Some(ref path),
+                tolerance: 15,
+                ..
+            } if path == std::path::Path::new("baseline.json")
+        ));
         let cli = parse(&[
             "relish",
             "bench",
@@ -4133,9 +4320,14 @@ mod tests {
     fn parse_batch_command() {
         let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
         match cli.command {
-            Command::Batch { action, path } => {
+            Command::Batch {
+                action,
+                path,
+                idempotency_key,
+            } => {
                 assert!(action.is_none());
                 assert_eq!(path, Some(PathBuf::from("jobs.toml")));
+                assert!(idempotency_key.is_none());
             }
             _ => panic!("expected Batch"),
         }
@@ -4148,7 +4340,8 @@ mod tests {
             cli.command,
             Command::Batch {
                 action: Some(BatchAction::Cancel { id: 7 }),
-                path: None
+                path: None,
+                ..
             }
         ));
         let cli = parse(&["relish", "batch", "results", "7", "--failed"]).unwrap();
@@ -4545,5 +4738,87 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn job_submissions_accept_an_idempotency_key_for_a_retry() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "render",
+            "--image",
+            "fixture:v1",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run { idempotency_key: Some(ref key), .. } if key == "retry-7"
+        ));
+        let cli = parse(&[
+            "relish",
+            "batch",
+            "jobs.toml",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch { idempotency_key: Some(ref key), .. } if key == "retry-7"
+        ));
+        let cli = parse(&[
+            "relish",
+            "batch",
+            "submit",
+            "jobs.toml",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch {
+                action: Some(BatchAction::Submit { idempotency_key: Some(ref key), .. }),
+                ..
+            } if key == "retry-7"
+        ));
+        // A dry run sends nothing, so a key would be meaningless.
+        assert!(
+            parse(&[
+                "relish",
+                "batch",
+                "submit",
+                "jobs.toml",
+                "--dry-run",
+                "--idempotency-key",
+                "k",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn job_help_text_matches_what_the_commands_do() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let mut help = String::new();
+        for path in [
+            &["run"][..],
+            &["batch-status"],
+            &["batch", "logs"],
+            &["batch", "submit"],
+        ] {
+            let mut command = &mut cli;
+            for name in path {
+                command = command.find_subcommand_mut(name).unwrap();
+            }
+            help.push_str(&format!("=== relish {} ===\n", path.join(" ")));
+            help.push_str(&command.render_long_help().to_string());
+            help.push('\n');
+        }
+        insta::assert_snapshot!(help);
     }
 }

@@ -11,10 +11,18 @@
 //! sync without any extra handshake.
 //!
 //! Each array gets a directory under `<data>/task-arrays/<batch id>/` with
-//! the ledger and the captured output of failed tasks. The node keeps it
+//! the ledger, its result index and the kept output of failed tasks (one
+//! segment per chunk grant, see [`super::task_output`]). The node keeps it
 //! while the cluster still lists the array, so `relish batch results` and
 //! `relish batch logs` work after the array finishes, and deletes it once
-//! the leader stops listing the array.
+//! the leader stops listing the array. The leader stops listing a finished
+//! array an hour after it finishes, on a timer, whether or not anyone
+//! submits more work.
+//!
+//! Task data counts toward disk pressure: when it grows past its share of
+//! the filesystem, or less than a gibibyte of it is free, the node
+//! advertises no free slots, so the leader grants it nothing new until
+//! retention frees the space.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
@@ -42,8 +50,19 @@ pub const TASK_ARRAYS_DIR: &str = "task-arrays";
 /// Most result rows one request returns.
 pub const MAX_RESULT_ROWS: usize = 1000;
 
+/// Most disk bytes a worker holds per finished task while the cluster still
+/// lists its run: a 22-byte ledger record plus a 24-byte result-index slot,
+/// rounded up for block headers and filesystem blocks. Kept failure output
+/// comes on top, bounded per chunk. Everything goes once the run retires.
+pub const STORAGE_BYTES_PER_TASK: u64 = 50;
+
 /// Tasks examined by a detail page, even when its failure filter returns no rows.
 pub const RESULT_PAGE_SPAN: u32 = 4096;
+
+/// Largest leader sync call a node accepts. Every active run's template
+/// rides in it, so it must cover the active-run cap at the largest template
+/// (`control_state_stays_within_budget_at_the_global_cap` checks that).
+pub const MAX_SYNC_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 /// One chunk the leader says this node holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +96,9 @@ pub struct ArrayAssignment {
     pub stopping: bool,
     /// Whether a missing outcome may be executed again after worker restart.
     pub replay_unknown: bool,
+    /// Labels for this node's job metrics: never a task index or run id.
+    #[serde(default)]
+    pub labels: crate::mayo::job_metrics::JobLabels,
 }
 
 /// Orders cluster recovery, leadership and committed assignment revisions.
@@ -118,6 +140,10 @@ pub struct NodeArrayCounters {
     pub failed: u64,
     /// Retries.
     pub retried: u64,
+    /// Start-lag histogram of pooled commands, in the summary's
+    /// power-of-two millisecond buckets.
+    #[serde(default)]
+    pub start_lag_ms_counts: [u64; 16],
 }
 
 /// A node's answer about one array.
@@ -131,6 +157,12 @@ pub struct ArrayProgress {
     /// Why `slots` is zero, if it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+    /// Whether `refused` comes from this node's configuration or runtime
+    /// (its allowlist, `mount_isolation`, what it can enforce), so it will
+    /// refuse the array every time, rather than from a passing fault. The
+    /// leader fails a run every node refuses this way (#777).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unrunnable: bool,
     /// Chunks finished at the attempt the leader asked for, not yet
     /// retired. Sent on every sync until the leader stops listing them.
     pub finished: Vec<ChunkResult>,
@@ -173,6 +205,11 @@ pub enum TaskArrayNodeError {
     UnknownArray { batch_id: u64 },
     #[error("this node kept no output for task {index}")]
     NoOutput { index: u32 },
+    #[error(
+        "task {index} failed, but its output wasn't kept: a chunk keeps the output of its first {} failed tasks only; the exit code is in `relish batch results`",
+        super::task_output::KEPT_FAILURES_PER_CHUNK
+    )]
+    OutputNotKept { index: u32 },
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error("task array file I/O failed: {0}")]
@@ -192,6 +229,21 @@ pub enum NodeRunner {
     Process(ProcessRunner),
     /// Compute outcomes without processes (tests and benchmarks).
     Fake(FakeRunner),
+}
+
+impl NodeRunner {
+    /// Where to measure the CPU and memory of this run's attempts on this
+    /// node right now. Empty for runners with nothing to measure.
+    async fn usage_targets(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Vec<crate::mayo::job_metrics::UsageTarget> {
+        match self {
+            Self::Owned(runner) => runner.usage_targets(batch_id, template).await,
+            Self::Process(_) | Self::Fake(_) => Vec::new(),
+        }
+    }
 }
 
 impl TaskRunner for NodeRunner {
@@ -245,6 +297,9 @@ pub struct TaskArrayNodeConfig {
     pub backoff: (Duration, Duration),
     /// Ledger group-commit policy.
     pub group_commit: GroupCommit,
+    /// The node's audit log (`<data>/audit`), which counts towards
+    /// task-data pressure alongside `root`. `None` counts task data alone.
+    pub audit_dir: Option<PathBuf>,
 }
 
 impl TaskArrayNodeConfig {
@@ -260,6 +315,7 @@ impl TaskArrayNodeConfig {
             default_concurrency: u32::try_from(safety_cap).unwrap_or(u32::MAX),
             backoff: (defaults.backoff_base, defaults.backoff_cap),
             group_commit: GroupCommit::default(),
+            audit_dir: Some(data_dir.join(crate::bun::audit::AUDIT_DIRECTORY)),
         }
     }
 }
@@ -294,6 +350,12 @@ pub struct TaskArrayNode {
     slots: Arc<Semaphore>,
     budget: Arc<super::execution_budget::ExecutionBudget>,
     indexes: Mutex<HashMap<u64, Arc<super::task_result_index::TaskResultIndex>>>,
+    telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
+    output_syncs: Arc<std::sync::atomic::AtomicU64>,
+    /// fsyncs the control fence has cost, for [`Self::control_syncs`].
+    control_syncs: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether this process has made `root`'s directory entry durable.
+    root_durable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TaskArrayNode {
@@ -313,6 +375,10 @@ impl TaskArrayNode {
             slots,
             budget,
             indexes: Mutex::new(HashMap::new()),
+            telemetry: Default::default(),
+            output_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            control_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
         }
@@ -328,6 +394,21 @@ impl TaskArrayNode {
             NodeRunner::Owned(runner) => runner.executor_timings(runtime),
             _ => None,
         }
+    }
+
+    /// Count this node's attempts into a telemetry shared with its metrics
+    /// collection and `relish top`.
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
+    ) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// Job counters, running gauges and the latest usage on this node.
+    pub fn telemetry(&self) -> &Arc<crate::mayo::job_metrics::JobTelemetry> {
+        &self.telemetry
     }
 
     /// Use the exact admission ledger the node's supervisor uses for apps.
@@ -354,6 +435,35 @@ impl TaskArrayNode {
         }
     }
 
+    /// How many fsyncs kept failure output has cost on this node.
+    pub fn output_syncs(&self) -> u64 {
+        self.output_syncs.load(Ordering::Relaxed)
+    }
+
+    /// How many fsyncs the control fence in [`Self::sync`] has cost on
+    /// this node.
+    pub fn control_syncs(&self) -> u64 {
+        self.control_syncs.load(Ordering::Relaxed)
+    }
+
+    /// Whether task data and the audit log, or the filesystem holding them,
+    /// are too full to take new grants. Blocking I/O.
+    fn task_data_pressured(root: &Path, audit_dir: Option<&Path>) -> bool {
+        let usage = match super::disk_pressure::FilesystemUsage::of(root) {
+            Ok(usage) => usage,
+            Err(error) => {
+                eprintln!("bun: task arrays: cannot measure the data filesystem: {error}");
+                return true;
+            }
+        };
+        let bytes = super::disk_pressure::node_data_bytes(root, audit_dir);
+        super::disk_pressure::task_data_pressured(
+            bytes,
+            usage,
+            super::disk_pressure::TASK_DATA_MAX_PERCENT,
+        )
+    }
+
     /// Where this node keeps one array's files.
     pub fn array_dir(&self, batch_id: u64) -> PathBuf {
         self.config.root.join(batch_id.to_string())
@@ -364,17 +474,29 @@ impl TaskArrayNode {
     /// and the reason.
     pub async fn sync(&self, request: &NodeSyncRequest) -> NodeSyncResponse {
         let mut arrays = self.arrays.lock().await;
-        let path = self.config.root.join("control.json");
+        let root = self.config.root.clone();
+        let path = root.join("control.json");
         let version = request.version;
+        let syncs = Arc::clone(&self.control_syncs);
+        let root_durable = Arc::clone(&self.root_durable);
         let checked = tokio::task::spawn_blocking(move || {
-            let directory = path.parent().expect("control has parent");
+            let directory = root.as_path();
+            let existed = directory.is_dir();
             std::fs::create_dir_all(directory)?;
             // The directory entry itself must survive before a fence can.
-            let parent = directory
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            std::fs::File::open(parent)?.sync_all()?;
+            // Once per process (a previous one may have crashed before its
+            // flush) and whenever the directory had to be created: the
+            // leader calls this every tick, and on macOS each fsync is a
+            // whole-device flush (#809).
+            if !existed || !root_durable.load(Ordering::Acquire) {
+                let parent = directory
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                std::fs::File::open(parent)?.sync_all()?;
+                syncs.fetch_add(1, Ordering::Relaxed);
+                root_durable.store(true, Ordering::Release);
+            }
             let previous: ControlVersion = match std::fs::read(&path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -416,6 +538,8 @@ impl TaskArrayNode {
             }
             if version > previous {
                 persist_json(&path, &version)?;
+                // The fence file and its directory.
+                syncs.fetch_add(2, Ordering::Relaxed);
             }
             Ok::<_, std::io::Error>(ControlCheck::Accepted)
         })
@@ -458,10 +582,27 @@ impl TaskArrayNode {
             }
         }
         self.delete_unknown(&request.known).await;
+        self.telemetry.retain_runs(|id| running.contains(&id));
+        let root = self.config.root.clone();
+        let audit_dir = self.config.audit_dir.clone();
+        let pressured = tokio::task::spawn_blocking(move || {
+            Self::task_data_pressured(&root, audit_dir.as_deref())
+        })
+        .await
+        .unwrap_or(true);
 
         let mut response = NodeSyncResponse::default();
         for assignment in &request.arrays {
             if let Err(reason) = self.admit(assignment) {
+                response.arrays.push(ArrayProgress {
+                    unrunnable: true,
+                    ..refused(assignment.batch_id, reason)
+                });
+                continue;
+            }
+            // Too big for this node isn't too big for every node: a larger
+            // one may join, so the run waits rather than failing.
+            if let Err(reason) = self.fits(assignment) {
                 response.arrays.push(refused(assignment.batch_id, reason));
                 continue;
             }
@@ -476,7 +617,13 @@ impl TaskArrayNode {
                     }
                 },
             };
-            response.arrays.push(self.reconcile(run, assignment).await);
+            let mut progress = self.reconcile(run, assignment).await;
+            if pressured {
+                // Chunks already granted still run and report; the leader
+                // just sees no room for more until retention frees space.
+                progress.slots = 0;
+            }
+            response.arrays.push(progress);
         }
         response
     }
@@ -487,10 +634,63 @@ impl TaskArrayNode {
             .map_or(default, |cap| cap.min(default).max(1))
     }
 
-    /// Whether this node may run the array's binary at all.
+    /// Why this node can never run `assignment`, if it can't: the same
+    /// check every sync makes, for the leader's admission of a run when
+    /// this node is the only one that could take it.
+    pub fn refusal(&self, assignment: &ArrayAssignment) -> Option<String> {
+        self.admit(assignment).err()
+    }
+
+    /// Whether the array's tasks, with any executor helper, fit inside this
+    /// node's allocatable resources at all.
+    fn fits(&self, assignment: &ArrayAssignment) -> Result<(), String> {
+        let capacity = self.budget.capacity();
+        if !capacity.fits(&assignment.resources) {
+            return Err("task requests exceed this node's allocatable resources".into());
+        }
+        let Some(template) = assignment.template.as_ref() else {
+            return Ok(());
+        };
+        let helper = match (template.runtime, self.runner.as_ref()) {
+            (crate::config::job::JobRuntime::SharedRunc, _) => {
+                Some("reusable profile plus helper exceeds node capacity")
+            }
+            (_, NodeRunner::Owned(runner))
+                if template.image.is_none() && runner.supports_host_limits() =>
+            {
+                Some("host profile plus helper exceeds node capacity")
+            }
+            _ => None,
+        };
+        if let Some(reason) = helper
+            && let Ok(profile) = super::reusable_executor::ExecutorProfile::new(template)
+            && !capacity.fits(&profile.reservation)
+        {
+            return Err(reason.into());
+        }
+        Ok(())
+    }
+
+    /// Whether this node may run the array's binary at all, whatever its
+    /// size: a refusal here holds for every attempt ([`Self::fits`] covers
+    /// size).
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
         if let Some(template) = assignment.template.as_ref() {
             template.validate_runtime().map_err(str::to_owned)?;
+            // An allowlist or allow_from this node can't hold would leave
+            // every attempt to fail at launch; refuse the array up front.
+            let enforced = match self.runner.as_ref() {
+                NodeRunner::Owned(runner) => runner.enforces_network_policy(template),
+                NodeRunner::Fake(_) => true,
+                NodeRunner::Process(_) => {
+                    super::task_runtime::egress_allow(template).is_empty()
+                        && super::task_runtime::allow_from(template)
+                            .is_none_or(|sources| sources.is_empty())
+                }
+            };
+            if !enforced {
+                return Err(super::task_runtime::NETWORK_POLICY_UNENFORCEABLE.into());
+            }
         }
         if assignment
             .template
@@ -509,17 +709,11 @@ impl TaskArrayNode {
                     .into(),
             );
         }
-        if !self.budget.capacity().fits(&assignment.resources) {
-            return Err("task requests exceed this node's allocatable resources".into());
-        }
         if let Some(template) = assignment.template.as_ref()
             && template.runtime == crate::config::job::JobRuntime::SharedRunc
         {
-            let profile = super::reusable_executor::ExecutorProfile::new(template)
+            super::reusable_executor::ExecutorProfile::new(template)
                 .map_err(|error| error.to_string())?;
-            if !self.budget.capacity().fits(&profile.reservation) {
-                return Err("reusable profile plus helper exceeds node capacity".into());
-            }
             return match self.runner.as_ref() {
                 NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
                 NodeRunner::Fake(_) => Ok(()),
@@ -565,11 +759,8 @@ impl TaskArrayNode {
             && runner.supports_host_limits()
             && let Some(template) = assignment.template.as_ref()
         {
-            let profile = super::reusable_executor::ExecutorProfile::new(template)
+            super::reusable_executor::ExecutorProfile::new(template)
                 .map_err(|error| error.to_string())?;
-            if !self.budget.capacity().fits(&profile.reservation) {
-                return Err("host profile plus helper exceeds node capacity".into());
-            }
         }
         if !self.config.policy.is_binary_allowed(&assignment.program) {
             return Err(format!(
@@ -578,10 +769,13 @@ impl TaskArrayNode {
             ));
         }
         if self.config.policy.mount_isolation {
-            // TODO(million-jobs M7): run tasks inside the mount namespace
+            // TODO(#714): run tasks inside the mount namespace
             // the ordinary process workloads use.
             return Err(
-                "task arrays don't run under [process_workloads] mount_isolation yet".to_string(),
+                "host jobs don't run under [process_workloads] mount_isolation yet \
+                 (on by default on Linux); set mount_isolation = false to run them \
+                 unisolated on the host, or give the job an image"
+                    .to_string(),
             );
         }
         Ok(())
@@ -594,7 +788,10 @@ impl TaskArrayNode {
             assignment.held.iter().map(|h| h.chunk.0).collect();
         let (ledger, resumed, highest) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(directory.join("output"))?;
-            std::fs::File::open(directory.parent().expect("array has parent"))?.sync_all()?;
+            let parent = directory
+                .parent()
+                .ok_or_else(|| std::io::Error::other("array directory has no parent"))?;
+            std::fs::File::open(parent)?.sync_all()?;
             let path = directory.join("ledger");
             let resumed = if path.exists() {
                 let mut records = Vec::new();
@@ -771,10 +968,14 @@ impl TaskArrayNode {
                 Arc::clone(&run.finished),
                 Arc::clone(&run.failure),
                 run.cancel.clone(),
-                self.array_dir(assignment.batch_id).join("output"),
+                OutputSink {
+                    directory: self.array_dir(assignment.batch_id).join("output"),
+                    syncs: Arc::clone(&self.output_syncs),
+                },
                 work,
                 resumed,
                 cancel,
+                (Arc::clone(&self.telemetry), assignment.labels.clone()),
             ));
         }
 
@@ -793,6 +994,24 @@ impl TaskArrayNode {
             .runner
             .busy_slots(assignment.batch_id, assignment.template.as_deref())
             .await;
+        let usage_targets = self
+            .runner
+            .usage_targets(assignment.batch_id, assignment.template.as_deref())
+            .await;
+        self.telemetry.observe(
+            assignment.batch_id,
+            &assignment.labels,
+            crate::mayo::job_metrics::AttemptCounts {
+                started: counters.attempts_started.load(Ordering::Relaxed),
+                succeeded: counters.succeeded.load(Ordering::Relaxed),
+                failed: counters.failed.load(Ordering::Relaxed),
+                retried: counters.retried.load(Ordering::Relaxed),
+            },
+            busy_slots
+                .or(active_commands)
+                .unwrap_or_else(|| counters.running.load(Ordering::Relaxed)),
+            usage_targets,
+        );
         ArrayProgress {
             batch_id: assignment.batch_id,
             slots: {
@@ -834,6 +1053,7 @@ impl TaskArrayNode {
                     .min(cap)
             },
             refused: None,
+            unrunnable: false,
             finished,
             counters: NodeArrayCounters {
                 running: counters.running.load(Ordering::Relaxed),
@@ -842,6 +1062,9 @@ impl TaskArrayNode {
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
                 failed: counters.failed.load(Ordering::Relaxed),
                 retried: counters.retried.load(Ordering::Relaxed),
+                start_lag_ms_counts: std::array::from_fn(|bucket| {
+                    counters.start_lag_counts[bucket].load(Ordering::Relaxed)
+                }),
             },
         }
     }
@@ -910,7 +1133,7 @@ impl TaskArrayNode {
                 if !path.exists() {
                     return Err(TaskArrayNodeError::UnknownArray { batch_id });
                 }
-                let index_path = path.with_extension("index.redb");
+                let index_path = path.with_extension("index");
                 if !index_path.exists() {
                     return Err(std::io::Error::other(
                         "result index unavailable; recover the worker ledger before reading detail",
@@ -919,7 +1142,7 @@ impl TaskArrayNode {
                 }
                 let index = tokio::task::spawn_blocking(move || {
                     let index = super::task_result_index::TaskResultIndex::open(
-                        &path.with_extension("index.redb"),
+                        &path.with_extension("index"),
                     )?;
                     // Accepted outcomes already required this index's durable
                     // commit. Recovery rebuilds active writers; a read never
@@ -951,7 +1174,8 @@ impl TaskArrayNode {
     }
 
     /// The captured output of a failed task: its first and last bytes.
-    /// Only failed tasks keep output.
+    /// Only failed tasks keep output, and only the first
+    /// [`super::task_output::KEPT_FAILURES_PER_CHUNK`] of each chunk.
     pub async fn task_output(
         &self,
         batch_id: u64,
@@ -978,17 +1202,25 @@ impl TaskArrayNode {
         grant: u64,
     ) -> Result<Vec<u8>, TaskArrayNodeError> {
         let directory = self.array_dir(batch_id);
-        let path = directory.join("output").join(format!("{index}-{grant}"));
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => Ok(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if tokio::fs::metadata(&directory).await.is_err() {
-                    Err(TaskArrayNodeError::UnknownArray { batch_id })
-                } else {
-                    Err(TaskArrayNodeError::NoOutput { index })
-                }
-            }
-            Err(error) => Err(error.into()),
+        let output = directory.join("output");
+        if let Some(bytes) =
+            tokio::task::spawn_blocking(move || super::task_output::read(&output, index, grant))
+                .await??
+        {
+            return Ok(bytes);
+        }
+        if tokio::fs::metadata(&directory).await.is_err() {
+            return Err(TaskArrayNodeError::UnknownArray { batch_id });
+        }
+        // A failure at this grant with no output went past its chunk's share.
+        let failed_here = self
+            .results_page(batch_id, true, 1, index, index.saturating_add(1))
+            .await
+            .is_ok_and(|rows| rows.iter().any(|row| row.grant_attempt == grant));
+        if failed_here {
+            Err(TaskArrayNodeError::OutputNotKept { index })
+        } else {
+            Err(TaskArrayNodeError::NoOutput { index })
         }
     }
 }
@@ -1000,7 +1232,10 @@ fn persist_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     file.write_all(&serde_json::to_vec(value)?)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
-    std::fs::File::open(path.parent().expect("fence has parent"))?.sync_all()
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("fence file has no parent directory"))?;
+    std::fs::File::open(parent)?.sync_all()
 }
 
 fn refused(batch_id: u64, reason: String) -> ArrayProgress {
@@ -1008,6 +1243,7 @@ fn refused(batch_id: u64, reason: String) -> ArrayProgress {
         batch_id,
         slots: 0,
         refused: Some(reason),
+        unrunnable: false,
         finished: Vec::new(),
         counters: NodeArrayCounters::default(),
     }
@@ -1030,6 +1266,12 @@ fn group_by_chunk(spec: &TaskArraySpec, records: Vec<TaskRecord>) -> HashMap<u32
     chunks
 }
 
+/// Where a chunk keeps its failed tasks' output.
+struct OutputSink {
+    directory: PathBuf,
+    syncs: Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// Run one chunk, make its records durable, keep failed tasks' output,
 /// then publish the result for the next sync.
 #[allow(clippy::too_many_arguments)]
@@ -1039,10 +1281,14 @@ async fn run_chunk(
     finished: Arc<Mutex<HashMap<(u32, u64), ChunkResult>>>,
     failure: Arc<Mutex<Option<String>>>,
     array_cancel: CancellationToken,
-    output_dir: PathBuf,
+    sink: OutputSink,
     work: ChunkWork,
     resumed: Vec<TaskRecord>,
     cancel: CancellationToken,
+    (telemetry, labels): (
+        Arc<crate::mayo::job_metrics::JobTelemetry>,
+        crate::mayo::job_metrics::JobLabels,
+    ),
 ) {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<TaskRecord>(1024);
     let stream_work = async {
@@ -1058,12 +1304,19 @@ async fn run_chunk(
                 }
                 let outputs: Vec<_> = records
                     .iter()
-                    .filter_map(|r| r.output.clone().map(|o| (r.index, r.grant_attempt, o)))
+                    .filter_map(|r| r.output.as_ref().map(|o| (r.index, render_output(o))))
                     .collect();
                 if !outputs.is_empty() {
-                    let directory = output_dir.clone();
-                    tokio::task::spawn_blocking(move || write_outputs(&directory, &outputs))
-                        .await??;
+                    let directory = sink.directory.clone();
+                    let range = work.spec.chunk_range(work.chunk).unwrap_or(0..=u32::MAX);
+                    let grant = work.grant_attempt;
+                    let appended = tokio::task::spawn_blocking(move || {
+                        super::task_output::append(&directory, &range, grant, &outputs)
+                    })
+                    .await??;
+                    if appended.synced {
+                        sink.syncs.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 for record in &records {
                     persisted.insert(record.index);
@@ -1107,6 +1360,7 @@ async fn run_chunk(
         );
         return;
     }
+    telemetry.record_durations(&labels, &outcome.result.duration_counts);
     // Keyed by attempt too: a taken-back run finishing late mustn't
     // overwrite the result of the chunk's newer grant on this node.
     finished
@@ -1128,35 +1382,35 @@ fn slot_cap(concurrency: u32, explicit: bool, reusable: bool) -> u32 {
     }
 }
 
-fn write_outputs(directory: &Path, outputs: &[(u32, u64, CapturedOutput)]) -> std::io::Result<()> {
-    for (index, grant, output) in outputs {
-        let mut bytes = output.head.clone();
-        if !output.tail.is_empty() {
-            let kept = (output.head.len() + output.tail.len()) as u64;
-            let skipped = output.total_bytes.saturating_sub(kept);
-            if skipped > 0 {
-                bytes
-                    .extend_from_slice(format!("\n[... {skipped} bytes skipped ...]\n").as_bytes());
-            }
-            bytes.extend_from_slice(&output.tail);
+/// A captured output as kept on disk: head, a skipped-bytes marker, tail.
+fn render_output(output: &CapturedOutput) -> Vec<u8> {
+    let mut bytes = output.head.clone();
+    if !output.tail.is_empty() {
+        let kept = (output.head.len() + output.tail.len()) as u64;
+        let skipped = output.total_bytes.saturating_sub(kept);
+        if skipped > 0 {
+            bytes.extend_from_slice(format!("\n[... {skipped} bytes skipped ...]\n").as_bytes());
         }
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(directory.join(format!("{index}-{grant}")))?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        bytes.extend_from_slice(&output.tail);
     }
-    std::fs::File::open(directory)?.sync_all()
+    bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_task_data_pressure_counts_the_audit_log() {
+        let config = TaskArrayNodeConfig::for_data_dir(
+            Path::new("/var/lib/reliaburger"),
+            ProcessWorkloadsConfig::default(),
+        );
+        assert_eq!(
+            config.audit_dir.as_deref(),
+            Some(Path::new("/var/lib/reliaburger/audit"))
+        );
+    }
     use crate::bun::task_executor::AttemptOutcome;
     use crate::meat::index_set::IndexRangeSet;
 
@@ -1193,6 +1447,7 @@ mod tests {
                 interval: Duration::from_millis(5),
                 max_records: 4096,
             },
+            audit_dir: None,
         }
     }
 
@@ -1224,7 +1479,39 @@ mod tests {
                 .collect(),
             stopping: false,
             replay_unknown: true,
+            labels: crate::mayo::job_metrics::JobLabels {
+                namespace: "default".into(),
+                definition: "render".into(),
+                profile: "default".into(),
+            },
         }
+    }
+
+    #[tokio::test]
+    async fn templates_with_network_policy_need_a_node_that_enforces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = assignment(1, 1, &[(0, 1)]);
+        task.template = Some(Box::new(
+            toml::from_str(
+                "image='proc-grill:image-ignored'\ncommand=['true']\n[egress]\nallow=['192.0.2.1:443']",
+            )
+            .unwrap(),
+        ));
+        let runner = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
+            crate::grill::ProcessGrill::new(),
+        ));
+        let node = TaskArrayNode::new(
+            TaskArrayNodeConfig::for_data_dir(dir.path(), ProcessWorkloadsConfig::default()),
+            NodeRunner::Owned(Box::new(runner)),
+        );
+        let refused = node.admit(&task).unwrap_err();
+        assert!(refused.contains("egress and allow_from"), "{refused}");
+        let template = task.template.as_mut().unwrap();
+        template.egress = None;
+        template.firewall = Some(crate::config::app::FirewallSpec {
+            allow_from: vec!["frontend/web".into()],
+        });
+        assert!(node.admit(&task).unwrap_err().contains("allow_from"));
     }
 
     #[tokio::test]
@@ -1323,6 +1610,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sync_flushes_the_disk_only_when_the_fence_changes() {
+        // On macOS every fsync is a whole-device flush, and the leader
+        // syncs each node every tick: an unchanged fence must cost none.
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("tasks");
+        let node = fake_node(&root, FakeRunner::always_succeeds());
+        let mut sync = request(Vec::new());
+        sync.version = ControlVersion {
+            epoch: 0,
+            term: 1,
+            index: 1,
+        };
+        node.sync(&sync).await;
+        // The new directory's entry, the fence file and its directory.
+        assert_eq!(node.control_syncs(), 3);
+        node.sync(&sync).await;
+        node.sync(&sync).await;
+        assert_eq!(
+            node.control_syncs(),
+            3,
+            "an unchanged fence flushed the disk"
+        );
+        sync.version.index = 2;
+        node.sync(&sync).await;
+        // A new fence rewrites its file; the directory entry is durable.
+        assert_eq!(node.control_syncs(), 5);
+        // A directory removed underneath the node is made durable again.
+        std::fs::remove_dir_all(&root).unwrap();
+        node.sync(&sync).await;
+        assert_eq!(node.control_syncs(), 8);
+        assert!(root.join("control.json").exists());
+    }
+
+    #[tokio::test]
     async fn recovery_epoch_refuses_old_ledgers_persistently_without_deleting_them() {
         let root = tempfile::tempdir().unwrap();
         let node = fake_node(root.path(), FakeRunner::always_succeeds());
@@ -1407,6 +1728,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_node_counts_its_attempts_into_job_telemetry() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let sync = request(vec![assignment(1, 25, &[(0, 1), (2, 3)])]);
+        sync_until_finished(&node, &sync, 2).await;
+        // The counters in the response lag the finished chunks by one sync.
+        node.sync(&sync).await;
+        let samples = node.telemetry().samples("node-a");
+        let value = |name: &str| {
+            samples
+                .iter()
+                .find(|sample| sample.key.name.as_str() == name)
+                .map(|sample| sample.value)
+        };
+        assert_eq!(value("job_tasks_succeeded_total"), Some(15.0));
+        assert_eq!(value("job_task_duration_ms_count"), Some(15.0));
+        let labels = &samples[0].key.labels;
+        assert_eq!(labels.get("definition").map(String::as_str), Some("render"));
+        assert_eq!(labels.get("node").map(String::as_str), Some("node-a"));
+
+        // Once the leader stops listing the run, nothing of it is running.
+        node.sync(&request(Vec::new())).await;
+        assert!(node.telemetry().usage_targets().is_empty());
+    }
+
+    #[tokio::test]
     async fn held_chunks_run_and_are_reported_at_their_attempt() {
         let root = tempfile::tempdir().unwrap();
         let node = fake_node(root.path(), FakeRunner::always_succeeds());
@@ -1449,6 +1796,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tasks_too_big_for_this_node_are_refused_but_not_for_good() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let mut greedy = assignment(1, 20, &[]);
+        greedy.resources.cpu_millicores = u64::MAX;
+        let progress = node.sync(&request(vec![greedy])).await.arrays.remove(0);
+        assert_eq!(progress.slots, 0);
+        assert!(
+            !progress.unrunnable,
+            "a bigger node may still take it, so the run must wait"
+        );
+        assert!(progress.refused.unwrap().contains("allocatable"));
+    }
+
+    #[tokio::test]
     async fn a_binary_off_the_allowlist_gets_no_slots() {
         let root = tempfile::tempdir().unwrap();
         let node = TaskArrayNode::new(
@@ -1461,6 +1823,7 @@ mod tests {
             .arrays
             .remove(0);
         assert_eq!(progress.slots, 0);
+        assert!(progress.unrunnable);
         assert!(progress.refused.unwrap().contains("allowed_binaries"));
         assert!(progress.finished.is_empty());
     }
@@ -1478,6 +1841,10 @@ mod tests {
             .arrays
             .remove(0);
         assert_eq!(progress.slots, 0);
+        assert!(
+            progress.unrunnable,
+            "the node's configuration refuses it every time"
+        );
         assert!(progress.refused.unwrap().contains("mount_isolation"));
     }
 
@@ -1622,5 +1989,130 @@ mod tests {
             node.task_output(5, 0).await,
             Err(TaskArrayNodeError::UnknownArray { batch_id: 5 })
         ));
+    }
+
+    fn failing_everywhere(
+        root: &Path,
+        count: u32,
+        chunk_size: u32,
+    ) -> (TaskArrayNode, ArrayAssignment) {
+        let node = fake_node(
+            root,
+            FakeRunner::new(Duration::ZERO, |_| AttemptOutcome::Exited { code: 3 }),
+        );
+        let chunks: Vec<_> = (0..count.div_ceil(chunk_size)).map(|c| (c, 1)).collect();
+        let mut array = assignment(9, count, &chunks);
+        array.spec.chunk_size = chunk_size;
+        array.spec.max_attempts = 1;
+        (node, array)
+    }
+
+    #[tokio::test]
+    async fn failure_output_is_kept_only_for_the_first_failures_of_a_chunk() {
+        use super::super::task_output::KEPT_FAILURES_PER_CHUNK;
+        let root = tempfile::tempdir().unwrap();
+        let (node, array) = failing_everywhere(root.path(), 100, 100);
+        let progress = sync_until_finished(&node, &request(vec![array]), 1).await;
+        assert_eq!(progress.finished[0].failed_count, 100);
+
+        let mut kept = 0;
+        for index in 0..100 {
+            match node.task_output(9, index).await {
+                Ok(_) => kept += 1,
+                Err(TaskArrayNodeError::OutputNotKept { index: i }) => assert_eq!(i, index),
+                Err(other) => panic!("task {index}: {other}"),
+            }
+        }
+        assert_eq!(
+            kept, KEPT_FAILURES_PER_CHUNK,
+            "the rest are counted, not kept"
+        );
+        let message = TaskArrayNodeError::OutputNotKept { index: 99 }.to_string();
+        assert!(message.contains("wasn't kept"), "{message}");
+        // Every failure still has its durable record and exit code.
+        assert_eq!(node.results(9, true, 1000).await.unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn failure_outputs_share_one_segment_and_one_fsync_per_batch() {
+        use super::super::task_output::KEPT_FAILURES_PER_CHUNK;
+        let root = tempfile::tempdir().unwrap();
+        let (node, array) = failing_everywhere(root.path(), 400, 100);
+        sync_until_finished(&node, &request(vec![array]), 4).await;
+
+        let segments: Vec<_> = std::fs::read_dir(node.array_dir(9).join("output"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            segments.len(),
+            4,
+            "one file per chunk, not per task: {segments:?}"
+        );
+        // At most one fsync per batch, and never one per kept output.
+        let syncs = node.output_syncs();
+        assert!(
+            (4..=4 * KEPT_FAILURES_PER_CHUNK as u64).contains(&syncs),
+            "{syncs} output fsyncs"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_array_directory_is_deleted_without_a_new_registration() {
+        use crate::meat::task_array_store::{TERMINAL_RETENTION_SECS, TaskArrayWrite, TaskArrays};
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        sync_until_finished(&node, &request(vec![assignment(1, 10, &[(0, 1)])]), 1).await;
+
+        // The leader's view: the array finished at t=100 and nothing new arrives.
+        let mut arrays = TaskArrays::default();
+        let template: crate::config::job::JobSpec =
+            toml::from_str("runtime='process'\nexec='/bin/sh'\ncommand=['-c','true']").unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::Register {
+                    name: "render".into(),
+                    namespace: "default".into(),
+                    template: Box::new(template),
+                    spec: TaskArraySpec::with_count(10),
+                    submitted_at_epoch_secs: 100,
+                },
+                || 1,
+            )
+            .unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    batch_id: 1,
+                    now_epoch_secs: 100,
+                },
+                || 0,
+            )
+            .unwrap();
+        let known = |arrays: &TaskArrays| NodeSyncRequest {
+            version: ControlVersion::default(),
+            known: arrays.ids(),
+            arrays: Vec::new(),
+        };
+        node.sync(&known(&arrays)).await;
+        assert!(
+            node.array_dir(1).exists(),
+            "kept while the cluster lists it"
+        );
+
+        // The leader's timer write is all it takes.
+        let now = 101 + TERMINAL_RETENTION_SECS;
+        assert!(arrays.has_expired(now, TERMINAL_RETENTION_SECS));
+        arrays
+            .apply(
+                &TaskArrayWrite::Prune {
+                    now_epoch_secs: now,
+                    retention_secs: TERMINAL_RETENTION_SECS,
+                },
+                || 0,
+            )
+            .unwrap();
+        node.sync(&known(&arrays)).await;
+        assert!(!node.array_dir(1).exists());
     }
 }

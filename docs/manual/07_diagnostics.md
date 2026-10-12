@@ -47,6 +47,11 @@ the nodes that answered run and names the one that didn't. If the nodes that
 answered disagree, the `version-skew` warning carries the silent node in its
 details.
 
+When desired apps span more than one namespace, `wtf` checks that every node
+can keep them apart. A node without the live eBPF hooks (rootless runc,
+ProcessGrill, eBPF off) gets a `namespace-isolation` warning naming it: there,
+any namespace's workloads reach any other's, and `allow_from` is refused.
+
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
 fenced out of a council `relish council recover` replaced, when nodes serve
@@ -139,7 +144,11 @@ workload identity, ingress, volumes, process workloads, jobs, the image
 registry and cluster coordination. Each case runs in its own leased `rbtest-*`
 namespace and cleans up after itself. While the council changes leader, the
 server refuses new leases with a 503 "retry shortly"; the runner asks again
-for up to 30 seconds before it gives up on the case.
+for up to 30 seconds before it gives up on the case. Job cases hold a job
+lease: their jobs run through the cluster's common job lifecycle like any
+other job, and releasing the lease cancels their runs and forgets their
+definitions. With a council the lease itself lives in Raft, so any node can
+check it.
 
 ```sh
 relish test                                  # every group, four at a time
@@ -152,7 +161,11 @@ Group names are `scheduling`, `service-discovery`, `deployments`,
 `health-checks`, `secrets-config`, `firewall`, `workload-identity`, `ingress`,
 `volumes`, `process-workloads`, `jobs`, `image-registry` and
 `cluster-coordination`. The default `development` profile accepts a skip with
-a known reason, such as a capability this node lacks. The full profiles
+a known reason, such as a capability this node lacks. A node with
+`[process_workloads] mount_isolation` on, the Linux default, doesn't advertise
+host workloads, because it refuses them until #714 lands; its host
+`process-workloads` and `jobs` cases skip with that reason rather than
+waiting for work that never starts. The full profiles
 (`full-runc`, `process-grill`) fail on required skips, unknown evidence,
 timeouts and unconfirmed cleanup. The server must grant
 `provision_isolated_workloads`. Any failure exits non-zero. `--chaos` runs the

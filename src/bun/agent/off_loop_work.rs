@@ -50,9 +50,6 @@ pub(super) enum WorkKey {
     },
     /// Removing a retired test lease's disposable storage.
     RetireTestStorage { namespace: String, app: String },
-    /// Killing a job's previous run, and confirming its exit, before a
-    /// rerun replaces it.
-    ClearJobRun(InstanceId),
     /// Force-killing an instance whose graceful stop failed, and confirming
     /// its exit.
     #[cfg_attr(
@@ -86,7 +83,6 @@ impl std::fmt::Display for WorkKey {
             WorkKey::RetireTestStorage { namespace, app } => {
                 write!(f, "removing {namespace}/{app}'s test storage")
             }
-            WorkKey::ClearJobRun(id) => write!(f, "killing {id}'s previous run"),
             WorkKey::FenceExecution(id) => write!(f, "force-killing {id}"),
             WorkKey::ReadNetworkReference(id) => {
                 write!(f, "reading {id}'s network reference")

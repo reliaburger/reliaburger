@@ -573,6 +573,15 @@ impl super::Grill for RuncGrill {
         self.owned_inventory().await
     }
 
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        self.owned_forget_retired(instance)
+            .await
+            .map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })
+    }
+
     async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
         self.owned_log_stem(instance).await.ok().flatten()
     }
@@ -1504,7 +1513,6 @@ mod tests {
             namespace: "payments".to_string(),
             app_name: "rootfs-adoption".to_string(),
             replica_index: 0,
-            is_job: false,
             image: ALPINE_IMAGE.to_string(),
             runtime: crate::grill::records::RuntimeKind::Runc,
             pid,

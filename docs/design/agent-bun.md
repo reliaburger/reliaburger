@@ -160,7 +160,22 @@ maps it into the node range and prepares every read-write volume:
   host gid, or world-writable. When the mode bits say the process can't write,
   Bun logs a warning naming the directory, its owner and the host uid to
   `chown` it to, then starts the container anyway: a read-mostly mount is
-  legitimate.
+  legitimate. Because every rootful container shares one id range, a host
+  path is also a tenant boundary (#676). The supervisor admits a volume or
+  `config_file` `source` only under a prefix in `[storage] allowed_host_paths`
+  (empty by default, so every host path is refused), matched by path
+  component after resolving symlinks, with `..` refused. It always refuses a
+  source that is under, or contains, the node's `[storage]`, identity and
+  script directories or the directories holding the master key and security
+  bootstrap. At apply, any `source` counts as host access, so a token with a
+  `[permission]` block needs `host-exec` as well as `deploy`. The check
+  returns the resolved path as an `ApprovedHostPath`, and
+  `WorkloadSupervisor::approve_host_paths` runs it again right before each
+  OCI spec is built (fresh instances and rolling or blue-green
+  replacements alike), so the bundle mounts the resolved path the policy
+  approved, not the `source` as written (#797). The remaining race: runc
+  mounts that path by name after the image pull and on every restart, so a
+  directory on it replaced by a symlink in between is still followed.
 - **Rootless runc** skips all of this: the volume was created by the user
   whose id is the container's only mapped id (container root).
 
@@ -202,7 +217,7 @@ cgroup path rather than fabricating a path runc cannot write.
 |-----------|----------------|-----|
 | **runc** | Runtime (external binary, Linux) | Low-level OCI container execution (namespaces, cgroups, seccomp). Grill writes the OCI bundle and calls `runc` directly; its `state` persists container liveness across Bun restarts. No containerd. |
 | **Apple Container** | Runtime (external, macOS) | OCI container lifecycle on macOS. Grill re-adopts a running workload via `container inspect` after a Bun exec. |
-| **Linux kernel 5.7+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE |
+| **Linux kernel 5.8+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE, the boot-time clock helper. Reusable job executors need `clone3(CLONE_INTO_CGROUP)` (5.7) and the cgroup v2 freezer (5.2), inside the same minimum; they use `cgroup.kill` (5.14) when present and otherwise freeze and kill each task. Bun turns the executor pools off on an older kernel, and the native host pool off without `CONFIG_PROC_CHILDREN` (`src/grill/kernel.rs`) |
 | **Mustard (gossip)** | Internal subsystem | Failure detection, leader discovery, cluster membership, metadata propagation (protocol version, node labels) |
 | **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
 | **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Worker nodes receive state via the reporting tree, not directly from Raft. |
@@ -1032,7 +1047,7 @@ before their Phase 15 cases can use this contract.
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
-9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem. Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
+9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was checked against `[storage] allowed_host_paths` at admission and again when the OCI spec was built, which mounts the resolved path that check approved). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container via containerd sharing the main container's network namespace and volumes. Wait for exit code 0. If any fails, transition to `Failed` and emit event.
 11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
 12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
@@ -1245,11 +1260,30 @@ Three decisions shape everything that follows, and each earns its keep against t
       CURRENT running binary.
    c. external_signature verifies against external_signing_key in node.toml
       (required for network upgrades).
+   d. the verified bytes, written to a private temporary file, answer
+      `--compatibility` with this node's protocol and state pair. The
+      candidate has 60 s from launch to answer; the bound is a hang guard,
+      wide because macOS assesses the first exec of every new executable
+      one file at a time across the host (about a second for a release
+      `bun`, longer behind other new executables), and the copy is always
+      new. A timeout names how far the candidate got (pid, first output,
+      exit).
    Any failure aborts before staging: the node reports failure and does NOT
    swap.
 
 4. Stage the binary and its detached signature under the version store,
    then flip the current symlink atomically to the new version.
+
+   The hashing and signature checks in 3 and the staging in 4 read, hash
+   and write the whole binary: seconds for a large build. They run on
+   Tokio's blocking pool (`spawn_blocking`), never on a runtime worker.
+   Done in place they starved the node's Raft core, which missed the
+   leader's heartbeats and called an election just before the exec,
+   deposing a healthy leader on every voter swap (#783). So do the other
+   steps whose cost grows with the binary or the disk: writing and deleting
+   the probe's private copy in 3, and syncing the `Staged` marker. On a busy
+   disk each of those alone held a worker for 0.2 to 0.6 s (#794). The
+   worker only launches the probe and waits for its answer.
 
 5. Exec the new binary in place (execve). The PID does not change; running
    containers keep serving. On startup the new Bun ADOPTS its still-running
@@ -1268,11 +1302,24 @@ Three decisions shape everything that follows, and each earns its keep against t
 The whole rolling walk lives in Raft under `DesiredState.active_upgrade`, so a leader change mid-run is a *resume*, not a restart: whichever node holds leadership drives the loop from the replicated state. Each tick polls reality first (`GET /v1/version` per node) and takes at most one round of actions, which makes every directive idempotent by observation.
 
 ```
-1. Start: relish verifies the binary (SHA-256 + dual signatures) and pushes
-   it to the leader's Pickle. The leader records the plan in Raft. The plan's
-   per-node ROLE and ADDRESS are derived server-side from gossip membership
-   and the Raft voter set — a client can't upgrade a node under a false
-   identity (a spoofed address or a mislabelled leader is rejected).
+1. Start: relish asks every node its platform (`platform` in
+   GET /v1/version, through the connected node's relay), downloads one
+   release build per platform present, checks each against the metadata's
+   SHA-256, adds the operator's signature (--external-key, or a countersigned
+   --sig) and pushes each to the connected node's Pickle. The start request
+   carries `binaries`, one PlatformBinary { platform, sha256, signatures }
+   per platform. The leader records the plan in Raft with each node's
+   platform; the orchestrator directs every node to its own platform's build
+   and refuses a node whose platform has none. The plan's per-node ROLE and
+   ADDRESS are derived server-side from gossip membership and the Raft voter
+   set — a client can't upgrade a node under a false identity (a spoofed
+   address or a mislabelled leader is rejected).
+
+   relish takes the single-node path only on the node's explicit 503
+   "no council on this node" from GET /v1/upgrade/cluster; any other error
+   stops the command. Until 1.0 a rolling upgrade works only between builds
+   with the same protocol and state pair; `metadata.json` names each
+   release's pair, and relish refuses a release with another one.
 
 2. Workers, in batches of --parallel (default 1):
    direct each, then wait until it polls back healthy at the target AND
@@ -1350,6 +1397,7 @@ join = ["10.0.1.5:9443"]
 | `[storage]` | `logs` | `/var/lib/reliaburger/logs` | absolute path | Application logs (Ketchup). Append-heavy. |
 | `[storage]` | `metrics` | `/var/lib/reliaburger/metrics` | absolute path | Time-series data (Mayo). Append-heavy, random reads. |
 | `[storage]` | `volumes` | `/var/lib/reliaburger/volumes` | absolute path | Persistent app data. Must be reliable. |
+| `[storage]` | `allowed_host_paths` | `[]` | list of absolute paths | Prefixes a volume or config-file `source` may mount from. Empty refuses every host path; the storage, identity, script and key directories are refused even under a listed prefix. |
 | `[resources]` | `reserved_cpu` | `"500m"` | resource string (millicores) | CPU reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_memory` | `"512Mi"` | resource string (bytes) | Memory reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
@@ -1438,6 +1486,14 @@ join = ["10.0.1.5:9443"]
 
 **Recovery:** Bun triggers garbage collection on the affected path. For images, unreferenced layers are removed. For logs and metrics, retention policies are enforced aggressively. For volumes, the operator must increase the volume size or delete data.
 
+**Bounds that keep it from happening (#678):**
+
+- `[logs]` and `[metrics]` default to `max_storage_mb = 2048` and `1024`. `0` is an explicit opt-out, and Bun refuses at startup a cap larger than the filesystem holding its data directory.
+- Task data under `<data>/task-arrays/<id>/` is a 22-byte-per-task ledger, a dense result index of 24-byte slots (a sparse file, so a worker pays only for the tasks it ran) and kept failure output: one append-only segment per chunk grant, holding the head and tail of the first 16 failed tasks, written with one fsync per batch. A million tasks measure about 47 bytes per task (`make bench-task-arrays` fails above 50). The index replaced a redb B-tree that measured 87 bytes per task, four times the ledger; ledger plus index, about 109 bytes per task, is the same order as the 82 bytes per accepted task the October qualification rig lost, and nothing else on the task path grows per task.
+- The leader prunes finished runs an hour after they finish with a replicated `Prune` write on its one-second tick, not only on the next registration, and each worker deletes a run's directory once the leader stops listing it. An idle cluster therefore returns to its baseline disk use.
+- Task data counts toward disk pressure, and so does the audit log under `{data}/audit` (#798; `disk_pressure::node_data_bytes`). When they pass a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
+- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. Ordinary app instances don't call it yet, so their route and journal files still outlive a deleted app.
+
 ### 7.4 Process Workload Binary Missing
 
 **What happens:** The binary specified in `exec` does not exist at the declared path, or has been removed since the allowlist was configured.
@@ -1462,7 +1518,7 @@ join = ["10.0.1.5:9443"]
 
 **What happens:** The new binary fails to start after the upgrade exec.
 
-**Detection:** The new Bun exits within 30 seconds, or fails to rejoin gossip within 60 seconds.
+**Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)).
 
 **Impact:** This node is temporarily unable to accept new work. Running containers are unaffected (containerd manages them independently).
 
@@ -1492,6 +1548,16 @@ join = ["10.0.1.5:9443"]
 **Impact:** The workload process is killed immediately. The workload transitions to `Stopped`, then restarts per the restart policy with exponential backoff.
 
 **Recovery:** Automatic restart with backoff. Once the `memory.events` watch lands, the OOM event will be logged with full memory state (current usage, limit, peak) and surfaced via `relish wtf`; today an OOM kill looks like any other unexpected exit.
+
+### 7.9 Reusable Executor Fails to Start
+
+**What happens:** A cold reusable executor (shared-runc or native host) fails while starting, before its helper connects: a runtime command misses its five-second bound on a loaded host, an I/O call fails, or the helper never connects. The job's command hasn't been sent anywhere yet.
+
+**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O and helper failures from refusals about the job itself.
+
+**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second failure, or any refusal, fails the attempt with the runtime's reason as `SpawnFailed`.
+
+**Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
 
 ---
 
@@ -1862,7 +1928,7 @@ Bun Restart
 
 ### 12.2 Evaluation Notes
 
-**`libbpf-rs` vs `aya`:** Both provide eBPF support in Rust. `libbpf-rs` wraps the C `libbpf` library and provides CO-RE support, meaning eBPF programs compiled once run on different kernel versions without recompilation. `aya` is a pure Rust implementation that avoids the C dependency but is younger and has less battle-tested kernel compatibility. For a system that must run on kernel 5.7+ across diverse distributions, `libbpf-rs`'s maturity and CO-RE support are the safer choice. Revisit if `aya` matures to equivalent kernel coverage.
+**`libbpf-rs` vs `aya`:** Both provide eBPF support in Rust. `libbpf-rs` wraps the C `libbpf` library and provides CO-RE support, meaning eBPF programs compiled once run on different kernel versions without recompilation. `aya` is a pure Rust implementation that avoids the C dependency but is younger and has less battle-tested kernel compatibility. For a system that must run on kernel 5.8+ across diverse distributions, `libbpf-rs`'s maturity and CO-RE support are the safer choice. Revisit if `aya` matures to equivalent kernel coverage.
 
 **`nftnl` GPL concern:** The `nftnl` crate has a GPL-2.0 license. If this is incompatible with the project's licensing, the alternative is to invoke the `nft` CLI as a subprocess for nftables management. This is slightly less performant (process spawn per rule change) but avoids the license issue. Atomic rule application is still possible via `nft -f <file>`.
 

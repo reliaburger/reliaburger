@@ -366,6 +366,41 @@ impl CouncilNode {
         Ok(())
     }
 
+    /// The voter set a committed but unfinished membership change is heading
+    /// for, or `None` when the membership is uniform or its joint step has
+    /// not committed yet.
+    ///
+    /// openraft changes voters in two steps, and the second (uniform) step is
+    /// proposed by the caller's future once the joint step commits. A caller
+    /// that gives up in between, such as the council reconciler's bounded
+    /// operation, leaves the council in the joint config, and nothing in
+    /// openraft finishes it (#673).
+    pub fn unfinished_membership_change(&self) -> Option<BTreeSet<u64>> {
+        let metrics = self.metrics().borrow().clone();
+        let configs = metrics.membership_config.membership().get_joint_config();
+        if configs.len() < 2 {
+            return None;
+        }
+        let membership_index = metrics.membership_config.log_id().map(|id| id.index);
+        let applied_index = metrics.last_applied.map(|id| id.index);
+        if applied_index < membership_index {
+            return None;
+        }
+        configs.last().cloned()
+    }
+
+    /// Propose the uniform step of an unfinished membership change, so the
+    /// council reaches the voter set the original change asked for. Returns
+    /// whether a change was proposed. Demoted voters are kept as learners: the
+    /// reconciler removes any that are dead once the council is whole again.
+    pub async fn finish_membership_change(&self) -> Result<bool, CouncilError> {
+        let Some(target) = self.unfinished_membership_change() else {
+            return Ok(false);
+        };
+        self.change_membership(target).await?;
+        Ok(true)
+    }
+
     async fn refuse_retired_voters(&self, members: &BTreeSet<u64>) -> Result<(), CouncilError> {
         let security = self.security_state().await;
         let metrics = self.metrics().borrow().clone();
@@ -801,17 +836,11 @@ mod tests {
         mut request: crate::council::RaftRequest,
     ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
         let previous = council.desired_state().await.last_applied_log;
-        match &mut request {
-            crate::council::RaftRequest::BatchRegister {
-                expected_log_id, ..
-            } => *expected_log_id = previous,
-            crate::council::RaftRequest::SchedulingDecision(decision) => {
-                request = crate::council::RaftRequest::SchedulingDecisions {
-                    expected_log_id: previous,
-                    decisions: vec![decision.clone()],
-                }
+        if let crate::council::RaftRequest::SchedulingDecision(decision) = &request {
+            request = crate::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
             }
-            _ => {}
         }
         council.write(request).await
     }
@@ -1354,6 +1383,93 @@ mod tests {
         // Voters are untouched.
         let voters: BTreeSet<u64> = membership.voter_ids().collect();
         assert_eq!(voters, BTreeSet::from([1, 2, 3]));
+    }
+
+    /// A one-voter council whose promotion of learner 2 committed its joint
+    /// step after the caller had given up: the shape #673 left behind when the
+    /// reconciler's five-second bound dropped `change_membership` mid-flight.
+    async fn abandoned_promotion() -> (Vec<CouncilNode>, InMemoryRaftRouter) {
+        let (mut nodes, router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let network = InMemoryRaftNetworkFactory::new(2, router.clone());
+        let node2 = CouncilNode::new(
+            2,
+            fast_config(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(2, node2.raft().clone()).await;
+        nodes.push(node2);
+        nodes[0].add_learner(2, node_info(2)).await.unwrap();
+
+        // The joint config {[1], [1, 2]} needs node 2's acknowledgement, so
+        // a partition holds it uncommitted past the caller's bound.
+        router.partition(1, 2).await;
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(500),
+            nodes[0].change_membership(BTreeSet::from([1, 2])),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the promotion should still be pending");
+        router.heal().await;
+
+        let committed_joint = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if nodes[0].unfinished_membership_change().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(committed_joint.is_ok(), "the joint step never committed");
+        (nodes, router)
+    }
+
+    fn voter_configs(node: &CouncilNode) -> Vec<BTreeSet<u64>> {
+        node.metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_promotion_stays_joint_until_finished() {
+        let (nodes, _router) = abandoned_promotion().await;
+        // Nothing in openraft proposes the uniform step on its own: the
+        // council would sit in the joint config, and the reconciler's
+        // change-in-flight gate would hold every later change, forever.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            voter_configs(&nodes[0]),
+            vec![BTreeSet::from([1]), BTreeSet::from([1, 2])]
+        );
+
+        assert!(nodes[0].finish_membership_change().await.unwrap());
+        assert_eq!(voter_configs(&nodes[0]), vec![BTreeSet::from([1, 2])]);
+        assert_eq!(nodes[0].unfinished_membership_change(), None);
+    }
+
+    #[tokio::test]
+    async fn finishing_a_uniform_membership_proposes_nothing() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let before = nodes[0].metrics().borrow().last_log_index;
+        assert_eq!(nodes[0].unfinished_membership_change(), None);
+        assert!(!nodes[0].finish_membership_change().await.unwrap());
+        assert_eq!(nodes[0].metrics().borrow().last_log_index, before);
     }
 
     #[tokio::test]

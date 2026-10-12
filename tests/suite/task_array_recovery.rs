@@ -20,11 +20,13 @@ fn record(index: u32) -> TaskRecord {
         exit_code: Some(0),
         run_ms: 1,
         output: None,
+        retry_causes: Default::default(),
     }
 }
 fn node(root: &Path, delay: Duration, concurrency: u32) -> TaskArrayNode {
     TaskArrayNode::new(
         TaskArrayNodeConfig {
+            audit_dir: None,
             root: root.into(),
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/review/task".into()],
@@ -61,6 +63,7 @@ fn assignment(id: u64, count: u32, attempt: u64) -> ArrayAssignment {
         }],
         stopping: false,
         replay_unknown: true,
+        labels: Default::default(),
     }
 }
 fn request(arrays: Vec<ArrayAssignment>) -> NodeSyncRequest {
@@ -193,6 +196,7 @@ fn failed_only_results_discard_a_superseded_failure() {
                 failed_indices: IndexRangeSet::new(),
                 not_run: 0,
                 retried: 0,
+                retry_causes: Default::default(),
             },
         )
         .unwrap();
@@ -201,6 +205,8 @@ fn failed_only_results_discard_a_superseded_failure() {
             .unwrap();
     let record = TaskArrayRecord {
         terminal_at_epoch_secs: None,
+        quota_blocked: None,
+        unrunnable: None,
         name: "review".into(),
         namespace: "default".into(),
         template,
@@ -329,6 +335,7 @@ async fn output_storage_failure_refuses_work_and_never_acknowledges_the_chunk() 
     let directory = tempfile::tempdir().unwrap();
     let failing = TaskArrayNode::new(
         TaskArrayNodeConfig {
+            audit_dir: None,
             root: directory.path().into(),
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/review/task".into()],

@@ -9,9 +9,23 @@ use super::task_array::{TaskArraySpec, validate_template};
 use crate::config::job::JobSpec;
 
 /// Bound reusable definitions independently of how many task indices they describe.
-pub const MAX_JOB_DEFINITIONS: usize = 256;
+/// One-off definitions expire with their last run, so only schedules, hooks and
+/// recent work count towards it.
+pub const MAX_JOB_DEFINITIONS: usize = 1024;
+/// One namespace's share of [`MAX_JOB_DEFINITIONS`], so one tenant can't lock
+/// every other out of new job names.
+pub const MAX_JOB_DEFINITIONS_PER_NAMESPACE: usize = 64;
 /// Active and retained run provenance must stay bounded alongside result retention.
-pub const MAX_JOB_RUNS: usize = 512;
+/// Retention already bounds it: every active run, plus the newest finished
+/// retention units, each at most a 64-job finite batch.
+pub const MAX_JOB_RUNS: usize = 2048;
+
+// The run bound is a backstop, never the limit people hit first.
+const _: () = assert!(
+    MAX_JOB_RUNS
+        >= super::task_array_store::MAX_ACTIVE_ARRAYS
+            + super::task_array_store::MAX_TERMINAL_ARRAYS * 64
+);
 
 fn singleton() -> TaskArraySpec {
     TaskArraySpec::with_count(1)
@@ -32,27 +46,51 @@ pub struct JobDefinition {
     /// Permit automatic replay after loss of an owner with an unknown outcome.
     #[serde(default)]
     pub replay_unknown: bool,
+    /// A deployment hook (`run_before`): kept like a schedule, because the
+    /// next apply that names it runs it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hook: bool,
 }
 
 impl JobDefinition {
     /// Normalise a TOML job into one indexed task, retaining its execution contract.
+    ///
+    /// The job's own policy fields move out of the template into the
+    /// definition. Omitted ones keep the defaults: four attempts and no
+    /// deadline, or one attempt and 600 seconds for a `run_before` hook.
     pub fn from_spec(mut template: JobSpec) -> Self {
+        let overlap = template.overlap.take().unwrap_or_default();
         let cron = template.schedule.take().map(|expression| CronPolicy {
             expression,
-            overlap: OverlapPolicy::Forbid,
+            overlap,
             missed: MissedRunPolicy::Skip,
         });
         let hook = !template.run_before.is_empty();
         template.run_before.clear();
         let mut tasks = TaskArraySpec::with_count(1);
-        tasks.max_attempts = if hook { 1 } else { 4 };
-        tasks.task_timeout_secs = if hook { 600 } else { 0 };
+        tasks.max_attempts = template
+            .max_attempts
+            .take()
+            .unwrap_or(if hook { 1 } else { 4 });
+        tasks.task_timeout_secs =
+            template
+                .task_timeout_secs
+                .take()
+                .unwrap_or(if hook { 600 } else { 0 });
+        let replay_unknown = std::mem::take(&mut template.replay_unknown);
         Self {
             template,
             tasks,
             cron,
-            replay_unknown: false,
+            replay_unknown,
+            hook,
         }
+    }
+
+    /// Whether the definition outlives its runs. Anything else is a one-off
+    /// and expires when its last run is pruned.
+    pub fn is_lasting(&self) -> bool {
+        self.cron.is_some() || self.hook
     }
 
     /// Validate the immutable definition before recording any revision or run.
@@ -74,16 +112,8 @@ impl JobDefinition {
     }
 }
 
-/// Whether a matching occurrence may overlap an earlier run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlapPolicy {
-    /// Advance the occurrence cursor without launching while a run remains active.
-    #[default]
-    Forbid,
-    /// Admit another run, still subject to the cluster's bounded capacity.
-    Allow,
-}
+/// TOML jobs name the overlap policy too, so it lives with the job config.
+pub use crate::config::job::OverlapPolicy;
 
 /// What a leader does with schedule minutes missed while it was unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +179,78 @@ pub struct DefinitionRecord {
     pub revision: u64,
     /// Latest processed UTC minute, including a deliberately skipped overlap.
     pub last_observed_minute: Option<i64>,
+    /// The latest occurrence the cluster had no room to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<SkippedOccurrence>,
+    /// How many occurrences were skipped for want of capacity, ever.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_count: u64,
+    /// The newest finished runs, oldest first, at most
+    /// [`MAX_DEFINITION_HISTORY`]. Kept here rather than with the runs, so
+    /// pruning a run's details never loses its outcome.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<RunOutcome>,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
+/// Most finished runs one definition remembers.
+pub const MAX_DEFINITION_HISTORY: usize = 10;
+
+/// How one finished run of a definition ended. Small and fixed-size, so a
+/// definition's history stays bounded however many tasks its runs had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOutcome {
+    /// The run's batch id.
+    pub run: u64,
+    /// When the run was admitted.
+    pub started_at_epoch_secs: u64,
+    /// When the run reached its terminal state.
+    pub finished_at_epoch_secs: u64,
+    /// The terminal state.
+    pub status: super::task_array_state::TaskArrayStatus,
+    /// Tasks that succeeded.
+    pub succeeded: u64,
+    /// Tasks that failed for good.
+    pub failed: u64,
+    /// Tasks that never ran because the run stopped first.
+    pub not_run: u64,
+    /// The lowest task index that failed, if any: where to start reading
+    /// failure output (`relish batch logs RUN --index N`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_index: Option<u32>,
+}
+
+impl RunOutcome {
+    /// Whether the run should page someone: any task failed for good.
+    pub fn failed(&self) -> bool {
+        use super::task_array_state::TaskArrayStatus;
+        matches!(
+            self.status,
+            TaskArrayStatus::Failed | TaskArrayStatus::CompletedWithFailures
+        )
+    }
+}
+
+/// A matching cron minute that was claimed but not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkippedOccurrence {
+    /// The UTC minute that matched the schedule.
+    pub minute: i64,
+    /// Why it didn't run.
+    pub reason: SkipReason,
+}
+
+/// Why a claimed occurrence didn't run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// Every active-run slot, reserved headroom included, was taken.
+    Capacity,
 }
 
 /// Immutable provenance of an admitted run; its execution snapshot lives in the array.
@@ -227,6 +329,10 @@ impl TryFrom<CatalogWire> for JobCatalog {
             if record.revision == 0
                 || record.definition.template.namespace.as_deref() != Some(namespace)
                 || record.last_observed_minute.is_some_and(|minute| minute < 0)
+                || record
+                    .skipped
+                    .is_some_and(|skip| Some(skip.minute) > record.last_observed_minute)
+                || record.history.len() > MAX_DEFINITION_HISTORY
             {
                 return Err("invalid job definition revision, namespace or cursor".into());
             }
@@ -292,6 +398,70 @@ impl JobCatalog {
             self.definitions.remove(&key);
         }
         Ok(())
+    }
+
+    /// Record that the occurrence at `minute` was claimed but had no room.
+    /// The cursor already moved past it in [`Self::prepare`].
+    pub(crate) fn record_skip(&mut self, namespace: &str, name: &str, minute: i64) {
+        if let Some(record) = self.definitions.get_mut(&format!("{namespace}/{name}")) {
+            record.skipped = Some(SkippedOccurrence {
+                minute,
+                reason: SkipReason::Capacity,
+            });
+            record.skipped_count = record.skipped_count.saturating_add(1);
+        }
+    }
+
+    /// Remember how a run of `namespace/name` ended, dropping the oldest
+    /// outcome once the history is full. A run whose definition has gone
+    /// (forgotten, or a manifest profile) leaves no history.
+    pub(crate) fn record_outcome(&mut self, namespace: &str, name: &str, outcome: RunOutcome) {
+        let Some(record) = self.definitions.get_mut(&format!("{namespace}/{name}")) else {
+            return;
+        };
+        if record.history.iter().any(|known| known.run == outcome.run) {
+            return;
+        }
+        record.history.push(outcome);
+        let excess = record.history.len().saturating_sub(MAX_DEFINITION_HISTORY);
+        record.history.drain(..excess);
+    }
+
+    /// Drop one-off definitions that no retained run refers to (D22). A
+    /// schedule or hook stays, and so does anything `owned` says a pending
+    /// deployment still holds. Callers prune runs first, so this runs in the
+    /// same deterministic step that dropped the last run.
+    pub(crate) fn expire_one_off(&mut self, owned: impl Fn(&str, &str) -> bool) {
+        let referenced: BTreeSet<(&str, &str)> = self
+            .runs
+            .values()
+            .map(|run| (run.namespace.as_str(), run.name.as_str()))
+            .collect();
+        let expired: Vec<String> = self
+            .definitions
+            .iter()
+            .filter(|(key, record)| {
+                let Some((namespace, name)) = key.split_once('/') else {
+                    return false;
+                };
+                !record.definition.is_lasting()
+                    && !referenced.contains(&(namespace, name))
+                    && !owned(namespace, name)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            self.definitions.remove(&key);
+        }
+    }
+
+    /// Definitions held in `namespace`.
+    pub fn definitions_in(&self, namespace: &str) -> usize {
+        let prefix = format!("{namespace}/");
+        self.definitions
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .count()
     }
 
     /// Bounded retained provenance; never enumerates task indices.
@@ -394,8 +564,20 @@ impl JobCatalog {
                         .checked_add(1)
                         .ok_or("job definition revision exhausted")?,
                     None => {
+                        let held = self.definitions_in(namespace);
+                        if held >= MAX_JOB_DEFINITIONS_PER_NAMESPACE {
+                            return Err(format!(
+                                "namespace {namespace:?} already has {held} job definitions; \
+                                 the limit is {MAX_JOB_DEFINITIONS_PER_NAMESPACE} per namespace \
+                                 (one-off jobs expire with their last run)"
+                            ));
+                        }
                         if self.definitions.len() >= MAX_JOB_DEFINITIONS {
-                            return Err("job definition limit reached".into());
+                            return Err(format!(
+                                "the cluster already has {} job definitions; the limit is \
+                                 {MAX_JOB_DEFINITIONS}",
+                                self.definitions.len()
+                            ));
                         }
                         self.runs
                             .values()
@@ -425,6 +607,11 @@ impl JobCatalog {
                         definition: definition.clone(),
                         revision,
                         last_observed_minute,
+                        skipped: prior.and_then(|record| record.skipped),
+                        skipped_count: prior.map_or(0, |record| record.skipped_count),
+                        history: prior
+                            .map(|record| record.history.clone())
+                            .unwrap_or_default(),
                     },
                 );
                 let Some(trigger) = trigger else {
@@ -491,7 +678,10 @@ impl JobCatalog {
             }
         };
         if self.runs.len() >= MAX_JOB_RUNS {
-            return Err("job run provenance limit reached".into());
+            return Err(format!(
+                "the cluster already retains {} job runs; the limit is {MAX_JOB_RUNS}",
+                self.runs.len()
+            ));
         }
         let run = RunRecord {
             name: name.clone(),
@@ -526,6 +716,7 @@ mod tests {
                 missed: MissedRunPolicy::Skip,
             }),
             replay_unknown: false,
+            hook: false,
         }
     }
 
@@ -806,7 +997,7 @@ mod tests {
     fn admission_at_the_active_run_limit_cannot_partly_update_the_definition() {
         let mut store = TaskArrays::default();
         let mut next = 0;
-        for i in 0..crate::meat::task_array_store::MAX_ACTIVE_ARRAYS {
+        for i in 0..crate::meat::task_array_store::MAX_ACTIVE_RUNS_PER_NAMESPACE {
             apply(
                 &mut store,
                 put(
@@ -836,7 +1027,7 @@ mod tests {
         assert_eq!(store, before);
         assert_eq!(
             next,
-            crate::meat::task_array_store::MAX_ACTIVE_ARRAYS as u64
+            crate::meat::task_array_store::MAX_ACTIVE_RUNS_PER_NAMESPACE as u64
         );
     }
 
@@ -1122,5 +1313,259 @@ mod tests {
         );
         assert_eq!(store.jobs().run(1).unwrap().trigger, trigger);
         assert_eq!(store.get(1).unwrap().state.spec.count, 1);
+    }
+
+    #[test]
+    fn toml_job_timeout_reaches_the_definition() {
+        let config = crate::config::Config::parse(
+            "[job.cleanup]\nimage = 'cleanup:v1'\nschedule = '0 3 * * *'\nmax_attempts = 2\ntask_timeout_secs = 30\noverlap = 'allow'\nreplay_unknown = true\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let definition = JobDefinition::from_spec(config.job["cleanup"].clone());
+        assert_eq!(definition.tasks.task_timeout_secs, 30);
+        assert_eq!(definition.tasks.max_attempts, 2);
+        assert!(definition.replay_unknown);
+        let cron = definition.cron.as_ref().unwrap();
+        assert_eq!(cron.overlap, OverlapPolicy::Allow);
+        // The policy moved out of the template, so the template is a valid
+        // execution template and the definition as a whole validates.
+        assert!(!definition.template.has_run_policy());
+        definition.validate().unwrap();
+    }
+
+    #[test]
+    fn toml_job_without_policy_keeps_todays_defaults() {
+        let config = crate::config::Config::parse(
+            "[job.once]\nimage = 'once:v1'\n\n[job.nightly]\nimage = 'once:v1'\nschedule = '0 3 * * *'\n\n[job.migrate]\nimage = 'once:v1'\nrun_before = ['app.web']\n\n[app.web]\nimage = 'web:v1'\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let once = JobDefinition::from_spec(config.job["once"].clone());
+        assert_eq!(
+            (once.tasks.max_attempts, once.tasks.task_timeout_secs),
+            (4, 0)
+        );
+        assert!(!once.replay_unknown);
+        let nightly = JobDefinition::from_spec(config.job["nightly"].clone());
+        assert_eq!(nightly.cron.unwrap().overlap, OverlapPolicy::Forbid);
+        let hook = JobDefinition::from_spec(config.job["migrate"].clone());
+        assert_eq!(
+            (hook.tasks.max_attempts, hook.tasks.task_timeout_secs),
+            (1, 600)
+        );
+        assert!(!hook.replay_unknown);
+    }
+
+    #[test]
+    fn hook_refuses_replay_unknown() {
+        let config = crate::config::Config::parse(
+            "[job.migrate]\nimage = 'once:v1'\nrun_before = ['app.web']\nreplay_unknown = true\n\n[app.web]\nimage = 'web:v1'\n",
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("replay_unknown"), "{error}");
+        // A hook may still choose its attempts and deadline.
+        let config = crate::config::Config::parse(
+            "[job.migrate]\nimage = 'once:v1'\nrun_before = ['app.web']\nmax_attempts = 3\ntask_timeout_secs = 0\n\n[app.web]\nimage = 'web:v1'\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let hook = JobDefinition::from_spec(config.job["migrate"].clone());
+        assert_eq!(
+            (hook.tasks.max_attempts, hook.tasks.task_timeout_secs),
+            (3, 0)
+        );
+    }
+
+    #[test]
+    fn array_templates_refuse_run_policy_fields() {
+        let mut definition = definition(4, None);
+        definition.template.task_timeout_secs = Some(30);
+        let error = definition.validate().unwrap_err();
+        assert!(error.contains("task_timeout_secs"), "{error}");
+    }
+
+    fn named_put(
+        namespace: &str,
+        name: &str,
+        definition: JobDefinition,
+        trigger: Option<RunTrigger>,
+        now_epoch_secs: u64,
+    ) -> TaskArrayWrite {
+        TaskArrayWrite::Job(Box::new(JobWrite::Put {
+            name: name.into(),
+            namespace: namespace.into(),
+            definition: Box::new(definition),
+            trigger,
+            now_epoch_secs,
+        }))
+    }
+
+    fn manual(request: &str) -> Option<RunTrigger> {
+        Some(RunTrigger::Manual {
+            request_id: request.into(),
+        })
+    }
+
+    /// Cancel every run at `now`, so each finishes then.
+    fn finish_everything(store: &mut TaskArrays, now: u64, next: &mut u64) {
+        for id in store.ids() {
+            apply(
+                store,
+                TaskArrayWrite::Cancel {
+                    batch_id: id,
+                    now_epoch_secs: now,
+                },
+                next,
+            );
+        }
+    }
+
+    /// Any registration past the retention window prunes finished runs.
+    fn much_later(store: &mut TaskArrays, next: &mut u64) {
+        let later = 1000 + crate::meat::task_array_store::TERMINAL_RETENTION_SECS;
+        apply(
+            store,
+            named_put(
+                "elsewhere",
+                "probe",
+                definition(1, None),
+                manual("probe"),
+                later,
+            ),
+            next,
+        );
+    }
+
+    #[test]
+    fn one_off_definition_expires_with_its_last_run() {
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        apply(
+            &mut store,
+            named_put("default", "render-1", definition(1, None), manual("a"), 100),
+            &mut next,
+        );
+        finish_everything(&mut store, 100, &mut next);
+        // Still visible while its run is retained.
+        assert!(store.jobs().definition("default", "render-1").is_some());
+        much_later(&mut store, &mut next);
+        assert!(store.jobs().run(1).is_none());
+        assert!(store.jobs().definition("default", "render-1").is_none());
+        // The name is free again, starting from revision 1.
+        apply(
+            &mut store,
+            named_put(
+                "default",
+                "render-1",
+                definition(2, None),
+                manual("b"),
+                9000,
+            ),
+            &mut next,
+        );
+        assert_eq!(
+            store
+                .jobs()
+                .definition("default", "render-1")
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn cron_definition_never_expires() {
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        apply(
+            &mut store,
+            put(definition(1, Some("* * * * *")), None),
+            &mut next,
+        );
+        apply(&mut store, fire(1, 3), &mut next);
+        finish_everything(&mut store, 200, &mut next);
+        much_later(&mut store, &mut next);
+        assert!(store.jobs().run(1).is_none());
+        assert!(store.jobs().definition("default", "cleanup").is_some());
+    }
+
+    #[test]
+    fn hook_definition_never_expires() {
+        let hook: JobSpec =
+            toml::from_str("runtime='process'\nexec='/bin/true'\nrun_before=['app.web']").unwrap();
+        let hook = JobDefinition::from_spec(hook);
+        assert!(hook.hook && hook.is_lasting());
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        let trigger = Some(RunTrigger::Hook {
+            operation_id: "op".into(),
+        });
+        apply(
+            &mut store,
+            named_put("default", "migrate", hook, trigger, 100),
+            &mut next,
+        );
+        finish_everything(&mut store, 100, &mut next);
+        much_later(&mut store, &mut next);
+        assert!(store.jobs().definition("default", "migrate").is_some());
+    }
+
+    #[test]
+    fn a_non_hook_definition_keeps_its_old_digest() {
+        // `hook` is left out when false, so existing definitions hash the same.
+        let encoded = serde_json::to_value(definition(1, None)).unwrap();
+        assert!(encoded.get("hook").is_none());
+    }
+
+    #[test]
+    fn definition_cap_is_per_namespace() {
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        for i in 0..MAX_JOB_DEFINITIONS_PER_NAMESPACE {
+            apply(
+                &mut store,
+                named_put(
+                    "greedy",
+                    &format!("daily-{i}"),
+                    definition(1, Some("0 0 * * *")),
+                    None,
+                    100,
+                ),
+                &mut next,
+            );
+        }
+        let refused = store
+            .apply(
+                &named_put(
+                    "greedy",
+                    "one-more",
+                    definition(1, Some("0 0 * * *")),
+                    None,
+                    100,
+                ),
+                || 0,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("\"greedy\""), "{refused}");
+        assert!(
+            refused.contains(&MAX_JOB_DEFINITIONS_PER_NAMESPACE.to_string()),
+            "{refused}"
+        );
+        // Another namespace still defines new jobs.
+        apply(
+            &mut store,
+            named_put(
+                "modest",
+                "daily",
+                definition(1, Some("0 0 * * *")),
+                None,
+                100,
+            ),
+            &mut next,
+        );
+        assert!(store.jobs().definition("modest", "daily").is_some());
     }
 }

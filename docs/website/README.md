@@ -51,7 +51,7 @@ runs `tour.sh --check`, which fails if the page gains a command the script
 doesn't know how to run.
 
 Every promoted release re-records the tour against its published install
-([releasing step 8](../releasing.md#staging-a-candidate)). With no other
+([releasing step 9](../releasing.md#staging-a-candidate)). With no other
 quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`
 so it can't touch yours:
 
@@ -89,6 +89,14 @@ tarball isn't published yet. The build step runs in a scratch directory, so
 beside a laptop cluster on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
+`--record` writes the installed version into the cast's title (`Reliaburger
+0.1.4: the five-minute tour`), and the caption under the player names it too.
+`tests/suite/website.rs` checks that both match `install.sh`'s default, so a
+promotion that forgets the re-record fails CI. The recording is behind for now:
+0.1.5 and 0.1.6 skipped it, and the test carries a dated exemption
+(`TOUR_RECORDED_BEHIND`, #688) that lapses when the installer's default moves
+to 0.2.0.
+
 The "Try it in five minutes" section keeps its heading and the recording in
 plain view; people didn't notice it when the whole section sat in one collapsed
 box. Only the step-by-step command list is folded, in a `<details
@@ -106,8 +114,9 @@ command-line definition, and does the same for the manual's copy of the tour
 The tour applies `https://reliaburger.com/demo/podinfo.yaml` and builds from
 `https://reliaburger.com/demo/burger.tar.gz`. Neither is committed here: the
 Pages workflow copies `examples/kubernetes/podinfo.yaml` into `demo/` and packs
-`examples/demo/burger` as `demo/burger.tar.gz` at deploy time, so the site
-always serves what CI tests. To preview them locally, make them the same way
+`examples/demo/burger` as `demo/burger.tar.gz` at deploy time, both taken from
+the tag `install.sh` installs. Someone running the tour has that release, and
+`main`'s demo may need features it doesn't have yet. To preview them locally, make them the same way
 (`demo/` is ignored by version control).
 
 Preview from the repository root:
@@ -124,6 +133,21 @@ at `https://github.com/reliaburger/reliaburger/releases/latest/download/reliabur
 every promoted release carries the four PDFs, and promotion marks it latest.
 The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
 from `main`; artefacts require GitHub sign-in and have limited retention.
+
+### Commands the installed release doesn't have
+
+The page and the READMEs are written on the development branch, but a visitor
+runs what the installer fetched. `scripts/release/released-cli.tsv` records
+every command, positional, option and listed option value of that release,
+written from the published binary's own help by
+`scripts/release/released_cli.py VERSION > scripts/release/released-cli.tsv`.
+`tests/suite/website.rs` checks every `relish …` command on this page, in the
+README and in the tour chapter against it. The tour may only use released
+commands. Anything else has to say which release adds it, in the words
+"0.2.0, not in 0.1.6" (the build's version, then the installer's), in the
+same paragraph, `<details>` or section. The README's generated command list
+labels such commands itself. When the installer's default changes, regenerate
+the snapshot; the test refuses a snapshot for another version.
 
 The page leads with the one-line install now that releases are published;
 building from source is the second path. Update the release-status paragraph

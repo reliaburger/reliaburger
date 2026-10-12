@@ -119,8 +119,7 @@ impl Ledger {
                 file.sync_all()?;
             }
         }
-        let index =
-            super::task_result_index::TaskResultIndex::open(&path.with_extension("index.redb"))?;
+        let index = super::task_result_index::TaskResultIndex::open(&path.with_extension("index"))?;
         index.rebuild(path)?;
         Ok(Self {
             index,
@@ -211,6 +210,8 @@ pub(crate) fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskReco
         exit_code: (exit_code != NO_EXIT_CODE).then_some(exit_code),
         run_ms: u32_at(10),
         output: None,
+        // The ledger keeps attempt counts only; see `TaskRecord::retry_causes`.
+        retry_causes: Default::default(),
     })
 }
 
@@ -461,6 +462,7 @@ mod tests {
             },
             run_ms: index.wrapping_mul(3),
             output: None,
+            retry_causes: Default::default(),
         }
     }
 
@@ -686,15 +688,40 @@ mod tests {
             ledger.append(&shifted);
             ledger.flush().unwrap();
         }
-        let bytes = std::fs::metadata(path_in(&dir)).unwrap().len();
-        assert!(bytes <= 24 * 1024 * 1024, "{bytes} ledger bytes");
-        let indexed = std::fs::metadata(path_in(&dir).with_extension("index.redb"))
-            .unwrap()
-            .len();
-        eprintln!("million task outcomes: ledger={bytes} bytes, index={indexed} bytes");
+        let tasks = 245 * 4096u64;
+        // The format, to the byte: a header per block plus 22-byte records,
+        // and one 24-byte index slot per task. Logical lengths don't depend
+        // on the filesystem, so these are exact on every run.
+        let length = |path: &Path| std::fs::metadata(path).unwrap().len();
+        assert_eq!(
+            length(&path_in(&dir)),
+            (MAGIC.len() + 245 * BLOCK_HEADER_BYTES) as u64 + tasks * RECORD_BYTES as u64
+        );
+        assert_eq!(
+            length(&path_in(&dir).with_extension("index")),
+            tasks * super::super::task_result_index::SLOT_BYTES as u64
+        );
+        // Allocated bytes: what the disk actually pays. The filesystem, not
+        // the format, decides these. APFS keeps up to about 1 MiB allocated
+        // past the end of a file grown by fsynced appends, a different amount
+        // each run (#717), so only the whole budget, which leaves room for
+        // that, bounds them. Production-sized blocks keep the measurement
+        // honest: written as one block, the same records allocate no slack.
+        let allocated = |path: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().blocks() * 512
+        };
+        let bytes = allocated(&path_in(&dir));
+        let indexed = allocated(&path_in(&dir).with_extension("index"));
+        eprintln!(
+            "{tasks} task outcomes: ledger {bytes} bytes ({:.1}/task), index {indexed} bytes ({:.1}/task)",
+            bytes as f64 / tasks as f64,
+            indexed as f64 / tasks as f64,
+        );
+        let bound = super::super::task_array_node::STORAGE_BYTES_PER_TASK;
         assert!(
-            bytes + indexed <= 128 * 1024 * 1024,
-            "{} total bytes",
+            bytes + indexed <= tasks * bound,
+            "{} bytes is over {bound} per task",
             bytes + indexed
         );
         let replayed = replay(&path_in(&dir)).unwrap();

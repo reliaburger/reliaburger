@@ -377,7 +377,6 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
 mod tests {
     use super::*;
     use crate::relish::quickstart::state::ClusterSpec;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A stand-in `limactl`: it appends each argument list to `calls.log`
     /// and answers `list --json` from `list.json`.
@@ -389,20 +388,16 @@ mod tests {
     impl FakeLima {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
-            let script = directory.path().join("limactl");
-            let log = directory.path().join("calls.log");
-            let list = directory.path().join("list.json");
+            let script = directory.path().join("limactl.sh");
+            // Run through `/bin/sh`, so no new executable is launched and
+            // macOS has nothing to assess inside the deadline (#762). The
+            // script finds this test's files beside itself.
             std::fs::write(
                 &script,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = list ]; then cat '{}'; fi\n",
-                    log.display(),
-                    list.display()
-                ),
+                "dir=${0%/*}\nprintf '%s\\n' \"$*\" >> \"$dir/calls.log\"\nif [ \"$1\" = list ]; then cat \"$dir/list.json\"; fi\n",
             )
             .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let lima = Lima::new(script, Duration::from_secs(5));
+            let lima = Lima::shell_script(script, Duration::from_secs(5));
             Self { directory, lima }
         }
 

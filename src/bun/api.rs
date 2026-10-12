@@ -37,7 +37,7 @@ use crate::mayo::rollup_store::RollupStore;
 use crate::mayo::store::MayoStore;
 use crate::meat::deploy_types::DeployHistoryEntry;
 use crate::pickle::types::ManifestCatalog;
-use crate::testkit::lease::{LeaseScope, is_node_job_lease};
+use crate::testkit::lease::LeaseScope;
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
@@ -45,6 +45,7 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 // the helpers at the bottom of this file are the ones several groups share.
 pub(crate) mod apply;
 mod apps;
+pub(crate) mod audit;
 mod ca;
 mod deploys;
 mod discovery;
@@ -68,6 +69,7 @@ mod upgrade;
 use apply::{apply_handler, cluster_apply};
 pub(crate) use apply::{bind_images, leader_api_url};
 use apps::{delete_handler, exec_handler, stop_handler};
+use audit::audit_handler;
 use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
 use deploys::{
     cluster_deploy_history, deploy_cancel_handler, deploys_active_handler, deploys_history_handler,
@@ -363,15 +365,11 @@ pub struct ApiState {
     /// Self-upgrade manager, for the fast dependency-free `/v1/version`
     /// endpoint. Upgrade *operations* go through the agent command channel.
     pub upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
-    /// Batch job tracker (Phase 12 F1). Lives leader-side: submissions
-    /// and status reads leader-forward, so one tracker sees them all.
-    pub batch_tracker: Arc<tokio::sync::Mutex<crate::meat::batch_tracker::BatchTracker>>,
-    /// The leader's aggregated worker reports — batch capacity comes
-    /// from here (the same source the deploy scheduler uses). `None`
-    /// standalone; batch then schedules onto this node only.
+    /// The leader's aggregated worker reports, the same source the deploy
+    /// scheduler uses. `None` standalone.
     pub aggregated_rx:
         Option<tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>>,
-    /// This node's gossip name, for batch self-dispatch short-circuits.
+    /// This node's gossip name.
     pub node_name: Option<String>,
     /// Immutable SPIFFE trust domain for build-signing identities.
     pub trust_domain: String,
@@ -406,10 +404,6 @@ pub struct ApiState {
     /// is only `Completed` once its pushed digest carries a signature
     /// the cluster trusts (JOB7).
     pub require_signatures: bool,
-    /// Batch ids with a live leader-side completion watcher in this
-    /// process. Lets a restarted leader spot durable batches nobody is
-    /// watching and resume them (JOB4).
-    pub batch_watchers: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
     /// Build ids with a live runner task in this process. A durable
     /// `Running` record without one means the node restarted mid-build
     /// and the record is terminated honestly (JOB4).
@@ -423,6 +417,9 @@ pub struct ApiState {
     /// Task arrays: this node's executor, the standalone store and the
     /// leader's latest view of every node (0.2.0, million jobs).
     pub task_arrays: Arc<super::task_array_leader::TaskArrayService>,
+    /// Which refused requests the audit log records one by one, and how
+    /// many it has suppressed per source (#798).
+    pub refusals: Arc<tokio::sync::Mutex<crate::bun::audit::refusals::RefusalLimiter>>,
 }
 
 /// Build the API router.
@@ -540,9 +537,6 @@ pub fn router_with_upgrade(
         cluster_http,
         api_port,
         upgrade,
-        batch_tracker: Arc::new(tokio::sync::Mutex::new(
-            crate::meat::batch_tracker::BatchTracker::new(),
-        )),
         aggregated_rx,
         trust_domain,
         node_name,
@@ -556,14 +550,17 @@ pub fn router_with_upgrade(
         static_capabilities: Arc::new(static_capabilities),
         max_context_bytes,
         require_signatures,
-        batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         active_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         task_arrays: task_arrays
             .unwrap_or_else(|| Arc::new(super::task_array_leader::TaskArrayService::new(None))),
+        refusals: Arc::new(tokio::sync::Mutex::new(
+            crate::bun::audit::refusals::RefusalLimiter::new(),
+        )),
     };
 
     spawn_node_fault_reaper(state.clone());
+    audit::spawn_refusal_sweeper(state.clone());
     super::task_array_leader::spawn_leader_loop(state.clone());
 
     let mut auth_state = crate::sesame::auth::AuthState::new(
@@ -640,6 +637,7 @@ pub fn router_with_upgrade(
             post(super::job_api::disable_schedule_handler),
         )
         .route("/v1/events", get(events_handler))
+        .route("/v1/audit", get(audit_handler))
         .route("/v1/ws/events", get(ws_events_handler))
         .route("/v1/ws/logs/{app}/{namespace}", get(ws_logs_handler))
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
@@ -781,11 +779,6 @@ pub fn router_with_upgrade(
             "/v1/batch/summaries",
             get(super::task_array_api::summaries_handler),
         )
-        .route("/v1/batch/run", post(super::batch::batch_run_handler))
-        .route(
-            "/v1/batch/{id}/report",
-            post(super::batch::batch_report_handler),
-        )
         .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
         .route(
             "/v1/batch/manifest",
@@ -797,7 +790,9 @@ pub fn router_with_upgrade(
         )
         .route(
             "/v1/batch/array/sync",
-            post(super::task_array_api::sync_handler),
+            post(super::task_array_api::sync_handler).layer(axum::extract::DefaultBodyLimit::max(
+                super::task_array_node::MAX_SYNC_REQUEST_BYTES,
+            )),
         )
         .route(
             "/v1/batch/array/{id}/local/results",
@@ -850,9 +845,20 @@ pub fn router_with_upgrade(
             "/v1/ca/rotation/finalize",
             post(ca_rotation_finalize_handler),
         )
+        // Inside the auth layer, so it sees who the caller is (#685).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            audit::audit_layer,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::sesame::auth::auth_middleware,
+        ))
+        // Outside the auth layer, so it sees the 401s that layer answers
+        // as well as the 403s handlers do (#798).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            audit::refusal_layer,
         ))
         .with_state(state.clone());
 
@@ -1088,36 +1094,102 @@ pub(super) async fn record_caller_audit(
     auth: Option<&crate::sesame::auth::AuthContext>,
     kind: crate::bun::events::EventKind,
     action: &str,
-    mut details: std::collections::BTreeMap<String, String>,
+    details: std::collections::BTreeMap<String, String>,
     message: String,
 ) {
+    record_caller_action(
+        state,
+        auth,
+        CallerAction {
+            kind,
+            severity: crate::bun::events::EventSeverity::Info,
+            action,
+            app: None,
+            namespace: None,
+            node: None,
+            details,
+            message,
+        },
+    )
+    .await;
+}
+
+/// One audited action a caller asked for, before attribution.
+pub(super) struct CallerAction<'a> {
+    pub(super) kind: crate::bun::events::EventKind,
+    pub(super) severity: crate::bun::events::EventSeverity,
+    pub(super) action: &'a str,
+    pub(super) app: Option<String>,
+    pub(super) namespace: Option<String>,
+    /// The node the action targets; `None` records this node.
+    pub(super) node: Option<String>,
+    pub(super) details: std::collections::BTreeMap<String, String>,
+    pub(super) message: String,
+}
+
+/// The principal an audit record names, and the token name it adds to the
+/// details: the caller's, or `local-bootstrap` before any token exists.
+pub(super) fn audit_principal(auth: Option<&crate::sesame::auth::AuthContext>) -> (String, String) {
+    match auth {
+        Some(auth) => (auth.principal_id.clone(), auth.token_name.clone()),
+        None => ("local-bootstrap".to_string(), "local-bootstrap".to_string()),
+    }
+}
+
+/// Record `action`, attributed to the caller and to the address the request
+/// came from, in the event ring and this node's durable audit log. Returns
+/// once the log has the record on disk, or has given up; a failed write is
+/// logged and counted but never fails the caller's action.
+pub(super) async fn record_caller_action(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    action: CallerAction<'_>,
+) {
+    let (principal, token_name) = audit_principal(auth);
+    let mut details = action.details;
+    details.insert("token_name".to_string(), token_name);
+    write_audit(
+        state,
+        crate::bun::events::AuditEvent {
+            timestamp: unix_now_seconds(),
+            kind: action.kind,
+            severity: action.severity,
+            action: action.action.to_string(),
+            principal,
+            app: action.app,
+            namespace: action.namespace,
+            node: Some(action.node.unwrap_or_else(|| local_node_name(state))),
+            source_address: crate::bun::audit::caller_address(),
+            details,
+            message: action.message,
+        },
+    )
+    .await;
+}
+
+/// Put `event` in the event ring and the durable audit log, then wait for
+/// the log to sync it. The ring's lock is released before the wait.
+pub(super) async fn write_audit(state: &ApiState, event: crate::bun::events::AuditEvent) {
     let Some(events) = &state.events else {
         return;
     };
-    let (principal, token_name) = match auth {
-        Some(auth) => (auth.principal_id.clone(), auth.token_name.clone()),
-        None => ("local-bootstrap".to_string(), "local-bootstrap".to_string()),
+    let action = event.action.clone();
+    let (has_log, receipt) = {
+        let mut store = events.write().await;
+        let has_log = store.audit_log().is_some();
+        (has_log, store.record_audit(event))
     };
-    details.insert("token_name".to_string(), token_name);
-    let timestamp = std::time::SystemTime::now()
+    if has_log && !receipt.written().await {
+        eprintln!("bun: audit record {action} is not on disk; the action went ahead");
+    }
+}
+
+/// Seconds since the Unix epoch, for audit timestamps.
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    events
-        .write()
-        .await
-        .record_audit(crate::bun::events::AuditEvent {
-            timestamp,
-            kind,
-            severity: crate::bun::events::EventSeverity::Info,
-            action: action.to_string(),
-            principal,
-            app: None,
-            namespace: None,
-            node: Some(local_node_name(state)),
-            details,
-            message,
-        });
+        .as_secs()
 }
 
 /// Ask every live member except this node for `path`.
@@ -1239,6 +1311,9 @@ pub(crate) fn copy_forwarded_auth(
 async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
     local_statuses(state).await.unwrap_or_default()
 }
+
+#[cfg(test)]
+mod audit_tests;
 
 #[cfg(test)]
 mod permission_tests;

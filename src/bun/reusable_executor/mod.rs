@@ -59,6 +59,18 @@ pub(crate) enum ExecutorError {
 }
 
 #[cfg(any(target_os = "linux", test))]
+impl ExecutorError {
+    /// Whether a fresh executor could get past this startup failure: the
+    /// runtime, the host or the helper failed, not the job's configuration.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::Configuration(_) | Self::Encoding(_) => false,
+            Self::Io(_) | Self::Runtime(_) | Self::Protocol(_) => true,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 impl ExecutorKey {
     pub(crate) fn new(template: &JobSpec) -> Result<Self, ExecutorError> {
         use sha2::{Digest, Sha256};
@@ -216,6 +228,19 @@ mod tests {
         toml::from_str("image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m-1000m'\nmemory='32Mi-64Mi'\n[env]\nTOKEN='first'").unwrap()
     }
     #[test]
+    fn startup_retries_runtime_host_and_helper_failures_but_not_refusals() {
+        let timed_out = ExecutorError::Runtime(crate::grill::GrillError::StateUnavailable {
+            instance: crate::grill::InstanceId("rbtest__executor-0".into()),
+            reason: "runtime command did not finish within 5s".into(),
+        });
+        assert!(timed_out.is_transient());
+        assert!(ExecutorError::Io(std::io::Error::other("busy")).is_transient());
+        assert!(ExecutorError::Protocol("helper connection timed out".into()).is_transient());
+        assert!(!ExecutorError::Configuration("an image is required").is_transient());
+        let encoding = serde_json::from_str::<u8>("x").unwrap_err();
+        assert!(!ExecutorError::Encoding(encoding).is_transient());
+    }
+    #[test]
     fn host_commands_share_only_a_namespace_and_resource_profile() {
         let mut first: JobSpec = toml::from_str("runtime='process'\nexec='/bin/true'\ncpu='100m-1000m'\nmemory='32Mi'\nnamespace='tenant-a'").unwrap();
         let key = ExecutorKey::new(&first).unwrap();
@@ -257,6 +282,34 @@ mod tests {
         );
         assert_ne!(ExecutorKey::new(&next).unwrap(), key);
     }
+    #[test]
+    fn tasks_with_different_egress_never_share_an_executor() {
+        let first = template();
+        let key = ExecutorKey::new(&first).unwrap();
+        let mut allowed = first.clone();
+        allowed.egress = Some(crate::config::app::EgressSpec {
+            allow: vec!["api.example.com:443".into()],
+            allow_franchise: Vec::new(),
+        });
+        let allowed_key = ExecutorKey::new(&allowed).unwrap();
+        assert_ne!(
+            allowed_key, key,
+            "an allowlist must not reuse an open executor"
+        );
+        let mut other = allowed.clone();
+        other.egress.as_mut().unwrap().allow = vec!["db.example.com:5432".into()];
+        assert_ne!(ExecutorKey::new(&other).unwrap(), allowed_key);
+        let mut ingress = first.clone();
+        ingress.firewall = Some(crate::config::app::FirewallSpec {
+            allow_from: vec!["frontend/web".into()],
+        });
+        assert_ne!(ExecutorKey::new(&ingress).unwrap(), key);
+        // The same policy with a different command still shares.
+        let mut same = allowed.clone();
+        same.command = Some(vec!["another".into()]);
+        assert_eq!(ExecutorKey::new(&same).unwrap(), allowed_key);
+    }
+
     #[test]
     fn pools_require_resolved_credentials_and_pinned_images() {
         let mut job = template();

@@ -71,7 +71,7 @@ pub(super) async fn deploy_cancel_handler(
             &state,
             crate::meat::task_array_store::TaskArrayWrite::DeployCancel {
                 operation_id: id.clone(),
-                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
             },
         )
         .await

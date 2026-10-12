@@ -817,6 +817,53 @@ pub fn authorize_user(ctx: Option<&AuthContext>, required: ApiRole) -> Result<()
 
 Now a stolen service token can still do a node's job (that's unavoidable — the node has to do its job) but can't mint credentials or touch key material. The blast radius of one compromised node shrinks from "the whole cluster" to "one node's workloads".
 
+### A cookie is not a node
+
+The service token has one more way out, and it's through the dashboard. `POST /ui/session` swaps a token for a browser cookie, and it accepts the service token too, so an operator on a node can paste it in and look around. The session it makes is read-only, like every session: the middleware builds its `AuthContext` with role `ReadOnly` and a principal id of `session:__system`. But it keeps the token's *name*, `__system`, and `require_system`, the gate on every node-to-node route, compared only the name:
+
+```rust
+match ctx {
+    Some(ctx) if ctx.token_name == SYSTEM_PRINCIPAL => Ok(()),
+    _ => Err(/* 403 */),
+}
+```
+
+So that "read-only" cookie could post to `/v1/batch/run` and run any job on a node, start a privileged Buildah build through `/v1/build/run`, reserve chaos experiments and renew node certificates. One cross-site scripting bug in the dashboard, or one cookie lifted off a laptop, and the documented rule that a stolen cookie "can read the dashboard but never mutate" was simply false.
+
+The fix is one more comparison, given a name so nobody has to remember it:
+
+```rust
+pub fn is_system_principal(ctx: &AuthContext) -> bool {
+    ctx.token_name == SYSTEM_PRINCIPAL && ctx.principal_id == SYSTEM_PRINCIPAL
+}
+```
+
+Only a bearer that matched the service token gets both fields. A session's principal id always starts `session:`, so it can never pass, whatever token it came from. The token-list handler already had exactly this check inline; now both use the helper. The regression, `require_system_refuses_a_session_made_from_the_service_token`, builds the session context with the middleware's own function rather than by hand, so a later change to what a session looks like can't quietly make the test pass. `service_token_cookie_cannot_run_a_batch_on_a_node` in the integration suite does the whole thing from the outside: log in with the service token, take the cookie, post the leader's task sync, get a 403, and check the agent never heard about it.
+
+### Every row, every caller
+
+How did that survive the route matrix? Because the matrix's principal column was documentation. We had tests that every mounted route has a row, that every per-app route checks scope, and that every permission-gated route names its action. None of them sent a request as somebody too small and checked the door shut.
+
+`every_route_refuses_callers_below_its_principal` does. It walks every row of `ROUTE_MATRIX` and plays seven callers against it: a read-only token, a user's dashboard session, a service-token session, a Deployer token scoped to some other namespace, a plain Deployer, an Admin and the system principal. Each caller has a rank (any token, Deployer, Admin, System), and every caller ranked below the row must get a 401 or 403. Then a second router, this time with a real token in its store, takes a request with no credentials at all for each row: everything but the `Public` rows must get the middleware's own 401, and the `Public` rows must not.
+
+Put the old `require_system` back and it fails on five routes, one line each for the service-token session. It also catches two rows that had been wrong all along, in opposite directions. The GitOps webhook was listed as needing a token, but it's mounted public, because GitHub signs the body and never sends a bearer. `/v1/placements/{node_id}` was listed as open to any token, while its handler wants the service token. So the test checks the open rows from the other side too: a read-only token must get *in* to every `AnyToken` route.
+
+One thing about axum made this harder than a loop. A handler's arguments are extractors, and they all run before the body does: `Json<RenewalRequest>` rejects a request that doesn't parse with a 415 or a 422, before the handler gets to ask who's calling. Send junk to `/v1/cluster/renew` as a read-only token and you learn nothing about its gate. So the probe carries a real body for each route that parses one first. For a dozen node-to-node routes whose message types are elaborate (a CSR, a Raft proposal), the test records them as unreached, compares that list against an exact expected set, and leaves them to a static check, `every_system_route_requires_the_system_principal`, which reads each handler's source and insists it calls `require_system`. If a route leaves the unreached list, the assertion says so, and somebody gets to delete a line.
+
+### A block means what it says
+
+The manual says a `[permission]` block limits a token to what it lists. Four kinds of route didn't ask the block anything. A Deployer token whose block granted only `logs` on `db` could still restore an old snapshot over `db`'s volume, or delete its snapshots, because the snapshot handlers checked the role and the scope and stopped. Builds, fault injection and test leases had the same gap.
+
+We could have documented the exceptions. We gated them instead (decision D5 in the [0.2.0 audit](https://github.com/reliaburger/reliaburger/issues/674)). Snapshot create, restore and delete and `POST /v1/build` need `deploy` on the app; for a build, that's the app the destination repository names, through the same `repository_namespace` the registry uses, and a destination that names no namespace needs `deploy` across the whole cluster. Test leases need `admin` across the cluster. Faults got an action of their own, `PermissionAction::Fault`, written `fault` in a block, because "may break this app on purpose" is a different grant from "may deploy it". Adding a variant to the enum is a one-line change, and the compiler then points at every `match` that has to say how the new action is spelled.
+
+Faults are the interesting one, because not every fault names an app. A workload fault names its target service in the request body, so the check is `fault` on that service. A node drain names a node, which belongs to no tenant, so it needs `fault` everywhere. Clearing a fault by id is worse: the request is just `DELETE /v1/fault/7`. The handler asks the agent for its fault list, finds fault 7, and judges the caller against whatever that fault targets. It only does the lookup for a caller with a scope or a block; everyone else is governed by their role, as before.
+
+The matrix rows changed to match (`App(DEPLOY)` on the snapshot routes, `Body(FAULT)` on the fault routes, `Cluster(ADMIN)` on the lease routes), so `every_gated_route_checks_its_permission_action` now holds these handlers to the action too. That static check used to pair a path with every handler mounted on it, whatever the method, so `GET /v1/snapshots/...` (the list) was being blamed for not checking `deploy`. It now reads the method off each `get(...)` or `post(...)` call. The behaviour tests (`logs_only_block_cannot_create_restore_or_delete_snapshots`, `logs_only_block_cannot_submit_a_build`, `fault_needs_the_fault_permission_action`, `test_leases_need_admin_permission`) check the response says *which* grant was missing, because a later check (the cluster's test policy, an agent that isn't there) can also answer 403, and a test that accepts any 403 can't tell the two apart.
+
+Reads had a version of the same problem. Every container gets a JWT, and the manual calls it confined to the workload's own app and namespace. But `/v1/resolve`, `/v1/routes`, `/v1/fault` and `/v1/build/{id}` took no auth context at all, so one compromised container could list every service VIP, every ingress route and every fault in the cluster. They now filter like `/v1/status` does, with `authorize_scoped(...).is_ok()` in a `filter`. That needed a namespace on two wire types that only carried an app name (`RouteInfo` and `FaultSummary`), and a destination repository on each build record. `GET /v1/fault?cluster=true` refuses a scoped caller outright, as the events listing does, because node faults belong to no tenant. The legacy batch status branch got the scope check its task-array neighbour already had.
+
+Three smaller holes went in the same change. The node relay forwards only an allowlist of paths, but it built a URL from the path, and a URL resolves `..` away: `v1/exec/../apply` matched the exec rule and left as `POST /v1/apply`. The target re-authorised, so it wasn't an escalation, but an allowlist you can walk around isn't one. The relay now refuses any `.` or `..` segment, percent-encoded or not. The session cookie gets `Secure` when the API serves TLS, which the handler learns from the `TlsTransport` extension the TLS listener puts on every request. And the registry, which used to fall back to plaintext when its TLS configuration failed to build, now fails to start, as the API always did.
+
 ### Don't hash under a lock
 
 The last gap is a performance-and-availability one, and it's a nice illustration of how a lock in the wrong place turns a slow function into a denial of service.
@@ -870,6 +917,150 @@ Escaping is context-sensitive. What's safe between tags isn't necessarily safe i
 ```
 
 The lesson generalises past this one attribute: match your escaping to the exact syntactic slot the value lands in, and when in doubt, escape both quote characters so a value can't jump contexts.
+
+## Who did what
+
+After an incident, the first question is usually "who changed this?" Reliaburger had an answer of sorts: token creation, CA rotation, secret rotation and fault injection each recorded an audit event, attributed to the credential that asked. But those events went into the same 1024-entry ring as every health check, deploy and job completion. A busy task array finishes runs by the hundred, so an admin's `token.created` could be pushed out of memory within seconds of happening, and a Bun restart emptied the ring outright. Worse, the actions you'd most want to trace (apply, delete, exec, upgrade, decommission) recorded nothing at all. The security runbook's step "audit all cluster activity during the compromise window" had nothing to read.
+
+The fix was to give the audit trail a store of its own (plan group G16 in the [0.2.0 audit](https://github.com/reliaburger/reliaburger/issues/674)). The ring stays as it was, for the TUI and the live stream. Every node also keeps `bun::audit::AuditLog`: JSON Lines under `[storage] data/audit/`, one record per action, synced to disk before the API answers.
+
+### A thread that owns the files
+
+Writing a file blocks. A Tokio worker thread that blocks stalls every task scheduled on it, so the log's file I/O lives on one dedicated thread, fed through a channel:
+
+```rust
+std::thread::Builder::new()
+    .name("audit-writer".to_string())
+    .spawn(move || run_writer(writer, receiver, thread_failures))
+    .map_err(AuditError::Thread)?;
+```
+
+`run_writer` loops on `receiver.blocking_recv()`, the synchronous twin of `recv().await` that a non-async thread can call on a Tokio channel. When every `AuditLog` handle has been dropped, the channel closes, `blocking_recv` returns `None` and the thread ends. No shutdown flag needed. We chose a thread over `spawn_blocking` because this one runs for the life of the process, and the blocking pool is for jobs that finish.
+
+Each record travels with a `oneshot` sender, and `AuditLog::submit` hands the caller the other end, wrapped as an `AuditReceipt`:
+
+```rust
+pub async fn written(self) -> bool {
+    let Some(receiver) = self.0 else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(AUDIT_WRITE_TIMEOUT, receiver).await,
+        Ok(Ok(true))
+    )
+}
+```
+
+The writer appends the line, calls `sync_data`, and only then sends `true`. An API handler awaits the receipt before replying, so an action you saw acknowledged is on disk. The agent loop, recording `fault.expired`, just drops the receipt. One method, two policies, and the caller chooses. `written` takes `self` by value, which means a receipt can only be waited on once; the compiler won't let you read the answer twice and wonder which one was real.
+
+A failed write (a full disk, a directory that vanished) increments a counter, prints a line and returns `false`. It never fails the request. That was a deliberate call: an operator whose disk is full must still be able to delete the app that's filling it. `GET /v1/audit` turns the counter into a warning, so the gap isn't silent.
+
+### Bounded, in segments
+
+An append-only log that never shrinks is a disk-full incident with a delay. The log is split into eight segments that share `[storage] audit_max_bytes` (64 MiB by default). A record that would push the newest segment past its share starts a new one, named after its first sequence number and zero-padded (`audit-00000000000000000417.jsonl`), so sorting the file names sorts the segments by age. When the total passes the bound, the oldest segment goes. Dropping a whole file is cheaper and safer than rewriting one, and it means what survives is always an unbroken run of the newest records, which `oldest_segment_is_dropped_first` checks.
+
+A crash mid-write can leave half a line at the end of the newest segment. On open, the writer ends it with a newline, and the reader skips any line that doesn't parse. The sequence number carries on from the last whole record, so a restart never reuses one.
+
+### One layer instead of thirty handlers
+
+The obvious way to audit apply, delete, exec, rollback and the rest is a `record_audit(...)` call in each handler. That's about thirty call sites, each with several early returns, and the first handler someone adds next year won't have one. So most auditing happens in one axum layer, `audit_layer`, that wraps every authenticated route. It sits inside the auth layer, so the caller's `AuthContext` is already in the request's extensions, and it knows the matched route pattern (`MatchedPath`), the path parameters and, after the handler has run, the status. If the route is in `AUDITED_ROUTES` and the response is a success, it writes the record. Refusals get their own record, which we'll come to below.
+
+Some handlers know things the path doesn't. An apply's namespace is in the manifest, a decommission's target node is in the JSON body. Passing those back up through every return path would undo the point of the layer, so the handler *annotates* the request instead:
+
+```rust
+crate::bun::audit::annotate(audit::manifest_audit_note(&config));
+```
+
+`annotate` writes into a task-local, a value that belongs to the current Tokio task the way a thread-local belongs to a thread:
+
+```rust
+tokio::task_local! {
+    static REQUEST: RequestAudit;
+}
+```
+
+`task_local!` is a macro that declares the slot; `REQUEST.scope(value, future)` runs `future` with the slot filled, and `REQUEST.try_with(|request| ...)` reads it from anywhere inside, returning an error (rather than panicking) when called outside a scope. The layer opens the scope around the handler, so the handler and everything it awaits see the same `RequestAudit`. That struct holds the caller's address and a `RefCell<AuditNote>`. We met `RefCell` in chapter 7: it lets you mutate through a shared reference, checking the borrow at run time. `try_with` only ever gives you `&RequestAudit`, so the note has to be a `RefCell` for `annotate` to change it. The same task-local is how a fault or token handler, deep inside its own helpers, learns the address the request came from without a new parameter on every function between the router and the record.
+
+Is a task-local hidden state? A little. It's scoped to one request, though, and the alternative was threading a source address through dozens of signatures. We kept it to two facts (the address and the note) and made `annotate` a no-op outside a request, so background code that calls it by accident does nothing rather than crashing.
+
+### Making every route choose
+
+A layer driven by a table has the same weakness as the handlers it replaced: someone has to add the new route to the table. So `every_mutating_route_is_audited_or_exempt` walks the route matrix from earlier in this chapter and fails for any `POST` or `DELETE` route that isn't in exactly one of three lists: audited by the layer, audits itself (tokens, CAs, secrets and faults, which record richer details), or exempt with a written reason (node-to-node plumbing, heartbeats, reads that happen to be `POST`). Adding a route now means making a decision, in a place a reviewer will see it.
+
+### Reading it back
+
+`GET /v1/audit` takes `since`, `until`, `action` (exact, or a family like `fault.*`), `principal` and `namespace`, and returns the newest matching records, oldest first. With `?cluster=true` the node asks every live member for its records and merges them by `(timestamp, node, sequence)`, naming any member that didn't answer. It forwards the *caller's* token rather than the cluster service token, so each node repeats the authorisation itself, and the service token never needs to be able to read the log. That matters: the log lists every principal and the addresses they work from, which is exactly the map an attacker holding a stolen node credential would want. Reading needs an unscoped Admin with `admin` across the cluster. `relish audit` wraps it, with `--since 2h` style times.
+
+### Recording the refusals
+
+Our first version recorded only successes, on the theory that a refused request changed nothing. That's true, and beside the point. After an incident you want to know who tried the door, not just who got in: a token probing namespaces it doesn't own, a stolen credential bouncing off a `[permission]` block, a script hammering `fault inject` with no token at all. So every audited route now records its refusals as `api.refused`, with the principal (or `anonymous`), the source address, the route, the namespace when we know it, and a reason: `unauthenticated`, `forbidden` or `scope`.
+
+Where should that happen? Not in `audit_layer`. A request with a bad token is answered by the auth middleware with a 401 and never reaches a layer inside it. So there's a second layer, `refusal_layer`, *outside* the auth layer, which sees every response on its way out. It knows the route and the status, but not who the caller was: the `AuthContext` lived in the request, which was consumed on the way in. The inner layer does know, so on a 401 or 403 it hands that knowledge outwards on the response:
+
+```rust
+response.extensions_mut().insert(RefusedCaller {
+    principal,
+    token_name,
+    app: note.app,
+    namespace: note.namespace,
+});
+```
+
+An axum (really, `http` crate) request or response carries *extensions*: a map keyed by type, so `insert` stores one value of each type and `extensions().get::<RefusedCaller>()` gets it back. The `::<RefusedCaller>` part is Rust's "turbofish", which names a generic function's type parameter when the compiler can't infer it. Extensions never go on the wire, so a private struct can ride along to the outer layer, which takes it back off with `remove`. `RefusedCaller` isn't `pub`, so nothing outside the module can read or forge one.
+
+The `reason` uses the same trick. A 403 might be a role check, a permission block or a scope check, and we didn't want to tell them apart by parsing error messages. So the scope checks build their refusal through one helper that marks it:
+
+```rust
+pub fn scope_refusal(message: impl Into<String>) -> Response {
+    let mut response = (StatusCode::FORBIDDEN, message.into()).into_response();
+    response.extensions_mut().insert(RefusalReason::Scope);
+    response
+}
+```
+
+`impl Into<String>` in argument position means "any type that converts into a `String`", so callers pass a `&str` literal or a `format!` result without writing `.to_string()`. A 403 without the mark is `forbidden`.
+
+### A flood mustn't flush the log
+
+Here's the catch. A real action costs the caller something: it needs a valid token, and it does work. A refusal costs nothing. A script with a wrong token can make thousands a second, and our log is bounded. Record every one and, within the hour, the oldest segments (the real history) are gone. The audit trail would become a denial-of-service lever against itself.
+
+So refusals go through `RefusalLimiter`, a fixed-window counter per source address and principal. The first five refusals a minute from a source are recorded; the rest are counted; when the minute is over, one `api.refusals_suppressed` record says "45 more refused requests by anonymous from 203.0.113.9 suppressed". The source is the IP without the port, since every new connection gets a new port, and a key that includes it would never repeat.
+
+The key is an enum whose variants carry different data:
+
+```rust
+pub enum RefusalSource {
+    Caller {
+        address: Option<IpAddr>,
+        principal: String,
+    },
+    Overflow,
+}
+```
+
+C has tagged unions you have to keep honest yourself; Rust's enums *are* tagged unions, checked by the compiler, and `#[derive(Hash, PartialEq, Eq)]` makes one a `HashMap` key. `Overflow` is there because the limiter's memory must be bounded too. An attacker with a botnet, or an IPv6 /64, has an endless supply of addresses, and a map with one entry per address is a memory leak with extra steps. The limiter tracks at most 256 sources; while the table is full, refusals from new sources are counted together under `Overflow`. On top of that, all sources together get at most 100 records a minute, so even 256 busy sources can't write more than a few hundred KiB an hour.
+
+Closing windows is a sweep over the map:
+
+```rust
+self.sources.retain(|source, window| {
+    if !window.closed_at(now) {
+        return true;
+    }
+    if window.suppressed > 0 {
+        summaries.push(SuppressedRefusals { /* ... */ });
+    }
+    false
+});
+```
+
+`retain` keeps the entries for which the closure returns `true` and drops the rest, in one pass. The closure borrows `summaries` mutably while `retain` borrows the map, which is fine because they're different values; the borrow checker only objects when two mutable borrows could touch the same thing. The sweep runs on every refusal, so the next refusal from anyone carries the summaries that are due, and a small task runs it every 15 seconds too, so a burst that simply stops still gets its summary.
+
+Notice what the limiter *doesn't* do: it doesn't read the clock. `admit(source, now)` takes the time as an argument. That made the tests trivial: `a_burst_of_refusals_is_summarised_not_stored_one_by_one` sends fifty refusals at one instant and the fifty-first a minute later, with no sleeping and no paused runtime. It also means a clock that steps backwards keeps a window open (`saturating_sub` stops at zero) instead of underflowing.
+
+Last, the log now counts toward the node's disk pressure, alongside task data (chapter 17). It stays within `audit_max_bytes` regardless, but the disk doesn't know which directory a byte belongs to.
+
+What we didn't build: a central copy. Each node's log is its own, so a node you decommission takes its history with it, and a call a follower forwards to the leader shows up on both (with the client's address on one and the follower's on the other). Shipping records to the leader, or to object storage, and chaining their hashes so tampering shows, are the obvious next steps. Neither was needed to make "who did what" answerable after a restart, which was the bug.
 
 ## Join token validation
 
@@ -1488,6 +1679,12 @@ Two subtleties took a second pass to get right, and both were the same shape of 
 **Failing closed.** The original code bailed on the first error — DNS didn't resolve, a map write failed — and returned having enforced nothing. That's *fail-open*: the instance runs with unrestricted egress, the exact opposite of what `[egress] allow` asked for. Now, once we know egress is configured and eBPF is loaded, we enable enforcement *first* (an enabled flag with no allow entries denies everything) and only then open destinations one at a time. A failure anywhere after that point leaves the cgroup denying all egress, and the periodic re-resolve fills the allowlist back in once DNS recovers. Deny-by-default is only a safe default if the failure path defaults to it too. This contract starts when you declare an allowlist; an app with no `[egress]` block still has unrestricted egress. The cluster-wide default from the design remains future work.
 
 Two honesty notes. First, this is eBPF-only. A build without the feature, a non-Linux host, or a runtime that can't join a prepared cgroup now refuses `[egress]` before it creates a workload. The old warning-and-continue path was honest in its log message but wrong in its outcome. Second, verifying this needs the kernel. The `egress_denied_by_default_allowed_when_listed` test in `tests/ebpf.rs` runs in the Lima VM: it loads the real programs, allows a single `127.0.0.1:port` for the test's own cgroup, and asserts that listed TCP and UDP destinations work while unlisted ones fail with `EPERM`. As with the connect rewrite in Chapter 3, `EPERM`, not `ECONNREFUSED`, is what a BPF `return 0` becomes.
+
+### An allowlist that can't resolve its own names
+
+Here's a fun one. Deploy an app with `allow = ["api.stripe.com:443"]` and watch it fail to reach Stripe. Not because the allowlist is wrong: because the app can't *look up* `api.stripe.com`. Workloads resolve through the node's DNS responder, at the runc gateway on port 53, and that address wasn't on the list. So `getaddrinfo` came back `EPERM`: glibc connects its UDP socket first, so connect4 refused it, and musl sends unconnected datagrams, so sendmsg4 did. `.internal` names failed the same way. The whitepaper had promised that allowlists "implicitly permit DNS" all along.
+
+The fix is one function, `implicit_destinations`, and the discipline to call it everywhere an allowlist is built. It returns the node's resolver on port 53 (the maps don't distinguish UDP from TCP, so that covers both), and the agent chains it into the union it programs for every enforced cgroup. Bun learns the resolver's address when it binds the responder, before any recovery reprograms an allowlist. Without `[dns]` there's no responder, so there's nothing implicit to allow, and the manual says to list your resolver yourself. `egress_allowlist_still_resolves_dns` checks both halves in the Lima VM: the agent programs the resolver into an app's allowlist, and the kernel then lets UDP and TCP through to it while still refusing an unlisted destination.
 
 ### The IPv6 bypass
 

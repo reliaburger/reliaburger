@@ -24,6 +24,17 @@ relish fault node-pressure node-03 --cpu 80% --memory 90% --acknowledge
 Workload faults take `--namespace` (default `default`), `--instance` to hit
 one instance, `--duration` and `--reason`, which is recorded with the fault.
 
+In 0.2.0 workload faults target apps only. `relish fault kill` or `pause`
+against a job is refused by the replica-minimum rail, and the attempts of an
+array or a shared executor are invisible to Smoker. To test jobs under
+failure, break the node instead: `node-kill`, `node-pressure`, or the
+node-level faults the release's job qualification uses (killing Bun on a
+worker or on the leader, delaying traffic between nodes, filling the disk,
+slowing fsync; see `scripts/release/qualify-jobs-sustained.sh`). Job-aware
+chaos, which exempts run-to-completion work from the rail and targets
+executors, is planned for 0.2.2
+([#704](https://github.com/reliaburger/reliaburger/issues/704)).
+
 Every fault has a duration (default 10 minutes) and cleans up after itself:
 
 ```sh
@@ -52,6 +63,17 @@ Admin doesn't override a missing grant. `node-pressure` also needs
 zero (both default to 0, and memory stops at 90%). Clearing needs the same role
 and grant, but no acknowledgement. Bun takes the audit identity from the
 authenticated credential, not `$USER` or the request body.
+
+Every injection, clear and expiry is in the audit log: `relish audit --action
+'fault.*'` lists them. `fault.injected` names the namespace, and its
+`include_leader` and `override_safety` details say whether you overrode a
+safety rail; an injection that did is recorded as critical. When a fault runs
+out its duration, the node that held it records `fault.expired` as `system`.
+
+A token with a `[permission]` block (see `security`) also needs the `fault`
+action. On one app it covers injecting and clearing that app's faults. A node
+fault targets no app, and `relish fault clear` with no service reaches every
+tenant, so those need `fault` with `apps = ["*"]` and no `namespaces`.
 
 `[testing] safety_class` is `development`, `staging`, `production` or, when
 unset, `unknown`. On `production` and `unknown` clusters every injection also
@@ -82,7 +104,9 @@ command prints each one. `relish fault list` shows every node's faults with a
 `NODE` column, and `relish fault clear <id>` finds the node that holds that
 id (pass `--node` if two nodes happen to use the same number). `relish fault
 clear` with no id, or with a service name, clears on every node; clearing
-everything needs an unscoped token.
+everything needs an unscoped token. So does `relish fault list`: a token
+scoped to some apps or namespaces sees only its own apps' faults on the node
+it asks, and the cluster-wide list refuses it.
 
 Network faults (`delay`, `drop`, `dns`, `partition`) are the other way round.
 They change what happens when something *calls* the target, and that happens

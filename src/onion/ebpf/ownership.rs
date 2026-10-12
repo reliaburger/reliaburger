@@ -358,6 +358,7 @@ pub(super) fn load(
             "backend_map" => (1, 8, 272, 65534),
             "firewall_map" => (1, 16, 4, 262144),
             "cgroup_namespace_map" | "egress_enabled_map" => (1, 8, 4, 65536),
+            "destination_map" => (1, 8, 8, 131072),
             "egress_map" => (1, 16, 4, 65536),
             "egress6_map" => (1, 32, 4, 65536),
             "egress_cidr4_map" => (11, 16, 20, 65536),

@@ -262,7 +262,7 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
 
 /// Parse a point in time for `--flag`: raw epoch seconds, or a duration like
 /// `30s`, `5m`, `2h`, `1d` before now.
-fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
+pub(super) fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
     if value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty() {
         return value.parse::<u64>().map_err(|e| RelishError::InvalidFlag {
             flag: flag.to_string(),
@@ -537,6 +537,51 @@ pub enum InitSecurityMode {
     DevelopmentPlaintext,
 }
 
+/// What `relish init` needs to know about the host it writes a node config
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitHost {
+    /// The host runs Linux, where the eBPF data path exists.
+    pub linux: bool,
+    /// `relish init` runs as root, as Bun will on a rootful runc node.
+    pub root: bool,
+    /// `runc` is on `PATH`.
+    pub runc: bool,
+}
+
+impl InitHost {
+    /// Inspect the current host.
+    pub fn detect() -> Self {
+        let runc = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|directory| directory.join("runc").is_file())
+        });
+        Self {
+            linux: cfg!(target_os = "linux"),
+            root: nix::unistd::geteuid().is_root(),
+            runc,
+        }
+    }
+
+    /// Whether a node here runs rootful runc and so can load the eBPF data
+    /// path.
+    fn runs_rootful_runc(self) -> bool {
+        self.linux && self.root && self.runc
+    }
+}
+
+/// Turn on the eBPF data path and the DNS responder for a rootful runc
+/// node. Namespace isolation is enforced only with eBPF, and Bun refuses to
+/// start such a node when eBPF fails to load, so isolation is on by default
+/// rather than silently absent. An egress allowlist resolves names through
+/// the DNS responder. Elsewhere both stay off, and Bun refuses `allow_from`
+/// and egress allowlists instead of running them unenforced.
+pub fn enable_node_data_path(config: &mut crate::config::node::NodeConfig, host: InitHost) {
+    if host.runs_rootful_runc() {
+        config.ebpf.enabled = true;
+        config.dns.enabled = true;
+    }
+}
+
 /// Initialise a new cluster with starter config files and PKI, using mTLS for
 /// its internal transports.
 pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishError> {
@@ -631,6 +676,7 @@ pub fn init_with_security(
     // address — bun otherwise refuses to bind them (C7).
     node_config.security.allow_insecure_cluster =
         security_mode == InitSecurityMode::DevelopmentPlaintext;
+    enable_node_data_path(&mut node_config, InitHost::detect());
     let security_header = match security_mode {
         InitSecurityMode::MutualTls => "# Internal cluster transports require mTLS.\n",
         InitSecurityMode::DevelopmentPlaintext => {
@@ -1635,7 +1681,10 @@ fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
         "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
     );
     for row in rows {
-        let pid = pid_cell(&row.instance);
+        // A job row stands for many tasks, so it shows their count, not a PID.
+        let pid = row
+            .tasks
+            .map_or_else(|| pid_cell(&row.instance), |tasks| format!("tasks:{tasks}"));
         let cpu = row
             .cpu_percent
             .map(|cpu| format!("{cpu:.1}%"))
@@ -2099,8 +2148,62 @@ pub async fn build(
     Ok(())
 }
 
+/// Longest `Idempotency-Key` the cluster keeps as a request identity.
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+/// The key this submission sends: the caller's `--idempotency-key`, or a
+/// fresh random one. Either way it is written to `err` (stderr in
+/// production) *before* anything is sent, so a person whose submission times
+/// out already holds the key that makes the retry safe.
+pub fn submission_key(
+    explicit: Option<String>,
+    err: &mut dyn std::io::Write,
+) -> Result<String, RelishError> {
+    let key = match explicit {
+        Some(key) => {
+            if key.is_empty()
+                || key.len() > MAX_IDEMPOTENCY_KEY_BYTES
+                || !key.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(RelishError::InvalidFlag {
+                    flag: "idempotency-key".into(),
+                    reason: format!(
+                        "use 1–{MAX_IDEMPOTENCY_KEY_BYTES} printable ASCII characters without spaces"
+                    ),
+                });
+            }
+            key
+        }
+        None => format!("{:032x}", rand::random::<u128>()),
+    };
+    // A failed write to stderr mustn't stop the submission.
+    let _ = writeln!(
+        err,
+        "idempotency key {key}; if this submission times out, retry with --idempotency-key {key}"
+    );
+    Ok(key)
+}
+
 /// Submit a batch of jobs for high-throughput scheduling.
-pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
+pub async fn batch(
+    path: &std::path::Path,
+    idempotency_key: Option<String>,
+) -> Result<(), RelishError> {
+    batch_with_client(
+        path,
+        idempotency_key,
+        &BunClient::default_local(),
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+async fn batch_with_client(
+    path: &std::path::Path,
+    idempotency_key: Option<String>,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
+) -> Result<(), RelishError> {
     use crate::config::Config;
 
     let config = Config::from_file(path)?;
@@ -2109,8 +2212,8 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
         return Ok(());
     }
 
-    let client = BunClient::default_local();
-    let result = client.submit_batch(&config.job).await?;
+    let key = submission_key(idempotency_key, err)?;
+    let result = client.submit_batch(&config.job, Some(&key)).await?;
     println!(
         "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
@@ -2210,6 +2313,8 @@ pub struct TaskArrayRun {
     pub env: Vec<String>,
     /// Count and policy.
     pub spec: crate::meat::task_array::TaskArraySpec,
+    /// `--idempotency-key` from an earlier, uncertain submission.
+    pub idempotency_key: Option<String>,
 }
 
 /// Turn `relish run --batch` flags into the API request, refusing bad
@@ -2269,6 +2374,12 @@ pub fn task_array_request(
             namespace: None,
             exec: run.exec,
             script: None,
+            firewall: None,
+            egress: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         },
         spec: run.spec,
     })
@@ -2279,6 +2390,26 @@ pub async fn submit_task_manifest(
     path: &std::path::Path,
     output: OutputFormat,
     dry_run: bool,
+    idempotency_key: Option<String>,
+) -> Result<(), RelishError> {
+    submit_task_manifest_with_client(
+        path,
+        output,
+        dry_run,
+        idempotency_key,
+        &BunClient::default_local(),
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+async fn submit_task_manifest_with_client(
+    path: &std::path::Path,
+    output: OutputFormat,
+    dry_run: bool,
+    idempotency_key: Option<String>,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
 ) -> Result<(), RelishError> {
     let source = std::fs::read_to_string(path)?;
     let request: crate::bun::task_array_api::TaskManifestRequest = toml::from_str(&source)
@@ -2293,6 +2424,7 @@ pub async fn submit_task_manifest(
             &crate::meat::task_array_store::TaskArrayWrite::RegisterManifest {
                 name: request.name.clone(),
                 namespace: request.namespace.clone(),
+                request_id: "dry-run".into(),
                 cohorts: request.cohort.clone(),
                 submitted_at_epoch_secs: 0,
             },
@@ -2314,9 +2446,8 @@ pub async fn submit_task_manifest(
         );
         return Ok(());
     }
-    let response = BunClient::default_local()
-        .submit_task_manifest(&request)
-        .await?;
+    let key = submission_key(idempotency_key, err)?;
+    let response = client.submit_task_manifest(&request, Some(&key)).await?;
     if matches!(output, OutputFormat::Human) {
         println!(
             "manifest {} submitted; watch with: relish batch watch {}",
@@ -2357,7 +2488,7 @@ pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), Re
 /// attempt. Quantiles merge bucket counts and report bucket upper bounds.
 pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     if summary["kind"] == "schedule" {
-        return format!(
+        let mut line = format!(
             "{}/{}: UTC schedule {}, {} tasks per occurrence; revision {}",
             summary["namespace"].as_str().unwrap_or("default"),
             summary["name"].as_str().unwrap_or("?"),
@@ -2365,6 +2496,13 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
             summary["total"],
             summary["revision"]
         );
+        if let Some(minute) = summary["skipped"]["minute"].as_i64() {
+            line.push_str(&format!(
+                " | skipped: capacity ({} so far, latest at minute {minute})",
+                summary["skipped_count"].as_u64().unwrap_or(1)
+            ));
+        }
+        return line;
     }
 
     let rate = summary["rates"]["successes_per_second"]
@@ -2410,6 +2548,12 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
         " | {} queued, {} held",
         summary["queued"], summary["held"]
     ));
+    if let Some(reason) = summary["quota_blocked_reason"].as_str() {
+        output.push_str(&format!(" | quota blocked: {reason}"));
+    }
+    if let Some(reason) = summary["unrunnable_reason"].as_str() {
+        output.push_str(&format!(" | refused: {reason}"));
+    }
     let failure_rate = summary["rates"]["failures_per_second"]
         .as_f64()
         .map_or("unknown".into(), |r| format!("{r:.1}/s"));
@@ -2442,6 +2586,14 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
             cohort["memory_request_bytes"].as_u64().unwrap_or(0) / (1024 * 1024)
         ));
     }
+    for cohort in summary["cohorts"].as_array().into_iter().flatten() {
+        if let Some(reason) = cohort["unrunnable_reason"].as_str() {
+            output.push_str(&format!(
+                "\n  array {} refused: {reason}",
+                cohort["batch_id"]
+            ));
+        }
+    }
     for profile in
         std::iter::once(summary).chain(summary["cohorts"].as_array().into_iter().flatten())
     {
@@ -2465,9 +2617,25 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
 
 /// Submit a task array (`relish run --batch`).
 pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
+    run_task_array_with_client(run, &BunClient::default_local(), &mut std::io::stderr()).await
+}
+
+async fn run_task_array_with_client(
+    mut run: TaskArrayRun,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
+) -> Result<(), RelishError> {
+    let explicit = run.idempotency_key.take();
+    let scheduled = run.schedule.is_some();
     let request = task_array_request(run)?;
-    let client = BunClient::default_local();
-    let answer = client.submit_task_array(&request).await?;
+    // A schedule registers a definition, not a run, so it needs no key;
+    // re-registering the same schedule is already idempotent.
+    let key = if scheduled {
+        explicit.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()))
+    } else {
+        submission_key(explicit, err)?
+    };
+    let answer = client.submit_task_array(&request, Some(&key)).await?;
     if let Some(id) = answer["batch_id"].as_u64() {
         println!(
             "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
@@ -2495,14 +2663,7 @@ pub async fn jobs(definitions: bool, output: OutputFormat) -> Result<(), RelishE
     }
     if definitions {
         for row in rows["definitions"].as_array().into_iter().flatten() {
-            println!(
-                "{}/{} revision {}: {} tasks, UTC schedule {}",
-                row["namespace"].as_str().unwrap_or("?"),
-                row["name"].as_str().unwrap_or("?"),
-                row["revision"],
-                row["count"],
-                row["cron"]["expression"].as_str().unwrap_or("disabled")
-            );
+            print!("{}", format_definition(row));
         }
     } else {
         for row in rows["batches"].as_array().into_iter().flatten() {
@@ -2626,6 +2787,22 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         count("not_run"),
         count("retried"),
     ));
+    let causes: Vec<String> = [
+        ("exit_code", "non-zero exit"),
+        ("signal", "signal"),
+        ("timeout", "timeout"),
+        ("unknown", "unknown outcome"),
+        ("unrecorded", "not recorded across a restart"),
+    ]
+    .into_iter()
+    .filter_map(|(key, label)| {
+        let value = summary["retry_causes"][key].as_u64()?;
+        (value > 0).then(|| format!("{value} {label}"))
+    })
+    .collect();
+    if !causes.is_empty() {
+        out.push_str(&format!("  retry causes: {}\n", causes.join(", ")));
+    }
     out.push_str(&format!(
         "  chunks: {} of {} done; {} tasks held by nodes, {} queued\n",
         count("chunks_done"),
@@ -2633,6 +2810,12 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         count("held"),
         count("queued"),
     ));
+    if let Some(reason) = summary["quota_blocked_reason"].as_str() {
+        out.push_str(&format!("  waiting for quota: {reason}\n"));
+    }
+    if let Some(reason) = summary["unrunnable_reason"].as_str() {
+        out.push_str(&format!("  refused: {reason}\n"));
+    }
     if let Some(ranges) = summary["failed_indices"].as_array()
         && !ranges.is_empty()
     {
@@ -2929,6 +3112,42 @@ fn render_token_scope(scope: &super::client::TokenScopeSummary) -> String {
     }
 }
 
+/// One job definition for `relish jobs --definitions`: its schedule, then
+/// its last outcomes, newest first. The outcomes outlive the runs' details.
+fn format_definition(row: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "{}/{} revision {}: {} tasks, UTC schedule {}\n",
+        row["namespace"].as_str().unwrap_or("?"),
+        row["name"].as_str().unwrap_or("?"),
+        row["revision"],
+        row["count"],
+        row["cron"]["expression"].as_str().unwrap_or("disabled")
+    );
+    let history = row["history"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for outcome in history.iter().rev() {
+        let _ = write!(
+            text,
+            "  run {} finished {}: {}, {} succeeded, {} failed",
+            outcome["run"],
+            outcome["finished_at_epoch_secs"]
+                .as_u64()
+                .map_or_else(|| "?".to_string(), format_utc),
+            outcome["status"].as_str().unwrap_or("?"),
+            outcome["succeeded"],
+            outcome["failed"],
+        );
+        if outcome["not_run"].as_u64().is_some_and(|count| count > 0) {
+            let _ = write!(text, ", {} not run", outcome["not_run"]);
+        }
+        if let Some(index) = outcome["first_failed_index"].as_u64() {
+            let _ = write!(text, "; first failure: task {index}");
+        }
+        text.push('\n');
+    }
+    text
+}
+
 /// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
 fn format_utc(unix_seconds: u64) -> String {
     let Ok(at) = i64::try_from(unix_seconds)
@@ -3171,7 +3390,36 @@ mod tests {
             },
             cpu_percent: cpu,
             memory_bytes: memory,
+            tasks: None,
         }
+    }
+
+    #[test]
+    fn job_definitions_list_their_last_outcomes_newest_first() {
+        let text = format_definition(&serde_json::json!({
+            "namespace": "ops", "name": "nightly", "revision": 2, "count": 1,
+            "cron": {"expression": "0 3 * * *"},
+            "history": [
+                {"run": 40, "finished_at_epoch_secs": 1_791_601_200u64, "status": "Succeeded",
+                 "succeeded": 1, "failed": 0, "not_run": 0},
+                {"run": 41, "finished_at_epoch_secs": 1_791_687_600u64, "status": "CompletedWithFailures",
+                 "succeeded": 0, "failed": 1, "not_run": 0, "first_failed_index": 0},
+            ],
+        }));
+        insta::assert_snapshot!(text);
+    }
+
+    #[test]
+    fn top_shows_a_job_row_with_its_running_task_count() {
+        let mut job = top_row("rb-2", "tasks", None, Some(250.0), Some(8 << 20));
+        job.instance.app_name = "render".into();
+        job.tasks = Some(27);
+        let table = render_top(&[job]);
+        let line = table.lines().nth(1).unwrap();
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(columns[1], "render", "{table}");
+        assert_eq!(columns[4], "tasks:27", "{table}");
+        assert_eq!(columns[6], "250.0%", "{table}");
     }
 
     #[test]
@@ -3868,6 +4116,44 @@ spec:
     }
 
     #[test]
+    fn init_enables_ebpf_and_dns_on_rootful_linux() {
+        let rootful = InitHost {
+            linux: true,
+            root: true,
+            runc: true,
+        };
+        let mut config = crate::config::node::NodeConfig::default();
+        enable_node_data_path(&mut config, rootful);
+        assert!(config.ebpf.enabled, "namespace isolation needs eBPF");
+        assert!(
+            config.dns.enabled,
+            "allowlisted workloads resolve through Bun"
+        );
+
+        for host in [
+            InitHost {
+                linux: false,
+                ..rootful
+            },
+            InitHost {
+                root: false,
+                ..rootful
+            },
+            InitHost {
+                runc: false,
+                ..rootful
+            },
+        ] {
+            let mut config = crate::config::node::NodeConfig::default();
+            enable_node_data_path(&mut config, host);
+            assert!(
+                !config.ebpf.enabled && !config.dns.enabled,
+                "{host:?} can't load eBPF, so it must not be told to"
+            );
+        }
+    }
+
+    #[test]
     fn init_creates_a_missing_output_directory() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("cluster");
@@ -4240,6 +4526,112 @@ mod task_array_tests {
     use crate::bun::task_array_node::TaskResultRow;
     use crate::meat::task_array::TaskArraySpec;
 
+    /// A stand-in leader that records each `/v1/batch/array` submission's
+    /// `Idempotency-Key` header and admits it as run 7.
+    async fn key_recording_server() -> (
+        BunClient,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/batch/array",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let recorder = recorder.clone();
+                async move {
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    recorder.lock().unwrap().push(key);
+                    axum::Json(serde_json::json!({"batch_id": 7, "count": 10, "chunks": 1}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (client, seen, server)
+    }
+
+    #[tokio::test]
+    async fn run_batch_sends_and_prints_an_idempotency_key() {
+        let (client, seen, server) = key_recording_server().await;
+        let mut err = Vec::new();
+        run_task_array_with_client(run(), &client, &mut err)
+            .await
+            .unwrap();
+        server.abort();
+        let sent = seen.lock().unwrap().clone();
+        let [Some(key)] = sent.as_slice() else {
+            panic!("expected one keyed submission, got {sent:?}");
+        };
+        assert_eq!(key.len(), 32, "{key}");
+        let printed = String::from_utf8(err).unwrap();
+        assert!(
+            printed.contains(&format!("--idempotency-key {key}")),
+            "{printed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_idempotency_key_is_sent_unchanged() {
+        let (client, seen, server) = key_recording_server().await;
+        let mut retry = run();
+        retry.idempotency_key = Some("retry-after-timeout-1".into());
+        let mut err = Vec::new();
+        run_task_array_with_client(retry, &client, &mut err)
+            .await
+            .unwrap();
+        let mut bad = run();
+        bad.idempotency_key = Some("has a space".into());
+        assert!(
+            run_task_array_with_client(bad, &client, &mut Vec::new())
+                .await
+                .is_err()
+        );
+        server.abort();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("retry-after-timeout-1".to_string())],
+            "a refused key never reaches the cluster"
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("retry-after-timeout-1")
+        );
+    }
+
+    #[test]
+    fn lint_rejects_an_out_of_range_job_policy() {
+        for policy in [
+            "max_attempts = 0",
+            "max_attempts = 11",
+            "task_timeout_secs = 86401",
+            "overlap = 'allow'",
+        ] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                file.path(),
+                format!("[job.cleanup]\nimage = 'cleanup:v1'\n{policy}\n"),
+            )
+            .unwrap();
+            assert!(lint(file.path()).is_err(), "{policy}");
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "[job.cleanup]\nimage = 'cleanup:v1'\nschedule = '@daily'\nmax_attempts = 2\ntask_timeout_secs = 300\noverlap = 'allow'\nreplay_unknown = true\n",
+        )
+        .unwrap();
+        lint(file.path()).unwrap();
+    }
+
     fn run() -> TaskArrayRun {
         TaskArrayRun {
             runtime: crate::config::job::JobRuntime::Process,
@@ -4253,6 +4645,7 @@ mod task_array_tests {
             args: vec!["--frame".to_string(), "{index}".to_string()],
             env: vec!["MODE=fast".to_string(), "EMPTY=".to_string()],
             spec: TaskArraySpec::with_count(10),
+            idempotency_key: None,
         }
     }
 
@@ -4322,6 +4715,8 @@ mod task_array_tests {
             "kind": "array", "name": "render", "namespace": "default",
             "status": "Running", "total": 100000, "succeeded": 51200,
             "failed": 5, "not_run": 0, "retried": 12, "queued": 40000,
+            "retry_causes": { "exit_code": 10, "signal": 2, "timeout": 0,
+                              "unknown": 0, "unrecorded": 0 },
             "held": 8800, "chunks": 98, "chunks_done": 50,
             "failed_indices": [[7, 7], [1000, 1002]],
             "nodes": [
@@ -4335,6 +4730,7 @@ mod task_array_tests {
             format_array_summary(3, &summary),
             "task array 3 (render in default): Running\n\
              \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 12 retries\n\
+             \x20 retry causes: 10 non-zero exit, 2 signal\n\
              \x20 chunks: 50 of 98 done; 8800 tasks held by nodes, 40000 queued\n\
              \x20 failed indices: 7, 1000-1002 and 1 more (see relish batch results 3 --failed)\n\
              \x20 node-1: 8 slots, 8 running, 51200 succeeded, 5 failed\n\
@@ -4360,6 +4756,33 @@ mod task_array_tests {
         }
         let unknown = format_batch_watch(&serde_json::json!({"kind":"array"}));
         assert!(unknown.contains("unknown active commands"));
+    }
+
+    #[test]
+    fn status_says_why_no_node_could_run_a_failed_run() {
+        let reason =
+            "no node can run it: host jobs don't run under [process_workloads] mount_isolation yet";
+        let run = serde_json::json!({"kind":"array","batch_id":4,"status":"Failed","not_run":20,"unrunnable_reason":reason});
+        assert!(format_batch_watch(&run).contains(&format!("refused: {reason}")));
+        assert!(format_array_summary(4, &run).contains(&format!("  refused: {reason}\n")));
+        // A manifest names the profile no node could run.
+        let manifest = serde_json::json!({"kind":"manifest","batch_id":5,"status":"Failed","cohorts":[
+            {"profile":"small","batch_id":6,"succeeded":1,"total":1},
+            {"profile":"host","batch_id":7,"succeeded":0,"total":4,"unrunnable_reason":reason}]});
+        assert!(format_batch_watch(&manifest).contains(&format!("array 7 refused: {reason}")));
+    }
+
+    #[test]
+    fn status_says_why_a_run_waits_and_which_occurrences_were_skipped() {
+        let reason = "namespace \"tenant\" would exceed CPU quota: 2000+1000 > 2000m";
+        let run = serde_json::json!({"kind":"array","batch_id":4,"status":"Running","quota_blocked_reason":reason});
+        assert!(format_batch_watch(&run).contains(&format!("quota blocked: {reason}")));
+        assert!(format_array_summary(4, &run).contains(&format!("waiting for quota: {reason}")));
+        let schedule = serde_json::json!({"kind":"schedule","name":"nightly","namespace":"ops","cron":{"expression":"0 2 * * *"},"total":1,"revision":1,"skipped":{"minute":29000000,"reason":"capacity"},"skipped_count":2});
+        assert!(
+            format_batch_watch(&schedule)
+                .contains("skipped: capacity (2 so far, latest at minute 29000000)")
+        );
     }
 
     #[test]

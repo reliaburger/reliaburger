@@ -245,7 +245,18 @@ impl StateMachineInner {
             && lease.placements.is_empty()
             && lease.resources.iter().all(|resource| match resource {
                 LeasedResource::App { app_id } => !self.state.apps.contains_key(app_id),
-                LeasedResource::Job { .. } => false,
+                LeasedResource::Job { job_id } => {
+                    self.state
+                        .task_arrays
+                        .jobs()
+                        .definition(&job_id.namespace, &job_id.name)
+                        .is_none()
+                        && self
+                            .state
+                            .task_arrays
+                            .deployment_owner(&job_id.name, &job_id.namespace)
+                            .is_none()
+                }
                 LeasedResource::Namespace { name } => !self.state.namespaces.contains_key(name),
                 LeasedResource::ApiToken { name, .. } => !self
                     .state
@@ -426,171 +437,6 @@ impl StateMachineInner {
                 }
                 self.state = staged.state;
             }
-            RaftRequest::PrerequisiteBegin {
-                operation_id,
-                term,
-                config,
-            } => {
-                use super::prerequisites::{MAX_CLAIMS, PrerequisiteClaim};
-                let refusal = |reason: String| Some(CouncilResponse::Refused { reason });
-                if self
-                    .state
-                    .last_applied_log
-                    .is_none_or(|log| log.leader_id.term != *term)
-                {
-                    return refusal("stale prerequisite leadership term".into());
-                }
-                let namespaces: Vec<_> = self.state.namespaces.keys().cloned().collect();
-                if let Err(error) = config.validate_against(&namespaces) {
-                    return refusal(error.to_string());
-                }
-                if self.state.prerequisite_claims.contains_key(operation_id)
-                    || self.state.prerequisite_claims.len() >= MAX_CLAIMS
-                {
-                    return refusal(
-                        "prerequisite ownership capacity exhausted or operation already exists"
-                            .into(),
-                    );
-                }
-                if let Some(owner) =
-                    super::prerequisites::conflict(&self.state.prerequisite_claims, config)
-                {
-                    return refusal(format!(
-                        "prerequisite operation {owner} still owns a workload"
-                    ));
-                }
-                // Confirm finite ownership before cloning or staging desired-state writes.
-                let mut next = self.state.prerequisite_claims.clone();
-                next.insert(
-                    operation_id.clone(),
-                    PrerequisiteClaim {
-                        term: *term,
-                        recovery_epoch: self.state.recovery_epoch,
-                        apps_committed: false,
-                        config: *config.clone(),
-                    },
-                );
-                if let Err(reason) = super::prerequisites::validate_claims(&next) {
-                    return refusal(reason);
-                }
-                // Jobs launch under their canonical physical names on the local
-                // node. Permanent global batch ownership outlives tracker pruning.
-                if config.job.iter().any(|(name, job)| {
-                    self.state
-                        .batch_state
-                        .execution_owner(job.namespace.as_deref().unwrap_or("default"), name)
-                        .is_some()
-                }) {
-                    return refusal("job identity belongs to a batch execution".into());
-                }
-                // Reject known desired-state admission failures before authorizing
-                // migration side effects. Commit repeats this against current state.
-                let mut staged = StateMachineInner {
-                    state: self.state.clone(),
-                    ..Default::default()
-                };
-                for write in super::config_to_desired_writes(config) {
-                    if let Some(CouncilResponse::Refused { reason }) =
-                        staged.apply_request_at(&write, position)
-                    {
-                        return refusal(reason);
-                    }
-                }
-                self.state.prerequisite_claims = next;
-            }
-            RaftRequest::PrerequisiteCommit { operation_id } => {
-                let Some(claim) = self.state.prerequisite_claims.get(operation_id).cloned() else {
-                    return Some(CouncilResponse::Refused {
-                        reason: "unknown prerequisite operation".into(),
-                    });
-                };
-                if self
-                    .state
-                    .last_applied_log
-                    .is_none_or(|log| log.leader_id.term != claim.term)
-                    || claim.recovery_epoch != self.state.recovery_epoch
-                {
-                    return Some(CouncilResponse::Refused { reason: "prerequisite worker belongs to an earlier leadership or recovery generation".into() });
-                }
-                if claim.apps_committed {
-                    return Some(CouncilResponse::Refused {
-                        reason: "prerequisite desired writes already committed".into(),
-                    });
-                }
-                let namespaces: Vec<_> = self.state.namespaces.keys().cloned().collect();
-                if let Err(error) = claim.config.validate_against(&namespaces) {
-                    return Some(CouncilResponse::Refused {
-                        reason: error.to_string(),
-                    });
-                }
-                // Only the staged copy temporarily removes this operation's fence.
-                // A refused desired write publishes nothing and retains ownership.
-                let writes = super::config_to_desired_writes(&claim.config);
-                let mut staged = StateMachineInner {
-                    state: self.state.clone(),
-                    ..Default::default()
-                };
-                staged.state.prerequisite_claims.remove(operation_id);
-                for write in writes {
-                    if let Some(CouncilResponse::Refused { reason }) =
-                        staged.apply_request_at(&write, position)
-                    {
-                        return Some(CouncilResponse::Refused { reason });
-                    }
-                }
-                if claim.has_ordinary_jobs() {
-                    let mut retained = claim;
-                    retained.apps_committed = true;
-                    staged
-                        .state
-                        .prerequisite_claims
-                        .insert(operation_id.clone(), retained);
-                    if let Err(reason) =
-                        super::prerequisites::validate_claims(&staged.state.prerequisite_claims)
-                    {
-                        return Some(CouncilResponse::Refused { reason });
-                    }
-                }
-                self.state = staged.state;
-            }
-            RaftRequest::PrerequisiteFailed { operation_id } => {
-                let Some(claim) = self.state.prerequisite_claims.get(operation_id) else {
-                    return Some(CouncilResponse::Refused {
-                        reason: "unknown prerequisite operation".into(),
-                    });
-                };
-                if self
-                    .state
-                    .last_applied_log
-                    .is_none_or(|log| log.leader_id.term != claim.term)
-                    || claim.recovery_epoch != self.state.recovery_epoch
-                {
-                    return Some(CouncilResponse::Refused { reason: "cannot release uncertain prerequisite ownership from an earlier leadership or recovery generation".into() });
-                }
-                if claim.apps_committed {
-                    return Some(CouncilResponse::Refused {
-                        reason: "committed ordinary jobs require positive job settlement".into(),
-                    });
-                }
-                self.state.prerequisite_claims.remove(operation_id);
-            }
-            RaftRequest::JobApplyComplete { operation_id } => {
-                let Some(claim) = self.state.prerequisite_claims.get(operation_id) else {
-                    return Some(CouncilResponse::Refused {
-                        reason: "unknown job apply operation".into(),
-                    });
-                };
-                if self
-                    .state
-                    .last_applied_log
-                    .is_none_or(|log| log.leader_id.term != claim.term)
-                    || claim.recovery_epoch != self.state.recovery_epoch
-                    || !claim.apps_committed
-                {
-                    return Some(CouncilResponse::Refused { reason: "job completion does not own this committed leadership and recovery generation".into() });
-                }
-                self.state.prerequisite_claims.remove(operation_id);
-            }
             RaftRequest::ReserveNodeFault {
                 reservation,
                 membership_log_id,
@@ -657,27 +503,12 @@ impl StateMachineInner {
                 }
                 if self
                     .state
-                    .batch_state
-                    .execution_owner(&app_id.namespace, &app_id.name)
+                    .task_arrays
+                    .deployment_owner(&app_id.name, &app_id.namespace)
                     .is_some()
                 {
                     return Some(CouncilResponse::Refused {
-                        reason: "identity belongs to a batch execution".into(),
-                    });
-                }
-                if self
-                    .state
-                    .prerequisite_claims
-                    .values()
-                    .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
-                    || self
-                        .state
-                        .task_arrays
-                        .deployment_owner(&app_id.name, &app_id.namespace)
-                        .is_some()
-                {
-                    return Some(CouncilResponse::Refused {
-                        reason: "an outstanding prerequisite owns this app".into(),
+                        reason: "an outstanding job deployment owns this app".into(),
                     });
                 }
                 if crate::testkit::lease::valid_test_namespace(&app_id.namespace) {
@@ -697,14 +528,9 @@ impl StateMachineInner {
             RaftRequest::AppStop { app_id } => {
                 if self
                     .state
-                    .prerequisite_claims
-                    .values()
-                    .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
-                    || self
-                        .state
-                        .task_arrays
-                        .deployment_owner(&app_id.name, &app_id.namespace)
-                        .is_some()
+                    .task_arrays
+                    .deployment_owner(&app_id.name, &app_id.namespace)
+                    .is_some()
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "an outstanding job operation owns this app".into(),
@@ -720,14 +546,9 @@ impl StateMachineInner {
             RaftRequest::AppDelete { app_id } => {
                 if self
                     .state
-                    .prerequisite_claims
-                    .values()
-                    .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
-                    || self
-                        .state
-                        .task_arrays
-                        .deployment_owner(&app_id.name, &app_id.namespace)
-                        .is_some()
+                    .task_arrays
+                    .deployment_owner(&app_id.name, &app_id.namespace)
+                    .is_some()
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "an outstanding job operation owns this app".into(),
@@ -1365,94 +1186,39 @@ impl StateMachineInner {
                     }
                 }
             }
-            RaftRequest::BatchRegister {
-                expected_log_id,
-                batch,
-            } => {
-                if *expected_log_id != position.previous_log_id {
-                    return Some(CouncilResponse::Refused {
-                        reason: "admission revision changed".into(),
-                    });
-                }
-                if batch.jobs.iter().any(|job| {
-                    job.node.as_ref().is_some_and(|node| {
-                        self.state
-                            .security_state
-                            .crl
-                            .retired_nodes
-                            .contains_key(&node.0)
-                    })
-                }) {
-                    return Some(CouncilResponse::Refused {
-                        reason: "batch target node is retired".into(),
-                    });
-                }
-                if batch.jobs.iter().any(|job| {
-                    self.state.prerequisite_claims.values().any(|claim| {
-                        // Display labels fence only held job operations. Physical
-                        // execution names fence every target, including held apps.
-                        claim.config.job.get(&job.name).is_some_and(|held_job| {
-                            held_job.namespace.as_deref().unwrap_or("default") == job.namespace
-                                && claim.blocks(&job.name, &job.namespace)
-                        }) || claim.blocks(&job.execution_name, &job.namespace)
-                    })
-                }) {
-                    return Some(CouncilResponse::Refused {
-                        reason: "batch job identity is held by prerequisite ownership".into(),
-                    });
-                }
-                if batch.jobs.iter().any(|job| {
-                    self.state
-                        .apps
-                        .contains_key(&crate::meat::types::AppId::new(
-                            &job.execution_name,
-                            &job.namespace,
-                        ))
-                }) {
-                    return Some(CouncilResponse::Refused {
-                        reason: "execution identity already belongs to an app".into(),
-                    });
-                }
-                return Some(match self.state.batch_state.register(batch.clone()) {
-                    Ok(batch_id) => CouncilResponse::BatchRegistered { batch_id },
-                    Err(reason) => CouncilResponse::Refused { reason },
-                });
-            }
-            RaftRequest::BatchJobUpdate {
-                batch_id,
-                job_name,
-                namespace,
-                status,
-                exit_code,
-            } => {
-                // Transition validation lives here, at the single point
-                // every replica passes through: forged states, unknown
-                // jobs and conflicting terminal reports are refused;
-                // duplicate terminal reports apply as no-ops (JOB3).
-                if let Err(e) = self
-                    .state
-                    .batch_state
-                    .report(*batch_id, job_name, namespace, *status, *exit_code)
-                {
-                    return Some(CouncilResponse::Refused {
-                        reason: e.to_string(),
-                    });
-                }
-            }
             RaftRequest::TaskArray(write) => {
                 use crate::meat::task_array_store::TaskArrayWrite;
-                if let TaskArrayWrite::DeployBegin { config, .. } = write.as_ref() {
+                if let TaskArrayWrite::DeployBegin {
+                    config,
+                    now_epoch_secs,
+                    ..
+                } = write.as_ref()
+                {
+                    // A job in a test namespace runs only under the active job
+                    // lease that owns it, so the lease's cleanup can find it.
+                    let leased_at = now_epoch_secs.saturating_mul(1000);
+                    for (name, spec) in &config.job {
+                        let namespace = spec.namespace.as_deref().unwrap_or("default");
+                        if !crate::testkit::lease::valid_test_namespace(namespace) {
+                            continue;
+                        }
+                        let resource = crate::testkit::lease::LeasedResource::Job {
+                            job_id: crate::meat::AppId::new(name, namespace),
+                        };
+                        if !self.state.test_leases.values().any(|lease| {
+                            lease.resources.contains(&resource) && lease.is_active_at(leased_at)
+                        }) {
+                            return Some(CouncilResponse::Refused {
+                                reason: "a job in a test lease namespace needs an active job \
+                                         lease that owns it"
+                                    .into(),
+                            });
+                        }
+                    }
                     let namespaces: Vec<_> = self.state.namespaces.keys().cloned().collect();
                     if let Err(error) = config.validate_against(&namespaces) {
                         return Some(CouncilResponse::Refused {
                             reason: error.to_string(),
-                        });
-                    }
-                    if super::prerequisites::conflict(&self.state.prerequisite_claims, config)
-                        .is_some()
-                    {
-                        return Some(CouncilResponse::Refused {
-                            reason: "an earlier job operation still owns a workload".into(),
                         });
                     }
                     let mut staged = StateMachineInner {
@@ -1471,16 +1237,6 @@ impl StateMachineInner {
                         {
                             return Some(CouncilResponse::Refused {
                                 reason: "job identity belongs to an app".into(),
-                            });
-                        }
-                        if self
-                            .state
-                            .batch_state
-                            .execution_owner(namespace, name)
-                            .is_some()
-                        {
-                            return Some(CouncilResponse::Refused {
-                                reason: "identity belongs to a batch execution".into(),
                             });
                         }
                     }
@@ -1521,26 +1277,6 @@ impl StateMachineInner {
                     {
                         return Some(CouncilResponse::Refused { reason: "identity belongs to an app; delete it before changing workload kind".into() });
                     }
-                    if self
-                        .state
-                        .batch_state
-                        .execution_owner(namespace, name)
-                        .is_some()
-                    {
-                        return Some(CouncilResponse::Refused {
-                            reason: "identity belongs to a batch execution".into(),
-                        });
-                    }
-                    if self
-                        .state
-                        .prerequisite_claims
-                        .values()
-                        .any(|claim| claim.blocks(name, namespace))
-                    {
-                        return Some(CouncilResponse::Refused {
-                            reason: "an earlier job operation owns this workload".into(),
-                        });
-                    }
                 }
                 // Arrays share the batch id counter, so `batch-status ID`
                 // names one thing. Every rule lives in `TaskArrays::apply`;
@@ -1553,18 +1289,17 @@ impl StateMachineInner {
                         });
                     }
                 };
-                let batch_state = &mut self.state.batch_state;
-                if let Err(reason) = batch_state.preflight_ids(ids) {
+                let batch_ids = &mut self.state.batch_ids;
+                if let Err(reason) = batch_ids.preflight(ids) {
                     return Some(CouncilResponse::Refused { reason });
                 }
-                match self
-                    .state
-                    .task_arrays
-                    .apply(write, || batch_state.allocate_id())
-                {
+                match self.state.task_arrays.apply(write, || batch_ids.allocate()) {
                     Ok(crate::meat::task_array_store::TaskArrayApplied::Registered {
                         batch_id,
                     }) => return Some(CouncilResponse::TaskArrayRegistered { batch_id }),
+                    Ok(crate::meat::task_array_store::TaskArrayApplied::Ticked { refused }) => {
+                        return Some(CouncilResponse::TaskArrayTicked { refused });
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         return Some(CouncilResponse::Refused {
@@ -1786,11 +1521,6 @@ impl StateMachineInner {
                                 .into(),
                     });
                 }
-                if lease.scope != crate::testkit::lease::LeaseScope::Applications {
-                    return Some(CouncilResponse::Refused {
-                        reason: "node job leases must remain on their owning node".to_string(),
-                    });
-                }
                 if let Err(error) = lease.validate() {
                     return Some(CouncilResponse::Refused {
                         reason: error.to_string(),
@@ -1918,6 +1648,50 @@ impl StateMachineInner {
                 };
                 owners.remove(node_id);
             }
+            RaftRequest::TestLeaseJobs {
+                lease_id,
+                observed_at_unix_ms,
+                jobs,
+            } => {
+                use crate::testkit::lease::{LeaseScope, LeasedResource};
+                let refuse = |reason: &str| {
+                    Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    })
+                };
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return refuse("lease not found");
+                };
+                if !lease.is_active_at(*observed_at_unix_ms) {
+                    return refuse("lease is expired or cleanup has started");
+                }
+                if lease.scope != LeaseScope::NodeJobs {
+                    return refuse("only a job lease can own jobs");
+                }
+                if jobs.iter().any(|job| job.namespace != lease.namespace) {
+                    return refuse("job namespace does not match its lease");
+                }
+                let resources: std::collections::BTreeSet<_> = jobs
+                    .iter()
+                    .map(|job_id| LeasedResource::Job {
+                        job_id: job_id.clone(),
+                    })
+                    .collect();
+                let additional = resources.difference(&lease.resources).count();
+                if lease.resource_count().saturating_add(additional)
+                    > crate::testkit::lease::MAX_LEASED_RESOURCES
+                {
+                    return refuse("lease resource limit reached");
+                }
+                if self.state.test_leases.iter().any(|(id, candidate)| {
+                    id != lease_id && resources.iter().any(|r| candidate.resources.contains(r))
+                }) {
+                    return refuse("job already belongs to another lease");
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.resources.extend(resources);
+                }
+            }
             RaftRequest::TestLeaseAppSpec {
                 lease_id,
                 observed_at_unix_ms,
@@ -1926,27 +1700,12 @@ impl StateMachineInner {
             } => {
                 if self
                     .state
-                    .batch_state
-                    .execution_owner(&app_id.namespace, &app_id.name)
+                    .task_arrays
+                    .deployment_owner(&app_id.name, &app_id.namespace)
                     .is_some()
                 {
                     return Some(CouncilResponse::Refused {
-                        reason: "identity belongs to a batch execution".into(),
-                    });
-                }
-                if self
-                    .state
-                    .prerequisite_claims
-                    .values()
-                    .any(|claim| claim.blocks(&app_id.name, &app_id.namespace))
-                    || self
-                        .state
-                        .task_arrays
-                        .deployment_owner(&app_id.name, &app_id.namespace)
-                        .is_some()
-                {
-                    return Some(CouncilResponse::Refused {
-                        reason: "an outstanding prerequisite owns this app".into(),
+                        reason: "an outstanding job deployment owns this app".into(),
                     });
                 }
 
@@ -1955,6 +1714,11 @@ impl StateMachineInner {
                         reason: "lease not found".to_string(),
                     });
                 };
+                if lease.scope != crate::testkit::lease::LeaseScope::Applications {
+                    return Some(CouncilResponse::Refused {
+                        reason: "a job lease owns only jobs".into(),
+                    });
+                }
                 if !lease.is_active_at(*observed_at_unix_ms) {
                     return Some(CouncilResponse::Refused {
                         reason: "lease is expired or cleanup has started".to_string(),
@@ -2008,6 +1772,11 @@ impl StateMachineInner {
                         reason: "lease not found".to_string(),
                     });
                 };
+                if lease.scope != crate::testkit::lease::LeaseScope::Applications {
+                    return Some(CouncilResponse::Refused {
+                        reason: "a job lease owns only jobs".into(),
+                    });
+                }
                 if !lease.is_active_at(*observed_at_unix_ms) {
                     return Some(CouncilResponse::Refused {
                         reason: "lease is expired or cleanup has started".to_string(),
@@ -2049,6 +1818,11 @@ impl StateMachineInner {
                         reason: "lease not found".into(),
                     });
                 };
+                if lease.scope != crate::testkit::lease::LeaseScope::Applications {
+                    return Some(CouncilResponse::Refused {
+                        reason: "a job lease owns only jobs".into(),
+                    });
+                }
                 let resource = match lease.token_resource(token, owner_id, *observed_at_unix_ms) {
                     Ok(resource) => resource,
                     Err(error) => {
@@ -2439,8 +2213,20 @@ impl StateMachineInner {
                 let remaining: Vec<String> = resources
                     .iter()
                     .filter_map(|resource| match resource {
-                        crate::testkit::lease::LeasedResource::Job { job_id } => {
-                            Some(format!("node job {job_id}"))
+                        crate::testkit::lease::LeasedResource::Job { job_id }
+                            if self
+                                .state
+                                .task_arrays
+                                .jobs()
+                                .definition(&job_id.namespace, &job_id.name)
+                                .is_some()
+                                || self
+                                    .state
+                                    .task_arrays
+                                    .deployment_owner(&job_id.name, &job_id.namespace)
+                                    .is_some() =>
+                        {
+                            Some(format!("job {job_id}"))
                         }
                         crate::testkit::lease::LeasedResource::ApiToken { name, .. }
                             if self
@@ -3150,19 +2936,13 @@ mod tests {
             let entries: Vec<_> = entries
                 .into_iter()
                 .map(|mut entry| {
-                    if let EntryPayload::Normal(request) = &mut entry.payload {
-                        match request {
-                            RaftRequest::SchedulingDecision(decision) => {
-                                *request = RaftRequest::SchedulingDecisions {
-                                    expected_log_id: previous,
-                                    decisions: vec![decision.clone()],
-                                }
-                            }
-                            RaftRequest::BatchRegister {
-                                expected_log_id, ..
-                            } => *expected_log_id = previous,
-                            _ => {}
-                        }
+                    if let EntryPayload::Normal(RaftRequest::SchedulingDecision(decision)) =
+                        &mut entry.payload
+                    {
+                        entry.payload = EntryPayload::Normal(RaftRequest::SchedulingDecisions {
+                            expected_log_id: previous,
+                            decisions: vec![decision.clone()],
+                        });
                     }
                     previous = Some(entry.log_id);
                     entry
@@ -7097,9 +6877,7 @@ mod tests {
         crate::upgrade::types::ClusterUpgradeState {
             upgrade_id: upgrade_id.to_string(),
             target_version: "v0.2.0".parse().unwrap(),
-            binary_sha256: "abc123".to_string(),
-            embedded_signature: "sig".to_string(),
-            external_signature: None,
+            binaries: Vec::new(),
             parallel: 1,
             direction: crate::upgrade::types::UpgradeDirection::Upgrade,
             phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
@@ -7218,154 +6996,6 @@ mod tests {
 
     // -- Batch/build durable tracking (12b.2) ---------------------------------
 
-    fn batch_record(job: &str, node: &str) -> crate::meat::batch_tracker::BatchRecord {
-        crate::meat::batch_tracker::BatchRecord {
-            jobs: vec![crate::meat::batch_tracker::BatchJobRecord {
-                resources: crate::meat::Resources::default(),
-                name: job.to_string(),
-                execution_name: job.to_string(),
-                spec_digest: "a".repeat(64),
-                namespace: "default".to_string(),
-                node: Some(crate::meat::types::NodeId::new(node)),
-                status: crate::meat::batch_tracker::JobStatus::Pending,
-            }],
-            submitted_at_epoch_secs: 1_000_000,
-        }
-    }
-
-    fn owned_batch_record(
-        execution: &str,
-        namespace: &str,
-    ) -> crate::meat::batch_tracker::BatchRecord {
-        serde_json::from_value(serde_json::json!({
-            "jobs": [{
-                "name": "migration",
-                "execution_name": execution,
-                "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64),
-                "namespace": namespace,
-                "node": "worker",
-                "status": "Pending"
-            }],
-            "submitted_at_epoch_secs": 1_000_000
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn committing_an_app_first_prevents_batch_execution_ownership_from_taking_it() {
-        let mut inner = StateMachineInner::default();
-        let identity = AppId::new("owned-execution", "default");
-        inner.apply_request(&RaftRequest::AppSpec {
-            app_id: identity.clone(),
-            spec: Box::new(default_spec()),
-        });
-        let before = inner.state.batch_state.clone();
-        let response = inner.apply_request(&RaftRequest::BatchRegister {
-            expected_log_id: None,
-            batch: owned_batch_record(&identity.name, &identity.namespace),
-        });
-        assert!(
-            matches!(response, Some(CouncilResponse::Refused { .. })),
-            "{response:?}"
-        );
-        assert_eq!(inner.state.batch_state, before);
-        assert_eq!(inner.state.apps[&identity], default_spec());
-    }
-
-    #[tokio::test]
-    async fn batch_registration_on_the_current_revision_refuses_a_retired_target_atomically() {
-        let mut sm = CouncilStateMachine::new();
-        let retirement = RaftRequest::DecommissionNode {
-            node_id: "retired-worker".into(),
-            retired_by: "operator".into(),
-            reason: "powered off".into(),
-            retired_at_unix_ms: 1,
-            membership_log_id: None,
-        };
-        let response = sm.apply([normal_entry(1, 1, retirement)]).await.unwrap();
-        assert!(
-            matches!(response[0], CouncilResponse::NodeDecommissioned { .. }),
-            "{response:?}"
-        );
-        let before = sm.desired_state().await.batch_state;
-        let mut batch = owned_batch_record("retired-execution", "default");
-        batch.jobs[0].node = Some(NodeId::new("retired-worker"));
-        let response = sm
-            .apply([normal_entry(
-                1,
-                2,
-                RaftRequest::BatchRegister {
-                    expected_log_id: Some(log_id(1, 1)),
-                    batch,
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            matches!(response[0], CouncilResponse::Refused { .. }),
-            "{response:?}"
-        );
-        assert_eq!(sm.desired_state().await.batch_state, before);
-    }
-
-    #[tokio::test]
-    async fn shared_admission_compares_the_previous_log_and_keeps_refused_inventory_unchanged() {
-        let mut sm = CouncilStateMachine::new();
-        let first = owned_batch_record("first-execution", "default");
-        let second = owned_batch_record("second-execution", "default");
-        let responses = sm
-            .apply([
-                normal_entry(
-                    3,
-                    10,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: first,
-                    },
-                ),
-                normal_entry(
-                    3,
-                    11,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: second.clone(),
-                    },
-                ),
-            ])
-            .await
-            .unwrap();
-        assert!(matches!(
-            responses[0],
-            CouncilResponse::BatchRegistered { batch_id: 1 }
-        ));
-        assert!(matches!(responses[1], CouncilResponse::Refused { .. }));
-        let state = sm.desired_state().await;
-        assert_eq!(state.last_applied_log, Some(log_id(3, 11)));
-        assert_eq!(state.batch_state.next_batch_id, 2);
-        assert_eq!(state.batch_state.batches.len(), 1);
-        assert!(
-            state
-                .batch_state
-                .execution_owner("default", "second-execution")
-                .is_none()
-        );
-        let response = sm
-            .apply([normal_entry(
-                3,
-                12,
-                RaftRequest::BatchRegister {
-                    expected_log_id: Some(log_id(3, 11)),
-                    batch: second,
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(
-            response[0],
-            CouncilResponse::BatchRegistered { batch_id: 2 }
-        ));
-    }
-
     #[tokio::test]
     async fn whole_placement_pass_has_one_revision_and_no_partial_invalid_writes() {
         let mut sm = CouncilStateMachine::new();
@@ -7458,184 +7088,13 @@ mod tests {
         assert!(!sm.desired_state().await.scheduling.contains_key(&app_id));
     }
 
-    #[test]
-    fn committing_batch_ownership_first_atomically_refuses_app_and_leased_app_writes() {
-        for leased in [false, true] {
-            let mut inner = StateMachineInner::default();
-            let namespace = if leased { "rbtest-run1" } else { "default" };
-            if leased {
-                inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
-            }
-            let identity = AppId::new("owned-execution", namespace);
-            assert!(matches!(
-                inner.apply_request(&RaftRequest::BatchRegister {
-                    expected_log_id: None,
-                    batch: owned_batch_record(&identity.name, namespace),
-                }),
-                Some(CouncilResponse::BatchRegistered { .. })
-            ));
-            let request = if leased {
-                RaftRequest::TestLeaseAppSpec {
-                    lease_id: "run1".into(),
-                    observed_at_unix_ms: 20,
-                    app_id: identity.clone(),
-                    spec: Box::new(default_spec()),
-                }
-            } else {
-                RaftRequest::AppSpec {
-                    app_id: identity.clone(),
-                    spec: Box::new(default_spec()),
-                }
-            };
-            let response = inner.apply_request(&request);
-            assert!(
-                matches!(response, Some(CouncilResponse::Refused { .. })),
-                "leased={leased}: {response:?}"
-            );
-            assert!(!inner.state.apps.contains_key(&identity));
-            if leased {
-                assert!(inner.state.test_leases["run1"].resources.is_empty());
-            }
-            // Ownership is namespaced: the same name elsewhere remains ordinary.
-            assert!(
-                inner
-                    .apply_request(&RaftRequest::AppSpec {
-                        app_id: AppId::new(&identity.name, "other"),
-                        spec: Box::new(default_spec()),
-                    })
-                    .is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn a_batch_registration_cannot_borrow_another_batchs_execution_identity() {
-        let mut inner = StateMachineInner::default();
-        let request = RaftRequest::BatchRegister {
-            expected_log_id: None,
-            batch: owned_batch_record("owned-execution", "default"),
-        };
-        assert!(matches!(
-            inner.apply_request(&request),
-            Some(CouncilResponse::BatchRegistered { batch_id: 1 })
-        ));
-        let before = inner.state.batch_state.clone();
-        let response = inner.apply_request(&request);
-        assert!(
-            matches!(response, Some(CouncilResponse::Refused { .. })),
-            "{response:?}"
-        );
-        assert_eq!(inner.state.batch_state, before);
-    }
-
-    fn ownership_capacity_record(
-        count: usize,
-        long_labels: bool,
-    ) -> crate::meat::batch_tracker::BatchRecord {
-        let namespace = if long_labels {
-            "n".repeat(63)
-        } else {
-            "default".to_string()
-        };
-        crate::meat::batch_tracker::BatchRecord {
-            jobs: (0..count)
-                .map(|i| {
-                    let short_name = format!("execution-{i:08}");
-                    let execution = if long_labels {
-                        format!("{}-{i:08}", "e".repeat(54))
-                    } else {
-                        short_name.clone()
-                    };
-                    serde_json::from_value(serde_json::json!({
-                        "name": if long_labels { format!("{}-{i:08}", "l".repeat(54)) } else { short_name },
-                        "execution_name": execution,
-                "resources":{"cpu_millicores":0,"memory_bytes":0,"gpus":0}, "spec_digest": "a".repeat(64),
-                        "namespace": namespace,
-                        "node": "worker",
-                        "status": "Pending"
-                    })).unwrap()
-                })
-                .collect(),
-            submitted_at_epoch_secs: 1_000_000,
-        }
-    }
-
-    #[test]
-    fn a_full_execution_ownership_index_refuses_registration_but_keeps_active_transitions() {
-        let mut inner = StateMachineInner::default();
-        // The published admission contract has a 131,072-entry bound independent
-        // of its encoded-byte bound. Short valid labels fit beneath both.
-        let response = inner.apply_request(&RaftRequest::BatchRegister {
-            expected_log_id: None,
-            batch: ownership_capacity_record(131_072, false),
-        });
-        assert!(
-            matches!(
-                response,
-                Some(CouncilResponse::BatchRegistered { batch_id: 1 })
-            ),
-            "{response:?}"
-        );
-        let before = inner.state.batch_state.clone();
-        let response = inner.apply_request(&RaftRequest::BatchRegister {
-            expected_log_id: None,
-            batch: owned_batch_record("overflow-execution", "default"),
-        });
-        assert!(
-            matches!(response, Some(CouncilResponse::Refused { .. })),
-            "{response:?}"
-        );
-        assert_eq!(inner.state.batch_state, before);
-        // Exhaustion must not prevent an already-admitted execution from
-        // publishing the positive terminal result that its watcher needs.
-        assert!(
-            inner
-                .apply_request(&RaftRequest::BatchJobUpdate {
-                    batch_id: 1,
-                    job_name: "execution-00000000".into(),
-                    namespace: "default".into(),
-                    exit_code: Some(0),
-                    status: crate::meat::batch_tracker::JobStatus::Completed,
-                })
-                .is_none()
-        );
-        assert_eq!(
-            inner.state.batch_state.get(1).unwrap().jobs[0].status,
-            crate::meat::batch_tracker::JobStatus::Completed
-        );
-    }
-
-    #[test]
-    fn an_oversized_execution_ownership_index_refuses_the_whole_registration_before_mutation() {
-        let mut inner = StateMachineInner::default();
-        let before = inner.state.batch_state.clone();
-        // Valid maximum-length labels exceed the independent 32 MiB encoded
-        // bound while still obeying the entry bound. No partial ownership or
-        // allocated batch ID may leak from the rejected group.
-        let response = inner.apply_request(&RaftRequest::BatchRegister {
-            expected_log_id: None,
-            batch: ownership_capacity_record(131_072, true),
-        });
-        assert!(
-            matches!(response, Some(CouncilResponse::Refused { .. })),
-            "{response:?}"
-        );
-        assert_eq!(inner.state.batch_state, before);
-        assert!(matches!(
-            inner.apply_request(&RaftRequest::BatchRegister {
-                expected_log_id: None,
-                batch: owned_batch_record("small-execution", "default"),
-            }),
-            Some(CouncilResponse::BatchRegistered { batch_id: 1 })
-        ));
-    }
-
     fn build_record(name: &str) -> crate::bun::build_runner::BuildRecord {
         crate::bun::build_runner::BuildRecord {
             name: name.to_string(),
             runner_node: Some("n1".to_string()),
             state: crate::bun::build_runner::BuildState::Running,
             created_at_epoch_secs: 1_000_000,
+            repository: None,
         }
     }
 
@@ -7656,6 +7115,12 @@ mod tests {
                     namespace: None,
                     exec: Some("/usr/bin/true".into()),
                     script: None,
+                    firewall: None,
+                    egress: None,
+                    max_attempts: None,
+                    task_timeout_secs: None,
+                    overlap: None,
+                    replay_unknown: false,
                 }),
                 spec: crate::meat::task_array::TaskArraySpec {
                     chunk_size: 4,
@@ -7771,8 +7236,8 @@ mod tests {
         use crate::meat::task_array_store::{ManifestCohort, TaskArrayWrite};
         for manifest in [false, true] {
             let mut sm = CouncilStateMachine::new();
-            sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX - u64::from(manifest);
-            let before = sm.desired_state().await.batch_state.next_batch_id;
+            sm.inner.write().await.state.batch_ids.next_batch_id = u64::MAX - u64::from(manifest);
+            let before = sm.desired_state().await.batch_ids.next_batch_id;
             let RaftRequest::TaskArray(array) = task_array_register(1) else {
                 unreachable!()
             };
@@ -7783,6 +7248,7 @@ mod tests {
                 TaskArrayWrite::RegisterManifest {
                     name: "render".into(),
                     namespace: "default".into(),
+                    request_id: "render-1".into(),
                     cohorts: vec![ManifestCohort {
                         name: "small".into(),
                         template: *template,
@@ -7803,7 +7269,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
             let state = sm.desired_state().await;
-            assert_eq!(state.batch_state.next_batch_id, before);
+            assert_eq!(state.batch_ids.next_batch_id, before);
             assert!(state.task_arrays.ids().is_empty());
             assert_eq!(state.task_arrays.manifests().count(), 0);
         }
@@ -7886,6 +7352,7 @@ mod tests {
                             failed_indices: IndexRangeSet::new(),
                             not_run: 0,
                             retried: 0,
+                            retry_causes: Default::default(),
                             duration_counts: [0; 16],
                         },
                     )],
@@ -7931,6 +7398,7 @@ mod tests {
                 tasks: spec,
                 cron: None,
                 replay_unknown: false,
+                hook: false,
             }),
             trigger: Some(RunTrigger::Manual {
                 request_id: request_id.into(),
@@ -7950,7 +7418,7 @@ mod tests {
             responses[0],
             CouncilResponse::TaskArrayRegistered { batch_id: 1 }
         );
-        sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX;
+        sm.inner.write().await.state.batch_ids.next_batch_id = u64::MAX;
         let original = sm.desired_state().await.task_arrays;
         let responses = sm
             .apply(vec![normal_entry(2, 2, common_job_request("original"))])
@@ -7962,13 +7430,13 @@ mod tests {
         );
         let state = sm.desired_state().await;
         assert_eq!(state.task_arrays, original);
-        assert_eq!(state.batch_state.next_batch_id, u64::MAX);
+        assert_eq!(state.batch_ids.next_batch_id, u64::MAX);
     }
 
     #[tokio::test]
     async fn common_run_id_exhaustion_cannot_publish_a_definition_without_its_run() {
         let mut sm = CouncilStateMachine::new();
-        sm.inner.write().await.state.batch_state.next_batch_id = u64::MAX;
+        sm.inner.write().await.state.batch_ids.next_batch_id = u64::MAX;
         let original = sm.desired_state().await.task_arrays;
         let responses = sm
             .apply(vec![normal_entry(1, 1, common_job_request("fresh"))])
@@ -7984,44 +7452,29 @@ mod tests {
                 .definition("default", "render")
                 .is_none()
         );
-        assert_eq!(state.batch_state.next_batch_id, u64::MAX);
+        assert_eq!(state.batch_ids.next_batch_id, u64::MAX);
     }
 
     #[tokio::test]
-    async fn task_arrays_share_the_batch_id_counter() {
+    async fn task_arrays_take_consecutive_ids_from_the_shared_counter() {
         let mut sm = CouncilStateMachine::new();
         let responses = sm
             .apply_fixture(vec![
-                normal_entry(
-                    1,
-                    1,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: batch_record("j1", "n1"),
-                    },
-                ),
-                normal_entry(1, 2, task_array_register(10)),
-                normal_entry(
-                    1,
-                    3,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: batch_record("j2", "n1"),
-                    },
-                ),
+                normal_entry(1, 1, task_array_register(10)),
+                normal_entry(1, 2, task_array_register(20)),
             ])
             .await
             .unwrap();
         assert_eq!(
-            responses[1],
-            CouncilResponse::TaskArrayRegistered { batch_id: 2 }
-        );
-        assert_eq!(
-            responses[2],
-            CouncilResponse::BatchRegistered { batch_id: 3 }
+            responses,
+            vec![
+                CouncilResponse::TaskArrayRegistered { batch_id: 1 },
+                CouncilResponse::TaskArrayRegistered { batch_id: 2 },
+            ]
         );
         let state = sm.desired_state().await;
-        assert_eq!(state.task_arrays.get(2).unwrap().state.spec.count, 10);
+        assert_eq!(state.task_arrays.get(2).unwrap().state.spec.count, 20);
+        assert_eq!(state.batch_ids.next_batch_id, 3);
     }
 
     #[tokio::test]
@@ -8047,7 +7500,7 @@ mod tests {
         assert!(matches!(responses[1], CouncilResponse::Refused { .. }));
         let state = sm.desired_state().await;
         assert!(state.task_arrays.ids().is_empty());
-        assert_eq!(state.batch_state.next_batch_id, 1, "no id was burnt");
+        assert_eq!(state.batch_ids.next_batch_id, 1, "no id was burnt");
     }
 
     #[tokio::test]
@@ -8083,40 +7536,170 @@ mod tests {
         let state = restored.desired_state().await;
         let array = state.task_arrays.get(1).unwrap();
         assert_eq!(array.state.summary().held, 8);
-        assert_eq!(state.batch_state.next_batch_id, 2);
+        assert_eq!(state.batch_ids.next_batch_id, 2);
     }
 
     #[tokio::test]
-    async fn batch_register_returns_the_allocated_id() {
+    async fn a_tick_entry_reports_its_refused_arrays() {
+        use crate::meat::index_set::IndexRangeSet;
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let grant = |batch_id| TaskArrayWrite::Sync {
+            now_epoch_secs: 0,
+            batch_id,
+            results: Vec::new(),
+            grants: vec![(
+                crate::meat::types::NodeId::new("n1"),
+                IndexRangeSet::from_range(0..=0),
+            )],
+        };
         let mut sm = CouncilStateMachine::new();
         let responses = sm
             .apply_fixture(vec![
-                normal_entry(
-                    1,
-                    1,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: batch_record("j1", "n1"),
-                    },
-                ),
+                normal_entry(1, 1, task_array_register(10)),
                 normal_entry(
                     1,
                     2,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: batch_record("j2", "n1"),
-                    },
+                    RaftRequest::TaskArray(Box::new(TaskArrayWrite::Tick {
+                        writes: vec![grant(1), grant(9)],
+                    })),
                 ),
             ])
             .await
             .unwrap();
-        assert_eq!(
-            responses[0],
-            CouncilResponse::BatchRegistered { batch_id: 1 }
+        let CouncilResponse::TaskArrayTicked { refused } = &responses[1] else {
+            panic!("expected a tick, got {:?}", responses[1]);
+        };
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, 9);
+        let state = sm.desired_state().await;
+        assert_eq!(state.task_arrays.get(1).unwrap().state.summary().held, 4);
+    }
+
+    /// A job lease in Raft and a job in its namespace, as a leased apply
+    /// writes them: the lease, its ownership of the job, then the deployment.
+    fn leased_job_entries() -> (String, String, Vec<RaftRequest>) {
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let lease = crate::testkit::lease::TestLease::new_scoped(
+            format!("node-jobs-{suffix}"),
+            "token:ci".into(),
+            "ci".into(),
+            format!("rbtest-node-{suffix}"),
+            1_000,
+            u64::MAX / 2,
+            crate::testkit::lease::LeaseScope::NodeJobs,
+        )
+        .unwrap();
+        let namespace = lease.namespace.clone();
+        let lease_id = lease.lease_id.clone();
+        let config = crate::config::Config::parse(&format!(
+            "[job.migrate]\nimage = 'migration:v1'\nnamespace = '{namespace}'\ncpu = '4'\n"
+        ))
+        .unwrap();
+        let entries = vec![
+            RaftRequest::TestLeaseCreate(lease),
+            RaftRequest::TestLeaseJobs {
+                lease_id: lease_id.clone(),
+                observed_at_unix_ms: 5_000,
+                jobs: vec![crate::meat::AppId::new("migrate", &namespace)],
+            },
+            RaftRequest::TaskArray(Box::new(TaskArrayWrite::DeployBegin {
+                operation_id: "c".repeat(32),
+                config: Box::new(config),
+                now_epoch_secs: 10,
+            })),
+        ];
+        (lease_id, namespace, entries)
+    }
+
+    /// Leased applies now take the common job lifecycle (`JobApplyCommit`),
+    /// so there is no claim tied to the leadership term that admitted them.
+    /// A new leader reads the same lease and deployment, and nothing holds
+    /// node capacity for a job no node has been granted yet.
+    #[tokio::test]
+    async fn leased_job_apply_survives_leader_change_without_reserving_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leased.redb");
+        let (lease_id, namespace, entries) = leased_job_entries();
+        {
+            let db = std::sync::Arc::new(Database::create(&path).unwrap());
+            let mut sm = CouncilStateMachine::with_store(db).unwrap();
+            let responses = sm
+                .apply_fixture(
+                    entries
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, request)| normal_entry(1, index as u64 + 1, request))
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                responses
+                    .iter()
+                    .all(|response| !matches!(response, CouncilResponse::Refused { .. })),
+                "{responses:?}"
+            );
+            let mut builder = sm.get_snapshot_builder().await;
+            builder.build_snapshot().await.unwrap();
+        }
+
+        // A later term reads the snapshot, as a new leader would.
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let sm = CouncilStateMachine::with_store(db).unwrap();
+        let desired = sm.desired_state().await;
+        assert!(desired.test_leases[&lease_id].resources.contains(
+            &crate::testkit::lease::LeasedResource::Job {
+                job_id: crate::meat::AppId::new("migrate", &namespace),
+            }
+        ));
+        assert!(
+            desired
+                .task_arrays
+                .deployment_owner("migrate", &namespace)
+                .is_some()
         );
+
+        let mut cache = crate::meat::ClusterStateCache::new();
+        cache.set_node(crate::meat::SchedulerNodeState {
+            node_id: crate::meat::NodeId::new("worker"),
+            allocatable: crate::meat::Resources::new(8000, 8 << 30, 0),
+            allocated: crate::meat::Resources::default(),
+            labels: Default::default(),
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: Default::default(),
+            uptime_secs: 0,
+            cached_images: Default::default(),
+        });
+        crate::meat::admission::reserve_commitments(&mut cache, &desired);
         assert_eq!(
-            responses[1],
-            CouncilResponse::BatchRegistered { batch_id: 2 }
+            cache
+                .get_node(&crate::meat::NodeId::new("worker"))
+                .unwrap()
+                .allocated,
+            crate::meat::Resources::default(),
+            "an unscheduled leased job reserves nothing"
+        );
+    }
+
+    /// A job lands in a test lease namespace only when an active job lease
+    /// owns it, so the lease's cleanup can always find and stop it.
+    #[tokio::test]
+    async fn a_job_in_a_lease_namespace_needs_the_lease_to_own_it() {
+        let (_, _, entries) = leased_job_entries();
+        let mut sm = CouncilStateMachine::new();
+        let without_ownership: Vec<_> = entries
+            .into_iter()
+            .filter(|request| !matches!(request, RaftRequest::TestLeaseJobs { .. }))
+            .enumerate()
+            .map(|(index, request)| normal_entry(1, index as u64 + 1, request))
+            .collect();
+        let responses = sm.apply_fixture(without_ownership).await.unwrap();
+        assert!(matches!(responses[1], CouncilResponse::Refused { .. }));
+        assert_eq!(
+            sm.desired_state().await.task_arrays.deployments().count(),
+            0
         );
     }
 
@@ -8130,14 +7713,7 @@ mod tests {
             let db = std::sync::Arc::new(Database::create(&path).unwrap());
             let mut sm = CouncilStateMachine::with_store(db).unwrap();
             sm.apply_fixture(vec![
-                normal_entry(
-                    1,
-                    1,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: batch_record("j1", "n1"),
-                    },
-                ),
+                normal_entry(1, 1, task_array_register(10)),
                 normal_entry(
                     1,
                     2,
@@ -8156,14 +7732,7 @@ mod tests {
         let mut sm = CouncilStateMachine::with_store(db).unwrap();
         let responses = sm
             .apply_fixture(vec![
-                normal_entry(
-                    2,
-                    3,
-                    RaftRequest::BatchRegister {
-                        expected_log_id: None,
-                        batch: batch_record("j2", "n1"),
-                    },
-                ),
+                normal_entry(2, 3, task_array_register(10)),
                 normal_entry(
                     2,
                     4,
@@ -8176,7 +7745,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             responses[0],
-            CouncilResponse::BatchRegistered { batch_id: 2 }
+            CouncilResponse::TaskArrayRegistered { batch_id: 2 }
         );
         assert_eq!(
             responses[1],
@@ -8185,74 +7754,8 @@ mod tests {
 
         // The pre-restart records reloaded too.
         let state = sm.desired_state().await;
-        assert!(state.batch_state.get(1).is_some());
+        assert!(state.task_arrays.get(1).is_some());
         assert!(state.build_state.get(1).is_some());
-    }
-
-    #[tokio::test]
-    async fn batch_job_update_validates_transitions() {
-        let mut sm = CouncilStateMachine::new();
-        sm.apply_fixture(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::BatchRegister {
-                expected_log_id: None,
-                batch: batch_record("j1", "n1"),
-            },
-        )])
-        .await
-        .unwrap();
-
-        // A legal completion applies…
-        let ok = sm
-            .apply_fixture(vec![normal_entry(
-                1,
-                2,
-                RaftRequest::BatchJobUpdate {
-                    batch_id: 1,
-                    job_name: "j1".to_string(),
-                    namespace: "default".into(),
-                    exit_code: Some(0),
-                    status: crate::meat::batch_tracker::JobStatus::Completed,
-                },
-            )])
-            .await
-            .unwrap();
-        assert_eq!(ok[0], CouncilResponse::Applied { log_index: 2 });
-
-        // …a conflicting terminal report is refused…
-        let refused = sm
-            .apply_fixture(vec![normal_entry(
-                1,
-                3,
-                RaftRequest::BatchJobUpdate {
-                    batch_id: 1,
-                    job_name: "j1".to_string(),
-                    namespace: "default".into(),
-                    exit_code: Some(1),
-                    status: crate::meat::batch_tracker::JobStatus::Failed,
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
-
-        // …and so is a report for an unknown batch.
-        let unknown = sm
-            .apply_fixture(vec![normal_entry(
-                1,
-                4,
-                RaftRequest::BatchJobUpdate {
-                    batch_id: 99,
-                    job_name: "j1".to_string(),
-                    namespace: "default".into(),
-                    exit_code: Some(0),
-                    status: crate::meat::batch_tracker::JobStatus::Completed,
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(unknown[0], CouncilResponse::Refused { .. }));
     }
 
     #[tokio::test]
@@ -8829,8 +8332,10 @@ mod tests {
         .unwrap()
     }
 
+    /// Job leases live in Raft like application leases, so every node and
+    /// a later leader can check them. They still own only jobs.
     #[tokio::test]
-    async fn node_job_leases_never_enter_replicated_state() {
+    async fn job_leases_enter_replicated_state_and_own_only_jobs() {
         let mut sm = CouncilStateMachine::new();
         let suffix = "0123456789abcdef0123456789abcdef";
         let lease = crate::testkit::lease::TestLease::new_scoped(
@@ -8843,16 +8348,32 @@ mod tests {
             crate::testkit::lease::LeaseScope::NodeJobs,
         )
         .unwrap();
+        let lease_id = lease.lease_id.clone();
+        let namespace = lease.namespace.clone();
         let responses = sm
-            .apply_fixture(vec![normal_entry(
-                1,
-                1,
-                RaftRequest::TestLeaseCreate(lease),
-            )])
+            .apply_fixture(vec![
+                normal_entry(1, 1, RaftRequest::TestLeaseCreate(lease)),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::TestLeaseAppSpec {
+                        lease_id: lease_id.clone(),
+                        observed_at_unix_ms: 20,
+                        app_id: AppId::new("web", &namespace),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ])
             .await
             .unwrap();
-        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
-        assert!(sm.inner.read().await.state.test_leases.is_empty());
+        assert!(!matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(
+            matches!(responses[1], CouncilResponse::Refused { .. }),
+            "a job lease cannot own an app"
+        );
+        let state = sm.desired_state().await;
+        assert!(state.test_leases[&lease_id].resources.is_empty());
+        assert!(state.apps.is_empty());
     }
 
     #[tokio::test]
@@ -9866,574 +9387,6 @@ mod tests {
     // Append inside src/council/state_machine.rs's existing tests module.
     // Prepared OFFTREE only. These snippets have NOT been compiled or executed.
 
-    fn claim_review_manifest() -> crate::config::Config {
-        crate::config::Config::parse(
-        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n",
-    )
-    .unwrap()
-    }
-
-    #[tokio::test]
-    async fn prerequisite_commit_rechecks_deleted_namespace_without_partial_publication() {
-        let operation_id = "11111111111111111111111111111111".to_owned();
-        let mut sm = CouncilStateMachine::new();
-        let external = crate::config::Config::parse("[namespace.external]\n")
-            .unwrap()
-            .namespace
-            .remove("external")
-            .unwrap();
-        sm.apply(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::NamespaceSpec {
-                name: "external".into(),
-                spec: Box::new(external),
-            },
-        )])
-        .await
-        .unwrap();
-        let config = crate::config::Config::parse(
-        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n[namespace.staged]\n[permission.staged]\nactions=['deploy']\nnamespaces=['external']\n",
-    )
-    .unwrap();
-        let begun = sm
-            .apply(vec![normal_entry(
-                1,
-                2,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: operation_id.clone(),
-                    term: 1,
-                    config: Box::new(config.clone()),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(!matches!(&begun[0], CouncilResponse::Refused { .. }));
-        sm.apply(vec![normal_entry(
-            1,
-            3,
-            RaftRequest::NamespaceDelete {
-                name: "external".into(),
-            },
-        )])
-        .await
-        .unwrap();
-        let before = sm.desired_state().await;
-        let committed = sm
-            .apply(vec![normal_entry(
-                1,
-                4,
-                RaftRequest::PrerequisiteCommit {
-                    operation_id: operation_id.clone(),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(&committed[0], CouncilResponse::Refused { .. }));
-        let after = sm.desired_state().await;
-        assert_eq!(after.namespaces, before.namespaces);
-        assert_eq!(after.permissions, before.permissions);
-        assert_eq!(after.apps, before.apps);
-        assert_eq!(after.prerequisite_claims[&operation_id].config, config);
-        assert!(!after.namespaces.contains_key("staged"));
-        assert!(!after.permissions.contains_key("staged"));
-    }
-
-    async fn claim_review_active_app() -> (CouncilStateMachine, String, AppId) {
-        let operation_id = "22222222222222222222222222222222".to_owned();
-        let app_id = AppId::new("web", "default");
-        let mut sm = CouncilStateMachine::new();
-        sm.apply(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::AppSpec {
-                app_id: app_id.clone(),
-                spec: Box::new(default_spec()),
-            },
-        )])
-        .await
-        .unwrap();
-        let begun = sm
-            .apply(vec![normal_entry(
-                1,
-                2,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: operation_id.clone(),
-                    term: 1,
-                    config: Box::new(claim_review_manifest()),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(!matches!(&begun[0], CouncilResponse::Refused { .. }));
-        (sm, operation_id, app_id)
-    }
-
-    #[tokio::test]
-    async fn prerequisite_claim_refuses_a_stop_that_its_later_commit_would_undo() {
-        let (mut sm, operation_id, app_id) = claim_review_active_app().await;
-        let before = sm.desired_state().await;
-        let stopped = sm
-            .apply(vec![normal_entry(
-                1,
-                3,
-                RaftRequest::AppStop {
-                    app_id: app_id.clone(),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(&stopped[0], CouncilResponse::Refused { .. }));
-        let after = sm.desired_state().await;
-        assert_eq!(after.apps, before.apps);
-        assert_eq!(after.stopped_apps, before.stopped_apps);
-        assert!(after.prerequisite_claims.contains_key(&operation_id));
-    }
-
-    #[tokio::test]
-    async fn prerequisite_claim_refuses_a_delete_that_its_later_commit_would_restore() {
-        let (mut sm, operation_id, app_id) = claim_review_active_app().await;
-        let before = sm.desired_state().await;
-        let deleted = sm
-            .apply(vec![normal_entry(
-                1,
-                3,
-                RaftRequest::AppDelete {
-                    app_id: app_id.clone(),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(&deleted[0], CouncilResponse::Refused { .. }));
-        let after = sm.desired_state().await;
-        assert_eq!(after.apps, before.apps);
-        assert_eq!(after.stopped_apps, before.stopped_apps);
-        assert!(after.prerequisite_claims.contains_key(&operation_id));
-    }
-
-    #[tokio::test]
-    async fn prerequisite_snapshot_and_restart_retain_the_original_claim_and_term_fence() {
-        let operation_id = "33333333333333333333333333333333".to_owned();
-        let config = claim_review_manifest();
-        let root = tempfile::tempdir().unwrap();
-        let db = Arc::new(Database::create(root.path().join("claims.redb")).unwrap());
-        let mut sm = CouncilStateMachine::with_store(db.clone()).unwrap();
-        let begun = sm
-            .apply(vec![normal_entry(
-                1,
-                1,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: operation_id.clone(),
-                    term: 1,
-                    config: Box::new(config.clone()),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(!matches!(&begun[0], CouncilResponse::Refused { .. }));
-        let snapshot = sm
-            .get_snapshot_builder()
-            .await
-            .build_snapshot()
-            .await
-            .unwrap();
-        let mut restored = CouncilStateMachine::new();
-        restored
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
-            .await
-            .unwrap();
-        let restarted = CouncilStateMachine::with_store(db).unwrap();
-        for state in [
-            restored.desired_state().await,
-            restarted.desired_state().await,
-        ] {
-            let held = &state.prerequisite_claims[&operation_id];
-            assert_eq!(held.term, 1);
-            assert_eq!(held.config, config);
-        }
-        for (index, request) in [
-            RaftRequest::PrerequisiteCommit {
-                operation_id: operation_id.clone(),
-            },
-            RaftRequest::PrerequisiteFailed {
-                operation_id: operation_id.clone(),
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let response = restored
-                .apply(vec![normal_entry(2, index as u64 + 2, request)])
-                .await
-                .unwrap();
-            assert!(matches!(&response[0], CouncilResponse::Refused { .. }));
-            assert!(
-                restored
-                    .desired_state()
-                    .await
-                    .prerequisite_claims
-                    .contains_key(&operation_id)
-            );
-        }
-    }
-
-    #[test]
-    fn prerequisite_decode_refuses_missing_or_malformed_ownership_inventory() {
-        let encoded = serde_json::to_value(DesiredState::default()).unwrap();
-        for malformed in [
-            None,
-            Some(serde_json::Value::Null),
-            Some(serde_json::json!([])),
-            Some(serde_json::json!({"44444444444444444444444444444444": {"config": {}}})),
-            Some(serde_json::json!({"44444444444444444444444444444444": {"term": 1}})),
-        ] {
-            let mut document = encoded.clone();
-            match malformed {
-                Some(inventory) => document["prerequisite_claims"] = inventory,
-                None => {
-                    document
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("prerequisite_claims");
-                }
-            }
-            assert!(
-                serde_json::from_value::<DesiredState>(document).is_err(),
-                "missing or malformed durable ownership must never become an empty fence"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn ordinary_job_intent_blocks_a_same_namespace_prerequisite_but_not_another_namespace() {
-        let mut sm = CouncilStateMachine::new();
-        let ordinary =
-            crate::config::Config::parse("[job.migrate]\nimage='migration:v1'\n").unwrap();
-        let first = sm
-            .apply(vec![normal_entry(
-                1,
-                1,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: "66666666666666666666666666666666".into(),
-                    term: 1,
-                    config: Box::new(ordinary),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            !matches!(&first[0], CouncilResponse::Refused { .. }),
-            "ordinary jobs need authoritative intent before asynchronous dispatch"
-        );
-        let collision = sm
-            .apply(vec![normal_entry(
-                1,
-                2,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: "77777777777777777777777777777777".into(),
-                    term: 1,
-                    config: Box::new(claim_review_manifest()),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(&collision[0], CouncilResponse::Refused { .. }));
-        let separate = crate::config::Config::parse(
-        "[namespace.other]\n[app.web]\nimage='web:v2'\nnamespace='other'\n[job.migrate]\nimage='migration:v1'\nnamespace='other'\nrun_before=['app.web']\n",
-    )
-    .unwrap();
-        let allowed = sm
-            .apply(vec![normal_entry(
-                1,
-                3,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: "88888888888888888888888888888888".into(),
-                    term: 1,
-                    config: Box::new(separate),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(!matches!(&allowed[0], CouncilResponse::Refused { .. }));
-        let state = sm.desired_state().await;
-        assert_eq!(state.prerequisite_claims.len(), 2);
-        assert!(
-            !state
-                .prerequisite_claims
-                .contains_key("77777777777777777777777777777777")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_recovered_prerequisite_cannot_complete_or_release_when_the_term_number_repeats() {
-        let (sm, operation_id, _) = claim_review_active_app().await;
-        let backup = sm.desired_state().await;
-        let old_epoch = backup.recovery_epoch;
-        assert_eq!(backup.prerequisite_claims[&operation_id].term, 1);
-        for request in [
-            RaftRequest::PrerequisiteCommit {
-                operation_id: operation_id.clone(),
-            },
-            RaftRequest::PrerequisiteFailed {
-                operation_id: operation_id.clone(),
-            },
-        ] {
-            // Each branch gets a separate recovery: a bad successful Commit must
-            // not hide the independent Failed-release defect by removing the claim.
-            let mut recovered = CouncilStateMachine::from_recovered_state(backup.clone());
-            assert!(recovered.desired_state().await.recovery_epoch > old_epoch);
-            let response = recovered
-                .apply(vec![normal_entry(1, 1, request)])
-                .await
-                .unwrap();
-            assert!(
-                matches!(&response[0], CouncilResponse::Refused { .. }),
-                "a matching term number cannot reuse ownership from the dead cluster epoch"
-            );
-            let after = recovered.desired_state().await;
-            assert_eq!(after.apps, backup.apps);
-            assert_eq!(
-                after.prerequisite_claims[&operation_id].config,
-                claim_review_manifest()
-            );
-        }
-    }
-
-    #[test]
-    fn prerequisite_decode_refuses_semantically_invalid_or_unbounded_claims() {
-        let mut state = DesiredState::default();
-        state.prerequisite_claims.insert(
-            "66666666666666666666666666666666".into(),
-            super::super::prerequisites::PrerequisiteClaim {
-                term: 1,
-                recovery_epoch: 0,
-                apps_committed: false,
-                config: claim_review_manifest(),
-            },
-        );
-        let valid = serde_json::to_value(&state).unwrap();
-        let claim = valid["prerequisite_claims"]["66666666666666666666666666666666"].clone();
-        let mut malformed = Vec::new();
-        malformed.push(serde_json::json!({"invalid-operation": claim.clone()}));
-        let mut empty = claim.clone();
-        empty["config"] = serde_json::json!({});
-        malformed.push(serde_json::json!({"66666666666666666666666666666666": empty}));
-        let mut too_many = serde_json::Map::new();
-        for i in 0..65 {
-            too_many.insert(format!("{i:032x}"), claim.clone());
-        }
-        malformed.push(serde_json::Value::Object(too_many));
-        let mut too_large = claim;
-        too_large["config"]["job"]["migrate"]["env"] = serde_json::json!({"PAYLOAD": serde_json::to_value(crate::config::types::EnvValue::Plain("x".repeat(8*1024*1024))).unwrap()});
-        malformed.push(serde_json::json!({"66666666666666666666666666666666": too_large}));
-        for inventory in malformed {
-            let mut document = valid.clone();
-            document["prerequisite_claims"] = inventory;
-            assert!(
-                serde_json::from_value::<DesiredState>(document).is_err(),
-                "malformed ownership must refuse recovery"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn prerequisite_commit_releases_apps_and_migrations_but_retains_ordinary_job_names() {
-        let mut sm = CouncilStateMachine::new();
-        let operation_id = "99999999999999999999999999999999".to_owned();
-        let config = crate::config::Config::parse(
-        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n[job.notify]\nimage='notify:v1'\n",
-    )
-    .unwrap();
-        let begun = sm
-            .apply(vec![normal_entry(
-                1,
-                1,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: operation_id.clone(),
-                    term: 1,
-                    config: Box::new(config),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(!matches!(&begun[0], CouncilResponse::Refused { .. }));
-        let completed = sm
-            .apply(vec![normal_entry(
-                1,
-                2,
-                RaftRequest::PrerequisiteCommit {
-                    operation_id: operation_id.clone(),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(!matches!(&completed[0], CouncilResponse::Refused { .. }));
-        let state = sm.desired_state().await;
-        let held = state
-            .prerequisite_claims
-            .get(&operation_id)
-            .expect("ordinary dispatch must retain the claim after desired-state commit");
-        assert_eq!(serde_json::to_value(held).unwrap()["apps_committed"], true);
-        assert!(!held.blocks("web", "default"));
-        assert!(!held.blocks("migrate", "default"));
-        assert!(held.blocks("notify", "default"));
-        assert!(!held.blocks("notify", "another"));
-
-        for (index, request) in [
-            RaftRequest::AppStop {
-                app_id: AppId::new("web", "default"),
-            },
-            RaftRequest::AppDelete {
-                app_id: AppId::new("web", "default"),
-            },
-            RaftRequest::AppSpec {
-                app_id: AppId::new("web", "default"),
-                spec: Box::new(default_spec()),
-            },
-            // A completed migration no longer owns its old runtime identity.
-            RaftRequest::AppSpec {
-                app_id: AppId::new("migrate", "default"),
-                spec: Box::new(default_spec()),
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let response = sm
-                .apply(vec![normal_entry(1, index as u64 + 3, request)])
-                .await
-                .unwrap();
-            assert!(!matches!(&response[0], CouncilResponse::Refused { .. }));
-        }
-        let collision = sm
-            .apply(vec![normal_entry(
-                1,
-                7,
-                RaftRequest::AppSpec {
-                    app_id: AppId::new("notify", "default"),
-                    spec: Box::new(default_spec()),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(&collision[0], CouncilResponse::Refused { .. }));
-        let second_commit = sm
-            .apply(vec![normal_entry(
-                1,
-                8,
-                RaftRequest::PrerequisiteCommit {
-                    operation_id: operation_id.clone(),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(&second_commit[0], CouncilResponse::Refused { .. }));
-        let failed_release = sm
-            .apply(vec![normal_entry(
-                1,
-                9,
-                RaftRequest::PrerequisiteFailed {
-                    operation_id: operation_id.clone(),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(matches!(
-            &failed_release[0],
-            CouncilResponse::Refused { .. }
-        ));
-        assert!(
-            sm.desired_state()
-                .await
-                .prerequisite_claims
-                .contains_key(&operation_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn prerequisite_decode_refuses_a_duplicate_operation_key_in_the_snapshot_json() {
-        let (sm, operation_id, _) = claim_review_active_app().await;
-        let state = sm.desired_state().await;
-        let claim = serde_json::to_string(&state.prerequisite_claims[&operation_id]).unwrap();
-        let inventory = format!("{{\"{operation_id}\":{claim}}}");
-        let repeated = format!("{{\"{operation_id}\":{claim},\"{operation_id}\":{claim}}}");
-        let document = serde_json::to_string(&state).unwrap();
-        let needle = format!("\"prerequisite_claims\":{inventory}");
-        assert_eq!(document.matches(&needle).count(), 1);
-        let damaged = document.replacen(&needle, &format!("\"prerequisite_claims\":{repeated}"), 1);
-        assert!(
-            serde_json::from_str::<DesiredState>(&damaged).is_err(),
-            "duplicate durable operation keys must not silently replace prior ownership"
-        );
-    }
-    #[tokio::test]
-    async fn prerequisite_decode_refuses_distinct_operations_owning_the_same_active_identity() {
-        let (sm, operation_id, _) = claim_review_active_app().await;
-        let state = sm.desired_state().await;
-        let mut value = serde_json::to_value(&state).unwrap();
-        let claim = value["prerequisite_claims"][&operation_id].clone();
-        value["prerequisite_claims"]["ffffffffffffffffffffffffffffffff"] = claim;
-        assert!(
-            serde_json::from_value::<DesiredState>(value).is_err(),
-            "distinct durable operations must not own the same active namespaced identity"
-        );
-    }
-    async fn assert_oversized_claim_refuses_before_staging(config: crate::config::Config) {
-        let mut sm = CouncilStateMachine::new();
-        PREREQUISITE_NAMESPACE_VISITS.with(|visits| visits.set(0));
-        let result = sm
-            .apply(vec![normal_entry(
-                1,
-                1,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                    term: 1,
-                    config: Box::new(config),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            matches!(&result[0], CouncilResponse::Refused { .. }),
-            "{result:?}"
-        );
-        let state = sm.desired_state().await;
-        assert!(state.prerequisite_claims.is_empty());
-        assert!(state.namespaces.is_empty());
-        let visits = PREREQUISITE_NAMESPACE_VISITS.with(|visits| visits.replace(0));
-        assert_eq!(
-            visits, 0,
-            "oversized manifest performed desired-state staging before bounded admission"
-        );
-    }
-
-    #[tokio::test]
-    async fn prerequisite_resource_bound_refuses_before_any_staged_desired_write() {
-        let mut config = claim_review_manifest();
-        for i in 0..super::super::prerequisites::MAX_TARGETS {
-            config.namespace.insert(
-                format!("bounded-{i}"),
-                toml::from_str::<crate::config::NamespaceSpec>("").unwrap(),
-            );
-        }
-        assert_oversized_claim_refuses_before_staging(config).await;
-    }
-
-    #[tokio::test]
-    async fn prerequisite_encoded_size_bound_refuses_before_any_staged_desired_write() {
-        let mut config = claim_review_manifest();
-        config.namespace.insert(
-            "bounded".into(),
-            toml::from_str::<crate::config::NamespaceSpec>("").unwrap(),
-        );
-        config.job.get_mut("migrate").unwrap().env.insert(
-            "PAYLOAD".into(),
-            crate::config::types::EnvValue::Plain(
-                "x".repeat(super::super::prerequisites::MAX_CLAIM_BYTES),
-            ),
-        );
-        assert_oversized_claim_refuses_before_staging(config).await;
-    }
     #[tokio::test]
     async fn a_stale_sync_completion_cannot_consume_a_newer_admitted_webhook() {
         let mut machine = CouncilStateMachine::new();
@@ -10546,478 +9499,5 @@ mod tests {
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(inner.state.gitops_sync_state.unwrap(), before);
-    }
-}
-
-// Append as a cfg(test) sibling module to src/council/state_machine.rs AFTER #543 integration.
-// Uses the actual RaftStateMachine apply path; no new production helper is needed to compile.
-#[cfg(test)]
-mod audit_held_job_admission {
-    use super::*;
-    use crate::meat::batch_tracker::{BatchJobRecord, BatchRecord, JobStatus};
-    use crate::meat::{NodeId, Resources};
-
-    fn entry(term: u64, index: u64, request: RaftRequest) -> openraft::Entry<TypeConfig> {
-        openraft::Entry {
-            log_id: LogId::new(openraft::CommittedLeaderId::new(term, 0), index),
-            payload: EntryPayload::Normal(request),
-        }
-    }
-    fn manifest() -> crate::config::Config {
-        crate::config::Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nimage='migration:v1'\ncpu='5'\nrun_before=['app.web']\n[job.notify]\nimage='notify:v1'\ncpu='3'\n").unwrap()
-    }
-    fn empty_report(node: &str) -> crate::reporting::types::StateReport {
-        crate::reporting::types::StateReport {
-            node_id: NodeId::new(node),
-            timestamp: std::time::SystemTime::UNIX_EPOCH,
-            running_apps: vec![],
-            cached_specs: vec![],
-            event_log: vec![],
-            has_buildah: false,
-            resource_usage: Default::default(),
-        }
-    }
-    fn footprint(state: &DesiredState, node: &str) -> u64 {
-        crate::meat::admission::unreported_commitments(
-            state,
-            &NodeId::new(node),
-            &empty_report(node),
-        )
-        .cpu_millicores
-    }
-    async fn begin(sm: &mut CouncilStateMachine, index: u64) -> String {
-        let id = "1234567890abcdef1234567890abcdef".to_owned();
-        let result = sm
-            .apply([entry(
-                1,
-                index,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: id.clone(),
-                    term: 1,
-                    config: Box::new(manifest()),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            !matches!(result[0], CouncilResponse::Refused { .. }),
-            "{result:?}"
-        );
-        id
-    }
-    fn record(logical: &str, execution: &str, namespace: &str, time: u64) -> BatchRecord {
-        BatchRecord {
-            submitted_at_epoch_secs: time,
-            jobs: vec![BatchJobRecord {
-                name: logical.into(),
-                execution_name: execution.into(),
-                namespace: namespace.into(),
-                spec_digest: "a".repeat(64),
-                resources: Resources::default(),
-                node: Some(NodeId::new("remote")),
-                status: JobStatus::Pending,
-            }],
-        }
-    }
-    async fn register(
-        sm: &mut CouncilStateMachine,
-        index: u64,
-        batch: BatchRecord,
-    ) -> CouncilResponse {
-        let previous = sm.desired_state().await.last_applied_log;
-        sm.apply([entry(
-            1,
-            index,
-            RaftRequest::BatchRegister {
-                expected_log_id: previous,
-                batch,
-            },
-        )])
-        .await
-        .unwrap()
-        .remove(0)
-    }
-
-    #[tokio::test]
-    async fn held_job_capacity_tracks_real_begin_commit_and_positive_settlement() {
-        let mut sm = CouncilStateMachine::new();
-        let id = begin(&mut sm, 1).await;
-        let pending = sm.desired_state().await;
-        for node in ["a", "b", "unreported-third"] {
-            assert_eq!(
-                footprint(&pending, node),
-                8000,
-                "precommit footprint on {node}"
-            );
-        }
-        let result = sm
-            .apply([entry(
-                1,
-                2,
-                RaftRequest::PrerequisiteCommit {
-                    operation_id: id.clone(),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            !matches!(result[0], CouncilResponse::Refused { .. }),
-            "{result:?}"
-        );
-        let committed = sm.desired_state().await;
-        assert!(committed.prerequisite_claims[&id].apps_committed);
-        for node in ["a", "b"] {
-            assert_eq!(footprint(&committed, node), 3000);
-        }
-        let result = sm
-            .apply([entry(
-                1,
-                3,
-                RaftRequest::JobApplyComplete { operation_id: id },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            !matches!(result[0], CouncilResponse::Refused { .. }),
-            "{result:?}"
-        );
-        assert_eq!(footprint(&sm.desired_state().await, "a"), 0);
-    }
-
-    #[tokio::test]
-    async fn held_job_capacity_survives_snapshot_and_handover_without_a_guessed_release() {
-        for commit_first in [false, true] {
-            let mut sm = CouncilStateMachine::new();
-            let id = begin(&mut sm, 1).await;
-            if commit_first {
-                let result = sm
-                    .apply([entry(
-                        1,
-                        2,
-                        RaftRequest::PrerequisiteCommit {
-                            operation_id: id.clone(),
-                        },
-                    )])
-                    .await
-                    .unwrap();
-                assert!(!matches!(result[0], CouncilResponse::Refused { .. }));
-            }
-            let snapshot = sm
-                .get_snapshot_builder()
-                .await
-                .build_snapshot()
-                .await
-                .unwrap();
-            let mut restored = CouncilStateMachine::new();
-            restored
-                .install_snapshot(&snapshot.meta, snapshot.snapshot)
-                .await
-                .unwrap();
-            restored
-                .apply([entry(2, 3, RaftRequest::Noop)])
-                .await
-                .unwrap();
-            let result = restored
-                .apply([entry(
-                    2,
-                    4,
-                    if commit_first {
-                        RaftRequest::JobApplyComplete {
-                            operation_id: id.clone(),
-                        }
-                    } else {
-                        RaftRequest::PrerequisiteFailed {
-                            operation_id: id.clone(),
-                        }
-                    },
-                )])
-                .await
-                .unwrap();
-            assert!(
-                matches!(result[0], CouncilResponse::Refused { .. }),
-                "{result:?}"
-            );
-            let state = restored.desired_state().await;
-            assert!(state.prerequisite_claims.contains_key(&id));
-            for node in ["a", "b"] {
-                assert_eq!(
-                    footprint(&state, node),
-                    if commit_first { 3000 } else { 8000 }
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_current_revision_batch_cannot_take_a_held_logical_job_but_other_namespace_is_independent()
-     {
-        let mut sm = CouncilStateMachine::new();
-        let id = begin(&mut sm, 1).await;
-        for (index, logical) in [(2, "migrate"), (3, "notify")] {
-            let before = sm.desired_state().await.batch_state;
-            let response = register(
-                &mut sm,
-                index,
-                record(logical, &format!("execution-{index}"), "default", 1),
-            )
-            .await;
-            assert!(
-                matches!(response, CouncilResponse::Refused { .. }),
-                "{response:?}"
-            );
-            assert_eq!(
-                sm.desired_state().await.batch_state,
-                before,
-                "refusal mutated ownership/ID"
-            );
-        }
-        let response = register(&mut sm, 4, record("notify", "execution-other", "other", 1)).await;
-        assert!(
-            matches!(response, CouncilResponse::BatchRegistered { .. }),
-            "{response:?}"
-        );
-        let result = sm
-            .apply([entry(
-                1,
-                5,
-                RaftRequest::PrerequisiteCommit { operation_id: id },
-            )])
-            .await
-            .unwrap();
-        assert!(!matches!(result[0], CouncilResponse::Refused { .. }));
-        let response = register(
-            &mut sm,
-            6,
-            record("migrate", "execution-migration-released", "default", 1),
-        )
-        .await;
-        assert!(
-            matches!(response, CouncilResponse::BatchRegistered { .. }),
-            "{response:?}"
-        );
-        let before = sm.desired_state().await.batch_state;
-        let response = register(
-            &mut sm,
-            7,
-            record("notify", "execution-ordinary-held", "default", 1),
-        )
-        .await;
-        assert!(
-            matches!(response, CouncilResponse::Refused { .. }),
-            "{response:?}"
-        );
-        assert_eq!(sm.desired_state().await.batch_state, before);
-    }
-
-    #[tokio::test]
-    async fn prerequisite_begin_cannot_claim_a_pruned_global_batch_physical_identity() {
-        let mut sm = CouncilStateMachine::new();
-        let physical = "batch-retained-physical";
-        let response = register(
-            &mut sm,
-            1,
-            record("logical-original", physical, "default", 1),
-        )
-        .await;
-        let CouncilResponse::BatchRegistered { batch_id } = response else {
-            panic!("{response:?}")
-        };
-        let result = sm
-            .apply([entry(
-                1,
-                2,
-                RaftRequest::BatchJobUpdate {
-                    batch_id,
-                    job_name: physical.into(),
-                    namespace: "default".into(),
-                    status: JobStatus::Completed,
-                    exit_code: Some(0),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            !matches!(result[0], CouncilResponse::Refused { .. }),
-            "{result:?}"
-        );
-        let response = register(
-            &mut sm,
-            3,
-            record(
-                "pruning-trigger",
-                "new-independent-physical",
-                "default",
-                7200,
-            ),
-        )
-        .await;
-        assert!(matches!(response, CouncilResponse::BatchRegistered { .. }));
-        let before = sm.desired_state().await;
-        assert!(
-            before.batch_state.get(batch_id).is_none(),
-            "fixture failed to prune history"
-        );
-        assert!(
-            before
-                .batch_state
-                .execution_owner("default", physical)
-                .is_some()
-        );
-        let config =
-            crate::config::Config::parse(&format!("[job.'{physical}']\nimage='migration:v1'\n"))
-                .unwrap();
-        let response = sm
-            .apply([entry(
-                1,
-                4,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: "abcdefabcdefabcdefabcdefabcdefab".into(),
-                    term: 1,
-                    config: Box::new(config.clone()),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            matches!(response[0], CouncilResponse::Refused { .. }),
-            "{response:?}"
-        );
-        assert_eq!(
-            sm.desired_state().await.prerequisite_claims,
-            before.prerequisite_claims
-        );
-        let mut independent = config;
-        independent.job.get_mut(physical).unwrap().namespace = Some("other".into());
-        let response = sm
-            .apply([entry(
-                1,
-                5,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: "fedcba9876543210fedcba9876543210".into(),
-                    term: 1,
-                    config: Box::new(independent),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            !matches!(response[0], CouncilResponse::Refused { .. }),
-            "{response:?}"
-        );
-    }
-
-    async fn begin_cross_namespace_same_label_claim(sm: &mut CouncilStateMachine) {
-        let config = crate::config::Config::parse(
-            "[app.foo]\nimage='web:v1'\nnamespace='team'\n[job.foo]\nimage='notify:v1'\nnamespace='other'\n",
-        )
-        .unwrap();
-        config.validate_intrinsic().unwrap();
-        let result = sm
-            .apply([entry(
-                1,
-                1,
-                RaftRequest::PrerequisiteBegin {
-                    operation_id: "1234567890abcdef1234567890abcdef".into(),
-                    term: 1,
-                    config: Box::new(config),
-                },
-            )])
-            .await
-            .unwrap();
-        assert!(
-            !matches!(result[0], CouncilResponse::Refused { .. }),
-            "fixture claim was refused: {result:?}"
-        );
-        assert_eq!(sm.desired_state().await.prerequisite_claims.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn cross_namespace_same_label_claim_does_not_block_independent_batch_display_label() {
-        let mut sm = CouncilStateMachine::new();
-        begin_cross_namespace_same_label_claim(&mut sm).await;
-        let response = register(
-            &mut sm,
-            2,
-            record("foo", "opaque-independent-job", "team", 1),
-        )
-        .await;
-        assert!(
-            matches!(response, CouncilResponse::BatchRegistered { .. }),
-            "an other-namespace held job must not turn the team app display label into a held job: {response:?}"
-        );
-        assert!(
-            sm.desired_state()
-                .await
-                .batch_state
-                .execution_owner("team", "opaque-independent-job")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn cross_namespace_same_label_claim_still_blocks_its_held_job_operation() {
-        let mut sm = CouncilStateMachine::new();
-        begin_cross_namespace_same_label_claim(&mut sm).await;
-        let before = sm.desired_state().await.batch_state;
-        let response = register(
-            &mut sm,
-            2,
-            record("foo", "opaque-independent-job", "other", 1),
-        )
-        .await;
-        assert!(
-            matches!(response, CouncilResponse::Refused { .. }),
-            "the actual held job namespace must remain fenced: {response:?}"
-        );
-        assert_eq!(sm.desired_state().await.batch_state, before);
-    }
-
-    #[tokio::test]
-    async fn cross_namespace_same_label_claim_still_blocks_held_app_physical_identity() {
-        let mut sm = CouncilStateMachine::new();
-        begin_cross_namespace_same_label_claim(&mut sm).await;
-        let before = sm.desired_state().await.batch_state;
-        let response = register(&mut sm, 2, record("independent-label", "foo", "team", 1)).await;
-        assert!(
-            matches!(response, CouncilResponse::Refused { .. }),
-            "the held app physical identity must remain fenced: {response:?}"
-        );
-        assert_eq!(sm.desired_state().await.batch_state, before);
-    }
-
-    #[tokio::test]
-    async fn a_batch_display_label_matching_a_held_app_is_independent() {
-        let mut sm = CouncilStateMachine::new();
-        begin(&mut sm, 1).await;
-        let response = register(
-            &mut sm,
-            2,
-            record("web", "opaque-independent-job", "default", 1),
-        )
-        .await;
-        assert!(
-            matches!(response, CouncilResponse::BatchRegistered { .. }),
-            "{response:?}"
-        );
-        assert!(
-            sm.desired_state()
-                .await
-                .batch_state
-                .execution_owner("default", "opaque-independent-job")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_batch_physical_execution_matching_a_held_app_is_refused() {
-        let mut sm = CouncilStateMachine::new();
-        begin(&mut sm, 1).await;
-        let before = sm.desired_state().await.batch_state;
-        let response = register(&mut sm, 2, record("independent-label", "web", "default", 1)).await;
-        assert!(
-            matches!(response, CouncilResponse::Refused { .. }),
-            "{response:?}"
-        );
-        assert_eq!(sm.desired_state().await.batch_state, before);
     }
 }

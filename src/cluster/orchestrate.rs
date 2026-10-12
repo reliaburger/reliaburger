@@ -733,7 +733,7 @@ fn plan_pass(
                 placements.len() == want
                     && placements
                         .iter()
-                        .all(|p| p.resources == requested && liveness.keeps(p, spec, cache))
+                        .all(|p| p.resources == requested && liveness.keeps(app_id, p, spec, cache))
             })
             .unwrap_or(false);
         planned.push((app_id, spec, override_replicas, want, converged));
@@ -800,7 +800,7 @@ fn plan_pass(
             Replicas::Fixed(_) => {
                 let mut holding: Vec<_> = previous
                     .iter()
-                    .filter(|p| liveness.keeps(p, spec, cache))
+                    .filter(|p| liveness.keeps(app_id, p, spec, cache))
                     .cloned()
                     .collect();
                 holding.sort_by_key(|p| p.ordinal);
@@ -1119,9 +1119,11 @@ impl Liveness<'_> {
     /// managed-volume app stays on its home whatever its node is doing
     /// (#423), even when its new request no longer fits there. Any other
     /// replica stays while its node holds it and still has room for the
-    /// request it makes now (#434).
+    /// request it makes now (#434), unless the node reported it couldn't fit
+    /// the app: job leases may have taken the room since it was placed.
     fn keeps(
         &self,
+        app_id: &crate::meat::types::AppId,
         placement: &crate::meat::types::Placement,
         spec: &AppSpec,
         cache: &ClusterStateCache,
@@ -1139,6 +1141,9 @@ impl Liveness<'_> {
         }
         if keeps_volume_home(placement, spec, self.retired) {
             return true;
+        }
+        if cache.capacity_refused(&placement.node_id, app_id) {
+            return false;
         }
         placement_holds(
             placement,
@@ -1271,7 +1276,7 @@ fn node_can_run(
     spec: &AppSpec,
     dns_required: bool,
 ) -> bool {
-    let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+    let requires_egress = spec.requires_network_policy();
     node.ready
         && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!dns_required || node.capabilities.dns.can_resolve_internal())
@@ -1332,7 +1337,7 @@ fn daemon_eligible_count(
         .as_ref()
         .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
         .unwrap_or_default();
-    let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+    let requires_egress = spec.requires_network_policy();
     crate::meat::scheduler::daemon_candidates(
         cache,
         app_id,
@@ -1689,9 +1694,14 @@ fn build_cluster_cache(
                 memory_bytes: u64::from(usage.memory_total_mb) * 1024 * 1024,
                 gpus: 0,
             },
+            // App requests plus what task attempts and reusable executors
+            // hold in the same node budget. Apps and jobs share one ledger
+            // on the node, so the leader has to see both.
             allocated: Resources {
-                cpu_millicores: u64::from(usage.cpu_used_millicores),
-                memory_bytes: u64::from(usage.memory_used_mb) * 1024 * 1024,
+                cpu_millicores: u64::from(usage.cpu_used_millicores)
+                    .saturating_add(report.job_reservations.cpu_millicores),
+                memory_bytes: (u64::from(usage.memory_used_mb) * 1024 * 1024)
+                    .saturating_add(report.job_reservations.memory_bytes),
                 gpus: 0,
             },
             labels: member.labels.clone(),
@@ -1719,6 +1729,12 @@ fn build_cluster_cache(
                     u64::from(instance.resource_usage.memory_mb) * 1024 * 1024,
                     0,
                 ),
+            );
+        }
+        for refusal in &report.capacity_refusals {
+            cache.record_capacity_refusal(
+                &member.node_id,
+                &crate::meat::AppId::new(&refusal.app_name, &refusal.namespace),
             );
         }
     }
@@ -4413,6 +4429,8 @@ image = "busybox:latest"
                 memory_total_mb: 8192,
             },
             event_log: vec![],
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 
@@ -5573,6 +5591,107 @@ image = "busybox:latest"
         assert!(decisions.is_empty(), "{decisions:?}");
     }
 
+    /// Reports from two ready nodes with 4000m each, `full` holding all of
+    /// its CPU in task attempts and executor leases, `idle` holding nothing.
+    fn job_filled_and_idle_reports() -> (Vec<MembershipSnapshot>, AggregatedState) {
+        let members = vec![member("full", 1), member("idle", 2)];
+        let mut reports = AggregatedState::default();
+        let mut full = report(4000, 0);
+        full.job_reservations = crate::reporting::types::JobReservations {
+            cpu_millicores: 4000,
+            memory_bytes: 1 << 30,
+        };
+        reports.reports.insert(NodeId::new("full"), full);
+        reports.reports.insert(NodeId::new("idle"), report(4000, 0));
+        for name in ["full", "idle"] {
+            reports
+                .readiness
+                .insert(NodeId::new(name), readiness(name, true));
+        }
+        reports.receive_deadlines = reports
+            .reports
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+            })
+            .collect();
+        (members, reports)
+    }
+
+    /// Job attempts and executors lease from the same node budget as app
+    /// replicas. The leader used to see only app requests, so it put a
+    /// replica on a node jobs had filled, where it could never start.
+    #[test]
+    fn app_replica_avoids_a_node_whose_budget_is_held_by_job_leases() {
+        let (members, reports) = job_filled_and_idle_reports();
+        let mut cache = build_cluster_cache(&members, &reports);
+        assert_eq!(
+            cache
+                .get_node(&NodeId::new("full"))
+                .unwrap()
+                .allocated
+                .cpu_millicores,
+            4000,
+            "job leases count as allocated"
+        );
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(AppId::new("web", "default"), app_spec(1000, 1));
+        let alive = HashSet::from([NodeId::new("full"), NodeId::new("idle")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["idle"]);
+    }
+
+    /// A placement the node refuses for lack of capacity moves: holding it
+    /// there would leave the replica down while another node sits idle.
+    #[test]
+    fn capacity_refusal_from_the_agent_moves_the_replica() {
+        let (members, mut reports) = job_filled_and_idle_reports();
+        let app = AppId::new("web", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 1));
+        desired.scheduling.insert(app.clone(), placed_on(&["full"]));
+        // The node had room when the replica was placed; jobs took it since.
+        reports
+            .reports
+            .get_mut(&NodeId::new("full"))
+            .unwrap()
+            .job_reservations = Default::default();
+        let alive = HashSet::from([NodeId::new("full"), NodeId::new("idle")]);
+        let mut cache = build_cluster_cache(&members, &reports);
+        assert!(
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default())
+                .is_empty(),
+            "a placement nobody refused stays where it is"
+        );
+
+        let (_, filled) = job_filled_and_idle_reports();
+        reports = filled;
+        reports
+            .reports
+            .get_mut(&NodeId::new("full"))
+            .unwrap()
+            .capacity_refusals
+            .push(crate::reporting::types::CapacityRefusal {
+                app_name: "web".to_string(),
+                namespace: "default".to_string(),
+            });
+        let mut cache = build_cluster_cache(&members, &reports);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["idle"]);
+    }
+
     /// A node mid-upgrade is cordoned, which the cache records as not
     /// ready. That's a reason to put nothing new on it, not to start its
     /// volume app somewhere else on an empty volume.
@@ -6704,6 +6823,8 @@ mod audit_stale_endpoints {
                     uptime: Duration::ZERO,
                     resource_usage: AppResourceUsage::default(),
                 }],
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         let backends = |catalog: &crate::onion::catalog::EndpointCatalog| {
@@ -6777,6 +6898,8 @@ mod audit_stale_endpoints {
                 },
                 event_log: vec![],
                 has_buildah: false,
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         assert!(!has_stale_member(&members, &reports));
@@ -7244,37 +7367,25 @@ mod revalidation_in_place {
     }
 
     fn assert_reported_footprint(
-        batch: bool,
         reported_cpu: u32,
         ordinal: u32,
         extra_cpu: u64,
         should_place: bool,
     ) {
         let mut desired = DesiredState::default();
-        let name = if batch {
-            "opaque-execution"
-        } else {
-            "existing-app"
-        };
-        if batch {
-            desired.batch_state.register(serde_json::from_value(serde_json::json!({
-                        "submitted_at_epoch_secs": 1, "jobs": [{"name":"logical", "namespace":"default", "execution_name":name,
-                        "spec_digest":"a".repeat(64), "node":"home", "status":"Pending", "resources":{"cpu_millicores":500,"memory_bytes":0,"gpus":0}}]
-                    })).unwrap()).unwrap();
-        } else {
-            let app = AppId::new(name, "default");
-            desired
-                .apps
-                .insert(app.clone(), requesting(500, Replicas::Fixed(1)));
-            desired.scheduling.insert(
-                app,
-                vec![Placement {
-                    node_id: NodeId::new("home"),
-                    resources: Resources::new(500, 0, 0),
-                    ordinal: 0,
-                }],
-            );
-        }
+        let name = "existing-app";
+        let app = AppId::new(name, "default");
+        desired
+            .apps
+            .insert(app.clone(), requesting(500, Replicas::Fixed(1)));
+        desired.scheduling.insert(
+            app,
+            vec![Placement {
+                node_id: NodeId::new("home"),
+                resources: Resources::new(500, 0, 0),
+                ordinal: 0,
+            }],
+        );
         let extra = AppId::new("z-extra", "default");
         desired
             .apps
@@ -7334,6 +7445,8 @@ mod revalidation_in_place {
                         memory_mb: 0,
                     },
                 }],
+                job_reservations: Default::default(),
+                capacity_refusals: Vec::new(),
             },
         );
         let mut cache = build_cluster_cache(&[member], &reports);
@@ -7346,93 +7459,23 @@ mod revalidation_in_place {
         assert_eq!(
             !placements_of(&decisions, &extra).is_empty(),
             should_place,
-            "batch={batch},reported={reported_cpu},ordinal={ordinal}: {decisions:?}"
+            "reported={reported_cpu},ordinal={ordinal}: {decisions:?}"
         );
     }
 
     #[test]
     fn ordinary_app_partial_request_cannot_credit_the_full_placement() {
-        assert_reported_footprint(false, 250, 0, 600, false);
+        assert_reported_footprint(250, 0, 600, false);
     }
 
     #[test]
     fn ordinary_app_other_ordinal_cannot_credit_the_committed_instance() {
-        assert_reported_footprint(false, 500, 1, 500, false);
+        assert_reported_footprint(500, 1, 500, false);
     }
 
     #[test]
     fn ordinary_app_exact_complete_report_is_counted_once() {
-        assert_reported_footprint(false, 500, 0, 500, true);
-    }
-
-    #[test]
-    fn owned_batch_partial_request_cannot_credit_the_full_reservation() {
-        assert_reported_footprint(true, 250, 0, 600, false);
-    }
-
-    #[test]
-    fn owned_batch_other_ordinal_cannot_credit_execution_zero() {
-        assert_reported_footprint(true, 500, 1, 500, false);
-    }
-
-    #[test]
-    fn owned_batch_exact_complete_report_is_counted_once() {
-        assert_reported_footprint(true, 500, 0, 500, true);
-    }
-
-    #[test]
-    fn ordinary_apps_respect_unreported_batch_reservations_and_exact_namespace_dedup() {
-        for reported_namespace in [None, Some("default"), Some("other")] {
-            let mut desired = DesiredState::default();
-            let app = AppId::new("web", "default");
-            desired
-                .apps
-                .insert(app.clone(), requesting(4000, Replicas::Fixed(1)));
-            let batch: crate::meat::batch_tracker::BatchRecord = serde_json::from_value(serde_json::json!({
-                "submitted_at_epoch_secs": 1,
-                "jobs": [{"name":"logical", "namespace":"default", "execution_name":"opaque-owned",
-                    "spec_digest":"a".repeat(64), "node":"home", "status":"Pending",
-                    "resources":{"cpu_millicores":5000,"memory_bytes":0,"gpus":0}}]
-            })).unwrap();
-            desired.batch_state.register(batch).unwrap();
-            let mut home = node("home", 8000, "east");
-            if let Some(namespace) = reported_namespace {
-                home.allocated = Resources::new(5000, 0, 0);
-                home.app_replicas
-                    .insert(AppId::new("opaque-owned", namespace), 1);
-            }
-            let mut cache = ClusterStateCache::new();
-            cache.set_node(home);
-            if let Some(namespace) = reported_namespace {
-                cache.record_reported_instance(
-                    &NodeId::new("home"),
-                    &AppId::new("opaque-owned", namespace),
-                    0,
-                    Resources::new(5000, 0, 0),
-                );
-            }
-            let decisions = plan_scheduling_pass(
-                &mut cache,
-                &desired,
-                &HashSet::from([NodeId::new("home")]),
-                &mut QuotaLedger::default(),
-            );
-            assert!(
-                placements_of(&decisions, &app).is_empty(),
-                "namespace={reported_namespace:?}: {decisions:?}"
-            );
-            let allocated = cache
-                .get_node(&NodeId::new("home"))
-                .unwrap()
-                .allocated
-                .cpu_millicores;
-            let expected = if reported_namespace == Some("other") {
-                10000
-            } else {
-                5000
-            };
-            assert_eq!(allocated, expected, "namespace={reported_namespace:?}");
-        }
+        assert_reported_footprint(500, 0, 500, true);
     }
 
     #[test]
@@ -7579,120 +7622,5 @@ mod revalidation_in_place {
         assert_eq!(placements_of(&decisions, &app), [("home".to_string(), 900)]);
         let home = cache.get_node(&NodeId::new("home")).unwrap();
         assert_eq!(home.allocated.cpu_millicores, 900);
-    }
-}
-
-// Append to src/cluster/orchestrate.rs after integrating root534 + actual543.
-#[cfg(test)]
-mod audit_prerequisite_capacity {
-    use super::*;
-    use crate::council::prerequisites::PrerequisiteClaim;
-    use crate::meat::types::AppId;
-
-    fn approved() -> Config {
-        Config::parse("[app.web]\nimage='web:v1'\n[job.migrate]\nimage='migration:v1'\ncpu='5'\nrun_before=['app.web']\n[job.notify]\nimage='notify:v1'\ncpu='3'\n").unwrap()
-    }
-    fn candidates() -> ClusterStateCache {
-        let mut cache = ClusterStateCache::new();
-        for name in ["a", "b"] {
-            cache.set_node(SchedulerNodeState {
-                node_id: NodeId::new(name),
-                allocatable: Resources::new(8000, 16 * 1024 * 1024 * 1024, 0),
-                allocated: Resources::default(),
-                labels: Default::default(),
-                ready: true,
-                capabilities: Default::default(),
-                app_replicas: Default::default(),
-                uptime_secs: 100,
-                cached_images: Default::default(),
-            });
-        }
-        cache
-    }
-    fn probe(cpu: u64) -> (AppId, AppSpec) {
-        let id = AppId::new("capacity-probe", "another-namespace");
-        let mut spec: AppSpec = toml::from_str("image='probe:v1'").unwrap();
-        spec.cpu = Some(crate::config::types::ResourceRange {
-            request: cpu,
-            limit: cpu,
-        });
-        (id, spec)
-    }
-    fn run(desired: &crate::council::types::DesiredState, cpu: u64) -> (ClusterStateCache, bool) {
-        let mut desired = desired.clone();
-        let (id, spec) = probe(cpu);
-        desired.apps.insert(id.clone(), spec);
-        let mut cache = candidates();
-        let decisions = plan_scheduling_pass(
-            &mut cache,
-            &desired,
-            &HashSet::from([NodeId::new("a"), NodeId::new("b")]),
-            &mut crate::meat::quota::QuotaLedger::default(),
-        );
-        let placed = decisions
-            .iter()
-            .any(|decision| decision.app_id == id && !decision.placements.is_empty());
-        (cache, placed)
-    }
-    #[test]
-    fn ordinary_placement_subtracts_precommit_jobs_from_every_candidate_before_reports_arrive() {
-        let mut desired = crate::council::types::DesiredState::default();
-        desired.prerequisite_claims.insert(
-            "1234567890abcdef1234567890abcdef".into(),
-            PrerequisiteClaim {
-                term: 1,
-                recovery_epoch: 0,
-                apps_committed: false,
-                config: approved(),
-            },
-        );
-        let (cache, placed) = run(&desired, 4000);
-        assert!(
-            !placed,
-            "planner spent capacity held by an unreported migration/ordinary job"
-        );
-        for node in ["a", "b"] {
-            let state = cache.get_node(&NodeId::new(node)).unwrap();
-            assert_eq!(state.allocated.cpu_millicores, 8000, "{node}");
-            assert_eq!(
-                state.replicas_of(&AppId::new("migrate", "default")),
-                0,
-                "a reservation invented a report replica"
-            );
-        }
-        desired
-            .prerequisite_claims
-            .values_mut()
-            .next()
-            .unwrap()
-            .term = 99;
-        let (_, placed) = run(&desired, 4000);
-        assert!(!placed, "a different owner term is not proof of settlement");
-    }
-    #[test]
-    fn ordinary_placement_releases_migration_after_commit_but_keeps_the_ordinary_tail() {
-        let mut desired = crate::council::types::DesiredState::default();
-        desired.prerequisite_claims.insert(
-            "1234567890abcdef1234567890abcdef".into(),
-            PrerequisiteClaim {
-                term: 1,
-                recovery_epoch: 0,
-                apps_committed: true,
-                config: approved(),
-            },
-        );
-        let (_, placed) = run(&desired, 6000);
-        assert!(!placed, "ordinary tail's 3000m reservation disappeared");
-        let (_, placed) = run(&desired, 4000);
-        assert!(
-            placed,
-            "completed migration's 5000m reservation survived commit"
-        );
-        desired.prerequisite_claims.clear();
-        let (_, placed) = run(&desired, 8000);
-        assert!(
-            placed,
-            "positively released ownership still blocked placement"
-        );
     }
 }

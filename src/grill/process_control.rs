@@ -454,6 +454,48 @@ impl ProcessControl {
         .await
     }
 
+    /// Cancel a generation whose owner never started, fencing any delayed
+    /// start. Returns whether it is now Cancelled. A generation in any other
+    /// phase, or one whose owner holds its lock because it is starting right
+    /// now, is left alone. Never sends a signal.
+    pub(crate) async fn cancel_unstarted(&self, id: &InstanceId) -> io::Result<bool> {
+        let nonce = self.record(id).await?.nonce;
+        self.run(id, move |this, id| {
+            let directory = this.directory(&id)?;
+            let _operation = operation_lock(&directory)?;
+            if this.load(&id)?.nonce != nonce {
+                return Err(io::Error::other(
+                    "process generation changed before cancellation",
+                ));
+            }
+            this.cancel_locked(&id)
+        })
+        .await
+    }
+
+    /// Under the operation lock, turn a Prepared record into Cancelled if no
+    /// owner holds the owner lock. Locking fences a helper still waiting to
+    /// start: its reload sees Cancelled and never runs user code.
+    fn cancel_locked(&self, id: &InstanceId) -> io::Result<bool> {
+        let directory = self.directory(id)?;
+        if !matches!(self.load(id)?.phase, OwnerPhase::Prepared) {
+            return Ok(false);
+        }
+        let _owner = match process_owner::lock_owner(&directory) {
+            Ok(owner) => owner,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut record = self.load(id)?;
+        if !matches!(record.phase, OwnerPhase::Prepared) {
+            return Ok(false);
+        }
+        record.phase = OwnerPhase::Cancelled;
+        process_owner::persist(&directory, &record)?;
+        remove_control_socket(&record)?;
+        Ok(true)
+    }
+
     fn finish_retirement(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
         let directory = self.directory(id)?;
         let mut record = self.load(id)?;
@@ -980,6 +1022,38 @@ mod tests {
             }
         }
         assert_eq!(still_held, 0, "operation locks still held after drop");
+    }
+
+    /// Only an attempt nobody is starting may be cancelled: an owner that
+    /// holds its lock is starting right now and must be left to run (#812).
+    #[tokio::test]
+    async fn cancelling_an_unstarted_generation_leaves_a_starting_or_running_owner_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("command-unstarted".into());
+        control.prepare(&id, &spec()).await.unwrap();
+        let directory = control.directory(&id).unwrap();
+        let starting = process_owner::lock_owner(&directory).unwrap();
+        assert!(!control.cancel_unstarted(&id).await.unwrap());
+        assert!(matches!(
+            control.load(&id).unwrap().phase,
+            OwnerPhase::Prepared
+        ));
+        drop(starting);
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        assert!(matches!(
+            control.load(&id).unwrap().phase,
+            OwnerPhase::Cancelled
+        ));
+        assert!(control.start(&id).await.is_err(), "a delayed start ran");
+
+        let running = InstanceId("command-running".into());
+        let _owner = ImpatientOwner::start(&control, &running, 0).await;
+        assert!(!control.cancel_unstarted(&running).await.unwrap());
+        assert!(matches!(
+            control.load(&running).unwrap().phase,
+            OwnerPhase::Running { .. }
+        ));
     }
 
     #[tokio::test]

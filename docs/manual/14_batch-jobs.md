@@ -1,8 +1,8 @@
 # Batch jobs
 
-Development preview for 0.2.0. Build matching development binaries and start a
-fresh cluster: protocol 51 and state 68 change control messages and durable
-state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
+Development preview: 0.2.0, not in 0.1.6. Build matching development binaries
+and start a fresh cluster, because 0.2.0 changes the control messages and the
+durable state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.
 
@@ -35,21 +35,65 @@ arbitrary task dependency graphs aren't supported. Ordinary jobs are admitted
 when application publication succeeds. A disconnected client or a new leader
 can resume the operation from the same accepted run identities.
 
-Ordinary TOML jobs get four attempts for known failures; deployment hooks get one
-attempt, so a failed migration is not repeated automatically. Ordinary jobs have no implicit
-runtime deadline; hooks have a 600-second deadline. An uncertain attempt outcome
-becomes `Unknown`, retains ownership and prevents automatic replay, even after
-worker restart or disappearance. A successful launch isn't evidence of successful
-work. Explicit bulk submissions retain at-least-once replay, including a
-one-element array. This is a retry policy on the common engine.
+Each `[job.<name>]` can set its run policy with the same field names that
+manifests and the JSON API use:
 
-Cron uses five fields in UTC. Registration starts with the next matching minute.
+```toml
+[job.cleanup]
+image = "database-tools:v1"
+command = ["/cleanup"]
+schedule = "0 3 * * *"
+max_attempts = 2          # 1–10
+task_timeout_secs = 1800  # 0–86400; 0 means no deadline
+overlap = "allow"         # cron only: "forbid" (default) or "allow"
+replay_unknown = true     # safe to repeat after a lost worker
+```
+
+Omitted fields keep the defaults. Ordinary TOML jobs get four attempts for
+known failures and no deadline. Deployment hooks get one attempt, so a failed
+migration isn't repeated automatically, and a 600-second deadline. `overlap`
+needs a `schedule`, and a `run_before` hook refuses `replay_unknown = true`.
+`relish lint` and `relish apply --dry-run` reject out-of-range values. Give
+every job that might hang a `task_timeout_secs`: without one, a stuck cron job
+runs for ever, and with `overlap = "forbid"` it also blocks every later
+occurrence.
+
+An uncertain attempt outcome becomes `Unknown`. Unless the job sets
+`replay_unknown = true`, it retains ownership and prevents automatic replay,
+even after worker restart or disappearance. A timed-out attempt counts as
+uncertain too: Bun stops the command, but the work may have half happened, so
+a job without `replay_unknown` waits for `relish batch replay` rather than
+retrying. With `replay_unknown = true`, a timeout is an ordinary failed attempt.
+A successful launch isn't evidence of successful work. Explicit bulk
+submissions retain at-least-once replay, including a one-element array. This is
+a retry policy on the common engine.
+
+Cron schedules are in UTC. Registration starts with the next matching minute.
 The leader atomically claims the occurrence and admits its run. Default overlap
-is `forbid`; JSON definitions can select `allow`. Both skip missed minutes, with
-no catch-up queue. Skipped overlapping occurrences advance the cursor too.
-Registration and observation cursors survive leader changes, result pruning and
-clock rollback. A conservative definition with unknown ownership skips new
-occurrences even when overlap is allowed.
+is `forbid`; TOML jobs and JSON definitions can select `allow`. Both skip missed
+minutes, with no catch-up queue. Skipped overlapping occurrences advance the
+cursor too. Registration and observation cursors survive leader changes, result
+pruning and clock rollback. A conservative definition with unknown ownership
+skips new occurrences even when overlap is allowed. When every active-run slot
+is taken, reserved headroom included, the occurrence is skipped rather than
+lost: the cursor advances, the definition records `skipped: capacity` with the
+minute and a running count, and the leader emits one `job-skipped` event.
+`relish jobs` shows the latest skip beside the schedule.
+
+The schedule dialect is the one Kubernetes CronJob uses:
+
+- Five fields: minute, hour, day of month, month, day of week. Each takes `*`,
+  a number, a list (`1,15`), a range (`1-5`) and a step (`*/15`, `0-30/10`).
+- `N/step` repeats from N to the field's maximum: `5/15` in the minute field is
+  minutes 5, 20, 35 and 50.
+- Month names `JAN`–`DEC` and weekday names `SUN`–`SAT`, in any case. Sunday is
+  0 or 7.
+- When day of month and day of week are both restricted, either one matching
+  fires the job: `0 0 1 * MON` runs on the 1st and on every Monday. A field that
+  starts with `*`, such as `*/2`, counts as unrestricted for this rule, so
+  `0 0 */2 * MON` runs on odd-numbered days that are also Mondays.
+- The macros `@hourly`, `@daily` (or `@midnight`), `@weekly`, `@monthly` and
+  `@yearly` (or `@annually`). `@reboot`, `@every` and time zones are refused.
 
 ```sh
 relish jobs
@@ -115,6 +159,14 @@ packing; rootful Linux container and native process jobs enforce limits. Omitted
 status. Images are bound to a digest at submission and must pass the cluster's Pickle
 and upstream trust policies, including required cosign signatures.
 
+Every name you submit is a job definition, and its runs are kept as receipts.
+A definition with no schedule and no `run_before` hook is a one-off: it expires
+in the same pruning step that drops its last run (see retention below). A
+daily `relish run --batch render-$DATE` therefore keeps working indefinitely.
+Schedules and deployment hooks stay until you stop or delete them. Disabling a
+schedule turns its definition into a one-off. Each namespace holds at most 64
+definitions and the cluster 1,024; the refusal names the namespace and the cap.
+
 `--count` defaults to one. Add `--schedule "0 3 * * *"` to register an array
 schedule without an immediate run. Every task receives `RELIABURGER_TASK_INDEX`, `RELIABURGER_TASK_COUNT`, `RELIABURGER_BATCH_ID` and `RELIABURGER_TASK_ATTEMPT`.
 Its identity is the array ID and index; retries keep that identity. The job image and command apply to
@@ -145,7 +197,8 @@ has a unique DNS-label `name`, `count`, optional array policies and a `[cohort.t
 job specification. There are at most 16 profiles and 16,777,216 total indexes
 per submission. Names and namespaces are DNS labels; each template is at most
 16 KiB. Use `relish batch submit burger/jobs.toml --dry-run` for local validation.
-The cluster admits at most 64 active profiles. Reduce chunk
+Each profile is one active run, so a manifest counts against the active-run
+limits under [Execution and capacity limits](#execution-and-capacity-limits). Reduce chunk
 size for expensive tasks and straggler tails; larger chunks amortise dispatch
 and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
 
@@ -154,11 +207,22 @@ and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
 `relish batch watch ID` polls once per second. Status and the dashboard show
 counts, backlog, retries, resource profiles and accepted success rates. Rates
 count unique outcomes accepted by the cluster, rather than attempts started.
-They begin as unknown and reset after leadership changes or stale samples.
+They begin as unknown and reset after leadership changes or stale samples
+(the Mayo job counters below don't; each node keeps its own).
 Accepted counts arrive when chunks are acknowledged, so a one-second rate can
 alternate between zero and a burst. Use a sustained interval for capacity planning.
 Duration histograms merge across workers; watch displays p50, p95 and p99 bucket
 upper bounds for final attempts. They exclude queueing and earlier retries.
+Retries come with their causes: non-zero exit, a signal (including the memory
+limit's kill), a timeout, an unknown outcome, or "not recorded across a
+restart" when a worker read an attempt count back from its ledger, which
+keeps counts but not reasons. The causes always add up to the retry count,
+and they're a handful of counters per run, never a log per task.
+Each node's row also carries `start_lag_ms_counts`: how long pooled commands
+(shared containers and host jobs) waited between the pool taking an attempt
+and the command starting, in the same millisecond buckets. A single run's
+summary reports `state_bytes`, the replicated state its chunk bookkeeping
+occupies.
 `relish --output json batch-status ID` returns the machine-readable summary.
 `GET /v1/batch/summaries` lists retained parent summaries and standalone arrays,
 filtered to the caller's scope. Views and metric labels do not enumerate tasks.
@@ -178,18 +242,23 @@ Only the worker and grant whose completion was accepted can supply an outcome
 or retained task output. Unreachable workers are explicit. Singletons keep bounded successful output as
 well as failure output; larger arrays discard successful output. Control reports keep exact failure counts and at most 256 index
 ranges per chunk; indexed detail remains available beyond that preview.
-Retained output keeps a bounded head and tail. Singleton live stdout/stderr also
+Retained output keeps a bounded head and tail. Each chunk keeps the output
+of its first 16 failed tasks; later failures keep their exit code and attempts
+in the results, and `relish batch logs` says the output wasn't kept. Singleton live stdout/stderr also
 uses ordinary log capture under its logical name, namespace and `run-ID` selector. Never interpret
 missing detail as success. A missing or corrupt result index is an explicit
 error; rebuilding it is worker recovery, rather than an unbounded page read.
-Use the child array ID for results and logs. Each profile index has a 1 MiB
-cache budget; more detail traffic may require additional disk reads.
+Use the child array ID for results and logs.
 
-Detail remains on the worker disk. Later submissions prune detail older than
-one hour **after completion** and keep the newest 20 terminal submissions.
-This is pruning on registration, rather than a background expiry timer; detail
-can remain readable longer while no new work is submitted. For a mixed manifest,
+Detail remains on the worker disk for one hour **after completion**. Each
+namespace keeps its newest 20 finished submissions, and the cluster keeps 24
+in all: when more finish, the namespace keeping the most loses its oldest
+first, so a per-minute cron in one namespace can't push out another
+namespace's runs. The leader checks every second and prunes expired runs with
+one replicated write, whether or not anyone submits new work; workers then
+delete the run's ledger, index and kept output on their next sync. For a mixed manifest,
 the clock starts when its last profile finishes; profiles are pruned together.
+A run's outcome outlives its detail: see [Job history](#job-history-metrics-and-events).
 Permanent worker or disk loss can lose
 individual results even when accepted aggregate counts remain replicated.
 Export needed results before retention expires. Cancelling counts never-started and interrupted
@@ -198,21 +267,147 @@ capacity. An abandoned attempt quarantines its capacity until startup recovery;
 a dropped future cannot free an uncertain execution's request. Retries release
 capacity during backoff.
 
+## Job history, metrics and events
+
+Did last night's cron job succeed? A run's detail goes after an hour, but its
+outcome stays with its definition. Each definition remembers its last 10
+finished runs: run ID, when it started and finished, how it ended, how many
+tasks succeeded, failed or never ran, and the lowest failed task index, which
+is where to start reading failure output:
+
+```sh
+relish jobs --definitions
+```
+
+```text
+ops/nightly revision 2: 1 tasks, UTC schedule 0 3 * * *
+  run 41 finished 2026-10-11 03:00 UTC: CompletedWithFailures, 0 succeeded, 1 failed; first failure: task 0
+  run 40 finished 2026-10-10 03:00 UTC: Succeeded, 1 succeeded, 0 failed
+```
+
+The dashboard's job card shows a schedule's last five outcomes beside it.
+History lives with the definition, so schedules and deployment hooks keep it
+until you stop or delete them; a one-off definition and its history expire
+with its last run. Manifest profiles have no definition and keep no history.
+
+Every node exports Mayo series for the attempts it ran itself, so they survive
+a leader change. Each carries only `namespace`, `definition` (the job or array
+name), `profile` (a manifest's resource profile, `default` otherwise) and
+`node`, never a task index or run ID. A node keeps at most 1,024 label sets.
+
+| Series | Meaning |
+|--------|---------|
+| `job_attempts_started_total` | Attempts started, retries included |
+| `job_tasks_succeeded_total`, `job_tasks_failed_total` | Tasks that ended either way |
+| `job_task_retries_total` | Extra attempts spent on retries |
+| `job_tasks_running` | Attempts holding a slot now |
+| `job_task_duration_ms_bucket{le}`, `job_task_duration_ms_count` | Final-attempt durations, cumulative buckets from 1 ms to 16,384 ms and `+Inf` |
+| `job_cpu_percent`, `job_memory_bytes` | Usage of the running attempts, from their cgroups on Linux |
+
+Counters start at zero when a node restarts, as Prometheus counters do.
+
+The leader records one event per run, never one per task: `job-completed`
+when every task succeeded, `job-failed` when any failed for good,
+`job-cancelled`, and `job-unknown` when a node holding the run's work went
+quiet and nobody knows whether its tasks ran. `job-failed` and `job-unknown`
+also go to every alert destination (`[[alerts.destinations]]`) as a critical
+`job_run_failed` or `job_run_unknown_outcome` alert, labelled with `job`,
+`namespace` and `run`. A new leader doesn't announce runs that finished
+before it took over, so a run finishing in the second before a leader change
+can go unannounced; its outcome is still in the definition's history.
+
+`relish top` lists running array tasks as one row per definition and profile
+on each node, with the number of tasks in the PID column (`tasks:27`) and
+their CPU and memory. A singleton run keeps its own `run-ID` row.
+
 ## Execution and capacity limits
+
+Every namespace shares the cluster, so no namespace may take all of it:
+
+| Limit | Value | What happens past it |
+|-------|-------|----------------------|
+| Active runs, whole cluster | 128 | Nothing new starts until a run finishes |
+| Reserved for cron fires and deployment jobs | 32 of the 128 | Arrays, batches, profiles and manual runs stop at 96 |
+| Active arrays, batches, profiles and manual runs per namespace | 64 | Refused, naming the namespace and the cap |
+| Job definitions per namespace | 64 | Refused; one-off definitions expire with their last run |
+| Job definitions, whole cluster | 1,024 | Refused |
+| Retained run receipts, whole cluster | 2,048 | Retention keeps it below this backstop |
+| Finished submissions kept per namespace | 20 | The namespace's oldest detail is pruned |
+| Finished submissions kept, whole cluster | 24 | The namespace keeping the most loses its oldest |
+| Outcomes remembered per definition | 10 | The oldest outcome is dropped |
+| Named jobs in one finite batch | 64 | Refused |
+
+Cron fires and deployment hooks never compete with bulk work for their
+headroom, so a tenant filling its arrays can't stop another tenant's nightly
+job or block an apply. A cron fire refused even then is recorded as a skipped
+occurrence (see above), not retried for the rest of the minute.
+
+Namespace quotas cover jobs too. When the leader grants chunks, it charges
+each attempt a chunk can start (no more than the node's slots for it) at the
+template's CPU, memory and GPU requests, after the namespace's apps. If the
+quota has no room, the run gets no more grants and its status says why:
+`relish batch-status ID` shows `waiting for quota: …`, and the JSON summary has
+`quota_blocked` and `quota_blocked_reason`. Running attempts are never
+cancelled; grants resume as they finish. Jobs use what apps leave: an app that
+fits its namespace quota is never displaced by that namespace's jobs. A chunk
+costs up to one node's slots at once, so set `--concurrency` (per-node
+concurrency) low enough for one node's share to fit the quota.
+
+The leader syncs every node once a second and writes one Raft entry per tick
+for all running arrays together, however many there are. It waits for the
+nodes' answers for half a second at most. A node that's slow or hung (still in
+gossip, but its API doesn't answer) delays only its own grants: the others are
+planned from the answers that arrived, and the slow node's call carries over
+into later ticks rather than being repeated. Its chunks stay with it until it
+has been silent for 30 seconds, then go to other nodes at the next attempt, as
+for a node that left.
+
+Small chunks spread across many nodes are safe for the replicated state. The
+leader records which node and grant finished each chunk, and once that record
+passes 4,096 ranges it keeps only the grant, which is enough to pick the right
+result. An array of 65,536 one-task chunks on ten nodes stays under 60 KiB of
+state. For a compacted chunk, `relish batch results` and `relish batch logs`
+ask every node rather than the one that ran it, so a page contacts more
+workers. Larger chunks still cost less dispatch per task.
 
 Explicit bulk execution is at least once. Ordinary jobs and hooks use
 acknowledged replay for unknown outcomes. A lost worker or a crash before a durable outcome
 can rerun a task, so external effects need a stable business idempotency key.
 Array ID and index identify a task within this cluster history; backup rollback
 or a new cluster can reuse those IDs. Grant fencing prevents accepting an obsolete result; it cannot undo
-an external effect. Submission timeouts have an uncertain outcome. Reuse the same `Idempotency-Key`
-for array, finite group or apply admission; the JSON definition endpoint uses
-`request_id`. Changed content under a retained identity is refused. Dedupe lasts
-while that receipt is retained; a new request creates new identities. Workers repair an incomplete ledger tail before appending,
+an external effect. Submission timeouts have an uncertain outcome. `relish run
+--batch`, `relish batch FILE` and `relish batch submit` print an idempotency key
+on stderr before they send anything:
+
+```text
+idempotency key 3f9c…; if this submission times out, retry with --idempotency-key 3f9c…
+```
+
+Retry with that `--idempotency-key` and the cluster returns the runs it already
+admitted rather than starting a second array. API clients send the same
+`Idempotency-Key` header for array, manifest, finite group or apply admission;
+the JSON definition endpoint uses `request_id`. A request without one is always
+new work. Changed content under a retained identity is refused. Dedupe lasts
+while that receipt is retained; a new request creates new identities.
+
+Manifests, cohorts and JSON `tasks` objects refuse fields they don't know. A
+typo such as `task_timeout = 30` or `max_attempt = 1` fails, including at
+`relish batch submit --dry-run`, instead of silently falling back to the
+defaults (three attempts and 600 seconds). Array templates refuse the TOML job
+policy fields; set them beside the template. Workers repair an incomplete ledger tail before appending,
 commit incremental outcomes in groups and acknowledge chunks only after
 outcomes and their result index are durable. Standalone admission reserves sparse progress within its 64 MiB store before
 accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
+
+A worker holds at most 50 bytes of disk per accepted task while the cluster
+lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
+million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
+about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
+tasks' head and tail per chunk. All of it goes when the run retires. Task data,
+together with the node's audit log, counts toward disk pressure: past a quarter of the filesystem, or with less
+than 1 GiB free, a worker finishes the chunks it holds but advertises no
+free slots, so it takes no new grants until retention frees space.
 
 After council disaster recovery advances the recovery epoch, workers with old
 array directories stop their attempts and persist a refusal. Old results and
@@ -245,6 +440,26 @@ Ordinary `[job]` host commands, and every host command on other platforms, use
 the original owned process backend and refuse explicit limits. Containers and native jobs
 keep separate execution capabilities.
 
+Linux turns `[process_workloads] mount_isolation` on by default, and host jobs
+don't run under it yet (#714). Until they do, every node that should run host
+jobs needs this in its config:
+
+```toml
+[process_workloads]
+mount_isolation = false
+```
+
+Forget it and the cluster says so straight away. A standalone node refuses the
+submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
+and the reason. In a cluster the run is admitted, because some other node might
+take it, and the leader fails it within a sync or two once every node it can
+reach has refused it. `relish batch-status` and `relish jobs` then show
+`Failed`, every task not run, and a `refused:` line quoting the nodes' reason;
+the JSON summary carries it as `unrunnable_reason`. The same rule catches any
+refusal that comes from a node's own configuration, such as a binary missing
+from every node's `allowed_binaries`. A run that only some nodes refuse keeps
+going on the others.
+
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
 
 ```sh
@@ -260,6 +475,22 @@ burst limits. Reservations remain charged while a compatible executor is idle;
 it expires after a second and yields to waiting profiles. Native host jobs keep
 host filesystem access and Bun's user. The raw VM baseline bypasses admission,
 resource limits, durable ownership and task outcomes.
+
+### Apps and jobs share each node
+
+Jobs and applications draw on the same per-node execution budget. App
+replicas, running task attempts and reusable executors each lease their CPU
+and memory requests from it; a queued chunk, a retry waiting out its backoff
+and an idle schedule hold nothing. Each node's state report carries what its
+task attempts and executors hold, separately from its app requests, and the
+leader counts both when it places an app replica. A node full of job work
+looks full, so the replica goes to a node with room.
+
+Placement and attempts can still race: jobs may take a node's room between the
+leader placing a replica and the node starting it. The agent doesn't wait or
+preempt running attempts. It reports the refusal, and the leader moves that
+replica to another node. Capacity a job held returns to the budget only once
+its attempt has positively retired.
 
 
 ## Reusable containers
@@ -281,6 +512,10 @@ keeps at most 32 compatible containers. The compatibility key includes the
 pinned image, namespace, live credentials and resource profile. Each container
 runs one command at a time, as a separate process. Jobs, arrays, schedules and
 hooks keep their common run identities, retries and durable results.
+Once a container's retirement is proven, the worker deletes its runtime
+journal, bundle and route files, and at startup it sweeps any an interrupted
+retirement left behind, so executor metadata doesn't grow with every namespace
+that ever ran a job.
 
 The command is born in its task cgroup, with independent CPU and memory limits.
 It receives its own mount and IPC namespaces, empty environment before explicit
@@ -299,8 +534,15 @@ the helper. It yields to waiting requests and expires after one idle second.
 A timeout, cancellation, lost policy or uncertain receipt retires the whole
 container before its resources can be used again. Waiting for a compatible
 slot or resource admission does not consume the command's attempt timeout;
-cold preparation counts after the full profile is reserved. Abandoned ownership remains
-quarantined until recovery retires the original generation. Host execution,
+cold preparation counts after the full profile is reserved. Cancellation and
+the timeout interrupt cold preparation too: an attempt stuck behind a slow
+image pull or a helper that never connects stops there, and the half-started
+container is retired. The pull itself carries on in the background and warms
+the image cache. If the caller disappears in the middle of a command, the idle
+eviction loop retires its container and frees the slot and reservation without
+a restart. Only a container whose task cgroup never empties (a command stuck in
+an uninterruptible kernel wait) stays quarantined, holding its slot and
+reservation, until it finally retires. Host execution,
 rootless runtimes and GPU requests cannot select this mode. Kubernetes export
 turns it into an ordinary Job, which starts a fresh Pod for every attempt, and
 reports the reused container as unsupported: a Job cannot preserve this contract.
@@ -313,6 +555,23 @@ Host jobs report `process`. On rootful Linux runc, memory-limited image jobs dis
 in both fresh and reused execution. A job exceeding its RAM limit can be OOM-killed; it cannot silently
 spill into swap and consume unaccounted disk I/O. Choose the memory range for
 the actual working set, including model weights.
+
+Some limits are fixed rather than derived from the profile. Each command's
+task cgroup allows 256 processes and threads (`pids.max`); threads count, so a
+JVM or another heavily threaded command may need fresh containers instead. The
+helper's own cgroup allows 16, outside the command's limits. `/tmp` and
+`/dev/shm` are 16 MiB tmpfs mounts, and regular files written anywhere are
+capped at 1 MiB.
+
+Reusable executors need Linux 5.8 or later, the same minimum as the rest of
+the node. Bun checks the kernel the first time it is asked for an executor and
+logs what it found. On an older kernel the pools are off: `shared-runc` jobs
+fail with a reason, and host jobs use the original owned process backend,
+which refuses explicit CPU and memory ranges. A kernel without `cgroup.kill`
+(before 5.14, such as Debian 11's 5.10) keeps its pools: retirement freezes the
+task cgroup and kills each process in it instead. Native host executors also
+need `CONFIG_PROC_CHILDREN`, which every mainstream distribution kernel
+enables; without it host jobs take the fallback path too.
 
 Compare accepted-success rates over the whole run and service
 latency alongside launch rates; container reuse alone does not qualify the
@@ -340,12 +599,36 @@ GPU placement is tracked separately in #359. Test-lease workloads retain their
 lease-aware admission; unowned lease namespaces and images are refused here.
 
 With eBPF enabled, image tasks inherit their namespace before starting. They
-may reach services in that namespace; cross-namespace services are refused.
-Batch templates currently have no explicit cross-namespace grant or egress
-allowlist fields. Without eBPF, namespace network enforcement is unavailable,
-as it is for ordinary apps. The worker caches at most 256 namespace bindings,
-evicts only idle bindings, and journals them for cleanup after old executors
-retire at startup. Losing the source binding stops its original runtime owner.
+may reach services in that namespace; cross-namespace services are refused,
+at their VIPs and their real addresses alike. A job, or a batch template,
+takes the same network policy an app does:
+
+```toml
+[job.crawl]
+image = "registry.example.com/crawler@sha256:..."
+runtime = "shared-runc"
+
+[job.crawl.egress]
+allow = ["api.example.com:443"]
+
+[job.crawl.firewall]
+allow_from = ["frontend/dashboard"]
+```
+
+The egress allowlist goes into the task's cgroup before its command runs, and
+always permits the node's DNS responder on port 53. A name that doesn't
+resolve within five seconds refuses the attempt rather than starting it
+without its allowlist. Reused executors run commands with the same allowlist
+only: the policy is part of the executor profile, so two templates that differ
+in `egress` or `firewall` never share a container. A job publishes no service,
+so `allow_from` names the apps in other namespaces that may reach the task's
+own container address. Both need a container task on rootful Linux runc with
+eBPF: nodes that can't enforce them refuse the array, and `runtime =
+"process"` refuses both. Without eBPF, namespace network enforcement is
+unavailable, as it is for ordinary apps. The worker caches at most 256
+namespace bindings, evicts only idle bindings, and journals them for cleanup
+after old executors retire at startup. Losing the source binding stops its
+original runtime owner.
 
 Local packing is non-preemptive. Existing applications have reserved requests;
 new deployments and rolling replacements also need free capacity. There is no
@@ -364,10 +647,10 @@ app scheduler. Set requests for services sharing a node with batch work, and
 leave capacity for rollouts. Admission protects requests; it cannot guarantee
 latency when workloads burst up to their limits.
 
-Namespace app quotas currently govern ordinary app placement, not delegated
-array resource usage. Scope checks still apply to submission and reads. Use
-admission limits and dedicated capacity for mutually untrusted batch tenants
-until tenant resource allocation is added.
+Namespace quotas govern both app placement and job grants (see
+[Execution and capacity limits](#execution-and-capacity-limits)); scope checks
+still apply to submission and reads. Quotas cap what each tenant holds. They
+don't share spare capacity fairly between tenants: there is no DRF.
 
 ## API admission shapes
 
@@ -492,8 +775,26 @@ Use `--cpu-request` to change admission while retaining the one-core limit,
 `--namespace` to select a namespace you can deploy into, and `--image` for another
 digest-pinned image containing `/bin/busybox`. A report file must not already
 exist. Without `--scenario`, `relish bench` still runs its ordinary data-plane
-suite. Its `--quick`, `--compare`, `--capacity` and `--disruptive` options belong
-to that suite and cannot be combined with job scenarios.
+suite. Its `--quick`, `--capacity` and `--disruptive` options belong to that
+suite and cannot be combined with job scenarios.
+
+`--compare` works for both. Given an earlier `--report` file from the same
+scenario, it compares the window rates and fails when this run is slower by
+more than `--tolerance` percent (10 by default):
+
+```sh
+relish bench --scenario jobs-host-processes --report before.json
+# ... change something ...
+relish bench --scenario jobs-host-processes --compare before.json --tolerance 15
+```
+
+A baseline from another scenario, or one that didn't complete and clean up,
+is refused before anything runs. A different window, concurrency, CPU
+request, image or executable makes the verdict informational: it's printed
+but never fails the command. Compare on the same rig and build only; a laptop
+VM moved by about 11% between two sessions of the same binary. The
+[five-round rerun's reports](../qualification/2026-10-09-timed-job-scenarios/README.md#independent-five-round-rerun)
+are committed as baselines for that rig.
 
 The public clock starts before submission. Image pulls and cold executors are
 included unless you prepare the image before running. Fresh containers use
@@ -610,17 +911,21 @@ uses a mixed-profile reusable manifest and a running application:
 python3 scripts/demo/verify-job-recovery.py mixed-jobs.toml \
   --bun /opt/qualification/bun --relish /opt/qualification/relish \
   --config /opt/qualification/node.toml --pid-file /opt/qualification/bun.pid \
-  --node-name worker-1 --service-name web --service-url http://app.example/health \
+  --service-name web --service-url http://app.example/health \
   --output recovery-proof
 ```
 
 Set the ordinary `RELIABURGER_ENDPOINT`, `RELIABURGER_CA_CERT` and
-`RELIABURGER_TOKEN` environment variables. The probe checks the original binary
+`RELIABURGER_TOKEN` environment variables; the probe reaches the cluster only
+through `relish`, so a deployer token is enough. It checks the original binary
 and configuration before using a Linux PID handle to kill Bun during partially
 accepted completion. It starts the same binary/configuration, updates the PID
 file, verifies the application's original PID, resumed accepted outcomes and
-selected indexes, and rejects a stale control version over verified node TLS.
-The replacement remains running. Preserve its binary and ownership journals
+selected indexes, and checks that no worker reports a refusal and no owner is
+left unknown. An ordinary token can't send control messages, so the probe
+doesn't replay a stale control version itself; the portable test
+`task_array_recovery::stale_control_cannot_delete_ledgers_after_a_restart`
+covers that fence. The replacement remains running. Preserve its binary and ownership journals
 until normal workload retirement. This proves a single-node crash; separate
 multi-node and sustained fault cases remain necessary.
 
@@ -710,8 +1015,9 @@ The original node/application identities remained stable until the fixture and
 its exact kernel owner retired after measurement.
 
 Disk use grew materially: sampled VM free disk ended at 209.6 MiB, and all capped
-storage scans were incomplete. The four fresh retries recovered, but retained
-final outcomes don't identify their earlier failure causes. The [full hourly
+storage scans were incomplete. The four fresh retries recovered, but that
+build's retained final outcomes didn't identify their earlier failure causes;
+summaries now count retries by cause. The [full hourly
 record](../qualification/2026-10-09-timed-job-scenarios/README.md#hourly-sequence)
 includes resource samples, latency, cleanup proofs and these diagnostic limits.
 These completed hours establish saturation observations; global metadata bounds,

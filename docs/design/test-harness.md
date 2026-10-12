@@ -205,7 +205,58 @@ Harnesses own their spawned tasks and cancellation tokens. The main ProcessGrill
 waits for shutdown in `Drop`, then aborts only after a bounded grace period. TCP reporting
 does the same for listeners, workers and aggregators. Tests bind port `0`, use temporary
 directories and keep every resource scoped so worktrees and nextest processes can run
-concurrently.
+concurrently. A listener that must come back on the same port after a restart or an
+upgrade exec is the exception: it leases its port instead (see the cluster fixtures below).
+
+## A new executable's first launch
+
+On macOS the first `exec` of a newly written executable waits for `syspolicyd` to assess
+it. Terminals with the Developer Tools permission are exempt, so a test can pass every
+time on a developer's laptop and still time out on a CI runner or in an agent's shell. The
+wait happens in the child after `posix_spawn` has returned, so it lands inside any deadline
+the test put around the child, and assessments queue host-wide: a freshly linked debug
+`relish` (about 490 MB) took 4 to 8 seconds alone and over 15 seconds while two other fresh
+binaries were being assessed ([#573](https://github.com/reliaburger/reliaburger/issues/573)).
+A small fresh script waits in the same queue.
+
+A fixture that times a subprocess therefore pays the first launch outside its deadline.
+`tests/support/first_launch.rs` runs each executable once, all at the same time, with a
+45-second bound that names the phase if the queue never drains, and remembers which paths
+it has launched in this test process. The behavioural deadline then measures only the
+program it was written for.
+
+Fake tools are the bigger source. nextest runs every test in its own process, so a script
+each test writes for itself is a new file every time, and six lifecycle tests starting
+together each queued a fresh `limactl` behind the others
+([#582](https://github.com/reliaburger/reliaburger/issues/582)). Fixtures install scripts
+with `install_script(path, body)` instead of `std::fs::write`. It keeps one read-only copy
+of each distinct body, named by its SHA-256, in a directory only the current user can
+write (`reliaburger-fixture-scripts-<uid>` under the system temporary directory), launches
+it once with `--reliaburger-first-launch` (a line the helper adds, so the body doesn't
+run), and hard-links it to `path`. A hard link shares the already-assessed file; a copy is
+a new file that gets assessed again. Per-test state goes beside the link, and the script
+finds it through `${0%/*}`, the directory of the name it was started as, so one body
+serves every test. Library unit tests reach the same file through
+`#[cfg(all(test, unix))] #[path = "../tests/support/first_launch.rs"] mod first_launch;`
+in `src/lib.rs`.
+
+That one shared launch still queues behind whatever else the host is assessing, including
+another worktree's freshly built binaries: a two-line script waited up to 32 s behind one
+fresh 800 MB test binary, and 75 to 94 s behind two at load average 50 to 180. A fake that
+the code under test runs through a configurable program path can avoid the launch
+altogether. The quickstart lifecycle fake is a plain script run as `/bin/sh <script> <args>`
+via the test-only `Lima::shell_script`
+([#762](https://github.com/reliaburger/reliaburger/issues/762)); `/bin/sh` is a system
+binary and never assessed, and the same script started that way took 0.02 s. The runner's
+fake `limactl` does the same, and the provisioning tests define their stub `apt-get`,
+`systemctl`, `dpkg-query` and `install` as Bash functions ahead of the script instead of
+files on `PATH`. Prefer this
+shape for a new fixture whose caller can take an interpreter; use `install_script` when the
+caller needs a single executable path.
+
+The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
+depends on `make warm-executables`, which runs each of them once before the suite
+([#722](https://github.com/reliaburger/reliaburger/issues/722)).
 
 ## Benchmarks and coverage
 
@@ -322,3 +373,66 @@ included once at the suite root and reached through `crate::`.
 Multi-node tests start their clusters through `tests/support/cluster.rs`: the fully wired
 `bun --cluster` node, the in-memory five-node council, `local`, `wait_until` and the leader
 waits all live there, so include it rather than copying another start-up helper.
+
+A cluster test shares nothing with another test or with an earlier run. `make test-cluster`
+runs its binaries side by side, and #721 found two ways that went wrong in
+`cluster_failover`: a fixed port block that `placement` also used (node `fo3`'s reporting
+port was `wk1`'s Raft port, so whichever started second failed with "Address already in
+use"), and a fixed data directory that a killed root run left with a `reliaburger-identity`
+tmpfs still mounted, which `start_wired_node` failed to remove and then reused. So:
+
+- lease each node's port block with `reserve_port_block_lease` from
+  `tests/support/bun_process.rs` and hold it until the test ends;
+- give each test its own temporary `data_root`; `start_wired_node` clears a node's directory
+  with `clear_fixture_dir`, which unmounts anything beneath it on Linux and fails the test
+  rather than starting on what it couldn't remove;
+- ask the cluster which node leads before writing, reading the leader's aggregated reports
+  or killing it. Leadership can move under load, and a write to a follower returns
+  `ForwardToLeader`.
+
+Older suites (`placement`, `cluster_task_arrays`, `council_disaster_recovery`) still use
+fixed blocks below the leased 27000–30000 range; keep new fixed ports out of that range.
+
+The same rule covers any port a process gives up and binds again: a crash fixture's
+restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
+new binary binds the configured ports once it starts. Never choose such a port with
+`bind("127.0.0.1:0")` and release it. That port comes from the ephemeral range, and in the
+gap any other test's `bind(0)`, outgoing `connect()` or slirp forward can take it. That was
+one of #734's two causes: `oci_crash`'s upgrade fixture released its API port, a parallel
+`owned_rootless` test could draw the same number for a slirp forward, and the exec'd Bun
+exited with "Address already in use". Nothing restarts Bun in that fixture, so the walk
+reported only "owned runtime never settled on v0.1.0" after 45 seconds. (The other cause
+was in the product: adoption after an exec refused while the old process's last `runc`
+command was still finishing; see chapter 15.) The upgrade
+fixtures in `oci_crash`, `self_upgrade` and `self_upgrade_cluster`, and the slirp host
+ports in `owned_rootless`, now lease their ports for the whole test. The settle wait also
+fails at once with the node log when the Bun it watches exits.
+
+Cleanup has to find everything a test started, including processes whose command lines
+don't name the test root. `oci_crash`'s `RootCleanup` killed only those that did, so a
+failed rootless run leaked its `slirp4netns` helper: the helper names only its generation's
+`/tmp/rbr-<uid>-<generation>/` directory. The leaked helper also kept every descriptor it
+inherited, including the lock the shared Linux test VM queues its users on, and it held
+that lock for an hour. `RootCleanup` now reads each node's runtime intents for those
+directories and kills whatever names them too.
+
+Cleanup must also stop at what the test owns. The scan reads every process on the host, and
+on a CI runner that includes the runner. Until #800 it killed the whole process group of any
+match outside the test's own group. From #758 on, a match could be any process with a file
+open under the root. A process the test didn't start, sitting in someone else's group, would have taken
+that group down with it. A runner killed that way loses the job and every log it had.
+That is how the privileged Linux job's OCI step failed five times on 11 October, though no
+run proved which process matched. The rule now
+lives in one place, [`tests/support/root_processes.rs`](../../tests/support/root_processes.rs),
+shared by `oci_crash`, `kubernetes_demo` and `autoscale_memory`:
+
+- A process counts as the test's if its command line names one of the test's unique paths,
+  or if it descends from the test process. Holding a file under the root isn't enough.
+- A group is killed only when one of the test's processes leads it, as Bun's detached owners
+  do. Any other process of the test's is killed alone.
+- Anything else is left running, and the cleanup logs that it spared it.
+
+`root_teardown` in the portable suite proves it on Linux. A sleeper started through
+`setsid -f` (its own group, outside the test's tree) holds a file under the root. Next to it
+runs an owner that leads its own group. Teardown must kill the owner and its child and leave
+the sleeper running.
