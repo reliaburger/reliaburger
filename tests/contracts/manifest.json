@@ -11,6 +11,7 @@
         "coverage"
       ],
       "required_in": [
+        "light",
         "portable",
         "full"
       ]
@@ -39,6 +40,7 @@
         "test-contract-boundaries"
       ],
       "required_in": [
+        "light",
         "portable",
         "full"
       ]
@@ -7344,6 +7346,33 @@
             "tests/registry_durability.rs"
           ]
         }
+      ]
+    },
+    {
+      "id": "issue-823-runc-launches-survive-a-switch-to-the-mixed-runtime",
+      "issue": 823,
+      "promise": "A node restarted from the runc runtime to the mixed runtime routes each running container to the runc owner that launched it, so startup recovery reads it instead of stopping Bun.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "runtime-switch-runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A launch both backends claim stays unrouted, and recovery refuses it as before."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate; the portable mixed-runtime tests cover the routing rules with mock backends."
       ]
     }
   ]

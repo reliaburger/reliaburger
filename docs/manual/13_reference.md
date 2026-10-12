@@ -39,7 +39,10 @@ backups use each backend's standard credential variables.
 | `--compatibility` | | print the protocol and state formats this binary supports |
 
 Linux `--runtime mixed` enables both container and host backends. Auto may
-select both; explicit `--runtime runc` selects containers only. Jobs choose
+select both; explicit `--runtime runc` selects containers only. Restarting a
+node from `runc` to `mixed` (or `auto`) keeps its running containers: Bun
+adopts each one through runc. A node with running image apps can't yet switch
+from `process` to `mixed` (#827). Jobs choose
 `runtime="runc"` (default), `runtime="process"` or `runtime="shared-runc"`.
 Process jobs refuse images and container jobs refuse host exec/script fields.
 
