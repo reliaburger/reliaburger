@@ -20,8 +20,8 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Validates and rate-limits incoming webhooks.
 pub struct WebhookValidator {
-    /// HMAC key for signature validation.
-    secret: Vec<u8>,
+    /// HMAC key for signature validation; `None` refuses every webhook.
+    secret: Option<Vec<u8>>,
     /// Maximum triggers per minute.
     rate_limit: u32,
     /// Recent delivery IDs for replay detection.
@@ -68,13 +68,42 @@ impl WebhookValidator {
     /// Create a validator that reads the time from `clock`.
     pub fn with_clock(secret: &str, rate_limit: u32, clock: Clock) -> Self {
         Self {
-            secret: secret.as_bytes().to_vec(),
+            secret: Some(secret.as_bytes().to_vec()),
             rate_limit,
             recent_ids: VecDeque::with_capacity(1000),
             max_replay_entries: 1000,
             recent_triggers: VecDeque::with_capacity(rate_limit as usize),
             clock,
         }
+    }
+
+    /// A validator with no secret yet: it refuses every webhook until
+    /// [`rekey`](Self::rekey) gives it one. A cluster node whose own
+    /// `[gitops]` has no secret starts with this and takes the cluster's.
+    pub fn unkeyed(rate_limit: u32) -> Self {
+        Self {
+            secret: None,
+            ..Self::new("", rate_limit)
+        }
+    }
+
+    /// Use the cluster's current secret and rate limit (#693). The replay
+    /// and rate windows carry over, so a rekey can't reopen a replay.
+    pub fn rekey(&mut self, secret: Option<&str>, rate_limit: u32) {
+        self.secret = secret.map(|secret| secret.as_bytes().to_vec());
+        self.rate_limit = rate_limit;
+    }
+
+    /// Whether the validator has a secret to check webhooks against.
+    pub fn is_keyed(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    /// The secret, or an error when there is none: fail closed.
+    fn key(&self) -> Result<&[u8], LettuceError> {
+        self.secret
+            .as_deref()
+            .ok_or_else(|| LettuceError::WebhookInvalid("webhook secret not configured".into()))
     }
 
     /// Authenticate and reserve local budgets until admission commits or drops.
@@ -141,7 +170,7 @@ impl WebhookValidator {
         delivery_id: Option<&str>,
         branch: &str,
     ) -> Result<WebhookEvent, LettuceError> {
-        if !constant_time_eq(token.as_bytes(), &self.secret) {
+        if !constant_time_eq(token.as_bytes(), self.key()?) {
             return Err(LettuceError::WebhookInvalid("token mismatch".to_string()));
         }
         self.check_replay_and_rate(delivery_id)?;
@@ -214,7 +243,7 @@ impl WebhookValidator {
         let expected_sig = hex::decode(sig_hex)
             .map_err(|_| LettuceError::WebhookInvalid("invalid hex in signature".to_string()))?;
 
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.secret);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, self.key()?);
         hmac::verify(&key, body, &expected_sig)
             .map_err(|_| LettuceError::WebhookInvalid("signature mismatch".to_string()))
     }
@@ -253,6 +282,34 @@ mod tests {
         let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
         let tag = hmac::sign(&key, body);
         format!("sha256={}", hex::encode(tag.as_ref()))
+    }
+
+    /// #693: a node with no secret of its own refuses every webhook, even
+    /// one signed with an empty key, until it takes the cluster's secret.
+    #[test]
+    fn an_unkeyed_validator_fails_closed_until_rekeyed() {
+        let mut validator = WebhookValidator::unkeyed(10);
+        let body = br#"{"after": "abc123"}"#;
+        assert!(!validator.is_keyed());
+        let empty = sign_payload("", body);
+        assert!(
+            validator
+                .validate(body, Some(&empty), Some("d1"), "main")
+                .is_err()
+        );
+        assert!(
+            validator
+                .validate_gitlab(body, "", Some("d2"), "main")
+                .is_err()
+        );
+
+        validator.rekey(Some("cluster-secret"), 10);
+        let signed = sign_payload("cluster-secret", body);
+        assert!(
+            validator
+                .validate(body, Some(&signed), Some("d3"), "main")
+                .is_ok()
+        );
     }
 
     #[test]

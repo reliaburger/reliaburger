@@ -4,55 +4,81 @@
 //! a leader-only task that clones the configured repo, syncs on a poll
 //! timer or a webhook nudge, and applies the resulting `ResourceChange`s
 //! to Raft desired state — the same `AppSpec`/`AppDelete` writes a
-//! manual `relish apply` makes.
+//! manual `relish apply` makes, wrapped in a `GitOpsWrite` that records
+//! what GitOps owns (#693).
+//!
+//! The configuration comes from Raft, not from the node's `node.toml`
+//! (#693). A node's `[gitops]` section seeds Raft when the cluster has
+//! none; after that every leader syncs the same repository, and a node
+//! whose own section differs reports it rather than using it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::council::node::CouncilNode;
 use crate::council::types::{CouncilResponse, DesiredState, RaftRequest};
 use crate::pickle::binding::ImageBinder;
 
-use super::diff::{ChangePayload, ResourceChange};
+use super::diff::{ChangePayload, CurrentState, ResourceChange};
 use super::git::GitRepo;
 use super::subprocess::CommandBudget;
 use super::sync::{SyncOutcome, execute_sync};
 use super::types::{
-    CommitInfo, CoordinatorElection, CoordinatorElectionReason, GitOpsConfig, SyncHistoryEntry,
-    SyncPhase, SyncResult, SyncState,
+    CommitInfo, CoordinatorElection, CoordinatorElectionReason, GitOpsConfig, LettuceError,
+    LocalConfigCheck, StoredGitOpsConfig, SyncHistoryEntry, SyncPhase, SyncResult, SyncState,
+    check_local_config,
 };
 
 /// How many past syncs `SyncState.history` retains (oldest dropped first).
 const MAX_SYNC_HISTORY: usize = 100;
 
-/// Spawn the leader-only GitOps sync loop.
+/// The poll interval before the cluster's configuration is known.
+const DEFAULT_POLL: Duration = Duration::from_secs(30);
+
+/// A running GitOps sync loop.
+#[derive(Debug)]
+pub struct GitOpsSync {
+    /// Finishes once the shutdown token is cancelled.
+    pub task: tokio::task::JoinHandle<()>,
+    /// How this node's own `[gitops]` section compares with the cluster's,
+    /// refreshed on every tick. The API serves it to `relish wtf`.
+    pub local_check: watch::Receiver<LocalConfigCheck>,
+}
+
+/// Spawn the GitOps sync loop.
 ///
-/// Syncs when the poll timer fires or a webhook arrives (whichever
-/// comes first). Non-leaders idle; the git clone and sync run in
-/// `spawn_blocking` because `GitRepo` shells out to `git`.
+/// Every cluster node runs it. Each tick compares the node's own
+/// `[gitops]` section (`local_config`) with the configuration in Raft and
+/// publishes the result on [`GitOpsSync::local_check`]. Only the leader
+/// goes further: it seeds Raft from `local_config` when the cluster has no
+/// configuration, then syncs whatever Raft holds. The git clone and sync
+/// run in `spawn_blocking` because `GitRepo` shells out to `git`.
 ///
-/// Every sync reconciles Git against desired state, even when Git hasn't
-/// moved, so a manual change is repaired on the next tick (B16). The
-/// returned handle finishes once `shutdown` is cancelled; a `git` child
-/// running at that moment is killed rather than waited for (B19).
+/// It syncs when the poll timer fires or a webhook arrives (whichever
+/// comes first). Every sync reconciles Git against desired state, even
+/// when Git hasn't moved, so a manual change to a GitOps resource is
+/// repaired on the next tick (B16). The task finishes once `shutdown` is
+/// cancelled; a `git` child running at that moment is killed rather than
+/// waited for (B19).
 ///
 /// With a `binder` (the leader's runtime pulls images), each app's images
 /// bind to digests as they're written, as a manual apply binds them.
 pub fn spawn_gitops_sync(
     council: Arc<CouncilNode>,
-    config: GitOpsConfig,
+    local_config: Option<GitOpsConfig>,
     mut webhook_rx: mpsc::Receiver<()>,
     data_dir: PathBuf,
     shutdown: CancellationToken,
     binder: Option<ImageBinder>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> GitOpsSync {
+    let (check_tx, local_check) = watch::channel(LocalConfigCheck::Unknown);
+    let task = tokio::spawn(async move {
         let repo_dir = data_dir.join("gitops-repo");
-        let poll = Duration::from_secs(config.poll_interval_secs.max(1));
+        let mut poll = local_config.as_ref().map_or(DEFAULT_POLL, poll_interval);
         let mut ticker = tokio::time::interval(poll);
         let mut triggers = council.gitops_trigger_updates();
         let mut leadership = council.metrics();
@@ -79,11 +105,48 @@ pub fn spawn_gitops_sync(
                 }
             };
 
+            // The term comes first: a snapshot read after it is at least as
+            // new, and every write below must commit in this same term, or
+            // the state machine refuses it (finding 7).
+            let term = council.current_term();
+            let mut desired = council.desired_state().await;
+            let master_key = council.wrapping_ikm().map(|key| key.as_slice());
+            let mut cluster_config = unseal(desired.gitops_config.as_ref(), master_key);
+            publish_local_check(&check_tx, local_config.as_ref(), cluster_config.as_ref());
+
             if !council.is_leader().await {
                 continue;
             }
 
-            let desired = council.desired_state().await;
+            if cluster_config.is_none() {
+                let Some(local) = &local_config else {
+                    continue; // GitOps is off for this cluster.
+                };
+                if !seed_cluster_config(&council, local, master_key).await {
+                    continue;
+                }
+                desired = council.desired_state().await;
+                cluster_config = unseal(desired.gitops_config.as_ref(), master_key);
+                publish_local_check(&check_tx, local_config.as_ref(), cluster_config.as_ref());
+            }
+            let config = match cluster_config {
+                None => continue,
+                Some(Ok(config)) => config,
+                Some(Err(error)) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    record_failure(&council, &desired, &error.to_string(), None, 0).await;
+                    backoff(poll, consecutive_failures, &shutdown).await;
+                    continue;
+                }
+            };
+            let configured_poll = poll_interval(&config);
+            if configured_poll != poll {
+                poll = configured_poll;
+                ticker = tokio::time::interval(poll);
+                // An interval's first tick is immediate; this one has run.
+                ticker.reset();
+            }
+
             if durable_wake
                 && !desired
                     .gitops_sync_state
@@ -95,6 +158,7 @@ pub fn spawn_gitops_sync(
             let current_apps = desired.apps.clone();
             let current_namespaces = desired.namespaces.clone();
             let current_permissions = desired.permissions.clone();
+            let owned = desired.gitops_owned.clone();
             let overrides = desired.autoscale_overrides.clone();
             let last_sha = desired
                 .gitops_sync_state
@@ -125,12 +189,16 @@ pub fn spawn_gitops_sync(
                     &config_clone.branch,
                     budget,
                 )?;
-                Ok::<_, super::types::LettuceError>(execute_sync(
+                let current = CurrentState {
+                    apps: &current_apps,
+                    namespaces: &current_namespaces,
+                    permissions: &current_permissions,
+                    owned: &owned,
+                };
+                Ok::<_, LettuceError>(execute_sync(
                     &repo,
                     &config_clone,
-                    &current_apps,
-                    &current_namespaces,
-                    &current_permissions,
+                    &current,
                     &overrides,
                     last_sha_clone.as_deref(),
                 ))
@@ -200,44 +268,39 @@ pub fn spawn_gitops_sync(
                 SyncResult::Success | SyncResult::PartialSuccess { .. } => {}
             }
 
-            // Apply each change through the SAME desired-state writes a
-            // manual `relish apply` makes (12b.2 T6). Every supported kind
-            // maps to a request: apps, namespaces and permissions. Trees
-            // containing jobs were explicitly refused by `execute_sync`.
+            let warnings_changed = desired
+                .gitops_sync_state
+                .as_ref()
+                .is_none_or(|state| state.warnings != outcome.warnings);
+            if warnings_changed {
+                for warning in &outcome.warnings {
+                    eprintln!("gitops: warning: {warning}");
+                }
+            }
+
+            // Apply every change through the SAME desired-state writes a
+            // manual `relish apply` makes (12b.2 T6), each wrapped so the
+            // state machine records what GitOps owns. A refused change no
+            // longer blocks the rest (#693): every change is tried and
+            // every refusal named.
             //
             // Atomicity (D12): `last_applied_commit` advances only if
-            // EVERY write in the sync succeeds. The old code advanced the
-            // commit regardless of per-change failures, so a failed write
-            // was marked "applied" and never retried — the resource just
-            // vanished until the next unrelated commit. Now a failure
-            // leaves the commit unadvanced, and the next tick re-applies
-            // the whole set. Writes are idempotent (spec upsert / delete),
-            // so re-applying an already-committed change is a harmless
-            // no-op.
-            let applied = match apply_changes(&council, &outcome.changes, binder.as_ref()).await {
-                Ok(applied) => applied,
-                Err(unapplied) => {
-                    let sha = outcome
-                        .commit
-                        .as_ref()
-                        .map(|c| c.sha.as_str())
-                        .unwrap_or("?");
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    record_failure(
-                        &council,
-                        &desired,
-                        &format!(
-                            "apply of {sha} failed at {unapplied}; commit not advanced, \
-                             will retry"
-                        ),
-                        outcome.commit.as_ref(),
-                        duration_ms,
-                    )
-                    .await;
-                    backoff(poll, consecutive_failures, &shutdown).await;
-                    continue;
-                }
-            };
+            // EVERY write in the sync succeeded. A partial sync leaves the
+            // commit unadvanced and the next tick re-applies the whole set.
+            // Writes are idempotent (spec upsert / delete), so re-applying
+            // an already-committed change is a harmless no-op.
+            let report = apply_changes(&council, term, &outcome.changes, binder.as_ref()).await;
+            if let Some(reason) = &report.abandoned {
+                eprintln!("gitops: sync abandoned: {reason}");
+                continue;
+            }
+            if !report.refused.is_empty() {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                record_partial(&council, &desired, &outcome, &report.refused, duration_ms).await;
+                backoff(poll, consecutive_failures, &shutdown).await;
+                continue;
+            }
+            let applied = report.applied;
 
             // A clean cycle: reset the failure run and record the applied
             // commit (D12) plus the elected coordinator, then clear the
@@ -248,7 +311,7 @@ pub fn spawn_gitops_sync(
             consecutive_failures = 0;
             let sha = outcome.commit.as_ref().map(|c| c.sha.as_str());
             let same_commit = sha.is_some() && sha == last_sha.as_deref();
-            if same_commit && applied == 0 && sync_state_is_clean(&desired) {
+            if same_commit && applied == 0 && !warnings_changed && sync_state_is_clean(&desired) {
                 continue;
             }
             record_success(&council, &desired, &outcome, duration_ms).await;
@@ -265,7 +328,93 @@ pub fn spawn_gitops_sync(
                 );
             }
         }
-    })
+    });
+    GitOpsSync { task, local_check }
+}
+
+/// The poll interval a configuration asks for, at least a second.
+fn poll_interval(config: &GitOpsConfig) -> Duration {
+    Duration::from_secs(config.poll_interval_secs.max(1))
+}
+
+/// The cluster's configuration with its credentials, if it has one.
+fn unseal(
+    stored: Option<&StoredGitOpsConfig>,
+    master_key: Option<&[u8]>,
+) -> Option<Result<GitOpsConfig, LettuceError>> {
+    stored.map(|stored| stored.unseal(master_key))
+}
+
+/// Publish how this node's `[gitops]` compares with the cluster's, and log
+/// when that changes, so an ignored local section doesn't go unnoticed.
+fn publish_local_check(
+    check_tx: &watch::Sender<LocalConfigCheck>,
+    local: Option<&GitOpsConfig>,
+    cluster: Option<&Result<GitOpsConfig, LettuceError>>,
+) {
+    let check = check_local_config(local, cluster.map(Result::as_ref));
+    let changed = check_tx.send_if_modified(|current| {
+        if *current == check {
+            return false;
+        }
+        *current = check.clone();
+        true
+    });
+    if !changed {
+        return;
+    }
+    match &check {
+        LocalConfigCheck::Differs { fields } => eprintln!(
+            "gitops: this node's [gitops] differs from the cluster's ({}); the cluster's \
+             configuration in Raft is used. Change it with `relish gitops set`",
+            fields.join(", ")
+        ),
+        LocalConfigCheck::Unreadable { reason } => {
+            eprintln!("gitops: can't read the cluster's GitOps configuration: {reason}")
+        }
+        _ => {}
+    }
+}
+
+/// Seed the cluster's configuration from this node's `[gitops]` section.
+///
+/// Returns whether Raft now holds a configuration (this node's, or one
+/// another node seeded first). A section whose credentials can't be
+/// sealed is never written in clear: it's logged and skipped.
+async fn seed_cluster_config(
+    council: &CouncilNode,
+    local: &GitOpsConfig,
+    master_key: Option<&[u8]>,
+) -> bool {
+    let stored = match StoredGitOpsConfig::seal(local, master_key) {
+        Ok(stored) => stored,
+        Err(error) => {
+            eprintln!("gitops: not seeding the cluster from [gitops]: {error}");
+            return false;
+        }
+    };
+    match council
+        .write(RaftRequest::GitOpsConfigSet {
+            config: Some(Box::new(stored)),
+            seed: true,
+        })
+        .await
+    {
+        Ok(CouncilResponse::Refused { .. }) => true,
+        Ok(_) => {
+            println!(
+                "gitops: seeded the cluster's GitOps configuration from this node's [gitops] \
+                 ({} {})",
+                super::git::redact_url_credentials(&local.repo),
+                local.branch
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("gitops: could not seed the cluster's GitOps configuration: {error}");
+            false
+        }
+    }
 }
 
 /// Whether the recorded sync state has no error left to clear.
@@ -318,8 +467,8 @@ async fn record_failure(
     // A history entry is per-commit: repo-access and panic failures never
     // reached a commit, so there is nothing to attribute the failure to and
     // we record only the scalar error above. A commit-bearing failure (a bad
-    // signature, a parse/validation error, a half-applied set) does get an
-    // entry so the run shows up in the UI's timeline.
+    // signature, a parse/validation error) does get an entry so the run
+    // shows up in the UI's timeline.
     if let Some(commit) = commit {
         push_history(
             &mut sync_state,
@@ -342,6 +491,65 @@ async fn record_failure(
     {
         eprintln!("gitops: failed to record sync failure: {e}");
     }
+}
+
+/// Record a sync in which some changes were refused (#693, finding 4).
+///
+/// Every other change applied. The result is `PartialSuccess` naming each
+/// offender, in `last_error` and in the history; the applied commit stays
+/// where it was, so the next tick retries the refused changes (D12).
+async fn record_partial(
+    council: &CouncilNode,
+    desired: &DesiredState,
+    outcome: &SyncOutcome,
+    refused: &[String],
+    duration_ms: u64,
+) {
+    let sha = outcome
+        .commit
+        .as_ref()
+        .map_or("?", |commit| commit.sha.as_str());
+    let error = super::git::redact_url_credentials(&partial_sync_error(sha, refused));
+    eprintln!("gitops: {error}");
+    let now = now_millis();
+    let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
+    sync_state.phase = SyncPhase::Error;
+    sync_state.last_error = Some(error);
+    sync_state.consecutive_failures = sync_state.consecutive_failures.saturating_add(1);
+    sync_state.last_attempt_at = Some(now);
+    sync_state.last_sync_duration_ms = duration_ms;
+    sync_state.warnings = outcome.warnings.clone();
+    if let Some(commit) = &outcome.commit {
+        sync_state.last_fetched_commit = Some(commit.clone());
+        push_history(
+            &mut sync_state,
+            SyncHistoryEntry {
+                commit: commit.clone(),
+                timestamp: now,
+                duration_ms,
+                result: SyncResult::PartialSuccess {
+                    errors: refused.to_vec(),
+                },
+                diff_summary: outcome.diff_summary.clone(),
+            },
+        );
+    }
+    record_coordinator(council, &mut sync_state).await;
+    if let Err(e) = council
+        .write(RaftRequest::GitOpsSyncUpdate(Box::new(sync_state)))
+        .await
+    {
+        eprintln!("gitops: failed to record a partial sync: {e}");
+    }
+}
+
+/// The sync status line for a partial sync: every refused change, named.
+fn partial_sync_error(sha: &str, refused: &[String]) -> String {
+    format!(
+        "partial sync of {sha}: {} change(s) refused: {}; commit not advanced, will retry",
+        refused.len(),
+        refused.join("; ")
+    )
 }
 
 /// Record a clean sync in `SyncState`: advance the applied commit, clear
@@ -369,6 +577,7 @@ async fn record_success(
     sync_state.last_sync_duration_ms = duration_ms;
     sync_state.last_diff_summary = outcome.diff_summary.clone();
     sync_state.file_errors = outcome.file_errors.clone();
+    sync_state.warnings = outcome.warnings.clone();
     push_history(
         &mut sync_state,
         SyncHistoryEntry {
@@ -448,28 +657,49 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Apply a sync's changes to Raft, stopping at the first failure.
+/// What applying a sync's changes did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    /// Writes the cluster committed.
+    pub applied: usize,
+    /// Every change that didn't apply, as `resource_id: reason`.
+    pub refused: Vec<String>,
+    /// Set when leadership changed part-way and the sync stopped: the
+    /// remaining changes belong to the next leader's sync.
+    pub abandoned: Option<String>,
+}
+
+/// Apply a sync's changes to Raft, every one of them (#693, finding 4).
 ///
-/// Returns `Ok(count)` with the number of writes committed when every
-/// change applied, or `Err(resource_id)` naming the change that failed or
-/// that the state machine refused. The caller must advance `last_applied_commit` only on `Ok` — that's
-/// the D12 atomicity guarantee: a half-applied sync leaves the commit
-/// unadvanced so the next tick re-applies the whole (idempotent) set.
+/// Each change goes in a `GitOpsWrite` stamped with `term`, the term the
+/// sync read desired state in, so the state machine records ownership and
+/// refuses the write if leadership has moved since. A change the cluster
+/// refuses, or whose image can't be bound, is named in
+/// [`ApplyReport::refused`] and the rest still apply. The caller must
+/// advance `last_applied_commit` only when nothing was refused: that's the
+/// D12 guarantee that the next tick re-applies the (idempotent) set.
 ///
-/// With a `binder`, an app's images bind to digests before its write; an
-/// image that can't be bound fails the change like a refused write, and
-/// the error names the image.
+/// When the term moves, or this node stops leading, the sync is abandoned
+/// at once rather than applying the rest of a stale diff.
 pub async fn apply_changes(
     council: &CouncilNode,
+    term: u64,
     changes: &[ResourceChange],
     binder: Option<&ImageBinder>,
-) -> Result<usize, String> {
-    let mut applied = 0usize;
+) -> ApplyReport {
+    let mut report = ApplyReport::default();
     for change in changes {
+        if let Some(reason) = leadership_moved(council, term).await {
+            report.abandoned = Some(reason);
+            return report;
+        }
         let Some(mut request) = change_to_request(change) else {
             continue; // jobs/builds: not reconciled desired state
         };
-        if let (Some(binder), RaftRequest::AppSpec { app_id, spec }) = (binder, &mut request) {
+        let adopting = matches!(change, ResourceChange::Adopt { .. });
+        if let (Some(binder), RaftRequest::AppSpec { app_id, spec }, false) =
+            (binder, &mut request, adopting)
+        {
             let catalog = council.manifest_catalog().await;
             match binder.bind_app(&app_id.name, spec, &catalog).await {
                 Ok(bindings) => {
@@ -478,27 +708,56 @@ pub async fn apply_changes(
                     }
                 }
                 Err(error) => {
-                    eprintln!("gitops: failed to apply {}: {error}", change_id(change));
-                    return Err(format!("{} ({error})", change_id(change)));
+                    report
+                        .refused
+                        .push(format!("{} ({error})", change_id(change)));
+                    continue;
                 }
             }
         }
+        let write = RaftRequest::GitOpsWrite {
+            term,
+            change: Box::new(request),
+        };
         // A committed entry the state machine refused left desired state
         // unchanged, so it's as unapplied as a failed write (B15).
-        match council.write(request).await {
+        match council.write(write).await {
             Ok(CouncilResponse::Refused { reason }) => {
-                eprintln!("gitops: {} refused: {reason}", change_id(change));
-                return Err(change_id(change).to_string());
+                if let Some(moved) = leadership_moved(council, term).await {
+                    report.abandoned = Some(moved);
+                    return report;
+                }
+                report
+                    .refused
+                    .push(format!("{}: {reason}", change_id(change)));
             }
-            Ok(_) => {}
+            Ok(_) => report.applied += 1,
             Err(e) => {
-                eprintln!("gitops: failed to apply {}: {e}", change_id(change));
-                return Err(change_id(change).to_string());
+                if let Some(moved) = leadership_moved(council, term).await {
+                    report.abandoned = Some(moved);
+                    return report;
+                }
+                report
+                    .refused
+                    .push(format!("{}: write failed: {e}", change_id(change)));
             }
         }
-        applied += 1;
     }
-    Ok(applied)
+    report
+}
+
+/// Why this node may no longer apply a sync read in `term`, if it can't.
+async fn leadership_moved(council: &CouncilNode, term: u64) -> Option<String> {
+    let current = council.current_term();
+    if current != term {
+        return Some(format!(
+            "leadership changed (term {term} became {current}) during the sync"
+        ));
+    }
+    if !council.is_leader().await {
+        return Some("this node is no longer the leader".to_string());
+    }
+    None
 }
 
 /// Map a diff `ResourceChange` to the Raft write that realises it.
@@ -510,6 +769,7 @@ pub async fn apply_changes(
 fn change_to_request(change: &ResourceChange) -> Option<RaftRequest> {
     match change {
         ResourceChange::Add { resource_id, spec }
+        | ResourceChange::Adopt { resource_id, spec }
         | ResourceChange::Update {
             resource_id, spec, ..
         } => payload_to_request(resource_id, spec),
@@ -568,6 +828,7 @@ fn change_id(change: &ResourceChange) -> &str {
     match change {
         ResourceChange::Add { resource_id, .. }
         | ResourceChange::Update { resource_id, .. }
+        | ResourceChange::Adopt { resource_id, .. }
         | ResourceChange::Remove { resource_id } => resource_id,
     }
 }
@@ -711,6 +972,118 @@ mod tests {
             .is_none()
         );
     }
+    async fn leader_council() -> Arc<CouncilNode> {
+        use std::collections::BTreeMap;
+
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+
+        let raft_router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
+        let node = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        raft_router.register(1, node.raft().clone()).await;
+        let members = BTreeMap::from([(
+            1,
+            CouncilNodeInfo {
+                addr: "127.0.0.1:9445".parse().unwrap(),
+                name: "node-1".into(),
+            },
+        )]);
+        node.initialize(members).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !node.is_leader().await {
+            assert!(tokio::time::Instant::now() < deadline, "no leader");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Arc::new(node)
+    }
+
+    fn app_add(resource_id: &str) -> ResourceChange {
+        let spec = crate::config::Config::parse("[app.web]\nimage = \"x:1\"\n")
+            .unwrap()
+            .app
+            .remove("web")
+            .unwrap();
+        ResourceChange::Add {
+            resource_id: resource_id.to_string(),
+            spec: ChangePayload::App(Box::new(spec)),
+        }
+    }
+
+    /// The changes the tests below apply: two the cluster refuses (an app
+    /// in a test-lease namespace, and a delete of an app GitOps never
+    /// wrote) between two it accepts.
+    fn mixed_changes() -> Vec<ResourceChange> {
+        vec![
+            app_add("app.default/first"),
+            app_add("app.rbtest-lease/web"),
+            ResourceChange::Remove {
+                resource_id: "app.default/manual".into(),
+            },
+            app_add("app.default/last"),
+        ]
+    }
+
+    /// #693 (finding 4): a refused change no longer stops the sync; every
+    /// change after it is still applied.
+    #[tokio::test]
+    async fn one_refused_change_does_not_block_the_others() {
+        let council = leader_council().await;
+        let report = apply_changes(&council, council.current_term(), &mixed_changes(), None).await;
+        assert_eq!(report.applied, 2, "{report:?}");
+        assert!(report.abandoned.is_none());
+        let state = council.desired_state().await;
+        assert!(state.apps.contains_key(&AppId::new("first", "default")));
+        assert!(state.apps.contains_key(&AppId::new("last", "default")));
+        assert!(
+            state
+                .gitops_owned
+                .apps
+                .contains(&AppId::new("last", "default"))
+        );
+        council.shutdown().await.ok();
+    }
+
+    /// #693 (finding 4): the partial result names every offender, in the
+    /// report and in the sync status line.
+    #[tokio::test]
+    async fn partial_sync_names_every_offender() {
+        let council = leader_council().await;
+        let report = apply_changes(&council, council.current_term(), &mixed_changes(), None).await;
+        assert_eq!(report.refused.len(), 2, "{report:?}");
+        assert!(report.refused[0].starts_with("app.rbtest-lease/web: "));
+        assert!(report.refused[1].starts_with("app.default/manual: "));
+        let line = partial_sync_error("abc123", &report.refused);
+        assert!(line.contains("2 change(s) refused"), "{line}");
+        assert!(line.contains("app.rbtest-lease/web"), "{line}");
+        assert!(line.contains("app.default/manual"), "{line}");
+        council.shutdown().await.ok();
+    }
+
+    /// #693 (finding 7): a sync whose snapshot was read in an earlier term
+    /// writes nothing; the next leader's sync takes over.
+    #[tokio::test]
+    async fn sync_is_abandoned_when_the_term_changed() {
+        let council = leader_council().await;
+        let stale_term = council.current_term().saturating_sub(1);
+        let report = apply_changes(&council, stale_term, &mixed_changes(), None).await;
+        assert!(report.abandoned.is_some(), "{report:?}");
+        assert_eq!(report.applied, 0);
+        assert!(council.desired_state().await.apps.is_empty());
+        council.shutdown().await.ok();
+    }
+
     #[test]
     fn an_unchanged_commit_still_records_completion_of_a_pending_generation() {
         let mut desired = DesiredState {
