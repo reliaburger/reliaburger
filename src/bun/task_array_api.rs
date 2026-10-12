@@ -764,7 +764,10 @@ pub async fn sync_handler(
         return response;
     }
     match &state.task_arrays.node {
-        Some(node) => Json(node.sync(&request).await).into_response(),
+        Some(node) => match node.sync(&request).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => node_error(error),
+        },
         None => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "this node has no task-array executor",
@@ -781,6 +784,11 @@ fn node_error(error: TaskArrayNodeError) -> Response {
         // kept its share of failure output.
         TaskArrayNodeError::OutputNotKept { .. } => {
             self::error(StatusCode::GONE, error.to_string())
+        }
+        // The leader counts it as a failed sync, as it would a timeout,
+        // so the node's held chunks still move on after its silence.
+        TaskArrayNodeError::SyncBusy => {
+            self::error(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
         }
         other => self::error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
@@ -1327,6 +1335,12 @@ mod tests {
             template: template(),
             spec: TaskArraySpec::with_count(100),
         }
+    }
+
+    #[test]
+    fn a_busy_node_answers_the_leader_service_unavailable() {
+        let response = node_error(TaskArrayNodeError::SyncBusy);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
