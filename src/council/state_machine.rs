@@ -544,31 +544,20 @@ impl StateMachineInner {
                 self.state.stopped_apps.insert(app_id.clone());
             }
             RaftRequest::AppDelete { app_id } => {
-                if self
-                    .state
-                    .task_arrays
-                    .deployment_owner(&app_id.name, &app_id.namespace)
-                    .is_some()
-                {
+                // A live lease's apps leave only through its cleanup, which
+                // carries the lease (#693): GitOps or a stray delete can't
+                // take a running test's workload out from under it.
+                if self.namespace_is_leased(&app_id.namespace) {
                     return Some(CouncilResponse::Refused {
-                        reason: "an outstanding job operation owns this app".into(),
+                        reason: format!(
+                            "app {app_id} belongs to a test lease; only the lease's cleanup \
+                             deletes it"
+                        ),
                     });
                 }
-                self.state.apps.remove(app_id);
-                self.state.stopped_apps.remove(app_id);
-                self.state.scheduling.remove(app_id);
-                self.state.last_placed_nodes.remove(app_id);
-                self.state.quota_blocked.remove(app_id);
-                // A deleted app leaves no baseline for an override to sit
-                // above; drop it so a re-created app of the same name starts
-                // from its own spec, not a ghost override (DEP8).
-                let key = app_id.to_string();
-                self.state.autoscale_overrides.retain(|(k, _)| k != &key);
-                let prefix = format!("{app_id}/");
-                self.state
-                    .security_state
-                    .secret_seals
-                    .retain(|key, _| !key.starts_with(&prefix));
+                if let Some(refused) = self.remove_app(app_id) {
+                    return Some(refused);
+                }
             }
             RaftRequest::SchedulingDecision(_) => {
                 return Some(CouncilResponse::Refused {
@@ -747,6 +736,18 @@ impl StateMachineInner {
             }
             RaftRequest::DeleteTag(delete) => {
                 self.state.manifest_catalog.apply_delete_tag(delete);
+            }
+            RaftRequest::ExpireManifest(expire) => {
+                // Recheck at apply time: a push, tag or deploy may have
+                // landed between the leader's plan and this entry.
+                let pinned = self.state.pinned_image_digests();
+                if let Err(reason) = self
+                    .state
+                    .manifest_catalog
+                    .apply_expire_manifest(expire, &pinned)
+                {
+                    return Some(CouncilResponse::Refused { reason });
+                }
             }
             RaftRequest::AutoscaleOverride {
                 app_id,
@@ -1331,13 +1332,23 @@ impl StateMachineInner {
                 self.state.namespaces.insert(name.clone(), *spec.clone());
             }
             RaftRequest::NamespaceDelete { name } => {
+                if self.namespace_is_leased(name) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "namespace {name} belongs to a test lease; only the lease's \
+                             cleanup deletes it"
+                        ),
+                    });
+                }
                 self.state.namespaces.remove(name);
+                self.state.gitops_owned.namespaces.remove(name);
             }
             RaftRequest::PermissionSpec { name, spec } => {
                 self.state.permissions.insert(name.clone(), *spec.clone());
             }
             RaftRequest::PermissionDelete { name } => {
                 self.state.permissions.remove(name);
+                self.state.gitops_owned.permissions.remove(name);
             }
             RaftRequest::RegisterEndpointConsumer { node_id } => {
                 if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
@@ -2042,6 +2053,11 @@ impl StateMachineInner {
                 for placements in self.state.scheduling.values_mut() {
                     placements.retain(|placement| placement.node_id.0 != *node_id);
                 }
+                // Its image copies will never serve again: heal must see
+                // every image it held as under-replicated (#697).
+                self.state
+                    .manifest_catalog
+                    .remove_node_holdings(registry_node_id);
                 self.state.endpoint_catalog = catalog;
                 self.state.endpoint_withdrawals = withdrawals;
                 let released_node_fault = self
@@ -2300,7 +2316,156 @@ impl StateMachineInner {
                     last_error: Some(reason.chars().take(512).collect()),
                 };
             }
+            RaftRequest::GitOpsWrite { term, change } => {
+                return self.apply_gitops_write(*term, change, position);
+            }
+            RaftRequest::GitOpsConfigSet { config, seed } => {
+                if *seed && self.state.gitops_config.is_some() {
+                    return Some(CouncilResponse::Refused {
+                        reason: "the cluster already has a GitOps configuration".into(),
+                    });
+                }
+                self.state.gitops_config = config.as_deref().cloned();
+            }
+            RaftRequest::TestLeaseAppDelete { lease_id, app_id } => {
+                if !self
+                    .state
+                    .test_leases
+                    .get(lease_id)
+                    .is_some_and(|lease| lease.namespace == app_id.namespace)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "app is not in this lease's namespace".into(),
+                    });
+                }
+                if let Some(refused) = self.remove_app(app_id) {
+                    return Some(refused);
+                }
+            }
+            RaftRequest::TestLeaseNamespaceDelete { lease_id, name } => {
+                if !self
+                    .state
+                    .test_leases
+                    .get(lease_id)
+                    .is_some_and(|lease| &lease.namespace == name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "namespace does not belong to this lease".into(),
+                    });
+                }
+                self.state.namespaces.remove(name);
+                self.state.gitops_owned.namespaces.remove(name);
+            }
         }
+        None
+    }
+
+    /// Apply a Lettuce write and record what GitOps owns, in one entry (#693).
+    ///
+    /// Refused when the entry wasn't proposed in the term the sync read its
+    /// snapshot in (finding 7), when the change isn't a declarative spec or
+    /// delete, and when it deletes a resource GitOps didn't write (D9).
+    fn apply_gitops_write(
+        &mut self,
+        term: u64,
+        change: &RaftRequest,
+        position: ApplyEntryPosition,
+    ) -> Option<CouncilResponse> {
+        let entry_term = position.current_log_id.map(|id| id.leader_id.get_term());
+        if entry_term != Some(term) {
+            return Some(CouncilResponse::Refused {
+                reason: format!(
+                    "the GitOps sync read desired state in term {term} but wrote in term \
+                     {}; leadership changed, so the sync is abandoned",
+                    entry_term.map_or_else(|| "unknown".to_string(), |t| t.to_string())
+                ),
+            });
+        }
+        let owned = &self.state.gitops_owned;
+        let unowned = match change {
+            RaftRequest::AppSpec { .. }
+            | RaftRequest::NamespaceSpec { .. }
+            | RaftRequest::PermissionSpec { .. } => None,
+            RaftRequest::AppDelete { app_id } => {
+                (!owned.apps.contains(app_id)).then(|| format!("app {app_id}"))
+            }
+            RaftRequest::NamespaceDelete { name } => {
+                (!owned.namespaces.contains(name)).then(|| format!("namespace {name}"))
+            }
+            RaftRequest::PermissionDelete { name } => {
+                (!owned.permissions.contains(name)).then(|| format!("permission {name}"))
+            }
+            _ => {
+                return Some(CouncilResponse::Refused {
+                    reason: "a GitOps write carries only app, namespace and permission changes"
+                        .into(),
+                });
+            }
+        };
+        if let Some(resource) = unowned {
+            return Some(CouncilResponse::Refused {
+                reason: format!("GitOps didn't write {resource}, so it won't delete it"),
+            });
+        }
+        let response = self.apply_request_at(change, position);
+        if matches!(response, Some(CouncilResponse::Refused { .. })) {
+            return response;
+        }
+        // Deletes forget ownership in their own handlers, as a manual
+        // delete does; a spec is GitOps-owned from this write on.
+        let owned = &mut self.state.gitops_owned;
+        match change {
+            RaftRequest::AppSpec { app_id, .. } => {
+                owned.apps.insert(app_id.clone());
+            }
+            RaftRequest::NamespaceSpec { name, .. } => {
+                owned.namespaces.insert(name.clone());
+            }
+            RaftRequest::PermissionSpec { name, .. } => {
+                owned.permissions.insert(name.clone());
+            }
+            _ => {}
+        }
+        response
+    }
+
+    /// Whether a live test lease owns `namespace`.
+    fn namespace_is_leased(&self, namespace: &str) -> bool {
+        self.state
+            .test_leases
+            .values()
+            .any(|lease| lease.namespace == namespace)
+    }
+
+    /// Remove an app and everything desired state keeps for it, unless an
+    /// outstanding job deployment owns it.
+    fn remove_app(&mut self, app_id: &crate::meat::types::AppId) -> Option<CouncilResponse> {
+        if self
+            .state
+            .task_arrays
+            .deployment_owner(&app_id.name, &app_id.namespace)
+            .is_some()
+        {
+            return Some(CouncilResponse::Refused {
+                reason: "an outstanding job operation owns this app".into(),
+            });
+        }
+        self.state.apps.remove(app_id);
+        self.state.stopped_apps.remove(app_id);
+        self.state.scheduling.remove(app_id);
+        self.state.last_placed_nodes.remove(app_id);
+        self.state.quota_blocked.remove(app_id);
+        self.state.gitops_owned.apps.remove(app_id);
+        // A deleted app leaves no baseline for an override to sit
+        // above; drop it so a re-created app of the same name starts
+        // from its own spec, not a ghost override (DEP8).
+        let key = app_id.to_string();
+        self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+        let prefix = format!("{app_id}/");
+        self.state
+            .security_state
+            .secret_seals
+            .retain(|key, _| !key.starts_with(&prefix));
         None
     }
 
@@ -5349,12 +5514,20 @@ mod tests {
                 RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
                     repository: "team-copy/app".into(),
                     tag: "latest".into(),
+                    deleted_at_unix_ms: 1,
                 }),
             )])
             .await
             .unwrap();
         let state = restored.desired_state().await;
-        assert_eq!(state.manifest_catalog.manifests.len(), 1);
+        // Deleting the tag untags only the copy; expiry removes it later.
+        assert_eq!(state.manifest_catalog.manifests.len(), 2);
+        assert!(
+            state
+                .manifest_catalog
+                .get_manifest_by_tag("team-copy/app", "latest")
+                .is_none()
+        );
         let retained = state
             .manifest_catalog
             .get_manifest_by_tag("myapp", "latest")
@@ -5458,7 +5631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_delete_tag_removes_manifest() {
+    async fn apply_delete_tag_untags_the_manifest() {
         let mut sm = CouncilStateMachine::new();
 
         // Push a manifest with tag "latest"
@@ -5475,6 +5648,7 @@ mod tests {
         let delete = crate::pickle::types::DeleteTag {
             repository: "myapp".to_string(),
             tag: "latest".to_string(),
+            deleted_at_unix_ms: 42,
         };
         sm.apply_fixture(vec![normal_entry(1, 2, RaftRequest::DeleteTag(delete))])
             .await
@@ -5487,6 +5661,123 @@ mod tests {
                 .get_manifest_by_tag("myapp", "latest")
                 .is_none()
         );
+        let digest = test_manifest_commit().manifest.digest;
+        assert_eq!(
+            state.manifest_catalog.untagged_since("myapp", &digest),
+            Some(42)
+        );
+    }
+
+    /// #697: the leader's ExpireManifest removes an untagged manifest whose
+    /// untagging it observed, and nothing else.
+    #[test]
+    fn expire_manifest_removes_an_untagged_unpinned_manifest() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        let digest = commit.manifest.digest.clone();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+        inner.apply_request(&RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 42,
+        }));
+
+        let response = inner.apply_request(&RaftRequest::ExpireManifest(
+            crate::pickle::types::ExpireManifest {
+                repository: "myapp".into(),
+                digest: digest.clone(),
+                untagged_at_unix_ms: 42,
+            },
+        ));
+
+        assert!(response.is_none(), "{response:?}");
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest("myapp", digest.as_str())
+                .is_none()
+        );
+    }
+
+    /// #697: an app in desired state that pins the digest keeps the
+    /// manifest, however long it has been untagged.
+    #[test]
+    fn expire_manifest_refuses_a_digest_an_app_pins() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        let digest = commit.manifest.digest.clone();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+        inner.apply_request(&RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 42,
+        }));
+        inner.state.apps.insert(
+            AppId::new("web", "prod"),
+            AppSpec {
+                image: Some(format!("myapp:latest@{}", digest.as_str())),
+                ..default_spec()
+            },
+        );
+
+        let response = inner.apply_request(&RaftRequest::ExpireManifest(
+            crate::pickle::types::ExpireManifest {
+                repository: "myapp".into(),
+                digest: digest.clone(),
+                untagged_at_unix_ms: 42,
+            },
+        ));
+
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest("myapp", digest.as_str())
+                .is_some()
+        );
+    }
+
+    /// #697: a decommissioned node's copies never serve again, so it leaves
+    /// every holder set and heal sees the image as under-replicated.
+    #[test]
+    fn decommission_prunes_the_node_from_registry_holder_sets() {
+        let mut inner = StateMachineInner::default();
+        let node = "gone-for-good";
+        let mut commit = test_manifest_commit();
+        commit.holder_nodes = std::collections::BTreeSet::from([
+            1,
+            crate::cluster::identity::raft_id_from_name(node),
+        ]);
+        let digests: Vec<_> = commit
+            .manifest
+            .referenced_digests()
+            .into_iter()
+            .cloned()
+            .collect();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: node.into(),
+                retired_by: "operator".into(),
+                reason: "disk died".into(),
+                retired_at_unix_ms: 20,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+
+        for digest in digests {
+            assert_eq!(
+                inner.state.manifest_catalog.layer_holders(digest.as_str()),
+                std::collections::BTreeSet::from([1])
+            );
+        }
     }
 
     // --- SecurityState Raft tests ---
@@ -8214,7 +8505,8 @@ mod tests {
             inner.apply_request(&ready),
             Some(CouncilResponse::Refused { .. })
         ));
-        inner.apply_request(&RaftRequest::AppDelete {
+        inner.apply_request(&RaftRequest::TestLeaseAppDelete {
+            lease_id: "run1".into(),
             app_id: app_id.clone(),
         });
         assert!(matches!(
@@ -8884,7 +9176,8 @@ mod tests {
         requests.push(RaftRequest::TestLeaseBeginCleanup {
             lease_id: "run1".into(),
         });
-        requests.push(RaftRequest::AppDelete {
+        requests.push(RaftRequest::TestLeaseAppDelete {
+            lease_id: "run1".into(),
             app_id: AppId::new("web", "rbtest-run1"),
         });
         for (index, request) in requests.into_iter().enumerate() {
@@ -8989,7 +9282,8 @@ mod tests {
             RaftRequest::TestLeaseBeginCleanup {
                 lease_id: "run1".into(),
             },
-            RaftRequest::AppDelete {
+            RaftRequest::TestLeaseAppDelete {
+                lease_id: "run1".into(),
                 app_id: app_id.clone(),
             },
         ];
@@ -9188,7 +9482,8 @@ mod tests {
         sm.apply_fixture(vec![normal_entry(
             1,
             5,
-            RaftRequest::AppDelete {
+            RaftRequest::TestLeaseAppDelete {
+                lease_id: "run1".into(),
                 app_id: app_id.clone(),
             },
         )])
@@ -9499,5 +9794,341 @@ mod tests {
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(inner.state.gitops_sync_state.unwrap(), before);
+    }
+
+    fn gitops_write(term: u64, change: RaftRequest) -> RaftRequest {
+        RaftRequest::GitOpsWrite {
+            term,
+            change: Box::new(change),
+        }
+    }
+
+    fn namespace_spec() -> Box<crate::config::NamespaceSpec> {
+        Box::new(toml::from_str(r#"cpu = "1000m""#).unwrap())
+    }
+
+    /// #693: a GitOps write records the resource it wrote in the same
+    /// entry, and a manual write of another resource is not recorded.
+    #[tokio::test]
+    async fn gitops_write_records_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "prod");
+        let manual = AppId::new("manual", "prod");
+        let responses = sm
+            .apply_fixture(vec![
+                normal_entry(
+                    3,
+                    1,
+                    gitops_write(
+                        3,
+                        RaftRequest::NamespaceSpec {
+                            name: "prod".into(),
+                            spec: namespace_spec(),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    2,
+                    gitops_write(
+                        3,
+                        RaftRequest::PermissionSpec {
+                            name: "deployers".into(),
+                            spec: Box::new(crate::config::PermissionSpec {
+                                actions: vec!["deploy".into()],
+                                apps: vec![],
+                                namespaces: None,
+                            }),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    3,
+                    gitops_write(
+                        3,
+                        RaftRequest::AppSpec {
+                            app_id: web.clone(),
+                            spec: Box::new(default_spec()),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    4,
+                    RaftRequest::AppSpec {
+                        app_id: manual.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            responses
+                .iter()
+                .all(|r| !matches!(r, CouncilResponse::Refused { .. })),
+            "{responses:?}"
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&web));
+        assert!(state.gitops_owned.apps.contains(&web));
+        assert!(!state.gitops_owned.apps.contains(&manual));
+        assert!(state.gitops_owned.namespaces.contains("prod"));
+        assert!(state.gitops_owned.permissions.contains("deployers"));
+    }
+
+    /// #693: pruning a GitOps resource removes it from the ownership set,
+    /// and GitOps may never delete a resource it didn't write.
+    #[tokio::test]
+    async fn prune_clears_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        let manual = AppId::new("manual", "default");
+        let responses = sm
+            .apply_fixture(vec![
+                normal_entry(
+                    2,
+                    1,
+                    gitops_write(
+                        2,
+                        RaftRequest::AppSpec {
+                            app_id: web.clone(),
+                            spec: Box::new(default_spec()),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    2,
+                    2,
+                    RaftRequest::AppSpec {
+                        app_id: manual.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+                normal_entry(
+                    2,
+                    3,
+                    gitops_write(
+                        2,
+                        RaftRequest::AppDelete {
+                            app_id: manual.clone(),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    2,
+                    4,
+                    gitops_write(
+                        2,
+                        RaftRequest::AppDelete {
+                            app_id: web.clone(),
+                        },
+                    ),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&responses[2], CouncilResponse::Refused { reason } if reason.contains("GitOps")),
+            "{:?}",
+            responses[2]
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&manual), "manual app survives");
+        assert!(!state.apps.contains_key(&web));
+        assert!(state.gitops_owned.apps.is_empty());
+    }
+
+    /// #693 (finding 7): a GitOps write proposed in a different term from
+    /// the one its sync read its snapshot in is refused, so an A→B→A
+    /// leadership flap can't apply a stale diff.
+    #[tokio::test]
+    async fn a_gitops_write_from_an_earlier_term_is_refused() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        let responses = sm
+            .apply_fixture(vec![normal_entry(
+                5,
+                1,
+                gitops_write(
+                    3,
+                    RaftRequest::AppSpec {
+                        app_id: web.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&responses[0], CouncilResponse::Refused { reason } if reason.contains("term")),
+            "{responses:?}"
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.is_empty());
+        assert!(state.gitops_owned.apps.is_empty());
+    }
+
+    /// Only declarative writes travel inside a GitOps write.
+    #[tokio::test]
+    async fn a_gitops_write_carries_only_declarative_changes() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply_fixture(vec![normal_entry(
+                1,
+                1,
+                gitops_write(
+                    1,
+                    RaftRequest::ConfigSet {
+                        key: "k".into(),
+                        value: "v".into(),
+                    },
+                ),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(&responses[0], CouncilResponse::Refused { .. }));
+    }
+
+    /// A manual delete of a GitOps resource (`relish delete --force`)
+    /// leaves the ownership set describing only resources that exist.
+    #[tokio::test]
+    async fn a_manual_delete_forgets_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        sm.apply_fixture(vec![
+            normal_entry(
+                1,
+                1,
+                gitops_write(
+                    1,
+                    RaftRequest::AppSpec {
+                        app_id: web.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::AppDelete {
+                    app_id: web.clone(),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+        assert!(sm.desired_state().await.gitops_owned.apps.is_empty());
+    }
+
+    /// #693 (finding 2): a plain delete can't remove an app or namespace a
+    /// live test lease owns; only a delete carrying that lease can.
+    #[test]
+    fn app_delete_in_a_leased_namespace_needs_the_lease() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let app_id = AppId::new("web", "rbtest-run1");
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseNamespaceSpec {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    name: "rbtest-run1".into(),
+                    spec: namespace_spec(),
+                })
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseAppSpec {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    app_id: app_id.clone(),
+                    spec: Box::new(default_spec()),
+                })
+                .is_none()
+        );
+
+        for refused in [
+            RaftRequest::AppDelete {
+                app_id: app_id.clone(),
+            },
+            RaftRequest::NamespaceDelete {
+                name: "rbtest-run1".into(),
+            },
+            RaftRequest::TestLeaseAppDelete {
+                lease_id: "other".into(),
+                app_id: app_id.clone(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    inner.apply_request(&refused),
+                    Some(CouncilResponse::Refused { .. })
+                ),
+                "{refused:?}"
+            );
+        }
+        assert!(inner.state.apps.contains_key(&app_id));
+        assert!(inner.state.namespaces.contains_key("rbtest-run1"));
+
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseAppDelete {
+                    lease_id: "run1".into(),
+                    app_id: app_id.clone(),
+                })
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseNamespaceDelete {
+                    lease_id: "run1".into(),
+                    name: "rbtest-run1".into(),
+                })
+                .is_none()
+        );
+        assert!(!inner.state.apps.contains_key(&app_id));
+        assert!(!inner.state.namespaces.contains_key("rbtest-run1"));
+    }
+
+    /// #693: a node's `[gitops]` seeds the cluster's configuration only
+    /// when there is none; an explicit set replaces it, and clears it.
+    #[test]
+    fn a_seed_never_replaces_the_cluster_gitops_config() {
+        let stored = |repo: &str| {
+            Some(Box::new(crate::lettuce::types::StoredGitOpsConfig {
+                config: toml::from_str(&format!("repo = '{repo}'")).unwrap(),
+                sealed_credentials: None,
+            }))
+        };
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: stored("first"),
+            seed: true,
+        });
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: stored("second"),
+            seed: true,
+        });
+        let repo = |inner: &StateMachineInner| {
+            inner
+                .state
+                .gitops_config
+                .as_ref()
+                .map(|stored| stored.config.repo.clone())
+        };
+        assert_eq!(repo(&inner).as_deref(), Some("first"));
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: stored("third"),
+            seed: false,
+        });
+        assert_eq!(repo(&inner).as_deref(), Some("third"));
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: None,
+            seed: false,
+        });
+        assert_eq!(repo(&inner), None);
     }
 }

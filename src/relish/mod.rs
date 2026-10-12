@@ -102,7 +102,7 @@ pub enum RelishError {
 
     /// YAML serialisation failure.
     #[error("failed to serialise YAML: {0}")]
-    SerialiseYaml(serde_yaml::Error),
+    SerialiseYaml(yaml_serde::Error),
 
     /// Command requires a running Bun agent.
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
@@ -175,6 +175,16 @@ pub enum RelishError {
         "{image} is not in the cluster's Pickle registry (push it first; relish sign signs Pickle-hosted images only)"
     )]
     ImageNotInRegistry { image: String },
+
+    /// `relish images delete` takes a tag, never a digest or a bare name.
+    #[error(
+        "expected repository:tag (e.g. team/web:v1), got {reference:?}; an image leaves by losing its tags, never by digest"
+    )]
+    InvalidImageTag { reference: String },
+
+    /// The agent reported no registry listener to send the request to.
+    #[error("the agent reports no Pickle registry endpoint")]
+    RegistryUnavailable,
 
     /// Image signing key error (generation, parsing, signing).
     #[error("{0}")]

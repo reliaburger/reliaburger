@@ -56,30 +56,46 @@ def output_name(gate):
     return gate.replace('-', '_') + '_sha256'
 
 
-def archive_origin(context, needs):
-    """Use current successful build-job outputs before opening the archive."""
+def archive_origin(context, needs, runtime=None):
+    """Use current successful build-job outputs before opening the archive.
+
+    A verified archive runtime names the attempt that built the archive, which
+    is earlier than ours when only the failed consumer jobs were re-run.
+    """
     builder = needs.get('build-tests', {})
     c.require(builder.get('result') == 'success', 'archive build job did not succeed')
     outputs = builder.get('outputs', {})
     for name in ('archive_sha256', 'archive_origin_sha256'):
         c.require(isinstance(outputs.get(name), str) and len(outputs[name]) == 64,
                   'missing trusted archive builder digest')
-    expected = dict(schema_version=1, **{key: context[key] for key in ('commit', 'run_id', 'attempt')},
+    identity = {key: context[key] for key in ('commit', 'run_id', 'attempt')}
+    if runtime is not None:
+        identity['attempt'] = runtime['context']['attempt']
+    expected = dict(schema_version=1, **identity,
                     host='linux', command=w.ARCHIVE_COMMAND, exit_code=0,
                     archive_sha256=outputs['archive_sha256'])
     return dict(path='archive-origin.json', sha256=outputs['archive_origin_sha256'], builder=expected)
 
 
 def verify_archive_runtime(root, context, needs):
-    """Bind downloaded archive tool/runtime bytes to successful builder outputs."""
-    outputs = needs.get('build-tests', {}).get('outputs', {})
+    """Bind downloaded archive tool/runtime bytes to successful builder outputs.
+
+    The builder may come from an earlier attempt of this run and commit: GitHub
+    keeps a passed build job's outputs and artifact when only failed jobs re-run.
+    """
+    builder = needs.get('build-tests', {})
+    c.require(builder.get('result') == 'success', 'archive build job did not succeed')
+    outputs = builder.get('outputs', {})
     digest = outputs.get('archive_runtime_sha256')
     c.require(isinstance(digest, str) and len(digest) == 64, 'missing trusted archive runtime digest')
     path = Path(root) / 'archive-runtime.json'
     c.require(c.digest(path) == digest, 'archive runtime differs from successful builder output')
     runtime = c.read_json(path)
     c.fields(runtime, ('context', 'tools', 'command', 'exit_code', 'origin_sha256'))
-    c.require(runtime['context'] == {key: context[key] for key in ('commit', 'run_id', 'attempt')}
+    c.require(isinstance(runtime['context'], dict)
+              and set(runtime['context']) == {'commit', 'run_id', 'attempt'}
+              and all(runtime['context'][key] == context[key] for key in ('commit', 'run_id'))
+              and gates.earlier_or_current_attempt(runtime['context']['attempt'], context['attempt'])
               and runtime['exit_code'] == 0 and runtime['origin_sha256'] == outputs.get('archive_origin_sha256'),
               'wrong current archive runtime')
     make_owner.validate_tools(runtime['tools'])
@@ -226,8 +242,9 @@ def produce(root, manifest_path, gate, context, directory, needs=None):
         expected = dict(context=context, tools=tools, plans=approved,
                         origin_path='target/contracts/linux/oci-interruptions/build/build-origin.json')
     else:
-        origin = archive_origin(context, needs or {}) if JOBS[gate] in ('cluster', 'acceptance') else None
-        runtime = verify_archive_runtime(root, context, needs) if origin else None
+        archived = JOBS[gate] in ('cluster', 'acceptance')
+        runtime = verify_archive_runtime(root, context, needs or {}) if archived else None
+        origin = archive_origin(context, needs or {}, runtime) if archived else None
         entry = w.entry_from_make(root, manifest, gate, context['host'], archive_origin=origin)
         if runtime is not None:
             entry['archive_runtime'] = runtime
@@ -244,6 +261,24 @@ def produce(root, manifest_path, gate, context, directory, needs=None):
     return 0, seal(manifest_path, manifest, gate, context, expected, directory)
 
 
+def sealed_context(sealed, current):
+    """The producer context of a seal that belongs to this run, or None.
+
+    Commit, run and host must be the aggregator's own. The attempt may be
+    earlier: "re-run failed jobs" gives the re-run jobs attempt N+1, while the
+    jobs that passed keep their attempt-N seals, outputs and artifacts. The
+    seal's digest still comes from that job's trusted output, which GitHub
+    carries from the latest attempt of the job, so the set stays coherent.
+    """
+    if not isinstance(sealed, dict) or set(sealed) != set(current):
+        return None
+    if any(sealed[key] != current[key] for key in ('commit', 'run_id', 'host')):
+        return None
+    if not gates.earlier_or_current_attempt(sealed['attempt'], current['attempt']):
+        return None
+    return dict(sealed)
+
+
 def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None):
     """Waited job results and trusted output hashes authorize artifact consumption."""
     root, incoming = Path(root), Path(incoming)
@@ -258,7 +293,7 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None)
     c.require({name for name, _ in expected_gates} == set(selection['gates']),
               'manifest differs from the finite actual workflow gate schedule')
     gates.candidate_sources(root, context['commit'], subprocess.run)
-    verified = {}
+    verified, owners, attempts = {}, {}, {}
     for gate, host in sorted(expected_gates):
         c.require(gate in JOBS, 'unknown actual workflow owner')
         outputs = needs[JOBS[gate]].get('outputs', {})
@@ -271,10 +306,13 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None)
         )
         row = c.read_json(directory / 'gate-seal.json')
         c.fields(row, ('schema_version', 'gate', 'context', 'manifest_sha256', 'files'))
-        current = dict(context, host=host)
+        current = sealed_context(row['context'], dict(context, host=host))
         c.require(type(row['schema_version']) is int and row['schema_version'] == 1
-                  and row['gate'] == gate and row['context'] == current
+                  and row['gate'] == gate and current is not None
                   and row['manifest_sha256'] == c.digest(manifest_path), 'wrong current sealed owner')
+        c.require(attempts.setdefault(JOBS[gate], current['attempt']) == current['attempt'],
+                  'one job sealed owners in different attempts')
+        owners[(gate, host)] = current
         c.require(
             isinstance(row['files'], dict) and 'approved.json' in row['files'],
             'missing approved owner plan',
@@ -305,7 +343,7 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None)
                                 ['scripts/ci/legacy-oci-aliases.json'])
         aliases = oci_legacy_owner.qualify(
             root, c.read_json(aliases_path), bindings, manifest, manifest_path,
-            dict(context, host='linux'), needs['linux'],
+            owners[('oci-interruptions', 'linux')], needs['linux'],
             incoming / 'contract-linux-oci-interruptions',
             verified[('oci-interruptions', 'linux')],
         )

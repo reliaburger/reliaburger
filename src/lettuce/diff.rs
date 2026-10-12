@@ -4,19 +4,25 @@
 //! Raft desired state. Autoscaler-aware: the `replicas` field is
 //! compared independently so autoscaler overrides aren't reset by
 //! unrelated config changes.
+//!
+//! GitOps owns only what it wrote (D9, #693). A resource in Raft but not
+//! in git is removed only when the ownership set says GitOps wrote it, so
+//! `relish apply` and GitOps coexist. A running test's `rbtest-*`
+//! namespace never enters the diff at all.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::config::app::AppSpec;
 use crate::config::{Config, NamespaceSpec, PermissionSpec};
 use crate::meat::types::AppId;
+use crate::testkit::lease::valid_test_namespace;
 
-use super::types::DiffSummary;
+use super::types::{DiffSummary, GitOpsOwnership};
 
 /// The current declarative desired state a diff compares git against.
 ///
-/// Grouping the three maps keeps `compute_diff`'s signature from growing
-/// a parameter per resource kind.
+/// Grouping the maps keeps `compute_diff`'s signature from growing a
+/// parameter per resource kind.
 #[derive(Debug)]
 pub struct CurrentState<'a> {
     /// Apps currently in Raft, keyed by identity.
@@ -25,6 +31,8 @@ pub struct CurrentState<'a> {
     pub namespaces: &'a BTreeMap<String, NamespaceSpec>,
     /// Permissions currently in Raft, keyed by name.
     pub permissions: &'a BTreeMap<String, PermissionSpec>,
+    /// The resources GitOps wrote: the only ones it may remove.
+    pub owned: &'a GitOpsOwnership,
 }
 
 /// A single resource change to apply.
@@ -42,7 +50,14 @@ pub enum ResourceChange {
         /// Whether the replicas field specifically changed.
         replicas_changed: bool,
     },
-    /// A resource to remove.
+    /// A resource that already matches git but that GitOps didn't write.
+    /// It's written once, with the spec the cluster already runs, so the
+    /// write changes nothing but records that GitOps owns it (#693).
+    Adopt {
+        resource_id: String,
+        spec: ChangePayload,
+    },
+    /// A resource GitOps wrote that git no longer declares.
     Remove { resource_id: String },
 }
 
@@ -57,7 +72,22 @@ pub enum ChangePayload {
     Generic,
 }
 
+/// The changes for one resource kind, kept apart so `compute_diff` can
+/// order them: writes go namespaces, permissions, apps; removals go the
+/// other way.
+#[derive(Default)]
+struct KindDiff {
+    writes: Vec<ResourceChange>,
+    removals: Vec<ResourceChange>,
+}
+
 /// Compute the diff between git config and current Raft state.
+///
+/// Adds and updates come out namespaces first, then permissions, then
+/// apps, the order manual apply writes them in, so a namespace's quota
+/// exists before an app schedules against it. Removals follow, in the
+/// reverse order (#693). Only resources in `current.owned` are removed,
+/// and nothing in an `rbtest-*` namespace appears at all.
 ///
 /// The `autoscale_overrides` map is consulted to avoid resetting
 /// the autoscaler's replica count when only non-replica fields changed.
@@ -66,10 +96,11 @@ pub fn compute_diff(
     current: &CurrentState<'_>,
     _autoscale_overrides: &[(String, u32)],
 ) -> (Vec<ResourceChange>, DiffSummary) {
-    let mut changes = Vec::new();
-    let mut added = 0usize;
-    let mut modified = 0usize;
-    let mut removed = 0usize;
+    let mut summary = DiffSummary {
+        added: 0,
+        modified: 0,
+        removed: 0,
+    };
 
     // Apps diff on their full identity (namespace + name), not the bare
     // name. Two apps called `web` in `prod` and `staging` are different
@@ -81,121 +112,163 @@ pub fn compute_diff(
         .app
         .iter()
         .map(|(name, spec)| (app_id_for(name, spec), spec))
+        .filter(|(app_id, _)| !valid_test_namespace(&app_id.namespace))
         .collect();
+    let apps = diff_apps(&git_apps, current, &mut summary);
 
-    // Check for added and modified apps.
-    for (app_id, git_spec) in &git_apps {
-        match current.apps.get(app_id) {
-            None => {
-                changes.push(ResourceChange::Add {
-                    resource_id: app_resource_id(app_id),
-                    spec: ChangePayload::App(Box::new((*git_spec).clone())),
-                });
-                added += 1;
-            }
-            Some(current_spec) => {
-                let current_spec = &as_git_wrote_it(git_spec, current_spec);
-                let replicas_changed = replicas_differ(git_spec, current_spec);
-                let other_fields_changed = non_replica_fields_differ(git_spec, current_spec);
+    let git_namespaces: BTreeMap<&String, &NamespaceSpec> = git_config
+        .namespace
+        .iter()
+        .filter(|(name, _)| !valid_test_namespace(name))
+        .collect();
+    let current_namespaces: BTreeMap<&String, &NamespaceSpec> = current
+        .namespaces
+        .iter()
+        .filter(|(name, _)| !valid_test_namespace(name))
+        .collect();
+    let namespaces = diff_named(
+        "namespace",
+        &git_namespaces,
+        &current_namespaces,
+        &current.owned.namespaces,
+        |spec| ChangePayload::Namespace(Box::new(spec.clone())),
+        &mut summary,
+    );
 
-                if replicas_changed || other_fields_changed {
-                    changes.push(ResourceChange::Update {
-                        resource_id: app_resource_id(app_id),
-                        spec: ChangePayload::App(Box::new((*git_spec).clone())),
-                        replicas_changed,
-                    });
-                    modified += 1;
-                }
-            }
-        }
-    }
-
-    // Check for removed apps (in current but not in git), keyed by full
-    // identity so a removal deletes exactly the app git dropped.
-    for app_id in current.apps.keys() {
-        if !git_apps.contains_key(app_id) {
-            changes.push(ResourceChange::Remove {
-                resource_id: app_resource_id(app_id),
-            });
-            removed += 1;
-        }
-    }
-
-    // Namespaces: add/update/remove against current desired state. A
-    // namespace present in git but not in Raft is an add; one whose spec
-    // changed is an update; one in Raft but not in git is removed (GitOps
-    // reconciles the whole repo, unlike additive manual apply).
-    for (name, git_ns) in &git_config.namespace {
-        match current.namespaces.get(name) {
-            None => {
-                changes.push(ResourceChange::Add {
-                    resource_id: format!("namespace.{name}"),
-                    spec: ChangePayload::Namespace(Box::new(git_ns.clone())),
-                });
-                added += 1;
-            }
-            Some(current_ns) if current_ns != git_ns => {
-                changes.push(ResourceChange::Update {
-                    resource_id: format!("namespace.{name}"),
-                    spec: ChangePayload::Namespace(Box::new(git_ns.clone())),
-                    replicas_changed: false,
-                });
-                modified += 1;
-            }
-            Some(_) => {}
-        }
-    }
-    for name in current.namespaces.keys() {
-        if !git_config.namespace.contains_key(name) {
-            changes.push(ResourceChange::Remove {
-                resource_id: format!("namespace.{name}"),
-            });
-            removed += 1;
-        }
-    }
-
-    // Permissions: same add/update/remove reconcile.
-    for (name, git_perm) in &git_config.permission {
-        match current.permissions.get(name) {
-            None => {
-                changes.push(ResourceChange::Add {
-                    resource_id: format!("permission.{name}"),
-                    spec: ChangePayload::Permission(Box::new(git_perm.clone())),
-                });
-                added += 1;
-            }
-            Some(current_perm) if current_perm != git_perm => {
-                changes.push(ResourceChange::Update {
-                    resource_id: format!("permission.{name}"),
-                    spec: ChangePayload::Permission(Box::new(git_perm.clone())),
-                    replicas_changed: false,
-                });
-                modified += 1;
-            }
-            Some(_) => {}
-        }
-    }
-    for name in current.permissions.keys() {
-        if !git_config.permission.contains_key(name) {
-            changes.push(ResourceChange::Remove {
-                resource_id: format!("permission.{name}"),
-            });
-            removed += 1;
-        }
-    }
+    let git_permissions: BTreeMap<&String, &PermissionSpec> =
+        git_config.permission.iter().collect();
+    let current_permissions: BTreeMap<&String, &PermissionSpec> =
+        current.permissions.iter().collect();
+    let permissions = diff_named(
+        "permission",
+        &git_permissions,
+        &current_permissions,
+        &current.owned.permissions,
+        |spec| ChangePayload::Permission(Box::new(spec.clone())),
+        &mut summary,
+    );
 
     // Jobs are absent from desired-state diffs: no reconciled job map exists
     // in Raft. `execute_sync` explicitly refuses any tree containing jobs
     // before reaching this function, so dependent apps cannot be published
     // while a migration is omitted. Manual apply owns job execution.
 
-    let summary = DiffSummary {
-        added,
-        modified,
-        removed,
-    };
-
+    let changes = namespaces
+        .writes
+        .into_iter()
+        .chain(permissions.writes)
+        .chain(apps.writes)
+        .chain(apps.removals)
+        .chain(permissions.removals)
+        .chain(namespaces.removals)
+        .collect();
     (changes, summary)
+}
+
+/// Diff git's apps against Raft's, outside `rbtest-*` namespaces.
+fn diff_apps(
+    git_apps: &BTreeMap<AppId, &AppSpec>,
+    current: &CurrentState<'_>,
+    summary: &mut DiffSummary,
+) -> KindDiff {
+    let mut diff = KindDiff::default();
+    for (app_id, git_spec) in git_apps {
+        let resource_id = app_resource_id(app_id);
+        let Some(current_spec) = current.apps.get(app_id) else {
+            diff.writes.push(ResourceChange::Add {
+                resource_id,
+                spec: ChangePayload::App(Box::new((*git_spec).clone())),
+            });
+            summary.added += 1;
+            continue;
+        };
+        let as_git = as_git_wrote_it(git_spec, current_spec);
+        let replicas_changed = replicas_differ(git_spec, &as_git);
+        if replicas_changed || non_replica_fields_differ(git_spec, &as_git) {
+            diff.writes.push(ResourceChange::Update {
+                resource_id,
+                spec: ChangePayload::App(Box::new((*git_spec).clone())),
+                replicas_changed,
+            });
+            summary.modified += 1;
+        } else if !current.owned.apps.contains(app_id) {
+            diff.writes.push(ResourceChange::Adopt {
+                resource_id,
+                spec: ChangePayload::App(Box::new(current_spec.clone())),
+            });
+        }
+    }
+
+    // Removed apps: in Raft, owned by GitOps, gone from git. Keyed by full
+    // identity so a removal deletes exactly the app git dropped. Sorted so
+    // the order doesn't depend on the hash map.
+    let mut removed: Vec<&AppId> = current
+        .apps
+        .keys()
+        .filter(|app_id| {
+            current.owned.apps.contains(*app_id)
+                && !git_apps.contains_key(*app_id)
+                && !valid_test_namespace(&app_id.namespace)
+        })
+        .collect();
+    removed.sort();
+    for app_id in removed {
+        diff.removals.push(ResourceChange::Remove {
+            resource_id: app_resource_id(app_id),
+        });
+        summary.removed += 1;
+    }
+    diff
+}
+
+/// Diff a kind keyed by name (namespaces, permissions): add what git has
+/// and Raft doesn't, update what differs, adopt what matches but GitOps
+/// didn't write, remove what GitOps wrote and git dropped.
+fn diff_named<S: PartialEq>(
+    kind: &str,
+    git: &BTreeMap<&String, &S>,
+    current: &BTreeMap<&String, &S>,
+    owned: &BTreeSet<String>,
+    payload: impl Fn(&S) -> ChangePayload,
+    summary: &mut DiffSummary,
+) -> KindDiff {
+    let mut diff = KindDiff::default();
+    for (name, git_spec) in git {
+        let resource_id = format!("{kind}.{name}");
+        match current.get(name) {
+            None => {
+                diff.writes.push(ResourceChange::Add {
+                    resource_id,
+                    spec: payload(git_spec),
+                });
+                summary.added += 1;
+            }
+            Some(current_spec) if current_spec != git_spec => {
+                diff.writes.push(ResourceChange::Update {
+                    resource_id,
+                    spec: payload(git_spec),
+                    replicas_changed: false,
+                });
+                summary.modified += 1;
+            }
+            Some(current_spec) if !owned.contains(*name) => {
+                diff.writes.push(ResourceChange::Adopt {
+                    resource_id,
+                    spec: payload(current_spec),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for name in current.keys() {
+        if owned.contains(*name) && !git.contains_key(name) {
+            diff.removals.push(ResourceChange::Remove {
+                resource_id: format!("{kind}.{name}"),
+            });
+            summary.removed += 1;
+        }
+    }
+    diff
 }
 
 /// The `AppId` a git-declared app resolves to.
@@ -301,12 +374,18 @@ mod tests {
             .collect()
     }
 
-    /// A `CurrentState` over just apps; namespaces/permissions empty.
+    /// A `CurrentState` over just apps; namespaces/permissions empty, and
+    /// every current app owned by GitOps.
     fn apps_state(apps: &HashMap<AppId, AppSpec>) -> CurrentState<'_> {
+        let owned = GitOpsOwnership {
+            apps: apps.keys().cloned().collect(),
+            ..Default::default()
+        };
         CurrentState {
             apps,
             namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
             permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            owned: Box::leak(Box::new(owned)),
         }
     }
 
@@ -314,6 +393,199 @@ mod tests {
         std::sync::OnceLock::new();
     static EMPTY_PERM: std::sync::OnceLock<BTreeMap<String, PermissionSpec>> =
         std::sync::OnceLock::new();
+
+    fn ids(changes: &[ResourceChange]) -> Vec<(&'static str, &str)> {
+        changes
+            .iter()
+            .map(|change| match change {
+                ResourceChange::Add { resource_id, .. } => ("add", resource_id.as_str()),
+                ResourceChange::Update { resource_id, .. } => ("update", resource_id.as_str()),
+                ResourceChange::Adopt { resource_id, .. } => ("adopt", resource_id.as_str()),
+                ResourceChange::Remove { resource_id } => ("remove", resource_id.as_str()),
+            })
+            .collect()
+    }
+
+    /// D9, #693: GitOps removes only what it wrote. A manually applied app,
+    /// namespace and permission absent from git are left alone; the owned
+    /// ones absent from git are pruned.
+    #[test]
+    fn diff_never_removes_resources_gitops_did_not_write() {
+        let git = parse_config("");
+        let apps = make_current_apps(&[
+            ("manual", r#"image = "m:v1""#),
+            ("fromgit", r#"image = "g:v1""#),
+        ]);
+        let namespace: NamespaceSpec = toml::from_str(r#"cpu = "1000m""#).unwrap();
+        let namespaces = BTreeMap::from([
+            ("manual-ns".to_string(), namespace.clone()),
+            ("git-ns".to_string(), namespace),
+        ]);
+        let permission = PermissionSpec {
+            actions: vec!["deploy".into()],
+            apps: vec![],
+            namespaces: None,
+        };
+        let permissions = BTreeMap::from([
+            ("manual-perm".to_string(), permission.clone()),
+            ("git-perm".to_string(), permission),
+        ]);
+        let owned = GitOpsOwnership {
+            apps: [AppId::new("fromgit", "default")].into(),
+            namespaces: ["git-ns".to_string()].into(),
+            permissions: ["git-perm".to_string()].into(),
+        };
+        let current = CurrentState {
+            apps: &apps,
+            namespaces: &namespaces,
+            permissions: &permissions,
+            owned: &owned,
+        };
+        let (changes, summary) = compute_diff(&git, &current, &[]);
+        assert_eq!(
+            ids(&changes),
+            vec![
+                ("remove", "app.default/fromgit"),
+                ("remove", "permission.git-perm"),
+                ("remove", "namespace.git-ns"),
+            ]
+        );
+        assert_eq!(summary.removed, 3);
+    }
+
+    /// #693: a running test's `rbtest-*` namespace, and everything in it,
+    /// never enters the diff, whatever git or the ownership set says.
+    #[test]
+    fn diff_skips_test_lease_namespaces() {
+        let git = parse_config(
+            r#"
+            [namespace.rbtest-abc]
+            cpu = "1000m"
+            [app.web]
+            image = "web:v1"
+            namespace = "rbtest-abc"
+            "#,
+        );
+        let mut apps = HashMap::new();
+        apps.insert(
+            AppId::new("leased", "rbtest-run1"),
+            toml::from_str::<AppSpec>(r#"image = "t:v1""#).unwrap(),
+        );
+        let namespaces = BTreeMap::from([(
+            "rbtest-run1".to_string(),
+            toml::from_str::<NamespaceSpec>(r#"cpu = "1000m""#).unwrap(),
+        )]);
+        let owned = GitOpsOwnership {
+            apps: [AppId::new("leased", "rbtest-run1")].into(),
+            namespaces: ["rbtest-run1".to_string()].into(),
+            ..Default::default()
+        };
+        let current = CurrentState {
+            apps: &apps,
+            namespaces: &namespaces,
+            permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            owned: &owned,
+        };
+        let (changes, summary) = compute_diff(&git, &current, &[]);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(
+            summary,
+            DiffSummary {
+                added: 0,
+                modified: 0,
+                removed: 0
+            }
+        );
+    }
+
+    /// #693 (finding 5): adds and updates go namespaces, permissions, apps,
+    /// so a quota exists before the apps that schedule against it; removals
+    /// go the other way, apps first.
+    #[test]
+    fn diff_orders_namespaces_before_apps_and_removes_in_reverse() {
+        let git = parse_config(
+            r#"
+            [namespace.team]
+            cpu = "1000m"
+            [permission.deployers]
+            actions = ["deploy"]
+            [app.web]
+            image = "web:v1"
+            namespace = "team"
+            "#,
+        );
+        let apps = make_current_apps(&[("old", r#"image = "o:v1""#)]);
+        let namespaces = BTreeMap::from([(
+            "old-ns".to_string(),
+            toml::from_str::<NamespaceSpec>(r#"cpu = "1000m""#).unwrap(),
+        )]);
+        let permissions = BTreeMap::from([(
+            "old-perm".to_string(),
+            PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec![],
+                namespaces: None,
+            },
+        )]);
+        let owned = GitOpsOwnership {
+            apps: [AppId::new("old", "default")].into(),
+            namespaces: ["old-ns".to_string()].into(),
+            permissions: ["old-perm".to_string()].into(),
+        };
+        let current = CurrentState {
+            apps: &apps,
+            namespaces: &namespaces,
+            permissions: &permissions,
+            owned: &owned,
+        };
+        let (changes, _) = compute_diff(&git, &current, &[]);
+        assert_eq!(
+            ids(&changes),
+            vec![
+                ("add", "namespace.team"),
+                ("add", "permission.deployers"),
+                ("add", "app.team/web"),
+                ("remove", "app.default/old"),
+                ("remove", "permission.old-perm"),
+                ("remove", "namespace.old-ns"),
+            ]
+        );
+    }
+
+    /// #693: a resource that already matches git but that GitOps didn't
+    /// write is adopted: written once, with the spec the cluster already
+    /// runs (its bound image included), so GitOps owns it from then on.
+    #[test]
+    fn an_unowned_resource_matching_git_is_adopted_with_its_current_spec() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let git = parse_config("[app.web]\nimage = \"myapp:v1\"\n");
+        let apps = make_current_apps(&[("web", &format!("image = \"myapp:v1@{digest}\""))]);
+        let owned = GitOpsOwnership::default();
+        let current = CurrentState {
+            apps: &apps,
+            namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
+            permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+            owned: &owned,
+        };
+        let (changes, summary) = compute_diff(&git, &current, &[]);
+        assert!(
+            matches!(
+                &changes[..],
+                [ResourceChange::Adopt { resource_id, spec: ChangePayload::App(spec) }]
+                    if resource_id == "app.default/web"
+                        && spec.image.as_deref() == Some(format!("myapp:v1@{digest}").as_str())
+            ),
+            "{changes:?}"
+        );
+        assert_eq!(
+            summary,
+            DiffSummary {
+                added: 0,
+                modified: 0,
+                removed: 0
+            }
+        );
+    }
 
     #[test]
     fn detects_added_app() {
@@ -482,7 +754,8 @@ mod tests {
     /// change (or the wrong app survived).
     #[test]
     fn removing_a_namespaced_app_targets_that_namespace() {
-        // Git declares nothing; Raft holds prod/web and default/web.
+        // Git declares nothing; Raft holds prod/web and default/web, both
+        // written by GitOps.
         let git = parse_config("");
         let mut current = HashMap::new();
         let prod_web: AppSpec = toml::from_str(r#"image = "web:v1""#).unwrap();

@@ -164,12 +164,12 @@ pub const GROUPS: &[CommandGroup] = &[
         commands: &["images", "build", "snapshot"],
     },
     CommandGroup {
-        title: "Upgrades",
+        title: "Upgrades and GitOps",
         guides: &[Guide {
             label: "operations",
             path: "docs/manual/12_operations.md",
         }],
-        commands: &["upgrade"],
+        commands: &["upgrade", "gitops"],
     },
     CommandGroup {
         title: "Learn",

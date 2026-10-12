@@ -239,6 +239,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/upgrade/abort", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/upgrade/cluster-rollback", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/cluster/elect", Admin, Cluster(ADMIN)),
+    // GitOps: anyone may read the status (it never carries credentials);
+    // changing the cluster's configuration is an Admin operation (#693).
+    route(Get, "/v1/gitops", AnyToken),
+    gated(Post, "/v1/gitops/config", Admin, Cluster(ADMIN)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),

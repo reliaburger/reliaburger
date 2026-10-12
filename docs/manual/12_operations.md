@@ -257,6 +257,35 @@ namespace, and defaults outside it are not inherited. A workload's explicit
 namespace wins. GitOps reconciles deletions too: delete an app from the
 repository and it goes from the cluster.
 
+### What GitOps owns
+
+GitOps owns only what it wrote. The cluster remembers, in Raft, every app,
+namespace and permission a sync created or changed, and a sync removes only
+those. Turn GitOps on in a working cluster, or commit an empty tree, and the
+apps you deployed with `relish apply` stay where they are. A resource that
+already exists and matches the repository is adopted the first time a sync
+sees it: from then on GitOps owns it, and deleting it from the repository
+deletes it from the cluster. A running test's `rbtest-*` namespace, and
+everything in it, never enters a sync at all.
+
+So GitOps and `relish apply` coexist, with a few rules for the resources
+GitOps owns:
+
+- `relish apply` of a GitOps-managed resource goes ahead and warns:
+  `warning: namespace 'production' is managed by GitOps; manual changes are
+  reverted on the next sync`.
+- `relish delete` and `relish rollback` of a GitOps-managed app are refused,
+  because the next sync would undo them. Change the repository instead, or
+  pass `--force` when you really want the cluster to differ for a poll.
+- A forced delete also forgets the ownership. While the repository still
+  declares the app, the next sync recreates it and owns it again.
+
+A change the cluster refuses (an image that can't be bound, an identity a job
+already holds) doesn't hold the others up. The sync applies every change it
+can and records a partial result naming each refused one in the sync status.
+The applied commit doesn't move until everything applies, so the next poll
+retries the rest.
+
 GitOps reconciles apps, namespaces and permissions. Any `[job.*]` declaration,
 including a cron registration or a `run_before = ["app.web"]` migration, refuses
 the whole commit before desired-state writes. The failed sync names the jobs;
@@ -264,6 +293,8 @@ the applied SHA stays at the previous successful commit. Use `relish apply`
 with the migration and dependent app in the same manifest to execute their
 ordering, or `relish batch` for batch work. Lettuce has no durable job identity
 or dispatch path tied to a Git revision yet.
+
+### Configuring it
 
 ```toml
 [gitops]
@@ -275,6 +306,29 @@ require_signed_commits = true
 trusted_signing_keys = ["<GPG or SSH key fingerprint>"]
 webhook_secret = "a-long-random-string"
 ```
+
+The configuration lives in the cluster, in Raft, so every council member syncs
+the same repository and a leader failover carries on where the last leader
+stopped. A node's `[gitops]` section in `node.toml` only seeds it: the first
+leader that finds the cluster without a configuration writes its own. After
+that the cluster's copy wins. A node whose `[gitops]` differs logs the
+difference and `relish wtf` reports it, but the node still syncs the
+cluster's repository. A node with no `[gitops]` at all syncs it too.
+
+Change the cluster's configuration with `relish gitops` (an Admin token,
+and audited):
+
+```sh
+relish gitops status            # repository, last sync, warnings, what GitOps owns
+relish gitops set gitops.toml   # a file with a [gitops] section, or node.toml
+relish gitops disable           # stop syncing; what GitOps wrote stays
+```
+
+The credentials (a `user:token@` in the repository URL, and the webhook
+secret) never reach Raft in clear: the leader seals them with a key derived
+from the cluster master key, the way it seals CA keys. A configuration with a
+credential therefore needs `[security] master_key_path` on the council
+members, and `relish gitops status` never shows one.
 
 The sync always reads every `.toml` file under `path`, subdirectories
 included. Credentials go in the URL; Bun strips them out of the process arguments and
@@ -293,8 +347,23 @@ Every poll reconciles, not just polls that find a new commit: change or delete
 a GitOps-managed app by hand and the next poll puts it back. Autoscaler
 replica overrides and `relish stop` are left alone. A `git` command that runs
 longer than two minutes is killed and the sync retried later, so a stalled
-remote can't wedge GitOps. There's no `relish gitops` command: the web
-dashboard's GitOps page shows the last sync.
+remote can't wedge GitOps. `relish gitops status` and the web dashboard's
+GitOps page show the last sync.
+
+A sync that lost the leadership it started with is abandoned before it
+writes. It read the cluster's state in one Raft term, and the cluster refuses
+its writes in any other, so a leader that lost and regained leadership mid-sync
+can't apply a stale diff. The new leader's sync takes over.
+
+### Plaintext secrets
+
+An `env` value whose key looks secret (it contains `PASSWORD`, `SECRET`,
+`TOKEN` or `CREDENTIAL`, or ends in `_KEY`, in any case) but isn't an
+`ENC[AGE:...]` value gets a warning. It shows in the leader's log, in the
+sync status (`relish gitops status`) and in `relish wtf`. The sync still
+applies it: refusing would break repositories that worked yesterday. Encrypt
+the value with `relish secret encrypt` (see
+[Secrets](10_security.md#secrets)) and commit that instead.
 
 To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
 webhook at `https://NODE:9117/v1/gitops/webhook` with the same secret. The

@@ -191,7 +191,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
-- `relish images`: List images in the local Pickle registry
+- `relish images`: List images in the Pickle registry, or delete a tag
+  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.0, not in 0.1.6)*
 - `relish build <PATH>`: Build an OCI image and push to Pickle
 - `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
   - `relish snapshot create <APP>`: Snapshot an app's managed volumes
@@ -199,7 +200,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish snapshot restore <APP> <NAME>`: Restore a snapshot over its live volume (stop the app first)
   - `relish snapshot delete <APP> <NAME>`: Delete a snapshot
 
-**Upgrades** ([operations](docs/manual/12_operations.md))
+**Upgrades and GitOps** ([operations](docs/manual/12_operations.md))
 
 - `relish upgrade`: Roll a new bun binary across the cluster, or back
   - `relish upgrade check`: Check for available updates
@@ -209,6 +210,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
+- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.0, not in 0.1.6)*
+  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.0, not in 0.1.6)*
+  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.0, not in 0.1.6)*
+  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.0, not in 0.1.6)*
 
 **Learn** ([under the hood](docs/manual/06_under-the-hood.md))
 

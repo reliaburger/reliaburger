@@ -728,12 +728,16 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 1. Lettuce watches the configured git repository.
 2. On each poll (or webhook trigger), it pulls the latest commit.
 3. It compares the desired state in the repository against the actual state of the cluster.
-4. It computes a diff and applies only the changes.
-5. The Brioche UI shows the sync status, the last applied commit, a preview of pending changes, and a history of all syncs.
+4. It computes a diff and applies only the changes: namespaces first, then permissions, then apps, and removals in the reverse order. A change the cluster refuses doesn't block the others; the sync records a partial result naming each refused change, and the applied commit moves only once everything has applied.
+5. The Brioche UI and `relish gitops status` show the sync status, the last applied commit and a history of syncs. There's no preview of pending changes yet.
+
+**Ownership:** Lettuce prunes only what it wrote. Raft holds the set of apps, namespaces and permissions a sync created, changed or adopted, updated in the same entry as the write itself, and the diff removes only resources in that set. GitOps and `relish apply` therefore coexist: turning GitOps on in a working cluster, or committing an empty tree, leaves manually applied resources alone. A manual `relish apply` of a GitOps-managed resource warns that the next sync reverts it, and `relish delete` or `relish rollback` of one is refused without `--force`. A running test's `rbtest-*` namespace never enters the diff, and only the test lease's own cleanup can delete what's in it.
+
+**Plaintext secrets:** an `env` value whose key looks secret (`PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`, or ending in `_KEY`) but isn't `ENC[AGE:...]` is applied with a warning in the log, the sync status and `relish wtf`. Lettuce warns rather than refuses, so existing repositories keep working.
 
 **Autoscaler interaction:** Lettuce treats the `replicas` field in git as the *base* replica count. Autoscaler adjustments are runtime overrides stored in Raft, not in git. Lettuce compares the `replicas` field independently from other fields: only a change to the `replicas` value itself in git resets the runtime override. This prevents Lettuce from fighting the autoscaler during traffic spikes. After a leader election, the new leader carries forward autoscaler overrides from Raft and re-evaluates scaling decisions once the learning period completes and fresh Mayo metrics are available.
 
-**Coordinator:** The Raft leader runs the sync loop, because only the leader can write desired state; when leadership moves, the new leader's loop takes over. Each node reads `[gitops]` from its own `node.toml`, so every node that can become leader needs the same block, or a failover changes the repository the cluster follows. Storing the GitOps configuration in Raft is planned ([#693](https://github.com/reliaburger/reliaburger/issues/693)).
+**Coordinator:** The Raft leader runs the sync loop, because only the leader can write desired state; when leadership moves, the new leader's loop takes over. The GitOps configuration lives in Raft, so the new leader follows the same repository, branch and path from the committed sync state. A node's `[gitops]` in `node.toml` only seeds Raft when the cluster has no configuration; a node whose section differs reports it in `relish wtf` and is ignored. `relish gitops set` (admin only, audited) changes it. The repository URL's credentials and the webhook secret are sealed with a key derived from the cluster master key before they reach Raft. Each sync records the Raft term it read desired state in, and the state machine refuses its writes in any other term, so a leader that lost and regained leadership mid-sync can't apply a stale diff.
 
 > For sync loop internals and coordinator election, see [design/gitops-lettuce.md](design/gitops-lettuce.md).
 
@@ -1119,6 +1123,8 @@ They would be, without constraints. The constraint that ships today is a policy 
 ### Q7: How does Pickle ensure image durability?
 
 Durability is eventual, not guaranteed at push time. A push commits the image locally and returns immediately with an `oci-replication: pending` header, so the client never mistakes acceptance for full redundancy. A leader-only heal loop (running roughly every 60 seconds) then replicates layers towards a redundancy target of 2 total copies by default: the node that received the push plus one peer. There is no synchronous mode and no `push_sync` config key. This keeps push latency low and independent of cluster size, at the cost of a short window after a push where the image exists on only one node. In clusters too small to reach the target, the heal loop records that full redundancy can't be met rather than silently claiming success.
+
+Heal counts only copies on live nodes (alive or suspect in gossip). When a node dies, every image it held drops a copy, and the next heal pass has another live node copy the layers straight from a surviving holder; the leader plans but doesn't relay. Decommissioning a node removes it from every holder list. An image whose last live copy is gone is reported as *lost* by `relish status` and `relish wtf`, and a deploy of it fails telling you to re-push it. Old images don't pile up either: a manifest that has had no tag for `gc_retain_days` expires, unless an app or job pins it, and GC reclaims its layers.
 
 ### Resource-aware delegated execution
 

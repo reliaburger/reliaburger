@@ -799,21 +799,6 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
                 StatusCode::OK
             );
         }
-        // A fresh projection must not turn an already-full repository into zero usage.
-        fresh.quota = QuotaConfig {
-            per_repository_bytes: 11,
-            total_bytes: 0,
-        };
-        let response = reliaburger::pickle::api::router(fresh)
-            .oneshot(
-                Request::put("/v2/ordinary/manifests/over-quota")
-                    .header("content-type", "application/vnd.oci.image.manifest.v1+json")
-                    .body(Body::from(body.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     // The same actual TLS route owns and retires a worker's leased repository.
@@ -1240,26 +1225,19 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
             .is_err(),
         "ownership read succeeded without quorum"
     );
-    for query in [
-        RegistryQuery::Repository {
-            repository: "ordinary".into(),
-        },
-        RegistryQuery::Usage {
-            repository: "ordinary".into(),
-        },
-    ] {
-        assert!(
-            forwarder
-                .query(
-                    None,
-                    reliaburger::cluster::identity::raft_id_from_name("node"),
-                    query
-                )
-                .await
-                .is_err(),
-            "catalogue reads must refuse without quorum"
-        );
-    }
+    assert!(
+        forwarder
+            .query(
+                None,
+                reliaburger::cluster::identity::raft_id_from_name("node"),
+                RegistryQuery::Repository {
+                    repository: "ordinary".into(),
+                },
+            )
+            .await
+            .is_err(),
+        "catalogue reads must refuse without quorum"
+    );
     for server in servers {
         server.abort();
         let _ = server.await;

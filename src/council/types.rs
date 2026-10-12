@@ -387,6 +387,32 @@ pub enum RaftRequest {
         observed_at_unix_ms: u64,
         jobs: Vec<AppId>,
     },
+    /// A desired-state write Lettuce makes for the repository (#693).
+    ///
+    /// `change` is an app, namespace or permission spec or delete. It
+    /// applies, and the GitOps ownership set records (or forgets) the
+    /// resource, in this one entry. `term` is the Raft term the sync read
+    /// its snapshot in; an entry proposed in any other term is refused, so
+    /// a leader that lost and regained leadership mid-sync can't apply a
+    /// stale diff. A delete of a resource GitOps doesn't own is refused.
+    GitOpsWrite { term: u64, change: Box<RaftRequest> },
+    /// Set or clear the cluster's GitOps configuration (#693). With `seed`,
+    /// it only applies when the cluster has none: that's how a node's
+    /// `[gitops]` section bootstraps it without overriding the cluster.
+    GitOpsConfigSet {
+        config: Option<Box<crate::lettuce::types::StoredGitOpsConfig>>,
+        seed: bool,
+    },
+    /// Remove an app from a test lease's namespace. A plain `AppDelete` is
+    /// refused there, so only the lease's cleanup removes its apps.
+    TestLeaseAppDelete { lease_id: String, app_id: AppId },
+    /// Remove a test lease's namespace, carrying the lease.
+    TestLeaseNamespaceDelete { lease_id: String, name: String },
+    /// Remove an untagged registry manifest once it has been untagged for
+    /// `gc_retain_days` (#697). The leader proposes it; apply rechecks that
+    /// it is still untagged since the same moment and that no app or job
+    /// pins it, and answers `Refused` otherwise.
+    ExpireManifest(crate::pickle::types::ExpireManifest),
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +527,14 @@ pub struct DesiredState {
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
     pub gitops_coordinator: Option<crate::lettuce::types::CoordinatorElection>,
+    /// The cluster's GitOps configuration, credentials sealed (#693). Every
+    /// leader syncs from this, never from its own `node.toml`.
+    #[serde(default)]
+    pub gitops_config: Option<crate::lettuce::types::StoredGitOpsConfig>,
+    /// The apps, namespaces and permissions GitOps wrote, and so may prune
+    /// (D9, #693).
+    #[serde(default)]
+    pub gitops_owned: crate::lettuce::types::GitOpsOwnership,
     /// Cluster security state: CAs, tokens, age keypairs, OIDC config.
     /// Contains wrapped (encrypted) private keys — safe to replicate.
     pub security_state: SecurityState,
@@ -551,6 +585,34 @@ pub struct DesiredState {
 }
 
 impl DesiredState {
+    /// Every image digest an app or job in desired state pins
+    /// (`web:v1@sha256:…`): app and init-container images, job definitions
+    /// and task-array templates. Registry expiry never removes these.
+    ///
+    // TODO(#692): also read the persisted deploy history once it lands, so
+    // a rollback target stays pullable.
+    pub fn pinned_image_digests(&self) -> std::collections::HashSet<String> {
+        let apps = self.apps.values().flat_map(|spec| {
+            spec.image
+                .iter()
+                .chain(spec.init.iter().filter_map(|init| init.image.as_ref()))
+        });
+        let jobs = self
+            .task_arrays
+            .jobs()
+            .definitions()
+            .filter_map(|(_, record)| record.definition.template.image.as_ref());
+        let arrays = self
+            .task_arrays
+            .iter()
+            .filter_map(|(_, record)| record.template.image.as_ref());
+        apps.chain(jobs)
+            .chain(arrays)
+            .filter_map(|image| crate::pickle::types::image_pin_digest(image))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Turn a restored state into the first state of a new recovery epoch
     /// (12b.2 D21/CP12).
     ///
@@ -721,6 +783,14 @@ mod tests {
             RaftRequest::DeleteTag(DeleteTag {
                 repository: "myapp".to_string(),
                 tag: "old".to_string(),
+                deleted_at_unix_ms: 1,
+            }),
+            RaftRequest::ExpireManifest(crate::pickle::types::ExpireManifest {
+                repository: "myapp".to_string(),
+                digest: crate::pickle::types::Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                untagged_at_unix_ms: 1,
             }),
             RaftRequest::AttachSignature(AttachSignature {
                 manifest_digest: crate::pickle::types::Digest::from_sha256_hex(

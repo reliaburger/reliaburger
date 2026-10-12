@@ -52,6 +52,18 @@ can keep them apart. A node without the live eBPF hooks (rootless runc,
 ProcessGrill, eBPF off) gets a `namespace-isolation` warning naming it: there,
 any namespace's workloads reach any other's, and `allow_from` is refused.
 
+When the cluster has a GitOps configuration, `wtf` asks every node how it
+sees it. A secret-looking `env` value that's plaintext in the repository is a
+`gitops-plaintext-secret` warning naming the app and the key (never the
+value); GitOps still applies it, so encrypt it with `relish secret encrypt`.
+A node whose own `[gitops]` in `node.toml` differs from the cluster's gets a
+`gitops-local-config` warning listing the settings that differ: the cluster's
+configuration in Raft is the one that runs, and the node's is ignored. A node
+that can't unseal the cluster's GitOps credentials (no master key) gets a
+`gitops-config-unreadable` warning, since as leader it couldn't sync. With none
+of these, the `gitops` OK row says so. See
+[GitOps](12_operations.md#gitops).
+
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
 fenced out of a council `relish council recover` replaced, when nodes serve
@@ -63,6 +75,15 @@ answers but has applied more than 100 log entries fewer than the others is a
 warning too: it counts towards quorum but isn't applying the log, which is
 what a voter whose disk filled up looks like. `relish council status` shows
 the same comparison as a table.
+
+For the image registry, `wtf` warns (`registry-redundancy`) when a node's
+registry isn't listening, peers can't reach it, or some layers have fewer live
+copies than `[images] redundancy` asks for. Heal fixes the last on its own
+within a minute or two. A *lost* image is worse: some layer it needs has no
+live copy anywhere, so nothing can pull it. That's a CRITICAL
+`registry-lost-images` finding listing each `repository:tag`, and the only fix
+is to push the image again (or bring back the node that held it). `relish
+status` prints the same list on one line. See `images-and-volumes`.
 
 `relish inspect <app>` uses the same relay to list every instance of an app on
 every node, with the node it runs on, under a `desired` vs `running` replica

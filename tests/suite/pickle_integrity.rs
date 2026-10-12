@@ -53,7 +53,9 @@ impl Registry {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();
-        let app = router(state.clone());
+        let app = router(state.clone()).layer(axum::Extension(
+            reliaburger::pickle::replication::ReplicaClient(reqwest::Client::new()),
+        ));
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
             axum::serve(listener, app)
@@ -293,6 +295,7 @@ async fn old_catalogue_without_manifest_holders_is_healed_not_collected() {
         &catalog_snapshot,
         &node1.state,
         &[node1.peer(1), node2.peer(2)],
+        &[1, 2].into_iter().collect(),
         2,
         10,
         &reqwest::Client::new(),

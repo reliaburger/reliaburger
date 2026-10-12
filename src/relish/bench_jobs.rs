@@ -852,9 +852,9 @@ pub async fn run(args: JobBenchArgs) -> Result<CommandOutcome, RelishError> {
         })
         .map_err(RelishError::SerialiseJson)?,
         (OutputFormat::Yaml, None) => {
-            serde_yaml::to_string(&report).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&report).map_err(RelishError::SerialiseYaml)?
         }
-        (OutputFormat::Yaml, Some(comparison)) => serde_yaml::to_string(&ComparedReport {
+        (OutputFormat::Yaml, Some(comparison)) => yaml_serde::to_string(&ComparedReport {
             report: &report,
             comparison,
         })

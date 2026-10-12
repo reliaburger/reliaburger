@@ -71,6 +71,21 @@ async fn admit_gitops_webhook(
     let delivery = header_delivery_id(&headers);
     let branch = header_branch(&headers).unwrap_or_else(|| "main".to_owned());
     let mut validator = validator.lock().await;
+    // The cluster's secret in Raft wins over this node's `[gitops]` (#693),
+    // so every node checks a webhook against the same secret.
+    if let Some(council) = &state.council
+        && let Some(stored) = council.desired_state().await.gitops_config
+    {
+        match stored.unseal(council.wrapping_ikm().map(|key| key.as_slice())) {
+            Ok(config) => {
+                validator.rekey(config.webhook_secret.as_deref(), config.webhook_rate_limit)
+            }
+            Err(error) => return webhook_unavailable(error),
+        }
+    }
+    if !validator.is_keyed() {
+        return webhook_unavailable("webhook secret not configured");
+    }
     let admission =
         match validator.reserve(&body, signature, gitlab_token, delivery.as_deref(), &branch) {
             Ok(admission) => admission,
@@ -205,6 +220,122 @@ async fn admit_gitops_webhook(
         Json(serde_json::json!({"message": "sync queued"})),
     )
         .into_response()
+}
+
+/// This node's view of how its `[gitops]` compares with the cluster's,
+/// published by the sync loop (#693).
+#[derive(Debug, Clone)]
+pub struct GitOpsLocalCheck(
+    pub tokio::sync::watch::Receiver<crate::lettuce::types::LocalConfigCheck>,
+);
+
+/// `GET /v1/gitops` — the cluster's GitOps configuration (credentials
+/// never included), sync status, what GitOps owns, and how this node's own
+/// `[gitops]` compares (#693).
+pub(super) async fn gitops_status_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    local: Option<axum::Extension<GitOpsLocalCheck>>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return Json(crate::lettuce::types::GitOpsStatus::default()).into_response();
+    };
+    let desired = council.desired_state().await;
+    let status = crate::lettuce::types::GitOpsStatus {
+        has_credentials: desired
+            .gitops_config
+            .as_ref()
+            .is_some_and(|stored| stored.sealed_credentials.is_some()),
+        config: desired.gitops_config.map(|stored| stored.config),
+        sync: desired.gitops_sync_state,
+        owned: desired.gitops_owned,
+        local: local
+            .map(|axum::Extension(GitOpsLocalCheck(check))| check.borrow().clone())
+            .unwrap_or_default(),
+    };
+    Json(status).into_response()
+}
+
+/// `POST /v1/gitops/config` — replace the cluster's GitOps configuration,
+/// or turn GitOps off (#693). Admin only. The leader seals the credentials
+/// with the cluster master key before they reach Raft; a follower passes
+/// the request, with the caller's own credential, to the leader.
+pub(super) async fn gitops_config_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
+        return resp;
+    }
+    let bad_request = |error: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response()
+    };
+    let request: crate::lettuce::types::GitOpsConfigRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => return bad_request(format!("invalid GitOps configuration: {error}")),
+    };
+    let Some(council) = &state.council else {
+        return bad_request(
+            "GitOps configuration lives in the cluster's council; this node is standalone".into(),
+        );
+    };
+    if let Some(forwarded) = super::upgrade::forward_upgrade_to_leader(
+        &state,
+        council,
+        directory.as_deref(),
+        "/v1/gitops/config",
+        &headers,
+        &body,
+    )
+    .await
+    {
+        return forwarded;
+    }
+    let stored = match &request.config {
+        Some(config) => match crate::lettuce::types::StoredGitOpsConfig::seal(
+            config,
+            council.wrapping_ikm().map(|key| key.as_slice()),
+        ) {
+            Ok(stored) => Some(Box::new(stored)),
+            Err(error) => return bad_request(error.to_string()),
+        },
+        None => None,
+    };
+    let enabled = stored.is_some();
+    match council
+        .write(crate::council::types::RaftRequest::GitOpsConfigSet {
+            config: stored,
+            seed: false,
+        })
+        .await
+    {
+        Ok(crate::council::types::CouncilResponse::Refused { reason }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
+        Ok(_) => Json(serde_json::json!({
+            "status": if enabled { "configured" } else { "disabled" }
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": format!("could not update the cluster: {error}") })),
+        )
+            .into_response(),
+    }
 }
 
 /// The provider's delivery id header, if any (GitHub / Gitea).

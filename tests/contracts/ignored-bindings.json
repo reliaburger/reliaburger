@@ -1648,5 +1648,11 @@
     "function": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors",
     "binary": "reliaburger::owned_task_arrays",
     "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors"
+  },
+  {
+    "source": "tests/registry_durability.rs",
+    "function": "image_survives_loss_of_the_pushing_node",
+    "binary": "reliaburger::registry_durability",
+    "test": "image_survives_loss_of_the_pushing_node"
   }
 ]

@@ -9,11 +9,18 @@
 //! layer cannot both win). Single-node mode applies the same rule to
 //! its local catalog.
 //!
+//! GC reclaims blobs; it never decides that an *image* is gone. That is
+//! expiry's job (`ManifestCatalog::apply_expire_manifest`, #697): once an
+//! untagged manifest leaves the catalogue, its blobs are no longer
+//! referenced and this two-phase sweep reclaims them.
+//!
 //! Candidate protections:
-//! - Active images (referenced by deployed apps) are never nominated
+//! - Active images (running here, pinned `repo:tag@sha256:…`) are never
+//!   nominated
 //! - Tagged manifests' layers are never nominated
 //! - Sole-copy layers are never nominated (the arbiter re-checks)
-//! - Retention window: unreferenced images kept for `retain_days`
+//! - Retention window: an untagged manifest's layers are kept for
+//!   `retain_days` after it lost its last tag
 //! - Orphan grace: untracked blobs younger than `orphan_grace` are
 //!   kept — a blob mid-push has no holder entry until its manifest
 //!   commits, and must not be swept out from under the upload
@@ -27,7 +34,8 @@ use super::types::{Digest, GcReport, ManifestCatalog};
 /// Configuration for garbage collection.
 #[derive(Debug, Clone)]
 pub struct GcConfig {
-    /// Days to retain unreferenced images before collection.
+    /// Days an untagged manifest's layers are kept after it lost its last
+    /// tag (`[images] gc_retain_days`).
     pub retain_days: u32,
     /// This node's ID.
     pub node_id: u64,
@@ -89,16 +97,42 @@ pub fn gc_candidates(
     let mut retention_count = 0;
     let mut orphan_grace_count = 0;
 
+    // Running instances record `repo:tag@sha256:…` (#697): compare the
+    // pinned digest, and the `repo:tag` before it, separately.
+    let active_digests: HashSet<&str> = active_images
+        .iter()
+        .filter_map(|image| super::types::image_pin_digest(image))
+        .collect();
+    let active_names: HashSet<&str> = active_images
+        .iter()
+        .map(|image| {
+            image
+                .rsplit_once('@')
+                .map_or(image.as_str(), |(name, _)| name)
+        })
+        .collect();
+
     // Protect all layers from manifests that have tags or are actively deployed
     for (digest_str, manifest) in &catalog.manifests {
-        let is_tagged = !manifest.tags.is_empty();
-        let is_active = active_images.contains(digest_str)
+        let is_tagged = manifest
+            .tags
+            .iter()
+            .any(|tag| !super::types::is_digest_tag(tag));
+        let is_active = active_digests.contains(digest_str.as_str())
+            || active_names.contains(digest_str.as_str())
             || manifest
                 .tags
                 .iter()
-                .any(|t| active_images.contains(&format!("{}:{}", manifest.repository, t)));
+                .any(|t| active_names.contains(format!("{}:{}", manifest.repository, t).as_str()));
 
-        let within_retention = manifest.pushed_at >= retention_cutoff;
+        // Retention counts from when the manifest lost its last tag, not
+        // from its push (#697); a manifest with no recorded untagging falls
+        // back to its push time.
+        let untagged_at = catalog
+            .untagged_since(&manifest.repository, &manifest.digest)
+            .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
+            .unwrap_or(manifest.pushed_at);
+        let within_retention = untagged_at >= retention_cutoff;
 
         if is_tagged || is_active || within_retention {
             // Protect everything this manifest pins, its own blob
@@ -427,6 +461,72 @@ mod tests {
         let result = gc_candidates(&store, &catalog, &active, &default_config()).unwrap();
         assert!(result.candidates.is_empty());
         assert!(result.active_protected > 0);
+    }
+
+    /// #697: running instances record `repo:tag@sha256:…`. Comparing that
+    /// string with `repo:tag` or a bare digest never matched, so a running
+    /// image whose tag had moved on had no active protection at all.
+    #[test]
+    fn active_image_pinned_by_digest_is_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        let mut catalog = ManifestCatalog::default();
+        let manifest = test_manifest("myapp", "m1", SystemTime::UNIX_EPOCH);
+        for d in manifest.referenced_digests() {
+            write_fake_blob(&store, d);
+        }
+        let pinned = format!("myapp:latest@{}", manifest.digest.as_str());
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest,
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1, 2]),
+        });
+        // The tag moved on long ago; the instance still runs the old digest.
+        catalog.apply_delete_tag(&crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 1,
+        });
+
+        let active = HashSet::from([pinned]);
+        let result = gc_candidates(&store, &catalog, &active, &default_config()).unwrap();
+
+        assert!(result.candidates.is_empty(), "{:?}", result.candidates);
+        assert_eq!(result.active_protected, 1);
+    }
+
+    /// #697: retention counts from when the manifest lost its tag, not from
+    /// its push. An image pushed long ago and untagged just now stays.
+    #[test]
+    fn retention_counts_from_untagging_not_from_the_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        let mut catalog = ManifestCatalog::default();
+        let manifest = test_manifest("myapp", "m1", SystemTime::UNIX_EPOCH);
+        for d in manifest.referenced_digests() {
+            write_fake_blob(&store, d);
+        }
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest,
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1, 2]),
+        });
+        catalog.apply_delete_tag(&crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: crate::pickle::types::unix_millis(SystemTime::now()),
+        });
+        let config = GcConfig {
+            retain_days: 7,
+            ..default_config()
+        };
+
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &config).unwrap();
+
+        assert!(result.candidates.is_empty(), "{:?}", result.candidates);
+        assert_eq!(result.retention_protected, 1);
     }
 
     #[test]

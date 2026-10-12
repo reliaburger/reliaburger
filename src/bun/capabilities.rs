@@ -619,7 +619,7 @@ impl ClusterCapabilities {
             "fresh Raft membership and leader evidence".to_string(),
         );
 
-        let registry = placement.map(|snapshot| snapshot.registry);
+        let registry = placement.map(|snapshot| &snapshot.registry);
         let registry_available = registry.map(|value| value.ready && value.peer_reachable);
         add(
             Capability::Registry,
@@ -638,14 +638,18 @@ impl ClusterCapabilities {
                         value.ready
                             && value.peer_reachable
                             && value.redundancy_possible
-                            && value.under_replicated_layers == 0,
+                            && value.under_replicated_layers == 0
+                            && value.lost_image_count == 0,
                     )
                 })
                 .unwrap_or(CapabilityState::Unknown),
             match registry {
                 Some(value) => format!(
-                    "target {}, known nodes {}, under-replicated layers {}",
-                    value.redundancy_target, value.known_nodes, value.under_replicated_layers
+                    "target {}, known nodes {}, under-replicated layers {}, lost images {}",
+                    value.redundancy_target,
+                    value.known_nodes,
+                    value.under_replicated_layers,
+                    value.lost_image_count
                 ),
                 None => "registry redundancy evidence is unavailable".to_string(),
             },
