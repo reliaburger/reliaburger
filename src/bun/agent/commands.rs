@@ -22,6 +22,16 @@ pub enum ApplyEvent {
         created: usize,
         instances: Vec<String>,
     },
+    /// A rollout over running instances failed part-way and was cleaned
+    /// up. `rolled_back` says whether every instance runs the previous spec
+    /// again (`false`: the rollout halted with both specs running). The
+    /// `Error` that ends the stream follows it. The placement reconciler
+    /// reports it to the leader, which marks the spec `RolloutFailed`.
+    RolloutAborted {
+        app: String,
+        rolled_back: bool,
+        reason: String,
+    },
     /// The deploy failed.
     Error { message: String },
 }

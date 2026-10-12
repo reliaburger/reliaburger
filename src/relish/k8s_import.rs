@@ -912,7 +912,7 @@ fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationRepo
     if let Some(strategy) = spec.and_then(|s| s.strategy.as_ref()) {
         if let Some(rolling) = &strategy.rolling_update {
             app.deploy = Some(DeploySpec {
-                strategy: Some("rolling".to_string()),
+                strategy: Some(crate::meat::deploy_types::DeployStrategy::Rolling),
                 max_surge: rolling.max_surge.as_ref().and_then(|v| match v {
                     k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i) => {
                         Some(*i as u32)

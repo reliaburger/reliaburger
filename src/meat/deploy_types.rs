@@ -61,13 +61,38 @@ impl Default for DeployConfig {
 }
 
 impl DeployConfig {
-    /// Parse from a `DeploySpec` (from app config). Missing fields use defaults.
+    /// Parse a `DeploySpec`, refusing a duration that doesn't parse and a
+    /// surge/unavailable pair that can't make progress.
+    ///
+    /// `"1m30s"` or `"500ms"` used to fall back to the default without a
+    /// word, so an operator who asked for a 90-second drain got 30 seconds.
+    /// Like `[autoscale]`, a `[deploy]` table is refused rather than clamped.
+    pub fn parse(spec: &crate::config::app::DeploySpec) -> Result<Self, String> {
+        for (field, value) in [
+            ("drain_timeout", &spec.drain_timeout),
+            ("health_timeout", &spec.health_timeout),
+        ] {
+            if let Some(value) = value
+                && parse_duration(value).is_none()
+            {
+                return Err(format!(
+                    "{field} {value:?} is not a duration: use a whole number of seconds, \
+                     minutes or hours, such as \"90s\", \"5m\" or \"1h\""
+                ));
+            }
+        }
+        let config = Self::from_spec(spec);
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Parse from a `DeploySpec` (from app config). Missing fields use
+    /// defaults. Admission runs [`DeployConfig::parse`] first, so a spec
+    /// that reaches a node has durations that parse.
     pub fn from_spec(spec: &crate::config::app::DeploySpec) -> Self {
         let mut cfg = Self::default();
-        if let Some(ref s) = spec.strategy
-            && s == "blue-green"
-        {
-            cfg.strategy = DeployStrategy::BlueGreen;
+        if let Some(strategy) = spec.strategy {
+            cfg.strategy = strategy;
         }
         if let Some(v) = spec.max_surge {
             cfg.max_surge = v;
@@ -217,6 +242,7 @@ pub fn plan_rolling_step(
 
 /// Deploy strategy, from `[app.NAME.deploy] strategy` (`"rolling"` or `"blue-green"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DeployStrategy {
     Rolling,
     BlueGreen,
@@ -829,7 +855,7 @@ mod tests {
     #[test]
     fn deploy_config_from_spec() {
         let spec = crate::config::app::DeploySpec {
-            strategy: Some("rolling".to_string()),
+            strategy: Some(DeployStrategy::Rolling),
             max_surge: Some(2),
             max_unavailable: Some(1),
             drain_timeout: Some("60s".to_string()),

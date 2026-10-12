@@ -954,6 +954,17 @@ impl BunClient {
                         ApplyEvent::InstanceCreated { id, app } => {
                             eprintln!("  created {id} ({app})");
                         }
+                        // The error that follows carries the same reason.
+                        ApplyEvent::RolloutAborted {
+                            app, rolled_back, ..
+                        } => {
+                            let outcome = if *rolled_back {
+                                "rolled back"
+                            } else {
+                                "halted"
+                            };
+                            eprintln!("  rollout of {app} {outcome}");
+                        }
                         ApplyEvent::Complete { created, instances } => {
                             result = Some(ApplyResult {
                                 created: *created,
