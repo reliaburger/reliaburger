@@ -27,6 +27,8 @@ const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// Admission bounds open writers and the small buffers retained by each stream.
 const MAX_CONCURRENT_WRITES: usize = 4;
+/// How long a write over that limit waits for a slot before a 429.
+const WRITE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Shared state for Pickle API handlers.
@@ -523,9 +525,15 @@ pub fn router(state: PickleState) -> Router {
                             | axum::http::Method::PUT
                             | axum::http::Method::DELETE
                     ) {
-                        match writers.try_acquire_owned() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
+                        // Queue rather than refuse at once: docker and
+                        // containerd push several layers in parallel and
+                        // fail the whole push on a 429. A queued request's
+                        // body stays unread on its socket until admitted.
+                        match tokio::time::timeout(WRITE_ADMISSION_WAIT, writers.acquire_owned())
+                            .await
+                        {
+                            Ok(Ok(permit)) => Some(permit),
+                            Ok(Err(_)) | Err(_) => {
                                 return (
                                     StatusCode::TOO_MANY_REQUESTS,
                                     [("retry-after", "1")],
@@ -542,7 +550,23 @@ pub fn router(state: PickleState) -> Router {
             },
         ))
         .layer(axum::middleware::from_fn(standard_client_credentials))
+        .layer(axum::middleware::from_fn(api_version_header))
         .with_state(state)
+}
+
+/// Mark every answer as coming from a v2 registry, as the distribution spec
+/// asks. docker reads the header on its first `GET /v2/` to decide that this
+/// is a registry it can push to, and remembers it when explaining a failure.
+async fn api_version_header(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "docker-distribution-api-version",
+        axum::http::HeaderValue::from_static("registry/2.0"),
+    );
+    response
 }
 
 /// The challenge a TLS registry sends with every 401, so `docker login`,
@@ -2219,33 +2243,71 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn registry_refuses_excess_writers_without_buffering_their_bodies() {
-        let (state, _dir) = test_state();
-        let app = router(state);
-        let mut writers = Vec::new();
+    /// Fill every write slot with an upload whose body never arrives.
+    fn stalled_writers(
+        app: &Router,
+    ) -> Vec<futures_util::future::BoxFuture<'static, Result<Response, std::convert::Infallible>>>
+    {
         let digest = compute_sha256(b"data");
-        for _ in 0..MAX_CONCURRENT_WRITES {
-            let body = Body::from_stream(futures_util::stream::pending::<
-                Result<axum::body::Bytes, std::io::Error>,
-            >());
-            let request = axum::http::Request::builder()
-                .method("POST")
-                .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
-                .body(body)
-                .unwrap();
-            let mut writer = Box::pin(app.clone().oneshot(request));
-            assert!(futures_util::poll!(writer.as_mut()).is_pending());
-            writers.push(writer);
-        }
-        let request = axum::http::Request::builder()
+        (0..MAX_CONCURRENT_WRITES)
+            .map(|_| {
+                let body = Body::from_stream(futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::io::Error>,
+                >());
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+                    .body(body)
+                    .unwrap();
+                let writer: futures_util::future::BoxFuture<'static, _> =
+                    Box::pin(app.clone().oneshot(request));
+                writer
+            })
+            .collect()
+    }
+
+    fn start_upload() -> axum::http::Request<Body> {
+        axum::http::Request::builder()
             .method("POST")
             .uri("/v2/web/blobs/uploads/")
             .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_refuses_excess_writers_without_buffering_their_bodies() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let mut writers = stalled_writers(&app);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        // The excess writer waits for a slot, then gives up with 429.
+        let response = app.oneshot(start_upload()).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()["retry-after"], "1");
+        drop(writers);
+    }
+
+    /// docker and containerd push several layers at once and never retry a
+    /// 429, so a writer over the limit queues for a slot instead.
+    #[tokio::test(start_paused = true)]
+    async fn an_excess_writer_waits_for_a_free_slot_instead_of_failing() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let mut writers = stalled_writers(&app);
+        for writer in &mut writers {
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+        }
+        let mut waiting = Box::pin(app.clone().oneshot(start_upload()));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+
+        // One stalled upload goes away; its slot admits the waiter.
+        drop(writers.pop());
+        let response = waiting.await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         drop(writers);
     }
 

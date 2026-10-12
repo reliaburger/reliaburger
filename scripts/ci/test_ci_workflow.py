@@ -370,6 +370,13 @@ class EvidenceTests(unittest.TestCase):
         install = next(step for step in steps(acceptance) if "go-containerregistry" in step)
         self.assertIn("sha256sum --check", install)
 
+    def test_the_standard_clients_run_on_a_prepared_host(self):
+        acceptance = self.jobs["acceptance"]
+        provision = 'sudo scripts/standard-clients-host.sh --provision'
+        self.assertIn(provision, acceptance)
+        self.assertLess(acceptance.index(provision),
+                        acceptance.index('--gate standard-clients --host linux'))
+
 
 class BenchmarkTests(unittest.TestCase):
     def setUp(self):

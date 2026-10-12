@@ -61,7 +61,7 @@ be visible until we remove its race.
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-standard-clients` | `crane` against Pickle's TLS listener | Linux, with a pinned `crane`; PRs into `main`, `main` and nightly |
+| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make test-gpu`, `make test-s3` | Real NVIDIA hardware; a real S3 bucket | Manual |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
