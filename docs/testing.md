@@ -151,7 +151,8 @@ bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
 request runs the first when it touches the gossip protocol or its benchmarks,
 and the second when it touches what `benches/task_arrays.rs` measures: the
 task-array leader and node pool, the executor, range sets or the benchmark
-itself ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). The gossip numbers
+itself ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)), unless it targets a
+merge train: there both wait for the merge queue and the push. The gossip numbers
 gate nothing. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved, and fails only when one is more than twice
 as slow ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)): hosted
@@ -166,14 +167,68 @@ in the `Makefile` isn't run by any workflow.
 [`select-jobs.sh`](../scripts/ci/select-jobs.sh) diffs a pull request against
 its base (with renames split into a deletion and an addition, so moving code
 into `docs/` still counts as code). Documentation-only changes skip the Rust
-jobs. Pull requests into `main` or into a release's merge-train branch
-(`release-*`, one per release, e.g. `release-1-1-4`) run the heavy suites;
-pull requests stacked on any other branch skip them unless labelled
-`full-ci`. When GitHub retargets a stacked pull request to `main`,
+jobs. What else runs depends on where the change is going:
+
+| Run | Jobs | Typical wall time |
+|---|---|---|
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-1`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, portable Linux (with coverage and doctests) and the optimised contract boundaries | 15–20 minutes |
+| The same, labelled `full-ci`; any pull request whose head is a train (the gate PR into `main`); any pull request into `main` | Everything the change touches: the light set plus three macOS shards, privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks | about 45 minutes, plus any wait for macOS runners |
+| Merge-queue group on a train (`merge_group`), push to a train or to `main`, nightly, manual | Everything | about 45 minutes, plus any wait for macOS runners |
+| Pull request stacked on any other branch | The light set plus macOS; the heavy suites only with `full-ci` | 40 minutes |
+
+The light set exists because macOS was the critical path of almost every run:
+twelve runs before the change took 45–55 minutes of wall time, of which
+runner queueing was mostly under ten, portable macOS 35–49 and acceptance
+about 34; every other job finished in about 15. A pull request into a train
+only needs to show it compiles, lints and passes the portable suite on Linux,
+with the coverage floor (`COVERAGE_MIN_LINES`, which only the Linux job
+measures). Nothing is lost, only moved: the merge queue on each `release-*`
+branch runs every job on the batch merged onto the train before any of it
+lands, and the push to the train runs everything again on the result. So
+every commit on a train, and the gate PR into `main`, has full coverage. Label
+a pull request `full-ci` when you want the whole set on the PR itself, for
+example for a change to the heavy suites or to macOS-only code.
+
+The merge queue requires one check, `ignored-test evidence`. It waits for
+every other job, fails if any of them failed or was cancelled, and then runs
+the evidence aggregation below, so a skipped job can only count when select
+jobs left it out. On a merge-queue group, a push or a manual run the
+aggregation demands every owner; only a pull request may qualify with fewer.
+Evidence there binds to the queue's temporary group commit
+(`github.event.merge_group.head_sha`), the commit it checked out.
+
+A newer push to the same pull request, or to the same train, cancels the
+older run; pushes to `main`, merge-queue groups and nightly runs each keep
+their own. When GitHub retargets a stacked pull request,
 [`ci-retarget.yml`](../.github/workflows/ci-retarget.yml) reruns CI with the
-new base, so the heavy suites don't wait for another push. Its fixtures, in
-[`test_select_jobs.py`](../scripts/ci/test_select_jobs.py), cover each of
-those cases.
+new base, so the new base's set applies without another push. The fixtures in
+[`test_select_jobs.py`](../scripts/ci/test_select_jobs.py) cover each case.
+
+### Portable macOS in three shards
+
+The portable suite on macOS runs as three parallel jobs, `portable macOS
+(1/3)` to `(3/3)`, each running `make test` with `--partition hash:K/3`
+(`SHARDS` in [`workflow_assembly.py`](../scripts/ci/workflow_assembly.py)).
+A hash partition keeps each test in the same shard whatever else is added, so
+a failure in shard 2 reproduces locally with
+`cargo nextest run --partition hash:2/3`. Each shard compiles the suite
+itself, and compiling is most of a macOS job: on the first sharded run each
+shard spent about 38 minutes compiling and under 3 testing (7 unsharded), so
+a shard takes 42–44 minutes, level with acceptance. Building once and sharing
+a nextest archive would take the compile off two of the three runners, but not
+off the critical path. One shard runs `make lint-macos` and another the
+doctests. A shard re-run on its own keeps its own attempt; the evidence gate
+treats each shard as its own job when it checks attempts.
+
+Each shard seals its own envelope (`contract-darwin-portable-darwin-K`) and
+sets only its own output. A nextest list under a partition still names every
+test, marking the other shards' tests as `mismatch` with reason `partition`,
+so the evidence gate merges the three: they must list the same tests, run
+disjoint parts of them, run all of them between them, and together complete
+every required case. A missing, failed or swapped shard fails the gate.
+[`test_shard_partition.py`](../scripts/ci/test_shard_partition.py) checks that
+merge against what the pinned nextest really prints, on a throwaway crate.
+Coverage is unaffected: only the Linux portable job measures it.
 
 ## Finite contracts and current evidence
 

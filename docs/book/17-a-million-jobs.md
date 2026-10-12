@@ -1153,6 +1153,52 @@ positive proof that the original owner retired. A missing route isn't
 permission to recreate: both backends' inventories must prove the identity
 absent first.
 
+That rule broke the first time the 0.2.0 soak switched a node from
+`--runtime runc` to `--runtime mixed` (#823). The harness rewrote the unit file
+and killed Bun with `SIGKILL`; the node's containers kept running, as they're
+meant to. The new Bun read its launch inventory during startup recovery, found
+a runc launch for `frontend-2`, and looked for its route. A runc-only Bun never
+writes routes, so the route directory didn't exist, and the first check on it
+returned a bare "No such file or directory". Recovery treated that as fatal,
+systemd restarted Bun, and the same read failed seventy-four times in a row.
+The `runc` and `exe` processes systemd kept reporting weren't a half-finished
+`runc create`. They were the container's own launcher (Bun's binary, run
+through `/proc/self/exe`) and the `runc run` under it, doing their job.
+
+A launch without a route isn't the same as a lost route, though. Each backend
+keeps its own ownership journal, and a launch that exactly one backend lists
+has an owner we can prove. So before anything reads the inventory, a mixed Bun
+calls `route_unrouted_launches`, which writes a route for every such launch,
+pointing at the backend that listed it:
+
+```rust
+for (id, hosts) in owners {
+    let [(host, true)] = hosts[..] else {
+        continue;
+    };
+    // ... store a route to `host`'s backend, under the route's lock ...
+}
+```
+
+`hosts` is a `Vec<(bool, bool)>` with one entry per backend that lists the
+instance: whether that backend is the host one, and whether the launch fits
+it (a host command on the host backend, an image on the container one).
+`hosts[..]` views the vector as a slice, and the pattern `[(host, true)]`
+matches only a slice of exactly one element whose second field is `true`,
+binding the first field to `host`. `let PATTERN = value else { ... };` is
+Rust's *let-else*: if the pattern doesn't match, the `else` block runs and must
+leave the scope (here, `continue`). In Go you'd write
+`if len(hosts) != 1 || !hosts[0].fits { continue }; host := hosts[0].host`,
+and nothing would stop a later edit from indexing before the check.
+
+Everything else still gets no route, so recovery refuses it as before. An
+instance both backends claim is conflicting ownership, not a runtime switch.
+An image app that `--runtime process` ran as a host process doesn't fit
+either: the mixed runtime would run it in a container, so it can't adopt that
+execution, and switching such a node from `process` to `mixed` still stops
+Bun (#827). An instance that already has a route keeps it, so running the step
+on every start changes nothing after the first.
+
 A file lock serialises route changes, and the adapter moves that lock into a
 spawned task. If the caller's future is dropped mid-create, the lock stays held
 until the runtime operation really finishes. That's right for create and stop.
