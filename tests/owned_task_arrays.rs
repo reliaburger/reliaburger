@@ -1382,6 +1382,88 @@ async fn runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_origin
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A node that ran `--runtime runc` and restarts with `--runtime mixed`
+/// keeps its running containers. The mixed runtime routes each one to the
+/// runc owner that launched it, so startup recovery can read them (#823).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
+    use reliaburger::grill::{AnyGrill, InstanceId};
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-runc-to-mixed-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("runtime switch fixture: {}", root.display());
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runc = || {
+        RuncGrill::new(
+            root.join("bundles"),
+            images.clone(),
+            false,
+            root.join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap()
+    };
+    let container = InstanceId("rbtest-switch__frontend-2".into());
+    let job: reliaburger::config::job::JobSpec =
+        toml::from_str(&format!("image='{image}'\ncommand=['/bin/sleep','60']")).unwrap();
+    let spec = reliaburger::grill::generate_job_oci_spec(
+        "frontend",
+        "rbtest-switch",
+        &job,
+        "/sys/fs/cgroup/reliaburger/rbtest-switch/frontend/2",
+        None,
+    );
+    let single = AnyGrill::Runc(runc());
+    single.create(&container, &spec).await.unwrap();
+    single.start(&container).await.unwrap();
+    assert_eq!(
+        single.state(&container).await.unwrap(),
+        ContainerState::Running
+    );
+    drop(single);
+
+    let mixed = AnyGrill::with_host_processes(
+        runc(),
+        &root.join("instances"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    );
+    assert!(
+        mixed.launch_inventory().await.is_err(),
+        "an unrouted runc launch was readable before routing"
+    );
+    let AnyGrill::Mixed(router) = &mixed else {
+        panic!("with_host_processes did not build the mixed runtime");
+    };
+    assert_eq!(
+        router.route_unrouted_launches().await.unwrap(),
+        vec![container.clone()]
+    );
+    let launches = mixed.launch_inventory().await.unwrap().unwrap();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].instance_id, container);
+    assert_eq!(
+        mixed.state(&container).await.unwrap(),
+        ContainerState::Running
+    );
+    mixed.kill(&container).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while mixed.state(&container).await.unwrap() != ContainerState::Stopped {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the routed runc container did not retire");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Warm capacity remains usable while its reservation is retained; queued
 /// commands must resolve secrets again after that wait, before execution.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
