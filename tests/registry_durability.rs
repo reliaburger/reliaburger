@@ -32,7 +32,9 @@ struct Node {
     name: String,
     process: BunProcess,
     client: BunClient,
+    endpoint: String,
     ip: Ipv4Addr,
+    images: PathBuf,
 }
 
 impl Node {
@@ -40,6 +42,32 @@ impl Node {
     async fn registry(&self) -> Option<RegistryCapabilityEvidence> {
         let capabilities = self.client.capabilities().await.ok()?;
         Some(capabilities.placement?.registry)
+    }
+
+    /// This node's view of the council, or `None` while it can't say.
+    async fn council(&self) -> Option<reliaburger::bun::agent::CouncilStatus> {
+        self.client
+            .http()
+            .ok()?
+            .get(format!("{}/v1/cluster/council", self.endpoint))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
+    /// Whether this node's blob store holds every one of `digests`: the
+    /// bytes on disk, not anyone's account of them.
+    fn holds(&self, digests: &[&str]) -> bool {
+        let store = reliaburger::pickle::store::BlobStore::new(&self.images);
+        digests.iter().all(|digest| {
+            reliaburger::pickle::types::Digest::new(digest)
+                .is_ok_and(|digest| store.has_blob(&digest))
+        })
     }
 }
 
@@ -178,7 +206,9 @@ async fn image_survives_loss_of_the_pushing_node() {
         name: "node-01".into(),
         process: first_process,
         client: BunClient::new_with_ca(&first_endpoint, Some(&token), &ca_bytes).unwrap(),
+        endpoint: first_endpoint.clone(),
         ip: Ipv4Addr::new(127, 0, 0, 1),
+        images: first.storage.images.clone(),
     }];
     for number in 2..=3u8 {
         let name = format!("node-{number:02}");
@@ -234,21 +264,35 @@ async fn image_survives_loss_of_the_pushing_node() {
             name,
             process,
             client: BunClient::new_with_ca(&endpoint, Some(&token), &ca_bytes).unwrap(),
+            endpoint,
             ip,
+            images: follower.storage.images.clone(),
         });
     }
+    // Heal and the authoritative registry evidence run on council members,
+    // so wait until all three are voters that agree on a leader.
     wait_until(
-        "three live registries",
+        "three council voters and three live registries",
         Duration::from_secs(120),
         async || {
-            let mut ready = true;
+            let mut leaders = std::collections::BTreeSet::new();
             for node in &nodes {
-                ready &= node
+                let Some(view) = node.council().await else {
+                    return false;
+                };
+                if view.members.len() != 3 {
+                    return false;
+                }
+                leaders.insert(view.leader);
+                let live = node
                     .registry()
                     .await
                     .is_some_and(|registry| registry.ready && registry.known_nodes == 3);
+                if !live {
+                    return false;
+                }
             }
-            ready
+            leaders.len() == 1 && leaders.iter().all(Option::is_some)
         },
     )
     .await;
@@ -260,17 +304,23 @@ async fn image_survives_loss_of_the_pushing_node() {
     reliaburger::testkit::oci::push_image(&http, &registry, "durable", "v1", &image)
         .await
         .unwrap();
+    let digests = [
+        image.manifest_digest.as_str(),
+        image.config_digest.as_str(),
+        image.layer_digest.as_str(),
+    ];
+    assert!(nodes[0].holds(&digests), "the push must land on node 1");
     wait_until(
-        "heal to reach two copies",
+        "heal to make a second copy",
         Duration::from_secs(240),
-        async || {
-            nodes[0]
-                .registry()
-                .await
-                .is_some_and(|registry| registry.under_replicated_layers == 0)
-        },
+        async || nodes.iter().filter(|node| node.holds(&digests)).count() >= 2,
     )
     .await;
+    assert_eq!(
+        nodes.iter().filter(|node| node.holds(&digests)).count(),
+        2,
+        "redundancy 2 means exactly one extra copy"
+    );
 
     // Node 1 dies for good. Its copy no longer counts, so heal must make a
     // new one on the third node from the survivor that holds it.
@@ -282,6 +332,9 @@ async fn image_survives_loss_of_the_pushing_node() {
         "heal to restore two live copies after the node loss",
         Duration::from_secs(360),
         async || {
+            if !nodes.iter().all(|node| node.holds(&digests)) {
+                return false;
+            }
             let mut healed = true;
             for node in &nodes {
                 healed &= node.registry().await.is_some_and(|registry| {
@@ -300,9 +353,21 @@ async fn image_survives_loss_of_the_pushing_node() {
     for node in &nodes {
         let survivor = format!("https://{}:{}", node.ip, base.images.registry_port);
         let http = node.client.registry_http_client(&survivor).unwrap();
-        let manifest = reliaburger::testkit::oci::fetch_manifest(&http, &survivor, "durable", "v1")
-            .await
-            .unwrap();
+        // The catalogue answers once the survivors have a leader again.
+        let mut manifest = None;
+        wait_until(
+            "the tag to resolve on a survivor",
+            Duration::from_secs(60),
+            async || {
+                manifest =
+                    reliaburger::testkit::oci::fetch_manifest(&http, &survivor, "durable", "v1")
+                        .await
+                        .ok();
+                manifest.is_some()
+            },
+        )
+        .await;
+        let manifest = manifest.unwrap();
         assert_eq!(
             reliaburger::testkit::oci::sha256_digest(&manifest),
             image.manifest_digest
