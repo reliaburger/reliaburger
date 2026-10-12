@@ -154,7 +154,7 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -789,7 +789,7 @@ pub async fn decommission_node(
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&retirement).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&retirement).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())
@@ -829,7 +829,7 @@ async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(
                 println!("{json}");
             }
             OutputFormat::Yaml => {
-                let yaml = serde_yaml::to_string(&nodes).map_err(RelishError::SerialiseYaml)?;
+                let yaml = yaml_serde::to_string(&nodes).map_err(RelishError::SerialiseYaml)?;
                 print!("{yaml}");
             }
         }
@@ -991,7 +991,7 @@ async fn council_with_client(output: OutputFormat, client: &BunClient) -> Result
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&report).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&report).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -1009,7 +1009,7 @@ fn print_standalone_council(
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(council).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(council).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -1243,7 +1243,7 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
                 }
                 OutputFormat::Yaml => {
                     let yaml =
-                        serde_yaml::to_string(&result).map_err(RelishError::SerialiseYaml)?;
+                        yaml_serde::to_string(&result).map_err(RelishError::SerialiseYaml)?;
                     print!("{yaml}");
                 }
             }
@@ -1291,7 +1291,7 @@ pub async fn cancel_deploy(operation_id: &str, output: OutputFormat) -> Result<(
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&operation).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&operation).map_err(RelishError::SerialiseYaml)?
         ),
     }
     if matches!(
@@ -1341,7 +1341,7 @@ pub async fn history(app: &str, namespace: &str, output: OutputFormat) -> Result
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&entries).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&entries).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -1589,7 +1589,7 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&top.rows).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&top.rows).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -1845,7 +1845,7 @@ pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
             OutputFormat::Json => {
                 serde_json::to_string_pretty(&result).map_err(RelishError::SerialiseJson)?
             }
-            _ => serde_yaml::to_string(&result).map_err(RelishError::SerialiseYaml)?,
+            _ => yaml_serde::to_string(&result).map_err(RelishError::SerialiseYaml)?,
         };
         print!("{text}");
         if matches!(output, OutputFormat::Json) {
@@ -2708,7 +2708,7 @@ pub async fn batch_results(
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&results).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&results).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())
@@ -3027,7 +3027,7 @@ pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&listing).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&listing).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())

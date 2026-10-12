@@ -608,7 +608,7 @@ fn label_selector(
 }
 
 fn to_yaml<T: serde::Serialize>(resource: &T) -> Result<String, RelishError> {
-    serde_yaml::to_string(resource).map_err(|e| RelishError::FormatFailed(e.to_string()))
+    yaml_serde::to_string(resource).map_err(|e| RelishError::FormatFailed(e.to_string()))
 }
 
 /// Map Reliaburger env vars to Kubernetes `EnvVar`s.

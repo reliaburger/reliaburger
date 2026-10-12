@@ -36,7 +36,7 @@ pub fn sparkline(values: &[f64]) -> String {
 ///
 /// - `Human` calls the value's `Display` implementation.
 /// - `Json` serialises with `serde_json` (pretty-printed).
-/// - `Yaml` serialises with `serde_yaml`.
+/// - `Yaml` serialises with `yaml_serde`.
 pub fn format_output<T: Serialize + fmt::Display>(
     value: &T,
     format: OutputFormat,
@@ -47,7 +47,7 @@ pub fn format_output<T: Serialize + fmt::Display>(
             serde_json::to_string_pretty(value).map_err(super::RelishError::SerialiseJson)
         }
         OutputFormat::Yaml => {
-            serde_yaml::to_string(value).map_err(super::RelishError::SerialiseYaml)
+            yaml_serde::to_string(value).map_err(super::RelishError::SerialiseYaml)
         }
     }
 }
@@ -96,9 +96,69 @@ mod tests {
     }
 
     #[test]
-    fn yaml_format_uses_serde_yaml() {
+    fn yaml_format_uses_serialize() {
         let g = greeting();
         let output = format_output(&g, OutputFormat::Yaml).unwrap();
         assert!(output.contains("message: world"), "got: {output}");
+    }
+
+    /// Pins the exact YAML layout, so swapping the YAML crate (serde_yaml to
+    /// yaml_serde, #817) can't silently change what scripts parse.
+    #[derive(Serialize)]
+    struct Layout {
+        name: String,
+        replicas: u32,
+        ratio: f64,
+        enabled: bool,
+        missing: Option<String>,
+        looks_like_bool: String,
+        looks_like_number: String,
+        multi_line: String,
+        empty: Vec<String>,
+        ports: Vec<u16>,
+        labels: std::collections::BTreeMap<String, String>,
+        state: Mode,
+    }
+
+    #[derive(Serialize)]
+    enum Mode {
+        Running,
+        Failed { code: i32 },
+    }
+
+    #[test]
+    fn yaml_output_layout_is_stable() {
+        let layout = Layout {
+            name: "web".to_string(),
+            replicas: 3,
+            ratio: 0.5,
+            enabled: true,
+            missing: None,
+            looks_like_bool: "yes".to_string(),
+            looks_like_number: "8080".to_string(),
+            multi_line: "line one\nline two\n".to_string(),
+            empty: Vec::new(),
+            ports: vec![80, 443],
+            labels: [("tier".to_string(), "front".to_string())].into(),
+            state: Mode::Running,
+        };
+        let output = yaml_serde::to_string(&layout).unwrap();
+        assert_eq!(
+            output,
+            "name: web\n\
+             replicas: 3\n\
+             ratio: 0.5\n\
+             enabled: true\n\
+             missing: null\n\
+             looks_like_bool: yes\n\
+             looks_like_number: '8080'\n\
+             multi_line: |\n  line one\n  line two\n\
+             empty: []\n\
+             ports:\n- 80\n- 443\n\
+             labels:\n  tier: front\n\
+             state: Running\n"
+        );
+        let failed = yaml_serde::to_string(&Mode::Failed { code: 2 }).unwrap();
+        assert_eq!(failed, "!Failed\ncode: 2\n");
     }
 }

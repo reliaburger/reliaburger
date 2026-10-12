@@ -25,3 +25,14 @@ make audit
 cargo tree --locked -i unsafe-libyaml
 git grep -ln serde_yaml -- src
 ```
+
+## Resolution, 0.2.1
+
+[#817](https://github.com/reliaburger/reliaburger/issues/817) removed this
+exception. `relish` now uses [yaml_serde 0.10](https://crates.io/crates/yaml_serde),
+the YAML organization's maintained fork of `serde_yaml` with the same API, which
+depends on their maintained [libyaml-rs](https://crates.io/crates/libyaml-rs)
+fork of unsafe-libyaml. Neither crate has a RustSec advisory. `cargo tree -i
+unsafe-libyaml` finds nothing, `RUSTSEC-2024-0449` is gone from
+`.cargo/audit.toml`, and a portable test (`dependency_audit` in `tests/suite/`)
+fails if either `unsafe-libyaml` or `serde_yaml` returns to `Cargo.lock`.

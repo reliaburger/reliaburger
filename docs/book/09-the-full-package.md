@@ -640,6 +640,16 @@ k8s-openapi = { version = "0.22", default-features = false, features = ["latest"
 
 We disable `default-features` on k8s-openapi because we only need the type definitions, not the API client operations. That shaves off a chunk of compile time.
 
+### Reading the YAML
+
+k8s-openapi gives us types, not a parser. For that we started with `serde_yaml`, the crate everyone reached for, and it did the job: a `Deserializer` iterates over the documents in a stream (so a Helm `# Source:` comment or a `---` inside a PEM block doesn't split anything), each document becomes a generic `Value`, and we pick the k8s-openapi type from its `kind`.
+
+Then its author archived it. `serde_yaml` 0.9 ships as `0.9.34+deprecated`, and it sits on `unsafe-libyaml`, the C libyaml machine-translated into unsafe Rust, archived along with it. RustSec lists that one as unmaintained (RUSTSEC-2024-0449), and in October 2026 our weekly audit, which denies every warning it hasn't been told about, went red. Nothing was exploitable. But we'd have been parsing other people's manifests with unsafe code that nobody fixes any more.
+
+We could have added an audit exception and moved on. We did, for a few days. The real fix turned out to be smaller: the YAML organization forked both crates and maintains them as `yaml_serde` and `libyaml-rs`. It's still the same translated libyaml underneath (so still `unsafe`), but now somebody answers the bug reports. The API is unchanged, so the swap was one line in `Cargo.toml` and `serde_yaml::` becoming `yaml_serde::` in twelve files; every call site (`to_string`, `from_value`, `Deserializer::from_str`) compiles as it was. A test in `src/relish/output.rs` pins the exact YAML layout (quoting, block scalars, enum tags) and passed before and after the swap, so `--output yaml` didn't move by a byte. Another reads `Cargo.lock` and fails if `unsafe-libyaml` ever creeps back in.
+
+Why not a pure-Rust parser such as `serde-saphyr`? It would remove the `unsafe` entirely, but it's a different implementation with its own error messages and edge cases, and we wanted the smallest behaviour change that clears the advisory. That's a trade worth revisiting if YAML parsing ever moves off the operator's own machine.
+
 ### The field mapping
 
 A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but it's close enough that the output is usable without manual editing for most cases:
