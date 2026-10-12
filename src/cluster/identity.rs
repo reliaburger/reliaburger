@@ -84,9 +84,60 @@ pub fn pickle_peers_scheme(
         .collect()
 }
 
+/// The nodes whose registry copies count (#697): every member gossip
+/// reports Alive or Suspect, plus `self_id`. A Suspect node may still be
+/// back in a moment, so heal doesn't race to replace it; a Dead or Left
+/// node's copies can't serve a pull, so they no longer count.
+pub fn live_registry_nodes(
+    members: &[MembershipSnapshot],
+    self_id: u64,
+) -> std::collections::BTreeSet<u64> {
+    use crate::mustard::state::NodeState;
+    members
+        .iter()
+        .filter(|m| matches!(m.state, NodeState::Alive | NodeState::Suspect))
+        .map(|m| raft_id_from_name(&m.node_id.0))
+        .chain(std::iter::once(self_id))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_registry_nodes_keep_suspects_and_drop_the_dead() {
+        use crate::meat::types::NodeId;
+        use crate::mustard::state::NodeState;
+        let member = |name: &str, state: NodeState| MembershipSnapshot {
+            node_id: NodeId::new(name),
+            address: "10.0.0.1:9443".parse().unwrap(),
+            state,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: std::collections::BTreeMap::new(),
+            first_seen: std::time::Instant::now(),
+            resources: None,
+        };
+        let members = [
+            member("alive", NodeState::Alive),
+            member("suspect", NodeState::Suspect),
+            member("dead", NodeState::Dead),
+            member("left", NodeState::Left),
+        ];
+
+        let live = live_registry_nodes(&members, 7);
+
+        assert_eq!(
+            live,
+            std::collections::BTreeSet::from([
+                7,
+                raft_id_from_name("alive"),
+                raft_id_from_name("suspect"),
+            ])
+        );
+    }
 
     #[test]
     fn raft_id_is_deterministic_and_nonzero() {

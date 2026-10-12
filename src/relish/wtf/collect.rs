@@ -933,6 +933,8 @@ fn collect_registry(
                     peer_reachable: registry.peer_reachable,
                     redundancy_possible: registry.redundancy_possible,
                     under_replicated_layers: registry.under_replicated_layers,
+                    lost_images: registry.lost_images,
+                    lost_image_count: registry.lost_image_count,
                 });
             }
         }

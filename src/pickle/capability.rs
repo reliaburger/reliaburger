@@ -1,5 +1,6 @@
 //! Live Pickle registry reachability and redundancy evidence.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
@@ -67,7 +68,11 @@ pub fn plan_registry_bind(
         (configured, advertised),
         (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
     );
-    let listen_ip = if configured.is_loopback() {
+    let listen_ip = if configured == advertised {
+        // Exactly the address peers use. On one host this lets several
+        // nodes advertise 127.0.0.1, .2 and .3 and share a registry port.
+        configured
+    } else if configured.is_loopback() {
         // A loopback *default* on a routable cluster must bind the unspecified
         // address of the advertise family, not the advertised IP itself. The
         // wildcard covers both the routable address peers use AND loopback —
@@ -96,8 +101,12 @@ pub fn plan_registry_bind(
     })
 }
 
+/// At most this many Lost image names travel in one capability report; the
+/// count is always exact.
+pub const MAX_REPORTED_LOST_IMAGES: usize = 50;
+
 /// Operator-visible Pickle reachability and redundancy evidence.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryCapabilityEvidence {
     /// Whether the listener was bound and entered its run loop.
     pub ready: bool,
@@ -111,31 +120,49 @@ pub struct RegistryCapabilityEvidence {
     pub p2p_enabled: bool,
     /// Desired number of holders per image layer.
     pub redundancy_target: u32,
-    /// Active nodes currently visible through membership.
+    /// Live nodes (Alive or Suspect in gossip, plus this one).
     pub known_nodes: usize,
     /// Whether the current membership can satisfy the configured target.
     pub redundancy_possible: bool,
-    /// Catalogue layers with fewer holders than the configured target.
+    /// Catalogue blobs with fewer live holders than the configured target.
     pub under_replicated_layers: usize,
+    /// Images some blob of which no live node holds (design §7.3), as
+    /// `repository:tag` (or `repository@digest` when untagged). At most
+    /// [`MAX_REPORTED_LOST_IMAGES`] names.
+    #[serde(default)]
+    pub lost_images: Vec<String>,
+    /// How many images are Lost, including any beyond the reported names.
+    #[serde(default)]
+    pub lost_image_count: usize,
 }
 
 /// Assemble a current capability snapshot from listener, membership and
 /// catalogue state.
+///
+/// `live_nodes` is every node gossip reports Alive or Suspect, plus this
+/// one. Holders outside it don't count (#697): a dead node recorded as a
+/// holder can't serve its copy.
 pub fn registry_capability_evidence(
     bind: RegistryBindPlan,
     ready: bool,
     tls: bool,
     p2p_enabled: bool,
     redundancy_target: u32,
-    known_nodes: usize,
+    live_nodes: &BTreeSet<u64>,
     catalog: &ManifestCatalog,
 ) -> RegistryCapabilityEvidence {
     let redundancy_target = redundancy_target.max(1);
     let under_replicated_layers = catalog
         .layer_locations
         .iter()
-        .filter(|(_, holders)| holders.len() < redundancy_target as usize)
+        .filter(|(_, holders)| {
+            holders.intersection(live_nodes).count() < redundancy_target as usize
+        })
         .count();
+    let mut lost_images = catalog.lost_images(live_nodes);
+    let lost_image_count = lost_images.len();
+    lost_images.truncate(MAX_REPORTED_LOST_IMAGES);
+    let known_nodes = live_nodes.len().max(1);
     RegistryCapabilityEvidence {
         ready,
         listen_addr: Some(bind.listen_addr),
@@ -146,6 +173,8 @@ pub fn registry_capability_evidence(
         known_nodes,
         redundancy_possible: known_nodes >= redundancy_target as usize,
         under_replicated_layers,
+        lost_images,
+        lost_image_count,
     }
 }
 
@@ -185,12 +214,94 @@ mod tests {
         assert!(plan.peer_reachable);
     }
 
+    /// Several nodes on one host advertise their own loopback addresses and
+    /// share the cluster-wide registry port, so each binds only its own.
+    #[test]
+    fn a_bind_equal_to_the_advertised_loopback_address_binds_exactly_it() {
+        let advertised = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let plan = plan_registry_bind("127.0.0.2", 5050, Some(advertised)).unwrap();
+        assert_eq!(plan.listen_addr, "127.0.0.2:5050".parse().unwrap());
+        assert!(plan.peer_reachable);
+    }
+
     #[test]
     fn an_explicit_wildcard_bind_is_preserved() {
         let advertised = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5));
         let plan = plan_registry_bind("0.0.0.0", 5050, Some(advertised)).unwrap();
         assert_eq!(plan.listen_addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(plan.peer_reachable);
+    }
+
+    fn catalog_with(holders: &[(&str, &str, &[u64])]) -> ManifestCatalog {
+        use super::super::types::{Digest, ImageManifest, LayerDescriptor, ManifestCommit};
+        let mut catalog = ManifestCatalog::default();
+        for (repository, tag, nodes) in holders {
+            let digest = |part: &str| {
+                super::super::store::compute_sha256(format!("{repository}-{part}").as_bytes())
+            };
+            let layer = |digest: Digest| LayerDescriptor {
+                digest,
+                size: 1,
+                media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+                platform: None,
+            };
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                manifest: ImageManifest {
+                    digest: digest("manifest"),
+                    config: layer(digest("config")),
+                    layers: vec![layer(digest("layer"))],
+                    repository: repository.to_string(),
+                    tags: Default::default(),
+                    total_size: 2,
+                    pushed_at: std::time::SystemTime::UNIX_EPOCH,
+                    pushed_by: 1,
+                    signature: None,
+                },
+                tag: tag.to_string(),
+                holder_nodes: nodes.iter().copied().collect(),
+            });
+        }
+        catalog
+    }
+
+    fn cluster_bind() -> RegistryBindPlan {
+        plan_registry_bind(
+            "0.0.0.0",
+            5050,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5))),
+        )
+        .unwrap()
+    }
+
+    /// #697: a dead node still recorded as a holder must not make an image
+    /// look fully replicated.
+    #[test]
+    fn under_replicated_count_uses_effective_holders() {
+        // Every blob of `web` is recorded on nodes 1 and 2; node 2 died.
+        let catalog = catalog_with(&[("web", "v1", &[1, 2])]);
+        let live = BTreeSet::from([1, 3]);
+
+        let evidence =
+            registry_capability_evidence(cluster_bind(), true, true, true, 2, &live, &catalog);
+
+        assert_eq!(evidence.known_nodes, 2);
+        assert_eq!(evidence.under_replicated_layers, 3);
+        assert!(evidence.lost_images.is_empty());
+    }
+
+    /// #697 (D17): an image whose only holders are gone is Lost, named by
+    /// repository and tag.
+    #[test]
+    fn image_with_no_live_holder_is_reported_lost() {
+        let catalog = catalog_with(&[("web", "v1", &[2]), ("api", "v3", &[1])]);
+        let live = BTreeSet::from([1, 3]);
+
+        let evidence =
+            registry_capability_evidence(cluster_bind(), true, true, true, 1, &live, &catalog);
+
+        assert_eq!(evidence.lost_images, vec!["web:v1".to_string()]);
+        assert_eq!(evidence.lost_image_count, 1);
     }
 
     #[test]

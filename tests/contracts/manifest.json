@@ -7320,6 +7320,33 @@
       ]
     },
     {
+      "id": "issue-697-image_survives_loss_of_the_pushing_node",
+      "issue": 697,
+      "promise": "A pushed image survives losing the node it was pushed to: heal counts only live copies and re-replicates from a survivor.",
+      "supported_paths": [
+        "Three-node TLS council with redundancy 2, each node on its own loopback address and the shared registry port."
+      ],
+      "refused_paths": [
+        "A dead node's recorded copy never counts towards redundancy, and the image is never reported Lost while a live copy exists."
+      ],
+      "boundaries": [
+        "Linux only: the fixture needs 127.0.0.2 and 127.0.0.3. It proves the OCI pull a deploy performs, not an app start under the process runtime."
+      ],
+      "cases": [
+        {
+          "id": "durability-image_survives_loss_of_the_pushing_node",
+          "binary": "reliaburger::registry_durability",
+          "test": "image_survives_loss_of_the_pushing_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/registry_durability.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-692-rollout-safety",
       "issue": 692,
       "promise": "A cluster spec change reaches one node at a time, a failed rollout is marked RolloutFailed and never retried until the spec changes, and rollback targets survive every node restarting.",

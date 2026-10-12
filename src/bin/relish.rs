@@ -435,8 +435,12 @@ enum Command {
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
     },
-    /// List images in the local Pickle registry.
-    Images,
+    /// List images in the Pickle registry, or delete a tag.
+    #[command(visible_alias = "image")]
+    Images {
+        #[command(subcommand)]
+        action: Option<ImagesAction>,
+    },
     /// Build an OCI image and push to Pickle.
     Build {
         /// Path to a TOML config file with [build.*] sections.
@@ -1206,6 +1210,17 @@ enum LocalAction {
     Start,
     Stop,
     Destroy,
+}
+
+#[derive(Subcommand)]
+enum ImagesAction {
+    /// Delete a tag (`repository:tag`). The image stays pullable by digest
+    /// until it has been untagged for `[images] gc_retain_days`; then it
+    /// expires, unless an app or job pins it, and GC reclaims its layers.
+    Delete {
+        /// The tag to delete, as `repository:tag` (e.g. `team/web:v1`).
+        reference: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2030,7 +2045,10 @@ async fn main() -> ExitCode {
         Command::Import { ref files, strict } => commands::import_k8s(files, strict),
         #[cfg(feature = "kubernetes")]
         Command::Export { ref file } => commands::export_k8s(file),
-        Command::Images => commands::images(cli.output).await,
+        Command::Images { action: None } => commands::images(cli.output).await,
+        Command::Images {
+            action: Some(ImagesAction::Delete { reference }),
+        } => commands::image_delete(&reference).await,
         Command::Build {
             ref path,
             registry_port,
@@ -3919,7 +3937,21 @@ mod tests {
     #[test]
     fn parse_images_command() {
         let cli = parse(&["relish", "images"]).unwrap();
-        assert!(matches!(cli.command, Command::Images));
+        assert!(matches!(cli.command, Command::Images { action: None }));
+    }
+
+    /// #697: `relish images delete` and its `relish image delete` alias.
+    #[test]
+    fn parse_image_delete_under_either_spelling() {
+        for spelling in ["images", "image"] {
+            let cli = parse(&["relish", spelling, "delete", "team/web:v1"]).unwrap();
+            match cli.command {
+                Command::Images {
+                    action: Some(ImagesAction::Delete { reference }),
+                } => assert_eq!(reference, "team/web:v1"),
+                _ => panic!("expected images delete for {spelling}"),
+            }
+        }
     }
 
     #[test]

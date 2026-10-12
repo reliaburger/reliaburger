@@ -179,7 +179,7 @@ gossip still advertises them as alive.
   catalogue accepted it (blob replication may still be running); 503 means the
   Raft commit wasn't confirmed, so retry.
 - Clustered workers and followers forward writes to the authenticated leader.
-  Repository reads, quota checks and `relish images` also use the leader's
+  Repository reads and `relish images` also use the leader's
   committed view; if the leader is unreachable you get 503, not an empty
   catalogue.
 - Pushing identical bytes into another repository keeps independent tags and
@@ -1014,7 +1014,14 @@ Operational constraints:
   identity. A misconfigured cluster without that token still fails closed. The
   open, tokenless bootstrap window exists only for a loopback standalone registry.
 - Authenticated `GET /v1/capabilities` reports the selected listener, TLS/P2P
-  state, redundancy target, active node count and under-replicated layer count.
+  state, redundancy target, live node count, under-replicated layer count and
+  lost images. Copies on dead nodes don't count: heal re-replicates after a
+  node loss, with each chosen node copying straight from a live holder, and an
+  image with no live copy left is reported lost by `relish status` and
+  `relish wtf`.
+- `relish images delete repo:tag` (OCI `DELETE /v2/<name>/manifests/<tag>`)
+  untags an image. A manifest untagged for `gc_retain_days` expires, unless an
+  app or job pins it, and GC reclaims its layers.
 
 ```toml
 [images]
