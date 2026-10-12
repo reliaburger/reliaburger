@@ -1741,7 +1741,7 @@ pub async fn gitops_status(output: OutputFormat) -> Result<(), RelishError> {
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&status).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&status).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())
