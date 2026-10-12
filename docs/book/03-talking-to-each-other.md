@@ -1483,4 +1483,19 @@ The other half of the fix is to lose the race less often. `reqwest` keeps an idl
 
 Two tests pin this down, both built on a fake backend that answers the first request on a connection and then drops the connection as soon as the next request arrives. `idempotent_request_on_a_closed_pooled_connection_is_retried` sends three `GET`s and wants three 200s; before the fix the second one came back 502 every time. `streamed_post_on_a_closed_pooled_connection_is_not_replayed` warms the pool, sends a `POST`, and wants a 502 plus a backend that saw the `POST` exactly once.
 
-Finally, a limit. Rootless Runc can prove who owns its local host port, but nothing yet carries that proof through remote withdrawal. So for 0.1.0 rootless Runc is standalone only: Bun refuses `--cluster` as soon as it selects a rootless runtime, before it touches any state. Container clusters are rootful Linux Runc with eBPF, which is what the macOS quickstart runs inside its Linux VM.
+Finally, a limit. Rootless Runc can prove who owns its local host port, but nothing yet carries that proof through remote withdrawal. So for 0.1.0 rootless Runc is standalone only: Bun refuses `--cluster` when the runtime it would select is rootless Runc, before it touches any state. Container clusters are rootful Linux Runc with eBPF, which is what the macOS quickstart runs inside its Linux VM.
+
+That refusal used to come later than it should. Bun first wrote its state-format marker, claimed the image upload lock and started hashing its own binary for self-upgrade, and only then selected the runtime and refused. The hash runs on Tokio's blocking pool (`spawn_blocking`, threads set aside for work that would stall the async scheduler), and dropping a Tokio runtime waits for every blocking task it started. So the error message waited for a SHA-256 of the whole binary: 2.5 seconds for an 850 MB debug build on an idle VM, 16 seconds on a loaded one, which is how a test with a 10 second bound found it ([#813](https://github.com/reliaburger/reliaburger/issues/813)). The conflict is between the command line and the host (no root, and a selection that means Runc), so `refuse_rootless_cluster` now runs straight after argument parsing, before Bun loads its config:
+
+```rust
+#[cfg(target_os = "linux")]
+if cli.cluster {
+    let rootless = reliaburger::grill::rootless::is_rootless();
+    let runc_installed = rootless
+        && cli.runtime == "auto"
+        && matches!(detect_runtime().await, DetectedRuntime::Runc { .. });
+    refuse_rootless_cluster(&cli.runtime, rootless, runc_installed)?;
+}
+```
+
+`#[cfg(target_os = "linux")]` compiles the block only on Linux, where Runc exists. The `&&` chain short-circuits, as in C, so only a rootless `auto` cluster pays for the `which runc` probe. In the `matches!` pattern from Chapter 1, `{ .. }` ignores the variant's fields. The decision itself is a plain function of three inputs, so unit tests cover every selection without a rootless host. The integration test also checks that the refused node left nothing but its `node.toml` behind.
