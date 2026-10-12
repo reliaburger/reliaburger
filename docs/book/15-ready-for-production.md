@@ -3698,6 +3698,50 @@ everything after it. A test kills a process mid-command, the way an exec
 does, and claims the generation in a fresh one. That test failed with the
 exact error from the CI run before the change.
 
+Five seconds wasn't the whole story. The same test failed again a day later
+(#812), this time after the rollback, with the same message. Waiting only
+helps if somebody will finish the command, and there was a case where nobody
+would. A short command takes three steps: `prepare` writes its record as
+`Prepared`, `start` spawns the owner that flips it to `Running`, and the
+owner marks it `Retired` once it exits. The state sweep runs on other tasks
+while the agent's loop calls `execv`, so the exec can land between the first
+two steps. Then the record says `Prepared` forever: the process that would
+have started it no longer exists, and no owner was ever spawned. The new
+binary waited its five seconds for a command that could never run, gave up,
+and exited.
+
+The refusal now names the command and its state (`command-… is Prepared`),
+and admission cancels such a command instead of waiting for it:
+
+```rust
+if let (id, CommandState::Prepared) = &unretired
+    && self
+        .commands
+        .cancel_unstarted(id)
+        .await
+        .map_err(io::Error::other)?
+{
+    continue;
+}
+```
+
+That's a let chain again (Chapter 1): the cancel only runs when the pattern
+matched, and it can use the `id` the pattern bound. Matching against
+`&unretired`, a reference to the tuple, borrows `id` instead of moving it out,
+so the tuple is still whole for the error message further down.
+
+Why is cancelling safe? The generation's claim is exclusive, and every caller
+holds it from `prepare` right through `start`. So a `Prepared` command that
+admission finds has no caller left. The only thing that could still start it
+is a bootstrapper the dead process spawned a moment before the exec, and
+`cancel_unstarted` fences that: it takes the owner lock (which a live owner
+holds for its whole life) before writing `Cancelled`, and a late owner that
+then wakes up reloads the record, sees `Cancelled` and runs nothing. If the
+owner lock is already taken, an owner is starting right now, so admission
+leaves it alone and waits for it like any running command. It never sends a
+signal. A command that is really running still gets its five seconds, and a
+stuck one still fences everything after it.
+
 #### The tick reads in parallel
 
 `check_apps` and `check_jobs` asked the runtime for every running instance's

@@ -528,39 +528,60 @@ impl IntentCommands {
     }
 
     async fn require_terminal_commands(&self) -> io::Result<()> {
-        if self.commands_terminal().await? {
-            return Ok(());
+        match self.unretired_command().await? {
+            None => Ok(()),
+            Some(unretired) => Err(earlier_command_running(&unretired)),
         }
-        Err(earlier_command_running())
     }
 
     /// Admit new work once every earlier command has retired, waiting up to
     /// [`EARLIER_COMMAND_RETIREMENT`] for one that is still finishing.
     async fn await_terminal_commands(&self) -> io::Result<()> {
         let deadline = tokio::time::Instant::now() + EARLIER_COMMAND_RETIREMENT;
-        while !self.commands_terminal().await? {
+        while let Some(unretired) = self.unretired_command().await? {
+            // This claim is exclusive and every caller keeps it from prepare
+            // through start, so a Prepared command here has no caller left:
+            // its process exec'd or failed before starting the owner. Nothing
+            // will ever start it, so waiting can't help (#812). Cancel it,
+            // which also fences a bootstrapper still on its way.
+            if let (id, CommandState::Prepared) = &unretired
+                && self
+                    .commands
+                    .cancel_unstarted(id)
+                    .await
+                    .map_err(io::Error::other)?
+            {
+                continue;
+            }
             if tokio::time::Instant::now() >= deadline {
-                return Err(earlier_command_running());
+                return Err(earlier_command_running(&unretired));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok(())
     }
 
-    /// Whether every recorded short command is positively terminal.
-    async fn commands_terminal(&self) -> io::Result<bool> {
+    /// The first recorded short command that is not positively terminal,
+    /// with the state it was last seen in.
+    async fn unretired_command(&self) -> io::Result<Option<(CommandId, CommandState)>> {
         for id in self.commands.inventory().await.map_err(io::Error::other)? {
+            let state = self.commands.state(&id).await.map_err(io::Error::other)?;
             if !matches!(
-                self.commands.state(&id).await.map_err(io::Error::other)?,
+                state,
                 CommandState::Cancelled | CommandState::Retired { .. }
             ) {
-                return Ok(false);
+                return Ok(Some((id, state)));
             }
         }
-        Ok(true)
+        Ok(None)
     }
 }
 
-fn earlier_command_running() -> io::Error {
-    io::Error::other("an earlier runtime command has not retired")
+/// Name the command that blocks admission and its state, so a refusal in a
+/// log says whether it was still running or never started.
+fn earlier_command_running((id, state): &(CommandId, CommandState)) -> io::Error {
+    io::Error::other(format!(
+        "an earlier runtime command has not retired ({} is {state:?})",
+        id.as_str()
+    ))
 }
