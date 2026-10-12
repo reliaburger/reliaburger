@@ -1,11 +1,14 @@
 /// Gossip message types.
 ///
-/// All messages are fixed-size to keep UDP datagrams under the MTU
-/// (max 1400 bytes). Membership updates are piggybacked on every
-/// PING/ACK exchange, achieving O(log N) convergence without
-/// dedicated broadcast messages.
+/// Every message fits one UDP datagram of at most [`MAX_DATAGRAM_BYTES`].
+/// Membership updates are piggybacked on every PING/ACK exchange,
+/// achieving O(log N) convergence without dedicated broadcast messages;
+/// a probe carries as many as fit in the bytes its header and directory
+/// extension leave over.
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,8 +16,14 @@ use crate::meat::NodeId;
 
 use super::state::NodeState;
 
-/// Maximum number of piggybacked membership updates per gossip message.
-/// Bounded to keep message size constant (~512 bytes total).
+/// Largest gossip datagram any node sends, in bytes. Stays below a
+/// typical 1500-byte MTU so a datagram is never fragmented.
+pub const MAX_DATAGRAM_BYTES: usize = 1400;
+
+/// Most piggybacked membership updates one gossip message carries. A probe
+/// carries fewer when its header and directory extension leave no room:
+/// the byte budget ([`GossipMessage::piggyback_room`]) is the real limit,
+/// and this count only bounds the work per message.
 pub const MAX_PIGGYBACK_UPDATES: usize = 8;
 
 /// Most datagrams one side sends in a single anti-entropy exchange.
@@ -59,6 +68,11 @@ pub struct GossipMessage {
     pub sender: NodeId,
     /// Sender's current incarnation number.
     pub incarnation: u64,
+    /// The sender's message counter, which rises with every message it
+    /// creates. The HMAC covers it, so a receiver that keeps the highest
+    /// sequence seen per sender can drop a replayed datagram: its sequence
+    /// is old, and an attacker can't raise it without the key.
+    pub sequence: u64,
     /// HMAC-SHA256 over the rest of the message. Zeroed at construction; the
     /// transport signs it on send and verifies it on receive when keyed.
     pub hmac: [u8; 32],
@@ -75,7 +89,8 @@ impl GossipMessage {
     /// Current protocol version.
     pub const VERSION: u8 = crate::compatibility::CURRENT.protocol as u8;
 
-    /// Create a new gossip message with the given sender and payload.
+    /// Create a new gossip message with the given sender and payload, and
+    /// the next [`sequence`](Self::sequence) number.
     /// HMAC is zeroed; the transport signs it on send when a key is configured.
     pub fn new(sender: NodeId, incarnation: u64, payload: GossipPayload) -> Self {
         Self {
@@ -83,6 +98,7 @@ impl GossipMessage {
             state_format: crate::compatibility::CURRENT.state,
             sender,
             incarnation,
+            sequence: next_sequence(),
             hmac: [0u8; 32],
             payload,
             extension: None,
@@ -120,6 +136,80 @@ impl GossipMessage {
             Err(_) => false,
         }
     }
+
+    /// The size of this message on the wire, directory extension included.
+    /// Signing fills fixed-size tags, so it never changes the size.
+    /// `usize::MAX` if the message can't be encoded at all.
+    pub fn encoded_len(&self) -> usize {
+        let body = bincode::serialized_size(self);
+        let extension = match &self.extension {
+            Some(extension) => bincode::serialized_size(extension),
+            None => Ok(0),
+        };
+        match (body, extension) {
+            (Ok(body), Ok(extension)) => {
+                usize::try_from(body.saturating_add(extension)).unwrap_or(usize::MAX)
+            }
+            _ => usize::MAX,
+        }
+    }
+
+    /// Bytes left in the datagram for more piggybacked updates.
+    pub fn piggyback_room(&self) -> usize {
+        MAX_DATAGRAM_BYTES.saturating_sub(self.encoded_len())
+    }
+
+    /// Attach `extension` if the datagram still fits with it. Returns
+    /// whether it was attached. Membership matters more than directory
+    /// data, so a message that can't carry both goes without the extension.
+    pub fn attach_extension(&mut self, extension: DirectoryExtension) -> bool {
+        self.extension = Some(extension);
+        if self.encoded_len() <= MAX_DATAGRAM_BYTES {
+            return true;
+        }
+        self.extension = None;
+        false
+    }
+
+    /// Add as many of `updates` as fit in the datagram, in order, up to
+    /// [`MAX_PIGGYBACK_UPDATES`] in all. Stops at the first that doesn't
+    /// fit. Returns how many were added.
+    pub fn piggyback(&mut self, updates: impl IntoIterator<Item = MembershipUpdate>) -> usize {
+        let mut room = self.piggyback_room();
+        let mut added = 0;
+        let slots = self.payload.updates_mut();
+        for update in updates {
+            let cost = update.encoded_len();
+            if slots.len() >= MAX_PIGGYBACK_UPDATES || cost > room {
+                break;
+            }
+            room -= cost;
+            slots.push(update);
+            added += 1;
+        }
+        added
+    }
+}
+
+/// The process-wide message counter behind [`GossipMessage::sequence`].
+///
+/// It starts at the wall clock in microseconds, so a restarted node's
+/// counter starts above everything its previous run sent (a node sends a
+/// few dozen datagrams a second, far fewer than a million). One process
+/// runs one gossip node, so a per-process counter is a per-sender counter.
+static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+
+/// The next value of the process-wide message counter.
+fn next_sequence() -> u64 {
+    SEQUENCE
+        .get_or_init(|| {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX / 2))
+                .unwrap_or(1);
+            AtomicU64::new(micros)
+        })
+        .fetch_add(1, Ordering::Relaxed)
 }
 
 /// The payload of a gossip message.
@@ -143,12 +233,13 @@ pub enum GossipPayload {
     Ack {
         /// Piggybacked membership updates.
         updates: Vec<MembershipUpdate>,
-        /// Whether this ACK was *forwarded* by a relay on behalf of the
-        /// `sender` (an indirect-probe rescue), rather than sent directly by
-        /// the sender itself. On a relayed ACK the transport socket is the
-        /// relay's, not the sender's, so the receiver must NOT record the
-        /// sender's address from it (M13).
-        relayed: bool,
+        /// The probed node this ACK vouches for when a relay forwards it
+        /// (an indirect-probe rescue); `None` when the sender answers for
+        /// itself. A forwarded ACK's sender is the relay, which stamped and
+        /// sent it, so its sequence number and socket address are the
+        /// relay's own, and nobody records the probed node at the relay's
+        /// address (M13).
+        relayed_for: Option<NodeId>,
     },
     /// Anti-entropy push-pull: part of the sender's full membership table.
     ///
@@ -178,6 +269,18 @@ impl GossipPayload {
             } => updates,
         }
     }
+
+    /// Mutable access to the piggybacked updates of any payload variant.
+    pub fn updates_mut(&mut self) -> &mut Vec<MembershipUpdate> {
+        match self {
+            GossipPayload::Ping { updates }
+            | GossipPayload::PingReq { updates, .. }
+            | GossipPayload::Ack { updates, .. }
+            | GossipPayload::Sync {
+                entries: updates, ..
+            } => updates,
+        }
+    }
 }
 
 /// A single membership update piggybacked on gossip messages.
@@ -195,6 +298,17 @@ pub struct MembershipUpdate {
     pub state: NodeState,
     /// Incarnation number for CRDT-like conflict resolution.
     pub incarnation: u64,
+}
+
+impl MembershipUpdate {
+    /// The bytes this update adds to a datagram's piggyback list.
+    /// `usize::MAX` if it can't be encoded, so it never fits.
+    pub fn encoded_len(&self) -> usize {
+        bincode::serialized_size(self)
+            .ok()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(usize::MAX)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,10 +346,10 @@ pub struct LeaderHint {
 /// costs directory data but never the membership payload — see
 /// [`encode_datagram`].
 ///
-/// `node_id` names the node the endpoints belong to. It is always the node
-/// that physically stamped the datagram — which is NOT always
-/// `GossipMessage::sender` (a relayed indirect-probe ACK is sent by the
-/// relay but carries the probed target as its sender).
+/// `node_id` names the node the endpoints belong to: the node that stamped
+/// the datagram, which is always `GossipMessage::sender`. A receiver
+/// ignores an extension that names anyone else, so directory data is bound
+/// to the sender's sequence number like the rest of the message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryExtension {
     /// The node these endpoints belong to (the stamping node).
@@ -535,7 +649,7 @@ mod tests {
     fn gossip_payload_updates_extracts_from_ack() {
         let payload = GossipPayload::Ack {
             updates: vec![],
-            relayed: false,
+            relayed_for: None,
         };
         assert!(payload.updates().is_empty());
     }
@@ -610,6 +724,154 @@ mod tests {
         );
     }
 
+    // -- datagram byte budget (#696) -----------------------------------------
+
+    /// A 63-byte (DNS-label-length) node name.
+    fn longest_name(tag: u64) -> NodeId {
+        let tag = tag.to_string();
+        NodeId::new(format!("{}{tag}", "n".repeat(63 - tag.len())))
+    }
+
+    fn ipv6(port: u16) -> SocketAddr {
+        SocketAddr::from((
+            [
+                0xfd00, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+            ],
+            port,
+        ))
+    }
+
+    /// The biggest extension a node can stamp: 63-byte names, IPv6
+    /// endpoints, a leader hint, a recovery claim and a full label set (16
+    /// labels using every byte of the label budget).
+    fn worst_case_extension() -> DirectoryExtension {
+        let labels: BTreeMap<String, String> = (0..MAX_DIRECTORY_LABELS)
+            .map(|i| (format!("{i:0>16}"), "v".repeat(16)))
+            .collect();
+        let labels = bounded_labels(&labels);
+        assert_eq!(labels.len(), MAX_DIRECTORY_LABELS);
+        assert_eq!(
+            labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>(),
+            MAX_DIRECTORY_LABEL_BYTES
+        );
+        DirectoryExtension {
+            node_id: longest_name(1),
+            api_address: ipv6(9117),
+            reporting_address: ipv6(9445),
+            leader: Some(LeaderHint {
+                node_id: longest_name(2),
+                term: u64::MAX,
+                recovery_epoch: u64::MAX,
+                api_address: ipv6(9117),
+                reporting_address: ipv6(9445),
+            }),
+            labels,
+            disk_pressured: true,
+            recovery_epoch: Some(u64::MAX),
+            recovery_id: Some(crate::council::types::RecoveryId(u128::MAX)),
+            hmac: [0xff; 32],
+        }
+    }
+
+    fn worst_case_update(tag: u64) -> MembershipUpdate {
+        MembershipUpdate {
+            node_id: longest_name(tag),
+            address: ipv6(9443),
+            state: NodeState::Suspect,
+            incarnation: u64::MAX,
+        }
+    }
+
+    /// Stamp the worst-case extension on `payload`, fill the piggyback list
+    /// from an endless supply of worst-case updates, and check the signed
+    /// datagram fits. Returns how many updates it carried.
+    fn fill_worst_case(payload: GossipPayload) -> usize {
+        let mut message = GossipMessage::new(longest_name(1), u64::MAX, payload);
+        message.sequence = u64::MAX;
+        assert!(
+            message.attach_extension(worst_case_extension()),
+            "the worst-case extension must fit beside a worst-case header"
+        );
+        let carried = message.piggyback((10..).map(worst_case_update));
+
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let mut signed = message.signed(&key).unwrap();
+        let extension = signed.extension.take().unwrap();
+        let canonical = signed.canonical_bytes().unwrap();
+        signed.extension = Some(extension.signed(&key, &canonical).unwrap());
+        let datagram = encode_datagram(&signed).unwrap();
+        assert!(
+            datagram.len() <= MAX_DATAGRAM_BYTES,
+            "datagram of {} bytes exceeds the {MAX_DATAGRAM_BYTES}-byte budget",
+            datagram.len()
+        );
+        assert_eq!(datagram.len(), signed.encoded_len());
+        carried
+    }
+
+    #[test]
+    fn worst_case_ping_with_full_extension_fits_the_udp_budget() {
+        let carried = fill_worst_case(GossipPayload::Ping { updates: vec![] });
+        assert!(
+            carried >= 1,
+            "a worst-case ping must still carry at least one update"
+        );
+    }
+
+    #[test]
+    fn worst_case_ack_and_ping_req_fit_the_udp_budget() {
+        fill_worst_case(GossipPayload::Ack {
+            updates: vec![],
+            relayed_for: Some(longest_name(3)),
+        });
+        fill_worst_case(GossipPayload::PingReq {
+            target: longest_name(3),
+            requester: longest_name(4),
+            updates: vec![],
+        });
+    }
+
+    #[test]
+    fn piggyback_stops_at_the_byte_budget() {
+        let mut message = GossipMessage::new(
+            NodeId::new("sender"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        message.attach_extension(worst_case_extension());
+        let room = message.piggyback_room();
+        let cost = worst_case_update(10).encoded_len();
+        let carried = message.piggyback((10..).map(worst_case_update));
+        assert_eq!(carried, (room / cost).min(MAX_PIGGYBACK_UPDATES));
+        assert!(message.encoded_len() <= MAX_DATAGRAM_BYTES);
+    }
+
+    #[test]
+    fn an_extension_that_cannot_fit_is_left_off() {
+        let mut message = GossipMessage::new(
+            NodeId::new("x".repeat(MAX_DATAGRAM_BYTES)),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        assert!(!message.attach_extension(worst_case_extension()));
+        assert!(message.extension.is_none());
+    }
+
+    #[test]
+    fn every_new_message_has_a_higher_sequence() {
+        let first = a_message();
+        let second = a_message();
+        assert!(second.sequence > first.sequence);
+    }
+
+    #[test]
+    fn the_sequence_is_covered_by_the_message_hmac() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let mut signed = a_message().signed(&key).unwrap();
+        signed.sequence += 1;
+        assert!(!signed.verify_hmac(&key));
+    }
+
     #[test]
     fn membership_update_serialisation_round_trip() {
         let update = MembershipUpdate {
@@ -670,9 +932,9 @@ mod tests {
 
     #[test]
     fn extension_is_excluded_from_message_canonical_bytes() {
-        let mut with = a_message();
-        with.extension = Some(an_extension());
         let without = a_message();
+        let mut with = without.clone();
+        with.extension = Some(an_extension());
         // The message HMAC must not change when an extension is attached,
         // so a datagram whose extension is dropped still verifies.
         assert_eq!(
@@ -828,7 +1090,7 @@ mod tests {
                     state: NodeState::Suspect,
                     incarnation: 7,
                 }],
-                relayed: false,
+                relayed_for: None,
             },
         );
         // Exactly what a peer puts on the wire: plain `bincode::serialize`.

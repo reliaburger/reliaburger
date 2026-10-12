@@ -5,10 +5,15 @@
 /// a limited number of times: `ceil(log2(cluster_size))`, which is
 /// enough for O(log N) convergence across the whole cluster.
 ///
-/// The queue prioritises failure-related updates (Dead, Suspect) over
-/// join updates (Alive), so failures propagate faster.
+/// The queue sends this node's own refutations first, then
+/// failure-related updates (Dead, Suspect), then joins (Alive), so a
+/// falsely suspected node clears its name before anything else goes out
+/// and failures propagate faster than joins. A newer update about a node
+/// supersedes an older one still queued, which is then never sent.
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
+
+use crate::meat::NodeId;
 
 use super::message::{MAX_PIGGYBACK_UPDATES, MembershipUpdate};
 
@@ -19,6 +24,17 @@ struct QueuedUpdate {
     update: MembershipUpdate,
     /// How many more times this update should be piggybacked.
     remaining_broadcasts: u32,
+    /// Whether this is the local node refuting a claim about itself.
+    refutation: bool,
+}
+
+/// How SWIM ranks two updates about the same node: incarnation first, then
+/// state (Dead/Left over Suspect over Alive). Mirrors
+/// [`crate::mustard::state::resolve_conflict`].
+type Rank = (u64, u8);
+
+fn rank(update: &MembershipUpdate) -> Rank {
+    (update.incarnation, update.state.dissemination_priority())
 }
 
 impl Eq for QueuedUpdate {}
@@ -31,14 +47,18 @@ impl PartialEq for QueuedUpdate {
     }
 }
 
-/// Priority ordering: higher dissemination priority first, then
-/// more remaining broadcasts first (fresher updates).
+/// Priority ordering: our own refutation first, then higher dissemination
+/// priority, then more remaining broadcasts (fresher updates).
 impl Ord for QueuedUpdate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.update
-            .state
-            .dissemination_priority()
-            .cmp(&other.update.state.dissemination_priority())
+        self.refutation
+            .cmp(&other.refutation)
+            .then_with(|| {
+                self.update
+                    .state
+                    .dissemination_priority()
+                    .cmp(&other.update.state.dissemination_priority())
+            })
             .then_with(|| self.remaining_broadcasts.cmp(&other.remaining_broadcasts))
     }
 }
@@ -79,20 +99,28 @@ const HARD_CAP: usize = 65_536;
 /// strictly higher-priority state (Dead/Left/Suspect over Alive). This mirrors
 /// [`crate::mustard::state::resolve_conflict`]'s precedence.
 fn queued_supersedes(queued: &QueuedUpdate, existing: &QueuedUpdate) -> bool {
-    use std::cmp::Ordering;
-    match queued.update.incarnation.cmp(&existing.update.incarnation) {
-        Ordering::Greater => true,
-        Ordering::Less => false,
-        Ordering::Equal => {
-            queued.update.state.dissemination_priority()
-                > existing.update.state.dissemination_priority()
-        }
-    }
+    rank(&queued.update) > rank(&existing.update)
+}
+
+/// What the queue holds about one node.
+#[derive(Debug, Clone, Copy)]
+struct NodeEntries {
+    /// The best rank queued about the node.
+    best: Rank,
+    /// How many entries about the node are still in the heap.
+    queued: usize,
 }
 
 /// The dissemination queue that selects updates to piggyback on messages.
 pub struct DisseminationQueue {
     queue: BinaryHeap<QueuedUpdate>,
+    /// The best-ranked update queued about each node. A queued entry that
+    /// ranks below it is stale: selection discards it instead of sending
+    /// it. Removing it from the heap on enqueue would cost a scan of the
+    /// whole heap per update, which a 10,000-member first dissemination
+    /// can't afford. A node's record goes when its last entry leaves the
+    /// heap, so this never outgrows the queue.
+    newest: HashMap<NodeId, NodeEntries>,
 }
 
 impl DisseminationQueue {
@@ -100,19 +128,47 @@ impl DisseminationQueue {
     pub fn new() -> Self {
         Self {
             queue: BinaryHeap::new(),
+            newest: HashMap::new(),
         }
     }
 
     /// Enqueue an update for dissemination.
     ///
-    /// The update will be piggybacked on `ceil(log2(cluster_size))`
-    /// outgoing messages. If `cluster_size` is 0 or 1, the update
-    /// is broadcast once.
+    /// The update will be piggybacked on `3 * ceil(log2(cluster_size))`
+    /// outgoing messages (at least 6). It supersedes any queued update
+    /// about the same node that it outranks, and is itself dropped if a
+    /// queued update already outranks it.
     pub fn enqueue(&mut self, update: MembershipUpdate, cluster_size: usize) {
+        self.push(update, cluster_size, false);
+    }
+
+    /// Enqueue this node's own refutation (Alive about itself at a raised
+    /// incarnation). It goes out ahead of every other update, Dead and
+    /// Suspect included: a node that peers suspect has the most to lose
+    /// from waiting behind a backlog, and nobody else can clear its name.
+    pub fn enqueue_refutation(&mut self, update: MembershipUpdate, cluster_size: usize) {
+        self.push(update, cluster_size, true);
+    }
+
+    fn push(&mut self, update: MembershipUpdate, cluster_size: usize, refutation: bool) {
+        let update_rank = rank(&update);
+        let entries = self
+            .newest
+            .entry(update.node_id.clone())
+            .or_insert(NodeEntries {
+                best: update_rank,
+                queued: 0,
+            });
+        if entries.best > update_rank {
+            return;
+        }
+        entries.best = update_rank;
+        entries.queued += 1;
         let broadcasts = broadcast_count(cluster_size);
         self.queue.push(QueuedUpdate {
             update,
             remaining_broadcasts: broadcasts,
+            refutation,
         });
         // Scale the trigger with the cluster: one queued update per member is
         // normal, so compacting at a flat threshold would fire constantly on a
@@ -141,11 +197,8 @@ impl DisseminationQueue {
     /// aren't members at all, and it complains rather than trimming in
     /// silence.
     fn compact(&mut self) {
-        use std::collections::HashMap;
-
         let drained: Vec<QueuedUpdate> = self.queue.drain().collect();
-        let mut newest: HashMap<crate::meat::NodeId, QueuedUpdate> =
-            HashMap::with_capacity(drained.len());
+        let mut newest: HashMap<NodeId, QueuedUpdate> = HashMap::with_capacity(drained.len());
         for queued in drained {
             match newest.get(&queued.update.node_id) {
                 // Keep the surviving update per SWIM precedence: a higher
@@ -175,44 +228,85 @@ impl DisseminationQueue {
                  dropped {dropped} update(s) — this implies updates about non-members"
             );
         }
+        self.newest = remaining
+            .iter()
+            .map(|queued| {
+                let entries = NodeEntries {
+                    best: rank(&queued.update),
+                    queued: 1,
+                };
+                (queued.update.node_id.clone(), entries)
+            })
+            .collect();
         self.queue = remaining.into_iter().collect();
     }
 
-    /// Select up to `MAX_PIGGYBACK_UPDATES` updates to piggyback on
-    /// the next outgoing message.
-    ///
-    /// Highest-priority updates are selected first. Each selected
-    /// update has its remaining broadcast count decremented. Updates
-    /// that have been broadcast enough times are dropped.
+    /// Select up to [`MAX_PIGGYBACK_UPDATES`] updates for a message with
+    /// unlimited room. A caller that builds a real datagram uses
+    /// [`Self::select_updates_within`] with the room the datagram has left.
     pub fn select_updates(&mut self) -> Vec<MembershipUpdate> {
-        let mut selected = Vec::with_capacity(MAX_PIGGYBACK_UPDATES);
-        let mut remaining = Vec::new();
+        self.select_updates_within(usize::MAX, MAX_PIGGYBACK_UPDATES)
+    }
 
-        while let Some(mut entry) = self.queue.pop() {
-            if selected.len() < MAX_PIGGYBACK_UPDATES {
-                selected.push(entry.update.clone());
-                entry.remaining_broadcasts -= 1;
-                if entry.remaining_broadcasts > 0 {
-                    remaining.push(entry);
-                }
-            } else {
-                remaining.push(entry);
+    /// Select at most `max_count` updates whose encoded size adds up to at
+    /// most `byte_budget`, to piggyback on the next outgoing message.
+    ///
+    /// Highest-priority updates are selected first. Selection stops at the
+    /// first update that doesn't fit, which stays queued with its broadcast
+    /// count untouched, so priority order holds across messages. Each
+    /// selected update has its remaining broadcast count decremented, and
+    /// one that has been broadcast enough times is dropped. A superseded
+    /// update is discarded without being sent.
+    pub fn select_updates_within(
+        &mut self,
+        byte_budget: usize,
+        max_count: usize,
+    ) -> Vec<MembershipUpdate> {
+        let mut selected = Vec::with_capacity(max_count.min(MAX_PIGGYBACK_UPDATES));
+        let mut sent = Vec::new();
+        let mut room = byte_budget;
+
+        while selected.len() < max_count {
+            let Some(mut entry) = self.queue.pop() else {
                 break;
+            };
+            let stale = self
+                .newest
+                .get(&entry.update.node_id)
+                .is_some_and(|entries| entries.best > rank(&entry.update));
+            if stale {
+                self.forget(&entry.update.node_id);
+                continue;
+            }
+            let cost = entry.update.encoded_len();
+            if cost > room {
+                self.queue.push(entry);
+                break;
+            }
+            room -= cost;
+            selected.push(entry.update.clone());
+            entry.remaining_broadcasts -= 1;
+            if entry.remaining_broadcasts > 0 {
+                sent.push(entry);
+            } else {
+                self.forget(&entry.update.node_id);
             }
         }
 
-        // Put back entries we didn't select (still in the heap)
-        // plus remaining entries that still need broadcasting
-        for entry in remaining {
-            self.queue.push(entry);
-        }
-        // Also push back anything left in the original heap
-        // (the break above may leave entries)
-        // Actually, the while loop drains the heap, so remaining
-        // already has everything. But we broke early, so re-drain.
-        // Let me restructure this.
-
+        // Re-queue what still has broadcasts left only now, so one message
+        // never carries the same update twice.
+        self.queue.extend(sent);
         selected
+    }
+
+    /// One entry about `node` has left the heap.
+    fn forget(&mut self, node: &NodeId) {
+        if let Some(entries) = self.newest.get_mut(node) {
+            entries.queued = entries.queued.saturating_sub(1);
+            if entries.queued == 0 {
+                self.newest.remove(node);
+            }
+        }
     }
 
     /// Number of pending updates in the queue.
@@ -273,7 +367,104 @@ mod tests {
         QueuedUpdate {
             update: u,
             remaining_broadcasts: 3,
+            refutation: false,
         }
+    }
+
+    // -- byte budget, refutation priority, superseding (#696) -----------------
+
+    #[test]
+    fn selection_stops_at_the_byte_budget_and_keeps_the_rest_queued() {
+        let mut queue = DisseminationQueue::new();
+        for i in 0..5 {
+            queue.enqueue(update(&format!("n{i}"), NodeState::Alive), 100);
+        }
+        let cost = update("n0", NodeState::Alive).encoded_len();
+
+        // Room for two and a half updates: two go, and nothing is lost.
+        let selected = queue.select_updates_within(cost * 5 / 2, MAX_PIGGYBACK_UPDATES);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(queue.len(), 5, "unsent updates must stay queued");
+
+        // A message with no room carries nothing and costs no broadcasts.
+        assert!(
+            queue
+                .select_updates_within(cost - 1, MAX_PIGGYBACK_UPDATES)
+                .is_empty()
+        );
+
+        // The three that didn't fit go out next, before the two already
+        // sent once (they have more broadcasts left).
+        let next = queue.select_updates_within(cost * 3, MAX_PIGGYBACK_UPDATES);
+        assert_eq!(next.len(), 3);
+        let mut everyone: Vec<_> = selected.iter().chain(&next).map(|u| &u.node_id).collect();
+        everyone.sort();
+        everyone.dedup();
+        assert_eq!(everyone.len(), 5, "every update went out exactly once");
+    }
+
+    #[test]
+    fn own_refutation_goes_out_before_suspect_and_dead() {
+        let mut queue = DisseminationQueue::new();
+        for i in 0..MAX_PIGGYBACK_UPDATES * 2 {
+            let state = if i % 2 == 0 {
+                NodeState::Dead
+            } else {
+                NodeState::Suspect
+            };
+            queue.enqueue(update(&format!("n{i}"), state), 100);
+        }
+        let mut refutation = update("me", NodeState::Alive);
+        refutation.incarnation = 2;
+        queue.enqueue_refutation(refutation.clone(), 100);
+
+        let selected = queue.select_updates_within(usize::MAX, 1);
+        assert_eq!(selected, vec![refutation]);
+    }
+
+    #[test]
+    fn newer_incarnation_supersedes_a_queued_update() {
+        let mut queue = DisseminationQueue::new();
+        let mut suspect = update("n1", NodeState::Suspect);
+        suspect.incarnation = 5;
+        let mut alive = update("n1", NodeState::Alive);
+        alive.incarnation = 6;
+        queue.enqueue(suspect.clone(), 100);
+        queue.enqueue(alive.clone(), 100);
+        // A late, older claim is not queued behind the newer one either.
+        queue.enqueue(suspect.clone(), 100);
+
+        let mut sent = Vec::new();
+        while !queue.is_empty() {
+            sent.extend(queue.select_updates());
+        }
+        assert!(sent.contains(&alive));
+        assert!(
+            !sent.contains(&suspect),
+            "a superseded Suspect must never go out"
+        );
+    }
+
+    #[test]
+    fn a_superseded_update_stays_unsent_after_the_newer_one_expires() {
+        // The stale Alive ranks below the Dead in the heap, so the Dead
+        // spends all its broadcasts first. The Alive must still be known to
+        // be stale when it finally pops.
+        let mut queue = DisseminationQueue::new();
+        let mut alive = update("n1", NodeState::Alive);
+        alive.incarnation = 5;
+        let mut dead = update("n1", NodeState::Dead);
+        dead.incarnation = 6;
+        queue.enqueue(alive.clone(), 2);
+        queue.enqueue(dead.clone(), 2);
+
+        let mut sent = Vec::new();
+        while !queue.is_empty() {
+            sent.extend(queue.select_updates_within(usize::MAX, 1));
+        }
+        assert_eq!(sent.len(), 6, "the Dead goes out its six times");
+        assert!(sent.iter().all(|u| *u == dead));
+        assert!(queue.newest.is_empty(), "bookkeeping outlived the queue");
     }
 
     // -- coalescing precedence (M11) ------------------------------------------

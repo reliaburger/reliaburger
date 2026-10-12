@@ -7094,6 +7094,33 @@
       ]
     },
     {
+      "id": "issue-696-gossip-datagram-budget",
+      "issue": 696,
+      "promise": "Gossip probes from nodes with the longest names and a full label set fit the 1,400-byte datagram, so those nodes keep acknowledging and stay alive through churn.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime over loopback UDP"
+      ],
+      "cases": [
+        {
+          "id": "gossip-budget-nodes_with_maximal_labels_stay_alive_during_churn",
+          "binary": "reliaburger::cluster_gossip",
+          "test": "nodes_with_maximal_labels_stay_alive_during_churn",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_gossip.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A directory extension that cannot fit beside the header is left off the datagram rather than sent oversize."
+      ],
+      "boundaries": [
+        "A maximally labelled node piggybacks fewer updates per probe; anti-entropy, which carries no extension, makes up the difference."
+      ]
+    },
+    {
       "id": "issue-759-executor-start-retries-on-a-fresh-executor",
       "issue": 759,
       "promise": "An executor start that misses a runtime command's bound retires that executor and runs the command once on a fresh one, within the command's deadline.",

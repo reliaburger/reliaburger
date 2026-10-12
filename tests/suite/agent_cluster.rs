@@ -490,7 +490,7 @@ async fn udp_gossip_transport_round_trip() {
     let t1 = UdpMustardTransport::bind(addr(0)).await.unwrap();
     let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
 
-    let t2_addr = t2.local_addr();
+    let t2_addr = t2.local_addr().unwrap();
 
     let msg = GossipMessage::new(
         NodeId::new("sender"),

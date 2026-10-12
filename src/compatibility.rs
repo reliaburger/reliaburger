@@ -96,6 +96,10 @@ pub struct Compatibility {
 /// `DeleteTag::deleted_at_unix_ms` (deleting a tag now untags), the
 /// `ExpireManifest` request and `RegistryMutation::DeleteTag`; the registry
 /// `Usage` query is gone.
+/// Gossip robustness (#696): `GossipMessage::sequence` for replay
+/// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
+/// its own name) in place of `relayed`, and the reporting
+/// `ReportingMessage::AggregatedReport` variant is gone.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

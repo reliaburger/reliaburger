@@ -568,9 +568,6 @@ fn report_header() -> [u8; 12] {
 fn check_event_admission(message: &ReportingMessage) -> Result<(), String> {
     let too_many = match message {
         ReportingMessage::Report(report) => report.event_log.len() > MAX_EVENTS_PER_REPORT,
-        ReportingMessage::AggregatedReport { reports } => reports
-            .values()
-            .any(|report| report.event_log.len() > MAX_EVENTS_PER_REPORT),
         _ => false,
     };
     if too_many {

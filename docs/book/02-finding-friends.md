@@ -224,7 +224,7 @@ One subtlety: when we receive a gossip update about a node we've never seen, we 
 
 ### Piggyback dissemination
 
-SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, and each update is broadcast `ceil(log2(cluster_size))` times before it expires.
+SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, or fewer when they don't fit in the datagram (we'll get to that budget shortly), and each update is broadcast `ceil(log2(cluster_size))` times before it expires.
 
 Why `ceil(log2(N))`? Because SWIM's mathematical properties guarantee that an update will reach every node within O(log N) protocol periods with high probability. For a 10,000-node cluster, that's about 14 broadcasts per update — spread across 500ms protocol intervals, that's 7 seconds for full convergence. Not bad.
 
@@ -243,6 +243,23 @@ impl NodeState {
 ```
 
 Dead and suspect updates jump the queue. If the queue is full and we have to choose between telling people about a new join and telling them about a failure, the failure wins. Failure detection is time-sensitive; join announcements can wait.
+
+There's one update that has to beat even a failure, and the first version got it wrong. When peers suspect *us*, we refute with "I'm alive at a higher incarnation", which is an `Alive`, priority 1. Picture a rack failure: forty Dead and Suspect rumours in the queue, eight going out per message, and somewhere behind them a healthy node's refutation. It waits five messages while its suspicion timer runs, and if the timer wins, a node that was never down gets declared dead and then has to fight its way back. So the queue now has a separate lane: `enqueue_refutation` marks the update, and the ordering puts the refutation flag before everything else:
+
+```rust
+impl Ord for QueuedUpdate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.refutation
+            .cmp(&other.refutation)
+            .then_with(|| /* state priority */)
+            .then_with(|| /* remaining broadcasts */)
+    }
+}
+```
+
+`bool` implements `Ord` with `false < true`, and `BinaryHeap` pops the *largest* element, so `true` comes out first. `then_with` only runs its closure when the comparison so far is `Equal`, which is how you chain tie-breakers without nested `if`s.
+
+The other half is superseding. The queue used to happily send `n1 Suspect@5` after it already held `n1 Alive@6`: both went out, the stale one first because Suspect outranks Alive, and every receiver discarded it after spending datagram space on it. Now the queue keeps the best-ranked update it holds for each node (incarnation first, then state, the same order `resolve_conflict` uses) in a `HashMap`. An update that ranks below what's held is never queued, and an older entry that's still in the heap is thrown away when it's popped rather than sent. Why not remove it from the heap straight away? Because a binary heap can't find an element without scanning all of it, and on a 10,000-member cluster's first dissemination that's 10,000 scans of 10,000 entries. Marking stale and skipping later costs one hash lookup.
 
 ### The queue that had no ceiling, and the ceiling that was wrong
 
@@ -466,7 +483,53 @@ fn refute(&mut self) {
 }
 ```
 
-Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. The refutation update jumps onto the very next outgoing ACK message, so it propagates quickly.
+Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_refutation`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
+
+### Three holes in the probe cycle
+
+An audit of the gossip layer in 0.2.1 found three ways a healthy node could still be declared dead, all under exactly the conditions where a cluster is already busy.
+
+**Datagrams that were too big.** The transport refuses anything over 1,400 bytes, and every caller threw that error away with `let _ =`. Was anything ever that big? Do the arithmetic. A PING carries a header (sender name, incarnation, HMAC), eight piggybacked updates chosen *by count*, and since Phase 12 the sender's directory extension: its endpoints, the leader hint, a recovery claim and up to 512 bytes of labels. With 63-byte node names (the longest a DNS label can be), IPv6 addresses and a full label set, the extension alone is about 1,100 bytes and eight updates are another 840. The node's ACKs would be refused, silently, the moment its queue held enough updates; its peers would suspect it during exactly the churn that filled the queue. No test caught it, because the only worst-case size test was for `Sync`, which carries no extension.
+
+The fix is to choose updates by bytes, not by count. A probe is now built in order: header, then the extension, then updates until the next one doesn't fit:
+
+```rust
+let mut message = GossipMessage::new(self.node_id.clone(), self.incarnation, payload);
+if let Some(extension) = self.local_extension() {
+    message.attach_extension(extension); // left off if it alone can't fit
+}
+let room = message.piggyback_room();     // 1,400 minus what's encoded so far
+let updates = self.dissemination.select_updates_within(room, MAX_PIGGYBACK_UPDATES);
+message.piggyback(updates);
+```
+
+`piggyback_room` measures the message with `bincode::serialized_size` rather than adding up constants, so when a later release adds a field to the header or the extension, the budget shrinks by itself. An update that doesn't fit stays queued with its broadcast count untouched; selection stops there rather than skipping ahead, so priority order holds across messages. In the very worst case a PING still carries one update and a PING-REQ may carry none. That's fine: anti-entropy sends no extension and makes up the difference. And a send that does fail is now counted and logged, at most once every ten seconds with a count of what it held back, so a node that can't get its datagrams out says so.
+
+**Replays.** Gossip has been HMAC-signed since Phase 4, and we've already seen (in "Coming back after maintenance") that authentication stops forgery but not replay. That fix covered a replayed `Left`. The audit found two more: `add_node` moved a known member to the UDP source address of *any* validly signed datagram from it, and directory fields were last-write-wins. So an attacker on the LAN could capture one of n2's PINGs and replay it from its own IP: everyone records n2 at the attacker's address, probes go there, and n2 is declared dead. Replay an old extension instead and n2's recovery epoch rolls back.
+
+The fix is a sequence number inside the HMAC. Every `GossipMessage::new` takes the next value of a process-wide counter, every receiver remembers the highest sequence it has accepted from each sender, and anything at or below that is dropped before a single field is applied:
+
+```rust
+static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+
+fn next_sequence() -> u64 {
+    SEQUENCE
+        .get_or_init(|| AtomicU64::new(wall_clock_micros()))
+        .fetch_add(1, Ordering::Relaxed)
+}
+```
+
+`AtomicU64` is a `u64` that several threads can update without a lock; `fetch_add` adds one and returns the old value as a single indivisible step, so two callers can never get the same number. `Ordering::Relaxed` says we only need that atomicity, not any ordering guarantee about *other* memory, which is all a counter needs. (It's `std::sync::atomic::Ordering`, not the `cmp::Ordering` from the dissemination queue: same name, different job.) `OnceLock`, which we met in Chapter 1, runs the initialiser the first time anyone asks. Seeding from wall-clock microseconds is what makes the counter rise across restarts: a node sends a few dozen datagrams a second, nowhere near a million, so a restarted process always starts above everything its previous run sent.
+
+Why a counter and not just a timestamp in each message? Because a timestamp check needs the receiver's clock to agree with the sender's, and so it needs a tolerance window for skew. Anything captured inside that window replays fine. A counter needs no clock agreement at all: the only question is "is this newer than the last thing *you* sent me?", and only the sender can answer yes. The wall clock appears only once, as a seed, and the worst it can do is step backwards across a restart; then peers ignore the node until they reap its old record, which drops the remembered sequence too. The price of strict ordering is that a datagram UDP delivers out of order behind a newer one is dropped. Gossip already treats loss as normal, so that's one lost datagram, not an error.
+
+One wrinkle forced a wire change. A relay used to forward the target's ACK with `sender` set to the *target*, so the requester's `wait_for_ack` would recognise it. That datagram was physically stamped by the relay, with the relay's counter, under someone else's name: there's no way to give it a sequence that means anything. So a relay now sends the ACK in its own name and says whom it vouches for, `Ack { relayed_for: Some(target) }`. Every message has exactly one stamping node, a receiver ignores a directory extension that names anyone but the sender, and the M13 rule (never record the target at the relay's socket) falls out for free, because the only address a relayed ACK can teach is the relay's own.
+
+**Relays that went deaf.** A relay used to wait inline for the target's ACK: send the PING, then loop on `recv` for one probe timeout, applying piggybacked updates and ignoring everything else. Calling the full `handle_message` from in there would have meant async recursion (`handle_message` waits for the relay, which calls `handle_message`, which can wait for another relay), and Rust won't compile a recursive `async fn` without boxing it, because the future would have to contain itself. So the wait took a shortcut, and the shortcut dropped every PING and `Sync` that arrived for 200 ms. A busy relay stopped acknowledging its own probers and got itself suspected for helping someone else.
+
+Rather than box the recursion, we removed the wait. A relay records "forward b's ACK to a" with a deadline in a small bounded list and returns at once; b's ACK arrives through `handle_message` like any message, and the `Ack` arm forwards it. There's no waiting state left to be deaf in. `handle_message` now also returns whether it accepted the message, and `wait_for_ack` only counts an ACK that was accepted, so a replayed old ACK can't pass for a fresh one.
+
+The tests read as the scenarios they prevent: `replayed_ping_from_another_address_does_not_move_the_member`, `replayed_extension_cannot_roll_a_recovery_epoch_back`, `ping_during_a_relay_wait_is_acknowledged`, `own_refutation_goes_out_before_suspect_and_dead`, and in `message.rs`, `worst_case_ping_with_full_extension_fits_the_udp_budget`, which signs a datagram with every field at its maximum and checks the bytes. The gated `nodes_with_maximal_labels_stay_alive_during_churn` runs it for real: nodes with 63-byte names and full label sets over UDP, one leaving and one joining, and nobody else is ever declared dead.
 
 ### Dead node cleanup
 
@@ -712,7 +775,7 @@ Since `handle_message` already walks `message.payload.updates()`, every entry in
 
 memberlist swaps tables over TCP, because a table can be large: at 10,000 members it's hundreds of kilobytes. Mustard's gossip has only a UDP transport. We could add a TCP listener, with its own framing and authentication, for one message type. Or we could keep each exchange small enough for UDP. We chose the second.
 
-Each `Sync` datagram carries at most eight entries, the same as a PING's piggyback, and no directory extension (the extension can take 700 bytes with a full label set, and every probe carries it anyway). That keeps a datagram under 1,400 bytes even with 63-byte node names and IPv6 addresses, and a test builds exactly that worst case. One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (eight) datagrams, so at most 64 entries. A table that fits goes whole every time. A bigger one goes out as a window that rotates through the table:
+Each `Sync` datagram carries at most eight entries, the same as a PING's piggyback, and no directory extension (the extension can take 1,100 bytes with a full label set, and every probe carries it anyway). That keeps a datagram under 1,400 bytes even with 63-byte node names and IPv6 addresses, and a test builds exactly that worst case. One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (eight) datagrams, so at most 64 entries. A table that fits goes whole every time. A bigger one goes out as a window that rotates through the table:
 
 ```rust
 fn membership_window(&mut self) -> Vec<MembershipUpdate> {
