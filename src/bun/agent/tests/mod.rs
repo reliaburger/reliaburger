@@ -13,6 +13,7 @@ mod loop_rule;
 mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod runtime_metadata;
 mod upgrade_answer;
 
 #[test]
@@ -6065,7 +6066,16 @@ async fn retirement_releases_ownership_only_after_the_process_exits() {
         .expect("retirement never finished")
         .unwrap()
         .unwrap();
-    assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+    // The runtime then forgets the instance (#738), which it does only
+    // for one it has seen stop.
+    let state = grill.state(&id).await;
+    assert!(
+        matches!(
+            state,
+            Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. })
+        ),
+        "{state:?}"
+    );
     let (status, _) = timed_status(&tx).await;
     assert!(status.is_empty(), "retirement must release ownership");
 

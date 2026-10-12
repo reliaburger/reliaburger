@@ -15,6 +15,16 @@ mod bun_process;
 mod root_processes;
 use bun_process::PortBlockReservation;
 
+/// Whether recovery left `state`'s instance retired. Once it has, the agent
+/// may already have asked the runtime to forget the instance (#738), which
+/// the runtime does only for a retired generation.
+fn retired_or_forgotten(state: Result<ContainerState, reliaburger::grill::GrillError>) -> bool {
+    matches!(
+        state,
+        Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })
+    )
+}
+
 struct Node {
     child: tokio::process::Child,
     client: BunClient,
@@ -676,12 +686,8 @@ registry_port = 0
             recovered.client.stop(&name, "default").await.unwrap();
         } else {
             for launch in &inventory {
-                assert_eq!(
-                    runtime(root.as_path())
-                        .state(&launch.instance_id)
-                        .await
-                        .unwrap(),
-                    ContainerState::Stopped,
+                assert!(
+                    retired_or_forgotten(runtime(root.as_path()).state(&launch.instance_id).await),
                     "unadopted {phase} execution survived recovery"
                 );
             }
@@ -945,10 +951,7 @@ async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_succ
     std::fs::remove_file(root.join("armed")).unwrap();
     let mut recovered = Node::start(&root).await;
     assert!(recovered.client.status().await.unwrap().is_empty());
-    assert_eq!(
-        runtime(&root).state(&id).await.unwrap(),
-        ContainerState::Stopped
-    );
+    assert!(retired_or_forgotten(runtime(&root).state(&id).await));
     assert!(!record.exists());
     assert_eq!(kernel_manifest(&root), original_kernel);
     recovered.client.apply(&config).await.unwrap();
@@ -1869,10 +1872,9 @@ async fn actual_bun_kernel_discovery_host_reboot() {
                 node.client.status().await.unwrap().is_empty(),
                 "old runtime was republished"
             );
-            assert_eq!(
-                runtime(root).state(&reference.instance_id).await.unwrap(),
-                ContainerState::Stopped
-            );
+            assert!(retired_or_forgotten(
+                runtime(root).state(&reference.instance_id).await
+            ));
             assert_eq!(
                 runtime(root)
                     .exit_code(&reference.instance_id)

@@ -759,13 +759,10 @@ async fn agent_retires_launches_that_have_no_adoption_record() {
     let result = recovery_agent(directory.path())
         .adopt_recorded_instances()
         .await;
-    let live_state = grill.state(&live).await;
-    let prepared_state = grill.state(&prepared).await;
-    grill.kill(&live).await.unwrap();
-    stopped(&grill, &live).await;
+    // The runtime forgets only a generation that has retired, so the
+    // journals going is the proof that neither launch can still run (#738).
+    owners_forgotten(directory.path(), &[&live.0, &prepared.0]).await;
     assert_eq!(result.unwrap(), 0);
-    assert_eq!(live_state.unwrap(), ContainerState::Stopped);
-    assert_eq!(prepared_state.unwrap(), ContainerState::Stopped);
 }
 
 #[tokio::test]
@@ -1300,4 +1297,159 @@ async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
         "{private} leaked: {env}"
     );
     assert_eq!(resolved.unwrap(), "found");
+}
+
+/// An agent with a durable process runtime and records under `directory`,
+/// its loop running, and the sender that commands it.
+fn running_agent(
+    directory: &Path,
+) -> (
+    tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let mut agent = reliaburger::bun::agent::BunAgent::new(
+        runtime(directory),
+        reliaburger::grill::PortAllocator::new(30000, 30100),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(directory.to_path_buf());
+    agent.set_volumes_dir(directory.join("volumes"));
+    agent.set_perimeter_enabled(false);
+    let task = tokio::spawn(async move { agent.run().await });
+    (sender, shutdown, task)
+}
+
+async fn deploy(
+    sender: &tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+    toml: &str,
+) {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
+    let (events, mut received) = tokio::sync::mpsc::channel(64);
+    sender
+        .send(AgentCommand::Deploy {
+            config: reliaburger::config::Config::parse(toml).unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+    let mut last = None;
+    while let Some(event) = received.recv().await {
+        last = Some(event);
+    }
+    assert!(
+        matches!(last, Some(ApplyEvent::Complete { .. })),
+        "deploy failed: {last:?}"
+    );
+}
+
+/// The process runtime's ownership journal for `id`.
+fn owner_directory(directory: &Path, id: &str) -> std::path::PathBuf {
+    directory.join("process-owners").join(id)
+}
+
+/// Wait until the ownership journals of every one of `ids` are gone.
+async fn owners_forgotten(directory: &Path, ids: &[&str]) {
+    let gone = tokio::time::timeout(Duration::from_secs(15), async {
+        while ids.iter().any(|id| owner_directory(directory, id).exists()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let kept: Vec<_> = ids
+        .iter()
+        .filter(|id| owner_directory(directory, id).exists())
+        .collect();
+    assert!(
+        gone.is_ok(),
+        "ownership journals outlived retirement: {kept:?}"
+    );
+}
+
+const SLEEPER: &str =
+    "image = 'proc-grill:image-ignored'\ncommand = ['/bin/sh', '-c', 'sleep 60']\n";
+
+#[tokio::test]
+async fn deleting_an_app_removes_the_ownership_journal_of_every_instance() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path());
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 2\n")).await;
+    let ids = ["default__web-0", "default__web-1"];
+    assert!(
+        ids.iter()
+            .all(|id| owner_directory(directory.path(), id).is_dir())
+    );
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    owners_forgotten(directory.path(), &ids).await;
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path());
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 3\n")).await;
+    let before = ["default__web-0", "default__web-1", "default__web-2"];
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 1\n")).await;
+    owners_forgotten(directory.path(), &before).await;
+    let kept = std::fs::read_dir(directory.path().join("process-owners"))
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter(|name| name.starts_with("default__web"))
+        .count();
+    assert_eq!(kept, 1, "the remaining replica keeps its journal");
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_adoption_keeps_a_live_instances_journal_and_forgets_a_dead_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, _shutdown, task) = running_agent(directory.path());
+    deploy(
+        &sender,
+        &format!("[app.live]\n{SLEEPER}[app.dead]\n{SLEEPER}"),
+    )
+    .await;
+    // The previous bun process goes away without stopping its workloads.
+    task.abort();
+    let _ = task.await;
+    let grill = runtime(directory.path());
+    let dead = InstanceId("default__dead-0".into());
+    grill.kill(&dead).await.unwrap();
+    stopped(&grill, &dead).await;
+
+    let mut restarted = recovery_agent(directory.path());
+    let adopted = restarted.adopt_recorded_instances().await;
+    owners_forgotten(directory.path(), &[&dead.0]).await;
+    // Give a wrong forget of the adopted instance the chance to land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let live = InstanceId("default__live-0".into());
+    let live_journal = owner_directory(directory.path(), &live.0).is_dir();
+    let live_state = grill.state(&live).await;
+    grill.kill(&live).await.unwrap();
+    stopped(&grill, &live).await;
+    assert_eq!(adopted.unwrap(), 1);
+    assert!(live_journal, "the adopted instance lost its journal");
+    assert_eq!(live_state.unwrap(), ContainerState::Running);
 }

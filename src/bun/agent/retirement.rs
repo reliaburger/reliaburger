@@ -36,6 +36,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for id in instances {
             // LOOP-INLINE: in-memory lock, no I/O
             self.supervisor.retire_instance(&id).await;
+            self.forget_runtime_metadata(&id);
         }
         self.deployed_specs
             .remove(&(app_name.to_string(), namespace.to_string()));
@@ -220,6 +221,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Retire an instance's artifacts outside the loop (startup adoption),
     /// where nothing else is waiting, so a slow disk is simply waited out.
+    /// Nothing adopts the instance afterwards, so its runtime metadata goes
+    /// too.
     pub(super) async fn retire_instance_artifacts_fully(
         &mut self,
         instance_id: &InstanceId,
@@ -227,9 +230,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         loop {
             match self.retire_instance_artifacts(instance_id).await {
                 Err(BunError::StillRunning { .. }) => continue,
-                result => return result,
+                Ok(()) => {
+                    self.forget_runtime_metadata(instance_id);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Ask the runtime to forget an instance whose retirement is proven and
+    /// that nothing owns any more: its ownership journal, its route and their
+    /// lock files (#738). Without this, every app instance ever deleted,
+    /// scaled away or replaced left them behind.
+    ///
+    /// Call it only once the supervisor has let the instance go, or startup
+    /// has decided not to adopt it. A stopped replica that `relish stop`
+    /// keeps owned must keep its metadata, since a later apply rolls over it.
+    ///
+    /// The deletion runs in a task, so no turn waits on its fsyncs. The
+    /// runtime refuses, and keeps everything, while the identity may still
+    /// own a process or an address, including when a successor generation
+    /// of the same identity has started since. What a refusal or a crash
+    /// leaves is retired and forgotten again by the next start's adoption.
+    pub(super) fn forget_runtime_metadata(&self, instance_id: &InstanceId) {
+        let grill = self.supervisor.grill().clone();
+        let id = instance_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = grill.forget_retired(&id).await {
+                eprintln!("bun: {id}: runtime metadata kept: {error}");
+            }
+        });
     }
 
     /// Force-kill `id` and confirm its exit from a task, as `key`'s work
@@ -326,6 +357,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.retire_instance_artifacts(old_id).await?;
         // LOOP-INLINE: in-memory lock, no I/O
         self.supervisor.retire_instance(old_id).await;
+        self.forget_runtime_metadata(old_id);
         self.sync_firewall_ebpf().await;
         self.rebuild_routing_table().await;
         Ok(())

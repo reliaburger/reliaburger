@@ -5251,7 +5251,9 @@ async fn check_backend_retirement(
                             "rollout retired the original destination before confirmed backend withdrawal");
                     } else {
                         anyhow::ensure!(completed, "rollout did not complete");
-                        anyhow::ensure!(runtime.state(&id).await? == reliaburger::grill::ContainerState::Stopped,
+                        // Retired, and possibly forgotten already (#738).
+                        anyhow::ensure!(matches!(runtime.state(&id).await,
+                            Ok(reliaburger::grill::ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })),
                             "confirmed rollout did not retire the original destination");
                     }
                 } else {
@@ -5649,7 +5651,12 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if runtime.state(&old).await? == ContainerState::Stopped { return Ok::<(), anyhow::Error>(()); }
+                // Retired, and possibly forgotten already (#738).
+                match runtime.state(&old).await {
+                    Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. }) => return Ok::<(), anyhow::Error>(()),
+                    Ok(_) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await??;
