@@ -257,6 +257,17 @@ selector or artifact. Archived suites also bind their executable/archive bytes
 to the successful current builder. Keep the failure artifacts; they explain a
 failure but cannot qualify another gate.
 
+"Re-run failed jobs" works without a new commit. GitHub gives the re-run jobs
+attempt N+1 and carries over the outputs and artifacts of the jobs that passed
+in attempt N. So each seal keeps the attempt that produced it, and `aggregate`
+accepts any attempt from 1 up to its own, provided the commit, run and host are
+exactly its own. Every owner of one job must share one attempt. An archived
+suite re-run on its own takes the builder's attempt from the archive runtime
+file, whose digest the build job published. The trusted job output still picks
+the one seal that counts, and GitHub reports the latest attempt of each job, so
+a seal from another commit or run, a later attempt or an earlier attempt that a
+re-run replaced can't qualify.
+
 Linux coverage wraps the existing `make coverage` once, including its clean,
 instrumented nextest run, LCOV/HTML reports and unchanged line floor. Discovery
 uses that run's instrumented environment, selectors and target directory.

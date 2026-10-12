@@ -316,7 +316,11 @@ context cannot qualify CI.
 The archive builder publishes current successful archive/runtime digests before
 archived jobs execute. Aggregation requires those builder outputs, successful
 selected jobs and each producer's sealed output digest. Commit, run ID, attempt,
-host, owner command, inputs and payload bytes all belong to that context. Do not
+host, owner command, inputs and payload bytes all belong to that context. Commit,
+run ID and host must equal the aggregator's; the attempt may be earlier, because
+re-running only the failed jobs keeps the passed jobs' attempt-N outputs, and all
+owners of one job must share an attempt. An archived owner takes the builder's
+attempt from the digest-bound archive runtime, never later than its own. Do not
 reconstruct authority from artifact filenames or let a late report choose which
 owners should have run. Always retain whole-command failure as failure, even if
 all finite required assertions passed before the command failed elsewhere.

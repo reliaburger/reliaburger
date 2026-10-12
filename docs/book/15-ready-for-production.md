@@ -5827,6 +5827,28 @@ uses those trusted outputs to verify the reports. A late artifact can't invent
 its own parent or decide that a missing job was optional. Archive users also
 verify the successful current builder's archive and executable identity.
 
+Our first version said "current" and meant "this attempt". That broke the
+cheapest retry GitHub offers. When one job fails, "Re-run failed jobs" runs just
+that job (and the jobs after it) as attempt 2. The jobs that passed aren't run
+again, so their outputs and artifacts still say attempt 1. The evidence job,
+re-run as attempt 2, compared every seal with its own attempt and refused the
+set: "wrong current sealed owner". A re-run cluster job fared no better, because
+the archive it downloaded was built in attempt 1. The only way through was a new
+commit and another 40 to 60 minutes of CI.
+
+What does the attempt actually protect? The commit and the run do the real work:
+evidence from another commit or another run must never count. Within one run,
+the trusted job outputs already decide which seal counts, and GitHub reports
+each job's latest attempt. So a seal now keeps the attempt that produced it.
+Aggregation accepts anything from attempt 1 up to its own, as long as the
+commit, run and host match exactly and all the owners of one job agree on an
+attempt. A later attempt, attempt 0 or a malformed one is still refused. An
+archived suite takes its builder's attempt from the archive runtime file, which
+the build job's digest already vouches for. The tests in
+`scripts/ci/test_workflow_adapter.py` replay the exact re-run shape (macOS at
+attempt 3, the rest at attempt 2) and the forgeries next to it: an earlier
+attempt from another run, commit or host.
+
 Coverage gets the same treatment. Its owner wraps the existing `make coverage`
 recipe once, keeping the clean, instrumented nextest run, reports and unchanged
 line floor. Discovery uses the instrumented run's actual selectors and

@@ -148,7 +148,7 @@ pub fn import_from_yaml(yaml: &str) -> Result<ImportResult, RelishError> {
 
 /// Parse a multi-document YAML string into typed K8s resources.
 ///
-/// Uses `serde_yaml::Deserializer` to split documents (M28) rather than a naive
+/// Uses `yaml_serde::Deserializer` to split documents (M28) rather than a naive
 /// `split("---")`: the latter shredded any document with an embedded `---` (a
 /// PEM block or a `|`-scalar), and skipping documents that *start with* `#`
 /// dropped every Helm-rendered manifest, since Helm prefixes each with a
@@ -160,8 +160,8 @@ fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError
 
     let mut resources = Vec::new();
 
-    for document in serde_yaml::Deserializer::from_str(yaml) {
-        let value = serde_yaml::Value::deserialize(document)
+    for document in yaml_serde::Deserializer::from_str(yaml) {
+        let value = yaml_serde::Value::deserialize(document)
             .map_err(|e| RelishError::FormatFailed(format!("YAML parse error: {e}")))?;
 
         // A comment-only or empty document deserialises to null — skip it.
@@ -177,57 +177,57 @@ fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError
 
         let resource = match kind.as_str() {
             "Deployment" => {
-                let d: Deployment = serde_yaml::from_value(value.clone())
+                let d: Deployment = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Deployment(name, d)
             }
             "DaemonSet" => {
-                let d: DaemonSet = serde_yaml::from_value(value.clone())
+                let d: DaemonSet = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::DaemonSet(name, d)
             }
             "StatefulSet" => {
-                let d: StatefulSet = serde_yaml::from_value(value.clone())
+                let d: StatefulSet = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::StatefulSet(name, d)
             }
             "Service" => {
-                let s: Service = serde_yaml::from_value(value.clone())
+                let s: Service = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Service(name, s)
             }
             "Ingress" => {
-                let i: Ingress = serde_yaml::from_value(value.clone())
+                let i: Ingress = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Ingress(name, i)
             }
             "HorizontalPodAutoscaler" => {
-                let h: HorizontalPodAutoscaler = serde_yaml::from_value(value.clone())
+                let h: HorizontalPodAutoscaler = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Hpa(name, h)
             }
             "ConfigMap" => {
-                let c: ConfigMap = serde_yaml::from_value(value.clone())
+                let c: ConfigMap = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::ConfigMap(name, c)
             }
             "Secret" => {
-                let s: Secret = serde_yaml::from_value(value.clone())
+                let s: Secret = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Secret(name, s)
             }
             "Job" => {
-                let j: Job = serde_yaml::from_value(value.clone())
+                let j: Job = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Job(name, j)
             }
             "CronJob" => {
-                let c: CronJob = serde_yaml::from_value(value.clone())
+                let c: CronJob = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::CronJob(name, c)
             }
             "Namespace" => {
-                let n: Namespace = serde_yaml::from_value(value.clone())
+                let n: Namespace = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Namespace(name, n)
             }

@@ -224,6 +224,74 @@ class WorkflowAdapter(unittest.TestCase):
                 self.aggregate()
             self.context[field] = original
 
+    def reseal(self, gate, shard=None, **context):
+        """Rewrite one owner's seal as another producer would, with a matching trusted output."""
+        host = self.manifest['gates'][gate]['hosts'][0]
+        directory = self.incoming / ('contract-' + host + '-' + self.a.label(gate, shard))
+        seal = c.read_json(directory / 'gate-seal.json')
+        seal['context'].update(context)
+        (directory / 'gate-seal.json').write_text(json.dumps(seal))
+        self.needs[self.a.JOBS[gate]]['outputs'][self.a.output_name(gate, shard)] = \
+            c.digest(directory / 'gate-seal.json')
+
+    def test_rerun_of_failed_jobs_accepts_owners_sealed_by_an_earlier_attempt_of_this_run(self):
+        # Attempt 2 ran every owner; "re-run failed jobs" then re-ran only the
+        # failed macOS shard as attempt 3, and GitHub carried the rest over.
+        self.context['attempt'] = '3'
+        self.reseal('portable-darwin', 2, attempt='3')
+        seen = {}
+
+        def oracle(manifest, gate, context, approved, directory, shard=None):
+            seen[(gate, shard)] = context
+            return self.oracle(manifest, gate, context, approved, directory, shard)
+
+        with patch.object(self.a.gates, 'candidate_sources'), patch.object(self.a, 'verify_owner', oracle):
+            verified = self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs)
+        self.assertEqual(len(verified), 3)
+        # Each owner's cases are checked against the attempt that produced them;
+        # each macOS shard is its own matrix job with its own attempt.
+        self.assertEqual(seen[('portable-darwin', 2)], dict(self.context, host='darwin', attempt='3'))
+        for shard in (1, 3):
+            self.assertEqual(seen[('portable-darwin', shard)], dict(self.context, host='darwin', attempt='2'))
+        self.assertEqual(seen[('portable-linux', None)], dict(self.context, host='linux', attempt='2'))
+        self.assertEqual(seen[('optimized-cron', None)], dict(self.context, host='linux', attempt='2'))
+
+    def test_earlier_attempt_seal_from_another_run_commit_or_host_is_refused(self):
+        for field, value in [('run_id', '999'), ('commit', 'b' * 40), ('host', 'darwin')]:
+            with self.subTest(field=field):
+                self.tearDown()
+                self.setUp()
+                self.context['attempt'] = '3'
+                self.reseal('portable-linux', **{field: value})
+                with self.assertRaisesRegex(c.Invalid, 'wrong current sealed owner'):
+                    self.aggregate()
+
+    def test_seal_from_a_later_zero_or_malformed_attempt_is_refused(self):
+        for attempt in ['3', '0', '', '1a', 2]:
+            with self.subTest(attempt=attempt):
+                self.tearDown()
+                self.setUp()
+                self.reseal('portable-linux', attempt=attempt)
+                with self.assertRaisesRegex(c.Invalid, 'wrong current sealed owner'):
+                    self.aggregate()
+
+    def test_seal_with_extra_context_fields_is_refused(self):
+        self.reseal('portable-linux', authority='forged')
+        with self.assertRaisesRegex(c.Invalid, 'wrong current sealed owner'):
+            self.aggregate()
+
+    def test_owners_of_one_job_must_come_from_the_same_attempt(self):
+        # portable-darwin and optimized-cron belong to different jobs; put two
+        # owners in one job so that a mixed set is possible.
+        self.a.JOBS['optimized-cron'] = 'portable'
+        self.addCleanup(self.a.JOBS.__setitem__, 'optimized-cron', 'contract-boundaries')
+        self.needs['portable']['outputs'][self.a.output_name('optimized-cron')] = (
+            self.needs['contract-boundaries']['outputs'].pop(self.a.output_name('optimized-cron')))
+        self.context['attempt'] = '3'
+        self.reseal('optimized-cron', attempt='3')
+        with self.assertRaisesRegex(c.Invalid, 'one job sealed owners in different attempts'):
+            self.aggregate()
+
     def test_same_named_report_in_wrong_host_gate_does_not_count(self):
         shutil.rmtree(self.incoming / 'contract-darwin-portable-darwin-1')
         with self.assertRaises(c.Invalid):
@@ -316,6 +384,45 @@ class WorkflowAdapter(unittest.TestCase):
                 self.a.verify_archive_runtime(self.root, dict(self.context, host='linux'), needs)
         finally:
             fixture.tearDown()
+
+    def test_rerun_owner_accepts_an_archive_built_by_an_earlier_attempt_of_this_run(self):
+        # build-tests passed in attempt 1; the cluster job failed and was
+        # re-run alone as attempt 2, so it consumes the attempt-1 archive.
+        import test_owner_tools
+        fixture = test_owner_tools.OwnerTools()
+        fixture.setUp()
+        try:
+            builder_context = dict(self.context, attempt='1')
+            runtime = dict(context=builder_context, tools=fixture.tools,
+                           command=[fixture.tools['nextest']['path'], 'nextest', 'archive'] + self.a.w.ARCHIVE_COMMAND[3:],
+                           exit_code=0, origin_sha256='b' * 64)
+            path = self.root / 'archive-runtime.json'
+            path.write_text(json.dumps(runtime))
+            needs = {'build-tests': {'result': 'success', 'outputs': {
+                'archive_sha256': 'a' * 64, 'archive_origin_sha256': 'b' * 64,
+                'archive_runtime_sha256': c.digest(path)}}}
+            current = dict(self.context, host='linux')
+            self.assertEqual(self.a.verify_archive_runtime(self.root, current, needs), runtime)
+            origin = self.a.archive_origin(current, needs, runtime)
+            self.assertEqual(origin['builder']['attempt'], '1')
+            self.assertEqual(origin['builder']['run_id'], self.context['run_id'])
+            self.assertEqual(origin['builder']['commit'], self.context['commit'])
+            for field, value in [('run_id', '999'), ('commit', 'b' * 40), ('attempt', '0')]:
+                with self.subTest(field=field):
+                    path.write_text(json.dumps(dict(runtime, context=dict(builder_context, **{field: value}))))
+                    needs['build-tests']['outputs']['archive_runtime_sha256'] = c.digest(path)
+                    with self.assertRaises(c.Invalid):
+                        self.a.verify_archive_runtime(self.root, current, needs)
+        finally:
+            fixture.tearDown()
+
+    def test_failed_archive_builder_runtime_is_refused(self):
+        path = self.root / 'archive-runtime.json'
+        path.write_text('{}')
+        needs = {'build-tests': {'result': 'failure', 'outputs': {
+            'archive_runtime_sha256': c.digest(path), 'archive_origin_sha256': 'b' * 64}}}
+        with self.assertRaisesRegex(c.Invalid, 'archive build job did not succeed'):
+            self.a.verify_archive_runtime(self.root, dict(self.context, host='linux'), needs)
 
     def test_cron_metadata_refuses_feature_drift_before_tests(self):
         from types import SimpleNamespace
