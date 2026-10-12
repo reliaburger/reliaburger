@@ -2820,7 +2820,7 @@ impl CouncilStateMachine {
         // A recovered node re-bootstraps its own Raft: the old log id and
         // membership belong to the cluster that died, so we drop them and let
         // `initialize` establish a fresh term line and voter set.
-        state.enter_recovery_epoch();
+        state.enter_recovery_epoch(0);
 
         let inner = StateMachineInner {
             state,
@@ -2833,10 +2833,12 @@ impl CouncilStateMachine {
     }
 
     /// Offline disaster recovery (12b.2 D21/CP12): stamp a restored
-    /// `DesiredState` into the durable snapshot store at `snapshot_db`,
-    /// bumping the recovery epoch and clearing the dead cluster's log id and
-    /// membership. The next node start loads this snapshot via
-    /// [`CouncilStateMachine::with_store`] and re-bootstraps a fresh Raft.
+    /// `DesiredState` into the durable snapshot store at `snapshot_db`. The
+    /// caller has already entered the new recovery epoch
+    /// ([`DesiredState::enter_recovery_epoch`]), which needs the recovering
+    /// node's fence record as its floor (#694). The next node start loads
+    /// this snapshot via [`CouncilStateMachine::with_store`] and
+    /// re-bootstraps a fresh Raft.
     ///
     /// The write uses the same enveloped format (version + checksum) as a
     /// normal snapshot, so nothing downstream can tell a recovered snapshot
@@ -2845,9 +2847,8 @@ impl CouncilStateMachine {
     #[allow(clippy::result_large_err)]
     pub fn persist_recovered_snapshot(
         snapshot_db: &Database,
-        mut state: DesiredState,
+        state: DesiredState,
     ) -> Result<(), redb::Error> {
-        state.enter_recovery_epoch();
         // Serialisation of a plain struct with only owned data is infallible in
         // practice; map any error into a redb error rather than panicking.
         let data = serde_json::to_vec(&state)
@@ -3140,7 +3141,9 @@ mod tests {
     async fn only_an_offline_recovery_snapshot_is_a_pending_bootstrap() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::create(dir.path().join("snapshot.redb")).unwrap());
-        CouncilStateMachine::persist_recovered_snapshot(&db, DesiredState::default()).unwrap();
+        let mut state = DesiredState::default();
+        state.enter_recovery_epoch(0);
+        CouncilStateMachine::persist_recovered_snapshot(&db, state).unwrap();
         let mut recovered = CouncilStateMachine::with_store(db).unwrap();
         assert!(recovered.recovered_bootstrap_pending().await);
         assert!(

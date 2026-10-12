@@ -263,6 +263,12 @@ pub struct DirectoryExtension {
     /// reads its peers' epochs here to learn, before it serves Raft, whether
     /// a recovery replaced its council.
     pub recovery_epoch: Option<u64>,
+    /// The recovery that started the stamping node's epoch (#694): `None`
+    /// at epoch 0, or while it holds no epoch. Two nodes advertising the
+    /// same epoch with different ids belong to two councils that came from
+    /// separate recoveries; each fences itself as a split when it sees the
+    /// other's advertisement.
+    pub recovery_id: Option<crate::council::types::RecoveryId>,
     /// HMAC-SHA256 over the carrying message's canonical bytes plus this
     /// extension with `hmac` zeroed. Zeroed when gossip runs unkeyed.
     pub hmac: [u8; 32],
@@ -634,6 +640,7 @@ mod tests {
             labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
             hmac: [0u8; 32],
         }
     }

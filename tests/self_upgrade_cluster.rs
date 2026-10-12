@@ -1,16 +1,18 @@
 //! Cluster rolling-upgrade integration tests (Phase 14).
 //!
-//! Four REAL bun processes form a gossip+Raft cluster on localhost; the
+//! Three REAL bun processes form a gossip+Raft cluster on localhost; the
 //! test plays systemd for each of them and drives upgrades through the
 //! same HTTP API relish uses. These are the slowest tests in the repo
 //! (a couple of minutes each) — they earn it by proving the rolling walk,
 //! leader-last in-place upgrade, pause/resume, and cluster rollback
 //! against real processes exec'ing themselves.
 //!
-//! Note on roles: with four nodes the council reconciler makes ALL of
-//! them Raft voters (the cap is seven), and the harness waits until it
-//! has before any test starts, so every upgrade walk takes real voters
-//! down one at a time against a four-voter quorum. "Worker" here is a
+//! Note on roles: with three nodes the council reconciler makes ALL of
+//! them Raft voters (the council holds the largest odd number of voters
+//! the live nodes allow, D12), and the harness waits until it has before
+//! any test starts, so every upgrade walk takes real voters down one at a
+//! time against a three-voter quorum. (Four nodes would leave one as a
+//! plain worker.) "Worker" here is a
 //! label in the upgrade plan, not a Raft status: the leader corrects it
 //! to `Council`. The ordering mechanics the tests assert (council one at
 //! a time, leader last, in place) are exactly the mechanics under test.
@@ -26,7 +28,7 @@ use reliaburger::upgrade::signing::{self, encode_public_key};
 #[path = "support/bun_process.rs"]
 mod bun_process;
 
-/// Cluster operations are slow: convergence, four swaps, verification.
+/// Cluster operations are slow: convergence, three swaps, verification.
 const WAIT: Duration = Duration::from_secs(180);
 
 /// Four real bun processes per test, minutes each — far past the default
@@ -342,10 +344,17 @@ retain_versions = 3
         .await;
         // The reconciler promotes one node per tick after a few seconds of
         // stable gossip, so a leader alone proves nothing about the council.
-        // Wait for every node to hold a vote: the rolling walk must take real
-        // voters down one at a time, not learners that Raft can do without.
-        wait_for("every node a council voter", WAIT, || async {
-            harness.voters().await.len() == harness.nodes.len()
+        // Wait for the full council: the rolling walk must take real voters
+        // down one at a time, not learners that Raft can do without. The
+        // council holds the largest odd number of voters the nodes allow
+        // (D12), so two nodes keep one voter and three or four keep three.
+        let council_size = match harness.nodes.len() {
+            0 | 1 => 1,
+            n if n % 2 == 1 => n,
+            n => n - 1,
+        };
+        wait_for("the full council of voters", WAIT, || async {
+            harness.voters().await.len() == council_size
         })
         .await;
         harness
@@ -809,7 +818,7 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     // This test owns the rolling *order* and clean convergence. Workload
     // survival across a node's in-place exec is a node-level invariant,
@@ -908,7 +917,7 @@ async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_addr
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let leader_node = harness.node(&leader);
 
@@ -1022,7 +1031,7 @@ async fn version_form_rolls_the_nodes_platform_build_countersigned_by_relish() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let leader_node = harness.node(&leader);
     let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
@@ -1105,7 +1114,7 @@ async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader(
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let other = harness
         .nodes
@@ -1135,7 +1144,7 @@ async fn start_refuses_same_version_other_bytes_and_unrequested_downgrades() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let leader_node = harness.node(&leader);
     let client = harness.relish_client(leader_node);
@@ -1191,7 +1200,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     let (upgrade_id, _, worker) = {
         // Poison ONLY the worker's v0.2.0 binary: it crash-loops, reverts
@@ -1259,7 +1268,7 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     let (upgrade_id, _, _) = harness.start_upgrade().await;
     let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
@@ -1438,7 +1447,7 @@ async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     // Poison the worker's v0.2.0 so the first swap reverts and the run
     // pauses with every node still on v0.1.0.
@@ -1557,7 +1566,7 @@ async fn a_registry_outage_at_directive_time_does_not_pause_the_upgrade() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
 
     // Longer than a node's own fetch budget (10 s), so the node answers

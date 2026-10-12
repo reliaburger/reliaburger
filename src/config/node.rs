@@ -552,6 +552,12 @@ pub struct ClusterSection {
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2
     /// D21/CP12). Off by default; set `url` to enable.
     pub backup: crate::council::backup::BackupConfig,
+    /// How long, in seconds, a restarted voter keeps listening for its
+    /// peers' recovery epochs after gossip has synced before it serves Raft
+    /// without having heard from every peer (#694). Unset means two gossip
+    /// anti-entropy intervals (20 s). Raise it on a network where gossip
+    /// converges slowly; lowering it shortens restarts but weakens the fence.
+    pub recovery_probe_window_secs: Option<u64>,
 }
 
 impl Default for ClusterSection {
@@ -564,6 +570,7 @@ impl Default for ClusterSection {
             reporting_port: 9445,
             environment: None,
             backup: crate::council::backup::BackupConfig::default(),
+            recovery_probe_window_secs: None,
         }
     }
 }

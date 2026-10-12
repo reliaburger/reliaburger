@@ -140,6 +140,7 @@ async fn start_node_with_mayo(
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
             readiness: None,
+            recovery_probe_window: None,
         },
         shutdown.clone(),
     )
@@ -221,6 +222,7 @@ async fn start_mtls_node(
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
             readiness: None,
+            recovery_probe_window: None,
         },
         shutdown.clone(),
     )

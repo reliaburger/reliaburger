@@ -7045,6 +7045,55 @@
       ]
     },
     {
+      "id": "issue-694-recovery-fencing-and-odd-councils",
+      "issue": 694,
+      "promise": "No two recoveries share an epoch and recovery id; two that land on one epoch both fence as a split, a fenced data directory needs --force and lands above the fencing epoch, a restarted old voter serves nothing before gossip has synced and had its probe window, and a two-node cluster keeps one voter.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime and the in-memory Raft router"
+      ],
+      "cases": [
+        {
+          "id": "recovery-fencing-recovering_two_survivors_independently_fences_one",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "recovering_two_survivors_independently_fences_one",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "recovery-fencing-slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "odd-council-two_node_cluster_survives_losing_the_non_voter",
+          "binary": "reliaburger::council_self_healing",
+          "test": "two_node_cluster_survives_losing_the_non_voter",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_self_healing.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Recovering a data directory whose fence record says it was fenced is refused without --force."
+      ],
+      "boundaries": [
+        "Old voters that can reach only each other, never a node on the newer epoch, still can't learn of the recovery."
+      ]
+    },
+    {
       "id": "issue-759-executor-start-retries-on-a-fresh-executor",
       "issue": 759,
       "promise": "An executor start that misses a runtime command's bound retires that executor and runs the command once on a fresh one, within the command's deadline.",

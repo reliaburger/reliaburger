@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 
 use super::fence::{Admission, RecoveryFence};
 use super::types::{CouncilNodeInfo, TypeConfig};
+use super::types::{RecoveryClaim, RecoveryId};
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -251,6 +252,10 @@ pub struct RaftRpcEnvelope {
     pub compatibility: crate::compatibility::Compatibility,
     /// The sending node's recovery epoch.
     pub sender_recovery_epoch: u64,
+    /// The recovery that started the sender's epoch (#694), `None` at epoch
+    /// 0. A receiver on the same epoch with a different id fences itself
+    /// as a split and names its own id in the refusal.
+    pub sender_recovery_id: Option<RecoveryId>,
     /// Versioned request field also makes development decoders refuse this frame.
     #[serde(rename = "request")]
     pub rpc: RaftRpc,
@@ -264,7 +269,11 @@ pub struct RaftRpcEnvelope {
 fn decode_and_admit(payload: &[u8], fence: &RecoveryFence) -> Option<(Admission, RaftRpc)> {
     let envelope = serde_json::from_slice::<RaftRpcEnvelope>(payload).ok()?;
     envelope.compatibility.require_current().ok()?;
-    Some((fence.admit(envelope.sender_recovery_epoch), envelope.rpc))
+    let sender = RecoveryClaim {
+        epoch: envelope.sender_recovery_epoch,
+        id: envelope.sender_recovery_id,
+    };
+    Some((fence.admit(sender), envelope.rpc))
 }
 
 /// Raft RPC response envelope, serialised over TCP.
@@ -275,8 +284,11 @@ pub enum RaftRpcResponse {
     InstallSnapshot(InstallSnapshotResponse<u64>),
     /// The peer refused the RPC under the recovery fence. `recovery_epoch` is
     /// the newest epoch it knows; a sender holding an older one fences itself.
+    /// `recovery_id` is the peer's own recovery id when that epoch is its
+    /// own: a sender on that epoch with a different id is a split (#694).
     Fenced {
         recovery_epoch: u64,
+        recovery_id: Option<RecoveryId>,
     },
 }
 
@@ -501,11 +513,12 @@ async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(
                 return;
             }
         }
-        Admission::Refuse { newest_epoch } => {
+        Admission::Refuse { newest } => {
             write_response(
                 &mut stream,
                 RaftRpcResponse::Fenced {
-                    recovery_epoch: newest_epoch,
+                    recovery_epoch: newest.epoch,
+                    recovery_id: newest.id,
                 },
             )
             .await;
@@ -729,7 +742,7 @@ impl TcpRaftNetwork {
             )));
         }
 
-        let Some(epoch) = self.fence.outbound_epoch() else {
+        let Some(claim) = self.fence.outbound_claim() else {
             return Err(Unreachable::new(&RouterError(
                 "recovery fence: this node is not serving raft".into(),
             )));
@@ -738,16 +751,25 @@ impl TcpRaftNetwork {
         // Wrap the entire RPC in a timeout — covers connect, write, and read.
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            self.rpc_inner(rpc, epoch),
+            self.rpc_inner(rpc, claim),
         )
         .await
         .map_err(|_| Unreachable::new(&RouterError("rpc timeout (10s)".into())))??;
-        if let RaftRpcResponse::Fenced { recovery_epoch } = response {
-            if self.fence.observe_peer_epoch(recovery_epoch) {
+        if let RaftRpcResponse::Fenced {
+            recovery_epoch,
+            recovery_id,
+        } = response
+        {
+            let peer = RecoveryClaim {
+                epoch: recovery_epoch,
+                id: recovery_id,
+            };
+            if self.fence.observe_peer(peer) {
                 eprintln!(
-                    "raft: fenced: peer {} serves recovery epoch {recovery_epoch}, newer than \
-                     this node's {epoch}; this node's council was replaced by a recovery",
-                    self.target_addr
+                    "raft: fenced: peer {} serves recovery epoch {recovery_epoch}, and this \
+                     node's council (epoch {}) is either older or a different recovery of the \
+                     same epoch",
+                    self.target_addr, claim.epoch
                 );
             }
             return Err(Unreachable::new(&RouterError(format!(
@@ -758,13 +780,18 @@ impl TcpRaftNetwork {
     }
 
     /// Inner RPC implementation (called within a timeout).
-    async fn rpc_inner(&self, rpc: RaftRpc, epoch: u64) -> Result<RaftRpcResponse, Unreachable> {
+    async fn rpc_inner(
+        &self,
+        rpc: RaftRpc,
+        claim: RecoveryClaim,
+    ) -> Result<RaftRpcResponse, Unreachable> {
         // JSON to match handle_raft_rpc (self-describing; see there). The RPC is
         // wrapped in a `RaftRpcEnvelope` stamped with this node's recovery epoch
         // (C5) so the accept side can fence off a different-epoch peer.
         let envelope = RaftRpcEnvelope {
             compatibility: crate::compatibility::CURRENT,
-            sender_recovery_epoch: epoch,
+            sender_recovery_epoch: claim.epoch,
+            sender_recovery_id: claim.id,
             rpc,
         };
         let payload = serde_json::to_vec(&envelope)
@@ -1002,6 +1029,7 @@ mod tests {
         RaftRpcEnvelope {
             compatibility: crate::compatibility::CURRENT,
             sender_recovery_epoch,
+            sender_recovery_id: None,
             rpc: RaftRpc::Vote(VoteRequest::new(
                 openraft::Vote::new(1, 7),
                 Some(openraft::LogId::new(
@@ -1028,7 +1056,12 @@ mod tests {
         let payload = serde_json::to_vec(&vote_envelope(0)).unwrap();
         let recovered = RecoveryFence::serving(1);
         let (admission, _) = decode_and_admit(&payload, &recovered).unwrap();
-        assert_eq!(admission, Admission::Refuse { newest_epoch: 1 });
+        assert_eq!(
+            admission,
+            Admission::Refuse {
+                newest: RecoveryClaim { epoch: 1, id: None }
+            }
+        );
         assert!(!recovered.is_fenced());
     }
 
@@ -1037,7 +1070,12 @@ mod tests {
         let payload = serde_json::to_vec(&vote_envelope(1)).unwrap();
         let old = RecoveryFence::serving(0);
         let (admission, _) = decode_and_admit(&payload, &old).unwrap();
-        assert_eq!(admission, Admission::Refuse { newest_epoch: 1 });
+        assert_eq!(
+            admission,
+            Admission::Refuse {
+                newest: RecoveryClaim { epoch: 1, id: None }
+            }
+        );
         assert_eq!(old.snapshot().fenced_by(), Some(1));
     }
 
@@ -1059,6 +1097,7 @@ mod tests {
         let fenced_peer = RecoveryFence::new(
             crate::council::fence::FenceSnapshot {
                 epoch: 0,
+                recovery_id: None,
                 state: crate::council::fence::FenceState::Fenced { newer_epoch: 1 },
             },
             None,
@@ -1070,13 +1109,14 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let payload = read_frame(&mut stream).await.unwrap();
             let (admission, _) = decode_and_admit(&payload, &server_fence).unwrap();
-            let Admission::Refuse { newest_epoch } = admission else {
+            let Admission::Refuse { newest } = admission else {
                 panic!("a fenced peer must refuse, got {admission:?}");
             };
             write_response(
                 &mut stream,
                 RaftRpcResponse::Fenced {
-                    recovery_epoch: newest_epoch,
+                    recovery_epoch: newest.epoch,
+                    recovery_id: newest.id,
                 },
             )
             .await;

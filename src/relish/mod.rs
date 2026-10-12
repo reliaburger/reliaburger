@@ -43,6 +43,7 @@ pub mod plan;
 pub mod quickstart;
 pub mod reader;
 pub mod readiness;
+pub mod recover_guard;
 pub mod released_cli;
 pub mod setup;
 pub mod source;

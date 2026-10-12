@@ -85,6 +85,74 @@ impl fmt::Display for CouncilNodeInfo {
 // NodeEssential + Serialize + Deserialize, which CouncilNodeInfo does.
 
 // ---------------------------------------------------------------------------
+// Recovery identity (#694)
+// ---------------------------------------------------------------------------
+
+/// A random 128-bit name for one `relish council recover` run.
+///
+/// The recovery epoch alone can't tell two recoveries apart: two survivors
+/// recovered independently from the same backup both land on the same
+/// epoch. Each recovery also draws a fresh id, so two councils at one epoch
+/// with different ids are recognisably a split. Serialised as 32 lowercase
+/// hex digits, which survives JSON readers that round big numbers.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct RecoveryId(pub u128);
+
+impl RecoveryId {
+    /// A fresh random id from the OS-seeded thread generator.
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
+}
+
+impl fmt::Display for RecoveryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+impl Serialize for RecoveryId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.len() != 32 {
+            return Err(serde::de::Error::custom(
+                "a recovery id is 32 hexadecimal digits",
+            ));
+        }
+        u128::from_str_radix(&text, 16)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The recovery a council descends from: its epoch, and the id of the
+/// recovery that started that epoch (`None` at epoch 0, which no recovery
+/// started, or where the id isn't known).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryClaim {
+    /// The recovery epoch.
+    pub epoch: u64,
+    /// The recovery that started it.
+    pub id: Option<RecoveryId>,
+}
+
+impl RecoveryClaim {
+    /// Whether `other` claims the same epoch from a different recovery: two
+    /// councils that can't both be the real one. An unknown id never
+    /// conflicts.
+    pub fn conflicts_with(&self, other: &RecoveryClaim) -> bool {
+        self.epoch == other.epoch
+            && matches!((self.id, other.id), (Some(mine), Some(theirs)) if mine != theirs)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RaftRequest (log entry payload)
 // ---------------------------------------------------------------------------
 
@@ -556,6 +624,10 @@ pub struct DesiredState {
     /// loss (stale reports, tokens tied to the old term line) is
     /// distinguishable from post-recovery state.
     pub recovery_epoch: u64,
+    /// The recovery that started `recovery_epoch` (#694): `None` at epoch 0.
+    /// Two councils on one epoch with different ids came from two separate
+    /// recoveries, a split that both sides must fence.
+    pub recovery_id: Option<RecoveryId>,
     /// Declared namespaces keyed by name (12b.2 T6). Their resource
     /// budgets feed the scheduler's quota ledger. Uses a `BTreeMap` so
     /// the JSON snapshot is deterministic.
@@ -616,12 +688,15 @@ impl DesiredState {
     /// Turn a restored state into the first state of a new recovery epoch
     /// (12b.2 D21/CP12).
     ///
-    /// Bumps the epoch, drops the dead council's log position and
-    /// membership so the recovered node starts a fresh term line, and lifts
-    /// the catalogue generation above anything the old epoch published
-    /// (#478).
-    pub fn enter_recovery_epoch(&mut self) {
-        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+    /// Bumps the epoch above both this state's and `floor` (the newest epoch
+    /// the recovering node's fence record knows of, so a fenced node never
+    /// lands on the epoch that fenced it), draws a fresh recovery id, drops
+    /// the dead council's log position and membership so the recovered node
+    /// starts a fresh term line, and lifts the catalogue generation above
+    /// anything the old epoch published (#478).
+    pub fn enter_recovery_epoch(&mut self, floor: u64) {
+        self.recovery_epoch = self.recovery_epoch.max(floor).saturating_add(1);
+        self.recovery_id = Some(RecoveryId::random());
         self.last_applied_log = None;
         self.last_membership = StoredMembership::default();
         self.endpoint_withdrawals
@@ -975,6 +1050,62 @@ mod tests {
         assert_ne!(app_spec, app_delete);
         assert_ne!(app_spec, noop);
         assert_ne!(app_delete, noop);
+    }
+
+    #[test]
+    fn each_recovery_gets_a_distinct_recovery_id() {
+        let backup = DesiredState::default();
+        let mut first = backup.clone();
+        let mut second = backup;
+        first.enter_recovery_epoch(0);
+        second.enter_recovery_epoch(0);
+        // Same backup, same epoch: only the id tells the two councils apart.
+        assert_eq!(first.recovery_epoch, second.recovery_epoch);
+        assert!(first.recovery_id.is_some());
+        assert_ne!(first.recovery_id, second.recovery_id);
+        let claim = |state: &DesiredState| RecoveryClaim {
+            epoch: state.recovery_epoch,
+            id: state.recovery_id,
+        };
+        assert!(claim(&first).conflicts_with(&claim(&second)));
+        assert!(!claim(&first).conflicts_with(&claim(&first)));
+    }
+
+    #[test]
+    fn entering_an_epoch_lands_above_the_floor() {
+        let mut state = DesiredState {
+            recovery_epoch: 1,
+            ..DesiredState::default()
+        };
+        state.enter_recovery_epoch(4);
+        assert_eq!(state.recovery_epoch, 5);
+        state.enter_recovery_epoch(0);
+        assert_eq!(state.recovery_epoch, 6);
+    }
+
+    #[test]
+    fn a_recovery_id_round_trips_as_hex() {
+        let id = RecoveryId(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"0123456789abcdef0011223344556677\"");
+        assert_eq!(serde_json::from_str::<RecoveryId>(&json).unwrap(), id);
+        assert!(serde_json::from_str::<RecoveryId>("\"12\"").is_err());
+    }
+
+    #[test]
+    fn an_unknown_recovery_id_never_conflicts() {
+        let known = RecoveryClaim {
+            epoch: 1,
+            id: Some(RecoveryId(1)),
+        };
+        let unknown = RecoveryClaim { epoch: 1, id: None };
+        assert!(!known.conflicts_with(&unknown));
+        assert!(!unknown.conflicts_with(&known));
+        let other_epoch = RecoveryClaim {
+            epoch: 2,
+            id: Some(RecoveryId(2)),
+        };
+        assert!(!known.conflicts_with(&other_epoch));
     }
 
     /// Helper to create a minimal AppSpec for tests.

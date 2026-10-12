@@ -88,6 +88,10 @@ pub struct Compatibility {
 /// and `gitops_config`, `SyncState::warnings`, and the `GitOpsWrite`,
 /// `GitOpsConfigSet`, `TestLeaseAppDelete` and `TestLeaseNamespaceDelete`
 /// requests, #693).
+/// Recovery ids (#694): `DesiredState::recovery_id` in snapshots, the
+/// fence record's `recovery_id` and `split_with`, `sender_recovery_id` on
+/// every Raft RPC and `recovery_id` in its fenced reply, and the gossip
+/// directory extension's `recovery_id`.
 /// Registry durability (#697): the manifest catalogue's `untagged_at`,
 /// `DeleteTag::deleted_at_unix_ms` (deleting a tag now untags), the
 /// `ExpireManifest` request and `RegistryMutation::DeleteTag`; the registry

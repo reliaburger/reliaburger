@@ -19,8 +19,9 @@ use openraft::RaftNetworkFactory;
 
 use crate::council::node::CouncilNode;
 use crate::council::state_machine::CouncilStateMachine;
-use crate::council::types::{CouncilConfig, CouncilNodeInfo, DesiredState, TypeConfig};
-use crate::mustard::membership::MembershipSnapshot;
+use crate::council::types::{
+    CouncilConfig, CouncilNodeInfo, DesiredState, RecoveryClaim, TypeConfig,
+};
 
 /// Where the restored desired state comes from.
 #[derive(Debug, Clone)]
@@ -36,6 +37,13 @@ pub enum RecoverySource {
 pub enum RecoveryError {
     #[error("a live council still exists: {0}; refusing to recover without --force")]
     LiveCouncil(String),
+    #[error(
+        "{path} holds a council that was fenced by recovery epoch {fenced_by}: another recovery \
+         already replaced it. Recovering it again would start a rival council; re-enrol this \
+         node with `relish council re-enrol` instead, or pass --force if you mean to replace the \
+         newer council (it lands above epoch {fenced_by})"
+    )]
+    FencedSource { path: String, fenced_by: u64 },
     #[error("backup: {0}")]
     Backup(#[from] crate::council::backup::BackupError),
     #[error("no backup found at {url}")]
@@ -81,19 +89,17 @@ pub fn reenrol_data_dir(data_dir: &Path, force: bool) -> Result<Option<u64>, Rec
     Ok(fenced_by)
 }
 
-/// Whether the gossip view shows any council voter still alive.
-///
-/// This is the pre-flight guard for `relish council recover`: recovery
-/// destroys the old term line, so running it against a cluster that still has
-/// a quorum would split-brain. `--force` overrides this, but only loudly.
-///
-/// Returns the name of a live voter if one is found, so the refusal message
-/// can point at it.
-pub fn live_council_voter(members: &[MembershipSnapshot]) -> Option<String> {
-    members
-        .iter()
-        .find(|m| m.is_council && !m.state.is_down())
-        .map(|m| m.node_id.0.clone())
+/// The voters of the council `state` was taken from: the membership its
+/// last applied configuration names, as a backup or a voter's own stores
+/// hold it (#694). `relish council recover` probes each one before it
+/// starts a new council, and refuses while any still answers as a council
+/// member. Empty when the state holds no membership.
+pub fn persisted_voters(state: &DesiredState) -> Vec<CouncilNodeInfo> {
+    let membership = state.last_membership.membership();
+    membership
+        .voter_ids()
+        .filter_map(|id| membership.get_node(&id).cloned())
+        .collect()
 }
 
 /// Load and unseal a `DesiredState` from a recovery source.
@@ -203,13 +209,42 @@ async fn load_state_from_data_dir(
 /// This is what `relish council recover` runs against a *stopped* survivor.
 /// Refuses live stores. Installation is journalled and resumed at startup;
 /// the previous directory remains beside the replacement for inspection.
-pub fn recover_data_dir(data_dir: &Path, state: DesiredState) -> Result<(), RecoveryError> {
+///
+/// The new epoch lands above both the restored state's epoch and every
+/// epoch the node's fence record knows of, and carries a fresh recovery id
+/// (#694). A data directory whose record says another recovery fenced it is
+/// refused unless `force`: recovering it would start a rival council.
+/// Returns the new council's claim.
+pub fn recover_data_dir(
+    data_dir: &Path,
+    mut state: DesiredState,
+    force: bool,
+) -> Result<RecoveryClaim, RecoveryError> {
     crate::compatibility::ensure_state_compatible(data_dir)
         .map_err(|e| RecoveryError::Persist(e.to_string()))?;
+    let raft_dir = data_dir.join("raft");
+    // Read the fence before the old directory moves aside with it.
+    let fence = crate::council::fence::RecoveryFence::read_persisted(&raft_dir)
+        .map_err(|e| RecoveryError::OpenSource(e.to_string()))?;
+    if let Some(fenced_by) = fence.and_then(|fence| fence.fenced_by())
+        && !force
+    {
+        return Err(RecoveryError::FencedSource {
+            path: raft_dir.display().to_string(),
+            fenced_by,
+        });
+    }
+    let floor = fence.map_or(0, |fence| fence.newest_known_epoch());
+    state.enter_recovery_epoch(floor);
+    let claim = RecoveryClaim {
+        epoch: state.recovery_epoch,
+        id: state.recovery_id,
+    };
     // The whole old directory moves aside, the fence record included: the
     // recovered snapshot is then the only source of this node's epoch.
-    super::recovery_storage::replace(&data_dir.join("raft"), state)
-        .map_err(|e| RecoveryError::Persist(e.to_string()))
+    super::recovery_storage::replace(&raft_dir, state)
+        .map_err(|e| RecoveryError::Persist(e.to_string()))?;
+    Ok(claim)
 }
 
 /// In-process recovery: build a `CouncilNode` seeded from a restored
@@ -256,22 +291,7 @@ pub fn sole_voter_set(raft_id: u64) -> BTreeSet<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mustard::state::NodeState;
     use std::net::SocketAddr;
-
-    fn snap(name: &str, is_council: bool, state: NodeState) -> MembershipSnapshot {
-        MembershipSnapshot {
-            node_id: crate::meat::NodeId::new(name),
-            address: SocketAddr::from(([127, 0, 0, 1], 9443)),
-            state,
-            incarnation: 1,
-            is_council,
-            is_leader: false,
-            labels: BTreeMap::new(),
-            first_seen: std::time::Instant::now(),
-            resources: None,
-        }
-    }
 
     async fn write_fence(raft_dir: &Path, fenced: bool) {
         use crate::council::fence::{FenceSnapshot, FenceState, RecoveryFence};
@@ -283,7 +303,11 @@ mod tests {
             FenceState::Serving
         };
         RecoveryFence::new(
-            FenceSnapshot { epoch: 1, state },
+            FenceSnapshot {
+                epoch: 1,
+                recovery_id: None,
+                state,
+            },
             Some(raft_dir.join(crate::council::fence::FENCE_FILE)),
         )
         .persist()
@@ -335,35 +359,83 @@ mod tests {
         std::fs::create_dir_all(&raft).unwrap();
         std::fs::write(
             raft.join(crate::council::fence::FENCE_FILE),
-            br#"{"epoch":0,"fenced_by":null}"#,
+            br#"{"epoch":0,"recovery_id":null,"fenced_by":null,"split_with":null}"#,
         )
         .unwrap();
-        recover_data_dir(dir.path(), DesiredState::default()).unwrap();
+        recover_data_dir(dir.path(), DesiredState::default(), false).unwrap();
         assert!(!raft.join(crate::council::fence::FENCE_FILE).exists());
     }
 
-    #[test]
-    fn live_council_voter_found_when_council_member_alive() {
-        let members = vec![
-            snap("worker", false, NodeState::Alive),
-            snap("voter", true, NodeState::Alive),
-        ];
-        assert_eq!(live_council_voter(&members).as_deref(), Some("voter"));
+    /// The #694 scenario: R was recovered to epoch 1 and fenced old voter A.
+    /// Recovering A from its own stores restores epoch 0 state, which must
+    /// not land on epoch 1 next to R's council.
+    #[tokio::test]
+    async fn recovering_a_fenced_dir_lands_above_the_epoch_that_fenced_it() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
+        // write_fence records epoch 1 fenced by epoch 2.
+        write_fence(&dir.path().join("raft"), true).await;
+        std::fs::remove_file(dir.path().join("raft").join("log.redb")).unwrap();
+        let claim = recover_data_dir(dir.path(), DesiredState::default(), true).unwrap();
+        assert_eq!(claim.epoch, 3);
+        assert!(claim.id.is_some());
+    }
+
+    #[tokio::test]
+    async fn recovering_a_fenced_dir_refuses_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
+        let raft = dir.path().join("raft");
+        write_fence(&raft, true).await;
+        let refused = recover_data_dir(dir.path(), DesiredState::default(), false);
+        assert!(
+            matches!(
+                refused,
+                Err(RecoveryError::FencedSource { fenced_by: 2, .. })
+            ),
+            "got {refused:?}"
+        );
+        // Nothing moved: the fenced stores are still there to re-enrol.
+        assert!(raft.join(crate::council::fence::FENCE_FILE).exists());
+        assert!(raft.join("log.redb").exists());
+    }
+
+    #[tokio::test]
+    async fn an_unfenced_record_still_raises_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
+        // A node that adopted epoch 1 but whose snapshot never showed it.
+        write_fence(&dir.path().join("raft"), false).await;
+        std::fs::remove_file(dir.path().join("raft").join("log.redb")).unwrap();
+        let claim = recover_data_dir(dir.path(), DesiredState::default(), false).unwrap();
+        assert_eq!(claim.epoch, 2);
     }
 
     #[test]
-    fn live_council_voter_none_when_all_voters_down() {
-        let members = vec![
-            snap("worker", false, NodeState::Alive),
-            snap("dead-voter", true, NodeState::Dead),
-        ];
-        assert!(live_council_voter(&members).is_none());
-    }
-
-    #[test]
-    fn live_council_voter_ignores_alive_workers() {
-        let members = vec![snap("worker", false, NodeState::Alive)];
-        assert!(live_council_voter(&members).is_none());
+    fn persisted_voters_reads_the_last_membership() {
+        let mut state = DesiredState::default();
+        assert!(persisted_voters(&state).is_empty());
+        let nodes = BTreeMap::from([
+            (
+                1,
+                CouncilNodeInfo::new(SocketAddr::from(([10, 0, 0, 1], 9444)), "a"),
+            ),
+            (
+                2,
+                CouncilNodeInfo::new(SocketAddr::from(([10, 0, 0, 2], 9444)), "b"),
+            ),
+            (
+                3,
+                CouncilNodeInfo::new(SocketAddr::from(([10, 0, 0, 3], 9444)), "learner"),
+            ),
+        ]);
+        let membership = openraft::Membership::new(vec![BTreeSet::from([1, 2])], nodes);
+        state.last_membership = openraft::StoredMembership::new(None, membership);
+        let names: Vec<String> = persisted_voters(&state)
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
     }
 
     #[test]
@@ -377,7 +449,7 @@ mod tests {
         let mut state = DesiredState::default();
         state.config.insert("k".to_string(), "v".to_string());
 
-        recover_data_dir(dir.path(), state).unwrap();
+        recover_data_dir(dir.path(), state, false).unwrap();
 
         // The next start's loader sees the restored state with a bumped epoch
         // and no stale log id.
@@ -398,7 +470,7 @@ mod tests {
         std::fs::create_dir(&raft).unwrap();
         let log = raft.join("log.redb");
         std::fs::write(&log, b"preserve old log").unwrap();
-        assert!(recover_data_dir(dir.path(), DesiredState::default()).is_err());
+        assert!(recover_data_dir(dir.path(), DesiredState::default(), false).is_err());
         assert_eq!(std::fs::read(log).unwrap(), b"preserve old log");
         assert!(!dir.path().join(crate::compatibility::STATE_STAMP).exists());
     }
@@ -603,7 +675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = DesiredState::default();
         state.config.insert("k".to_string(), "v".to_string());
-        recover_data_dir(dir.path(), state).unwrap();
+        recover_data_dir(dir.path(), state, false).unwrap();
 
         let loaded = load_state_from_data_dir(dir.path(), None).await.unwrap();
         assert_eq!(loaded.config.get("k").map(String::as_str), Some("v"));
@@ -620,7 +692,7 @@ mod tests {
         backup.endpoint_withdrawals.generation = 5;
 
         let dir = tempfile::tempdir().unwrap();
-        recover_data_dir(dir.path(), backup.clone()).unwrap();
+        recover_data_dir(dir.path(), backup.clone(), false).unwrap();
         let offline = load_state_from_data_dir(dir.path(), None).await.unwrap();
         let in_process = CouncilStateMachine::from_recovered_state(backup)
             .desired_state()
@@ -650,7 +722,7 @@ mod tests {
     #[tokio::test]
     async fn recover_data_dir_bumps_epoch_across_repeated_recoveries() {
         let dir = tempfile::tempdir().unwrap();
-        recover_data_dir(dir.path(), DesiredState::default()).unwrap();
+        recover_data_dir(dir.path(), DesiredState::default(), false).unwrap();
 
         // Load, then recover again from the loaded state.
         crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
@@ -662,7 +734,7 @@ mod tests {
         };
         assert_eq!(first.recovery_epoch, 1);
 
-        recover_data_dir(dir.path(), first).unwrap();
+        recover_data_dir(dir.path(), first, false).unwrap();
         let db = std::sync::Arc::new(redb::Database::create(&snapshot_path).unwrap());
         let sm = CouncilStateMachine::with_store(db).unwrap();
         let second = sm.desired_state().await;

@@ -257,19 +257,79 @@ impl HealthTracker {
 /// tick. The planner returns at most one: membership changes are serialised
 /// so a failure leaves the council in a state the next tick can re-plan
 /// from.
+///
+/// Every action that changes the voter count leaves it odd (D12, #694): an
+/// even council tolerates no more failures than the odd one below it, and
+/// costs an extra write acknowledgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CouncilAction {
     /// Add the node as a non-voting learner so it starts replicating.
     AddLearner(u64),
-    /// Promote a caught-up learner to voter via joint consensus.
+    /// Promote one caught-up learner to voter: only ever from an even
+    /// council, which this makes odd again.
     Promote(u64),
-    /// Remove a dead voter from the voter set and drop it from the
-    /// membership entirely.
+    /// Promote two caught-up learners in one joint-consensus change, growing
+    /// an odd council by two (1 to 3, 3 to 5).
+    PromotePair(u64, u64),
+    /// Swap a caught-up learner in for a dead or resigning voter in one
+    /// joint-consensus change, dropping the old voter from the membership.
+    /// The voter count doesn't change.
+    Replace {
+        /// The learner that takes the seat.
+        promote: u64,
+        /// The voter that leaves.
+        remove: u64,
+    },
+    /// Remove one voter (a dead one first) from an even council, making it
+    /// odd again.
     RemoveVoter(u64),
+    /// Remove two dead voters at once, shrinking an odd council by two
+    /// when nothing is left to replace them with.
+    RemoveVoterPair(u64, u64),
     /// Drop a dead learner from the membership.
     RemoveLearner(u64),
     /// Nothing to do this tick.
     Nothing,
+}
+
+impl CouncilAction {
+    /// The voter set after this action lands, given the current `voters`.
+    pub fn voters_after(&self, voters: &BTreeSet<u64>) -> BTreeSet<u64> {
+        let mut next = voters.clone();
+        match *self {
+            CouncilAction::Promote(id) => {
+                next.insert(id);
+            }
+            CouncilAction::PromotePair(a, b) => {
+                next.insert(a);
+                next.insert(b);
+            }
+            CouncilAction::Replace { promote, remove } => {
+                next.insert(promote);
+                next.remove(&remove);
+            }
+            CouncilAction::RemoveVoter(id) => {
+                next.remove(&id);
+            }
+            CouncilAction::RemoveVoterPair(a, b) => {
+                next.remove(&a);
+                next.remove(&b);
+            }
+            CouncilAction::AddLearner(_)
+            | CouncilAction::RemoveLearner(_)
+            | CouncilAction::Nothing => {}
+        }
+        next
+    }
+}
+
+/// The largest odd number of voters not above `n`, and at least one.
+pub fn largest_odd_at_most(n: usize) -> usize {
+    match n {
+        0 | 1 => 1,
+        n if n % 2 == 1 => n,
+        n => n - 1,
+    }
 }
 
 /// What the reconciler observed this tick: the Raft membership, gossip
@@ -309,14 +369,16 @@ pub struct CouncilObservation<'a> {
 /// Plan the single next membership action for the council.
 ///
 /// Pure function: same observation, same answer. Invariants the caller can
-/// rely on (and the proptest enforces):
+/// rely on (and the proptests enforce):
 ///
 /// - never proposes removing the leader;
-/// - never proposes a change that live voters could not commit, or that
-///   would drop the voter set below `min_council_size`;
-/// - prefers add-before-remove: a dead voter's replacement is brought in as
-///   a learner, caught up and promoted before the dead seat is evicted, so
-///   quorum never depends on the dead node's vote returning;
+/// - never proposes a change that live voters could not commit;
+/// - every change to the voter count leaves it odd, and the target is the
+///   largest odd number not above the live nodes and `max_council_size`
+///   (D12, #694): two live nodes keep one voter, four keep three;
+/// - prefers add-before-remove: a dead or resigning voter's replacement is
+///   brought in as a learner and caught up, then swapped in for the old
+///   seat in one change, so quorum never depends on the dead node's vote;
 /// - applies hysteresis: eviction requires `dead_window` of continuous
 ///   death, candidacy requires `candidate_alive_window` of continuous life.
 ///
@@ -364,79 +426,117 @@ pub fn plan_council_action(
     if alive_voters < majority(voters.len()) {
         // Quorum is already lost: no membership change can commit, so
         // planning one would only wedge the reconciler on timeouts.
-        // Full-council-loss disaster recovery (T3) hangs off this seam.
+        // Full-council-loss disaster recovery hangs off this seam.
         return CouncilAction::Nothing;
     }
 
     // A non-leader voter under sustained disk pressure wants to resign. It
     // still holds its seat and still votes, so it's treated as a soft-dead
-    // voter: replace it add-before-remove, evict it last, and never below
-    // quorum. An empty `disk_pressured` set leaves every rule below unchanged.
+    // voter: replaced add-before-remove, never below quorum.
     let pressured = |id: u64| id != leader_id && observation.disk_pressured.contains(&id);
-
     let dead_voters: Vec<u64> = voters
         .iter()
         .copied()
         .filter(|id| dead_past_window(*id))
         .collect();
-    // A voter that is merely flapping (dead inside the window) still holds
-    // its seat: only confirmed-dead seats count as open.
-    let seated = voters.len() - dead_voters.len();
-    // A pressured voter that is not already counted as dead also frees a seat
-    // for growth, so a healthy replacement is brought in before it resigns.
-    let pressured_alive_voters = voters
+    let pressured_voters: Vec<u64> = voters
         .iter()
-        .filter(|id| pressured(**id) && !dead_past_window(**id))
-        .count();
-    let effective_seated = seated.saturating_sub(pressured_alive_voters);
-
-    // 1. Promote the best caught-up, stably-alive learner while a healthy
-    //    seat is free (growth below the cap, a dead voter, or a resigning
-    //    pressured voter to replace).
-    if effective_seated < config.max_council_size {
-        for id in observation.candidates {
-            if observation.learners.contains(id)
+        .copied()
+        .filter(|id| pressured(*id) && !dead_past_window(*id))
+        .collect();
+    // Learners ready to vote, best-ranked first.
+    let ready: Vec<u64> = observation
+        .candidates
+        .iter()
+        .copied()
+        .filter(|id| {
+            observation.learners.contains(id)
                 && stable_alive(*id)
                 && learner_caught_up(observation, *id, config)
-            {
+        })
+        .collect();
+
+    // The live nodes a council could seat: live voters, live learners and
+    // live spare candidates. The target voter count is the largest odd
+    // number not above that, nor above the configured cap.
+    let pool: BTreeSet<u64> = voters
+        .iter()
+        .chain(observation.learners.iter())
+        .chain(observation.candidates.iter())
+        .copied()
+        .filter(|id| alive(*id))
+        .collect();
+    let target = largest_odd_at_most(pool.len().min(config.max_council_size));
+
+    // Commit safety for a change to `next`: live voters must form a
+    // majority of the new configuration too (joint consensus needs both).
+    let committable =
+        |next: &BTreeSet<u64>| next.iter().filter(|id| alive(**id)).count() >= majority(next.len());
+
+    if voters.len().is_multiple_of(2) {
+        // An even council (an older cluster, or a decommission): back to
+        // odd. Grow by one when the live nodes allow it, waiting for a
+        // learner to catch up rather than shrinking just to grow again;
+        // otherwise shrink by one, a dead voter first.
+        if voters.len() < target {
+            if let Some(id) = ready.first() {
                 return CouncilAction::Promote(*id);
+            }
+        } else {
+            let leaving = dead_voters
+                .first()
+                .or(pressured_voters.first())
+                .copied()
+                .or_else(|| voters.iter().copied().rev().find(|id| *id != leader_id));
+            if let Some(id) = leaving {
+                let action = CouncilAction::RemoveVoter(id);
+                if committable(&action.voters_after(voters)) {
+                    return action;
+                }
+            }
+        }
+    } else {
+        // 1. Swap a caught-up learner in for a dead voter, then for a
+        //    resigning pressured one.
+        if let (Some(remove), Some(promote)) = (
+            dead_voters.first().or(pressured_voters.first()),
+            ready.first(),
+        ) {
+            let action = CouncilAction::Replace {
+                promote: *promote,
+                remove: *remove,
+            };
+            if committable(&action.voters_after(voters)) {
+                return action;
+            }
+        }
+
+        // 2. Grow by two while the live nodes allow a bigger odd council.
+        if voters.len() + 2 <= target
+            && let [first, second, ..] = ready.as_slice()
+        {
+            return CouncilAction::PromotePair(*first, *second);
+        }
+
+        // 3. Two dead voters and no replacement: drop both, never below
+        //    the minimum size.
+        if let [first, second, ..] = dead_voters.as_slice() {
+            let action = CouncilAction::RemoveVoterPair(*first, *second);
+            if voters.len() - 2 >= config.min_council_size
+                && committable(&action.voters_after(voters))
+            {
+                return action;
             }
         }
     }
 
-    // 2. Evict a confirmed-dead voter once the council can spare the seat:
-    //    never below the minimum size, and only while live voters form a
-    //    majority of both the old and the shrunken config.
-    if let Some(id) = dead_voters.first() {
-        let shrunk = voters.len() - 1;
-        if shrunk >= config.min_council_size && alive_voters >= majority(shrunk) {
-            return CouncilAction::RemoveVoter(*id);
-        }
-    }
-
-    // 2b. Evict a resigning pressured voter, but only once a healthy
-    //     replacement has landed so the council still has enough seats. It is
-    //     evicted last (after any dead voter above) and only while quorum and
-    //     the minimum size survive the shrink — hysteresis against churn is
-    //     the sustained-pressure window the caller applies before flagging it.
-    if let Some(id) = voters.iter().copied().find(|id| pressured(*id)) {
-        let shrunk = voters.len() - 1;
-        // "Healthy replacement present" == the surviving voters (minus the
-        // pressured one) are still at least the minimum council size, so the
-        // council doesn't shrink below its floor by letting it go.
-        if shrunk >= config.min_council_size && alive_voters.saturating_sub(1) >= majority(shrunk) {
-            return CouncilAction::RemoveVoter(id);
-        }
-    }
-
-    // 3. Bring a replacement in as a learner (add-before-remove) when open
-    //    seats are not already covered by a live learner catching up. A
-    //    resigning pressured voter's seat counts as open here too.
+    // 4. Bring replacements and growth in as learners (add-before-remove):
+    //    enough to fill the seats below the target that dead or resigning
+    //    voters don't hold, less the live learners already catching up.
+    let seated = voters.len() - dead_voters.len() - pressured_voters.len();
     let live_learners = observation.learners.iter().filter(|id| alive(**id)).count();
-    let open_seats = config
-        .max_council_size
-        .saturating_sub(effective_seated + live_learners);
-    if open_seats > 0 {
+    let wanted = target.saturating_sub(seated);
+    if wanted > live_learners {
         for id in observation.candidates {
             if !observation.learners.contains(id) && !voters.contains(id) && stable_alive(*id) {
                 return CouncilAction::AddLearner(*id);
@@ -444,7 +544,7 @@ pub fn plan_council_action(
         }
     }
 
-    // 4. Drop a learner that has been dead past the window.
+    // 5. Drop a learner that has been dead past the window.
     for id in observation.learners {
         if dead_past_window(*id) {
             return CouncilAction::RemoveLearner(*id);
@@ -1133,13 +1233,20 @@ mod tests {
     }
 
     #[test]
-    fn planner_promotes_caught_up_learner() {
+    fn planner_swaps_a_caught_up_learner_in_for_a_dead_voter() {
         let now = Instant::now();
         let mut fixture = healthy_three(now);
         fixture.health.insert(3, dead_for(now, 60));
         fixture.learners.insert(4);
         fixture.replication.insert(4, Some(100));
-        assert_eq!(fixture.plan(&heal_config(), now), CouncilAction::Promote(4));
+        // One change: the council never passes through four voters.
+        assert_eq!(
+            fixture.plan(&heal_config(), now),
+            CouncilAction::Replace {
+                promote: 4,
+                remove: 3
+            }
+        );
     }
 
     #[test]
@@ -1161,7 +1268,13 @@ mod tests {
         fixture.health.insert(3, dead_for(now, 60));
         fixture.learners.insert(4);
         fixture.replication.insert(4, Some(95));
-        assert_eq!(fixture.plan(&heal_config(), now), CouncilAction::Promote(4));
+        assert_eq!(
+            fixture.plan(&heal_config(), now),
+            CouncilAction::Replace {
+                promote: 4,
+                remove: 3
+            }
+        );
     }
 
     #[test]
@@ -1298,8 +1411,178 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Odd council sizes (D12, #694)
+    // -------------------------------------------------------------------
+
+    /// A planner config with room for seven voters, the production cap.
+    fn roomy_config() -> CouncilSelectionConfig {
+        CouncilSelectionConfig {
+            max_council_size: 7,
+            ..heal_config()
+        }
+    }
+
+    #[test]
+    fn largest_odd_at_most_rounds_down_to_odd() {
+        let odd: Vec<usize> = (0..=8).map(largest_odd_at_most).collect();
+        assert_eq!(odd, [1, 1, 1, 3, 3, 5, 5, 7, 7]);
+    }
+
+    /// D12: with two machines Raft can't do better than one voter. The
+    /// second node never becomes a voter (two voters would need both for
+    /// quorum), so losing it is survivable.
+    #[test]
+    fn two_live_nodes_keep_one_voter() {
+        let now = Instant::now();
+        let mut fixture = PlannerFixture {
+            voters: BTreeSet::from([1]),
+            learners: BTreeSet::new(),
+            leader_id: 1,
+            health: HashMap::from([(2, alive_for(now, 600))]),
+            candidates: vec![2],
+            leader_last_log_index: Some(10),
+            replication: BTreeMap::new(),
+            change_in_flight: false,
+            disk_pressured: BTreeSet::new(),
+        };
+        assert_eq!(fixture.plan(&roomy_config(), now), CouncilAction::Nothing);
+
+        // Even if node 2 is already a caught-up learner, it stays one.
+        fixture.learners.insert(2);
+        fixture.replication.insert(2, Some(10));
+        assert_eq!(fixture.plan(&roomy_config(), now), CouncilAction::Nothing);
+    }
+
+    #[test]
+    fn a_third_node_grows_one_voter_to_three_in_one_change() {
+        let now = Instant::now();
+        let mut fixture = PlannerFixture {
+            voters: BTreeSet::from([1]),
+            learners: BTreeSet::new(),
+            leader_id: 1,
+            health: HashMap::from([(2, alive_for(now, 600)), (3, alive_for(now, 600))]),
+            candidates: vec![2, 3],
+            leader_last_log_index: Some(10),
+            replication: BTreeMap::new(),
+            change_in_flight: false,
+            disk_pressured: BTreeSet::new(),
+        };
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::AddLearner(2)
+        );
+        fixture.learners.insert(2);
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::AddLearner(3)
+        );
+        fixture.learners.insert(3);
+        // One learner caught up is not enough: 1 + 1 would be even.
+        fixture.replication.insert(2, Some(10));
+        assert_eq!(fixture.plan(&roomy_config(), now), CouncilAction::Nothing);
+        fixture.replication.insert(3, Some(10));
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::PromotePair(2, 3)
+        );
+    }
+
+    #[test]
+    fn four_live_nodes_keep_three_voters() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        fixture.candidates = vec![4];
+        fixture.health.remove(&5);
+        fixture.learners.insert(4);
+        fixture.replication.insert(4, Some(100));
+        assert_eq!(fixture.plan(&roomy_config(), now), CouncilAction::Nothing);
+    }
+
+    /// D12: an even council (left by an older release or a decommission)
+    /// returns to odd: up by one when a caught-up learner and the live
+    /// nodes allow it, otherwise down by one, a dead voter first.
+    #[test]
+    fn even_council_after_eviction_returns_to_odd() {
+        let now = Instant::now();
+        // Four voters, all alive, a fifth node caught up as a learner.
+        let mut fixture = healthy_three(now);
+        fixture.voters.insert(4);
+        fixture.replication.insert(4, Some(100));
+        fixture.learners.insert(5);
+        fixture.replication.insert(5, Some(100));
+        fixture.candidates = vec![5];
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::Promote(5)
+        );
+
+        // No learner to promote and no fifth node: shrink to three.
+        fixture.learners.clear();
+        fixture.candidates.clear();
+        fixture.health.remove(&5);
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::RemoveVoter(4)
+        );
+
+        // A dead voter goes first.
+        fixture.health.insert(2, dead_for(now, 60));
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::RemoveVoter(2)
+        );
+
+        // Two voters from an older release: down to one, never the leader.
+        let two = PlannerFixture {
+            voters: BTreeSet::from([1, 2]),
+            learners: BTreeSet::new(),
+            leader_id: 2,
+            health: HashMap::from([(1, alive_for(now, 600))]),
+            candidates: Vec::new(),
+            leader_last_log_index: Some(10),
+            replication: BTreeMap::from([(1, Some(10))]),
+            change_in_flight: false,
+            disk_pressured: BTreeSet::new(),
+        };
+        assert_eq!(
+            two.plan(&roomy_config(), now),
+            CouncilAction::RemoveVoter(1)
+        );
+    }
+
+    #[test]
+    fn two_dead_voters_with_no_replacement_shrink_five_to_three() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        fixture.voters.extend([4, 5]);
+        fixture.candidates.clear();
+        fixture.health.insert(4, dead_for(now, 60));
+        fixture.health.insert(5, dead_for(now, 60));
+        assert_eq!(
+            fixture.plan(&roomy_config(), now),
+            CouncilAction::RemoveVoterPair(4, 5)
+        );
+    }
+
+    // -------------------------------------------------------------------
     // Disk-pressure resignation tests (12b.2 T3)
     // -------------------------------------------------------------------
+
+    #[test]
+    fn planner_swaps_a_caught_up_replacement_in_for_a_pressured_voter() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        fixture.disk_pressured.insert(3);
+        fixture.learners.insert(4);
+        fixture.replication.insert(4, Some(100));
+        assert_eq!(
+            fixture.plan(&heal_config(), now),
+            CouncilAction::Replace {
+                promote: 4,
+                remove: 3
+            }
+        );
+    }
 
     #[test]
     fn planner_grows_replacement_for_a_disk_pressured_voter() {
@@ -1555,31 +1838,43 @@ mod tests {
                     )
                 };
 
+                let caught_up = |id: u64| {
+                    let last = leader_last.unwrap_or(0);
+                    match replication.get(&id).copied().flatten() {
+                        Some(m) => last.saturating_sub(m) <= config.max_promotion_lag,
+                        None => last == 0,
+                    }
+                };
+                let promotable = |id: u64| learners.contains(&id) && stable_alive(id) && caught_up(id);
+                let next = action.voters_after(&voters);
+                if next != voters {
+                    // Every voter-set change keeps the leader, is committable
+                    // by live voters in both configs, and lands on an odd size.
+                    prop_assert!(next.contains(&leader_id), "planner removed the leader");
+                    prop_assert!(alive_voters >= majority(voters.len()));
+                    let alive_next = next.iter().filter(|id| alive(**id)).count();
+                    prop_assert!(alive_next >= majority(next.len()));
+                    prop_assert_eq!(next.len() % 2, 1, "an even council after {:?}", action);
+                }
+
                 match action {
                     CouncilAction::RemoveVoter(id) => {
-                        prop_assert_ne!(id, leader_id, "planner removed the leader");
+                        // Only an even council sheds a single voter.
                         prop_assert!(voters.contains(&id));
-                        // Minimum-size safety holds for every eviction.
-                        prop_assert!(voters.len() > config.min_council_size);
-                        prop_assert!(alive_voters >= majority(voters.len()));
-
-                        if dead_past_window(id) {
-                            // A dead voter is not counted in `alive_voters`, so
-                            // the survivors already form the shrunken majority.
-                            prop_assert!(alive_voters >= majority(voters.len() - 1));
-                        } else {
-                            // The only other reason to evict a live voter is a
-                            // disk-pressure resignation (12b.2 T3). It *is*
-                            // counted in `alive_voters`, so removing it drops
-                            // the count by one — quorum must survive that.
-                            prop_assert!(
-                                disk_pressured.contains(&id),
-                                "evicted a voter that was neither dead nor pressured"
-                            );
-                            prop_assert!(
-                                alive_voters.saturating_sub(1) >= majority(voters.len() - 1)
-                            );
-                        }
+                        prop_assert_eq!(voters.len() % 2, 0);
+                    }
+                    CouncilAction::RemoveVoterPair(a, b) => {
+                        prop_assert!(a != b);
+                        prop_assert!(dead_past_window(a) && dead_past_window(b));
+                        prop_assert!(voters.len() - 2 >= config.min_council_size);
+                    }
+                    CouncilAction::Replace { promote, remove } => {
+                        prop_assert!(promotable(promote), "swapped in an unready learner");
+                        prop_assert!(voters.contains(&remove));
+                        prop_assert!(
+                            dead_past_window(remove) || disk_pressured.contains(&remove),
+                            "replaced a voter that was neither dead nor pressured"
+                        );
                     }
                     CouncilAction::RemoveLearner(id) => {
                         prop_assert_ne!(id, leader_id);
@@ -1587,18 +1882,12 @@ mod tests {
                         prop_assert!(dead_past_window(id), "evicted a learner inside the window");
                     }
                     CouncilAction::Promote(id) => {
-                        prop_assert!(learners.contains(&id));
-                        prop_assert!(stable_alive(id), "promoted an unstable learner");
-                        // Caught up within the lag bound.
-                        let last = leader_last.unwrap_or(0);
-                        let matched = replication.get(&id).copied().flatten();
-                        let caught_up = match matched {
-                            Some(m) => last.saturating_sub(m) <= config.max_promotion_lag,
-                            None => last == 0,
-                        };
-                        prop_assert!(caught_up, "promoted a lagging learner");
-                        // The change must be committable by live voters.
-                        prop_assert!(alive_voters >= majority(voters.len()));
+                        prop_assert!(promotable(id), "promoted an unready learner");
+                        prop_assert_eq!(voters.len() % 2, 0);
+                    }
+                    CouncilAction::PromotePair(a, b) => {
+                        prop_assert!(a != b);
+                        prop_assert!(promotable(a) && promotable(b), "promoted an unready learner");
                     }
                     CouncilAction::AddLearner(id) => {
                         prop_assert!(!voters.contains(&id));
@@ -1607,6 +1896,61 @@ mod tests {
                         prop_assert!(stable_alive(id), "added an unstable learner");
                     }
                     CouncilAction::Nothing => {}
+                }
+            }
+
+            /// D12: from an odd council, no action ever leaves an even one,
+            /// and the voter count never exceeds what the live nodes and
+            /// the cap allow.
+            #[test]
+            fn voter_count_is_never_even_after_any_action(
+                half in 0usize..4,
+                learner_count in 0usize..5,
+                extra_count in 0usize..5,
+                max_council_size in 1usize..8,
+                health_seeds in proptest::collection::vec((0u8..3, 0u64..120), 16),
+                matched_seeds in proptest::collection::vec(proptest::option::of(0u64..1000), 16),
+                leader_last in proptest::option::of(0u64..1000),
+                pressure_seeds in proptest::collection::vec(proptest::bool::ANY, 16),
+            ) {
+                let now = Instant::now();
+                let config = CouncilSelectionConfig {
+                    max_council_size,
+                    ..heal_config()
+                };
+                let voter_count = 2 * half + 1;
+                let voters: BTreeSet<u64> = (1..=voter_count as u64).collect();
+                let learners: BTreeSet<u64> =
+                    (voter_count as u64 + 1..=(voter_count + learner_count) as u64).collect();
+                let candidates: Vec<u64> = (voter_count as u64 + 1
+                    ..=(voter_count + learner_count + extra_count) as u64)
+                    .collect();
+                let mut health = HashMap::new();
+                let mut replication = BTreeMap::new();
+                let mut disk_pressured = BTreeSet::new();
+                for (i, id) in voters.iter().chain(learners.iter()).chain(candidates.iter()).enumerate() {
+                    health.insert(*id, health_from_seed(health_seeds[i % health_seeds.len()], now));
+                    replication.insert(*id, matched_seeds[i % matched_seeds.len()]);
+                    if pressure_seeds[i % pressure_seeds.len()] {
+                        disk_pressured.insert(*id);
+                    }
+                }
+                let observation = CouncilObservation {
+                    voters: &voters,
+                    learners: &learners,
+                    leader_id: 1,
+                    health: &health,
+                    candidates: &candidates,
+                    leader_last_log_index: leader_last,
+                    replication: &replication,
+                    change_in_flight: false,
+                    disk_pressured: &disk_pressured,
+                };
+                let action = plan_council_action(&observation, &config, now);
+                let next = action.voters_after(&voters);
+                prop_assert_eq!(next.len() % 2, 1, "{:?} left {} voters", action, next.len());
+                if next.len() > voters.len() {
+                    prop_assert!(next.len() <= max_council_size.max(1));
                 }
             }
         }

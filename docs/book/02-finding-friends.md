@@ -2167,11 +2167,16 @@ The heart of the fix is a pure function, `plan_council_action()`, that looks at 
 pub enum CouncilAction {
     AddLearner(u64),
     Promote(u64),
+    PromotePair(u64, u64),
+    Replace { promote: u64, remove: u64 },
     RemoveVoter(u64),
+    RemoveVoterPair(u64, u64),
     RemoveLearner(u64),
     Nothing,
 }
 ```
+
+(It started with four actions. "Odd numbers only", below, explains the other three.)
 
 One action per tick is a deliberate straitjacket. Membership changes are the most dangerous writes a Raft cluster performs, and the failure modes multiply when several are in flight. So the planner refuses to pipeline: if a joint-consensus change is still committing, it returns `Nothing`; otherwise it proposes the single next step. If that step fails or times out, nothing is remembered — the next tick observes the actual state and re-plans from scratch. Idempotent planning means retrying is free, which is what keeps the reconciler non-wedging: every operation is bounded by a timeout, every error is logged and abandoned, and the loop never blocks on a peer that won't answer.
 
@@ -2198,12 +2203,57 @@ When a voter is confirmed dead and a spare exists, the planner walks a fixed seq
 
 1. **`AddLearner(spare)`** — the spare starts receiving log replication but has no vote. Quorum arithmetic is untouched.
 2. **Wait for catch-up.** Promotion is gated on the learner's replicated log index being within `max_promotion_lag` entries (64 by default) of the leader's last index, read from openraft's replication metrics. A learner that can't catch up simply never gets a vote.
-3. **`Promote(spare)`** — a joint-consensus `change_membership`. Take the three-voter case with one seat dead: the new config has four voters, three of them alive. The change must commit in *both* configs — majority of the old three (two votes: fine) and of the new four (three votes: also fine). At no point does anything wait on the dead node.
-4. **`RemoveVoter(dead)`** — another joint-consensus change, shrinking back to three healthy voters. This one uses openraft's non-retaining mode, so the evicted node is dropped from the membership entirely rather than lingering as a learner the leader keeps trying to replicate to.
+3. **`Replace { promote: spare, remove: dead }`**, one joint-consensus `change_membership`. Take the three-voter case with one seat dead: the old config is `{a, b, dead}` and the new one `{a, b, spare}`. The change must commit in *both* configs: a majority of the old three (two votes, `a` and `b`: fine) and of the new three (two of `a`, `b` and the caught-up spare: also fine). At no point does anything wait on the dead node. The change uses openraft's non-retaining mode, so the evicted node is dropped from the membership entirely rather than lingering as a learner the leader keeps trying to replicate to.
 
-Could we remove first and add later? Sometimes, and the planner will evict a dead seat early when the council is large enough to spare it. But removal is refused whenever it would shrink the voter set below `min_council_size`, so in the common three-voter case the replacement *must* land first. Add-before-remove is the order that never gambles on the dead node's vote coming back.
+The first version took two steps here: promote the spare (four voters), then evict the dead seat (back to three). That worked, but it parked the council on an even number of voters between the two, and the next subsection is about why we no longer do that. Joint consensus doesn't care how many nodes join or leave in one change, so doing both in one costs nothing.
+
+Could we remove first and add later? Removing a single dead voter from three would leave two, an even council that needs both survivors for every write. So the planner only ever evicts dead voters alone in pairs (five down to three, never below `min_council_size`) when nothing is left to replace them. Add-before-remove is the order that never gambles on the dead node's vote coming back.
 
 Two guards apply to every plan. Live voters must form a majority of both the current and the proposed config, otherwise the change couldn't commit and proposing it would just wedge a timeout loop (if quorum is already lost, membership surgery can't fix it — that's disaster recovery's job, a later theme). And the planner never, under any input, proposes removing the leader. Gossip claiming the leader is dead gets ignored: the planner runs *on* the leader, and a node that's executing code is not dead, whatever the rumour mill says. When the leader itself must one day step aside (disk pressure, planned drain), that path needs a leadership transfer first — and openraft 0.9 has no graceful transfer, as we discovered the hard way in the self-upgrade work of chapter 14. The seam is documented and deliberately left empty rather than stubbed with something that can't work.
+
+### Odd numbers only
+
+What's the right number of voters for a two-node cluster? We used to say two, because the reconciler promoted every eligible node up to `max_council_size`. Count the votes again. Two voters need two votes for a majority, so losing *either* node stops the control plane. One voter needs one vote, so losing the other node costs nothing, and losing the voter costs exactly what it did before. The second voter bought no fault tolerance at all, and it doubled the failures that hurt. The whitepaper claimed a 2-node survivor "continues operating in single-leader mode", which was true of nothing we'd shipped.
+
+The same arithmetic holds at every size. Four voters need three votes and survive one failure, same as three. Six need four and survive two, same as five. An even council never tolerates more failures than the odd one below it, and every write waits for one more acknowledgement. So the planner now aims at an odd target (D12):
+
+```rust
+pub fn largest_odd_at_most(n: usize) -> usize {
+    match n {
+        0 | 1 => 1,
+        n if n % 2 == 1 => n,
+        n => n - 1,
+    }
+}
+
+let target = largest_odd_at_most(pool.len().min(config.max_council_size));
+```
+
+`pool` is every live node the council could seat: live voters, live learners and live spare candidates. Two nodes give a target of one, four give three, and seven or more give seven.
+
+The awkward part is getting from one odd number to the next without stopping on an even one. Growing from one voter to three by single promotions would pass through two. So growth waits until two learners have caught up and promotes both in one change, `PromotePair`. Replacing a dead voter is the `Replace` swap above. And when the council is even on arrival, left over from an older release or a `relish decommission-node`, the planner returns it to odd: up by one with `Promote` if a caught-up learner and the live nodes allow it, otherwise down by one with `RemoveVoter`, a dead voter first.
+
+The planner's guards look a little different with pairs about. The old code had one shrink rule; now there are three ways to change the voter count, and each has to be committable. Rather than repeat the majority arithmetic in each branch, every candidate action is turned into the voter set it would produce, and one closure checks it:
+
+```rust
+let committable = |next: &BTreeSet<u64>| {
+    next.iter().filter(|id| alive(**id)).count() >= majority(next.len())
+};
+```
+
+Picking a pair out of a ranked list uses a bit of syntax we haven't needed yet:
+
+```rust
+if voters.len() + 2 <= target
+    && let [first, second, ..] = ready.as_slice()
+{
+    return CouncilAction::PromotePair(*first, *second);
+}
+```
+
+`[first, second, ..]` is a *slice pattern*. It matches any slice with at least two elements, binds the first two, and `..` ignores the rest. A slice with fewer than two doesn't match, so the condition is false and we fall through. In C you'd check the length and then index; in Python you'd unpack and catch the error. Rust folds the length check and the binding into one pattern, and there's no index to get wrong. The `&& let` part is a let chain (stable since Rust 1.88): every condition in the `if` must hold, and the bindings from the pattern are in scope inside the block.
+
+A two-node cluster ends up with one voter and one plain worker, and the gated `two_node_cluster_survives_losing_the_non_voter` test checks the half Raft can promise: kill the worker and the voter keeps committing alone. The upgrade planner's refusal of a two-voter council (chapter 14) stays, as a guard for councils an older release left behind.
 
 ### Hysteresis, or why flapping must not churn
 
@@ -2215,9 +2265,9 @@ While a voter is inside the dead window, its seat still counts as occupied. That
 
 ### Testing it
 
-The planner being pure pays for itself here. Seventeen unit tests feed it hand-built observations — dead voter with a spare, learner sixty entries behind, quorum already lost, leader reported dead by gossip — and assert the exact action. No cluster, no sleeps, no flakes.
+The planner being pure pays for itself here. Unit tests feed it hand-built observations — dead voter with a spare, learner sixty entries behind, quorum already lost, leader reported dead by gossip — and assert the exact action. No cluster, no sleeps, no flakes.
 
-On top of that sits a proptest. It generates arbitrary voter sets, learner sets, health maps and replication states, and asserts the invariants hold for all of them: the leader is never removed, evictions only target nodes dead past the window, no plan drops live voters below a committable majority or the set below its minimum size, and the planner is deterministic. Writing the properties down turned out to be the best design review the planner got — two of the guards above exist because early property runs found inputs that violated them.
+On top of that sits a proptest. It generates arbitrary voter sets, learner sets, health maps and replication states, and asserts the invariants hold for all of them: the leader is never removed, evictions only target nodes dead past the window (or resigning under disk pressure), no plan drops live voters below a committable majority, every change to the voter count lands on an odd number, and the planner is deterministic. A second property starts from odd councils only and checks that no action ever leaves an even one. Writing the properties down turned out to be the best design review the planner got — two of the guards above exist because early property runs found inputs that violated them.
 
 The full loop runs in three gated acceptance tests (`RELIABURGER_CLUSTER_TESTS=1`): kill a voter and watch a spare walk in while a writer hammers the council and asserts every write lands; kill a learner mid-catch-up (faked by partitioning it at the Raft layer while gossip still likes it) and confirm the voter set refuses to move until a healthy learner catches up; and flap a voter inside the window and confirm nothing changes at all. They use real `CouncilNode`s over the in-memory router with gossip supplied through a watch channel, so the tests control exactly who looks alive and when — the same trick the SWIM tests used, one layer up.
 
@@ -2325,8 +2375,9 @@ A monotonic counter, stamped into the restored state:
 
 ```rust
 impl DesiredState {
-    pub fn enter_recovery_epoch(&mut self) {
-        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+    pub fn enter_recovery_epoch(&mut self, floor: u64) {
+        self.recovery_epoch = self.recovery_epoch.max(floor).saturating_add(1);
+        self.recovery_id = Some(RecoveryId::random());
         self.last_applied_log = None;
         self.last_membership = StoredMembership::default();
         self.endpoint_withdrawals
@@ -2335,7 +2386,7 @@ impl DesiredState {
 }
 ```
 
-Both recovery paths call it: the offline one that writes the snapshot `relish council recover` leaves behind, and the in-process one the tests use. The last line comes later in this section, in "Three more from the field".
+Both recovery paths call it: the offline one that writes the snapshot `relish council recover` leaves behind, and the in-process one the tests use. The `floor` and the `recovery_id` arrived later, in "Two recoveries, one epoch" below, and the last line in "Three more from the field".
 
 `saturating_add` is Rust's "add, but clamp at the maximum instead of overflowing." A plain `+` on an integer that's already at `u64::MAX` would panic in a debug build and wrap around in a release build — both wrong. Saturating arithmetic is the boring-correct choice for a counter that only ever goes up. Recover a cluster twice and the epoch reads 2; anything tagged with epoch 0 or 1 is demonstrably pre-recovery. It's cheap, it's monotonic, and it never lies.
 
@@ -2363,13 +2414,16 @@ A node holding epoch 0 that hears about epoch 1 *from anywhere* fences itself, f
 The state lives in a `tokio::sync::watch` channel shared by the transport, the council node and the runtime. Moving between states goes through `send_if_modified`, which hands you a mutable reference to the current value inside a closure and only wakes the subscribers if the closure returns `true`:
 
 ```rust
-pub fn observe_peer_epoch(&self, peer_epoch: u64) -> bool {
+pub fn observe_peer(&self, peer: RecoveryClaim) -> bool {
     let was_fenced = self.is_fenced();
-    self.state
-        .send_if_modified(|current| fence_if_newer(current, peer_epoch));
+    self.state.send_if_modified(|current| {
+        fence_if_newer(current, peer.epoch) || split_if_conflicting(current, peer)
+    });
     !was_fenced && self.is_fenced()
 }
 ```
+
+(This is today's version. It took an epoch alone at first; the next-but-one subsection explains the `RecoveryClaim` and the second check.)
 
 In Go you'd reach for a mutex around a struct and a separate condition variable to tell the watchers. Here the channel is both. The closure runs while the channel's internal lock is held, so two RPC handlers learning about epoch 1 at the same moment can't interleave a half-made update, and nobody gets woken for a no-op.
 
@@ -2381,7 +2435,51 @@ And chasing that one turned up a fourth, which had nothing to do with recovery. 
 
 The last piece is seeing it. One node's council status is only that node's opinion, and a split brain looks perfectly healthy from either half. That was the "both report healthy" part of the report. So `relish council status`, the header `relish status` now prints, and `relish wtf` all ask *every* node, through the relay, and compare. Two serving epochs, two leaders or a fenced node is critical, and each finding names the nodes and the way back.
 
-Is the fence perfect now? No, and the manual says so. An old voter only learns of the new epoch from a node that holds it. Bring two old voters back where they can see each other but not the recovered side, and they have nothing to learn from. That's why the manual's advice after `council recover --force` is blunt: re-enrol the old voters before you start them. If you don't, `relish wtf` will tell you, loudly.
+Is the fence perfect now? No, and the manual says so. An old voter only learns of the new epoch from a node that holds it. Bring two old voters back where they can see each other but not the recovered side, and they have nothing to learn from. That's why the manual's advice after `council recover` is blunt: re-enrol the old voters before you start them. If you don't, `relish wtf` will tell you, loudly.
+
+### Two recoveries, one epoch
+
+The 0.2.1 audit (#694) found four more holes in that story, all in the parts we'd been proudest of.
+
+The first was the epoch itself. A new epoch was the restored state's epoch plus one. Recover survivor R to epoch 1, and old voter A fences itself at 1. Now an operator, perhaps a different one, recovers A from its own data directory. A's stores hold the state from epoch 0, so A lands on epoch 1 as well. Two councils, one epoch, and the fence admits a peer at an equal epoch. Neither fences the other. The same happens when two survivors are recovered independently, or a stale backup is restored twice.
+
+Two fixes, because there are two ways in. A's own fence record already knew about epoch 1, and recovery moved the record aside without reading it. So `recover_data_dir` now reads it first and passes it to `enter_recovery_epoch` as the `floor`: the new epoch is above the restored state's, the record's and the epoch that fenced it. A record that says the node was fenced is also refused outright unless you pass `--force`, because recovering a replaced council's stores starts a rival.
+
+That covers the case where the node knew. When neither node knew (two survivors, two operators, no contact), they really do land on the same epoch, and nothing about the number can tell them apart. So every recovery also draws a random 128-bit id:
+
+```rust
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct RecoveryId(pub u128);
+
+impl Serialize for RecoveryId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+```
+
+This is the first time we've written `Serialize` by hand instead of deriving it. A derived impl would write the `u128` as a JSON number, and a 128-bit integer doesn't survive a JavaScript `JSON.parse` (it rounds to a 53-bit float), which is how the dashboard and anything else reading `relish council status --output json` would see it. So it's written as 32 hex digits, and the matching `Deserialize` impl checks the length before parsing. `Serializer` is serde's trait for an output format; our impl doesn't know or care whether that's JSON, bincode for gossip, or redb's snapshot envelope.
+
+The id travels next to the epoch everywhere the epoch goes: in the snapshot, in the fence record, on every Raft RPC, in a `Fenced` refusal and in each node's gossip directory extension. A node that meets its own epoch with a *different* id moves to a fifth fence state, `Split { other_id }`, and tells the other side its own id so it fences too. Both halves stop. That sounds harsh, and it's meant to: neither side can know which recovery the operator meant to keep, and guessing wrong loses writes. `relish council status` shows `1 split`, `relish wtf` raises a critical finding, and the way out is the `--force` path above: recover the side you're keeping (its record says it's fenced, so it lands above the split epoch) and re-enrol the other. `RecoveryClaim::conflicts_with` treats an unknown id as no conflict, which is what keeps epoch 0 (no recovery, no id) and a node that only knows a newer epoch by number from tripping it.
+
+The second hole was the guard on `council recover`. It asked the *local* agent whether a live voter was visible. But the node has to be stopped before recovery can run, so nothing ever answered, and the check passed every time. `live_council_voter` had been reachable only from its own tests. The manual even admitted it. Now relish reads the voter set from the recovery source (the data directory's last membership, or the backup's) and asks each voter's `/v1/health`, which says `council_voter: true` on an unfenced voter. It refuses, naming the voter, while any of them says yes. A voter that doesn't answer counts as gone; one that answers with something relish can't read refuses too, and so does a source with no voters to ask. A guard that can't tell is not a guard, so it fails closed. The probe skips certificate checks, which looks alarming until you notice the worst a spoofed answer can do is make recovery refuse.
+
+The third was the five seconds. A restarted voter served Raft once five seconds had passed since the *process* started, whatever gossip had shown it, and gossip only comes up a few seconds into that. Old voters that could reach the recovered node but heard from it late would elect a leader at epoch 0, acknowledge writes, and then fence themselves and lose them. The window now opens when gossip has joined and completed its first push-pull table exchange (the Mustard node publishes that on a `watch` channel), stays open for two anti-entropy intervals so a peer that missed every piggybacked update still reaches us, and closes early only when every peer the node's persisted membership names has advertised a claim. `[cluster] recovery_probe_window_secs` lets an operator stretch it on a slow network.
+
+Testing a twenty-second window in real time would make a slow test, and testing it with `tokio::spawn` and paused time is a known trap: auto-advance can skip past a spawned task's work. So the supervisor is an `async fn` the test polls itself:
+
+```rust
+let (rig, supervisor) = rig(probing_fence(None));
+tokio::pin!(supervisor);
+run_for(&mut supervisor, Duration::from_secs(120)).await;
+assert_eq!(rig.fence.snapshot().state, FenceState::Probing);
+```
+
+`tokio::pin!` pins the future to the stack so we can poll it through `&mut` again and again, and `run_for` races it against a `sleep` in a `select!`. With `#[tokio::test(start_paused = true)]`, the runtime jumps the clock forward whenever everything is waiting, so two minutes of probing take microseconds. A future is just a value in Rust, and nothing runs it until something polls it, which is what makes this possible. In Go, a goroutine runs whether you watch it or not.
+
+The fourth was a one-liner. The supervisor set `recorded = current` even when `persist()` failed, so after a disk-full event the fence was never retried, and the next restart brought the node back unfenced. It now updates `recorded` only after a write lands, retries every five seconds, and keeps the error where `relish council status` and `relish wtf` can show it. Writing that test turned up a sibling: the supervisor assumed the fence it started with was already on disk, but a Raft RPC can fence or adopt a node before the supervisor's task first runs. It now writes once on its first pass.
+
+The gated tests replay the audit's scenarios on real transports and real data directories. `recovering_two_survivors_independently_fences_one` recovers two survivors of one council separately, watches them meet and both fence as a split, refuses the plain re-recovery of a fenced directory, and shows that `--force` leaves exactly one council serving. `slow_gossip_restart_never_acknowledges_on_the_old_epoch` brings two old voters back first, keeps the recovered node down for eight seconds (past the old window), and checks that neither old voter acknowledges a single write before it hears about epoch 1.
 
 ### Three more from the field
 

@@ -45,6 +45,7 @@ async fn start_with_a_seed(
             labels: Default::default(),
             self_disk_pressured_rx: None,
             readiness: None,
+            recovery_probe_window: None,
         },
         cancel.clone(),
     )
@@ -74,7 +75,8 @@ async fn start_with_a_seed(
 #[tokio::test]
 async fn a_recovered_node_with_configured_seeds_must_bootstrap() {
     let root = tempfile::tempdir().unwrap();
-    reliaburger::council::recovery::recover_data_dir(root.path(), DesiredState::default()).unwrap();
+    reliaburger::council::recovery::recover_data_dir(root.path(), DesiredState::default(), false)
+        .unwrap();
     let started = start_with_a_seed(root.path(), Duration::from_secs(10), None).await;
     assert!(
         started.voters == 1 && started.leader.is_some(),
@@ -127,7 +129,7 @@ async fn a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file()
         ..Default::default()
     };
     let root = tempfile::tempdir().unwrap();
-    reliaburger::council::recovery::recover_data_dir(root.path(), restored).unwrap();
+    reliaburger::council::recovery::recover_data_dir(root.path(), restored, false).unwrap();
     let started = start_with_a_seed(
         root.path(),
         Duration::from_secs(10),

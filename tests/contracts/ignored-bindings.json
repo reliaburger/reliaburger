@@ -300,6 +300,18 @@
     "test": "recovered_council_regrows_onto_a_fresh_node"
   },
   {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "recovering_two_survivors_independently_fences_one",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "recovering_two_survivors_independently_fences_one"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "slow_gossip_restart_never_acknowledges_on_the_old_epoch"
+  },
+  {
     "source": "tests/council_self_healing.rs",
     "function": "killed_voter_is_replaced_by_healthy_spare",
     "binary": "reliaburger::council_self_healing",
@@ -316,6 +328,12 @@
     "function": "flapping_node_inside_window_causes_no_churn",
     "binary": "reliaburger::council_self_healing",
     "test": "flapping_node_inside_window_causes_no_churn"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "two_node_cluster_survives_losing_the_non_voter",
+    "binary": "reliaburger::council_self_healing",
+    "test": "two_node_cluster_survives_losing_the_non_voter"
   },
   {
     "source": "tests/ebpf.rs",

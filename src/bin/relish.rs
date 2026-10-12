@@ -797,9 +797,15 @@ enum CouncilCommand {
         /// `/etc/reliaburger/master.key`.
         #[arg(long)]
         master_key: Option<std::path::PathBuf>,
-        /// Skip the "is a council still alive?" safety check. Only pass this
-        /// when you are certain every voter is gone; recovering a live cluster
-        /// splits the brain.
+        /// The API port the cluster's nodes listen on. Before recovering,
+        /// relish asks every voter the restored state names, on this port,
+        /// whether it still serves a council.
+        #[arg(long, default_value_t = 9117)]
+        api_port: u16,
+        /// Skip the safety checks: the probe of the old voters, and the
+        /// refusal to recover a data directory another recovery already
+        /// fenced. Only pass this when you are certain every voter is gone;
+        /// recovering a live cluster splits the brain.
         #[arg(long)]
         force: bool,
     },
@@ -1765,10 +1771,17 @@ async fn main() -> ExitCode {
                 data_dir,
                 from,
                 master_key,
+                api_port,
                 force,
             }) => {
-                commands::council_recover(data_dir, from.as_deref(), master_key.as_deref(), *force)
-                    .await
+                commands::council_recover(
+                    data_dir,
+                    from.as_deref(),
+                    master_key.as_deref(),
+                    *api_port,
+                    *force,
+                )
+                .await
             }
         },
         Command::Join {

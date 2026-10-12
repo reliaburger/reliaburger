@@ -5,9 +5,37 @@ use std::collections::HashSet;
 
 use super::*;
 
-/// Liveness check.
-pub(super) async fn health_handler() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+/// Liveness check. Also says whether this node is an unfenced voter of a
+/// council (#694): `relish council recover` probes every voter a stopped
+/// node's stores name, before it starts a rival council, and has no token
+/// to ask anything that needs one. Gossip already advertises council
+/// membership, so this reveals nothing new.
+pub(super) async fn health_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let council_voter = state
+        .council
+        .as_deref()
+        .is_some_and(serves_as_council_voter);
+    Json(serde_json::json!({ "status": "ok", "council_voter": council_voter }))
+}
+
+/// Whether `council` holds a voter's seat in its membership and isn't
+/// fenced. A restarting voter still probing its peers counts: it is about
+/// to serve the council it belongs to.
+pub(super) fn serves_as_council_voter(council: &crate::council::CouncilNode) -> bool {
+    if council
+        .recovery_fence()
+        .is_some_and(|fence| fence.is_fenced())
+    {
+        return false;
+    }
+    let metrics = council.metrics();
+    let metrics = metrics.borrow();
+    let own_id = metrics.id;
+    metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .any(|id| id == own_id)
 }
 
 /// Return live critical-subsystem evidence. Unlike `/v1/health`, this is an
