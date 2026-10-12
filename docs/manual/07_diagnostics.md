@@ -52,6 +52,18 @@ can keep them apart. A node without the live eBPF hooks (rootless runc,
 ProcessGrill, eBPF off) gets a `namespace-isolation` warning naming it: there,
 any namespace's workloads reach any other's, and `allow_from` is refused.
 
+When the cluster has a GitOps configuration, `wtf` asks every node how it
+sees it. A secret-looking `env` value that's plaintext in the repository is a
+`gitops-plaintext-secret` warning naming the app and the key (never the
+value); GitOps still applies it, so encrypt it with `relish secret encrypt`.
+A node whose own `[gitops]` in `node.toml` differs from the cluster's gets a
+`gitops-local-config` warning listing the settings that differ: the cluster's
+configuration in Raft is the one that runs, and the node's is ignored. A node
+that can't unseal the cluster's GitOps credentials (no master key) gets a
+`gitops-config-unreadable` warning, since as leader it couldn't sync. With none
+of these, the `gitops` OK row says so. See
+[GitOps](12_operations.md#gitops).
+
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
 fenced out of a council `relish council recover` replaced, when nodes serve

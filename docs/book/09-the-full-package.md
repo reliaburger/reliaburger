@@ -439,8 +439,12 @@ The sync loop:
 2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
 3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
 4. **Configuration tree.** Read the verified commit under the configured watch root. Resolve `_defaults.toml` inheritance and directory namespaces through the same resolver as CLI compilation. A malformed or ambiguous tree refuses the whole sync
-5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
-6. **Selective apply.** Only changed resources written to Raft
+5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware, and removals only for resources Lettuce itself wrote
+6. **Selective apply.** Only changed resources written to Raft, each with its ownership record in the same entry
+
+### Owning only what it wrote
+
+A GitOps engine that treats the repository as the whole truth deletes everything the repository doesn't mention. That's a fine rule for a cluster GitOps built from scratch and a terrible one for a cluster that already has workloads deployed by hand. Lettuce keeps an ownership set in Raft, `DesiredState.gitops_owned`, with the apps, namespaces and permissions it wrote. Each write goes in a `RaftRequest::GitOpsWrite` that applies the change and updates the set in one entry, so the two can't disagree after a crash. The diff removes only owned resources; a resource that already matches git is adopted on the first sync that sees it. So turning GitOps on next to `relish apply` leaves the manual resources alone, a manual apply of a GitOps-owned resource warns that the next sync reverts it, and `relish delete` or `relish rollback` of one needs `--force`. A running test's `rbtest-*` namespace is never in the diff at all. The configuration itself lives in Raft too, with its credentials sealed under the cluster master key, so a failover keeps syncing the same repository. Chapter 7 tells the whole story, including how a sync refuses to write in a Raft term other than the one it read the cluster in.
 
 ### Coordinator election
 
@@ -639,6 +643,16 @@ k8s-openapi = { version = "0.22", default-features = false, features = ["latest"
 ```
 
 We disable `default-features` on k8s-openapi because we only need the type definitions, not the API client operations. That shaves off a chunk of compile time.
+
+### Reading the YAML
+
+k8s-openapi gives us types, not a parser. For that we started with `serde_yaml`, the crate everyone reached for, and it did the job: a `Deserializer` iterates over the documents in a stream (so a Helm `# Source:` comment or a `---` inside a PEM block doesn't split anything), each document becomes a generic `Value`, and we pick the k8s-openapi type from its `kind`.
+
+Then its author archived it. `serde_yaml` 0.9 ships as `0.9.34+deprecated`, and it sits on `unsafe-libyaml`, the C libyaml machine-translated into unsafe Rust, archived along with it. RustSec lists that one as unmaintained (RUSTSEC-2024-0449), and in October 2026 our weekly audit, which denies every warning it hasn't been told about, went red. Nothing was exploitable. But we'd have been parsing other people's manifests with unsafe code that nobody fixes any more.
+
+We could have added an audit exception and moved on. We did, for a few days. The real fix turned out to be smaller: the YAML organization forked both crates and maintains them as `yaml_serde` and `libyaml-rs`. It's still the same translated libyaml underneath (so still `unsafe`), but now somebody answers the bug reports. The API is unchanged, so the swap was one line in `Cargo.toml` and `serde_yaml::` becoming `yaml_serde::` in twelve files; every call site (`to_string`, `from_value`, `Deserializer::from_str`) compiles as it was. A test in `src/relish/output.rs` pins the exact YAML layout (quoting, block scalars, enum tags) and passed before and after the swap, so `--output yaml` didn't move by a byte. Another reads `Cargo.lock` and fails if `unsafe-libyaml` ever creeps back in.
+
+Why not a pure-Rust parser such as `serde-saphyr`? It would remove the `unsafe` entirely, but it's a different implementation with its own error messages and edge cases, and we wanted the smallest behaviour change that clears the advisory. That's a trade worth revisiting if YAML parsing ever moves off the operator's own machine.
 
 ### The field mapping
 

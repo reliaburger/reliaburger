@@ -184,7 +184,7 @@ fn render(report: &TestReport, output: OutputFormat) -> Result<(), RelishError> 
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(report).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(report).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
         OutputFormat::Human => print!("{}", render_human(report)),

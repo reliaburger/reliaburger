@@ -51,7 +51,7 @@ pub fn vm_config(
             "install -d -m 700 /etc/reliaburger\n")
         }]
     });
-    Ok(serde_yaml::to_string(&value)?)
+    Ok(yaml_serde::to_string(&value)?)
 }
 
 /// Shell that leaves the guest's wall clock to Lima's guest agent alone.
@@ -201,7 +201,7 @@ mod tests {
             Some(15050),
         )
         .unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(value["mounts"].as_sequence().unwrap().len(), 0);
         assert_eq!(value["containerd"]["user"], false);
         assert_eq!(value["containerd"]["system"], false);
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn provisioning_never_waits_for_a_graceful_logind_stop() {
         let yaml = vm_config("/private/cache/ubuntu.img", "aarch64", 19117, None, None).unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
         let script = value["provision"][0]["script"].as_str().unwrap();
         let kill = script
             .find("systemctl kill --signal=SIGKILL systemd-logind.service")
@@ -251,7 +251,7 @@ mod tests {
     #[cfg(unix)]
     fn run_provisioning(missing: Option<&str>) -> Provisioned {
         let yaml = vm_config("/private/cache/guest.qcow2", "aarch64", 19117, None, None).unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
         let script = value["provision"][0]["script"].as_str().unwrap();
         let logs = tempfile::tempdir().unwrap();
         let apt_log = logs.path().join("apt.log");

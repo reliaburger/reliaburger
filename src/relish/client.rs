@@ -1002,7 +1002,22 @@ impl BunClient {
     /// The server streams deploy progress as SSE; we drain it, surfacing
     /// any error, and return once the stream closes.
     pub async fn rollback(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
-        let url = format!("{}/v1/rollback/{app}/{namespace}", self.base_url);
+        self.rollback_with_force(app, namespace, false).await
+    }
+
+    /// [`rollback`](Self::rollback), with `force` to roll back an app that
+    /// GitOps manages (#693); the next sync puts back what git declares.
+    pub async fn rollback_with_force(
+        &self,
+        app: &str,
+        namespace: &str,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}/v1/rollback/{app}/{namespace}{}",
+            self.base_url,
+            force_query(force)
+        );
         let response = self
             .http()?
             .post(&url)
@@ -1555,7 +1570,24 @@ impl BunClient {
     /// Request removal (`POST /v1/delete/{app}/{namespace}`). Cluster cleanup
     /// is asynchronous; success does not confirm that every instance stopped.
     pub async fn delete(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
-        let url = format!("{}/v1/delete/{}/{}", self.base_url, app, namespace);
+        self.delete_with_force(app, namespace, false).await
+    }
+
+    /// [`delete`](Self::delete), with `force` to delete an app that GitOps
+    /// manages (#693); the next sync recreates it while git declares it.
+    pub async fn delete_with_force(
+        &self,
+        app: &str,
+        namespace: &str,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}/v1/delete/{}/{}{}",
+            self.base_url,
+            app,
+            namespace,
+            force_query(force)
+        );
         let response = self
             .http()?
             .post(&url)
@@ -2873,6 +2905,31 @@ impl BunClient {
             .await
             .or_else(|_| Ok(serde_json::Value::Null))
     }
+
+    /// The cluster's GitOps configuration and sync status, as the node
+    /// this client talks to sees it (#693).
+    pub async fn gitops_status(&self) -> Result<crate::lettuce::types::GitOpsStatus, RelishError> {
+        self.get_typed_json("/v1/gitops").await
+    }
+
+    /// Replace the cluster's GitOps configuration, or turn GitOps off with
+    /// `None` (admin only).
+    pub async fn gitops_config_set(
+        &self,
+        config: Option<crate::lettuce::types::GitOpsConfig>,
+    ) -> Result<(), RelishError> {
+        let body = serde_json::to_string(&crate::lettuce::types::GitOpsConfigRequest { config })
+            .map_err(|error| RelishError::ApiError {
+                status: 0,
+                body: error.to_string(),
+            })?;
+        self.post_json("/v1/gitops/config", body).await.map(|_| ())
+    }
+}
+
+/// The query that asks the server to change a GitOps-managed app anyway.
+fn force_query(force: bool) -> &'static str {
+    if force { "?force=true" } else { "" }
 }
 
 /// The public-key route, for the cluster or one namespace. The namespace

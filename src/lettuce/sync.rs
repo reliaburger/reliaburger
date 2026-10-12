@@ -5,12 +5,10 @@
 //! signatures, parses TOML, diffs against Raft state, and applies
 //! only changed resources.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::config::app::AppSpec;
-use crate::config::{Config, NamespaceSpec, PermissionSpec};
-use crate::meat::types::AppId;
+use crate::config::Config;
 
 use super::diff::{self, CurrentState, ResourceChange};
 use super::git::GitRepo;
@@ -30,6 +28,8 @@ pub struct SyncOutcome {
     pub changes: Vec<ResourceChange>,
     /// Configuration tree errors that refused the sync.
     pub file_errors: HashMap<String, String>,
+    /// Warnings that don't stop the sync: plaintext secrets in git (D8).
+    pub warnings: Vec<String>,
 }
 
 /// A failed outcome for `commit` with the given error.
@@ -40,6 +40,7 @@ fn failed(commit: Option<CommitInfo>, error: String) -> SyncOutcome {
         diff_summary: None,
         changes: Vec::new(),
         file_errors: HashMap::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -68,12 +69,14 @@ fn signature_admitted(status: &SignatureStatus, require_signed: bool) -> bool {
 /// the next commit. Now the cycle always diffs the current commit's config
 /// against the cluster's desired state; when the two already agree the
 /// diff is empty and the runner writes nothing.
+///
+/// `current` carries the GitOps ownership set, so the diff removes only
+/// what GitOps wrote (#693). A secret-looking env value that isn't
+/// encrypted comes back as a warning; the sync still applies it (D8).
 pub fn execute_sync(
     repo: &GitRepo,
     config: &GitOpsConfig,
-    current_apps: &HashMap<AppId, AppSpec>,
-    current_namespaces: &BTreeMap<String, NamespaceSpec>,
-    current_permissions: &BTreeMap<String, PermissionSpec>,
+    current: &CurrentState<'_>,
     autoscale_overrides: &[(String, u32)],
     last_applied_sha: Option<&str>,
 ) -> SyncOutcome {
@@ -140,6 +143,7 @@ pub fn execute_sync(
             diff_summary: None,
             changes: Vec::new(),
             file_errors,
+            warnings: Vec::new(),
         };
     }
 
@@ -149,7 +153,7 @@ pub fn execute_sync(
     // rejects — an inverted `[autoscale]` range, a `request > limit` resource
     // spec, a permission/build targeting an unknown namespace — was committed
     // straight to desired state via git and then silently ignored downstream.
-    let known_namespaces: Vec<String> = current_namespaces.keys().cloned().collect();
+    let known_namespaces: Vec<String> = current.namespaces.keys().cloned().collect();
     if let Err(e) = git_config.validate_against(&known_namespaces) {
         return failed(Some(commit), format!("config validation failed: {e}"));
     }
@@ -181,12 +185,7 @@ pub fn execute_sync(
     }
 
     // Step 4: Compute diff (only on a fully-parsed, valid config).
-    let current = CurrentState {
-        apps: current_apps,
-        namespaces: current_namespaces,
-        permissions: current_permissions,
-    };
-    let (changes, summary) = diff::compute_diff(&git_config, &current, autoscale_overrides);
+    let (changes, summary) = diff::compute_diff(&git_config, current, autoscale_overrides);
 
     SyncOutcome {
         commit: Some(commit),
@@ -194,6 +193,7 @@ pub fn execute_sync(
         diff_summary: Some(summary),
         changes,
         file_errors,
+        warnings: plaintext_secret_warnings(&git_config),
     }
 }
 
@@ -317,6 +317,59 @@ pub fn coordinator_for_leader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::app::AppSpec;
+    use crate::meat::types::AppId;
+
+    /// Desired state with nothing in it.
+    fn empty_state() -> CurrentState<'static> {
+        static APPS: std::sync::OnceLock<HashMap<AppId, AppSpec>> = std::sync::OnceLock::new();
+        static NAMESPACES: std::sync::OnceLock<
+            std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
+        > = std::sync::OnceLock::new();
+        static PERMISSIONS: std::sync::OnceLock<
+            std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+        > = std::sync::OnceLock::new();
+        static OWNED: std::sync::OnceLock<GitOpsOwnership> = std::sync::OnceLock::new();
+        CurrentState {
+            apps: APPS.get_or_init(HashMap::new),
+            namespaces: NAMESPACES.get_or_init(Default::default),
+            permissions: PERMISSIONS.get_or_init(Default::default),
+            owned: OWNED.get_or_init(Default::default),
+        }
+    }
+
+    /// D8, #693: a plaintext secret-looking env value in git is applied,
+    /// and the sync says so; an encrypted one and an ordinary key don't.
+    #[test]
+    fn plaintext_secret_in_git_warns_but_applies() {
+        let mut repository = SigningRepo::new();
+        repository.commit_apps(
+            "[app.web]\nimage = 'web:v1'\n[app.web.env]\nDB_PASSWORD = 'hunter2'\n\
+             API_TOKEN = 'ENC[AGE:abc]'\nPORT = '8080'\n",
+            false,
+        );
+        let outcome = repository.sync(None);
+        assert!(
+            matches!(outcome.result, SyncResult::Success),
+            "{:?}",
+            outcome.result
+        );
+        assert!(
+            outcome.changes.iter().any(|change| matches!(
+                change,
+                ResourceChange::Add { resource_id, .. } if resource_id == "app.default/web"
+            )),
+            "the app is still applied: {:?}",
+            outcome.changes
+        );
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("default/web"));
+        assert!(outcome.warnings[0].contains("DB_PASSWORD"));
+        assert!(
+            !outcome.warnings[0].contains("hunter2"),
+            "a warning never repeats the value"
+        );
+    }
 
     #[test]
     fn gitops_verified_commit_uses_the_watched_tree_defaults_and_namespaces() {
@@ -347,15 +400,7 @@ mod tests {
             let mut config = repository.config();
             config.path = "/configs".into();
             config.require_signed_commits = signed;
-            let outcome = execute_sync(
-                &repository.repo,
-                &config,
-                &HashMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-                None,
-            );
+            let outcome = execute_sync(&repository.repo, &config, &empty_state(), &[], None);
             assert!(
                 matches!(outcome.result, SyncResult::Success),
                 "signed={signed}: {:?}",
@@ -599,15 +644,22 @@ mod tests {
             AppId::new("web", "default"),
             toml::from_str(r#"image = "web:v1""#).unwrap(),
         );
-        let namespaces = BTreeMap::new();
-        let permissions = BTreeMap::new();
+        let namespaces = std::collections::BTreeMap::new();
+        let permissions = std::collections::BTreeMap::new();
+        let owned = crate::lettuce::types::GitOpsOwnership {
+            apps: current.keys().cloned().collect(),
+            ..Default::default()
+        };
 
         let outcome = execute_sync(
             &repo,
             &config,
-            &current,
-            &namespaces,
-            &permissions,
+            &CurrentState {
+                apps: &current,
+                namespaces: &namespaces,
+                permissions: &permissions,
+                owned: &owned,
+            },
             &[],
             None,
         );
@@ -674,15 +726,7 @@ mod tests {
             webhook_rate_limit: 10,
         };
 
-        let outcome = execute_sync(
-            &repo,
-            &config,
-            &HashMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &[],
-            None,
-        );
+        let outcome = execute_sync(&repo, &config, &empty_state(), &[], None);
 
         assert!(
             matches!(outcome.result, SyncResult::Failure { .. }),
@@ -813,9 +857,7 @@ mod tests {
             execute_sync(
                 &self.repo,
                 &self.config(),
-                &HashMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
+                &empty_state(),
                 &[],
                 last_applied,
             )
@@ -1015,15 +1057,8 @@ mod tests {
             let mut config = repository.config();
             config.require_signed_commits = signed;
             for last_applied in [None, Some(sha.as_str())] {
-                let outcome = execute_sync(
-                    &repository.repo,
-                    &config,
-                    &HashMap::new(),
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    &[],
-                    last_applied,
-                );
+                let outcome =
+                    execute_sync(&repository.repo, &config, &empty_state(), &[], last_applied);
                 let SyncResult::Failure { error } = &outcome.result else {
                     panic!(
                         "signed={signed}, last={last_applied:?}: unsupported jobs were silently accepted: {:?}",

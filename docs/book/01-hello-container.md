@@ -1663,7 +1663,7 @@ pub fn format_output<T: Serialize + fmt::Display>(
         OutputFormat::Human => Ok(value.to_string()),
         OutputFormat::Json => serde_json::to_string_pretty(value)
             .map_err(RelishError::SerialiseJson),
-        OutputFormat::Yaml => serde_yaml::to_string(value)
+        OutputFormat::Yaml => yaml_serde::to_string(value)
             .map_err(RelishError::SerialiseYaml),
     }
 }
@@ -1749,7 +1749,7 @@ $ relish --output json apply cluster.toml
 }
 ```
 
-YAML output is there for Kubernetes refugees who want the comfort of familiar syntax. `serde_yaml` makes it trivial — same `#[derive(Serialize)]`, different serialiser.
+YAML output is there for Kubernetes refugees who want the comfort of familiar syntax. `yaml_serde` (the maintained successor to `serde_yaml`; Chapter 9 explains the swap) makes it trivial — same `#[derive(Serialize)]`, different serialiser.
 
 The `Display` implementation for `ApplyPlan` uses `write!` and `writeln!` macros, which work like `format!` but write directly to a formatter instead of allocating a new string. The `+` prefix on each entry is the `Display` implementation for `PlanAction`:
 
@@ -1779,7 +1779,7 @@ pub enum RelishError {
     SerialiseJson(serde_json::Error),
 
     #[error("failed to serialise YAML: {0}")]
-    SerialiseYaml(serde_yaml::Error),
+    SerialiseYaml(yaml_serde::Error),
 
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
     AgentRequired { command: String },
@@ -1794,7 +1794,7 @@ pub enum RelishError {
 
 Two things worth pointing out. First, `#[from] ConfigError` generates a `From<ConfigError> for RelishError` implementation, which lets the `?` operator automatically convert config errors. When `Config::from_file(path)?` fails inside `apply()`, the `ConfigError` gets wrapped into `RelishError::Config` without any manual conversion.
 
-Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don't use `#[from]`. They can't, because `#[from]` generates `From<E>` implementations, and both `serde_json::Error` and `serde_yaml::Error` would conflict — Rust's orphan rules don't allow two blanket `From` impls that could overlap. Instead, we use `.map_err(RelishError::SerialiseJson)` at the call site. A small bit of ceremony, but it makes the error's origin unambiguous.
+Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don't use `#[from]`. They can't, because `#[from]` generates `From<E>` implementations, and both `serde_json::Error` and `yaml_serde::Error` would conflict — Rust's orphan rules don't allow two blanket `From` impls that could overlap. Instead, we use `.map_err(RelishError::SerialiseJson)` at the call site. A small bit of ceremony, but it makes the error's origin unambiguous.
 
 The binary's `main()` function doesn't use `anyhow::Result` anymore. Instead, it returns `ExitCode`:
 

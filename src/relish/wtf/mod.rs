@@ -14,10 +14,11 @@ pub use diagnose::diagnose;
 pub use model::{
     AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
     ClusterEvidence, CorrelatedEvent, CouncilObservation, CpuThrottleObservation,
-    DeployObservation, DiskObservation, Evidence, FaultObservation, IsolationObservation,
-    LogObservation, NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
-    RestartObservation, ServiceObservation, TokenObservation, WtfFinding, WtfInputs, WtfOk,
-    WtfReport, WtfSummary, WtfUnknown,
+    DeployObservation, DiskObservation, Evidence, FaultObservation, GitOpsObservation,
+    IsolationObservation, LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable,
+    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+    ServiceObservation, TokenObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary,
+    WtfUnknown,
 };
 
 /// Current serialised `wtf` report contract.

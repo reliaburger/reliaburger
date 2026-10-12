@@ -180,7 +180,7 @@ Every command supports three output modes via the `--output` flag:
 |------|------|-------------|
 | Human | `--output human` (default) | Coloured, aligned terminal output with Unicode symbols |
 | JSON | `--output json` | Machine-readable JSON, one object per line for streaming commands |
-| YAML | `--output yaml` | YAML serialisation via `serde_yaml`, useful for config round-tripping |
+| YAML | `--output yaml` | YAML serialisation via `yaml_serde`, useful for config round-tripping |
 
 Human-readable output uses ANSI colours (auto-detected, disabled when piped). Status indicators use Unicode: checkmarks, crosses, warning triangles, and bullets. Progress bars use `indicatif` for long-running operations (apply, upgrade, bench).
 
@@ -1919,7 +1919,7 @@ Relish is implemented in Rust. The following crates are used:
 | `reqwest` | 0.12.x | HTTP/2 client with mTLS, connection pooling, streaming |
 | `tokio` | 1.x | Async runtime for concurrent API calls, WebSocket streams, and TUI event loop |
 | `tokio-tungstenite` | 0.28.x | WebSocket client for streaming logs, events, and exec sessions |
-| `serde_yaml` | 0.9.x | YAML serialisation for `--output yaml` mode |
+| `yaml_serde` | 0.10.x | YAML serialisation for `--output yaml` mode and Kubernetes import (the maintained successor to `serde_yaml`) |
 | `serde` | 1.x | Serialisation/deserialisation for config, API responses, output |
 | `serde_json` | 1.x | JSON formatting for `--output json` |
 | `toml` | 0.8.x | TOML parsing for configuration files and `compile`/`lint`/`fmt` |

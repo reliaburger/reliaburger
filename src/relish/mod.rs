@@ -102,7 +102,7 @@ pub enum RelishError {
 
     /// YAML serialisation failure.
     #[error("failed to serialise YAML: {0}")]
-    SerialiseYaml(serde_yaml::Error),
+    SerialiseYaml(yaml_serde::Error),
 
     /// Command requires a running Bun agent.
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
