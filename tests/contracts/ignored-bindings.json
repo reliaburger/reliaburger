@@ -1272,6 +1272,24 @@
     "test": "rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale"
   },
   {
+    "source": "tests/placement.rs",
+    "function": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+    "binary": "reliaburger::placement",
+    "test": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+    "binary": "reliaburger::placement",
+    "test": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "rollback_works_after_every_node_restarts",
+    "binary": "reliaburger::placement",
+    "test": "rollback_works_after_every_node_restarts"
+  },
+  {
     "source": "tests/relish_test_catalogue.rs",
     "function": "runc_catalogue_decrypts_secrets_using_only_the_public_key_api",
     "binary": "reliaburger::relish_test_catalogue",
