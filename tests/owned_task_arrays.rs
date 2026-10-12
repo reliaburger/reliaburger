@@ -1385,6 +1385,8 @@ async fn runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_origin
 /// A node that ran `--runtime runc` and restarts with `--runtime mixed`
 /// keeps its running containers. The mixed runtime routes each one to the
 /// runc owner that launched it, so startup recovery can read them (#823).
+/// The runc node ran with a workload resolver, which every launch records:
+/// routing succeeds only once the mixed runtime has the same resolver (#839).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
 async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
@@ -1421,7 +1423,8 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
         "/sys/fs/cgroup/reliaburger/rbtest-switch/frontend/2",
         None,
     );
-    let single = AnyGrill::Runc(runc());
+    let resolver = runc().dns_gateway_address().unwrap();
+    let single = AnyGrill::Runc(runc().with_dns_nameserver(resolver));
     single.create(&container, &spec).await.unwrap();
     single.start(&container).await.unwrap();
     assert_eq!(
@@ -1430,18 +1433,24 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
     );
     drop(single);
 
-    let mixed = AnyGrill::with_host_processes(
+    // Bun builds the mixed runtime without a resolver and sets it later.
+    let AnyGrill::Mixed(router) = AnyGrill::with_host_processes(
         runc(),
         &root.join("instances"),
         env!("CARGO_BIN_EXE_bun").into(),
+    ) else {
+        panic!("with_host_processes did not build the mixed runtime");
+    };
+    assert!(
+        router.route_unrouted_launches().await.is_err(),
+        "a launch recorded under another resolver was routed"
     );
+    let router = router.with_container(runc().with_dns_nameserver(resolver));
+    let mixed = AnyGrill::Mixed(router.clone());
     assert!(
         mixed.launch_inventory().await.is_err(),
         "an unrouted runc launch was readable before routing"
     );
-    let AnyGrill::Mixed(router) = &mixed else {
-        panic!("with_host_processes did not build the mixed runtime");
-    };
     assert_eq!(
         router.route_unrouted_launches().await.unwrap(),
         vec![container.clone()]

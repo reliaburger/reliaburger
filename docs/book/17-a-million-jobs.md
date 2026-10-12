@@ -1199,6 +1199,46 @@ execution, and switching such a node from `process` to `mixed` still stops
 Bun (#827). An instance that already has a route keeps it, so running the step
 on every start changes nothing after the first.
 
+The fix shipped, and the next soak failed at the same step (#839), this time
+with "instance default__frontend-2 was started with a different runtime
+configuration". Every runc launch records the configuration it ran under: the
+runtime directories, the `runc` program, the node's subnet index and the
+address of the workload DNS resolver. Recovery refuses a live launch whose
+record differs, because a container prepared with one resolver mounted can't
+be adopted by a runtime that would prepare it with another. The runc node had
+run with DNS on. The mixed Bun routed its launches straight after choosing the
+runtime, and only gave that runtime its resolver a few lines later. To the
+routing step, every container looked like it came from some other
+configuration.
+
+The tests for #823 built the runc and the mixed runtime with the same
+configuration, so they couldn't see the order. The fix moves the step into one
+function, `prepare_runtime`, that does both in the only order that works:
+
+```rust
+async fn prepare_runtime(
+    runtime: AnyGrill,
+    section: &DnsSection,
+) -> anyhow::Result<(AnyGrill, Option<WorkloadDns>)> {
+    let (runtime, dns) = configure_dns_runtime(runtime, section)?;
+    route_previous_runtime_launches(&runtime).await?;
+    Ok((runtime, dns))
+}
+```
+
+`configure_dns_runtime` takes the runtime by value and hands back a new one
+with the resolver set, so the old, resolver-less value can't be used by
+accident: after the first line it has been *moved*, and the compiler rejects
+any later use of it. Binding the resolver's sockets is a separate step that
+runs afterwards, so a test can call `prepare_runtime` without root. The
+regression tests write a launch into runc's own journal the way a runc Bun with
+DNS on does, then hand `prepare_runtime` a mixed runtime built the way Bun
+builds it. Swap the two lines and the test fails with the soak's error. A
+second test does the same with DNS off, where neither runtime has a resolver.
+The resolver was the only part of the configuration that differed: both
+runtimes build their runc backend with the same function, from the same
+directories, `runc` program, user and hostname.
+
 A file lock serialises route changes, and the adapter moves that lock into a
 spawned task. If the caller's future is dropped mid-create, the lock stays held
 until the runtime operation really finishes. That's right for create and stop.
