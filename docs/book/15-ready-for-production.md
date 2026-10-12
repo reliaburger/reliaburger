@@ -5533,8 +5533,58 @@ pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), objec
 a Go interface value), and the `Box` puts it on the heap, because the compiler
 can't know how big an unknown type is. That's why we can hand back either the
 `parse_url` result or our own `LocalFileSystem`: both fit behind the same
-pointer. Cloud schemes pass through untouched, because S3 and GCS don't
+pointer. Cloud schemes passed through untouched, because S3 and GCS don't
 acknowledge a write until they've stored it.
+
+"Untouched" turned out to be the next bug (#695). `parse_url` builds an S3
+store with `AmazonS3Builder::new()`, and `new()` reads nothing from the
+environment; that's what `from_env()` is for. So `AWS_REGION`,
+`AWS_ACCESS_KEY_ID` and the rest, which the manual told you to set, did
+nothing. S3 fell back to the instance metadata service in `us-east-1`, which
+works on exactly one kind of machine in exactly one region, and no test
+noticed, because no test could talk to S3. Now `open` builds the cloud stores
+itself:
+
+```rust
+pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error> {
+    open_with_env(url, std::env::vars())
+}
+
+pub(crate) fn open_with_env<I>(url: &url::Url, env: I) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let (scheme, prefix) = ObjectStoreScheme::parse(url)?;
+    let store: Box<dyn ObjectStore> = match scheme {
+        ObjectStoreScheme::Local => Box::new(LocalFileSystem::new().with_fsync(true)),
+        ObjectStoreScheme::AmazonS3 => Box::new(s3_builder(url, env).build()?),
+        ObjectStoreScheme::GoogleCloudStorage => Box::new(gcs_builder(url, env).build()?),
+        _ => return object_store::parse_url(url),
+    };
+    Ok((store, prefix))
+}
+```
+
+Why not just call `from_env()`? Because then the only way to test it is
+`std::env::set_var`, and in Rust 2024 that function is `unsafe`. Setting an
+environment variable while another thread reads the environment is undefined
+behaviour in C's `setenv`, and the test runner runs tests on many threads.
+Taking the environment as an argument sidesteps the whole question: the real
+call passes `std::env::vars()`, the tests pass a `Vec` of pairs, and the
+builders' `get_config_value` shows what they picked up. `s3_builder` keeps
+only `AWS_*` variables and `gcs_builder` only `GOOGLE_*` (plus the bare
+`SERVICE_ACCOUNT` the crate's own `from_env` honours), so an S3 store never
+reads a Google setting that happens to share a lowercase name.
+
+`I: IntoIterator<Item = (String, String)>` is a generic bound: `env` can be
+any type that turns into an iterator of string pairs. `std::env::vars()`
+returns an iterator, a `Vec<(String, String)>` can become one, and the
+compiler generates a copy of `open_with_env` for each. It's the closest thing
+Rust has to Python's duck typing, checked at compile time.
+
+The unit tests never talk to a cloud. `make test-s3` does: with real
+credentials and `RELIABURGER_TEST_S3_URL`, it exports logs to the bucket and
+round-trips a council backup through it, put, list, prune and restore.
 
 The regression tests are less satisfying than we'd like. Nothing a unit test
 can observe changes when an `fsync` is missing, so each caller's test checks

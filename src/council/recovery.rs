@@ -26,8 +26,14 @@ use crate::council::types::{
 /// Where the restored desired state comes from.
 #[derive(Debug, Clone)]
 pub enum RecoverySource {
-    /// A sealed backup at an object-store URL (`file://`, `s3://`, `gs://`).
-    BackupUrl(String),
+    /// Sealed backups at an object-store URL (`file://`, `s3://`, `gs://`).
+    BackupUrl {
+        /// The backup destination.
+        url: String,
+        /// One backup to restore, by object name. `None` restores the
+        /// newest backup that decodes and unseals, skipping unusable ones.
+        backup: Option<String>,
+    },
     /// This node's own durable Raft data directory (it was a voter).
     NodeDataDir(std::path::PathBuf),
 }
@@ -48,6 +54,26 @@ pub enum RecoveryError {
     Backup(#[from] crate::council::backup::BackupError),
     #[error("no backup found at {url}")]
     NoBackup { url: String },
+    #[error(
+        "no usable backup at {url}; tried each, newest first:\n  {}",
+        skipped.join("\n  ")
+    )]
+    NoUsableBackup {
+        url: String,
+        /// `"{object name}: {reason}"` per backup, newest first.
+        skipped: Vec<String>,
+    },
+    #[error(
+        "{url} holds no backup named {name}; it holds:\n  {}",
+        if available.is_empty() { "(none)".to_string() } else { available.join("\n  ") }
+    )]
+    BackupNotFound {
+        url: String,
+        name: String,
+        available: Vec<String>,
+    },
+    #[error("backup {name} can't be restored: {reason}")]
+    UnusableBackup { name: String, reason: String },
     #[error("open recovery source: {0}")]
     OpenSource(String),
     #[error(
@@ -111,23 +137,93 @@ pub async fn load_recovery_state(
     master_key: Option<&[u8; 32]>,
 ) -> Result<DesiredState, RecoveryError> {
     match source {
-        RecoverySource::BackupUrl(url) => {
-            let store = crate::council::backup::BackupStore::from_url(url)?;
-            let sealed = store
-                .latest()
-                .await?
-                .ok_or_else(|| RecoveryError::NoBackup { url: url.clone() })?;
+        RecoverySource::BackupUrl { url, backup } => {
             let key = master_key.ok_or_else(|| {
                 RecoveryError::OpenSource(
                     "a sealed backup needs the cluster master key".to_string(),
                 )
             })?;
-            let bytes = crate::council::backup::unseal_snapshot(key, &sealed)?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| RecoveryError::OpenSource(format!("decode backup payload: {e}")))
+            load_state_from_backups(url, backup.as_deref(), key).await
         }
         RecoverySource::NodeDataDir(dir) => load_state_from_data_dir(dir, master_key).await,
     }
+}
+
+/// Restore from the backups at `url`: the one named `backup`, or else the
+/// newest usable one (#695).
+///
+/// Without a name, backups are tried newest first by
+/// [`BackupKey`](crate::council::backup::BackupKey) order. One that won't
+/// download, decode, unseal (the AES-GCM tag is the integrity check) or
+/// parse, or whose state isn't at the position its name claims, is logged
+/// and skipped. Only when every backup fails does recovery fail, listing
+/// each one and why. A named backup is the only one tried.
+async fn load_state_from_backups(
+    url: &str,
+    backup: Option<&str>,
+    master_key: &[u8; 32],
+) -> Result<DesiredState, RecoveryError> {
+    let store = crate::council::backup::BackupStore::from_url(url)?;
+    let keys = store.list().await?;
+    if let Some(name) = backup {
+        let Some(wanted) = keys.iter().find(|key| key.object_name() == name) else {
+            return Err(RecoveryError::BackupNotFound {
+                url: url.to_string(),
+                name: name.to_string(),
+                available: keys.iter().rev().map(|key| key.object_name()).collect(),
+            });
+        };
+        return restore_backup(&store, wanted, master_key)
+            .await
+            .map_err(|reason| RecoveryError::UnusableBackup {
+                name: name.to_string(),
+                reason,
+            });
+    }
+    if keys.is_empty() {
+        return Err(RecoveryError::NoBackup {
+            url: url.to_string(),
+        });
+    }
+    let mut skipped = Vec::new();
+    for key in keys.iter().rev() {
+        match restore_backup(&store, key, master_key).await {
+            Ok(state) => return Ok(state),
+            Err(reason) => {
+                eprintln!("recovery: skipping backup {key}: {reason}");
+                skipped.push(format!("{key}: {reason}"));
+            }
+        }
+    }
+    Err(RecoveryError::NoUsableBackup {
+        url: url.to_string(),
+        skipped,
+    })
+}
+
+/// Fetch, unseal and parse one backup, and check the state inside sits
+/// where `key` says. The error is the reason it can't be used.
+async fn restore_backup(
+    store: &crate::council::backup::BackupStore,
+    key: &crate::council::backup::BackupKey,
+    master_key: &[u8; 32],
+) -> Result<DesiredState, String> {
+    let sealed = store.fetch(key).await.map_err(|e| format!("read: {e}"))?;
+    let bytes = crate::council::backup::unseal_snapshot(master_key, &sealed)
+        .map_err(|e| format!("unseal: {e}"))?;
+    let state: DesiredState =
+        serde_json::from_slice(&bytes).map_err(|e| format!("decode the state: {e}"))?;
+    let inside = crate::council::backup::BackupKey::for_state(&state, std::time::UNIX_EPOCH);
+    let position = |key: &crate::council::backup::BackupKey| {
+        (key.recovery_epoch, key.term, key.index, key.recovery_id)
+    };
+    if position(&inside) != position(key) {
+        return Err(format!(
+            "the state inside is at epoch {}, term {}, index {}, not where its name says",
+            inside.recovery_epoch, inside.term, inside.index
+        ));
+    }
+    Ok(state)
 }
 
 /// Rebuild the state a voter had committed from its Raft directory
@@ -739,5 +835,171 @@ mod tests {
         let sm = CouncilStateMachine::with_store(db).unwrap();
         let second = sm.desired_state().await;
         assert_eq!(second.recovery_epoch, 2);
+    }
+
+    // -- restoring from sealed backups (#695) ------------------------------
+
+    const MASTER: [u8; 32] = [3; 32];
+
+    /// A backup of a state marked `marker`, applied up to `index` in term 1,
+    /// stored under its own key.
+    async fn put_backup(
+        store: &crate::council::backup::BackupStore,
+        marker: &str,
+        index: u64,
+        master: &[u8; 32],
+    ) -> crate::council::backup::BackupKey {
+        use crate::council::backup::{BackupConfig, BackupKey, seal_snapshot};
+        let mut state = DesiredState::default();
+        state.config.insert("marker".into(), marker.into());
+        state.last_applied_log = Some(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(1, 1),
+            index,
+        ));
+        let key = BackupKey::for_state(&state, std::time::SystemTime::UNIX_EPOCH);
+        let payload = serde_json::to_vec(&state).unwrap();
+        let sealed = seal_snapshot(master, &payload, &BackupConfig::default()).unwrap();
+        store.put(&key, &sealed).await.unwrap();
+        key
+    }
+
+    fn backup_source(dir: &tempfile::TempDir, backup: Option<String>) -> RecoverySource {
+        RecoverySource::BackupUrl {
+            url: format!("file://{}", dir.path().display()),
+            backup,
+        }
+    }
+
+    fn marker(state: &DesiredState) -> Option<&str> {
+        state.config.get("marker").map(String::as_str)
+    }
+
+    #[tokio::test]
+    async fn restore_falls_back_past_an_unsealable_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::council::backup::BackupStore::from_url(&format!(
+            "file://{}",
+            dir.path().display()
+        ))
+        .unwrap();
+        put_backup(&store, "good", 10, &MASTER).await;
+        // Newer, but sealed under another key: it can't be unsealed.
+        put_backup(&store, "foreign", 20, &[9; 32]).await;
+        // Newest, but torn: not even a sealed envelope.
+        let torn = put_backup(&store, "torn", 30, &MASTER).await;
+        std::fs::write(dir.path().join(torn.object_name()), b"{\"version\":").unwrap();
+
+        let state = load_recovery_state(&backup_source(&dir, None), Some(&MASTER))
+            .await
+            .unwrap();
+        assert_eq!(marker(&state), Some("good"));
+    }
+
+    #[tokio::test]
+    async fn restore_fails_listing_every_backup_when_none_is_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::council::backup::BackupStore::from_url(&format!(
+            "file://{}",
+            dir.path().display()
+        ))
+        .unwrap();
+        let first = put_backup(&store, "a", 1, &[9; 32]).await;
+        let second = put_backup(&store, "b", 2, &[9; 32]).await;
+
+        let error = load_recovery_state(&backup_source(&dir, None), Some(&MASTER))
+            .await
+            .unwrap_err();
+        let RecoveryError::NoUsableBackup { ref skipped, .. } = error else {
+            panic!("expected NoUsableBackup, got {error:?}");
+        };
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        // Newest first, each with its reason.
+        assert!(skipped[0].starts_with(&second.object_name()), "{skipped:?}");
+        assert!(skipped[1].starts_with(&first.object_name()), "{skipped:?}");
+        let message = error.to_string();
+        assert!(message.contains(&first.object_name()), "{message}");
+        assert!(message.contains(&second.object_name()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn restore_of_a_named_backup_uses_only_that_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::council::backup::BackupStore::from_url(&format!(
+            "file://{}",
+            dir.path().display()
+        ))
+        .unwrap();
+        let older = put_backup(&store, "older", 10, &MASTER).await;
+        let broken = put_backup(&store, "broken", 15, &[9; 32]).await;
+        put_backup(&store, "newest", 20, &MASTER).await;
+
+        let state = load_recovery_state(
+            &backup_source(&dir, Some(older.object_name())),
+            Some(&MASTER),
+        )
+        .await
+        .unwrap();
+        assert_eq!(marker(&state), Some("older"));
+
+        // A named backup that can't be used fails; it never falls back.
+        let error = load_recovery_state(
+            &backup_source(&dir, Some(broken.object_name())),
+            Some(&MASTER),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, RecoveryError::UnusableBackup { .. }),
+            "{error:?}"
+        );
+
+        // So does a name the destination doesn't hold, listing what it does.
+        let error = load_recovery_state(
+            &backup_source(&dir, Some("council-missing.backup".into())),
+            Some(&MASTER),
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RecoveryError::BackupNotFound { .. }),
+            "{message}"
+        );
+        assert!(message.contains(&older.object_name()), "{message}");
+    }
+
+    /// The state inside must sit where its object name says. A backup
+    /// renamed to look newer is skipped, not restored as the newest.
+    #[tokio::test]
+    async fn restore_skips_a_backup_whose_name_overstates_its_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::council::backup::BackupStore::from_url(&format!(
+            "file://{}",
+            dir.path().display()
+        ))
+        .unwrap();
+        put_backup(&store, "genuine", 10, &MASTER).await;
+        let stale = put_backup(&store, "stale", 5, &MASTER).await;
+        let mut renamed = stale.clone();
+        renamed.term = 9;
+        std::fs::rename(
+            dir.path().join(stale.object_name()),
+            dir.path().join(renamed.object_name()),
+        )
+        .unwrap();
+
+        let state = load_recovery_state(&backup_source(&dir, None), Some(&MASTER))
+            .await
+            .unwrap();
+        assert_eq!(marker(&state), Some("genuine"));
+    }
+
+    #[tokio::test]
+    async fn restore_from_an_empty_destination_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = load_recovery_state(&backup_source(&dir, None), Some(&MASTER))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RecoveryError::NoBackup { .. }), "{error:?}");
     }
 }

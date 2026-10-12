@@ -494,6 +494,21 @@ impl CouncilNode {
         Ok(self.state_machine.desired_state().await.security_state)
     }
 
+    /// The desired state, confirmed fresh with a quorum first, as
+    /// [`Self::security_state_linearizable`] does. Fails on a follower and
+    /// on a leader that has been deposed and doesn't know it yet. The
+    /// council backup exports this, so a stale leader never ships old state.
+    pub async fn desired_state_linearizable(&self) -> Result<DesiredState, CouncilError> {
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
+        Ok(self.state_machine.desired_state().await)
+    }
+
     /// Read the current Pickle manifest catalogue from the state machine.
     pub async fn manifest_catalog(&self) -> crate::pickle::types::ManifestCatalog {
         self.state_machine.desired_state().await.manifest_catalog

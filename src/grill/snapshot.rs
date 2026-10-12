@@ -11,7 +11,13 @@
 //! ```text
 //! {volumes_dir}/.snapshots/{namespace}/{app}/{volume-slug}/{name}            — read-only subvolume
 //! {volumes_dir}/.snapshots/{namespace}/{app}/{volume-slug}/{name}.meta.json — metadata sidecar
+//! {volumes_dir}/.snapshots/{namespace}/{app}/{volume-slug}/{name}.pending   — intent, while creating
 //! ```
+//!
+//! The intent file brackets a create: written before the subvolume, removed
+//! after the metadata. A power cut in between leaves it behind, and
+//! [`SnapshotManager::sweep_interrupted`] deletes the half-made snapshot
+//! nobody was ever told about (#695).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -324,6 +330,81 @@ fn collect_journals(dir: &Path, out: &mut Vec<PathBuf>) {
     );
 }
 
+/// Suffix of the intent file written beside a snapshot before its
+/// subvolume exists, and removed once its metadata is filed.
+const INTENT_SUFFIX: &str = ".pending";
+
+/// The intent file's contents: which process is creating the snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SnapshotIntent {
+    /// The creating process's [`process_token`]; `None` once a failed
+    /// create gave the snapshot up.
+    owner: Option<String>,
+}
+
+/// A random name for this process, so a sweep can tell a create still in
+/// flight here from one a dead process (or a failed create) left behind.
+fn process_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
+}
+
+/// Who an intent file says is creating its snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentOwner {
+    /// There is no intent file.
+    None,
+    /// This process, which may still be creating it.
+    ThisProcess,
+    /// A process that has since died, or a create that failed.
+    Abandoned,
+}
+
+/// What the sweep does with one snapshot name in a volume's snapshot
+/// directory, from [`plan_interrupted_snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptedSnapshot {
+    /// Nothing: a finished snapshot, or one this process is still creating.
+    Settled,
+    /// Remove the intent: its snapshot finished, or never started.
+    DropIntent,
+    /// The create died between the subvolume and its metadata. Nobody was
+    /// ever told the snapshot exists, so delete the subvolume, then the
+    /// intent.
+    DeleteSubvolume,
+    /// A subvolume with neither metadata nor an intent. Not ours to delete
+    /// (it predates intents, or someone made it by hand): report it.
+    Unexplained,
+}
+
+/// Decide what to do with one snapshot name, given whether its subvolume
+/// and its metadata exist and who its intent names. Pure, so every case is
+/// unit-testable without Btrfs.
+pub fn plan_interrupted_snapshot(
+    subvolume: bool,
+    meta: bool,
+    intent: IntentOwner,
+) -> InterruptedSnapshot {
+    match (intent, subvolume, meta) {
+        (IntentOwner::ThisProcess, _, _) => InterruptedSnapshot::Settled,
+        (IntentOwner::Abandoned, true, false) => InterruptedSnapshot::DeleteSubvolume,
+        (IntentOwner::Abandoned, _, _) => InterruptedSnapshot::DropIntent,
+        (IntentOwner::None, true, false) => InterruptedSnapshot::Unexplained,
+        (IntentOwner::None, _, _) => InterruptedSnapshot::Settled,
+    }
+}
+
+/// What [`SnapshotManager::sweep_interrupted`] found and did.
+#[derive(Debug, Default)]
+pub struct InterruptedSweep {
+    /// Subvolumes of interrupted creates it deleted.
+    pub removed: Vec<PathBuf>,
+    /// Subvolumes with no metadata and no intent, left alone.
+    pub unexplained: Vec<PathBuf>,
+    /// Snapshots it couldn't settle; they keep their intent for next time.
+    pub errors: Vec<SnapshotError>,
+}
+
 /// Flush a directory's entries (renames, creations) to disk.
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -483,6 +564,47 @@ impl SnapshotManager {
         sibling_with_suffix(snapshot_path, ".meta.json")
     }
 
+    fn intent_path(snapshot_path: &Path) -> PathBuf {
+        sibling_with_suffix(snapshot_path, INTENT_SUFFIX)
+    }
+
+    /// Durably record that a snapshot is about to be created at
+    /// `snapshot_path`, by this process (`owner`) or by nobody any more
+    /// (`None`, a create that failed).
+    fn write_intent(snapshot_path: &Path, owner: Option<&str>) -> Result<(), SnapshotError> {
+        let intent = SnapshotIntent {
+            owner: owner.map(str::to_string),
+        };
+        let json = serde_json::to_vec(&intent)
+            .map_err(|error| SnapshotError::Btrfs(format!("intent serialise: {error}")))?;
+        crate::sesame::identity::atomic_write(&Self::intent_path(snapshot_path), &json)?;
+        Ok(())
+    }
+
+    /// Drop a settled intent, durably.
+    fn remove_intent(snapshot_path: &Path) -> Result<(), SnapshotError> {
+        let intent = Self::intent_path(snapshot_path);
+        match std::fs::remove_file(&intent) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(sync_directory(intent.parent().unwrap_or(Path::new(".")))?),
+        }
+    }
+
+    /// Who an intent file says is creating its snapshot.
+    fn intent_owner(snapshot_path: &Path) -> IntentOwner {
+        let Ok(bytes) = std::fs::read(Self::intent_path(snapshot_path)) else {
+            return IntentOwner::None;
+        };
+        match serde_json::from_slice::<SnapshotIntent>(&bytes) {
+            Ok(SnapshotIntent { owner: Some(owner) }) if owner == process_token() => {
+                IntentOwner::ThisProcess
+            }
+            // Another process's, a failed create's, or unreadable: the
+            // file is written atomically, so nobody is still writing it.
+            _ => IntentOwner::Abandoned,
+        }
+    }
+
     /// Map a requested volume onto one of the app's provisioned managed
     /// volumes. The returned mount path comes from the inventory, never
     /// from the request, so a traversal like `/../../b/db/data` can't
@@ -611,11 +733,6 @@ impl SnapshotManager {
         let dir = self.snapshot_dir(namespace, app, volume_path);
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join(&name);
-
-        btrfs::run_btrfs(&snapshot_create_args(&live, &dest, true))
-            .map_err(SnapshotError::Btrfs)?;
-
-        let size_bytes = super::volume::VolumeManager::check_usage(&dest).unwrap_or(0);
         let meta = SnapshotMeta {
             schema: SNAPSHOT_META_SCHEMA,
             namespace: namespace.to_string(),
@@ -623,10 +740,46 @@ impl SnapshotManager {
             volume_path: volume_path.to_string(),
             name,
             created_at: now,
-            size_bytes,
+            size_bytes: 0,
             exports: Vec::new(),
         };
-        self.write_meta(&dest, &meta)?;
+        self.create_at(&live, &dest, meta, |live, dest| {
+            btrfs::run_btrfs(&snapshot_create_args(live, dest, true))
+        })
+    }
+
+    /// Snapshot `live` to `dest` with `snapshot` and file `meta` for it,
+    /// bracketed by an intent file (#695).
+    ///
+    /// The intent goes down durably before the subvolume and comes off after
+    /// the metadata, so a power cut anywhere in between leaves a `.pending`
+    /// file that [`sweep_interrupted`](Self::sweep_interrupted) can act on.
+    /// Without it, a subvolume with no metadata was invisible to listing,
+    /// upload and pruning: a silent disk leak. A create that fails hands its
+    /// intent over to the sweep's rules at once, to clean up what it left.
+    fn create_at(
+        &self,
+        live: &Path,
+        dest: &Path,
+        mut meta: SnapshotMeta,
+        snapshot: impl FnOnce(&Path, &Path) -> Result<(), String>,
+    ) -> Result<SnapshotMeta, SnapshotError> {
+        Self::write_intent(dest, Some(process_token()))?;
+        let filed = snapshot(live, dest)
+            .map_err(SnapshotError::Btrfs)
+            .and_then(|()| {
+                meta.size_bytes = super::volume::VolumeManager::check_usage(dest).unwrap_or(0);
+                self.write_meta(dest, &meta)
+            });
+        if let Err(error) = filed {
+            // Best effort: if even this fails, the intent still names this
+            // process, and the sweep at the next start settles it.
+            if Self::write_intent(dest, None).is_ok() {
+                let _ = Self::settle_interrupted(dest, &delete_subvolume);
+            }
+            return Err(error);
+        }
+        Self::remove_intent(dest)?;
         Ok(meta)
     }
 
@@ -912,6 +1065,98 @@ impl SnapshotManager {
         sync_directory(parent)?;
         remove_journal(live)?;
         Ok(())
+    }
+
+    /// Settle every interrupted snapshot create under the snapshot store
+    /// (#695), per [`plan_interrupted_snapshot`]. Bun runs this at startup
+    /// and at the start of every snapshot sweep. Creates still in flight in
+    /// this process are left alone.
+    pub fn sweep_interrupted(&self) -> InterruptedSweep {
+        self.sweep_interrupted_with(&delete_subvolume)
+    }
+
+    fn sweep_interrupted_with(
+        &self,
+        delete: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> InterruptedSweep {
+        let mut sweep = InterruptedSweep::default();
+        for volume_dir in self.snapshot_volume_dirs() {
+            let Ok(entries) = std::fs::read_dir(&volume_dir) else {
+                continue;
+            };
+            // Every name that has a subvolume or an intent.
+            let mut names = std::collections::BTreeSet::new();
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                // Dot files are atomic-write temporaries.
+                if file_name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                if is_dir {
+                    names.insert(file_name);
+                } else if let Some(name) = file_name.strip_suffix(INTENT_SUFFIX) {
+                    names.insert(name.to_string());
+                }
+            }
+            for name in names {
+                let snapshot_path = volume_dir.join(&name);
+                match Self::settle_interrupted(&snapshot_path, delete) {
+                    Ok(InterruptedSnapshot::DeleteSubvolume) => sweep.removed.push(snapshot_path),
+                    Ok(InterruptedSnapshot::Unexplained) => sweep.unexplained.push(snapshot_path),
+                    Ok(_) => {}
+                    Err(error) => sweep.errors.push(error),
+                }
+            }
+        }
+        sweep
+    }
+
+    /// Apply [`plan_interrupted_snapshot`] to the snapshot at
+    /// `snapshot_path`, returning what it decided.
+    fn settle_interrupted(
+        snapshot_path: &Path,
+        delete: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> Result<InterruptedSnapshot, SnapshotError> {
+        let subvolume = std::fs::symlink_metadata(snapshot_path).is_ok_and(|meta| meta.is_dir());
+        let meta = Self::meta_path(snapshot_path).exists();
+        let plan = plan_interrupted_snapshot(subvolume, meta, Self::intent_owner(snapshot_path));
+        match plan {
+            InterruptedSnapshot::Settled | InterruptedSnapshot::Unexplained => {}
+            InterruptedSnapshot::DropIntent => Self::remove_intent(snapshot_path)?,
+            InterruptedSnapshot::DeleteSubvolume => {
+                delete(snapshot_path).map_err(|reason| {
+                    SnapshotError::Btrfs(format!(
+                        "delete interrupted snapshot {}: {reason}",
+                        snapshot_path.display()
+                    ))
+                })?;
+                if let Some(parent) = snapshot_path.parent() {
+                    sync_directory(parent)?;
+                }
+                Self::remove_intent(snapshot_path)?;
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Every `{namespace}/{app}/{volume-slug}` directory of the snapshot
+    /// store.
+    fn snapshot_volume_dirs(&self) -> Vec<PathBuf> {
+        let subdirs = |dir: &Path| -> Vec<PathBuf> {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .collect()
+        };
+        subdirs(&self.volumes_dir.join(".snapshots"))
+            .iter()
+            .flat_map(|namespace| subdirs(namespace))
+            .flat_map(|app| subdirs(&app))
+            .collect()
     }
 
     /// Delete a snapshot and its metadata. `volume` picks between volumes
@@ -1736,6 +1981,150 @@ mod tests {
         );
     }
 
+    // -- interrupted creates (#695) ----------------------------------------
+
+    /// Plain directories stand in for subvolumes here.
+    fn remove_fake_subvolume(path: &Path) -> Result<(), String> {
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+    }
+
+    /// A snapshot directory under a fresh volumes root, and where snapshot
+    /// `name` of `/data` would live in it.
+    fn snapshot_slot(name: &str) -> (tempfile::TempDir, SnapshotManager, SnapshotMeta, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(root.path());
+        let meta = sample_meta("/data", name, 100);
+        let path = manager.snapshot_path(&meta);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        (root, manager, meta, path)
+    }
+
+    fn write_foreign_intent(path: &Path) {
+        std::fs::write(
+            SnapshotManager::intent_path(path),
+            br#"{"owner":"0000000000000000000000000000dead"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn plan_interrupted_snapshot_covers_every_case() {
+        use IntentOwner as Owner;
+        use InterruptedSnapshot::*;
+        let cases = [
+            // (subvolume, meta, intent) -> action
+            ((true, true, Owner::None), Settled),
+            ((true, false, Owner::None), Unexplained),
+            ((false, true, Owner::None), Settled),
+            ((false, false, Owner::None), Settled),
+            ((true, false, Owner::ThisProcess), Settled),
+            ((false, false, Owner::ThisProcess), Settled),
+            ((true, true, Owner::ThisProcess), Settled),
+            ((true, false, Owner::Abandoned), DeleteSubvolume),
+            ((true, true, Owner::Abandoned), DropIntent),
+            ((false, false, Owner::Abandoned), DropIntent),
+            ((false, true, Owner::Abandoned), DropIntent),
+        ];
+        for ((subvolume, meta, intent), expected) in cases {
+            assert_eq!(
+                plan_interrupted_snapshot(subvolume, meta, intent),
+                expected,
+                "subvolume={subvolume} meta={meta} intent={intent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_writes_an_intent_before_the_subvolume() {
+        let (_root, manager, meta, path) = snapshot_slot("1700000000");
+        let live = Path::new("/live");
+        let created = manager
+            .create_at(live, &path, meta.clone(), |_, dest| {
+                // The intent is durable, and names this process, before the
+                // subvolume exists.
+                assert_eq!(
+                    SnapshotManager::intent_owner(dest),
+                    IntentOwner::ThisProcess
+                );
+                assert!(!dest.exists());
+                std::fs::create_dir(dest).map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(created.name, meta.name);
+        assert!(SnapshotManager::meta_path(&path).exists());
+        assert!(!SnapshotManager::intent_path(&path).exists());
+        assert_eq!(manager.list("a", "web").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_create_hands_its_subvolume_to_the_sweep() {
+        let (_root, manager, meta, path) = snapshot_slot("1700000000");
+        let error = manager
+            .create_at(Path::new("/live"), &path, meta, |_, dest| {
+                std::fs::create_dir(dest).unwrap();
+                Err("disk full".to_string())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("disk full"), "{error}");
+        // A real subvolume would be gone already; a fake one can't be
+        // deleted by btrfs, so the intent now says nobody owns it.
+        assert_eq!(SnapshotManager::intent_owner(&path), IntentOwner::Abandoned);
+        let sweep = manager.sweep_interrupted_with(&remove_fake_subvolume);
+        assert_eq!(sweep.removed, vec![path.clone()]);
+        assert!(!path.exists());
+        assert!(!SnapshotManager::intent_path(&path).exists());
+    }
+
+    #[test]
+    fn sweep_removes_a_subvolume_with_an_intent_and_no_meta() {
+        let (_root, manager, _meta, path) = snapshot_slot("1700000000");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("data"), b"half a snapshot").unwrap();
+        write_foreign_intent(&path);
+
+        let sweep = manager.sweep_interrupted_with(&remove_fake_subvolume);
+        assert_eq!(sweep.removed, vec![path.clone()]);
+        assert!(sweep.unexplained.is_empty() && sweep.errors.is_empty());
+        assert!(!path.exists());
+        assert!(!SnapshotManager::intent_path(&path).exists());
+    }
+
+    #[test]
+    fn sweep_reports_an_unexplained_metadata_less_subvolume() {
+        let (_root, manager, _meta, path) = snapshot_slot("1700000000");
+        std::fs::create_dir(&path).unwrap();
+
+        let sweep = manager.sweep_interrupted_with(&remove_fake_subvolume);
+        assert_eq!(sweep.unexplained, vec![path.clone()]);
+        assert!(sweep.removed.is_empty());
+        assert!(path.exists(), "an unexplained subvolume is never deleted");
+    }
+
+    #[test]
+    fn sweep_leaves_finished_and_in_flight_snapshots_alone() {
+        let (_root, manager, meta, path) = snapshot_slot("1700000000");
+        std::fs::create_dir(&path).unwrap();
+        manager.write_meta(&path, &meta).unwrap();
+        let in_flight = path.with_file_name("1700000001");
+        std::fs::create_dir(&in_flight).unwrap();
+        SnapshotManager::write_intent(&in_flight, Some(process_token())).unwrap();
+
+        let sweep = manager.sweep_interrupted_with(&remove_fake_subvolume);
+        assert!(sweep.removed.is_empty(), "{sweep:?}");
+        assert!(sweep.unexplained.is_empty(), "{sweep:?}");
+        assert!(path.exists() && in_flight.exists());
+        assert!(SnapshotManager::intent_path(&in_flight).exists());
+    }
+
+    #[test]
+    fn sweep_drops_an_intent_whose_snapshot_never_started() {
+        let (_root, manager, _meta, path) = snapshot_slot("1700000000");
+        write_foreign_intent(&path);
+        let sweep = manager.sweep_interrupted_with(&remove_fake_subvolume);
+        assert!(sweep.removed.is_empty() && sweep.errors.is_empty());
+        assert!(!SnapshotManager::intent_path(&path).exists());
+    }
+
     // -- Btrfs integration (Linux, root, RELIABURGER_BTRFS_TESTS=1) ------
 
     #[cfg(target_os = "linux")]
@@ -1980,6 +2369,61 @@ mod tests {
             owner.restore("default", &app, &meta.name, None).unwrap();
             assert_eq!(std::fs::read(live.join("state")).unwrap(), b"v1");
         }
+    }
+
+    /// #695 on real Btrfs: a power cut between `btrfs subvolume snapshot`
+    /// and the metadata write leaves a read-only subvolume and its intent.
+    /// The next start's sweep deletes it; a metadata-less subvolume with no
+    /// intent is reported and kept; and snapshots work as before afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
+    fn interrupted_snapshot_is_cleaned_up_on_restart() {
+        let fs = ScratchBtrfs::new();
+        let volumes = crate::grill::volume::VolumeManager::new(&fs.mount);
+        let live = volumes
+            .create_managed_volume("default", "db", Path::new("/data"), None)
+            .unwrap();
+        std::fs::write(live.join("state"), b"v1").unwrap();
+
+        // The dead process's create: intent, then the subvolume, then the cut.
+        let dying = SnapshotManager::new(&fs.mount);
+        let mut meta = dying
+            .create("default", "db", "/data", Some("kept"), SystemTime::now())
+            .unwrap();
+        meta.name = "interrupted".to_string();
+        let interrupted = dying.snapshot_path(&meta);
+        std::fs::write(
+            SnapshotManager::intent_path(&interrupted),
+            br#"{"owner":"0000000000000000000000000000dead"}"#,
+        )
+        .unwrap();
+        btrfs::run_btrfs(&snapshot_create_args(&live, &interrupted, true)).unwrap();
+        meta.name = "by-hand".to_string();
+        let by_hand = dying.snapshot_path(&meta);
+        btrfs::run_btrfs(&snapshot_create_args(&live, &by_hand, true)).unwrap();
+
+        // The restarted node.
+        let sweep = SnapshotManager::new(&fs.mount).sweep_interrupted();
+        assert!(sweep.errors.is_empty(), "{:?}", sweep.errors);
+        assert_eq!(sweep.removed, vec![interrupted.clone()]);
+        assert_eq!(sweep.unexplained, vec![by_hand.clone()]);
+        assert!(!interrupted.exists());
+        assert!(!SnapshotManager::intent_path(&interrupted).exists());
+        assert!(by_hand.exists());
+
+        let snapshots = SnapshotManager::new(&fs.mount);
+        let names: Vec<String> = snapshots
+            .list("default", "db")
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.name)
+            .collect();
+        assert_eq!(names, vec!["kept".to_string()]);
+        let fresh = snapshots
+            .create("default", "db", "/data", Some("fresh"), SystemTime::now())
+            .unwrap();
+        assert!(!SnapshotManager::intent_path(&snapshots.snapshot_path(&fresh)).exists());
     }
 
     /// Restore swaps in a new subvolume; it must carry the original's qgroup

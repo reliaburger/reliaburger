@@ -404,7 +404,23 @@ retain = 24                         # default
 ```
 
 The leader writes one every `interval_secs`, encrypted with a key derived from
-the cluster's master key. Volumes aren't in it; snapshot those separately (see
+the cluster's master key. Each object is named after the state inside it: its
+recovery epoch, Raft term and last applied log index, then the leader's clock
+and the recovery id. Restores and retention go by that position, not by the
+time. A former leader whose clock ran fast can't push correct backups out of
+retention or win a restore with stale state, and the clock only breaks ties.
+The leader confirms it's still the leader before each export, so a deposed
+one skips it. Backups written by 0.2.0 or earlier are named by time alone;
+they're left alone and never restored.
+
+For `s3://` and `gs://`, Bun reads the standard variables of each backend:
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+`AWS_REGION` (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT` for S3 and
+S3-compatible stores; `GOOGLE_SERVICE_ACCOUNT` (or `SERVICE_ACCOUNT`) and
+`GOOGLE_APPLICATION_CREDENTIALS` for GCS. Set them in Bun's environment, and in
+the shell you run `relish council recover` from. With none set, S3 falls back
+to the instance's metadata credentials. Volume-snapshot upload and log and
+metrics export read the same variables. Volumes aren't in it; snapshot those separately (see
 `images-and-volumes`). Nor is the root CA's private key, which never enters the
 council: back that up yourself with `relish ca backup`, sealed to a passphrase
 or your own age key, and check it with `relish ca verify` (see `security`).
@@ -415,6 +431,24 @@ If every voter is gone, stop a surviving node and recover it:
 relish council recover --data-dir /var/lib/reliaburger/data \
   --from s3://backups/prod-council --master-key /etc/reliaburger/master.key
 ```
+
+With `--from`, it restores the newest backup that it can download, unseal
+and parse, and whose state sits where its name says. A backup that fails any
+of those (a torn upload, one sealed under another master key) is skipped with
+a line saying why, and the next older one is tried. Recovery fails only when
+none is usable, listing every backup and its reason. To see what's there, or to
+pick one yourself:
+
+```sh
+relish council backups --from s3://backups/prod-council
+relish council recover --data-dir /var/lib/reliaburger/data \
+  --from s3://backups/prod-council \
+  --backup council-e00000000000000000001-t00000000000000000004-…backup
+```
+
+`council backups` lists newest first, in the order recover tries them, and
+needs no master key. `--backup` restores exactly that object, and fails rather
+than falling back if it's unusable.
 
 Without `--from`, it rebuilds the state from the node's own Raft directory:
 its snapshot, if it has taken one, plus every committed log entry after it.
