@@ -152,18 +152,24 @@ impl DisseminationQueue {
 
     fn push(&mut self, update: MembershipUpdate, cluster_size: usize, refutation: bool) {
         let update_rank = rank(&update);
-        let entries = self
-            .newest
-            .entry(update.node_id.clone())
-            .or_insert(NodeEntries {
-                best: update_rank,
-                queued: 0,
-            });
-        if entries.best > update_rank {
-            return;
+        // Look up before inserting, so the common case (a node we already
+        // track) doesn't clone its id.
+        match self.newest.get_mut(&update.node_id) {
+            Some(entries) if entries.best > update_rank => return,
+            Some(entries) => {
+                entries.best = update_rank;
+                entries.queued += 1;
+            }
+            None => {
+                self.newest.insert(
+                    update.node_id.clone(),
+                    NodeEntries {
+                        best: update_rank,
+                        queued: 1,
+                    },
+                );
+            }
         }
-        entries.best = update_rank;
-        entries.queued += 1;
         let broadcasts = broadcast_count(cluster_size);
         self.queue.push(QueuedUpdate {
             update,

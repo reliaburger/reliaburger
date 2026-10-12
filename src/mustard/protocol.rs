@@ -445,8 +445,12 @@ impl<T: MustardTransport> MustardNode<T> {
     /// retransmissions have run out, so it can refute it.
     fn probe_message(&mut self, payload: GossipPayload, peer: Option<&NodeId>) -> GossipMessage {
         let mut message = GossipMessage::new(self.node_id.clone(), self.incarnation, payload);
-        if let Some(extension) = self.local_extension()
-            && !message.attach_extension(extension)
+        let mut room = match self.local_extension() {
+            Some(extension) => message.attach_extension(extension),
+            None => message.piggyback_room(),
+        };
+        if self.advertised.is_some()
+            && message.extension.is_none()
             && !self.oversize_extension_logged
         {
             self.oversize_extension_logged = true;
@@ -456,6 +460,7 @@ impl<T: MustardTransport> MustardNode<T> {
             );
         }
 
+        // Our claim about the peer, if it fits, then whatever else fits.
         let claim = peer
             .and_then(|peer| self.membership.get(peer))
             .filter(|member| member.state != NodeState::Alive)
@@ -464,11 +469,11 @@ impl<T: MustardTransport> MustardNode<T> {
                 address: member.address,
                 state: member.state,
                 incarnation: member.incarnation,
-            });
-        let mut room = message.piggyback_room();
+            })
+            .filter(|claim| claim.encoded_len() <= room);
         let mut slots = MAX_PIGGYBACK_UPDATES;
         if let Some(claim) = &claim {
-            room = room.saturating_sub(claim.encoded_len());
+            room -= claim.encoded_len();
             slots -= 1;
         }
         let mut updates = self.dissemination.select_updates_within(room, slots);
@@ -476,7 +481,7 @@ impl<T: MustardTransport> MustardNode<T> {
             updates.retain(|update| update.node_id != claim.node_id);
             updates.insert(0, claim);
         }
-        message.piggyback(updates);
+        *message.payload.updates_mut() = updates;
         message
     }
 
@@ -495,9 +500,13 @@ impl<T: MustardTransport> MustardNode<T> {
     /// its sequence if so. A replayed or duplicated datagram carries a
     /// sequence at or below the last one we accepted from that sender.
     fn admit_sequence(&mut self, message: &GossipMessage) -> bool {
-        match self.sequences.get(&message.sender) {
-            Some(&last) if message.sequence <= last => false,
-            _ => {
+        match self.sequences.get_mut(&message.sender) {
+            Some(last) if message.sequence <= *last => false,
+            Some(last) => {
+                *last = message.sequence;
+                true
+            }
+            None => {
                 self.sequences
                     .insert(message.sender.clone(), message.sequence);
                 true

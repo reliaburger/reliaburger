@@ -495,17 +495,18 @@ The fix is to choose updates by bytes, not by count. A probe is now built in ord
 
 ```rust
 let mut message = GossipMessage::new(self.node_id.clone(), self.incarnation, payload);
-if let Some(extension) = self.local_extension() {
-    message.attach_extension(extension); // left off if it alone can't fit
-}
-let room = message.piggyback_room();     // 1,400 minus what's encoded so far
+let room = match self.local_extension() {
+    // Left off if it alone can't fit; returns the bytes still free.
+    Some(extension) => message.attach_extension(extension),
+    None => message.piggyback_room(), // 1,400 minus what's encoded so far
+};
 let updates = self.dissemination.select_updates_within(room, MAX_PIGGYBACK_UPDATES);
-message.piggyback(updates);
+*message.payload.updates_mut() = updates;
 ```
 
-`piggyback_room` measures the message with `bincode::serialized_size` rather than adding up constants, so when a later release adds a field to the header or the extension, the budget shrinks by itself. An update that doesn't fit stays queued with its broadcast count untouched; selection stops there rather than skipping ahead, so priority order holds across messages. In the very worst case a PING still carries one update and a PING-REQ may carry none. That's fine: anti-entropy sends no extension and makes up the difference. And a send that does fail is now counted and logged, at most once every ten seconds with a count of what it held back, so a node that can't get its datagrams out says so.
+(The real `probe_message` also puts our claim about the peer first, as we'll see in "Coming back after maintenance".) `piggyback_room` measures the message with `bincode::serialized_size` rather than adding up constants, so when a later release adds a field to the header or the extension, the budget shrinks by itself. An update that doesn't fit stays queued with its broadcast count untouched; selection stops there rather than skipping ahead, so priority order holds across messages. In the very worst case a PING still carries one update and a PING-REQ may carry none. That's fine: anti-entropy sends no extension and makes up the difference. And a send that does fail is now counted and logged, at most once every ten seconds with a count of what it held back, so a node that can't get its datagrams out says so.
 
-**Replays.** Gossip has been HMAC-signed since Phase 4, and we've already seen (in "Coming back after maintenance") that authentication stops forgery but not replay. That fix covered a replayed `Left`. The audit found two more: `add_node` moved a known member to the UDP source address of *any* validly signed datagram from it, and directory fields were last-write-wins. So an attacker on the LAN could capture one of n2's PINGs and replay it from its own IP: everyone records n2 at the attacker's address, probes go there, and n2 is declared dead. Replay an old extension instead and n2's recovery epoch rolls back.
+**Replays.** Gossip has been HMAC-signed since Phase 4, but authentication stops forgery, not replay. "Coming back after maintenance" below deals with one replay, a stale `Left`. The audit found two more: `add_node` moved a known member to the UDP source address of *any* validly signed datagram from it, and directory fields were last-write-wins. So an attacker on the LAN could capture one of n2's PINGs and replay it from its own IP: everyone records n2 at the attacker's address, probes go there, and n2 is declared dead. Replay an old extension instead and n2's recovery epoch rolls back.
 
 The fix is a sequence number inside the HMAC. Every `GossipMessage::new` takes the next value of a process-wide counter, every receiver remembers the highest sequence it has accepted from each sender, and anything at or below that is dropped before a single field is applied:
 

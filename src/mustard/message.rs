@@ -159,35 +159,22 @@ impl GossipMessage {
         MAX_DATAGRAM_BYTES.saturating_sub(self.encoded_len())
     }
 
-    /// Attach `extension` if the datagram still fits with it. Returns
-    /// whether it was attached. Membership matters more than directory
-    /// data, so a message that can't carry both goes without the extension.
-    pub fn attach_extension(&mut self, extension: DirectoryExtension) -> bool {
-        self.extension = Some(extension);
-        if self.encoded_len() <= MAX_DATAGRAM_BYTES {
-            return true;
-        }
+    /// Attach `extension`, replacing any other, if the datagram still fits
+    /// with it. Returns the bytes then left for piggybacked updates, and
+    /// leaves the message without an extension if it didn't fit: membership
+    /// matters more than directory data.
+    pub fn attach_extension(&mut self, extension: DirectoryExtension) -> usize {
         self.extension = None;
-        false
-    }
-
-    /// Add as many of `updates` as fit in the datagram, in order, up to
-    /// [`MAX_PIGGYBACK_UPDATES`] in all. Stops at the first that doesn't
-    /// fit. Returns how many were added.
-    pub fn piggyback(&mut self, updates: impl IntoIterator<Item = MembershipUpdate>) -> usize {
-        let mut room = self.piggyback_room();
-        let mut added = 0;
-        let slots = self.payload.updates_mut();
-        for update in updates {
-            let cost = update.encoded_len();
-            if slots.len() >= MAX_PIGGYBACK_UPDATES || cost > room {
-                break;
-            }
-            room -= cost;
-            slots.push(update);
-            added += 1;
+        let room = self.piggyback_room();
+        let cost = bincode::serialized_size(&extension)
+            .ok()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(usize::MAX);
+        if cost > room {
+            return room;
         }
-        added
+        self.extension = Some(extension);
+        room - cost
     }
 }
 
@@ -782,17 +769,29 @@ mod tests {
         }
     }
 
-    /// Stamp the worst-case extension on `payload`, fill the piggyback list
-    /// from an endless supply of worst-case updates, and check the signed
-    /// datagram fits. Returns how many updates it carried.
+    /// Stamp the worst-case extension on `payload`, fill the room it leaves
+    /// with worst-case updates, and check the signed datagram fits and that
+    /// the room the message reported was exact. Returns how many updates it
+    /// carried.
     fn fill_worst_case(payload: GossipPayload) -> usize {
         let mut message = GossipMessage::new(longest_name(1), u64::MAX, payload);
         message.sequence = u64::MAX;
+        let mut room = message.attach_extension(worst_case_extension());
         assert!(
-            message.attach_extension(worst_case_extension()),
+            message.extension.is_some(),
             "the worst-case extension must fit beside a worst-case header"
         );
-        let carried = message.piggyback((10..).map(worst_case_update));
+        assert_eq!(room, message.piggyback_room());
+        let mut carried = 0;
+        for update in (10..).map(worst_case_update) {
+            let cost = update.encoded_len();
+            if carried == MAX_PIGGYBACK_UPDATES || cost > room {
+                break;
+            }
+            room -= cost;
+            message.payload.updates_mut().push(update);
+            carried += 1;
+        }
 
         let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
         let mut signed = message.signed(&key).unwrap();
@@ -806,6 +805,7 @@ mod tests {
             datagram.len()
         );
         assert_eq!(datagram.len(), signed.encoded_len());
+        assert_eq!(datagram.len(), MAX_DATAGRAM_BYTES - room);
         carried
     }
 
@@ -832,28 +832,13 @@ mod tests {
     }
 
     #[test]
-    fn piggyback_stops_at_the_byte_budget() {
-        let mut message = GossipMessage::new(
-            NodeId::new("sender"),
-            1,
-            GossipPayload::Ping { updates: vec![] },
-        );
-        message.attach_extension(worst_case_extension());
-        let room = message.piggyback_room();
-        let cost = worst_case_update(10).encoded_len();
-        let carried = message.piggyback((10..).map(worst_case_update));
-        assert_eq!(carried, (room / cost).min(MAX_PIGGYBACK_UPDATES));
-        assert!(message.encoded_len() <= MAX_DATAGRAM_BYTES);
-    }
-
-    #[test]
     fn an_extension_that_cannot_fit_is_left_off() {
         let mut message = GossipMessage::new(
             NodeId::new("x".repeat(MAX_DATAGRAM_BYTES)),
             1,
             GossipPayload::Ping { updates: vec![] },
         );
-        assert!(!message.attach_extension(worst_case_extension()));
+        assert_eq!(message.attach_extension(worst_case_extension()), 0);
         assert!(message.extension.is_none());
     }
 
