@@ -1862,10 +1862,23 @@ async fn manifest_head(state: &PickleState, name: &str, reference: &str) -> Resp
 }
 
 /// Detect the correct content-type for a manifest blob.
+///
+/// A manifest that names its own `mediaType` is served as that type: docker
+/// refuses a Docker schema 2 manifest labelled as OCI. One that doesn't is
+/// an OCI index if it lists manifests, else an OCI image manifest.
 fn detect_manifest_content_type(data: &[u8]) -> &'static str {
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(data)
-        && json.get("manifests").is_some()
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return "application/vnd.oci.image.manifest.v1+json";
+    };
+    let declared = json.get("mediaType").and_then(|value| value.as_str());
+    if let Some(known) = MANIFEST_MEDIA_TYPES
+        .iter()
+        .chain(INDEX_MEDIA_TYPES.iter())
+        .find(|known| Some(**known) == declared)
     {
+        return known;
+    }
+    if json.get("manifests").is_some() {
         return "application/vnd.oci.image.index.v1+json";
     }
     "application/vnd.oci.image.manifest.v1+json"
@@ -4996,6 +5009,66 @@ mod tests {
         assert!(resp.headers().contains_key("location"));
 
         digest
+    }
+
+    #[tokio::test]
+    async fn a_docker_schema_2_manifest_is_served_as_its_own_media_type() {
+        // docker 28 pushes Docker schema 2 manifests, and on pull refuses
+        // one whose content type disagrees with its `mediaType` field.
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        let config = b"docker config";
+        let layer = b"docker layer";
+        let config_digest = push_blob(&app, "myapp", config).await;
+        let layer_digest = push_blob(&app, "myapp", layer).await;
+        let docker_manifest = "application/vnd.docker.distribution.manifest.v2+json";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": docker_manifest,
+            "config": {
+                "digest": config_digest.as_str(),
+                "size": config.len(),
+                "mediaType": "application/vnd.docker.container.image.v1+json"
+            },
+            "layers": [{
+                "digest": layer_digest.as_str(),
+                "size": layer.len(),
+                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip"
+            }]
+        });
+        let put = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/v2/myapp/manifests/v1")
+                    .header("content-type", docker_manifest)
+                    .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        for method in ["GET", "HEAD"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/v2/myapp/manifests/v1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            assert_eq!(
+                response.headers()["content-type"],
+                docker_manifest,
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -61,6 +61,9 @@ Pickle does not implement the Docker token service (`WWW-Authenticate: Bearer re
 every client above speaks Basic, and a token service would add a second credential type
 with nothing to gain over the API token it would be exchanged for. Every `/v2/` response
 also carries `Docker-Distribution-API-Version: registry/2.0`, as the distribution spec asks.
+A manifest is served with the `Content-Type` its own `mediaType` names (Docker schema 2 or
+OCI, image or index), because docker refuses a pull whose header and body disagree; one
+with no `mediaType` is served as an OCI index if it lists manifests, else an OCI manifest.
 
 **Tested clients.** `make test-standard-clients` (`tests/suite/registry_standard_clients.rs`,
 run by CI's acceptance job) drives docker, podman, skopeo and crane against a TLS listener
