@@ -7539,6 +7539,208 @@ async fn rolling_redeploy_rolls_back_when_the_probe_fails() {
     agent_handle.await.unwrap();
 }
 
+/// Run `first`, then `second` with the given replacements failing their
+/// health wait, on a running agent. Returns the agent once it has shut
+/// down, every event of the second deploy, and its deploy history.
+async fn deploy_over_failing_replacements(
+    first: &str,
+    second: &str,
+    failing: &[InstanceId],
+) -> (
+    TestAgent,
+    Vec<ApplyEvent>,
+    Vec<crate::meat::deploy_types::DeployHistoryEntry>,
+) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    let history = agent.deploy_history_handle();
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    expect_complete(&send_deploy(&tx, Config::parse(first).unwrap()).await);
+    for id in failing {
+        grill.set_state(id, ContainerState::Failed);
+    }
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        send_deploy(&tx, Config::parse(second).unwrap()),
+    )
+    .await
+    .expect("the aborted rollout must finish");
+    let history = history.read().await.clone();
+    shutdown.cancel();
+    (task.await.unwrap(), events, history)
+}
+
+/// The live instances of `web`, sorted, with the image each runs.
+fn web_instances(agent: &BunAgent<MockGrill>) -> Vec<(String, String)> {
+    let mut instances: Vec<(String, String)> = agent
+        .supervisor
+        .list_instances()
+        .iter()
+        .filter(|instance| instance.app_name == "web")
+        .filter(|instance| {
+            !matches!(
+                instance.state,
+                ContainerState::Stopped | ContainerState::Failed
+            )
+        })
+        .map(|instance| (instance.id.0.clone(), instance.image.clone()))
+        .collect();
+    instances.sort();
+    instances
+}
+
+/// #692 scenario A: three replicas on one node, defaults. The first
+/// replacement goes healthy and an old instance retires for it, then the
+/// second replacement fails. Auto-rollback used to kill the healthy
+/// replacement and never restart the retired old instance, leaving two of
+/// three. It must end with three replicas, all on the old spec.
+#[tokio::test]
+async fn auto_rollback_after_a_retirement_restores_old_capacity() {
+    let canary = |generation, ordinal| {
+        crate::grill::InstanceIdentity::canary("default", "web", generation, ordinal).instance_id()
+    };
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\n",
+        "[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[canary(1, 1)],
+    )
+    .await;
+
+    let message = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the failed rollout must report an error");
+    assert!(message.contains("rolled back"), "{message}");
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances.len(),
+        3,
+        "the abort must end with the capacity it started from: {instances:?}"
+    );
+    assert!(
+        instances.iter().all(|(_, image)| image == "web:v1"),
+        "every replica must run the old spec again: {instances:?}"
+    );
+    assert!(
+        instances.iter().all(|(id, _)| !id.contains("-g1-")),
+        "no replacement of the failed spec may survive a rollback: {instances:?}"
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|(id, _)| id.contains("-g2-"))
+            .count(),
+        1,
+        "the retired old instance comes back as one old-spec replacement: {instances:?}"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::RolledBack)
+    );
+    assert_eq!(
+        agent
+            .deployed_specs
+            .get(&("web".to_string(), "default".to_string()))
+            .and_then(|spec| spec.image.clone())
+            .as_deref(),
+        Some("web:v1"),
+        "a rolled-back app's deployed spec is the old one again"
+    );
+}
+
+/// #692 scenario B: a managed volume forces stop-first, so the only old
+/// instance retires before its replacement starts. When the replacement
+/// fails, the old spec must run again rather than leave nothing.
+#[tokio::test]
+async fn auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance() {
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\n[[app.web.volumes]]\npath = '/data'\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\n",
+        "[app.web]\nimage = 'web:v2'\n[[app.web.volumes]]\npath = '/data'\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id()],
+    )
+    .await;
+
+    assert!(
+        matches!(events.last(), Some(ApplyEvent::Error { .. })),
+        "{events:?}"
+    );
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances,
+        vec![(
+            crate::grill::InstanceIdentity::canary("default", "web", 2, 0)
+                .instance_id()
+                .0,
+            "web:v1".to_string()
+        )],
+        "the volume app must run its old spec again, not nothing"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::RolledBack)
+    );
+}
+
+/// When the old spec can't come back either, the abort keeps the healthy
+/// replacement serving and says so, rather than killing it.
+#[tokio::test]
+async fn abort_keeps_healthy_new_instances_when_old_capacity_cannot_return() {
+    let canary = |generation, ordinal| {
+        crate::grill::InstanceIdentity::canary("default", "web", generation, ordinal).instance_id()
+    };
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        "[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[canary(1, 1), canary(2, 0), canary(2, 1), canary(2, 2)],
+    )
+    .await;
+
+    let message = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the failed rollout must report an error");
+    assert!(message.contains("halted"), "{message}");
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances.len(),
+        3,
+        "healthy new + remaining old must survive the abort: {instances:?}"
+    );
+    assert!(
+        instances.contains(&(canary(1, 0).0, "web:v2".to_string())),
+        "the healthy replacement must keep serving: {instances:?}"
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|(_, image)| image == "web:v1")
+            .count(),
+        2,
+        "{instances:?}"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::Halted)
+    );
+}
+
 /// The gate must not break healthy deploys: with the responder answering
 /// 200, the rolling redeploy completes through the real probe path and
 /// the replacement takes over.

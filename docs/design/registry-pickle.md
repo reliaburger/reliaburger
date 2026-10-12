@@ -805,7 +805,7 @@ Pickle splits cleanup in two. **Expiry** decides that an *image* is gone and rem
 - an app or job in desired state pins it (`repo:tag@sha256:…`: app and init-container images, job definitions, task-array templates), directly or through a pinned multi-platform index;
 - it's a platform of a multi-platform index still in the catalogue.
 
-An accepted expiry removes the manifest and drops the holder records of every blob no other manifest references. That last step matters: the GC arbiter never approves deleting a blob's last advertised holder, so without it one copy of every expired blob would live forever. A standalone node applies the same rule to its own catalogue, counting the images its instances run as pinned. Persisted deploy history will also count as pinned once it's in Raft (#692).
+An accepted expiry removes the manifest and drops the holder records of every blob no other manifest references. That last step matters: the GC arbiter never approves deleting a blob's last advertised holder, so without it one copy of every expired blob would live forever. A standalone node applies the same rule to its own catalogue, counting the images its instances run as pinned. On a cluster the rollback targets in each app's rollout record (the last ten specs that rolled out everywhere, #692) count as pinned too, so `relish rollback` can always pull them.
 
 **GC (per node, two-phase).**
 

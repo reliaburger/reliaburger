@@ -75,6 +75,7 @@ fn router_for_council(
                 timestamp: SystemTime::UNIX_EPOCH,
                 running_apps: vec![],
                 cached_specs: vec![],
+                rollouts: Vec::new(),
                 resource_usage: reliaburger::reporting::types::ResourceUsage {
                     cpu_total_millicores: 8000,
                     memory_total_mb: 16384,
@@ -905,6 +906,7 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             timestamp: SystemTime::UNIX_EPOCH,
             running_apps: vec![],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: reliaburger::reporting::types::ResourceUsage {
                 cpu_total_millicores: 8000,
                 memory_total_mb: 16384,

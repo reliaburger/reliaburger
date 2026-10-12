@@ -669,6 +669,10 @@ pub struct BunAgent<G: Grill> {
     /// namespace), with when that happened. State reports carry recent ones
     /// so the leader places the replicas elsewhere instead of holding them.
     capacity_refusals: std::collections::HashMap<(String, String), tokio::time::Instant>,
+    /// The app versions this node's placement reconciler last finished
+    /// deploying, as it last told the agent. State reports carry them so the
+    /// leader can release a rollout node by node (#692).
+    converged_rollouts: Vec<crate::reporting::types::RolloutReport>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; reservations advance beyond both this counter and all restored owners.
@@ -899,6 +903,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
             capture_offsets: Arc::default(),
@@ -1056,6 +1061,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
             capture_offsets: Arc::default(),

@@ -431,6 +431,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     },
                 )
                 .collect(),
+            rollouts: self.converged_rollouts.clone(),
         };
         let _ = req.response.send(snapshot);
     }
