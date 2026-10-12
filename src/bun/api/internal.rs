@@ -363,6 +363,101 @@ pub(super) async fn producer_retirement_handler(
     }
 }
 
+/// The apps `desired` places on `node`, each with the spec the node should
+/// run. A spec change reaches nodes one at a time (#692): until the rollout
+/// reaches this node, it's held on the app's last fully rolled-out spec.
+/// Without reports to read progress from, nothing is held.
+fn node_assignments(
+    desired: &crate::council::types::DesiredState,
+    reports: Option<&crate::reporting::aggregator::AggregatedState>,
+    node: &crate::meat::NodeId,
+) -> Vec<crate::cluster::orchestrate::NodeAssignment> {
+    let mut apps = Vec::new();
+    for (app_id, placements) in &desired.scheduling {
+        let mut ordinals: Vec<u32> = placements
+            .iter()
+            .filter(|p| &p.node_id == node)
+            .map(|p| p.ordinal)
+            .collect();
+        if ordinals.is_empty() {
+            continue;
+        }
+        ordinals.sort_unstable();
+        let Some(spec) = desired.apps.get(app_id) else {
+            continue; // spec deleted; placements lag briefly
+        };
+        let release = reports.and_then(|reports| {
+            let shares = crate::cluster::rollout::app_shares(desired, reports, app_id);
+            crate::cluster::rollout::plan_release(spec, desired.rollouts.get(app_id), &shares)
+                .remove(node)
+        });
+        let (spec, held) = match release {
+            Some(crate::cluster::rollout::Release::Hold(previous)) => (previous.clone(), true),
+            _ => (spec.clone(), false),
+        };
+        apps.push(crate::cluster::orchestrate::NodeAssignment {
+            name: app_id.name.clone(),
+            namespace: app_id.namespace.clone(),
+            ordinals,
+            spec,
+            held,
+        });
+    }
+    apps
+}
+
+/// `POST /v1/rollouts/failed` — a node's placement reconciler reports that
+/// its rollout of an app failed (#692, D11-B). The leader commits
+/// `RolloutFailed`, and stops handing that spec to nodes until a different
+/// one is applied. Only the leader can answer: the report goes to it.
+pub(super) async fn rollout_failed_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(report): Json<crate::cluster::rollout::RolloutFailureReport>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not running in cluster mode",
+        )
+            .into_response();
+    };
+    if !confirmed_lease_leader(council).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rollout failures go to the current leader",
+        )
+            .into_response();
+    }
+    let request = crate::council::RaftRequest::RolloutFailed {
+        app_id: crate::meat::AppId::new(&report.app_name, &report.namespace),
+        failure: crate::meat::deploy_types::RolloutFailure {
+            fingerprint: report.fingerprint,
+            node: report.node,
+            reason: report.reason,
+            at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default(),
+        },
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), council.write(request)).await {
+        Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error)) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "rollout failure outcome unknown; the node reports it again",
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/placements/{node_id}` — the apps (and per-node replica
 /// counts) the leader has assigned to a node. Served from the Raft
 /// state machine; reconcilers poll this every couple of seconds.
@@ -490,27 +585,15 @@ pub(super) async fn placements_handler(
     }
     let node = crate::meat::NodeId::new(&node_id);
 
-    let mut apps = Vec::new();
-    for (app_id, placements) in &desired.scheduling {
-        let mut ordinals: Vec<u32> = placements
-            .iter()
-            .filter(|p| p.node_id == node)
-            .map(|p| p.ordinal)
-            .collect();
-        if ordinals.is_empty() {
-            continue;
-        }
-        ordinals.sort_unstable();
-        let Some(spec) = desired.apps.get(app_id) else {
-            continue; // spec deleted; placements lag briefly
-        };
-        apps.push(crate::cluster::orchestrate::NodeAssignment {
-            name: app_id.name.clone(),
-            namespace: app_id.namespace.clone(),
-            ordinals,
-            spec: spec.clone(),
-        });
-    }
+    let apps = node_assignments(
+        &desired,
+        state
+            .aggregated_rx
+            .as_ref()
+            .map(|reports| reports.borrow())
+            .as_deref(),
+        &node,
+    );
 
     Json(crate::cluster::orchestrate::NodeAssignments {
         apps,

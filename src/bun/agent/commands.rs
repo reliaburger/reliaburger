@@ -108,6 +108,12 @@ pub enum AgentCommand {
         spec: Box<AppSpec>,
         response: oneshot::Sender<bool>,
     },
+    /// The placement reconciler's record of the app versions it last
+    /// finished deploying here, for the state report (#692). Replaces the
+    /// previous record.
+    RecordConvergedRollouts {
+        rollouts: Vec<crate::reporting::types::RolloutReport>,
+    },
     /// Get the local desired application specs for standalone diagnostics.
     DesiredApps {
         response: oneshot::Sender<Vec<crate::bun::diagnostics::DesiredAppEvidence>>,
@@ -372,6 +378,7 @@ impl AgentCommand {
             AgentCommand::RetireTestResources { .. } => "retire_test_resources",
             AgentCommand::Status { .. } => "status",
             AgentCommand::AdoptedPlacementMatches { .. } => "adopted_placement_matches",
+            AgentCommand::RecordConvergedRollouts { .. } => "record_converged_rollouts",
             AgentCommand::DesiredApps { .. } => "desired_apps",
             AgentCommand::ScrapeTargets { .. } => "scrape_targets",
             AgentCommand::CurrentResources { .. } => "current_resources",
@@ -544,6 +551,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 let _ = response.send(self.adopted_instances_match(&app_name, &namespace, &spec));
             }
+            AgentCommand::RecordConvergedRollouts { rollouts } => {
+                self.converged_rollouts = rollouts;
+            }
             AgentCommand::DesiredApps { response } => {
                 let mut apps = self
                     .deployed_specs
@@ -570,6 +580,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             service_port: spec.port,
                             blocked: None,
                             volume_home_away: None,
+                            rollout_failed: None,
                             volume_homes: Vec::new(),
                         },
                     )

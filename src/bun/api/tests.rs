@@ -55,6 +55,7 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         service_port: Some(8080),
         blocked: None,
         volume_home_away: None,
+        rollout_failed: None,
         volume_homes: Vec::new(),
     };
 
@@ -6489,6 +6490,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
             volume_homes: Vec::new(),
         },
         crate::bun::diagnostics::DesiredAppEvidence {
@@ -6500,6 +6502,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
             volume_homes: Vec::new(),
         },
     ];

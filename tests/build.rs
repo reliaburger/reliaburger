@@ -83,6 +83,7 @@ impl Harness {
                         timestamp: std::time::SystemTime::UNIX_EPOCH,
                         running_apps: vec![],
                         cached_specs: vec![],
+                        rollouts: Vec::new(),
                         resource_usage: Default::default(),
                         event_log: vec![],
                         has_buildah: true,

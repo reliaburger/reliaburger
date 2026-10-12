@@ -240,6 +240,80 @@ pub fn plan_rolling_step(
     }
 }
 
+/// The identity of an app spec as a rollout sees it: a hex SHA-256 of the
+/// spec with its replica count and ordinals set aside.
+///
+/// The leader holds an app's whole spec and each node runs its share of it,
+/// under its own count and ordinals, so those two fields differ between the
+/// two views of the same version. Everything else (image, command, env,
+/// health check, `[deploy]` table) is the version. A scale change keeps the
+/// fingerprint, so it never waits for a rollout.
+pub fn rollout_fingerprint(spec: &crate::config::app::AppSpec) -> String {
+    use sha2::Digest;
+    let mut version = spec.clone();
+    version.replicas = crate::config::Replicas::default();
+    version.ordinals = None;
+    // Serialising a spec can't fail: every field is plain data. An empty
+    // string would still be a stable (if useless) fingerprint.
+    let bytes = serde_json::to_vec(&version).unwrap_or_default();
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// How many distinct fully rolled-out specs the council keeps per app as
+/// `relish rollback` targets.
+pub const ROLLBACK_TARGETS_PER_APP: usize = 10;
+
+/// One app's rollout record in the council (#692): the specs it can roll
+/// back to, and the spec whose rollout failed, if any.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AppRollouts {
+    /// The last [`ROLLBACK_TARGETS_PER_APP`] distinct specs that finished
+    /// rolling out healthy on every node, oldest first. The newest is the
+    /// spec the leader keeps handing to nodes a rollout hasn't reached yet.
+    pub released: Vec<crate::config::app::AppSpec>,
+    /// The spec whose rollout failed on a node. Nodes aren't handed it until
+    /// the operator applies a different spec.
+    pub failed: Option<RolloutFailure>,
+}
+
+impl AppRollouts {
+    /// The newest fully rolled-out spec, if any.
+    pub fn last_released(&self) -> Option<&crate::config::app::AppSpec> {
+        self.released.last()
+    }
+
+    /// Record `spec` as fully rolled out: it becomes the newest target, and
+    /// an older entry of the same version moves up rather than repeating.
+    pub fn release(&mut self, spec: &crate::config::app::AppSpec) {
+        let fingerprint = rollout_fingerprint(spec);
+        self.released
+            .retain(|released| rollout_fingerprint(released) != fingerprint);
+        self.released.push(spec.clone());
+        let excess = self.released.len().saturating_sub(ROLLBACK_TARGETS_PER_APP);
+        self.released.drain(..excess);
+    }
+
+    /// Whether the rollout of the spec with this fingerprint failed.
+    pub fn failed_for(&self, fingerprint: &str) -> Option<&RolloutFailure> {
+        self.failed
+            .as_ref()
+            .filter(|failure| failure.fingerprint == fingerprint)
+    }
+}
+
+/// A rollout a node aborted, as the leader commits it (`RolloutFailed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutFailure {
+    /// [`rollout_fingerprint`] of the spec that failed.
+    pub fingerprint: String,
+    /// The node whose rollout failed.
+    pub node: String,
+    /// What the node said went wrong.
+    pub reason: String,
+    /// When the leader committed it, in milliseconds since the Unix epoch.
+    pub at_unix_ms: u64,
+}
+
 /// Deploy strategy, from `[app.NAME.deploy] strategy` (`"rolling"` or `"blue-green"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

@@ -77,7 +77,10 @@ kernel backend withdrawal, mount and network teardown, and removal of identity
 and adoption records. If any step fails, Bun reports the error and keeps
 ownership, so the cleanup can be retried; it never reports Stopped for a
 workload it can't prove has stopped. Rolling and blue-green deployments keep
-both generations when the old one's exit is uncertain. A failed final kernel
+both generations when the old one's exit is uncertain, and a rollout that fails
+never ends with fewer replicas than it started with. In a cluster a spec change
+reaches one node at a time, and a spec whose rollout fails is marked
+`RolloutFailed` instead of being retried. A failed final kernel
 backend publication is a deployment error, and the running workload stays owned.
 
 Each runtime confirmation step (accepting a stop request, accepting a
@@ -1164,7 +1167,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/capabilities` | Authenticated live DNS, egress and node-readiness evidence |
 | `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
 | `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
-| `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics. A node that isn't the leader forwards the read to the leader, and answers `503` when no leader answers |
+| `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas, service exposure and any `RolloutFailed` mark used by diagnostics. A node that isn't the leader forwards the read to the leader, and answers `503` when no leader answers |
 | `POST` | `/v1/path` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as unscoped Admin) |
@@ -1172,11 +1175,12 @@ The bun agent exposes a local HTTP API on port 9117:
 | `DELETE` | `/v1/test/leases/{id}` | Start cleanup; 202 while owners remain, 204 after confirmed retirement |
 | `POST` | `/v1/nodes/decommission` | Unscoped Admin attestation; permanently retire a stopped/fenced identity and resolve its cluster lease duties |
 | `POST` | `/v1/test/leases/retired` | Internal system-only acknowledgement of an exact lease/application/node retirement |
+| `POST` | `/v1/rollouts/failed` | Internal system-only report, to the leader, that a node's rollout of an app failed; the leader marks the spec `RolloutFailed` |
 | `POST` | `/v1/deploys/operations/{id}/cancel` | Request node-local cooperative deploy cancellation (Deployer, all target scopes) |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
 | `GET` | `/v1/deploys/active` | Live accepted deploy operations, phases and current targets |
 | `GET` | `/v1/deploys/operations` | Live operations plus the newest 50 terminal outcomes |
-| `GET` | `/v1/deploys/history/{app}` | Per-app version/spec history used by rollback |
+| `GET` | `/v1/deploys/history/{app}` | Per-app version/spec history from every node, the newest 50 per node |
 | `GET` | `/v1/status` | List all instances |
 | `GET` | `/v1/status/{app}/{namespace}` | Status for a specific app |
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app. In a cluster it answers `202 Accepted` with `{"status":"stopping"}` once the council records the stop; poll `/v1/status` for the instances to go. A standalone node answers `200` with `stopped` after the local stop completes |

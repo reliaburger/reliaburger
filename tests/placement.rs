@@ -3486,3 +3486,350 @@ async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
     }
     shutdown.cancel();
 }
+
+/// The council's rollout record for `web` (#692).
+async fn web_rollouts(node: &Node) -> Option<reliaburger::meat::deploy_types::AppRollouts> {
+    node.handle
+        .council
+        .as_ref()?
+        .desired_state()
+        .await
+        .rollouts
+        .get(&reliaburger::meat::AppId::new("web", "default"))
+        .cloned()
+}
+
+/// Wait until the council records `count` specs of `web` that rolled out on
+/// every node.
+async fn wait_for_released_web(node: &Node, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let released = web_rollouts(node)
+            .await
+            .map_or(0, |rollouts| rollouts.released.len());
+        if released >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the council never recorded {count} rolled-out spec(s) of web, only {released}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Apply `toml` through `node` until the council holds its `web` spec.
+async fn apply_web(node: &Node, toml: &str) {
+    let config = reliaburger::config::Config::parse(toml).unwrap();
+    let wanted = config.app.get("web").unwrap().command.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if desired_web(node).await.map(|spec| spec.command) == Some(wanted.clone()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the council never took the new web spec"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(15), node.client.apply(&config)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Running `web` instances on each node, and the ids of those that came
+/// from a rollout (`-g{generation}-`).
+async fn web_rollout_view(nodes: &[&Node]) -> (Vec<usize>, Vec<String>) {
+    let mut running = Vec::new();
+    let mut generated = Vec::new();
+    for node in nodes {
+        let statuses = node.client.status().await.unwrap_or_default();
+        running.push(
+            statuses
+                .iter()
+                .filter(|s| s.app_name == "web" && s.state == "running")
+                .count(),
+        );
+        generated.extend(
+            statuses
+                .iter()
+                .filter(|s| s.app_name == "web" && s.id.contains("-g"))
+                .map(|s| format!("{}/{}", node.name, s.id)),
+        );
+    }
+    (running, generated)
+}
+
+/// #692 (D10-C): one replica per node, rolling stop-first. When every node
+/// rolled its share at once, all three replicas were down together for the
+/// length of a replacement. Released one node at a time, two of the three
+/// keep serving throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy() {
+    let shutdown = CancellationToken::new();
+    let cluster = start_spread_web_cluster("rs", 24041, &shutdown).await;
+    let nodes: Vec<&Node> = cluster.iter().collect();
+    wait_for_released_web(nodes[0], 1).await;
+
+    // Stop-first on each node, and three seconds of init before the new
+    // replica runs, so a node mid-rollout serves nothing for a while.
+    apply_web(
+        nodes[0],
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sh", "-c", "while true; do echo tock from $$; sleep 0.3; done"]
+        port = 8080
+        replicas = 3
+
+        [[app.web.init]]
+        command = ["sleep", "3"]
+
+        [app.web.deploy]
+        max_surge = 0
+        max_unavailable = 1
+        drain_timeout = "0s"
+    "#,
+    )
+    .await;
+
+    let mut fewest = usize::MAX;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (running, generated) = web_rollout_view(&nodes).await;
+        fewest = fewest.min(running.iter().sum());
+        let rolled = nodes
+            .iter()
+            .filter(|node| {
+                generated
+                    .iter()
+                    .any(|id| id.starts_with(&format!("{}/", node.name)))
+            })
+            .count();
+        if rolled == 3 && running == [1, 1, 1] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the redeploy never reached every node: running {running:?}, new {generated:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        fewest >= 2,
+        "a node-by-node rollout keeps two of three replicas serving; saw {fewest}"
+    );
+    wait_for_released_web(nodes[0], 2).await;
+    shutdown.cancel();
+}
+
+/// #692 (D11-B): a version that fails its health check on the first node
+/// is marked `RolloutFailed`. No other node ever gets it, nothing retries
+/// it, every replica keeps serving the old version, and a different spec
+/// clears the mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
+    let shutdown = CancellationToken::new();
+    let cluster = start_spread_web_cluster("rf", 23041, &shutdown).await;
+    let nodes: Vec<&Node> = cluster.iter().collect();
+    wait_for_released_web(nodes[0], 1).await;
+
+    apply_web(
+        nodes[0],
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sh", "-c", "echo broken; exit 3"]
+        port = 8080
+        replicas = 3
+
+        [app.web.deploy]
+        health_timeout = "5s"
+    "#,
+    )
+    .await;
+    let bad = desired_web(nodes[0]).await.unwrap();
+
+    let mut tried: std::collections::BTreeSet<String> = Default::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let failure = loop {
+        let (_, generated) = web_rollout_view(&nodes).await;
+        tried.extend(generated);
+        if let Some(failure) = web_rollouts(nodes[0]).await.and_then(|r| r.failed) {
+            break failure;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the failed rollout was never marked RolloutFailed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        failure.fingerprint,
+        reliaburger::meat::deploy_types::rollout_fingerprint(&bad)
+    );
+
+    // Twenty seconds is four of the reconciler's first retry delays.
+    let window = tokio::time::Instant::now() + Duration::from_secs(20);
+    let before = tried.len();
+    while tokio::time::Instant::now() < window {
+        let (_, generated) = web_rollout_view(&nodes).await;
+        tried.extend(generated);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        tried.len(),
+        before,
+        "a RolloutFailed spec must not be retried: {tried:?}"
+    );
+    let tried_on: std::collections::BTreeSet<&str> = tried
+        .iter()
+        .filter_map(|id| id.split_once('/').map(|(node, _)| node))
+        .collect();
+    assert!(
+        tried_on.len() <= 1,
+        "only the first node may try a spec change before it proves healthy: {tried:?}"
+    );
+    assert_eq!(
+        running_web_instances(&nodes).await,
+        3,
+        "every replica keeps serving the old version"
+    );
+    // Status, wtf and the dashboard read it from here.
+    let desired = nodes[1].client.desired_apps().await.unwrap();
+    let web = desired.iter().find(|app| app.app == "web").unwrap();
+    assert_eq!(web.rollout_failed.as_ref(), Some(&failure));
+
+    // Re-applying the same spec, as a GitOps re-sync would, keeps the mark.
+    let same = reliaburger::config::Config::parse(&format!(
+        "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = {:?}\nport = 8080\n\
+         replicas = 3\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
+        bad.command.clone()
+    ))
+    .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&same)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        web_rollouts(nodes[0]).await.unwrap().failed.is_some(),
+        "an identical re-apply must not clear RolloutFailed"
+    );
+
+    // A fixed spec clears it and rolls out everywhere.
+    apply_web(
+        nodes[0],
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sh", "-c", "while true; do echo fixed from $$; sleep 0.3; done"]
+        port = 8080
+        replicas = 3
+    "#,
+    )
+    .await;
+    assert!(
+        web_rollouts(nodes[0]).await.unwrap().failed.is_none(),
+        "a different spec clears RolloutFailed"
+    );
+    wait_for_released_web(nodes[0], 2).await;
+    shutdown.cancel();
+}
+
+/// #692: deploy history lived only in each node's memory, so once every
+/// node had restarted (an upgrade, say) `relish rollback` had nothing to
+/// go back to and answered 404. The council now keeps the specs that
+/// rolled out everywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn rollback_works_after_every_node_restarts() {
+    let root = CancellationToken::new();
+    let ports = [("rr1", 25041_u16), ("rr2", 25045), ("rr3", 25049)];
+    let mut tokens: Vec<CancellationToken> = (0..3).map(|_| root.child_token()).collect();
+    let mut nodes: Vec<Option<Node>> = Vec::new();
+    for (index, (name, port)) in ports.iter().enumerate() {
+        let seeds = if index == 0 {
+            vec![]
+        } else {
+            vec![local(ports[0].1)]
+        };
+        nodes.push(Some(
+            labelled_node(name, *port, seeds, &tokens[index], &[], false).await,
+        ));
+    }
+    {
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        let ready = wait_until(Duration::from_secs(30), || {
+            live.iter().any(|n| *n.thinks_leader.borrow())
+        })
+        .await;
+        assert!(ready, "no leader elected");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        roll_web_out(&live, "v1").await;
+        wait_for_released_web(live[0], 1).await;
+        roll_web_out(&live, "v2").await;
+        wait_for_released_web(live[0], 2).await;
+    }
+
+    // Restart every node in turn, on its own data directory, the way an
+    // upgrade does. Each one's in-memory deploy history goes with it.
+    for index in 0..ports.len() {
+        let (name, port) = ports[index];
+        let stopped = nodes[index].take().unwrap();
+        tokens[index].cancel();
+        if let Some(council) = &stopped.handle.council {
+            council.shutdown().await.ok();
+        }
+        drop(stopped);
+        let seed = ports[(index + 1) % ports.len()].1;
+        tokens[index] = root.child_token();
+        nodes[index] =
+            Some(labelled_node(name, port, vec![local(seed)], &tokens[index], &[], true).await);
+        let live: Vec<&Node> = nodes.iter().flatten().collect();
+        let settled = wait_until(Duration::from_secs(60), || {
+            live.iter().filter(|n| *n.thinks_leader.borrow()).count() == 1
+        })
+        .await;
+        assert!(settled, "no leader after restarting {name}");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    let live: Vec<&Node> = nodes.iter().flatten().collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            live[0].client.rollback("web", "default"),
+        )
+        .await
+        .expect("rollback did not hang")
+        {
+            Ok(()) => break,
+            Err(reliaburger::relish::RelishError::ApiError { status: 503, .. })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => panic!("rollback after every node restarted: {error}"),
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let spec = desired_web(live[0]).await.expect("web is still desired");
+        if spec.image.as_deref() == Some("proc-grill:v1") {
+            assert_eq!(spec.replicas, reliaburger::config::Replicas::Fixed(2));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rollback never restored v1: {:?}",
+            spec.image
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    root.cancel();
+    for node in nodes.iter().flatten() {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}

@@ -645,7 +645,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             api_port,
             Some(Arc::clone(&event_store)),
             None,
-            None,
+            // The leader reads rollout progress from these (#692).
+            Some(aggregated_rx.clone()),
             "default".to_string(),
             Some(name.clone()),
             reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
@@ -679,7 +680,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             api_port,
             None,
             None,
-            None,
+            // The leader reads rollout progress from these (#692).
+            Some(aggregated_rx.clone()),
             "default".to_string(),
             Some(name.clone()),
             reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
@@ -713,7 +715,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             api_port,
             Some(event_store),
             None,
-            None,
+            // The leader reads rollout progress from these (#692).
+            Some(aggregated_rx.clone()),
             "default".to_string(),
             None,
             reliaburger::bun::build_runner::BuildSettings::with_timeout(900),

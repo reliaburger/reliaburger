@@ -1241,13 +1241,20 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 spec: Some(Box::new(spec.clone())),
             })
             .await;
-        let _ = events
-            .send(ApplyEvent::RolloutAborted {
-                app: app_name.to_string(),
-                rolled_back: result == crate::meat::deploy_types::DeployResult::RolledBack,
-                reason: message.clone(),
-            })
-            .await;
+        // An operator's cancellation isn't evidence that the spec is bad.
+        let cancelled = self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.cancellation_requested());
+        if !cancelled {
+            let _ = events
+                .send(ApplyEvent::RolloutAborted {
+                    app: app_name.to_string(),
+                    rolled_back: result == crate::meat::deploy_types::DeployResult::RolledBack,
+                    reason: message.clone(),
+                })
+                .await;
+        }
         let _ = events.send(ApplyEvent::Error { message }).await;
     }
 
@@ -1746,7 +1753,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let retention = self
                     .retain_started_replacements(
-                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                        app_name, namespace, spec, new_ids, new_ports, new_specs,
                     )
                     .await;
                 let _ = events
@@ -1781,7 +1788,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         {
             let retention = self
                 .retain_started_replacements(
-                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    app_name, namespace, spec, new_ids, new_ports, new_specs,
                 )
                 .await;
             let detail = match retention {

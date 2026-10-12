@@ -556,6 +556,7 @@ impl StateMachineInner {
                 }
                 self.state.apps.remove(app_id);
                 self.state.stopped_apps.remove(app_id);
+                self.state.rollouts.remove(app_id);
                 self.state.scheduling.remove(app_id);
                 self.state.last_placed_nodes.remove(app_id);
                 self.state.quota_blocked.remove(app_id);
@@ -1140,6 +1141,49 @@ impl StateMachineInner {
                 self.state.security_state.crl.updated_at = logical_now;
             }
             RaftRequest::Noop => {}
+            RaftRequest::RolloutFailed { app_id, failure } => {
+                let current = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .map(crate::meat::deploy_types::rollout_fingerprint);
+                if current.as_deref() != Some(failure.fingerprint.as_str()) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "the failed rollout is not of {app_id}'s current spec; nothing to mark"
+                        ),
+                    });
+                }
+                let rollouts = self.state.rollouts.entry(app_id.clone()).or_default();
+                // The first failure is the one that explains it. Another
+                // node's report of the same spec adds nothing.
+                if rollouts.failed_for(&failure.fingerprint).is_none() {
+                    let mut failure = failure.clone();
+                    failure.reason = failure.reason.chars().take(512).collect();
+                    rollouts.failed = Some(failure);
+                }
+            }
+            RaftRequest::RolloutReleased { app_id, spec } => {
+                let fingerprint = crate::meat::deploy_types::rollout_fingerprint(spec);
+                let current = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .map(crate::meat::deploy_types::rollout_fingerprint);
+                if current.as_deref() != Some(fingerprint.as_str()) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "the released spec is not {app_id}'s current spec; not a rollback target"
+                        ),
+                    });
+                }
+                let rollouts = self.state.rollouts.entry(app_id.clone()).or_default();
+                // Running healthy everywhere is the answer to a failure report.
+                if rollouts.failed_for(&fingerprint).is_some() {
+                    rollouts.failed = None;
+                }
+                rollouts.release(spec);
+            }
             RaftRequest::QuotaBlocked { blocked } => {
                 // Only apps still in desired state: a delete committed after
                 // the leader planned must not leave a ghost reason behind.
@@ -2321,6 +2365,18 @@ impl StateMachineInner {
             self.state.autoscale_overrides.retain(|(k, _)| k != &key);
         }
         self.state.apps.insert(app_id.clone(), spec.clone());
+        // A different spec is the operator's answer to a failed rollout
+        // (#692, D11-B). The same spec again, a GitOps re-sync say, isn't:
+        // it would only fail the same way.
+        let fingerprint = crate::meat::deploy_types::rollout_fingerprint(spec);
+        if let Some(rollouts) = self.state.rollouts.get_mut(app_id)
+            && rollouts
+                .failed
+                .as_ref()
+                .is_some_and(|failure| failure.fingerprint != fingerprint)
+        {
+            rollouts.failed = None;
+        }
         // Applying an app is how it starts again after `relish stop`.
         self.state.stopped_apps.remove(app_id);
         // Applying a spec is when encrypted values were re-sealed.
@@ -2954,6 +3010,130 @@ mod tests {
 
     fn default_spec() -> AppSpec {
         toml::from_str(r#"image = "test:v1""#).unwrap()
+    }
+
+    fn web_spec(image: &str) -> Box<AppSpec> {
+        Box::new(toml::from_str(&format!("image = {image:?}\nreplicas = 3\n")).unwrap())
+    }
+
+    fn failure_of(spec: &AppSpec) -> crate::meat::deploy_types::RolloutFailure {
+        crate::meat::deploy_types::RolloutFailure {
+            fingerprint: crate::meat::deploy_types::rollout_fingerprint(spec),
+            node: "node-2".into(),
+            reason: "web-g1-0 failed its health check".into(),
+            at_unix_ms: 1,
+        }
+    }
+
+    /// An app whose rollout of `image` failed on a node.
+    fn failed_rollout(image: &str) -> (StateMachineInner, AppId) {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        let spec = web_spec(image);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: spec.clone(),
+        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::RolloutFailed {
+                app_id: app_id.clone(),
+                failure: failure_of(&spec),
+            }),
+            None
+        );
+        (inner, app_id)
+    }
+
+    #[test]
+    fn identical_spec_reapply_keeps_rollout_failed() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        // A GitOps re-sync applies the very same spec again; so does a
+        // scale change, which isn't a new version.
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v2"),
+        });
+        let mut scaled = web_spec("web:v2");
+        scaled.replicas = crate::config::Replicas::Fixed(5);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: scaled,
+        });
+        let failed = inner.state.rollouts[&app_id].failed.clone();
+        assert_eq!(failed, Some(failure_of(&web_spec("web:v2"))));
+    }
+
+    #[test]
+    fn new_spec_clears_rollout_failed() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v3"),
+        });
+        assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    #[test]
+    fn a_failure_of_a_spec_the_operator_replaced_is_refused() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v3"),
+        });
+        // A late report from another node of v2's rollout.
+        let late = inner.apply_request(&RaftRequest::RolloutFailed {
+            app_id: app_id.clone(),
+            failure: failure_of(&web_spec("web:v2")),
+        });
+        assert!(matches!(late, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    #[test]
+    fn rollback_targets_are_capped_at_ten_per_app() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        for version in 0..15 {
+            let spec = web_spec(&format!("web:v{version}"));
+            inner.apply_request(&RaftRequest::AppSpec {
+                app_id: app_id.clone(),
+                spec: spec.clone(),
+            });
+            assert_eq!(
+                inner.apply_request(&RaftRequest::RolloutReleased {
+                    app_id: app_id.clone(),
+                    spec,
+                }),
+                None
+            );
+        }
+        // v14 again, released a second time, doesn't take two slots.
+        inner.apply_request(&RaftRequest::RolloutReleased {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v14"),
+        });
+        let images: Vec<String> = inner.state.rollouts[&app_id]
+            .released
+            .iter()
+            .filter_map(|spec| spec.image.clone())
+            .collect();
+        assert_eq!(
+            images,
+            (5..15).map(|v| format!("web:v{v}")).collect::<Vec<_>>()
+        );
+        // Releasing a spec that is no longer current is refused.
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::RolloutReleased {
+                app_id: app_id.clone(),
+                spec: web_spec("web:v3"),
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        // A deleted app takes its rollout record with it.
+        inner.apply_request(&RaftRequest::AppDelete {
+            app_id: app_id.clone(),
+        });
+        assert!(!inner.state.rollouts.contains_key(&app_id));
     }
 
     fn log_id(term: u64, index: u64) -> LogId<u64> {

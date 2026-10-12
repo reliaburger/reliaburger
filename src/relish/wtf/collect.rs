@@ -677,6 +677,7 @@ fn collect_replicas(
                 unanswered: unanswered.clone(),
                 blocked: desired.blocked.as_ref().map(ToString::to_string),
                 volume_home_away: desired.volume_home_away.clone(),
+                rollout_failed: desired.rollout_failed.clone(),
             }
         })
         .collect();
@@ -1169,6 +1170,7 @@ mod tests {
                 blocked: None,
                 volume_home_away: None,
                 volume_homes: Vec::new(),
+                rollout_failed: None,
             }]),
             Ok(Vec::new()),
             None,

@@ -1348,6 +1348,7 @@ mod capacity_contract {
                         timestamp: std::time::SystemTime::UNIX_EPOCH,
                         running_apps: Vec::new(),
                         cached_specs: Vec::new(),
+                        rollouts: Vec::new(),
                         resource_usage: reliaburger::reporting::types::ResourceUsage {
                             cpu_total_millicores: 8000,
                             memory_total_mb: 16384,

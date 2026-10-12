@@ -361,6 +361,11 @@ pub(super) fn council_app_evidence(
                     .into_iter()
                     .map(|node| node.0)
                     .collect(),
+                rollout_failed: desired.rollouts.get(app_id).and_then(|rollouts| {
+                    rollouts
+                        .failed_for(&crate::meat::deploy_types::rollout_fingerprint(spec))
+                        .cloned()
+                }),
             },
         )
         .collect::<Vec<_>>();

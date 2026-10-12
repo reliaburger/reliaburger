@@ -89,7 +89,8 @@ use identity::{
 };
 use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
-    producer_retirement_handler, refuse_retired_tls_peer, workload_csr_handler,
+    producer_retirement_handler, refuse_retired_tls_peer, rollout_failed_handler,
+    workload_csr_handler,
 };
 use join::{cluster_ca_handler, join_handler, node_renewal_handler, node_trust_ack_handler};
 use logs::{
@@ -773,6 +774,7 @@ pub fn router_with_upgrade(
             post(endpoint_withdrawal_receipt_handler),
         )
         .route("/v1/test/leases/retired", post(test_lease_retired_handler))
+        .route("/v1/rollouts/failed", post(rollout_failed_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(super::batch::batch_submit_handler))
         .route(

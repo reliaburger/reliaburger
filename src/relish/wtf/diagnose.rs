@@ -46,6 +46,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
     check_crashloops(inputs, &mut report);
     check_services(inputs, &mut report);
     check_replicas(inputs, &mut report);
+    check_rollouts(inputs, &mut report);
     check_deploys(inputs, &mut report);
     check_alerts(inputs, &mut report);
     check_cpu_throttling(inputs, &mut report);
@@ -727,6 +728,39 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// #692: an app whose current spec failed to roll out on a node. The
+/// leader holds the other nodes on the previous spec and won't try the
+/// failed one again, so nothing changes until the operator applies a
+/// different spec: a warning that says so, and how.
+fn check_rollouts(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(apps) = inputs.applications.replicas.value() else {
+        return;
+    };
+    for app in apps
+        .iter()
+        .filter(|app| app_matches(inputs.app.as_deref(), &app.app))
+    {
+        let Some(failure) = &app.rollout_failed else {
+            continue;
+        };
+        report.warnings.push(WtfFinding {
+            id: "rollout-failed".to_string(),
+            title: format!(
+                "app {}/{}'s rollout failed on {}; its other nodes stay on the previous spec",
+                app.app, app.namespace, failure.node
+            ),
+            details: vec![failure.reason.clone()],
+            suggestion: format!(
+                "fix the spec and apply it, or `relish rollback {}`; applying the same spec \
+                 again does not retry it",
+                app.app
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: app_resource(&app.app, &app.namespace),
+        });
+    }
+}
+
 /// #423: a managed-volume app whose home node is out of the cluster waits
 /// for it. That's an outage until someone brings the node back or writes
 /// its data off, so it's critical, and it says which of the two to do.
@@ -1343,6 +1377,7 @@ mod tests {
                     unanswered: Vec::new(),
                     blocked: None,
                     volume_home_away: None,
+                    rollout_failed: None,
                 }]),
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
@@ -2111,6 +2146,7 @@ mod tests {
             unanswered: vec!["node-3".to_string()],
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
         }]);
 
         let report = diagnose(&inputs);
@@ -2139,6 +2175,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -2165,6 +2202,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -2193,6 +2231,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: Some(reason.to_string()),
             volume_home_away: None,
+            rollout_failed: None,
         }]);
 
         let report = diagnose(&inputs);
@@ -2219,6 +2258,44 @@ mod tests {
         assert!(!report.ok.iter().any(|ok| ok.id == "replicas"));
     }
 
+    /// #692: a failed rollout is a warning naming the node, the reason and
+    /// the way out, and it doesn't hide the app's other findings.
+    #[test]
+    fn a_failed_rollout_is_a_warning_that_says_how_to_clear_it() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "api".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::from([("node-1".to_string(), 1)]),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+            rollout_failed: Some(crate::meat::deploy_types::RolloutFailure {
+                fingerprint: "abc".to_string(),
+                node: "node-1".to_string(),
+                reason: "api-g1-0 failed its health check".to_string(),
+                at_unix_ms: 1,
+            }),
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "rollout-failed")
+            .expect("a failed rollout is a warning");
+        assert_eq!(
+            finding.title,
+            "app api/default's rollout failed on node-1; its other nodes stay on the previous spec"
+        );
+        assert_eq!(finding.details, ["api-g1-0 failed its health check"]);
+        assert!(finding.suggestion.contains("relish rollback api"));
+        assert!(report.ok.iter().any(|ok| ok.id == "replicas"));
+    }
+
     /// #423: a volume app waiting for its home node is an outage, so it is
     /// critical, and it names the node and both ways out.
     #[test]
@@ -2233,6 +2310,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: Some("node-2".to_string()),
+            rollout_failed: None,
         }]);
 
         let report = diagnose(&inputs);
@@ -2274,6 +2352,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
         }]);
         let report = diagnose(&inputs);
         assert!(report.critical.is_empty(), "{:?}", report.critical);
@@ -2292,6 +2371,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
         }]);
         let report = diagnose(&inputs);
         assert!(report.warnings.is_empty());
