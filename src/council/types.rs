@@ -408,6 +408,11 @@ pub enum RaftRequest {
     TestLeaseAppDelete { lease_id: String, app_id: AppId },
     /// Remove a test lease's namespace, carrying the lease.
     TestLeaseNamespaceDelete { lease_id: String, name: String },
+    /// Remove an untagged registry manifest once it has been untagged for
+    /// `gc_retain_days` (#697). The leader proposes it; apply rechecks that
+    /// it is still untagged since the same moment and that no app or job
+    /// pins it, and answers `Refused` otherwise.
+    ExpireManifest(crate::pickle::types::ExpireManifest),
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +585,34 @@ pub struct DesiredState {
 }
 
 impl DesiredState {
+    /// Every image digest an app or job in desired state pins
+    /// (`web:v1@sha256:…`): app and init-container images, job definitions
+    /// and task-array templates. Registry expiry never removes these.
+    ///
+    // TODO(#692): also read the persisted deploy history once it lands, so
+    // a rollback target stays pullable.
+    pub fn pinned_image_digests(&self) -> std::collections::HashSet<String> {
+        let apps = self.apps.values().flat_map(|spec| {
+            spec.image
+                .iter()
+                .chain(spec.init.iter().filter_map(|init| init.image.as_ref()))
+        });
+        let jobs = self
+            .task_arrays
+            .jobs()
+            .definitions()
+            .filter_map(|(_, record)| record.definition.template.image.as_ref());
+        let arrays = self
+            .task_arrays
+            .iter()
+            .filter_map(|(_, record)| record.template.image.as_ref());
+        apps.chain(jobs)
+            .chain(arrays)
+            .filter_map(|image| crate::pickle::types::image_pin_digest(image))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Turn a restored state into the first state of a new recovery epoch
     /// (12b.2 D21/CP12).
     ///
@@ -750,6 +783,14 @@ mod tests {
             RaftRequest::DeleteTag(DeleteTag {
                 repository: "myapp".to_string(),
                 tag: "old".to_string(),
+                deleted_at_unix_ms: 1,
+            }),
+            RaftRequest::ExpireManifest(crate::pickle::types::ExpireManifest {
+                repository: "myapp".to_string(),
+                digest: crate::pickle::types::Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                untagged_at_unix_ms: 1,
             }),
             RaftRequest::AttachSignature(AttachSignature {
                 manifest_digest: crate::pickle::types::Digest::from_sha256_hex(

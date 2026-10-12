@@ -88,6 +88,10 @@ pub struct Compatibility {
 /// and `gitops_config`, `SyncState::warnings`, and the `GitOpsWrite`,
 /// `GitOpsConfigSet`, `TestLeaseAppDelete` and `TestLeaseNamespaceDelete`
 /// requests, #693).
+/// Registry durability (#697): the manifest catalogue's `untagged_at`,
+/// `DeleteTag::deleted_at_unix_ms` (deleting a tag now untags), the
+/// `ExpireManifest` request and `RegistryMutation::DeleteTag`; the registry
+/// `Usage` query is gone.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

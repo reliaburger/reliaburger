@@ -143,6 +143,13 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
                     crate::relish::council_view::render_status_header(&summary)
                 );
             }
+            // A Lost image can't be pulled or deployed until someone pushes
+            // it again (#697); say so before the instance list.
+            if let Ok(capabilities) = client.capabilities().await
+                && let Some(placement) = capabilities.placement
+            {
+                print!("{}", render_lost_images(&placement.registry));
+            }
             // The council knows why an app isn't placed. That is extra
             // detail: an agent that can't say still shows its instances.
             let desired = client.desired_apps().await.unwrap_or_default();
@@ -160,6 +167,27 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
     }
 
     Ok(())
+}
+
+/// The `relish status` warning for Lost images (design §7.3): one line
+/// naming them, or nothing when none are lost.
+pub fn render_lost_images(
+    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
+) -> String {
+    if registry.lost_image_count == 0 {
+        return String::new();
+    }
+    let mut names = registry.lost_images.join(", ");
+    let unnamed = registry
+        .lost_image_count
+        .saturating_sub(registry.lost_images.len());
+    if unnamed > 0 {
+        names.push_str(&format!(" and {unnamed} more"));
+    }
+    format!(
+        "registry: {} lost image(s), no live node holds them: {names}; re-push them\n",
+        registry.lost_image_count
+    )
 }
 
 /// The `relish logs` flags, as typed.
@@ -1954,6 +1982,55 @@ pub fn resolve_image_digest(
     };
     let digest = found.ok_or_else(not_found)?;
     crate::pickle::types::Digest::new(digest).map_err(|_| not_found())
+}
+
+/// Split `repository:tag` for `relish images delete`. A registry host in
+/// front (`localhost:5050/team/web:v1`) is dropped, the way deploys drop it.
+/// A digest, or a name without a tag, is refused: deleting `web` must not
+/// quietly mean `web:latest`.
+pub fn parse_image_tag(reference: &str) -> Result<(&str, &str), RelishError> {
+    let invalid = || RelishError::InvalidImageTag {
+        reference: reference.to_string(),
+    };
+    if reference.contains('@') {
+        return Err(invalid());
+    }
+    let tail_start = reference.rfind('/').map_or(0, |i| i + 1);
+    let (name, tag) = reference[tail_start..]
+        .rfind(':')
+        .map(|i| {
+            (
+                &reference[..tail_start + i],
+                &reference[tail_start + i + 1..],
+            )
+        })
+        .ok_or_else(invalid)?;
+    let repository = crate::meat::scheduler::canonical_repository(name);
+    if repository.is_empty() || tag.is_empty() || tag.starts_with("sha256") {
+        return Err(invalid());
+    }
+    Ok((repository, tag))
+}
+
+/// `relish images delete <repository:tag>`: untag an image in Pickle.
+pub async fn image_delete(reference: &str) -> Result<(), RelishError> {
+    image_delete_with_client(reference, &BunClient::default_local()).await
+}
+
+async fn image_delete_with_client(reference: &str, client: &BunClient) -> Result<(), RelishError> {
+    let (repository, tag) = parse_image_tag(reference)?;
+    let registry = client
+        .capabilities()
+        .await?
+        .service_endpoints
+        .registry
+        .ok_or(RelishError::RegistryUnavailable)?;
+    client.delete_image_tag(&registry, repository, tag).await?;
+    println!(
+        "deleted {repository}:{tag}; the image expires once it has been untagged for \
+         gc_retain_days, unless an app or job pins it"
+    );
+    Ok(())
 }
 
 pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
@@ -4600,6 +4677,52 @@ spec:
                 .as_str(),
             MYAPP_V2
         );
+    }
+
+    #[test]
+    fn status_names_lost_images_and_stays_quiet_otherwise() {
+        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
+        assert_eq!(render_lost_images(&registry), "");
+
+        registry.lost_images = vec!["web:v1".into(), "api@sha256:abc".into()];
+        registry.lost_image_count = 3;
+
+        assert_eq!(
+            render_lost_images(&registry),
+            "registry: 3 lost image(s), no live node holds them: web:v1, api@sha256:abc \
+             and 1 more; re-push them\n"
+        );
+    }
+
+    #[test]
+    fn image_delete_reads_repository_and_tag() {
+        assert_eq!(parse_image_tag("web:v1").unwrap(), ("web", "v1"));
+        assert_eq!(
+            parse_image_tag("team/web:v1.2").unwrap(),
+            ("team/web", "v1.2")
+        );
+        assert_eq!(
+            parse_image_tag("localhost:5050/team/web:latest").unwrap(),
+            ("team/web", "latest")
+        );
+    }
+
+    #[test]
+    fn image_delete_refuses_a_bare_name_or_a_digest() {
+        for reference in [
+            "web",
+            "localhost:5050/web",
+            "web:",
+            "web@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ] {
+            assert!(
+                matches!(
+                    parse_image_tag(reference),
+                    Err(RelishError::InvalidImageTag { .. })
+                ),
+                "{reference}"
+            );
+        }
     }
 
     #[test]
