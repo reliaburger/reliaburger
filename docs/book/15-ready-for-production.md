@@ -3742,6 +3742,13 @@ leaves it alone and waits for it like any running command. It never sends a
 signal. A command that is really running still gets its five seconds, and a
 stuck one still fences everything after it.
 
+The new test prepares a command in the old process's collection, drops the
+claim the way an exec would, and admits a command in a fresh one. Before the
+change it failed after five seconds with `command-… is Prepared`, the same
+words a Lima loop of the rootless test printed three times in 29 rounds. With
+it, Bun logs `cancelled runtime command …` and carries on; the same loop
+passed every round, and caught the cancellation doing its job twice.
+
 #### The tick reads in parallel
 
 `check_apps` and `check_jobs` asked the runtime for every running instance's
