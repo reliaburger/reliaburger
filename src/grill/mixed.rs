@@ -210,6 +210,68 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
         ids.retain(|id| !launched.contains(id));
         Ok(ids)
     }
+    /// Give a route to every launch that exactly one backend owns but no
+    /// route names, and return the instances routed.
+    ///
+    /// A node that ran a single runtime (`--runtime runc` or `process`)
+    /// and restarts with this one has live launches and no routing
+    /// journal. Each launch's own backend journal proves which backend
+    /// owns it, so routing it there guesses nothing. A launch both backends
+    /// claim, or an image workload the host backend ran, stays unrouted, and
+    /// recovery refuses it as before (#823).
+    ///
+    /// Call once at startup, before anything reads the inventory.
+    pub async fn route_unrouted_launches(&self) -> Result<Vec<InstanceId>, GrillError> {
+        let inventory = InstanceId("inventory".into());
+        let mut owners = std::collections::HashMap::<InstanceId, Vec<(bool, bool)>>::new();
+        for (host, backend) in [
+            (false, self.container.launch_inventory().await?),
+            (true, self.host.launch_inventory().await?),
+        ] {
+            let backend = backend
+                .ok_or_else(|| Self::error(&inventory, "backend inventory is unavailable"))?;
+            for launch in backend {
+                // An image workload the process runtime ran on the host has
+                // no place in this runtime, which would contain it. Leave it
+                // unrouted rather than route a launch inventory refuses.
+                let consistent = launch.spec.host_process == host;
+                owners
+                    .entry(launch.instance_id)
+                    .or_default()
+                    .push((host, consistent));
+            }
+        }
+        let mut owners: Vec<_> = owners.into_iter().collect();
+        owners.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        let mut routed = Vec::new();
+        for (id, hosts) in owners {
+            let [(host, true)] = hosts[..] else {
+                continue;
+            };
+            let added = self
+                .operation(&id, move |this, id| async move {
+                    if this.load(&id).await?.is_some() {
+                        return Ok(false);
+                    }
+                    // The backend already created this launch, and its own
+                    // journal decides whether that creation finished.
+                    this.store(&Route {
+                        schema: 1,
+                        instance: id.clone(),
+                        runtime: this.runtime_kind_for_host(host),
+                        committed: true,
+                        retired: false,
+                    })
+                    .await?;
+                    Ok(true)
+                })
+                .await?;
+            if added {
+                routed.push(id);
+            }
+        }
+        Ok(routed)
+    }
     fn selected_blocking(&self, id: &InstanceId) -> Result<Route, GrillError> {
         self.load_blocking(id)?
             .ok_or_else(|| Self::error(id, "mixed-runtime route is absent"))
@@ -1149,5 +1211,105 @@ mod tests {
             .collect();
         assert_eq!(routes.len(), 2, "{routes:?}");
         assert!(routes.iter().all(|name| name.starts_with("default__web-0")));
+    }
+
+    /// #823: a node that ran plain `--runtime runc` (or `process`) and
+    /// restarts with `mixed` has live launches but no routing journal.
+    /// Startup recovery read every launch through a route and stopped Bun
+    /// with a bare "No such file or directory" on every restart.
+    #[tokio::test]
+    async fn launches_from_a_single_runtime_agent_get_routes_at_startup() {
+        for host in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = pair(root.path()).await;
+            let id = InstanceId("default__frontend-2".into());
+            let backend = if host {
+                &runtime.host
+            } else {
+                &runtime.container
+            };
+            backend.set_launch_inventory(vec![launch(&id, host)]).await;
+            assert!(
+                runtime.launch_inventory().await.is_err(),
+                "an unrouted launch was readable before routing"
+            );
+
+            assert_eq!(
+                runtime.route_unrouted_launches().await.unwrap(),
+                vec![id.clone()]
+            );
+
+            let launches = runtime.launch_inventory().await.unwrap().unwrap();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(launches[0].instance_id, id);
+            backend.set_state(&id, ContainerState::Running);
+            assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+            assert!(
+                backend.calls().contains(&("state".to_string(), id.clone())),
+                "the route chose the wrong backend"
+            );
+            // Routing is idempotent: a second start finds nothing to route.
+            assert!(runtime.route_unrouted_launches().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_routes_are_never_rewritten_by_startup_routing() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let id = InstanceId("default__web-0".into());
+        runtime.create(&id, &spec(true)).await.unwrap();
+        runtime
+            .host
+            .set_launch_inventory(vec![launch(&id, true)])
+            .await;
+        let route = root.path().join("routes").join(format!("{}.json", id.0));
+        let before = std::fs::read(&route).unwrap();
+        assert!(runtime.route_unrouted_launches().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(&route).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn an_image_workload_the_host_backend_ran_stays_unrouted() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let id = InstanceId("default__web-0".into());
+        runtime
+            .host
+            .set_launch_inventory(vec![launch(&id, false)])
+            .await;
+        assert!(runtime.route_unrouted_launches().await.unwrap().is_empty());
+        assert!(
+            !root
+                .path()
+                .join("routes")
+                .join(format!("{}.json", id.0))
+                .exists(),
+            "an image workload was routed to the host backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_both_backends_claim_stays_unrouted() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let id = InstanceId("default__web-0".into());
+        runtime
+            .host
+            .set_launch_inventory(vec![launch(&id, true)])
+            .await;
+        runtime
+            .container
+            .set_launch_inventory(vec![launch(&id, false)])
+            .await;
+        assert!(runtime.route_unrouted_launches().await.unwrap().is_empty());
+        assert!(
+            !root
+                .path()
+                .join("routes")
+                .join(format!("{}.json", id.0))
+                .exists(),
+            "an ambiguous launch was given a guessed backend"
+        );
     }
 }

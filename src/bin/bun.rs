@@ -1069,6 +1069,29 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         &config.images.mirrors,
     )
     .await?;
+    // A node switched to the mixed runtime from runc or process has live
+    // launches without routes. Route them before recovery reads them (#823).
+    #[cfg(target_os = "linux")]
+    if let AnyGrill::Mixed(mixed) = &runtime {
+        let routed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            mixed.route_unrouted_launches(),
+        )
+        .await
+        .context("timed out routing launches from the previous runtime")?
+        .context("cannot route launches from the previous runtime")?;
+        if !routed.is_empty() {
+            eprintln!(
+                "bun: routed {} launch(es) from the previous runtime: {}",
+                routed.len(),
+                routed
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
