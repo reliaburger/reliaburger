@@ -328,6 +328,45 @@ Dry-run mode prints the timeline without executing:
 relish fault scenario payment-cascade.toml --dry-run
 ```
 
+The first version of the runner had three habits that made it useless in CI.
+It parsed each step only when its turn came, so a typo in step three surfaced
+after steps one and two were already injected. Its `kill` step sent `Kill {
+count: 0 }`, which means every replica, so the replica rail refused every
+single one. And when a step was refused it printed `FAILED`, then "Scenario
+complete", and exited 0.
+
+Now `build_timeline` turns every step into a `FaultRequest` before anything
+runs, and the first bad step fails the whole file with its number and
+description. The step struct carries `#[serde(deny_unknown_fields)]`, so
+`namepsace = "shop"` is a parse error rather than a silently ignored line.
+Steps also gained the scope the CLI flags always had: `namespace`, `from` (a
+`delay` or `partition` from one caller), `count` (a `kill`, one by default)
+and `instance`. A field the step's fault can't use is refused, rather than
+quietly dropped.
+
+The runner itself takes the injection as a closure, so a test can stand in
+for the network:
+
+```rust
+async fn run_scenario<F, Fut>(
+    timeline: Vec<TimelineEntry>,
+    acknowledged: bool,
+    mut inject: F,
+) -> Result<(), RelishError>
+where
+    F: FnMut(FaultRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<FaultSummary, RelishError>>,
+```
+
+Rust has no `async` closures that are this easy to name in a bound, so the
+usual trick is two type parameters. `F` is a closure that, called with a
+request, returns some future `Fut`, and `Fut` is anything that resolves to
+the injection's result. The real command passes `|request| async move {
+client.inject_fault(&request).await }`. The test passes a closure that
+refuses kills, and checks that the run ends in an error naming that step
+while the later steps still ran. A refused step no longer stops the
+timeline, but it does make `relish fault scenario` exit non-zero.
+
 ## The chaos test suite
 
 The roadmap defines 8 chaos scenarios. Each tests a different failure mode and verifies that Smoker's safety rails and the cluster's recovery mechanisms work correctly.
@@ -680,6 +719,65 @@ paying 300 ms on the way out.
 Clearing the fault brought it back to 42 ms. The test also kills a frontend
 replica mid-fault and waits for its replacement to carry the netem qdisc
 again, which it does within a tick.
+
+### A fault never outlives its Bun
+
+The `fa01:` sweep fixed one case of a wider problem, and for a while it was
+the only case we'd fixed. Every fault keeps its undo information in the fault
+registry, and the registry lives in Bun's memory. A CPU fault saves the
+workload's old `cpu.max` there, a pause saves the pids it froze, and clearing
+or expiring the fault reads them back. Now SIGKILL Bun halfway through `relish
+fault cpu web 80%`. The new Bun adopts `web`, which is still running, with its
+registry empty. `relish fault list` shows nothing, `relish fault clear` clears
+nothing, and `web` keeps 20% of a core for the rest of its life. A paused
+instance with no health check stays frozen just as long. On the rootful runc
+path the eBPF maps are pinned in bpffs so that egress policy survives a
+restart, and the fault map rode along: a `drop redis 50% --duration 1h` kept
+dropping for the rest of its hour with nothing on screen to explain it.
+
+A chaos tool that can leave production degraded with no visible cause is worse
+than no chaos tool. We could have written each fault's undo information to
+disk, but there's a simpler source of truth already there. Every adopted
+instance has a record with the OCI specification it was started from, and that
+says exactly what its limits should be. So adoption puts them back, whether or
+not there was a fault:
+
+```rust
+pub fn restore_recorded_limits(
+    cgroup_path: &Path,
+    resources: Option<&OciResources>,
+) -> Result<(), ResourceFaultError> {
+    write_if_present(&cgroup_path.join("cpu.max"), &recorded_cpu_max(resources))?;
+    write_if_present(
+        &cgroup_path.join("memory.high"),
+        &recorded_memory_high(resources),
+    )?;
+    // ...and every device in io.max goes back to rbps=max wbps=max
+}
+```
+
+`recorded_cpu_max` turns the spec's quota and period into the string runc
+wrote at start-up (`"50000 100000"` for a 500m limit, `"max 100000"` with no
+limit), and `recorded_memory_high` reads the soft limit back out of the
+`unified` map. `write_if_present` opens the file with
+`std::fs::OpenOptions::new().write(true).truncate(true)`. `OpenOptions` is
+Rust's builder for `open(2)` flags: you switch on the ones you want, and
+leaving out `.create(true)` means a missing file is an error (`NotFound`, which
+we skip) rather than a new file. A cgroup whose CPU controller isn't enabled
+has no `cpu.max`, and we'd rather leave it that way than invent one.
+
+The pause gets the same treatment: adoption reads the instance's
+`cgroup.procs` and sends every process SIGCONT, plus the main pid the runtime
+names (the process runtime keeps no cgroup of its own). A running process
+ignores SIGCONT, so it's safe to send unconditionally. And the owned eBPF
+loader now calls the same `cleanup_all_fault_maps` the throwaway loader always
+did, after it has checked the pinned maps and before it re-attaches the
+programs. The egress maps in the same pin directory stay, since keeping them
+is the whole point of pinning.
+
+So the rule is now simple to state: a fault dies with the Bun that injected
+it, and the next Bun tidies up after it. If you still want the fault, inject
+it again.
 
 ## One experiment at a time
 
@@ -1663,6 +1761,8 @@ RELIABURGER_EBPF_TESTS=1 cargo test --features ebpf --test ebpf
 ```
 
 On a Mac, `relish dev test` runs them inside Lima. Process faults (signals) run on any Unix including macOS; resource faults (cgroups) are Linux-only and their config logic is unit-tested everywhere, returning `UnsupportedPlatform` off Linux.
+
+For a long time the cgroup tests wrote to temporary files that only looked like cgroups, and nothing ever killed Bun with a fault active, which is how the leftovers in "A fault never outlives its Bun" went unseen. `make test-linux` now runs four agent tests against a real cgroup v2 subtree with a real process in it: a CPU and a memory fault each injected and expired, then a CPU cap and a pause each left behind by an agent that's dropped mid-fault (what a SIGKILL leaves), and lifted by the next agent's adoption. `owned_loader_clears_stale_fault_connect_entries` does the same for the pinned eBPF fault map, and checks that the egress policy in the same pins survives. The V02 soak's chaos rotation also gained `cpu` and `memory` faults on the frontend.
 
 Killing Bun also frees its sockets. The registry recovery fixture waits for a
 lease to expire before restarting the same node, so another parallel test could

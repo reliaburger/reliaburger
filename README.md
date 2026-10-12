@@ -156,7 +156,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish fault drop <TARGET> <PERCENTAGE>`: Fail a percentage of connections
   - `relish fault dns <TARGET> <FAULT_TYPE>`: Return NXDOMAIN for DNS resolution
   - `relish fault partition <TARGET>`: Block traffic between services
-  - `relish fault bandwidth <TARGET> <LIMIT>`: Throttle bandwidth to a service
+  - `relish fault bandwidth <TARGET> <LIMIT>`: Throttle bandwidth to a service (not implemented yet: Bun refuses it, #366)
   - `relish fault cpu <TARGET> <PERCENTAGE>`: Consume CPU in a service's cgroup
   - `relish fault memory <TARGET> <VALUE>`: Push memory usage toward a service's limit
   - `relish fault disk-io <TARGET> <LIMIT>`: Throttle disk I/O for a service
@@ -392,7 +392,9 @@ it refused, rate-limited so a flood of bad tokens can't flush the history.
   your own files.
 - **No PromQL.** Metrics are read through `relish metrics`, the dashboards and
   the API.
-- **`fault bandwidth` is refused**, and `fault delay` needs runc containers.
+- **`fault bandwidth` is refused** until it's implemented
+  ([#366](https://github.com/reliaburger/reliaburger/issues/366)), and `fault
+  delay` needs runc containers.
 - **Kubernetes import covers the kinds listed above.** Anything else is reported,
   not applied.
 - **Clusters start fresh.** Development-build state isn't migrated, and rolling

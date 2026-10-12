@@ -168,6 +168,30 @@
     "test": "smoker::resource::tests::cgroup_disk_io_throttle_applies_and_removes"
   },
   {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "cpu_fault_round_trip_restores_cpu_max",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::cpu_fault_round_trip_restores_cpu_max"
+  },
+  {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "memory_fault_round_trip_restores_memory_high",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::memory_fault_round_trip_restores_memory_high"
+  },
+  {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "cpu_fault_is_reverted_after_bun_is_killed",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::cpu_fault_is_reverted_after_bun_is_killed"
+  },
+  {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "paused_instance_resumes_after_bun_is_killed",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::paused_instance_resumes_after_bun_is_killed"
+  },
+  {
     "source": "tests/autoscale_memory.rs",
     "function": "runc_autoscaler_scales_up_on_real_memory_growth",
     "binary": "reliaburger::autoscale_memory",
@@ -544,6 +568,12 @@
     "function": "persistent_policy_refuses_conflicting_owners_and_retired_state",
     "binary": "reliaburger::ebpf",
     "test": "persistent_policy_refuses_conflicting_owners_and_retired_state"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "owned_loader_clears_stale_fault_connect_entries",
+    "binary": "reliaburger::ebpf",
+    "test": "owned_loader_clears_stale_fault_connect_entries"
   },
   {
     "source": "tests/ebpf.rs",

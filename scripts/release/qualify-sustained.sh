@@ -1139,6 +1139,7 @@ slot_node_fault() {
 # Every chaos kind against the rails: kill and pause meet the replica minimum,
 # so they aim at the three-replica frontend, one replica at a time; delay,
 # drop, partition and dns are network faults, which no replica rail guards;
+# cpu and memory cap each frontend's cgroup until the clear lifts it (#699);
 # the scenario runs its own checks.
 # Print one running instance of APP, or nothing unless at least two run.
 one_of_several() {
@@ -1157,7 +1158,7 @@ slot_chaos() {
 }
 
 chaos_one() {
-    local kinds=(kill delay partition scenario pause drop dns) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
+    local kinds=(kill delay partition scenario pause drop dns cpu memory) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
     kind=${kinds[chaos_index % ${#kinds[@]}]}
     chaos_index=$(( chaos_index + 1 ))
     say "fault: chaos $kind"
@@ -1178,6 +1179,9 @@ chaos_one() {
             fi ;;
         drop) rel fault drop frontend 10% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         dns) rel fault dns soak-redis nxdomain --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
+        # The frontend declares a 128 MiB limit, which a memory fault needs.
+        cpu) rel fault cpu frontend 80% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
+        memory) rel fault memory frontend 90% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         scenario)
             rel_budget=900 rel --output json test --chaos --yes --filter dead_worker_node_has_workloads_rescheduled \
                 --timeout 600s > "$output" 2>&1 || result=$? ;;

@@ -492,6 +492,9 @@ pub struct BunAgent<G: Grill> {
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
+    /// Where the cgroup v2 hierarchy is mounted: `/sys/fs/cgroup`, except in
+    /// tests that stand a directory in for it.
+    cgroup_mount: PathBuf,
     /// Which apps' volumes a snapshot operation owns right now.
     volume_maintenance: crate::bun::volume_maintenance::VolumeMaintenance,
     /// Test hook: an accepted restore waits here before touching the disk.
@@ -818,6 +821,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -964,6 +968,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -1267,6 +1272,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The constructors default it; the binary overrides from config.
     pub fn set_volumes_dir(&mut self, dir: std::path::PathBuf) {
         self.volumes_dir = dir;
+    }
+
+    /// Stand a directory in for the cgroup v2 mount.
+    #[cfg(test)]
+    pub(crate) fn set_cgroup_mount(&mut self, mount: std::path::PathBuf) {
+        self.cgroup_mount = mount;
     }
 
     /// Configure the actual protected listener ports, explicit enrolment peers

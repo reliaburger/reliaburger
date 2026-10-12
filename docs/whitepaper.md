@@ -844,19 +844,23 @@ relish fault delay redis 200ms --acknowledge       # tc netem on each caller's i
 relish fault drop api 10% --acknowledge            # fail 10% of connections
 relish fault dns redis nxdomain --acknowledge      # DNS failure
 relish fault cpu inference 50% --acknowledge       # CPU stress in cgroup
-relish fault kill web-3 --acknowledge              # kill an instance
-relish fault run chaos/scenario.toml --acknowledge # scripted multi-step scenario
+relish fault kill web --count 1 --acknowledge      # kill one replica
+relish fault scenario chaos/scenario.toml --acknowledge # scripted multi-step scenario
 ```
 
-`relish fault bandwidth` parses but Bun refuses it until it's implemented.
+`relish fault delay` has shipped; `relish fault bandwidth` parses but Bun
+refuses it until it's implemented
+([#366](https://github.com/reliaburger/reliaburger/issues/366)).
 Safety rails require an authenticated role, the matching server-owned
 `[testing].allowed_operations` grant and explicit acknowledgement. They also
 enforce duration limits (default 10 min) and blast-radius protection
-(quorum, replica and leader guards). A fault isn't re-applied after Bun
-restarts, but it isn't always cleanly undone either: CPU, memory and disk-I/O
-caps, paused processes and eBPF drop or partition entries can outlive a Bun
-crash or upgrade, and then don't show in `relish fault list`. Reverting them on
-restart is [#699](https://github.com/reliaburger/reliaburger/issues/699). Admin doesn't
+(quorum, replica and leader guards). A fault never outlives the Bun that
+injected it: after a crash, kill or upgrade, the new Bun empties the eBPF
+fault maps (pinned ones included), rewrites each adopted instance's CPU,
+memory and disk-I/O limits from its recorded specification, resumes paused
+processes and removes netem delays, so `relish fault list` and the kernel
+agree there's nothing active. A scripted scenario validates every step before
+it injects any and exits non-zero if a step is refused. Admin doesn't
 override a disabled operation, and Bun attributes audit events to the
 authenticated credential rather than a client-supplied name.
 

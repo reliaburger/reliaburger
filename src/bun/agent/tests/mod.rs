@@ -7,6 +7,8 @@ use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, tra
 use super::*;
 use crate::grill::mock::MockGrill;
 
+#[cfg(target_os = "linux")]
+mod cgroup_faults;
 mod fault_coverage;
 mod loop_harness;
 mod loop_rule;
@@ -8667,6 +8669,126 @@ async fn started_rootless_instance_persists_network_recreation_state() {
     assert_eq!(persisted[0].schema, crate::grill::records::RECORD_SCHEMA);
     assert_eq!(persisted[0].boot_id, crate::grill::records::current_boot());
     assert_eq!(persisted[0].rootless_network, Some(rootless_network));
+}
+
+/// An adoption record whose workload has a cgroup and resource limits, as
+/// a runc instance's has.
+pub(super) fn limited_adoption_record(
+    instance: &str,
+    app: &str,
+) -> crate::grill::records::InstanceRecord {
+    let mut record = adoption_record(instance, app, false);
+    record.oci_spec.linux.cgroups_path = Some(format!("/reliaburger/default/{app}/0"));
+    record.oci_spec.linux.resources = Some(crate::grill::oci::OciResources {
+        cpu: Some(crate::grill::oci::OciCpuResources {
+            quota: 50_000,
+            period: 100_000,
+        }),
+        memory: Some(crate::grill::oci::OciMemoryResources {
+            limit: 128 * 1024 * 1024,
+        }),
+        unified: std::collections::BTreeMap::from([(
+            "memory.high".to_string(),
+            "33554432".to_string(),
+        )]),
+    });
+    record
+}
+
+/// Whether `ps` reports `pid` as stopped (state `T`).
+pub(super) fn process_is_stopped(pid: u32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim_start()
+        .starts_with('T')
+}
+
+/// Wait up to five seconds for `pid` to be stopped, or running.
+pub(super) async fn wait_for_stopped(pid: u32, stopped: bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_is_stopped(pid) != stopped {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pid {pid} never became stopped={stopped}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Bun keeps a CPU fault's saved `cpu.max` only in memory. A Bun that was
+/// killed mid-fault left the cap behind, and the next one adopted the
+/// instance without lifting it (#699): the recorded specification says
+/// what the limits should be, so adoption writes them back.
+#[tokio::test]
+async fn adopting_an_instance_restores_its_recorded_cpu_max() {
+    let records = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_cgroup_mount(mount.path().to_path_buf());
+    let record = limited_adoption_record("default__web-0", "web");
+    let cgroup = mount.path().join("reliaburger/default/web/0");
+    std::fs::create_dir_all(&cgroup).unwrap();
+    // What a 99% CPU fault, a memory fault and a disk-I/O fault left.
+    std::fs::write(cgroup.join("cpu.max"), "1000 100000").unwrap();
+    std::fs::write(cgroup.join("memory.high"), "1024").unwrap();
+    std::fs::write(
+        cgroup.join("io.max"),
+        "8:0 rbps=1048576 wbps=1048576 riops=max wiops=max\n",
+    )
+    .unwrap();
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let read = |name: &str| std::fs::read_to_string(cgroup.join(name)).unwrap();
+    assert_eq!(read("cpu.max"), "50000 100000");
+    assert_eq!(read("memory.high"), "33554432");
+    assert_eq!(read("io.max"), "8:0 rbps=max wbps=max riops=max wiops=max");
+}
+
+/// A pause fault's frozen pids lived only in the old Bun's registry, so an
+/// instance paused when Bun died stayed frozen for good (#699).
+#[tokio::test]
+async fn adopting_an_instance_sends_sigcont_to_its_pids() {
+    let records = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_cgroup_mount(mount.path().to_path_buf());
+    let mut main = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut worker = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    for child in [&main, &worker] {
+        crate::smoker::process::pause_process(child.id() as i32).unwrap();
+        wait_for_stopped(child.id(), true).await;
+    }
+    // The runtime names the main process; the cgroup lists the rest.
+    grill.set_pid(main.id());
+    let record = limited_adoption_record("default__web-0", "web");
+    let cgroup = mount.path().join("reliaburger/default/web/0");
+    std::fs::create_dir_all(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), format!("{}\n", worker.id())).unwrap();
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    wait_for_stopped(main.id(), false).await;
+    wait_for_stopped(worker.id(), false).await;
+    for child in [&mut main, &mut worker] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 #[tokio::test]
