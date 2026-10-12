@@ -853,9 +853,28 @@ The second gap is quieter. The orchestrator marks a node `Healthy` when `/v1/ver
 The fix works at three layers, because each one can be reached without the others:
 
 - **The binary store** refuses to put different bytes under an existing version (`VersionContentConflict`). Identical bytes are accepted and left alone.
-- **Nodes report what they run.** `/v1/version` gains `binary_sha256`. Hashing a whole bun is CPU work, so the manager does it once, on the blocking pool, and caches it in a `tokio::sync::OnceCell`. `OnceCell::get_or_try_init` takes an async closure; the first caller runs it and everyone else awaits the same result. If the closure fails, the cell stays empty and the next caller tries again, which is what you want for an I/O error.
+- **Nodes report what they run.** `/v1/version` gains `binary_sha256`. Hashing a whole bun is CPU work, so the manager does it once, off the async workers, and caches it in a `tokio::sync::OnceCell`. `OnceCell::get_or_try_init` takes an async closure; the first caller runs it and everyone else awaits the same result. If the closure fails, the cell stays empty and the next caller tries again, which is what you want for an I/O error.
 
   Doing it on the first request turned out to be a mistake. A debug bun is over 500 MB, and on a loaded host the first `/v1/version` took longer than the 10 s a joining `relish` allows for its compatibility check, so `relish join` failed with "failed to reach cluster member" against an API that was up ([#765](https://github.com/reliaburger/reliaburger/issues/765)). Bun now calls `spawn_running_binary_hash` at boot, which `tokio::spawn`s a task that fills the same cell, and the hash reads the file in 1 MiB chunks instead of loading it whole. The `OnceCell` makes the change small: a request that arrives while the boot task is still hashing awaits that attempt instead of starting a second one.
+
+  Hashing at boot had a catch of its own ([#816](https://github.com/reliaburger/reliaburger/issues/816)). The hash first ran under `tokio::task::spawn_blocking`, Tokio's pool for work that would otherwise stall an async worker. When `main` returns, it drops the runtime, and dropping a runtime waits for every blocking-pool task to finish. Async tasks get cancelled at their next `.await`; a thread halfway through a `read` loop has no `.await` to cancel at. So a start-up error raised after the hash began, say the refusal to change durable ownership mode, sat silent until the whole binary was hashed: 2.5 s on an idle VM, about 17 s under load. Bun didn't even print the error until then, because `main` prints it after `block_on` returns and the runtime is gone.
+
+  The fix hands the hash to a plain `std::thread` that nothing joins and sends the digest back on a `tokio::sync::oneshot` channel:
+
+  ```rust
+  let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
+  std::thread::Builder::new()
+      .name("binary-hash".to_string())
+      .spawn(move || {
+          let _ = digest_tx.send(hash_running_binary(&stored));
+      })
+      .ok()?;
+  digest_rx.await.ok().flatten()
+  ```
+
+  In C you'd call this a detached pthread; in Go it's what every goroutine already is. Rust's `spawn` returns a `JoinHandle`, and dropping that handle detaches the thread rather than killing or joining it. When `main` returns, the process exits and takes the thread with it, which is exactly what you want for a cache nobody will ever read. The `move` closure takes ownership of `stored` and the sender, so the thread holds nothing borrowed from the caller and can outlive it. The `?` after `.ok()` is the escape hatch: if the OS won't give us a thread, there's no digest, the same as an unreadable file, and the next caller tries again.
+
+  The test needed a hash that's slow on demand, not on a slow machine. A FIFO does it. The test puts a named pipe where the stored binary should be, so the hash blocks in `read` until the test closes the write end. One test drops a runtime while the hash is blocked and fails if the drop takes more than 5 s; another starts the real `bun` with a FIFO nobody writes to and a refused data directory, and fails if it hasn't exited within 30 s. Before the fix both hung.
 - **One pure gate, `upgrade::plan::check_target`,** compares the target with what every node runs. Same version and different (or unknown) bytes: `SameVersionDifferentBinary`, which tells the operator to give the candidate a new version. Same version and identical bytes everywhere: `TargetCheck::AlreadyRunning`, and relish prints "nothing to do" and exits cleanly. The leader runs the gate in `/v1/upgrade/start` after probing every planned node, before anything goes into Raft. Each node runs it again in `prepare`. And the orchestrator re-checks the digest when a node reports the target version, so a node that changed underneath the walk fails the run instead of passing it.
 
 The API handler maps "already running" to a 200 rather than an error, with a match arm that binds and filters at once:

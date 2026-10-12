@@ -30,6 +30,7 @@ mod api_tokens;
 mod app_metrics;
 mod batch;
 mod bun_auth_startup;
+mod bun_startup_exit;
 mod ca_trust_rotation;
 mod cluster_fixtures;
 mod compatibility;
