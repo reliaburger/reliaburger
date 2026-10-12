@@ -50,3 +50,24 @@ esac
         );
     }
 }
+
+/// RUSTSEC-2024-0449: unsafe-libyaml is unmaintained. relish reads and writes
+/// YAML through yaml_serde, which uses the maintained libyaml-rs port, so the
+/// lock file must not pull unsafe-libyaml (or the deprecated serde_yaml) back
+/// in, and the audit must not need an exception for it (#817).
+#[test]
+fn lock_file_has_no_unsafe_libyaml_and_audit_needs_no_exception_for_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    for banned in ["unsafe-libyaml", "serde_yaml"] {
+        assert!(
+            !lock.contains(&format!("name = \"{banned}\"")),
+            "Cargo.lock still contains {banned}"
+        );
+    }
+    let audit = std::fs::read_to_string(root.join(".cargo/audit.toml")).unwrap();
+    assert!(
+        !audit.contains("\"RUSTSEC-2024-0449\""),
+        ".cargo/audit.toml still ignores RUSTSEC-2024-0449"
+    );
+}

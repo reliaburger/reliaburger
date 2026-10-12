@@ -82,7 +82,8 @@ use faults::{
     fault_list_handler, node_fault_fence_handler, node_fault_reserve_handler,
     spawn_node_fault_reaper,
 };
-use gitops::gitops_webhook_handler;
+pub use gitops::GitOpsLocalCheck;
+use gitops::{gitops_config_handler, gitops_status_handler, gitops_webhook_handler};
 use identity::{
     identity_jwks_handler, identity_sign_handler, join_token_create_handler, token_create_handler,
     token_list_handler, token_revoke_handler, token_rotate_handler,
@@ -762,6 +763,8 @@ pub fn router_with_upgrade(
         )
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
+        .route("/v1/gitops", get(gitops_status_handler))
+        .route("/v1/gitops/config", post(gitops_config_handler))
         .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/discovery/retire", post(producer_retirement_handler))

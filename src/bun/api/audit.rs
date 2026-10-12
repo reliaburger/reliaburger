@@ -116,6 +116,7 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         Operation,
     ),
     audited(Post, "/v1/cluster/elect", "council.elect", Operation),
+    audited(Post, "/v1/gitops/config", "gitops.configured", Operation),
     audited(
         Post,
         "/v1/nodes/decommission",

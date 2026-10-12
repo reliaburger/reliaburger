@@ -18,9 +18,10 @@ use crate::relish::council_view::CouncilNodeObservation;
 use super::{
     AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
     ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
-    DiskObservation, Evidence, FaultObservation, IsolationObservation, LogObservation,
-    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
-    ServiceObservation, TokenObservation, WtfInputs,
+    DiskObservation, Evidence, FaultObservation, GitOpsObservation, IsolationObservation,
+    LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
+    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
+    TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -225,6 +226,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         // Tokens live in the council; a standalone node has none.
         Evidence::available(collected_at, Vec::new())
     };
+    let gitops = collect_gitops(&endpoints, collected_at).await;
     let recent_logs = collect_logs(client, app, &restarts, collected_at).await;
 
     Ok(WtfInputs {
@@ -241,6 +243,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             registry,
             tokens,
             isolation,
+            gitops,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -935,6 +938,73 @@ fn collect_registry(
         }
     }
     builder.finish(observed_at)
+}
+
+/// Ask every node how the cluster's GitOps looks from there (#693).
+///
+/// The sync warnings live in Raft, so any node's answer carries them. Each
+/// node also reports whether its own `[gitops]` differs from the cluster's,
+/// which only that node knows.
+async fn collect_gitops(
+    endpoints: &[NodeEndpoint],
+    observed_at: u64,
+) -> Evidence<GitOpsObservation> {
+    let answers = futures_util::future::join_all(endpoints.iter().map(|endpoint| async move {
+        let status = match &endpoint.client {
+            Ok(client) => bounded("gitops status", client.gitops_status()).await,
+            Err(reason) => Err(reason.clone()),
+        };
+        (endpoint.status.node_id.clone(), status)
+    }))
+    .await;
+    let mut value = GitOpsObservation::default();
+    let mut answered = false;
+    let mut missing = Vec::new();
+    for (node_id, status) in answers {
+        let status = match status {
+            Ok(status) => status,
+            Err(reason) => {
+                missing.push(format!("node {node_id}: {reason}"));
+                continue;
+            }
+        };
+        if !answered {
+            value.warnings = status
+                .sync
+                .as_ref()
+                .map(|sync| sync.warnings.clone())
+                .unwrap_or_default();
+        }
+        answered = true;
+        value.configured |= status.config.is_some();
+        match status.local {
+            crate::lettuce::types::LocalConfigCheck::Differs { fields } => {
+                value
+                    .differing_nodes
+                    .push(NodeGitOpsDifference { node_id, fields });
+            }
+            crate::lettuce::types::LocalConfigCheck::Unreadable { reason } => {
+                value
+                    .unreadable_nodes
+                    .push(NodeGitOpsUnreadable { node_id, reason });
+            }
+            _ => {}
+        }
+    }
+    if !answered {
+        return Evidence::Unavailable {
+            reason: missing.join("; "),
+        };
+    }
+    if missing.is_empty() {
+        Evidence::available(observed_at, value)
+    } else {
+        Evidence::Degraded {
+            observed_at,
+            value,
+            reason: missing.join("; "),
+        }
+    }
 }
 
 /// Every namespace with a desired app, and whether each node can keep them

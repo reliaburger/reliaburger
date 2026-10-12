@@ -269,6 +269,10 @@ enum Command {
         /// Namespace the app lives in. Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Delete an app GitOps manages. The next sync recreates it while
+        /// the repository declares it.
+        #[arg(long)]
+        force: bool,
     },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init {
@@ -380,6 +384,10 @@ enum Command {
         /// directory). Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Roll back an app GitOps manages. The next sync puts back what
+        /// the repository declares.
+        #[arg(long)]
+        force: bool,
     },
     /// Validate a config file without deploying.
     Lint {
@@ -549,6 +557,11 @@ enum Command {
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+    /// Show or change the cluster's GitOps configuration.
+    Gitops {
+        #[command(subcommand)]
+        action: GitopsAction,
     },
     /// Back up the cluster's root CA, check the backup, and rotate intermediates.
     Ca {
@@ -1033,6 +1046,23 @@ enum BatchAction {
         #[arg(long)]
         index: u32,
     },
+}
+
+#[derive(Subcommand)]
+enum GitopsAction {
+    /// Show the cluster's GitOps configuration, sync status and what GitOps
+    /// owns. Credentials are never shown.
+    Status,
+    /// Replace the cluster's GitOps configuration from a TOML file holding
+    /// a `[gitops]` section (admin only; audited). Credentials in it are
+    /// sealed with the cluster master key before they reach Raft.
+    Set {
+        /// TOML file with a `[gitops]` section, such as a node's `node.toml`.
+        path: PathBuf,
+    },
+    /// Turn GitOps off for the whole cluster (admin only; audited). What
+    /// GitOps wrote stays in place.
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -1688,7 +1718,8 @@ async fn main() -> ExitCode {
         Command::Delete {
             ref app,
             ref namespace,
-        } => commands::delete(app, namespace).await,
+            force,
+        } => commands::delete(app, namespace, force).await,
         Command::Init {
             ref dir,
             ref cluster_name,
@@ -1986,7 +2017,8 @@ async fn main() -> ExitCode {
         Command::Rollback {
             ref app,
             ref namespace,
-        } => commands::rollback(app, namespace).await,
+            force,
+        } => commands::rollback(app, namespace, force).await,
         Command::Lint { ref path } => commands::lint(path),
         Command::Compile { ref path } => commands::compile(path),
         Command::Diff {
@@ -2104,6 +2136,11 @@ async fn main() -> ExitCode {
                 finalize,
                 namespace,
             } => commands::secret_rotate(*finalize, namespace.as_deref()).await,
+        },
+        Command::Gitops { action } => match &action {
+            GitopsAction::Status => commands::gitops_status(cli.output).await,
+            GitopsAction::Set { path } => commands::gitops_set(path).await,
+            GitopsAction::Disable => commands::gitops_disable().await,
         },
         Command::Ca { action } => match &action {
             CaAction::Backup {
@@ -3404,7 +3441,32 @@ mod tests {
         let cli = parse(&["relish", "delete", "web", "--namespace", "team-a"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Delete { ref app, ref namespace } if app == "web" && namespace == "team-a"
+            Command::Delete { ref app, ref namespace, force: false } if app == "web" && namespace == "team-a"
+        ));
+    }
+
+    /// #693: `--force` deletes or rolls back an app that GitOps manages.
+    #[test]
+    fn delete_and_rollback_take_force() {
+        let cli = parse(&["relish", "delete", "web", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Delete { force: true, .. }));
+        let cli = parse(&["relish", "rollback", "web", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Rollback { force: true, .. }));
+    }
+
+    #[test]
+    fn gitops_subcommands_parse() {
+        let cli = parse(&["relish", "gitops", "set", "node.toml"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gitops { action: GitopsAction::Set { ref path } } if path == std::path::Path::new("node.toml")
+        ));
+        let cli = parse(&["relish", "gitops", "disable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gitops {
+                action: GitopsAction::Disable
+            }
         ));
     }
 

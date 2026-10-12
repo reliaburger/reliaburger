@@ -387,6 +387,27 @@ pub enum RaftRequest {
         observed_at_unix_ms: u64,
         jobs: Vec<AppId>,
     },
+    /// A desired-state write Lettuce makes for the repository (#693).
+    ///
+    /// `change` is an app, namespace or permission spec or delete. It
+    /// applies, and the GitOps ownership set records (or forgets) the
+    /// resource, in this one entry. `term` is the Raft term the sync read
+    /// its snapshot in; an entry proposed in any other term is refused, so
+    /// a leader that lost and regained leadership mid-sync can't apply a
+    /// stale diff. A delete of a resource GitOps doesn't own is refused.
+    GitOpsWrite { term: u64, change: Box<RaftRequest> },
+    /// Set or clear the cluster's GitOps configuration (#693). With `seed`,
+    /// it only applies when the cluster has none: that's how a node's
+    /// `[gitops]` section bootstraps it without overriding the cluster.
+    GitOpsConfigSet {
+        config: Option<Box<crate::lettuce::types::StoredGitOpsConfig>>,
+        seed: bool,
+    },
+    /// Remove an app from a test lease's namespace. A plain `AppDelete` is
+    /// refused there, so only the lease's cleanup removes its apps.
+    TestLeaseAppDelete { lease_id: String, app_id: AppId },
+    /// Remove a test lease's namespace, carrying the lease.
+    TestLeaseNamespaceDelete { lease_id: String, name: String },
     /// A node aborted its rollout of an app's current spec (#692, D11-B).
     /// The leader stops handing that spec to nodes until a different one is
     /// applied. Refused when the fingerprint isn't the app's current spec:
@@ -522,6 +543,14 @@ pub struct DesiredState {
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
     pub gitops_coordinator: Option<crate::lettuce::types::CoordinatorElection>,
+    /// The cluster's GitOps configuration, credentials sealed (#693). Every
+    /// leader syncs from this, never from its own `node.toml`.
+    #[serde(default)]
+    pub gitops_config: Option<crate::lettuce::types::StoredGitOpsConfig>,
+    /// The apps, namespaces and permissions GitOps wrote, and so may prune
+    /// (D9, #693).
+    #[serde(default)]
+    pub gitops_owned: crate::lettuce::types::GitOpsOwnership,
     /// Cluster security state: CAs, tokens, age keypairs, OIDC config.
     /// Contains wrapped (encrypted) private keys — safe to replicate.
     pub security_state: SecurityState,

@@ -369,11 +369,15 @@ pub(super) async fn deploys_history_handler(
 /// `apply` (Raft in cluster mode, local deploy otherwise). The recorded
 /// spec carries the digest it ran, so the rollback runs those bytes; only
 /// a record from before binding (a bare tag) is resolved again.
+///
+/// An app GitOps manages is refused without `?force=true`: the next sync
+/// would put back what git declares (#693).
 pub(super) async fn rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<super::apps::ForceQuery>,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
@@ -400,6 +404,13 @@ pub(super) async fn rollback_handler(
             Json(serde_json::json!({"error": "deploy history unavailable"})),
         )
             .into_response();
+    }
+    if let Some(council) = &state.council
+        && let Some(refusal) =
+            super::apps::gitops_managed_refusal(council, &app, &namespace, "rollback", query.force)
+                .await
+    {
+        return refusal;
     }
 
     // On a cluster the council keeps the specs that rolled out everywhere

@@ -880,6 +880,8 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
 
 `Result<usize, String>` is Rust's answer to error handling — a value that's *either* an `Ok` carrying the count, *or* an `Err` carrying the id of the change that failed. There's no exception to forget to catch and no error code to ignore; the caller can't get at the count without acknowledging the failure case. The `let Some(x) = … else { continue }` is a *let-else*: bind `x` if the pattern matches, otherwise run the `else` (which must diverge — here, `continue` to the next change). It's the clean way to say "skip the ones that don't map to a write" without nesting.
 
+(Stopping at the first failure turned out to be too strict: one bad app blocked every change behind it. "GitOps owns what it wrote" below shows how `apply_changes` now tries every change and reports each refusal, while keeping the rule that follows.)
+
 The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the commit untouched and moves on; the next tick sees an unapplied commit and re-runs the whole set. That only works because the writes are idempotent — applying a `NamespaceSpec` that's already there is an upsert, a harmless no-op — so re-running a partially-applied sync converges instead of double-counting. Idempotence is what buys you "just retry the whole thing," which is the simplest correct recovery there is.
 
 The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
@@ -1113,6 +1115,78 @@ let fetched = repo.fetch().and_then(|new_commit| match new_commit {
 Reconciling every tick raises a cost question the old skip was hiding: if every poll ends in `record_success`, every poll writes a `GitOpsSyncUpdate` to Raft, and the log grows by one entry every thirty seconds forever. We already fixed that once (the fetch that never advanced its local ref, earlier in this chapter), so the runner is explicit about when it writes. A tick on the commit it already applied, with no changes and no error to clear, writes nothing. A tick that repaired drift writes a history entry and says so in the log (`gitops: repaired drift with 2 change(s) from …`). The applied commit doesn't move, because Git didn't.
 
 Then there's what *isn't* drift. An autoscaler that has scaled `worker` to five replicas hasn't disagreed with Git, and neither has an operator who ran `relish stop`. Both live outside the app spec: the override in `autoscale_overrides`, the stop in `stopped_apps`. GitOps writes app specs, and only when the spec differs, so a matching spec leaves both alone. The integration test does the whole thing through Raft on a single-node council: sync a repo with three apps, write a rogue image for one, delete another and write an autoscale override for the third, then wait. The polls, on the same SHA, put `web:v1` and `api` back; the override survives, and `last_applied_commit` still names the original commit. Before the fix the test timed out waiting for the image.
+
+## GitOps owns what it wrote, and nothing else
+
+Reconciling on every tick made one old assumption much louder. The diff treated the repository as the whole truth: anything in Raft that git didn't mention was a `Remove`. That's fine in a cluster GitOps built from nothing. Now turn GitOps on in a cluster that's been running for a month on `relish apply`. The first sync reads a repository with three apps in it, compares it with a cluster running thirty, and deletes twenty-seven. Commit an empty tree by mistake and it deletes everything. The design doc promised that GitOps and manual apply coexist. The code had no way to tell the two apart, so they didn't.
+
+The audit (#693) found two more ways to lose things. A running test's `rbtest-*` namespace sits in desired state like any other, so GitOps pruned the apps of a test in progress. And the `[gitops]` section came from each node's own `node.toml`, so after a failover the new leader could follow a different repository, or none at all, and prune whatever the old one had written.
+
+### An ownership set, written with the resource
+
+The maintainer's decision (D9) was an ownership marker: Raft records which resources Lettuce wrote, and Lettuce prunes only those. The interesting part is *where* the record gets written. If the runner wrote the app and then, in a second entry, marked it owned, a crash or leader change between the two would leave an app GitOps wrote but doesn't know it owns. It would never be pruned. So the ownership change rides in the same Raft entry as the write:
+
+```rust
+GitOpsWrite {
+    term: u64,
+    change: Box<RaftRequest>,
+},
+```
+
+That's an enum variant holding a boxed value of its own enum. In C you'd reach for a pointer to a struct of the same type; in Rust the `Box` is what makes it legal at all. An enum is laid out inline, as big as its largest variant, so a variant that contained a `RaftRequest` directly would need infinite size. `Box` puts the inner request on the heap and leaves a pointer-sized field behind. Serde and bincode follow the box without noticing it's there.
+
+The state machine unwraps it, checks the inner change is one of the six declarative writes (an app, namespace or permission, spec or delete), applies it through the ordinary handler, and then updates `gitops_owned`:
+
+```rust
+let response = self.apply_request_at(change, position);
+if matches!(response, Some(CouncilResponse::Refused { .. })) {
+    return response;
+}
+let owned = &mut self.state.gitops_owned;
+match change {
+    RaftRequest::AppSpec { app_id, .. } => {
+        owned.apps.insert(app_id.clone());
+    }
+    // namespaces and permissions likewise
+    _ => {}
+}
+```
+
+A delete goes the other way: it's refused outright when GitOps doesn't own the resource, and the delete handler forgets the ownership (as a manual delete does, so the set only ever describes things that exist). Two `&mut` borrows of `self.state` can't overlap, which is why `owned` is taken only after `apply_request_at` has finished with `self`. The borrow checker would refuse the other order, and it'd be right to.
+
+The diff then only removes what's in the set. A resource that's in git *and* already in the cluster, with the same spec, but that GitOps didn't write, gets a new kind of change, `ResourceChange::Adopt`, carrying the spec the cluster already runs. Writing it changes nothing (the bound image digest is kept, so no re-pull) except the ownership. From then on, deleting it from git deletes it from the cluster. Everything in an `rbtest-*` namespace is filtered out of both sides of the diff, and the state machine now refuses a plain `AppDelete` or `NamespaceDelete` in a namespace a live lease owns. The lease's cleanup carries the lease (`TestLeaseAppDelete`), so it's the only thing that can remove a running test's workload.
+
+What about the person at the keyboard? `relish apply` of a GitOps-owned resource goes ahead and prints `warning: app 'web' in namespace 'default' is managed by GitOps; manual changes are reverted on the next sync`. `relish delete` and `relish rollback` of one are refused with a `409` unless you pass `--force`, because the next sync would undo them anyway. Refusing the pointless change is kinder than letting it quietly bounce back thirty seconds later.
+
+### Every change gets its go
+
+The earlier section made "applied" mean "all of it applied", and the first version of that rule stopped at the first failure. That's correct for the commit pointer and wrong for everything else. One app whose image won't bind blocked every change behind it, removals included, forever, because the commit never advanced and the next tick stopped at the same app. `apply_changes` now tries every change and returns a report instead of a `Result`:
+
+```rust
+pub struct ApplyReport {
+    pub applied: usize,
+    pub refused: Vec<String>,
+    pub abandoned: Option<String>,
+}
+```
+
+A sync with refusals is recorded as `SyncResult::PartialSuccess { errors }`, naming each offender in the sync status. The D12 rule survives: `last_applied_commit` moves only when `refused` is empty, so the next tick retries, and the idempotent writes make retrying cheap. The diff's order matters more now that partial syncs are normal: adds and updates go namespaces, permissions, apps (the order manual apply already used), and removals go apps, permissions, namespaces, so a namespace is never pulled out from under apps still being written into it.
+
+### One configuration, held by the cluster
+
+The `[gitops]` section moved into Raft as `DesiredState.gitops_config`. Every cluster node runs the sync loop; a follower only compares its own section with the cluster's and publishes the result, and the leader syncs whatever Raft holds. A node's `node.toml` seeds Raft once, through `GitOpsConfigSet { seed: true }`, which the state machine ignores when a configuration is already there. After that the cluster's copy wins. A node whose section differs says so in its log and in `relish wtf`, and is ignored. `relish gitops set` changes it, behind an Admin token and the audit log.
+
+The awkward bit is credentials. A private repository means a token in the URL, and webhooks mean a shared secret, and neither belongs in a Raft log that every council member replicates and every snapshot copies. So `StoredGitOpsConfig::seal` lifts them out before the write and seals them with HKDF and AES-256-GCM under a key derived from the cluster master key, the same wrapping the CA keys get. No master key, no credentials: the seal refuses rather than storing them in clear.
+
+### A sync that knows which term it's in
+
+A sync reads desired state, then spends seconds (or minutes, on a slow remote) in `git`. If leadership moves to B and back to A meanwhile, A's diff is stale: B may have changed things A's snapshot never saw. The fix costs one `u64`. The runner reads the Raft term *before* the snapshot and stamps it on every `GitOpsWrite`. The state machine compares it with the term of the log entry carrying the write, which openraft gives us for free in the entry's `LogId`, and refuses a mismatch. Because the check happens as the entry applies, every replica refuses the same writes. The runner also checks the term before each write and abandons the sync on the first sign it moved; the new leader's sync takes over.
+
+### Warning, not refusing, about plaintext secrets
+
+Last, a smaller decision (D8). A repository with `DB_PASSWORD = "hunter2"` in it works, and always has. Refusing it would turn a bad habit into an outage with no migration path. So the sync applies it and warns: any env key containing `PASSWORD`, `SECRET`, `TOKEN` or `CREDENTIAL`, or ending in `_KEY`, whose value isn't `ENC[AGE:...]`, produces a warning naming the app and the key, never the value. It lands in the log (once, when the set of warnings changes), in `SyncState.warnings` and in `relish wtf`.
+
+The tests follow the findings. In `diff.rs`, `diff_never_removes_resources_gitops_did_not_write`, `diff_skips_test_lease_namespaces` and `diff_orders_namespaces_before_apps_and_removes_in_reverse`. In the state machine, `gitops_write_records_ownership`, `prune_clears_ownership`, `a_gitops_write_from_an_earlier_term_is_refused` and `app_delete_in_a_leased_namespace_needs_the_lease`. In the runner, `one_refused_change_does_not_block_the_others`, `partial_sync_names_every_offender` and `sync_is_abandoned_when_the_term_changed`. And end to end on a real council in `tests/suite/gitops.rs`: `enabling_gitops_keeps_manually_applied_apps` (the thirty-apps scenario, in miniature), `manual_apply_of_a_gitops_app_warns`, `delete_of_a_gitops_app_refuses_without_force`, `gitops_config_in_raft_survives_a_leader_without_local_config` and `differing_local_gitops_config_is_reported_not_used`.
 
 ## Stopping the work, not just the wait
 
