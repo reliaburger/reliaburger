@@ -16,8 +16,10 @@
 #
 #   --tier fast    compressed schedule, 90 minutes: every fault kind in the
 #                  first cycles, for the fix-and-rerun loop and CI hosts
-#   --tier final   full schedule, 24 hours: the run #668 needs on the final
-#                  candidate (after #678, #679 and #680)
+#   --tier final   full schedule, 12 hours: the run #668 needs on the final
+#                  candidate (after #678, #679 and #680). 12 rather than 24
+#                  hours is the maintainer's decision for 0.2.0: a reasonable
+#                  approximation of a day
 #   --target-rate  accepted successes a second (default 1390: 1,158, which is
 #                  100 million a day, plus 20% headroom)
 #   --plan         print the fault schedule and exit
@@ -40,7 +42,7 @@ done
 
 case $tier in
     fast) tier_options=(--tier fast) ;;
-    final) tier_options=(--tier final --duration 24h) ;;
+    final) tier_options=(--tier final --duration 12h) ;;
     *) usage >&2; fail '--tier must be fast or final' ;;
 esac
 

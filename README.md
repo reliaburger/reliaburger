@@ -370,7 +370,7 @@ all; the [throughput demo](https://reliaburger.com/#job-throughput) and its
 show what each kind of isolation costs per job; `relish bench --scenario
 jobs-shared-containers` and its siblings rerun them on your own cluster, and
 `--compare OLD.json` fails on a drop against an earlier report. The sustained
-target of 100 million jobs a day needs a 24-hour qualification that hasn't
+target of 100 million jobs a day needs a 12-hour qualification that hasn't
 passed yet ([#668](https://github.com/reliaburger/reliaburger/issues/668)).
 
 **Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
