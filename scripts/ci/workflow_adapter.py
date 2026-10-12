@@ -51,9 +51,42 @@ def source_files(manifest, gate):
                    if gate in case['requires'] for source in case['sources']})
 
 
-def output_name(gate):
+def output_name(gate, shard=None):
     c.require(gate in JOBS, 'unknown workflow owner gate')
-    return gate.replace('-', '_') + '_sha256'
+    w.partition(gate, shard)
+    return gate.replace('-', '_') + ('' if shard is None else '_' + str(shard)) + '_sha256'
+
+
+def label(gate, shard=None):
+    """The envelope directory and artifact suffix of one owner or one shard."""
+    w.partition(gate, shard)
+    return gate if shard is None else gate + '-' + str(shard)
+
+
+def owner_units(expected_gates):
+    """Each producer the selected gates need: one per owner, or one per shard."""
+    return [(gate, host, shard) for gate, host in sorted(expected_gates)
+            for shard in (range(1, w.SHARDS[gate] + 1) if gate in w.SHARDS else [None])]
+
+
+def shards_complete(manifest, gate, directories, owed):
+    """Merge one split owner: together its shards ran every listed test once.
+
+    Each shard's nextest list names the same unpartitioned tests and marks
+    the ones it ran. Those must not overlap, must cover the whole list, and
+    the cases each shard owed must add up to every required case.
+    """
+    shards = [c.partitioned(c.read_json(Path(directory) / 'discovery.json')) for directory in directories]
+    everything = shards[0][1]
+    ran = set()
+    for selected, listed in shards:
+        c.require(listed == everything, 'shards listed different unpartitioned tests')
+        c.require(not (ran & selected), 'a test ran in more than one shard')
+        ran |= selected
+    c.require(ran == everything, 'some listed tests ran in no shard')
+    found = set().union(*owed)
+    c.require(found == required_cases(manifest, gate), 'shards together missed a required case')
+    return found
 
 
 def archive_origin(context, needs):
@@ -88,9 +121,12 @@ def verify_archive_runtime(root, context, needs):
     return runtime
 
 
-def validate_expected(manifest, gate, context, expected):
+def validate_expected(manifest, gate, context, expected, shard=None):
     """Recheck static identity around runtime values approved by the producer."""
     c.require(expected['context'] == context, 'wrong current producer context')
+    if gate in w.SHARDS:
+        c.require(expected['entry'].get('partition') == w.partition(gate, shard),
+                  'shard ran a different partition')
     if gate == 'portable-linux':
         c.require(expected['owner_command'] == w.OWNERS[gate], 'wrong coverage owner')
         coverage.tool_context(expected['tools'], expected['tools'])
@@ -112,8 +148,8 @@ def validate_expected(manifest, gate, context, expected):
                   'wrong source-bound Make owner entry')
 
 
-def verify_owner(manifest, gate, context, expected, directory):
-    validate_expected(manifest, gate, context, expected)
+def verify_owner(manifest, gate, context, expected, directory, shard=None):
+    validate_expected(manifest, gate, context, expected, shard)
     required = required_cases(manifest, gate)
     if gate == 'portable-linux':
         return coverage.evidence(expected, directory, required)
@@ -130,10 +166,10 @@ def verify_owner(manifest, gate, context, expected, directory):
     return make_owner.evidence(expected, directory, required)
 
 
-def seal(manifest_path, manifest, gate, context, expected, directory):
+def seal(manifest_path, manifest, gate, context, expected, directory, shard=None):
     """Seal only a successful current producer, then expose its approved digest."""
     directory = Path(directory)
-    verify_owner(manifest, gate, context, expected, directory)
+    verify_owner(manifest, gate, context, expected, directory, shard)
     approved = directory / 'approved.json'
     approved.write_text(json.dumps(expected, sort_keys=True, indent=2) + '\n')
     payloads = {}
@@ -142,6 +178,8 @@ def seal(manifest_path, manifest, gate, context, expected, directory):
             payloads[path.relative_to(directory).as_posix()] = c.digest(path)
     row = dict(schema_version=1, gate=gate, context=context,
                manifest_sha256=c.digest(manifest_path), files=payloads)
+    if shard is not None:
+        row['shard'] = [shard, w.SHARDS[gate]]
     destination = directory / 'gate-seal.json'
     destination.write_text(json.dumps(row, sort_keys=True, indent=2) + '\n')
     return c.digest(destination)
@@ -204,12 +242,13 @@ def cron_dependencies(root, directory=None, run=subprocess.run, tools=None):
     return observations
 
 
-def produce(root, manifest_path, gate, context, directory, needs=None):
+def produce(root, manifest_path, gate, context, directory, needs=None, shard=None):
     root, directory = Path(root).resolve(), Path(directory).resolve()
     manifest = c.inventory(c.read_json(manifest_path), root)
-    c.require(directory == root / 'target/contracts' / context['host'] / gate,
-              'producer artifact directory differs from the predeclared workflow path')
     c.require(gate in JOBS and gate in manifest['gates'], 'unknown required workflow gate')
+    c.require((shard is None) == (gate not in w.SHARDS), 'split owners run one shard at a time')
+    c.require(directory == root / 'target/contracts' / context['host'] / label(gate, shard),
+              'producer artifact directory differs from the predeclared workflow path')
     declaration = manifest['gates'][gate]
     c.require(declaration['mode'] == 'ci' and context['host'] in declaration['hosts']
               and declaration['command'] == w.OWNERS[gate], 'wrong CI owner declaration')
@@ -228,7 +267,7 @@ def produce(root, manifest_path, gate, context, directory, needs=None):
     else:
         origin = archive_origin(context, needs or {}) if JOBS[gate] in ('cluster', 'acceptance') else None
         runtime = verify_archive_runtime(root, context, needs) if origin else None
-        entry = w.entry_from_make(root, manifest, gate, context['host'], archive_origin=origin)
+        entry = w.entry_from_make(root, manifest, gate, context['host'], archive_origin=origin, shard=shard)
         if runtime is not None:
             entry['archive_runtime'] = runtime
         approved = []
@@ -241,16 +280,23 @@ def produce(root, manifest_path, gate, context, directory, needs=None):
         expected = approved[0]
         if dependencies is not None:
             (directory / 'dependency-comparison.json').write_text(json.dumps(dependencies, indent=2) + '\n')
-    return 0, seal(manifest_path, manifest, gate, context, expected, directory)
+    return 0, seal(manifest_path, manifest, gate, context, expected, directory, shard)
 
 
-def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None):
-    """Waited job results and trusted output hashes authorize artifact consumption."""
+def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None, event=None):
+    """Waited job results and trusted output hashes authorize artifact consumption.
+
+    `event` is the workflow's own event name. Only a pull request may qualify
+    with fewer than every owner; the command line always passes it.
+    """
     root, incoming = Path(root), Path(incoming)
     manifest = c.inventory(c.read_json(manifest_path), root)
     changes = needs.get('changes', {}).get('outputs', {})
-    selection = w.selected_workflow(context, code=changes.get('code'), heavy=changes.get('heavy'))
+    selection = w.selected_workflow(context, code=changes.get('code'), heavy=changes.get('heavy'),
+                                    macos=changes.get('macos'))
     c.require(selection is not None, 'no selected code qualification')
+    c.require(event in (None, 'pull_request') or selection['mode'] == 'full',
+              'only a pull request may qualify without every owner')
     w.job_results(selection, needs)
     expected_gates = {(name, host) for name, gate in manifest['gates'].items()
                       if gate['mode'] == 'ci' and selection['mode'] in gate.get('required_in', ['portable', 'full'])
@@ -258,34 +304,43 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None)
     c.require({name for name, _ in expected_gates} == set(selection['gates']),
               'manifest differs from the finite actual workflow gate schedule')
     gates.candidate_sources(root, context['commit'], subprocess.run)
-    verified = {}
-    for gate, host in sorted(expected_gates):
+    verified, shards = {}, {}
+    for gate, host, shard in owner_units(expected_gates):
         c.require(gate in JOBS, 'unknown actual workflow owner')
         outputs = needs[JOBS[gate]].get('outputs', {})
-        digest = outputs.get(output_name(gate))
+        digest = outputs.get(output_name(gate, shard))
         c.require(isinstance(digest, str) and len(digest) == 64, 'missing successful owner step output')
-        directory = incoming / ('contract-' + host + '-' + gate)
+        directory = incoming / ('contract-' + host + '-' + label(gate, shard))
         c.require(
             c.digest(directory / 'gate-seal.json') == digest,
             'owner artifact differs from trusted step output',
         )
         row = c.read_json(directory / 'gate-seal.json')
-        c.fields(row, ('schema_version', 'gate', 'context', 'manifest_sha256', 'files'))
+        c.fields(row, ('schema_version', 'gate', 'context', 'manifest_sha256', 'files'), ('shard',))
         current = dict(context, host=host)
         c.require(type(row['schema_version']) is int and row['schema_version'] == 1
                   and row['gate'] == gate and row['context'] == current
+                  and row.get('shard') == (None if shard is None else [shard, w.SHARDS[gate]])
                   and row['manifest_sha256'] == c.digest(manifest_path), 'wrong current sealed owner')
         c.require(
             isinstance(row['files'], dict) and 'approved.json' in row['files'],
             'missing approved owner plan',
         )
+        c.require(shard is None or 'discovery.json' in row['files'], 'missing sealed shard test list')
         for name, expected_digest in row['files'].items():
             c.require(
                 c.digest(gates.inside(directory, name)) == expected_digest,
                 'sealed owner payload changed',
             )
         approved = c.read_json(directory / 'approved.json')
-        verified[(gate, host)] = verify_owner(manifest, gate, current, approved, directory)
+        cases = verify_owner(manifest, gate, current, approved, directory, shard)
+        if shard is None:
+            verified[(gate, host)] = cases
+        else:
+            shards.setdefault((gate, host), []).append((directory, cases))
+    for (gate, host), parts in shards.items():
+        verified[(gate, host)] = shards_complete(manifest, gate, [directory for directory, _ in parts],
+                                                 [cases for _, cases in parts])
     if selection['mode'] == 'full':
         c.require(bindings_path is not None, 'complete legacy ignored-owner bindings required')
         import ignored_owners
@@ -320,7 +375,8 @@ def main(argv=None):
     parser.add_argument('operation', choices=['produce', 'aggregate', 'archive'])
     for name in ('root', 'commit', 'run-id', 'attempt'):
         parser.add_argument('--' + name, required=True)
-    for name in ('manifest', 'gate', 'host', 'directory', 'needs', 'github-output', 'ignored-bindings'):
+    for name in ('manifest', 'gate', 'host', 'directory', 'needs', 'github-output', 'ignored-bindings',
+                 'shard', 'event'):
         parser.add_argument('--' + name)
     args = parser.parse_args(argv)
     context = dict(commit=args.commit, run_id=args.run_id, attempt=args.attempt)
@@ -360,6 +416,7 @@ def main(argv=None):
     c.require(args.manifest and args.directory, 'manifest and owner artifact directory required')
     if args.operation == 'aggregate':
         c.require(args.needs, 'trusted workflow needs object required')
+        c.require(args.event, 'the workflow event name is required')
         aggregate(
             args.root,
             args.manifest,
@@ -367,16 +424,29 @@ def main(argv=None):
             context,
             c.read_json(args.needs),
             args.ignored_bindings,
+            event=args.event,
         )
         return 0
     c.require(args.gate and args.host and args.github_output, 'current owner gate/host/output required')
     context['host'] = args.host
     needs = c.read_json(args.needs) if args.needs else None
-    status, digest = produce(args.root, args.manifest, args.gate, context, args.directory, needs)
+    shard = parse_shard(args.gate, args.shard)
+    status, digest = produce(args.root, args.manifest, args.gate, context, args.directory, needs, shard)
     if status:
         return status
-    write_output(args.github_output, output_name(args.gate), digest)
+    write_output(args.github_output, output_name(args.gate, shard), digest)
     return 0
+
+
+def parse_shard(gate, text):
+    """`--shard K/N` names shard K of a gate split into exactly N."""
+    if text is None:
+        return None
+    number, separator, count = text.partition('/')
+    c.require(separator == '/' and number.isdigit() and count.isdigit()
+              and gate in w.SHARDS and int(count) == w.SHARDS[gate], 'unknown owner shard')
+    w.partition(gate, int(number))
+    return int(number)
 
 
 if __name__ == '__main__':

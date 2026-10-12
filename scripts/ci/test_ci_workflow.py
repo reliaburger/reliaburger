@@ -6,6 +6,8 @@ import tempfile
 import subprocess
 import unittest
 
+from workflow_assembly import SHARDS
+
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO / ".github" / "workflows"
 
@@ -96,8 +98,17 @@ class EvidenceTests(unittest.TestCase):
             producer = blocks[index]
             identity = gate.replace('-', '_')
             self.assertIn('id: ' + identity, producer)
-            self.assertIn(identity + '_sha256: ${{ steps.' + identity
-                          + '.outputs.' + identity + '_sha256 }}', job)
+            # A split owner is one matrix job; each shard sets only its own output.
+            count = SHARDS.get(gate)
+            suffixes = [''] if count is None else ['_' + str(shard) for shard in range(1, count + 1)]
+            for suffix in suffixes:
+                self.assertIn(identity + suffix + '_sha256: ${{ steps.' + identity
+                              + '.outputs.' + identity + suffix + '_sha256 }}', job)
+            label = gate if count is None else gate + '-${{ matrix.shard }}'
+            if count is not None:
+                self.assertIn('        shard: [' + ', '.join(map(str, range(1, count + 1))) + ']\n', job)
+                self.assertIn('--shard "${{ matrix.shard }}/' + str(count) + '"', producer)
+                self.assertIn('--directory "target/contracts/' + host + '/' + label + '"', producer)
             if gate != 'oci-interruptions':
                 for argument in ('--host ' + host, '--commit "$EXPECTED_CHECKOUT_COMMIT"',
                                  '--run-id "$GITHUB_RUN_ID"', '--attempt "$GITHUB_RUN_ATTEMPT"',
@@ -105,11 +116,11 @@ class EvidenceTests(unittest.TestCase):
                     self.assertIn(argument, producer)
             retains = [step for step in blocks[index + 1:]
                        if 'actions/upload-artifact@' in step
-                       and 'name: contract-' + host + '-' + gate + '\n' in step]
+                       and 'name: contract-' + host + '-' + label + '\n' in step]
             self.assertEqual(len(retains), 1, gate)
             retain = retains[0]
             self.assertIn('if: always()', retain)
-            self.assertIn('path: target/contracts/' + host + '/' + gate, retain)
+            self.assertIn('path: target/contracts/' + host + '/' + label + '\n', retain)
             self.assertIn('retention-days: 14', retain)
             self.assertIn('if-no-files-found: error', retain)
         # Original test owners must be intercepted rather than executed again.
@@ -369,6 +380,69 @@ class EvidenceTests(unittest.TestCase):
                         acceptance.index('--gate standard-clients --host linux'))
         install = next(step for step in steps(acceptance) if "go-containerregistry" in step)
         self.assertIn("sha256sum --check", install)
+
+
+class TrainAndQueueTests(unittest.TestCase):
+    """Light checks on train PRs; everything on the merge queue and the train."""
+
+    def setUp(self):
+        self.ci = (WORKFLOWS / "ci.yml").read_text()
+        self.jobs = jobs(self.ci)
+        self.triggers = self.ci[:self.ci.index("\nconcurrency:")]
+
+    def test_the_merge_queue_and_pushes_to_a_train_run_ci(self):
+        self.assertRegex(self.triggers, r"\n  merge_group:\n(?:\s+#.*\n)*\s+types: \[checks_requested\]\n")
+        self.assertRegex(self.triggers, r"\n  push:\n(?:\s+#.*\n)*\s+branches: \[main, \"release-\*\"\]\n")
+
+    def test_selection_sees_the_head_branch_and_the_full_ci_label(self):
+        changes = self.jobs["changes"]
+        self.assertIn("HEAD_REF: ${{ github.event.pull_request.head.ref }}", changes)
+        self.assertIn("FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}", changes)
+        self.assertIn("macos: ${{ steps.select.outputs.macos }}", changes)
+
+    def test_evidence_binds_to_the_merge_groups_own_commit(self):
+        self.assertIn("  EXPECTED_CHECKOUT_COMMIT: ${{ github.event.merge_group.head_sha || github.sha }}\n",
+                      self.ci)
+
+    def test_a_newer_push_to_a_pull_request_or_a_train_cancels_the_older_run(self):
+        group = re.search(r"concurrency:\n(?:#.*\n)*\s+group: (.*)", self.ci).group(1)
+        cancel = re.search(r"\n  cancel-in-progress: (.*)", self.ci).group(1)
+        self.assertIn("github.event.pull_request.number", group)
+        self.assertIn("startsWith(github.ref, 'refs/heads/release-') && github.ref", group)
+        self.assertIn("github.event_name == 'pull_request'", cancel)
+        self.assertIn("github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')", cancel)
+        # Main and merge-queue runs fall back to their own run id.
+        self.assertTrue(group.rstrip().endswith("|| github.run_id }}"), group)
+
+    def test_the_final_gate_waits_for_every_other_job_and_always_reports(self):
+        gate = self.jobs["ignored-evidence"]
+        needs = set(re.search(r"needs: \[([^\]]*)\]", gate).group(1).split(", "))
+        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence"})
+        self.assertIn("    name: ignored-test evidence\n", gate)
+        self.assertIn("    if: ${{ always() }}\n", gate)
+        blocks = steps(gate)
+        first = next(index for index, step in enumerate(blocks) if "every_job.py" in step)
+        aggregate = next(index for index, step in enumerate(blocks) if "workflow_adapter.py aggregate" in step)
+        self.assertLess(first, aggregate)
+        self.assertNotIn("if:", blocks[first])
+        self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[first])
+        self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[aggregate])
+        self.assertIn("if: needs.changes.outputs.code == 'true'", blocks[aggregate])
+
+    def test_macos_runs_when_selected_and_splits_the_once_only_steps(self):
+        macos = self.jobs["macos"]
+        self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", macos)
+        self.assertIn("      fail-fast: false\n", macos)
+        self.assertIn("    name: portable macOS (${{ matrix.shard }}/" + str(SHARDS["portable-darwin"]) + ")\n", macos)
+        for name in ["Lint every target, with all features", "Doctests"]:
+            block = next(step for step in steps(macos) if "name: " + name in step)
+            self.assertRegex(block, r"if: matrix\.shard == \d\n")
+
+    def test_the_heavy_jobs_wait_for_their_own_selection(self):
+        for name in ["linux", "build-tests", "cluster", "acceptance"]:
+            self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
+        for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app"]:
+            self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
 
 
 class BenchmarkTests(unittest.TestCase):

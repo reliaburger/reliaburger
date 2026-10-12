@@ -613,9 +613,9 @@ book chapters sets `code` to false and runs no Rust at all, unless it touches ch
 the READMEs or the manual. Those count as code, because `documentation_first_run` checks
 their snippets and the manual is compiled into `relish`. A pull request stacked on another
 branch skips the acceptance suites unless someone labels it `full-ci`; it gets them when it
-targets `main`, or a release's merge-train branch: from 0.1.4 on, each release collects its
-pull requests on one `release-*` branch, and those are the release's changes, so they get the
-whole of CI. Benchmarks run on `main`, nightly, and on changes to the code they measure.
+targets `main`. From 0.1.4 on, each release collects its pull requests on one `release-*`
+merge-train branch, and from 0.2.1 those pull requests get a lighter set, for reasons the next
+section explains. Benchmarks run on `main`, nightly, and on changes to the code they measure.
 The gossip numbers gate nothing. The task-array benchmarks gate on one thing: a benchmark
 more than twice as slow as the baseline the last `main` run saved. Why twice, and not
 Criterion's own few per cent? Because a hosted runner is a different machine every night, and
@@ -636,6 +636,52 @@ its flakes: either the row says Fixed (with a loop that used to fail and now pas
 links a successor. Re-running those loops for the register paid for itself straight away:
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
+
+### Light checks on the train, everything in the queue
+
+By 0.2.1 the waiting was back. Every pull request into a train got the whole of CI, and a
+release had a dozen of them in flight. We timed twelve runs: 45 to 55 minutes of wall time.
+Runner queueing was mostly under ten minutes, so the runners weren't the problem. Portable
+macOS was the critical path in almost every run, at 35 to 49 minutes, then acceptance at about
+34. Everything else finished in about 15. Inside the macOS job, compiling the test binaries
+took 27 minutes; running all 6,288 tests took seven.
+
+So we asked what a pull request into a train actually needs to prove. That it compiles, lints
+clean on stable and on the minimum compiler, and passes the portable suite with the coverage
+floor. Portable Linux does all of that in about 15 minutes. macOS, the privileged and cluster
+suites, upgrades and benchmarks still have to pass, but on what lands, not on every draft of
+it. `select-jobs.sh` now gives a pull request into `release-*` a fourth output, `macos=false`,
+along with `heavy=false`. The full set runs in GitHub's merge queue, on the batch merged onto
+the train before any of it lands, and again on the push to the train. A `full-ci` label still
+buys the whole set on the pull request, and the gate PR into `main` (its head is a train) gets
+it too.
+
+Two things had to stay true. First, the evidence gate mustn't get weaker. It used to need only
+the evidence owners, so a failed `lint` job wouldn't have stopped it, and the merge queue can
+require exactly one check. `ignored-test evidence` now waits for every other job,
+fails when any of them failed or was cancelled, and still runs the owner checks. The
+aggregator accepts a light selection only when the run's own event is `pull_request`. A push,
+a merge-queue group or a manual run must show every owner, whatever select jobs said. In the
+queue, evidence binds to the temporary commit the queue built
+(`github.event.merge_group.head_sha`), exactly as a push binds to its own commit.
+
+Second, macOS had to get quicker, because the queue now waits for it. We split it into three
+jobs with nextest's `--partition hash:K/3`. Why hash and not `count`? `count` deals each
+binary's tests out in turn, so adding one test moves every later test to a different shard. A
+hash keeps a test where it is, so "it failed in shard 2" stays true tomorrow and reproduces
+locally. The cost is a slightly uneven split, and with seven minutes of tests between three
+shards that's seconds.
+
+Three jobs means three envelopes, and that opened a new way to cheat: two shards that both
+skip the same test would each look complete. The merge closes it. A partitioned
+`nextest list` still names every test, marking the ones it left to other shards as a
+mismatch with reason `partition`, so each shard's list carries the whole suite. The gate
+checks that the three lists name the same tests, that no test ran in two shards, that every
+test ran in one, and that the required cases add up. Each shard's seal names its shard, so one
+envelope can't be uploaded under another's name. Each shard still compiles the suite itself,
+so splitting saves the test time, not the compile time. A full run is now as slow as
+acceptance, not macOS, and a pull request into a train hears back in 15 to 20 minutes instead
+of about 50.
 
 ## Dependencies are code too
 
