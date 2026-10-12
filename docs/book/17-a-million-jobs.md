@@ -702,6 +702,40 @@ recorded as skipped, daily named arrays keep working past the definition cap,
 and on a real three-node cluster a cron job fires while other tenants fill
 every bulk slot.
 
+That last test first raced the wall clock. Its 96 bulk submissions had to land
+before the occurrence's minute came round, or the cron run took one of their
+slots, which is correct behaviour and a failed test. So it scheduled the
+occurrence for the next minute, or the one after when fewer than 30 seconds
+were left, and then waited for real time to pass: up to about 110 seconds
+against nextest's 120-second kill (#748). Giving it more slack would only move
+the cliff. Instead the leader now reads cron time from a `CronClock` on the
+task-array service:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub enum CronClock {
+    #[default]
+    System,
+    Manual(Arc<std::sync::atomic::AtomicU64>),
+}
+```
+
+Production never touches it, so `#[default]` makes `System` what
+`TaskArrayService` starts with. The test gives all three nodes clones of one
+`Manual` clock, which hold the same `Arc` and so the same counter, whichever
+node leads. It pins the clock to the current minute, schedules the occurrence
+half an hour later, fills the bulk slots, checks nothing has fired, and only
+then calls `set`. `set` takes `&self`, not `&mut self`, because the atomic
+gives us interior mutability: the leader loop reads the clock through its own
+`Arc` while the test moves it. The `Release` store pairs with the leader's
+`Acquire` load, so a leader that sees the new time also sees everything the
+test did before setting it. The wait went from up to two minutes to about
+seventeen seconds, most of it starting the cluster, and twelve runs in a row
+under eight busy loops all took the same time. Only the cron loop reads this
+clock. Registration, retention and the run timestamps stay on the wall clock,
+which is why the occurrence sits half an hour out: a schedule never fires in
+the wall-clock minute it was registered in.
+
 ### Watching a million jobs
 
 Here's the question that started issue #684: did last night's cron job
