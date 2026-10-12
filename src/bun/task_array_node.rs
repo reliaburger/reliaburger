@@ -352,6 +352,10 @@ pub struct TaskArrayNode {
     indexes: Mutex<HashMap<u64, Arc<super::task_result_index::TaskResultIndex>>>,
     telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
     output_syncs: Arc<std::sync::atomic::AtomicU64>,
+    /// fsyncs the control fence has cost, for [`Self::control_syncs`].
+    control_syncs: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether this process has made `root`'s directory entry durable.
+    root_durable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TaskArrayNode {
@@ -373,6 +377,8 @@ impl TaskArrayNode {
             indexes: Mutex::new(HashMap::new()),
             telemetry: Default::default(),
             output_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            control_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
         }
@@ -434,6 +440,12 @@ impl TaskArrayNode {
         self.output_syncs.load(Ordering::Relaxed)
     }
 
+    /// How many fsyncs the control fence in [`Self::sync`] has cost on
+    /// this node.
+    pub fn control_syncs(&self) -> u64 {
+        self.control_syncs.load(Ordering::Relaxed)
+    }
+
     /// Whether task data and the audit log, or the filesystem holding them,
     /// are too full to take new grants. Blocking I/O.
     fn task_data_pressured(root: &Path, audit_dir: Option<&Path>) -> bool {
@@ -465,15 +477,26 @@ impl TaskArrayNode {
         let root = self.config.root.clone();
         let path = root.join("control.json");
         let version = request.version;
+        let syncs = Arc::clone(&self.control_syncs);
+        let root_durable = Arc::clone(&self.root_durable);
         let checked = tokio::task::spawn_blocking(move || {
             let directory = root.as_path();
+            let existed = directory.is_dir();
             std::fs::create_dir_all(directory)?;
             // The directory entry itself must survive before a fence can.
-            let parent = directory
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            std::fs::File::open(parent)?.sync_all()?;
+            // Once per process (a previous one may have crashed before its
+            // flush) and whenever the directory had to be created: the
+            // leader calls this every tick, and on macOS each fsync is a
+            // whole-device flush (#809).
+            if !existed || !root_durable.load(Ordering::Acquire) {
+                let parent = directory
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                std::fs::File::open(parent)?.sync_all()?;
+                syncs.fetch_add(1, Ordering::Relaxed);
+                root_durable.store(true, Ordering::Release);
+            }
             let previous: ControlVersion = match std::fs::read(&path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -515,6 +538,8 @@ impl TaskArrayNode {
             }
             if version > previous {
                 persist_json(&path, &version)?;
+                // The fence file and its directory.
+                syncs.fetch_add(2, Ordering::Relaxed);
             }
             Ok::<_, std::io::Error>(ControlCheck::Accepted)
         })
@@ -1582,6 +1607,40 @@ mod tests {
         let req = request(vec![a]);
         let progress = sync_until_finished(&node, &req, 1).await;
         assert_eq!(progress.finished[0].succeeded, 10);
+    }
+
+    #[tokio::test]
+    async fn a_sync_flushes_the_disk_only_when_the_fence_changes() {
+        // On macOS every fsync is a whole-device flush, and the leader
+        // syncs each node every tick: an unchanged fence must cost none.
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("tasks");
+        let node = fake_node(&root, FakeRunner::always_succeeds());
+        let mut sync = request(Vec::new());
+        sync.version = ControlVersion {
+            epoch: 0,
+            term: 1,
+            index: 1,
+        };
+        node.sync(&sync).await;
+        // The new directory's entry, the fence file and its directory.
+        assert_eq!(node.control_syncs(), 3);
+        node.sync(&sync).await;
+        node.sync(&sync).await;
+        assert_eq!(
+            node.control_syncs(),
+            3,
+            "an unchanged fence flushed the disk"
+        );
+        sync.version.index = 2;
+        node.sync(&sync).await;
+        // A new fence rewrites its file; the directory entry is durable.
+        assert_eq!(node.control_syncs(), 5);
+        // A directory removed underneath the node is made durable again.
+        std::fs::remove_dir_all(&root).unwrap();
+        node.sync(&sync).await;
+        assert_eq!(node.control_syncs(), 8);
+        assert!(root.join("control.json").exists());
     }
 
     #[tokio::test]
