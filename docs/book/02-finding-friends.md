@@ -2569,20 +2569,79 @@ A resigning *leader* is the hard case, and it's where openraft 0.9 fought us.
 
 openraft 0.9 has no graceful leadership transfer. You cannot say "hand off to node 2 and step down." The self-healing planner worked around this by making "never remove the leader" an absolute rule and leaving the transfer seam for later. Later is now.
 
-The trick is to abuse the one lever openraft *does* give us: `trigger().elect()`, which forces a node to start a fresh election at a higher term:
+The trick is to abuse the one lever openraft *does* give us: `trigger().elect()`, which forces a node to start a fresh election at a higher term. A node can only trigger an election on itself, so the leader can't push anyone. Instead every voter's reconciler works out the same deposition target, a healthy voter that isn't under pressure itself, and that voter campaigns:
 
 ```rust
-if disk_pressured.contains(&self_id) {
-    if let Some(target) = pick_deposition_target(&voters, &health, self_id) {
-        council.raft().trigger().elect().await?;   // a healthy voter campaigns
-    }
-    return;   // never plan our own removal
+if let Some(leader) = current_leader
+    && leader != self_id
+    && disk_pressured.contains(&leader)
+    && pick_deposition_target(&voters, &health, leader, disk_pressured) == Some(self_id)
+{
+    council.raft().trigger().elect().await?;   // the chosen voter campaigns
+    return;
 }
 ```
 
-A follower campaigning at a higher term deposes the current leader by the normal rules of Raft — the leader sees a higher term and steps down. So a pressured leader picks a healthy voter, tells it to campaign, and gets demoted to an ordinary follower. Once it's an ordinary follower, the *new* leader's planner sees it as a pressured voter and replaces it with the follower path above. No new consensus primitive, no fork of openraft, just Raft's own term rules pointed at a useful outcome.
+A follower campaigning at a higher term deposes the current leader by the normal rules of Raft: the leader sees a higher term and steps down. Once it's an ordinary follower, the *new* leader's planner sees it as a pressured voter and replaces it with the follower path above. No new consensus primitive, no fork of openraft, just Raft's own term rules pointed at a useful outcome.
 
-Before building anything on this, we verified it actually works against openraft 0.9 in a gated test: elect a leader, make a healthy follower campaign, and assert the term advances and leadership moves. It does. Had it not, the fallback was an openraft version bump — a wire-and-storage compatibility risk we'd have flagged before taking. It held, so we didn't have to.
+Before building anything on this, we checked the lever against openraft 0.9 in a gated test: elect a leader, make a healthy follower campaign, and assert that the term advances and a single leader settles. It does. Had it not, the fallback was an openraft version bump, a wire-and-storage compatibility risk we'd have flagged before taking.
+
+Read that assertion again, though. It says *a* leader settles, not a *different* one. For a long time this chapter claimed the test showed leadership moving. It didn't, and the difference bit us.
+
+### Deposed is not replaced
+
+Deposing a leader only removes it. Who wins the election that follows is Raft's call, and Raft gives its vote to the most up-to-date log. On a busy cluster that's usually the old leader's: it wrote the newest entries, and a follower that campaigns a few milliseconds before receiving the latest one has the shorter log. The old leader and the other follower both refuse it. Its higher term still deposes the leader, and then the old leader's own election timer fires, it campaigns with the longest log, and it wins. The term went up, nothing moved.
+
+The cron test in chapter 17 hit exactly this (#646), and its fix pointed at the production one (#755). openraft exposes a runtime switch, `raft.runtime_config().elect(false)`, that stops a node starting elections on its own timer. It still votes, still replicates, and still leads if it's the leader. It just never campaigns. So a node that must give up leadership *holds its elections* first, and the only voters left in the race are the ones we want.
+
+Holding forever would be its own outage, so the hold is a little state machine with two ways out. The pure part is one function:
+
+```rust
+pub fn hold_ends(self_id: u64, current_leader: Option<u64>, now: Instant, until: Instant) -> bool {
+    current_leader.is_some_and(|leader| leader != self_id) || now >= until
+}
+```
+
+Another voter leads, so the handover worked and this node may campaign again. Or the deadline passed (30 seconds), so nobody else could win and the council needs this node back in the race. `Option::is_some_and` runs a test on the value if there is one and returns `false` for `None`, so "some other node leads" fits in one expression.
+
+The impure part lives in `ElectionHold`, which `CouncilNode` owns. It keeps the deadline in a `tokio::sync::watch` channel rather than behind a mutex:
+
+```rust
+pub(crate) fn hold_until(&self, until: Instant) {
+    let mut started = false;
+    self.until.send_modify(|held| {
+        started = held.is_none();
+        *held = Some(held.map_or(until, |current| current.max(until)));
+        self.raft.runtime_config().elect(false);
+    });
+    if started {
+        tokio::spawn(release_when_settled(/* ... */));
+    }
+}
+```
+
+`send_modify` runs the closure while it holds the channel's write lock, and the release task flips elections back on inside `send_if_modified` under the same lock. So a hold and a release can't interleave and leave elections switched on with a hold in place. The closure mutates `started`, a local outside it: Rust lets a closure borrow a local mutably as long as nothing else touches it until the closure is gone, and the compiler checks that for us. A repeated hold only pushes the deadline out (`max`), and only the first one spawns the release task, which waits on the Raft metrics watch and on the deadline, whichever moves first.
+
+The reconciler renews the hold on every tick while the pressured node leads *or nobody does*:
+
+```rust
+if pressured_voter_holds(
+    self_id,
+    current_leader,
+    disk_pressured.contains(&self_id),
+    pick_deposition_target(&voters, &health, self_id, disk_pressured).is_some(),
+) {
+    council.hold_elections_until(now + HANDOVER_HOLD);
+}
+```
+
+That "or nobody does" matters. The follower's campaign and the leader's tick race each other, and if the follower deposes the leader first, the leader is no longer a leader on its next tick. It still has to hold, because the election it must not win is the one happening right now. And the hold only starts when there's a successor that could lead and isn't under disk pressure itself. Three pressured voters holding each other's elections would be a council with no leader at all, so `pick_deposition_target` now skips pressured voters too.
+
+The admin endpoint got the same treatment. `POST /v1/cluster/elect` used to make the node that received it campaign once and report "election triggered", whoever won. Now the receiving voter first asks the leader to hold its elections (a forwarded call carrying the caller's own credential, so the leader repeats the admin check), then campaigns every one and a half leader leases until someone other than the old leader leads, and answers with who that is. Usually it's the node you asked. If another voter's log is longer, Raft picks that one instead, and that's still a handover. Sent to the leader itself, the request is refused: a leader can't campaign itself out of office.
+
+The new tests check the thing that matters, the identity of the next leader, not the term. A unit test builds the #646 situation on purpose: one follower misses an entry and campaigns at a higher term with the shorter log. Without the hold, the old leader wins back leadership on every run; with it, the up-to-date follower wins on every run. A gated test does five handovers in a row while a writer hammers whoever leads, and asserts each one moves leadership and no old leader ever leads at a later term. With the hold switched off, its first round never completes: under constant writes the old leader wins every election for 20 seconds straight.
+
+Is there anything here a reconciler timeout could abandon, the way #758 found a membership change left half done? No. `trigger().elect()` returns as soon as the campaign starts, and the hold is local state with its own deadline, so a slow tick leaves nothing half applied. A deposition in the middle of a membership change is #758's other case, a leader failing over between the two steps, and the new leader finishes it.
 
 ### Getting the signal to the person who can act on it
 
@@ -2648,7 +2707,7 @@ On the testing side, `relish test` now waits out a short leader change. Lease cr
 
 ### Testing the whole thing
 
-The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler and watches leadership move off it, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
+The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler, keeps writes flowing, and watches leadership move off it without the old leader ever winning it back, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
 
 The three field bugs each got a test that failed first. `security_state_init_never_replaces_an_initialised_security_state` applies a bootstrap on top of a state holding a token, and `a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file` starts a real node, bootstrap file and all, on a recovered directory. `durable_consumer_follows_a_recovered_council_and_still_refuses_the_replaced_one` drives a node's real durable consumer through the old council's generation, the recovered one, and the old one again. And `a_voter_that_never_snapshotted_recovers_from_its_committed_log` runs a one-voter council on durable, encrypted stores, writes fifty entries, stops it and recovers from what's on disk, with unit tests beside it for the commit point, the tail after a snapshot and the missing key.
 

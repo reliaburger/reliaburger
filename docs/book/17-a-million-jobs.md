@@ -315,7 +315,8 @@ favours the longest log, so the old leader won it a second later and the test
 waited 30 seconds for a handover that never came. Now the helper switches off
 the old leader's elections (openraft's `runtime_config().elect(false)`) and has
 the most up-to-date other voter campaign every 3 seconds until one of them
-leads. The test also registers its schedule early in a minute: the minute a
+leads. Production deposition had the same flaw, and 0.2.1 gave it the same fix
+(chapter 2, "Deposed is not replaced"). The test also registers its schedule early in a minute: the minute a
 schedule lands in counts as already seen, so a request sent at 59 seconds could
 miss the occurrence it was waiting for.
 

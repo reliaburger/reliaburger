@@ -539,7 +539,7 @@ Recovery from the last two cases is deliberately operator-triggered rather than 
 
 **Backup and restore:** For disaster recovery from total cluster loss, the leader periodically exports an encrypted state-machine snapshot to external object storage (`file://`, `s3://` or `gs://`), sealed with a key derived from the cluster master key. You configure the destination and cadence under `[cluster.backup]`; the export runs automatically on the leader, no command to remember. To recover after losing the whole council, `relish council recover` restores from the latest sealed backup on a stopped survivor (see §8.3 above).
 
-**Disk exhaustion:** Council nodes monitor available disk space and proactively step down from the council when storage falls below a configurable threshold (default: 1 GB), preventing Raft from stalling on failed log writes. The node rejoins the council automatically once disk pressure is resolved.
+**Disk exhaustion:** Council nodes monitor available disk space and proactively step down from the council when storage falls below a configurable threshold (default: 1 GB), preventing Raft from stalling on failed log writes. A pressured leader first hands leadership to a healthy voter, holding its own elections so it can't win the election that follows. The node rejoins the council automatically once disk pressure is resolved.
 
 > For protocol details, state machine diagrams, and split-brain prevention, see [design/gossip-mustard.md](design/gossip-mustard.md).
 
