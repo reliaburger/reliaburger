@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use reliaburger::grill::command::OwnedCommands;
 use reliaburger::grill::runc_intent::{IntentConfiguration, IntentJournal, IntentPhase};
 use reliaburger::grill::{InstanceId, OciSpec};
 
@@ -305,6 +306,79 @@ async fn the_next_process_waits_for_a_mutation_its_predecessor_left_running() {
         "the next mutation overtook its predecessor"
     );
     releaser.await.unwrap();
+    commands
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+/// Bun execs into a new binary after its state sweep has persisted a command
+/// but before the command's owner starts. Nothing will ever start that
+/// command, so waiting for it can't succeed: the new process refused
+/// adoption and exited (#812). Under the exclusive claim it must cancel the
+/// abandoned attempt, which also fences any delayed start, and go on.
+#[tokio::test]
+async fn the_next_process_cancels_a_mutation_its_predecessor_prepared_but_never_started() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = journal(root.path());
+    let id = instance();
+    let claim = journal
+        .claim(&id, None)
+        .await
+        .unwrap()
+        .publish(&spec())
+        .await
+        .unwrap();
+    let generation = claim.record().unwrap().generation.clone();
+    let generation_name: String =
+        serde_json::from_value(serde_json::to_value(&generation).unwrap()).unwrap();
+    // The predecessor's collection, at the path its claim supervises.
+    let abandoned_commands = OwnedCommands::new(
+        root.path()
+            .join("intents/records")
+            .join(&id.0)
+            .join("generations")
+            .join(generation_name)
+            .join("mutations"),
+        bun(),
+    );
+    let environment = BTreeMap::from([("ROOT".into(), root.path().display().to_string())]);
+    let abandoned = abandoned_commands
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "touch \"$ROOT/late-mutation\"".into()],
+            &environment,
+        )
+        .await
+        .unwrap();
+    // exec closes the claim's lock with every other descriptor.
+    drop(claim);
+
+    let commands = journal
+        .claim(&id, Some(generation))
+        .await
+        .unwrap()
+        .supervise_commands(bun())
+        .unwrap();
+    let (commands, output) = commands
+        .run(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("an abandoned prepared command refused admission");
+    assert_eq!(output.exit_code, Some(0));
+    assert!(
+        abandoned_commands.start(&abandoned).await.is_err(),
+        "a delayed start activated the abandoned command"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!root.path().join("late-mutation").exists());
     commands
         .seal(Duration::from_secs(15))
         .await
