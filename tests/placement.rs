@@ -3649,7 +3649,8 @@ async fn web_rollout_view(nodes: &[&Node]) -> (Vec<usize>, Vec<String>) {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy() {
     let shutdown = CancellationToken::new();
-    let cluster = start_spread_web_cluster("rs", 24041, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let cluster = start_spread_web_cluster("rs", cluster_ports.base, &shutdown).await;
     let nodes: Vec<&Node> = cluster.iter().collect();
     wait_for_released_web(nodes[0], 1).await;
 
@@ -3713,7 +3714,8 @@ async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy(
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
     let shutdown = CancellationToken::new();
-    let cluster = start_spread_web_cluster("rf", 23041, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let cluster = start_spread_web_cluster("rf", cluster_ports.base, &shutdown).await;
     let nodes: Vec<&Node> = cluster.iter().collect();
     wait_for_released_web(nodes[0], 1).await;
 
@@ -3833,7 +3835,9 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn rollback_works_after_every_node_restarts() {
     let root = CancellationToken::new();
-    let ports = [("rr1", 25041_u16), ("rr2", 25045), ("rr3", 25049)];
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let ports = [("rr1", base), ("rr2", base + 4), ("rr3", base + 8)];
     let mut tokens: Vec<CancellationToken> = (0..3).map(|_| root.child_token()).collect();
     let mut nodes: Vec<Option<Node>> = Vec::new();
     for (index, (name, port)) in ports.iter().enumerate() {
