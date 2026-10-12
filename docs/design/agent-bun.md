@@ -1456,6 +1456,8 @@ join = ["10.0.1.5:9443"]
 
 **Recovery:** systemd restarts Bun. On startup, Bun reconnects to running containers (see 5.1 reconnect), resumes all operations, and reconciles state with the cluster via the reporting tree.
 
+A restart may also change the runtime flag. When a node moves from `--runtime runc` or `--runtime process` to `mixed` (or to `auto`, which selects `mixed` where runc exists), its running workloads have no `runtime-routes` entry, because only the mixed runtime writes routes. Before startup recovery reads the launch inventory, Bun routes each launch that exactly one backend's ownership journal lists, and that fits that backend, to it, and logs the instances it routed. Without this step every `runc` to `mixed` restart with running containers failed and systemd restarted Bun in a loop (#823). A launch both backends list stays unrouted and recovery refuses it. So does an image app that the process runtime ran as a host process, which the mixed runtime would contain instead (#827).
+
 ### 7.2 Container Runtime (containerd) Crash
 
 **What happens:** containerd exits unexpectedly.
@@ -1518,7 +1520,7 @@ join = ["10.0.1.5:9443"]
 
 **What happens:** The new binary fails to start after the upgrade exec.
 
-**Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)).
+**Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)). Bun starts that hash at boot on a detached thread, not Tokio's blocking pool, because dropping the runtime waits for blocking-pool tasks: a start-up error exits at once rather than after the hash of a large binary finishes ([#816](https://github.com/reliaburger/reliaburger/issues/816)).
 
 **Impact:** This node is temporarily unable to accept new work. Running containers are unaffected (containerd manages them independently).
 

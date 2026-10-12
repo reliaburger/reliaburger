@@ -4,6 +4,10 @@
 //! refresher, and placement reconciler — the exact wiring `bun --cluster`
 //! runs. Apply an app on one node; assert replicas spread across the
 //! cluster.
+//!
+//! Each test leases its nodes' ports with `reserve_port_block_lease` and
+//! holds them until it ends, so these tests can run beside each other and
+//! beside the other cluster suites or another worktree's run (#744).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,6 +22,21 @@ use tokio_util::sync::CancellationToken;
 #[path = "support/cluster.rs"]
 mod cluster_support;
 use cluster_support::{MembershipSource, WiredNode, WiredNodeOptions, local, start_wired_node};
+#[path = "support/bun_process.rs"]
+mod bun_process;
+use bun_process::{PortBlockReservation, reserve_port_block_lease};
+
+/// Ports per node: gossip, +1 Raft, +2 reporting, +3 API.
+const PORTS_PER_NODE: u16 = 4;
+
+/// One leased block for a three-node test cluster: node `n` (0, 1 or 2)
+/// starts at `base + 4n`. The test holds it until it ends, so no other
+/// fixture on the host (a test beside it, another suite, another
+/// worktree's run) binds these ports, including a stopped node's ports
+/// while it restarts (#744).
+fn lease_cluster_ports() -> PortBlockReservation {
+    reserve_port_block_lease(3 * PORTS_PER_NODE)
+}
 
 /// How often `wait_until` re-checks its condition in this binary.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -267,9 +286,11 @@ async fn nodes_running_web(nodes: &[&Node]) -> usize {
 async fn apply_on_any_node_places_across_the_cluster() {
     let shutdown = CancellationToken::new();
 
-    let n1 = start_node("p1", 18441, vec![], &shutdown).await;
-    let n2 = start_node("p2", 18445, vec![local(18441)], &shutdown).await;
-    let n3 = start_node("p3", 18449, vec![local(18441)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("p1", base, vec![], &shutdown).await;
+    let n2 = start_node("p2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("p3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     // Wait for a leader to emerge and reports to arrive (the scheduler
@@ -387,9 +408,11 @@ async fn live_web_instances(nodes: &[&Node]) -> usize {
 async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
     let shutdown = CancellationToken::new();
 
-    let n1 = start_node("s1", 18461, vec![], &shutdown).await;
-    let n2 = start_node("s2", 18465, vec![local(18461)], &shutdown).await;
-    let n3 = start_node("s3", 18469, vec![local(18461)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("s1", base, vec![], &shutdown).await;
+    let n2 = start_node("s2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("s3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     let ready = wait_until(Duration::from_secs(30), || {
@@ -581,11 +604,25 @@ async fn stop_until_gone(node: &Node, nodes: &[&Node], app: &str) {
 async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
     let shutdown = CancellationToken::new();
 
-    let n1 = start_labelled_node("v1", 18561, vec![], &shutdown, &[("zone", "a")]).await;
-    let n2 =
-        start_labelled_node("v2", 18565, vec![local(18561)], &shutdown, &[("zone", "b")]).await;
-    let n3 =
-        start_labelled_node("v3", 18569, vec![local(18561)], &shutdown, &[("zone", "b")]).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_labelled_node("v1", base, vec![], &shutdown, &[("zone", "a")]).await;
+    let n2 = start_labelled_node(
+        "v2",
+        base + 4,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
+    let n3 = start_labelled_node(
+        "v3",
+        base + 8,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
     let nodes = [&n1, &n2, &n3];
     let ready = wait_until(Duration::from_secs(30), || {
         nodes.iter().any(|n| *n.thinks_leader.borrow())
@@ -649,7 +686,9 @@ fn volume_root(name: &str, gossip_port: u16, app: &str) -> std::path::PathBuf {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
     let root = CancellationToken::new();
-    let ports = [("h1", 21141_u16), ("h2", 21145), ("h3", 21149)];
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let ports = [("h1", base), ("h2", base + 4), ("h3", base + 8)];
     let zones = [[("zone", "a")], [("zone", "b")], [("zone", "b")]];
     let tokens: Vec<CancellationToken> = (0..3).map(|_| root.child_token()).collect();
     let mut nodes: Vec<Option<Node>> = Vec::new();
@@ -892,7 +931,9 @@ async fn autoscaler_scales_up_on_high_metric() {
     "#,
     )
     .unwrap();
-    let [n1, n2, n3] = start_autoscale_cluster(18541, &config, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let [n1, n2, n3] = start_autoscale_cluster(base, &config, &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     // The leader's autoscaler reads its own store; feed every node's so it
@@ -971,8 +1012,9 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
     "#,
     )
     .unwrap();
-    // Below the 27000..30000 range other suites lease port blocks from.
-    let [n1, n2, n3] = start_autoscale_cluster(22341, &config, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let [n1, n2, n3] = start_autoscale_cluster(base, &config, &shutdown).await;
     let nodes = [&n1, &n2, &n3];
 
     for node in &nodes {
@@ -1022,16 +1064,18 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
 async fn fault_injection_rejected_when_quorum_at_risk() {
     let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("r1", 18741, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("r1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "r2",
-        18745,
-        vec![local(18741)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("r3", 18749, vec![local(18741)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("r3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     // Wait for a 3-member council so `council_size == 3`.
@@ -1304,16 +1348,18 @@ async fn partition_isolates_a_node_for_real() {
 
     let auth = NodeFaultAuth::admin("partition-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("q1", 18641, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("q1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "q2",
-        18645,
-        vec![local(18641)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("q3", 18649, vec![local(18641)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("q3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     // Gossip can converge before Raft has elected a stable three-voter council.
@@ -1399,16 +1445,18 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
 
     let auth = NodeFaultAuth::admin("chaos-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("f1", 18941, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("f1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "f2",
-        18945,
-        vec![local(18941)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("f3", 18949, vec![local(18941)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("f3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     let converged = wait_until(Duration::from_secs(30), || {
@@ -1623,7 +1671,9 @@ async fn web_ordinals(nodes: &[&Node]) -> Vec<(u32, String)> {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn losing_the_leader_node_places_only_its_replica_on_the_survivors() {
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("nl", 19941, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("nl", base, &shutdown).await;
     let spread = web_ordinals(&nodes.iter().collect::<Vec<_>>()).await;
     let numbers: Vec<u32> = spread.iter().map(|(ordinal, _)| *ordinal).collect();
     assert_eq!(numbers, [0, 1, 2], "replicas share an id: {spread:?}");
@@ -1775,7 +1825,9 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("kw", 20441, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("kw", base, &shutdown).await;
     // The quorum rail admits one affected voter only once three vote, and the
     // leader refuses node faults until that membership has settled.
     let council: Vec<&Node> = nodes.iter().collect();
@@ -1925,7 +1977,9 @@ async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("wk", 19541, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("wk", base, &shutdown).await;
     let [entry, target, bystander] = &nodes;
 
     let (target_pid, _) = web_process(target).await.expect("target runs web");
@@ -2015,7 +2069,9 @@ async fn a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs()
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("nf", 19841, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("nf", base, &shutdown).await;
     let entry = &nodes[0];
 
     let summary = entry
@@ -2105,7 +2161,9 @@ fn followed_nodes(events: &[reliaburger::ketchup::sse::SseEvent]) -> Vec<String>
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn follow_and_top_cover_every_node_and_survive_one_leaving() {
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("lf", 19641, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("lf", base, &shutdown).await;
     let entry = &nodes[0];
     // Lose a follower rather than the leader, so the test watches the
     // follow's reaction rather than an election.
@@ -2224,7 +2282,9 @@ async fn tui_logs_history_and_events_cover_every_node_and_name_a_missing_one() {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("cv", 20541, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("cv", base, &shutdown).await;
     let entry = &nodes[0];
     let doomed = nodes[1..]
         .iter()
@@ -2342,7 +2402,9 @@ async fn tui_logs_history_and_events_cover_every_node_and_name_a_missing_one() {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn wtf_and_path_reach_every_node_through_the_entry_node() {
     let shutdown = CancellationToken::new();
-    let nodes = start_spread_web_cluster("wt", 19741, &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let nodes = start_spread_web_cluster("wt", base, &shutdown).await;
     // Enter through the middle node, so the path's source (the lowest-named
     // node running `web`) is somewhere else.
     let entry = &nodes[1];
@@ -2410,9 +2472,11 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn ingress_reaches_nodes_without_local_replicas() {
     let shutdown = CancellationToken::new();
-    let n1 = start_node("ingress1", 19441, vec![], &shutdown).await;
-    let n2 = start_node("ingress2", 19445, vec![local(19441)], &shutdown).await;
-    let n3 = start_node("ingress3", 19449, vec![local(19441)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("ingress1", base, vec![], &shutdown).await;
+    let n2 = start_node("ingress2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("ingress3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
     let config = reliaburger::config::Config::parse(
         r#"
@@ -2570,20 +2634,22 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
     let auth = NodeFaultAuth::admin("reservation-admin");
     let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
     let n1 =
-        start_node_with_auth("reservation1", 20341, vec![], &shutdown, Some(auth.clone())).await;
+        start_node_with_auth("reservation1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "reservation2",
-        20345,
-        vec![local(20341)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
     let n3 = start_node_with_auth(
         "reservation3",
-        20349,
-        vec![local(20341)],
+        base + 8,
+        vec![local(base)],
         &shutdown,
         Some(auth),
     )
@@ -2767,19 +2833,21 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
 async fn cluster_audit_query_merges_every_node() {
     let auth = NodeFaultAuth::admin("audit-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("audit1", 20641, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("audit1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "audit2",
-        20645,
-        vec![local(20641)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
     let n3 = start_node_with_auth(
         "audit3",
-        20649,
-        vec![local(20641)],
+        base + 8,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
@@ -2889,19 +2957,21 @@ async fn follower_apply_preserves_user_authority_for_administrative_manifests() 
     use reliaburger::sesame::types::{ApiRole, TokenScope};
     let auth = NodeFaultAuth::admin("apply-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("apply1", 20401, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("apply1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "apply2",
-        20405,
-        vec![local(20401)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
     let n3 = start_node_with_auth(
         "apply3",
-        20409,
-        vec![local(20401)],
+        base + 8,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
@@ -2992,16 +3062,18 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
     use reliaburger::relish::RelishError;
     let auth = NodeFaultAuth::admin("capacity-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("cap1", 26341, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("cap1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "cap2",
-        26345,
-        vec![local(26341)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 = start_node_with_auth("cap3", 26349, vec![local(26341)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth("cap3", base + 8, vec![local(base)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
     assert!(
         wait_until(Duration::from_secs(40), || nodes.iter().any(|node| {
@@ -3027,7 +3099,7 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
         loop {
             let peers = follower.client.nodes().await.unwrap();
             if peers.len() == 3 && peers.iter().all(|peer| peer.api_address.is_some()) {
-                let expected = [("cap1", 26344), ("cap2", 26348), ("cap3", 26352)];
+                let expected = [("cap1", base + 3), ("cap2", base + 7), ("cap3", base + 11)];
                 for (id, port) in expected {
                     let peer = peers.iter().find(|peer| peer.node_id == id).unwrap();
                     assert_eq!(peer.api_address, Some(local(port)));
@@ -3159,17 +3231,25 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
 async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion() {
     let auth = NodeFaultAuth::admin("storage-admin");
     let shutdown = CancellationToken::new();
-    let n1 = start_node_with_auth("storage1", 26841, vec![], &shutdown, Some(auth.clone())).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node_with_auth("storage1", base, vec![], &shutdown, Some(auth.clone())).await;
     let n2 = start_node_with_auth(
         "storage2",
-        26845,
-        vec![local(26841)],
+        base + 4,
+        vec![local(base)],
         &shutdown,
         Some(auth.clone()),
     )
     .await;
-    let n3 =
-        start_node_with_auth("storage3", 26849, vec![local(26841)], &shutdown, Some(auth)).await;
+    let n3 = start_node_with_auth(
+        "storage3",
+        base + 8,
+        vec![local(base)],
+        &shutdown,
+        Some(auth),
+    )
+    .await;
     let nodes = [&n1, &n2, &n3];
     assert!(
         wait_until(Duration::from_secs(40), || nodes.iter().any(|node| *node
@@ -3205,9 +3285,9 @@ async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion(
         .await
         .unwrap();
     let roots: Vec<_> = [
-        ("storage1", 26841),
-        ("storage2", 26845),
-        ("storage3", 26849),
+        ("storage1", base),
+        ("storage2", base + 4),
+        ("storage3", base + 8),
     ]
     .into_iter()
     .map(|(name, port)| std::env::temp_dir().join(format!("rb-placement-{name}-{port}/volumes")))
@@ -3416,9 +3496,11 @@ async fn roll_web_out(nodes: &[&Node], tag: &str) {
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
     let shutdown = CancellationToken::new();
-    let n1 = start_node("rb1", 18961, vec![], &shutdown).await;
-    let n2 = start_node("rb2", 18965, vec![local(18961)], &shutdown).await;
-    let n3 = start_node("rb3", 18969, vec![local(18961)], &shutdown).await;
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("rb1", base, vec![], &shutdown).await;
+    let n2 = start_node("rb2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("rb3", base + 8, vec![local(base)], &shutdown).await;
     let nodes = [&n1, &n2, &n3];
     let ready = wait_until(Duration::from_secs(30), || {
         nodes.iter().any(|n| *n.thinks_leader.borrow())

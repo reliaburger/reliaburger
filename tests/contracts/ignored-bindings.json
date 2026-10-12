@@ -1513,6 +1513,12 @@
   },
   {
     "source": "tests/owned_task_arrays.rs",
+    "function": "runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
     "function": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
     "binary": "reliaburger::owned_task_arrays",
     "test": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets"

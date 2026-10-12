@@ -35,13 +35,13 @@ class WorkflowAssembly(unittest.TestCase):
         self.temp.cleanup()
 
     def test_portable_plan_waits_for_both_hosts_and_optimized_boundary(self):
-        plan = self.w.selected_workflow(self.expected, code='true', heavy='false')
+        plan = self.w.selected_workflow(self.expected, code='true', heavy='false', macos='true')
         self.assertEqual(plan['mode'], 'portable')
         self.assertEqual(set(plan['jobs']), {'changes', 'portable', 'macos', 'contract-boundaries'})
         self.assertEqual(set(plan['gates']), {'portable-linux', 'portable-darwin', 'optimized-cron'})
 
     def test_full_plan_keeps_all_existing_owner_jobs_and_archive_builder(self):
-        plan = self.w.selected_workflow(self.expected, code='true', heavy='true')
+        plan = self.w.selected_workflow(self.expected, code='true', heavy='true', macos='true')
         self.assertEqual(plan['mode'], 'full')
         self.assertEqual(set(plan['jobs']), {'changes', 'portable', 'macos', 'contract-boundaries', 'linux', 'build-tests', 'cluster', 'acceptance'})
         self.assertIn('oci-interruptions', plan['gates'])
@@ -49,16 +49,54 @@ class WorkflowAssembly(unittest.TestCase):
 
     def test_selection_never_inferred_from_absent_artifacts(self):
         with self.assertRaises(c.Invalid):
-            self.w.selected_workflow(self.expected, code='false', heavy='true')
+            self.w.selected_workflow(self.expected, code='false', heavy='true', macos='true')
         with self.assertRaises(c.Invalid):
-            self.w.selected_workflow(self.expected, code=True, heavy='false')
-        self.assertIsNone(self.w.selected_workflow(self.expected, code='false', heavy='false'))
+            self.w.selected_workflow(self.expected, code=True, heavy='false', macos='true')
+        self.assertIsNone(self.w.selected_workflow(self.expected, code='false', heavy='false', macos='false'))
+
+    def test_light_plan_waits_only_for_linux_and_the_optimized_boundary(self):
+        plan = self.w.selected_workflow(self.expected, code='true', heavy='false', macos='false')
+        self.assertEqual(plan['mode'], 'light')
+        self.assertEqual(set(plan['jobs']), {'changes', 'portable', 'contract-boundaries'})
+        self.assertEqual(set(plan['gates']), {'portable-linux', 'optimized-cron'})
+
+    def test_heavy_work_without_macos_or_an_unknown_macos_value_is_refused(self):
+        with self.assertRaises(c.Invalid):
+            self.w.selected_workflow(self.expected, code='true', heavy='true', macos='false')
+        for value in [None, True, '', 'yes']:
+            with self.subTest(macos=value), self.assertRaises(c.Invalid):
+                self.w.selected_workflow(self.expected, code='true', heavy='false', macos=value)
+
+    def test_the_portable_macos_owner_is_split_into_three_hash_partitions(self):
+        self.assertEqual(self.w.SHARDS, {'portable-darwin': 3})
+        self.assertEqual([self.w.partition('portable-darwin', shard) for shard in (1, 2, 3)],
+                         ['hash:1/3', 'hash:2/3', 'hash:3/3'])
+        self.assertIsNone(self.w.partition('portable-linux', None))
+        for gate, shard in [('portable-darwin', None), ('portable-darwin', 0), ('portable-darwin', 4),
+                            ('portable-darwin', '1'), ('portable-linux', 1)]:
+            with self.subTest(gate=gate, shard=shard), self.assertRaises(c.Invalid):
+                self.w.partition(gate, shard)
+
+    def test_a_shard_lists_and_runs_with_its_partition(self):
+        self.root.joinpath('.config').mkdir()
+        self.root.joinpath('.config/nextest.toml').write_text('synthetic expected config')
+        manifest = {'gates': {'portable-darwin': {'command': ['make', 'test'], 'hosts': ['darwin']}},
+                    'contracts': [{'cases': [{'requires': ['portable-darwin'], 'sources': ['src/contract.rs']}]}]}
+        entry = self.w.entry_from_make(self.root, manifest, 'portable-darwin', 'darwin', shard=2)
+        self.assertEqual(entry['partition'], 'hash:2/3')
+        self.assertEqual(entry['selectors'], ['--profile', 'ci', '--partition', 'hash:2/3'])
+        run, listed = self.w.gates.commands(entry)
+        self.assertIn('hash:2/3', run)
+        self.assertIn('hash:2/3', listed)
+        unsharded = self.w.entry_from_make(self.root, manifest, 'portable-darwin', 'darwin')
+        self.assertNotIn('partition', unsharded)
+        self.assertNotIn('--partition', unsharded['selectors'])
 
     def test_context_uses_actual_checkout_not_pr_head_or_late_receipt(self):
         bad = dict(self.expected, commit='PR-head')
         with self.assertRaises(c.Invalid):
-            self.w.selected_workflow(bad, code='true', heavy='false')
-        plan = self.w.selected_workflow(self.expected, code='true', heavy='false')
+            self.w.selected_workflow(bad, code='true', heavy='false', macos='true')
+        plan = self.w.selected_workflow(self.expected, code='true', heavy='false', macos='true')
         self.assertEqual(plan['commit'], self.expected['commit'])
 
     def test_cluster_suffix_keeps_trailing_filter_space_and_archive_options(self):
@@ -97,7 +135,7 @@ class WorkflowAssembly(unittest.TestCase):
             self.w.make_selection(self.root, 'test')
 
     def test_job_aggregation_requires_completed_current_selected_jobs(self):
-        plan = self.w.selected_workflow(self.expected, code='true', heavy='false')
+        plan = self.w.selected_workflow(self.expected, code='true', heavy='false', macos='true')
         needs = {name: {'result': 'success'} for name in plan['jobs']}
         self.w.job_results(plan, needs)
         for status in ['failure', 'cancelled', 'skipped', 'in_progress', '']:
@@ -110,7 +148,7 @@ class WorkflowAssembly(unittest.TestCase):
             self.w.job_results(plan, needs)
 
     def test_portable_plan_rejects_accidental_missing_heavy_selection(self):
-        plan = self.w.selected_workflow(self.expected, code='true', heavy='true')
+        plan = self.w.selected_workflow(self.expected, code='true', heavy='true', macos='true')
         needs = {name: {'result': 'success'} for name in ['changes', 'portable', 'macos', 'contract-boundaries']}
         with self.assertRaises(c.Invalid):
             self.w.job_results(plan, needs)

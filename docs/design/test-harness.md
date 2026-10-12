@@ -81,7 +81,12 @@ acceptance uses Linux VMs (V04 in the roadmap's [known gaps](../roadmap.md#known
 
 Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
-PR targets `main` or a release's merge-train branch (`release-*`), and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+Pull requests into a release's merge-train branch (`release-*`) run the light set:
+lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
+contract boundaries. The merge queue on the train, the push to it and the gate PR
+into `main` run everything, including the three macOS shards
+([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
 holds a fixture for each of these rules.
@@ -297,8 +302,10 @@ own script declaration. No prefix matching or generic alias can widen the bridge
 The seventeen original manual/subprocess classifications remain outside CI
 inventory, with the original policy visible in the generated matrix.
 
-`workflow_assembly.py` defines eleven literal owners and derives portable/full
-selection from trusted current workflow inputs. `workflow_adapter.py` preserves
+`workflow_assembly.py` defines eleven literal owners and derives light, portable
+or full selection from trusted current workflow inputs; only a pull request may
+qualify with less than full. The macOS owner runs as three hash-partition
+shards, and aggregation proves their lists cover every test exactly once. `workflow_adapter.py` preserves
 those commands and their complete selections. Ordinary nextest producers retain
 discovery and JUnit under one selector/environment plan. `completion.py` retains
 libtest discovery, selected-case completion and the actual child exit for owned
@@ -394,8 +401,12 @@ tmpfs still mounted, which `start_wired_node` failed to remove and then reused. 
   or killing it. Leadership can move under load, and a write to a follower returns
   `ForwardToLeader`.
 
-Older suites (`placement`, `cluster_task_arrays`, `council_disaster_recovery`) still use
-fixed blocks below the leased 27000–30000 range; keep new fixed ports out of that range.
+`placement`, `cluster_task_arrays` and `council_disaster_recovery` lease their blocks the
+same way (#744). Before that, three `cluster_task_arrays` tests shared one fixed block and
+two more shared another, so two runs of the binary at once (two worktrees, say) failed with
+"Address already in use" on the second run's gossip bind. A suite that still has fixed
+ports (`cluster_gossip`) keeps them below the leased 27000–30000
+range; keep new fixed ports out of that range.
 
 The same rule covers any port a process gives up and binds again: a crash fixture's
 restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
