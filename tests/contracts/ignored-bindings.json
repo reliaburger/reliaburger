@@ -954,6 +954,18 @@
     "test": "managed_guest_startup_establishes_bpffs_before_bun"
   },
   {
+    "source": "tests/oci_crash.rs",
+    "function": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+    "binary": "reliaburger::oci_crash",
+    "test": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+    "binary": "reliaburger::oci_crash",
+    "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds"
+  },
+  {
     "source": "tests/owned_network.rs",
     "function": "owned_network_setup_and_forwarding_retire_through_the_generation",
     "binary": "reliaburger::owned_network",

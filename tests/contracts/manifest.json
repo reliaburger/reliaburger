@@ -7231,6 +7231,44 @@
       ]
     },
     {
+      "id": "issue-780-root-cleanup-mounts",
+      "issue": 780,
+      "promise": "An OCI test's root is unmounted and removed when the test ends, whether it passed or panicked.",
+      "supported_paths": [
+        "Rootful runs that leave workload identity tmpfs mounted beneath the root"
+      ],
+      "cases": [
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        },
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A root that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
       "id": "issue-734-rootless-test-cleanup",
       "issue": 734,
       "promise": "A failed rootless OCI test leaves none of its network helpers running.",
