@@ -7318,6 +7318,58 @@
       "boundaries": [
         "Running host tasks under mount isolation is #714; until then host jobs need mount_isolation = false."
       ]
+    },
+    {
+      "id": "issue-692-rollout-safety",
+      "issue": 692,
+      "promise": "A cluster spec change reaches one node at a time, a failed rollout is marked RolloutFailed and never retried until the spec changes, and rollback targets survive every node restarting.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs"
+      ],
+      "cases": [
+        {
+          "id": "rollout-safety-three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "binary": "reliaburger::placement",
+          "test": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "binary": "reliaburger::placement",
+          "test": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-rollback_works_after_every_node_restarts",
+          "binary": "reliaburger::placement",
+          "test": "rollback_works_after_every_node_restarts",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Re-applying the identical failed spec keeps RolloutFailed; only a different spec clears it."
+      ],
+      "boundaries": [
+        "Rollout progress comes from node reports; full leader-coordinated rollouts with a cluster-wide budget are not claimed."
+      ]
     }
   ]
 }
