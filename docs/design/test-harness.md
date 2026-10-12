@@ -390,8 +390,12 @@ tmpfs still mounted, which `start_wired_node` failed to remove and then reused. 
   or killing it. Leadership can move under load, and a write to a follower returns
   `ForwardToLeader`.
 
-Older suites (`placement`, `cluster_task_arrays`, `council_disaster_recovery`) still use
-fixed blocks below the leased 27000–30000 range; keep new fixed ports out of that range.
+`placement`, `cluster_task_arrays` and `council_disaster_recovery` lease their blocks the
+same way (#744). Before that, three `cluster_task_arrays` tests shared one fixed block and
+two more shared another, so two runs of the binary at once (two worktrees, say) failed with
+"Address already in use" on the second run's gossip bind. A suite that still has fixed
+ports (`cluster_gossip`) keeps them below the leased 27000–30000
+range; keep new fixed ports out of that range.
 
 The same rule covers any port a process gives up and binds again: a crash fixture's
 restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
