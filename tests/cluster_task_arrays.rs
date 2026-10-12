@@ -14,6 +14,11 @@
 //! Gated behind `RELIABURGER_CLUSTER_TESTS=1` like the other multi-node
 //! suites. Run via `make test-cluster`, or
 //! `RELIABURGER_CLUSTER_TESTS=1 cargo test --test cluster_task_arrays -- --ignored`.
+//!
+//! Every node leases its four-port block with `reserve_port_block_lease` and
+//! keeps its data under the test's own temporary directory, so the tests
+//! here can run beside each other, beside the other cluster suites and
+//! beside another worktree's run of this binary (#744).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -38,7 +43,8 @@ use cluster_support::{
 };
 
 const SERVICE_TOKEN: &str = "cluster-test-task-arrays-service";
-const BASE_PORT: u16 = 23510;
+/// Ports per node: gossip, +1 Raft, +2 reporting, +3 API.
+const PORTS_PER_NODE: u16 = 4;
 const BINARY: &str = "/usr/local/bin/rb-task";
 const TASKS: u32 = 100_000;
 
@@ -74,8 +80,18 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
     ))
 }
 
+/// One leased port block per node, held until the test ends so no other
+/// fixture on the host (another test here, another suite, another
+/// worktree's run) binds these ports while the cluster runs, including a
+/// killed node's ports while it is down (#744).
+fn lease_node_ports(nodes: usize) -> Vec<PortBlockReservation> {
+    (0..nodes)
+        .map(|_| reserve_port_block_lease(PORTS_PER_NODE))
+        .collect()
+}
+
 async fn start_node(
-    base: u16,
+    ports: &PortBlockReservation,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
@@ -83,11 +99,11 @@ async fn start_node(
 ) -> WiredNode {
     start_wired_node(WiredNodeOptions {
         name: format!("ta{index}"),
-        gossip_port: base + (index as u16) * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-task-arrays",
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         stale_report_timeout_secs: 10,
         metrics_rollup: None,
         scheduler: None,
@@ -161,18 +177,11 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_node(BASE_PORT, 0, vec![], &root, data[0].path()).await];
+    let ports = lease_node_ports(3);
+    let seed = local(ports[0].base);
+    let mut nodes = vec![start_node(&ports[0], 0, vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(
-            start_node(
-                BASE_PORT,
-                index,
-                vec![local(BASE_PORT)],
-                &root,
-                directory.path(),
-            )
-            .await,
-        );
+        nodes.push(start_node(&ports[index], index, vec![seed], &root, directory.path()).await);
     }
     // Killing a node before the voter set settles could leave the others
     // on a joint configuration that still needs it.
@@ -333,9 +342,6 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     root.cancel();
 }
 
-/// Ports for the leader-loss test, clear of the other tests' blocks.
-const LEADER_LOSS_BASE_PORT: u16 = BASE_PORT + 200;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run() {
@@ -345,18 +351,11 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_node(LEADER_LOSS_BASE_PORT, 0, vec![], &root, data[0].path()).await];
+    let ports = lease_node_ports(3);
+    let seed = local(ports[0].base);
+    let mut nodes = vec![start_node(&ports[0], 0, vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(
-            start_node(
-                LEADER_LOSS_BASE_PORT,
-                index,
-                vec![local(LEADER_LOSS_BASE_PORT)],
-                &root,
-                directory.path(),
-            )
-            .await,
-        );
+        nodes.push(start_node(&ports[index], index, vec![seed], &root, directory.path()).await);
     }
     wait_until(
         "three settled voters",
@@ -536,6 +535,7 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
 }
 
 async fn start_common_node(
+    ports: &PortBlockReservation,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
@@ -562,11 +562,11 @@ async fn start_common_node(
     );
     start_wired_node(WiredNodeOptions {
         name: format!("common{index}"),
-        gossip_port: BASE_PORT + 100 + index as u16 * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-common-jobs",
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         stale_report_timeout_secs: 10,
         metrics_rollup: None,
         scheduler: None,
@@ -592,6 +592,7 @@ async fn common_cluster(
 ) -> (
     CancellationToken,
     Vec<tempfile::TempDir>,
+    Vec<PortBlockReservation>,
     Vec<WiredNode>,
     String,
 ) {
@@ -604,15 +605,17 @@ async fn common_cluster(
     .unwrap();
     let root = CancellationToken::new();
     let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ports = lease_node_ports(3);
     let mut nodes = Vec::new();
     for (index, directory) in data.iter().enumerate() {
         nodes.push(
             start_common_node(
+                &ports[index],
                 index,
                 if index == 0 {
                     vec![]
                 } else {
-                    vec![local(BASE_PORT + 100)]
+                    vec![local(ports[0].base)]
                 },
                 &root,
                 directory.path(),
@@ -641,7 +644,7 @@ async fn common_cluster(
         },
     )
     .await;
-    (root, data, nodes, operator.plaintext)
+    (root, data, ports, nodes, operator.plaintext)
 }
 
 /// Move Raft leadership off `leader` and return the index of the node that
@@ -702,7 +705,7 @@ async fn hand_over_leadership(nodes: &[WiredNode], leader: usize) -> usize {
 #[ignore = "requires a real multi-node cluster; run with make test-cluster"]
 async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change() {
     assert!(cluster_tests_enabled());
-    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(2)).await;
+    let (root, _data, _ports, nodes, token) = common_cluster(Duration::from_secs(2)).await;
     let leader = nodes
         .iter()
         .position(|node| *node.thinks_leader.borrow())
@@ -829,7 +832,7 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
     };
     assert!(cluster_tests_enabled());
     // Every task takes far longer than the test, so every array stays active.
-    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(600)).await;
+    let (root, _data, _ports, nodes, token) = common_cluster(Duration::from_secs(600)).await;
     let leader = nodes
         .iter()
         .position(|node| *node.thinks_leader.borrow())
@@ -913,7 +916,7 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
 #[ignore = "requires a real multi-node cluster; run with make test-cluster"]
 async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt() {
     assert!(cluster_tests_enabled());
-    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(10)).await;
+    let (root, _data, _ports, nodes, token) = common_cluster(Duration::from_secs(10)).await;
     let leader = nodes
         .iter()
         .position(|node| *node.thinks_leader.borrow())
@@ -1052,7 +1055,6 @@ async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another
 }
 
 /// Ports one wired node binds: gossip, Raft, reporting and the API.
-const HUNG_PORTS_PER_NODE: u16 = 4;
 const HUNG_ARRAYS: usize = 16;
 // 16 arrays of 4,000 tasks at 20 ms each on 3 × 16 slots take at least
 // 27 s however fast the host is: three times the ~9 s from submitting them
@@ -1095,7 +1097,7 @@ async fn start_hung_node(
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-hung-worker",
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         stale_report_timeout_secs: 10,
         metrics_rollup: None,
         scheduler: None,
@@ -1198,11 +1200,7 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    // Leased blocks, held until the test ends, so no other fixture on the
-    // host binds these ports while the cluster runs.
-    let ports: Vec<PortBlockReservation> = (0..3)
-        .map(|_| reserve_port_block_lease(HUNG_PORTS_PER_NODE))
-        .collect();
+    let ports = lease_node_ports(3);
     let seed = local(ports[0].base);
     let mut nodes = vec![start_hung_node(0, &ports[0], vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
@@ -1362,6 +1360,7 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
 /// Bun wires it. `executor: false` leaves the node without one, so arrays
 /// run only on the nodes that have it.
 async fn shared_budget_node(
+    ports: &PortBlockReservation,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
@@ -1399,7 +1398,7 @@ async fn shared_budget_node(
     });
     start_wired_node(WiredNodeOptions {
         name: format!("shared{index}"),
-        gossip_port: BASE_PORT + 200 + index as u16 * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-shared-budget",
@@ -1418,7 +1417,7 @@ async fn shared_budget_node(
         fault_injection: false,
         labels: Default::default(),
         keep_data_dir: false,
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         task_arrays: Some(Arc::new(TaskArrayService::with_timings(
             None,
             Duration::from_millis(100),
@@ -1439,14 +1438,25 @@ async fn app_replica_lands_on_the_idle_node_while_another_runs_an_array() {
     assert!(cluster_tests_enabled());
     let root = CancellationToken::new();
     let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ports = lease_node_ports(3);
     let mut nodes = Vec::new();
     for (index, directory) in data.iter().enumerate() {
         let seeds = if index == 0 {
             vec![]
         } else {
-            vec![local(BASE_PORT + 200)]
+            vec![local(ports[0].base)]
         };
-        nodes.push(shared_budget_node(index, seeds, &root, directory.path(), index == 0).await);
+        nodes.push(
+            shared_budget_node(
+                &ports[index],
+                index,
+                seeds,
+                &root,
+                directory.path(),
+                index == 0,
+            )
+            .await,
+        );
     }
     wait_until(
         "three settled voters",
