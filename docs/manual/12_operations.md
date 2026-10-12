@@ -132,7 +132,7 @@ format can't join the cluster, so `start` fails with both pairs and nothing is
 recorded:
 
 ```text
-refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58. …
+refusing to upgrade to v0.2.0: incompatible binary: found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63. …
 ```
 
 The candidate gets 60 seconds to answer. It normally takes milliseconds, but
@@ -213,7 +213,7 @@ line says what it found and what it needs, so even a truncated journal line
 carries it:
 
 ```text
-incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: …
+incompatible state format: found 63; this binary (reliaburger v0.2.0 (465fdeb)) needs 68. Pre-1.0 builds don't migrate state: …
 ```
 
 A join between mismatched binaries fails the same way, starting

@@ -101,8 +101,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 40, state 58; this binary (reliaburger v0.1.6 (465fdeb)) needs protocol 46, state 63. …
+incompatible state format: found 63; this binary (reliaburger v0.2.0 (465fdeb)) needs 68. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 46, state 63; this binary (reliaburger v0.2.0 (465fdeb)) needs protocol 51, state 68. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -136,12 +136,14 @@ supported.
 
 Once main changes a format after a release, its `Cargo.toml` moves to the next
 version with a `-dev` suffix (after 0.1.6's formats changed, main became
-`0.2.0-dev`). A build from main then can't pass for the release before it:
-its refusals name `reliaburger v0.2.0-dev`, its binaries don't collide with
-the real `bun-v0.1.6` in a binary store, and `relish setup --quickstart`
-refuses to download nodes for it, because no `v0.2.0-dev` release exists and
-the last published one speaks older formats. Pass `--development-binaries`
-(see the [quickstart](quickstart.md#development-qualification)) to run one.
+`0.2.0-dev` until the 0.2.0 release dropped the suffix; the first format
+change after 0.2.0 moves it to the next `-dev`, such as `0.2.1-dev`). A build
+from main then can't pass for the release before it: its refusals name the
+`-dev` version, its binaries don't collide with the real `bun-v0.2.0` in a
+binary store, and `relish setup --quickstart` refuses to download nodes for
+it, because no `-dev` release exists and the last published one speaks older
+formats. Pass `--development-binaries` (see the
+[quickstart](quickstart.md#development-qualification)) to run one.
 Drop the suffix in the change that prepares the release, before
 `build.yml` builds the candidate, since the build reads the tag from
 `Cargo.toml`.
@@ -165,8 +167,8 @@ paused run, because no node moved.
 
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
-`start` fails with both format pairs. A 0.1.5 cluster refuses 0.1.6 like this:
-`refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58`.
+`start` fails with both format pairs. A 0.1.6 cluster refuses 0.2.0 like this:
+`refusing to upgrade to v0.2.0: incompatible binary: found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -591,16 +593,19 @@ the real `curl … | sh` install against it on every host we advertise.
    Drain begins inside the final two minutes; tier and recovery budgets stay
    unchanged. Missing support or incomplete coverage fails instead of skipping
    a mode. A local smoke check is not staged fast/final acceptance, and global
-   storage bounds and the 24-hour job qualification remain #668.
+   storage bounds and the 12-hour job qualification remain #668.
 
    **The 0.2.0 job gate (decision D18-C).** A release that claims sustained
    job throughput also needs the job qualification: #668's list on at least
-   three nodes, which is 24 hours at 1,158 accepted successes a second or
-   more (100 million a day) plus headroom, with concurrent apps, several
-   resource profiles, worker and leader loss, delayed messages and disk
-   faults. `qualify-jobs-sustained.sh` runs it through the same soak, with the
-   job campaign at the target load and a node-level fault in every cycle
-   (inter-node delay, a full disk, slow fsync). Faults stay node-level in
+   three nodes, which is 12 hours at 1,158 accepted successes a second or
+   more (the rate of 100 million a day) plus headroom, with concurrent apps,
+   several resource profiles, worker and leader loss, delayed messages and
+   disk faults. #668's list said 24 hours; for 0.2.0 the maintainer set the
+   final tier at 12 (12 October 2026), still on the 3-node quickstart cluster
+   with every fault and at the default 1,390 a second, as a reasonable
+   approximation. `qualify-jobs-sustained.sh` runs it through the same soak,
+   with the job campaign at the target load and a node-level fault in every
+   cycle (inter-node delay, a full disk, slow fsync). Faults stay node-level in
    0.2.0 (D19-B): nothing targets an individual job.
 
    ```sh
@@ -608,7 +613,7 @@ the real `curl … | sh` install against it on every host we advertise.
    scripts/release/qualify-jobs-sustained.sh --tier fast \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST
-   # 24 hours on the full schedule: the #668 run, on the final candidate.
+   # 12 hours on the full schedule: the #668 run, on the final candidate.
    scripts/release/qualify-jobs-sustained.sh --tier final \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
@@ -626,7 +631,7 @@ the real `curl … | sh` install against it on every host we advertise.
    million tasks and retained logs. Those are recorded in every run and never
    gate it. Commit both files. Bounded job storage
    ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
-   pass before the 24-hour run: until it does, a full disk stops a worker
+   pass before the 12-hour run: until it does, a full disk stops a worker
    taking grants and fails the run.
 
    Before release, re-record the published throughput table on the candidate
