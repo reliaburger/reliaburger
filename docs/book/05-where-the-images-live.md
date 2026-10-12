@@ -98,7 +98,7 @@ One subtlety worth keeping: the registry stores the manifest's *raw bytes*, not 
 
 ## Replication
 
-When you push an image, Pickle doesn't just store it locally. It replicates the layers to N peer nodes (default: 2 total copies) before returning success. If a node dies, the image is still available elsewhere.
+When you push an image, Pickle doesn't just store it locally. The leader's heal loop copies the layers to more nodes (default: 2 total copies) shortly afterwards. If a node dies, the image is still available elsewhere. (The first version replicated before returning success; *Honest push semantics* below explains why it stopped, and *Copies that can still answer* how heal copies now.)
 
 Replication uses the same OCI Distribution API that clients use. Each peer already runs the `/v2/` handlers, so the replicating node simply acts as a push client to its peers. No custom protocol, no new code paths to test.
 
@@ -122,13 +122,13 @@ The state machine applies it: stores the manifest, creates the tag→digest mapp
 
 ## Garbage collection
 
-Disk space isn't infinite. Pickle runs a periodic GC sweep that deletes unreferenced layers, with three safety rails:
+Disk space isn't infinite. Cleanup comes in two steps, and keeping them apart is the point. **Expiry** decides an *image* is gone: a manifest that has had no tag for `gc_retain_days` (default 7) leaves the Raft catalogue, unless an app or job pins it. **GC** then deletes *blobs* nothing references any more, with three safety rails:
 
-1. **Active reference protection.** If an app in `DesiredState` uses an image, none of its layers are touched.
-2. **Sole-copy protection.** If this node is the only one holding a layer, it's never deleted, even if unreferenced. You can't accidentally destroy the last copy.
-3. **Retention window.** Recently pushed images are kept for `gc_retain_days` (default 7) even if no tags reference them. This gives you time to notice and re-tag.
+1. **Reference protection.** A blob any catalogued manifest references is never deleted. The Raft state machine checks this when it approves a deletion, not just the node that asked.
+2. **Sole-copy protection.** A blob is deleted from a node only while some other node also holds it. You can't accidentally destroy the last copy.
+3. **Orphan grace.** A blob with no holder record that's younger than an hour is left alone: it's probably part of a push still in flight.
 
-After deletion, the node proposes a `GcReport` to Raft, which removes it from the layer holder sets. Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete.
+After deletion, the node proposes a `GcReport` to Raft, which removes it from the layer holder sets. Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete. "Expiry, then GC" is the 0.2.1 design; the story of how the first version never collected anything is in *Copies that can still answer*, below.
 
 ## Reachability is the whole game
 
@@ -613,7 +613,7 @@ only the holder sets prove whether the catalogue has achieved it.
 
 TLS comes for free from the same PKI: when the node has an mTLS identity, the registry serves with `build_api_server_config` — the very config the agent API listener uses — and peers address each other as `https://`. The scheme is threaded through one function (`pickle_peers_scheme`) so the server and every peer-URL derivation always agree.
 
-Two resource limits ride along. Storage **quotas** cap bytes per repository and across the whole registry (`0` means unlimited, the default). And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings — a registry with no quota and no session expiry is a disk-exhaustion waiting to happen.
+Two resource limits ride along. A storage **quota** caps the bytes each node's blob store holds (`[images] max_storage`, `0` meaning unlimited, the default). And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings. A registry with no quota and no session expiry is a disk-exhaustion waiting to happen. (There used to be a per-repository quota too. Nothing could configure it, so 0.2.1 deleted it rather than keep a feature that existed only in this chapter.)
 
 One more thing moved off the hot path: whole-blob hashing. Verifying a digest re-hashes the entire blob, which for a 500 MB layer is real CPU work. Running it on a Tokio worker would stall every other request on that thread, so it now runs under `spawn_blocking`:
 
@@ -1178,6 +1178,63 @@ Queuing costs little. Builds are rare, each stage still has its timeout, and the
 
 A `RUN` step that fetches packages makes Buildah (netavark, on Ubuntu 24.04) create a `podman0` bridge on `10.88.0.0/16` with firewall rules of its own. We read our nftables code to see whether the two collide. They don't, in the ways that matter. The perimeter firewall lives in its own tables, filters only the `input` hook with an `accept` policy, and deletes only its own tables when it reloads. Container networking masquerades `10.0.0.0/8`, which covers Buildah's range too, and a second masquerade is harmless. A build step that tries to reach the node's API or registry comes from `10.88.x.x`, which the perimeter treats as a stranger. One node in 256 draws a container subnet inside `10.88.0.0/16`, but every Reliaburger container has its own `/32` route, so traffic still finds it. So we left Buildah's network alone, and the manual suggests `RUN --network=none` for steps that don't need it, as the burger's Dockerfile does.
 
+## Copies that can still answer
+
+The 0.2.0 audit asked a simple question: push an image, let heal copy it to a second node, then lose that node for good. What happens?
+
+Nothing happened, and that was the problem. Heal counted the holders Raft had recorded, {A, B}, which met `redundancy = 2`, so it did nothing. `relish wtf` counted the same sets and reported zero under-replicated layers. A dead node left a holder set only through a GC approval or a repository retirement, and a dead node proposes neither. Lose A as well, and the image was gone without a single warning on the way.
+
+The fix is a definition. An image's **effective holders** are the recorded holders that are live right now: Alive or Suspect in gossip. Suspect still counts, because a node that missed a few probes is usually back a moment later, and copying everything it holds every time it hiccups would be a storm of its own. Dead and Left don't count.
+
+```rust
+pub fn effective_holders(&self, digest: &str, live: &BTreeSet<u64>) -> BTreeSet<u64> {
+    self.layer_locations
+        .iter()
+        .find(|(d, _)| d == digest)
+        .map(|(_, holders)| holders.intersection(live).copied().collect())
+        .unwrap_or_default()
+}
+```
+
+`intersection` doesn't build a set. It returns an iterator that walks both sorted sets together and yields *references* to the shared elements, `&u64`. `.copied()` turns each `&u64` into a `u64` (fine for any `Copy` type), and `collect` builds the new `BTreeSet` because that's the return type. In Go you'd write the loop by hand; in Python, `a & b`. Rust gives you the lazy version and lets the type decide what to build.
+
+Notice what the function *doesn't* do: read membership. The live set comes in as an argument. `plan_heal`, the capability count and `lost_images` all take it the same way, so they stay pure functions of the catalogue and a set of numbers, and the tests that prove them need no gossip at all. `plan_heal_ignores_holders_that_are_not_live` builds a catalogue where node 2 holds a copy, leaves node 2 out of the live set, and checks that heal now wants another copy. The caller, `live_registry_nodes`, owns the one decision about which gossip states count. Decommissioning a node goes further and removes it from every holder set in the same Raft entry that retires it.
+
+Once you count live copies, *Lost* falls out almost for free. The design doc always promised it and nothing implemented it: an image is lost when some blob it needs has no effective holder. The capability evidence lists lost images by `repository:tag`, `relish wtf` turns them into a critical finding, `relish status` prints a line, and a pull fails with `image … is lost: no live node holds 1 of its blobs; re-push it` instead of a generic transfer error. Nothing can repair a lost image, so the useful thing is to say so plainly and say what to do.
+
+### The leader plans, the nodes copy
+
+Heal had a second habit the audit didn't like: it pulled every missing layer onto the *leader* and pushed onwards from there. With `redundancy = 2` that made the leader a holder of every image in the cluster. It filled its `max_storage` first, and from then on every heal failed at the pull step while the followers had room to spare.
+
+Now the leader only plans. It picks targets among live nodes without a full copy, putting itself last, and sends each one `POST /v2/<name>/replicas/<digest>` with the holders it may copy from. The target pulls each blob straight from a holder, checks every digest, and confirms its own copy through Raft, the same `ConfirmImageCopy` a deploy's pull uses. The leader copies only when it's the chosen target. The route answers only the cluster's service principal, so nobody outside the cluster can point a node at an arbitrary URL. `heal_copies_from_holder_to_target_without_the_leader` runs three registries and counts the requests the leader's registry receives: zero.
+
+### An image leaves by losing its tags
+
+The other audit finding was worse because it was slow. Pushing `:latest` again moved the tag and left the old manifest in the catalogue with no tags. Nothing ever removed it. The GC arbiter refused every blob a catalogued manifest referenced, so only abandoned uploads were ever reclaimed, and `gc_retain_days` (measured from the push, of all things) did nothing. A CI job pushing a few times a day would fill the disk until every push, pull and heal copy got a 413.
+
+We considered declaring "no image deletion before 1.0" and documenting disk sizing. That would have been honest, and useless to anyone running CI against the cluster. So 0.2.1 adds expiry:
+
+1. When a manifest loses its last tag (a tag moved, or someone ran `relish images delete web:v1`, which is the OCI `DELETE /v2/web/manifests/v1`), the catalogue records `untagged_at`. The time travels inside the Raft entry: the new push's timestamp, or the leader's clock stamped before proposing a deletion. A replica applying the entry never reads its own clock, because `apply` must produce the same state on every node.
+2. Once a manifest has been untagged for `gc_retain_days`, the leader proposes `ExpireManifest`. The state machine checks again *at apply time*: still untagged since that exact moment, not pinned by any app or job in desired state, not a platform of a multi-platform index that's still catalogued. If any of that changed between the plan and the commit, the entry is refused and nothing moves.
+3. Expiry drops the holder records of blobs nothing else references, and the existing two-phase GC reclaims them on every node.
+
+Step 3's holder records are the subtle part. The arbiter never approves deleting a blob's last advertised holder. Leave the records in place after expiry and one copy of every expired blob survives forever, which is exactly the leak we set out to fix.
+
+"Pinned" needed one more fix of its own. Apply binds tags to digests, so a running instance reports its image as `web:v1@sha256:…`. The GC's active-image check compared that string with `web:v1` and with a bare digest, and never matched either. `image_pin_digest` reads the digest out properly:
+
+```rust
+pub fn image_pin_digest(image: &str) -> Option<&str> {
+    image
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+        .filter(|digest| is_digest_tag(digest))
+}
+```
+
+`rsplit_once` splits at the *last* `@` and gives back `Option<(&str, &str)>`, both halves borrowed from `image`: no allocation, and the lifetime in the signature says the result lives as long as the input does. `map` keeps the right half, and `filter` turns an `Option` into `None` when the predicate fails, so a reference with a stray `@` but no digest pins nothing.
+
+Deleting by digest answers `405 UNSUPPORTED`. The OCI spec allows a registry to refuse, and refusing keeps one rule: an image leaves by losing its tags, and only after the retention window. That window is your undo. An untagged image stays pullable by digest for a week by default, and `relish rollback` can still reach it.
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.
@@ -1326,8 +1383,8 @@ uploads and repository authority receipt payloads, including atomic-write copies
 It also limits the directory to 65,536 payload files, which bounds empty uploads
 and small receipts. This is a payload-byte policy, not filesystem block
 allocation. Unpacked root filesystems, catalogue files and filesystem overhead
-need their own disk capacity. Logical per-repository limits remain a separate
-policy.
+need their own disk capacity. There's no per-repository limit: expiry (below)
+is what keeps the store from filling.
 
 The tests fill the cap with bare blobs, reject a chunk before it grows the disk,
 race two upload reservations, restart with existing payloads, and hide an upload

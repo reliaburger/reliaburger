@@ -92,6 +92,10 @@ pub struct Compatibility {
 /// fence record's `recovery_id` and `split_with`, `sender_recovery_id` on
 /// every Raft RPC and `recovery_id` in its fenced reply, and the gossip
 /// directory extension's `recovery_id`.
+/// Registry durability (#697): the manifest catalogue's `untagged_at`,
+/// `DeleteTag::deleted_at_unix_ms` (deleting a tag now untags), the
+/// `ExpireManifest` request and `RegistryMutation::DeleteTag`; the registry
+/// `Usage` query is gone.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

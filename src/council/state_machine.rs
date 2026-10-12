@@ -737,6 +737,18 @@ impl StateMachineInner {
             RaftRequest::DeleteTag(delete) => {
                 self.state.manifest_catalog.apply_delete_tag(delete);
             }
+            RaftRequest::ExpireManifest(expire) => {
+                // Recheck at apply time: a push, tag or deploy may have
+                // landed between the leader's plan and this entry.
+                let pinned = self.state.pinned_image_digests();
+                if let Err(reason) = self
+                    .state
+                    .manifest_catalog
+                    .apply_expire_manifest(expire, &pinned)
+                {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
             RaftRequest::AutoscaleOverride {
                 app_id,
                 replicas,
@@ -2041,6 +2053,11 @@ impl StateMachineInner {
                 for placements in self.state.scheduling.values_mut() {
                     placements.retain(|placement| placement.node_id.0 != *node_id);
                 }
+                // Its image copies will never serve again: heal must see
+                // every image it held as under-replicated (#697).
+                self.state
+                    .manifest_catalog
+                    .remove_node_holdings(registry_node_id);
                 self.state.endpoint_catalog = catalog;
                 self.state.endpoint_withdrawals = withdrawals;
                 let released_node_fault = self
@@ -5500,12 +5517,20 @@ mod tests {
                 RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
                     repository: "team-copy/app".into(),
                     tag: "latest".into(),
+                    deleted_at_unix_ms: 1,
                 }),
             )])
             .await
             .unwrap();
         let state = restored.desired_state().await;
-        assert_eq!(state.manifest_catalog.manifests.len(), 1);
+        // Deleting the tag untags only the copy; expiry removes it later.
+        assert_eq!(state.manifest_catalog.manifests.len(), 2);
+        assert!(
+            state
+                .manifest_catalog
+                .get_manifest_by_tag("team-copy/app", "latest")
+                .is_none()
+        );
         let retained = state
             .manifest_catalog
             .get_manifest_by_tag("myapp", "latest")
@@ -5609,7 +5634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_delete_tag_removes_manifest() {
+    async fn apply_delete_tag_untags_the_manifest() {
         let mut sm = CouncilStateMachine::new();
 
         // Push a manifest with tag "latest"
@@ -5626,6 +5651,7 @@ mod tests {
         let delete = crate::pickle::types::DeleteTag {
             repository: "myapp".to_string(),
             tag: "latest".to_string(),
+            deleted_at_unix_ms: 42,
         };
         sm.apply_fixture(vec![normal_entry(1, 2, RaftRequest::DeleteTag(delete))])
             .await
@@ -5638,6 +5664,123 @@ mod tests {
                 .get_manifest_by_tag("myapp", "latest")
                 .is_none()
         );
+        let digest = test_manifest_commit().manifest.digest;
+        assert_eq!(
+            state.manifest_catalog.untagged_since("myapp", &digest),
+            Some(42)
+        );
+    }
+
+    /// #697: the leader's ExpireManifest removes an untagged manifest whose
+    /// untagging it observed, and nothing else.
+    #[test]
+    fn expire_manifest_removes_an_untagged_unpinned_manifest() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        let digest = commit.manifest.digest.clone();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+        inner.apply_request(&RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 42,
+        }));
+
+        let response = inner.apply_request(&RaftRequest::ExpireManifest(
+            crate::pickle::types::ExpireManifest {
+                repository: "myapp".into(),
+                digest: digest.clone(),
+                untagged_at_unix_ms: 42,
+            },
+        ));
+
+        assert!(response.is_none(), "{response:?}");
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest("myapp", digest.as_str())
+                .is_none()
+        );
+    }
+
+    /// #697: an app in desired state that pins the digest keeps the
+    /// manifest, however long it has been untagged.
+    #[test]
+    fn expire_manifest_refuses_a_digest_an_app_pins() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        let digest = commit.manifest.digest.clone();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+        inner.apply_request(&RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 42,
+        }));
+        inner.state.apps.insert(
+            AppId::new("web", "prod"),
+            AppSpec {
+                image: Some(format!("myapp:latest@{}", digest.as_str())),
+                ..default_spec()
+            },
+        );
+
+        let response = inner.apply_request(&RaftRequest::ExpireManifest(
+            crate::pickle::types::ExpireManifest {
+                repository: "myapp".into(),
+                digest: digest.clone(),
+                untagged_at_unix_ms: 42,
+            },
+        ));
+
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest("myapp", digest.as_str())
+                .is_some()
+        );
+    }
+
+    /// #697: a decommissioned node's copies never serve again, so it leaves
+    /// every holder set and heal sees the image as under-replicated.
+    #[test]
+    fn decommission_prunes_the_node_from_registry_holder_sets() {
+        let mut inner = StateMachineInner::default();
+        let node = "gone-for-good";
+        let mut commit = test_manifest_commit();
+        commit.holder_nodes = std::collections::BTreeSet::from([
+            1,
+            crate::cluster::identity::raft_id_from_name(node),
+        ]);
+        let digests: Vec<_> = commit
+            .manifest
+            .referenced_digests()
+            .into_iter()
+            .cloned()
+            .collect();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: node.into(),
+                retired_by: "operator".into(),
+                reason: "disk died".into(),
+                retired_at_unix_ms: 20,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+
+        for digest in digests {
+            assert_eq!(
+                inner.state.manifest_catalog.layer_holders(digest.as_str()),
+                std::collections::BTreeSet::from([1])
+            );
+        }
     }
 
     // --- SecurityState Raft tests ---

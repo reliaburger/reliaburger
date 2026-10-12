@@ -2222,6 +2222,31 @@ impl BunClient {
         })
     }
 
+    /// Delete `repository:tag` through the registry at `registry`
+    /// (`DELETE /v2/<repository>/manifests/<tag>`), with this client's
+    /// token and cluster-CA trust.
+    pub async fn delete_image_tag(
+        &self,
+        registry: &str,
+        repository: &str,
+        tag: &str,
+    ) -> Result<(), RelishError> {
+        let http = self
+            .registry_http_client(registry)
+            .map_err(|body| RelishError::ApiError { status: 0, body })?;
+        let url = format!(
+            "{}/v2/{repository}/manifests/{tag}",
+            registry.trim_end_matches('/')
+        );
+        let response = http.delete(&url).send().await.map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// List images in the local Pickle registry.
     pub async fn images(&self) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/images", self.base_url);

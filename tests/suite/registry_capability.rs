@@ -94,7 +94,15 @@ fn capability_counts_membership_and_under_replicated_layers() {
         ..Default::default()
     };
 
-    let evidence = registry_capability_evidence(bind, true, true, true, 2, 3, &catalog);
+    let evidence = registry_capability_evidence(
+        bind,
+        true,
+        true,
+        true,
+        2,
+        &BTreeSet::from([1, 2, 3]),
+        &catalog,
+    );
 
     assert!(evidence.ready);
     assert!(evidence.peer_reachable);

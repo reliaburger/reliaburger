@@ -254,6 +254,8 @@ fn cluster_params_from_config(
 }
 
 /// Assemble Pickle's live listener, membership and catalogue evidence.
+/// `self_id` always counts as live: this node's own copies can answer.
+#[allow(clippy::too_many_arguments)]
 async fn current_registry_capability(
     bind: reliaburger::pickle::capability::RegistryBindPlan,
     tls: bool,
@@ -264,17 +266,14 @@ async fn current_registry_capability(
     >,
     council: Option<&Arc<reliaburger::council::CouncilNode>>,
     catalog: &Arc<RwLock<ManifestCatalog>>,
+    self_id: u64,
 ) -> reliaburger::pickle::capability::RegistryCapabilityEvidence {
-    let known_nodes = membership
-        .map(|receiver| {
-            receiver
-                .borrow()
-                .iter()
-                .filter(|member| member.state == reliaburger::mustard::state::NodeState::Alive)
-                .count()
-        })
-        .unwrap_or(1)
-        .max(1);
+    let live_nodes = match membership {
+        Some(receiver) => {
+            reliaburger::cluster::identity::live_registry_nodes(&receiver.borrow(), self_id)
+        }
+        None => std::collections::BTreeSet::from([self_id]),
+    };
     let authoritative;
     let local;
     let catalog = if let Some(council) = council {
@@ -290,7 +289,7 @@ async fn current_registry_capability(
         tls,
         p2p_enabled,
         redundancy_target,
-        known_nodes,
+        &live_nodes,
         catalog,
     )
 }
@@ -3165,7 +3164,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         service_token.clone(),
     ));
     // Physical payloads, including temporary uploads and runtime pulls, share
-    // the configured BlobStore cap. Logical per-repository policy is separate.
+    // the configured BlobStore cap. Untagged-image expiry bounds growth.
     let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig::default();
     let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
         reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
@@ -3258,7 +3257,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
     );
 
-    let pickle_app = reliaburger::pickle::api::router(pickle_state.clone());
+    // The leader's heal asks this node to copy images straight from their
+    // holders (#697); it pulls with the same authenticated cluster client.
+    let pickle_app = reliaburger::pickle::api::router(pickle_state.clone()).layer(axum::Extension(
+        reliaburger::pickle::replication::ReplicaClient(registry_client.clone()),
+    ));
     // Describe the listener honestly (B3). A clustered listener authenticates
     // writes (service token or a Deployer bearer) and, on a routable bind,
     // reads too — regardless of TLS. Only the literal loopback standalone
@@ -3299,6 +3302,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 replication_membership.as_ref(),
                 api_council.as_ref(),
                 &pickle_catalog,
+                node_raft_id,
             )
             .await,
         )
@@ -3330,6 +3334,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             registry_evidence_membership.as_ref(),
                             registry_evidence_council.as_ref(),
                             &registry_evidence_catalog,
+                            node_raft_id,
                         ).await;
                         registry_evidence_readiness.set_registry(evidence).await;
                     }
@@ -3420,6 +3425,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let gc_store = Arc::clone(&blob_store);
         let gc_catalog = Arc::clone(&pickle_catalog);
         let gc_registry = pickle_state.clone();
+        let gc_council = api_council.clone();
+        let gc_retain =
+            std::time::Duration::from_secs(u64::from(config.images.gc_retain_days) * 86_400);
         let gc_shutdown = shutdown.clone();
         let gc_config = GcConfig {
             retain_days: config.images.gc_retain_days,
@@ -3462,8 +3470,40 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     }
                 };
 
-                // Phase 1: nominate (fs walk off the runtime).
-                let catalog_snapshot = gc_catalog.read().await.clone();
+                // Expiry first (#697): untagged manifests older than
+                // `gc_retain_days` leave the catalogue (through Raft on the
+                // leader, locally standalone), so this sweep can reclaim
+                // their layers. Images running here count as pinned.
+                let pinned: std::collections::HashSet<String> = active
+                    .iter()
+                    .filter_map(|image| reliaburger::pickle::types::image_pin_digest(image))
+                    .map(str::to_string)
+                    .collect();
+                match gc_registry
+                    .expire_untagged_manifests(
+                        reliaburger::pickle::types::unix_millis(std::time::SystemTime::now()),
+                        gc_retain,
+                        &pinned,
+                    )
+                    .await
+                {
+                    Ok(expired) if !expired.is_empty() => {
+                        println!("bun: expired {} untagged image(s)", expired.len());
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("bun: image expiry will retry: {error}"),
+                }
+
+                // Phase 1: nominate (fs walk off the runtime) against the
+                // authoritative catalogue. A worker's local view only knows
+                // its own pushes, and its stale tags would keep expired
+                // layers forever, so it nominates freely and lets the
+                // arbiter refuse anything still referenced.
+                let catalog_snapshot = match (&gc_council, gc_registry.forwarder.is_some()) {
+                    (Some(council), _) => council.manifest_catalog().await,
+                    (None, true) => reliaburger::pickle::types::ManifestCatalog::default(),
+                    (None, false) => gc_catalog.read().await.clone(),
+                };
                 let store = Arc::clone(&gc_store);
                 let gc_cfg = gc_config.clone();
                 let nominated = tokio::task::spawn_blocking(move || {
@@ -3492,10 +3532,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Pickle heal loop (L10 + Phase 12 B5): leader-only loop that keeps
-    // every manifest's layers on at least `[images] redundancy` nodes.
+    // every manifest's layers on at least `[images] redundancy` live nodes.
     // The tick body lives in `pickle::replication::heal_tick` — rarest
-    // first, capped per tick, pulling layers the leader lacks before
-    // replicating onward — so it is testable without a running binary.
+    // first, capped per tick, counting only live holders, and asking each
+    // chosen node to copy straight from a holder (#697) — so it is testable
+    // without a running binary.
     if let (Some(council), Some(membership_rx)) = (api_council.clone(), replication_membership) {
         let repl_registry = pickle_state.clone();
         let repl_shutdown = shutdown.clone();
@@ -3519,12 +3560,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
 
                 let catalog = council.manifest_catalog().await;
-                let peers = {
+                let (peers, live) = {
                     let members = membership_rx.borrow();
-                    reliaburger::cluster::identity::pickle_peers_scheme(
-                        &members,
-                        registry_port,
-                        &heal_scheme,
+                    (
+                        reliaburger::cluster::identity::pickle_peers_scheme(
+                            &members,
+                            registry_port,
+                            &heal_scheme,
+                        ),
+                        reliaburger::cluster::identity::live_registry_nodes(
+                            &members,
+                            repl_registry.node_raft_id,
+                        ),
                     )
                 };
                 if peers.len() < 2 {
@@ -3535,6 +3582,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     &catalog,
                     &repl_registry,
                     &peers,
+                    &live,
                     redundancy,
                     10,
                     &client,

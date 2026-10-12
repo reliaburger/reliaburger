@@ -145,6 +145,18 @@ filter = 'binary(registry_recovery) & (test(=expired_registry_lease_recovers_aft
 test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 4 }
 
+# Registry durability (#697) waits out several one-minute heal ticks on a
+# three-node TLS cluster, before and after killing the pushing node.
+[[profile.default.overrides]]
+filter = 'binary(registry_durability)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+[[profile.ci.overrides]]
+filter = 'binary(registry_durability)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 # Crash-recovery acceptance kills real Bun and owner processes and reboots
 # their kernel state. The cases share runc, bpffs and cgroup roots, so they
 # run one at a time, with room for the three-node upgrade case.

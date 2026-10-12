@@ -825,9 +825,11 @@ pub struct ImagesSection {
     pub max_storage: String,
     /// Number of replicas for each layer (including the original pusher).
     pub redundancy: u32,
-    /// Days to retain unreferenced images before GC.
+    /// Days an untagged image is kept before it expires: a manifest whose
+    /// last tag moved or was deleted this long ago leaves the registry,
+    /// unless an app or job pins it. GC then reclaims its layers.
     pub gc_retain_days: u32,
-    /// Hours between GC sweeps.
+    /// Hours between GC sweeps (and expiry checks).
     pub gc_interval_hours: u32,
     /// Port for the OCI Distribution API (Pickle registry).
     pub registry_port: u16,

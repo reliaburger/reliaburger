@@ -191,7 +191,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
-- `relish images`: List images in the local Pickle registry
+- `relish images`: List images in the Pickle registry, or delete a tag
+  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.0, not in 0.1.6)*
 - `relish build <PATH>`: Build an OCI image and push to Pickle
 - `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
   - `relish snapshot create <APP>`: Snapshot an app's managed volumes

@@ -1205,7 +1205,35 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(registries) = inputs.cluster.registry.value() else {
         return;
     };
-    let mut found = false;
+    // Every node computes Lost from the same catalogue, so report the union
+    // once rather than once per node.
+    let lost: std::collections::BTreeSet<&str> = registries
+        .iter()
+        .flat_map(|registry| registry.lost_images.iter().map(String::as_str))
+        .collect();
+    let lost_count = registries
+        .iter()
+        .map(|registry| registry.lost_image_count)
+        .max()
+        .unwrap_or(0)
+        .max(lost.len());
+    let mut found = lost_count > 0;
+    if found {
+        let mut details: Vec<String> = lost.iter().map(|image| image.to_string()).collect();
+        if lost_count > lost.len() {
+            details.push(format!("… and {} more", lost_count - lost.len()));
+        }
+        report.critical.push(WtfFinding {
+            id: "registry-lost-images".to_string(),
+            title: format!("{lost_count} image(s) are lost: no live node holds all their layers"),
+            details,
+            suggestion: "re-push each lost image (it cannot be pulled or deployed until then), \
+                         and bring back the node that held it if you still can"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "registry".to_string(),
+        });
+    }
     for registry in registries.iter().filter(|registry| {
         !registry.ready
             || (registry.clustered && !registry.peer_reachable)
@@ -1424,6 +1452,8 @@ mod tests {
                     peer_reachable: true,
                     redundancy_possible: true,
                     under_replicated_layers: 0,
+                    lost_images: Vec::new(),
+                    lost_image_count: 0,
                 }]),
                 tokens: available(vec![
                     token("admin", "admin", NOW - 10 * DAY, None),
@@ -2151,6 +2181,8 @@ mod tests {
             peer_reachable: false,
             redundancy_possible: false,
             under_replicated_layers: 2,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
         }]);
 
         let report = diagnose(&inputs);
@@ -2201,6 +2233,41 @@ mod tests {
         assert!(report.warnings.iter().any(|item| item.title == "api alert"));
     }
 
+    /// #697 (D17): a Lost image is gone until someone re-pushes it, so it
+    /// is an error finding that names each image, reported once however
+    /// many nodes saw it.
+    #[test]
+    fn lost_image_is_an_error_finding() {
+        let mut inputs = healthy_inputs();
+        let lost = |node: &str| RegistryObservation {
+            node_id: node.to_string(),
+            clustered: true,
+            ready: true,
+            peer_reachable: true,
+            redundancy_possible: true,
+            under_replicated_layers: 0,
+            lost_images: vec!["web:v1".to_string(), "api:v2".to_string()],
+            lost_image_count: 2,
+        };
+        inputs.cluster.registry = available(vec![lost("node-1"), lost("node-2")]);
+
+        let report = diagnose(&inputs);
+
+        let findings: Vec<_> = report
+            .critical
+            .iter()
+            .filter(|finding| finding.id == "registry-lost-images")
+            .collect();
+        assert_eq!(findings.len(), 1, "{:?}", report.critical);
+        let details = findings[0].details.join("\n");
+        assert!(
+            details.contains("web:v1") && details.contains("api:v2"),
+            "{details}"
+        );
+        assert!(findings[0].suggestion.contains("re-push"));
+        assert!(!report.ok.iter().any(|ok| ok.id == "registry"));
+    }
+
     #[test]
     fn standalone_registry_does_not_require_peer_reachability() {
         let mut inputs = healthy_inputs();
@@ -2211,6 +2278,8 @@ mod tests {
             peer_reachable: false,
             redundancy_possible: false,
             under_replicated_layers: 0,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
         }]);
 
         let report = diagnose(&inputs);

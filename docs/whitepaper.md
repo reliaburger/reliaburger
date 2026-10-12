@@ -1120,6 +1120,8 @@ They would be, without constraints. The constraint that ships today is a policy 
 
 Durability is eventual, not guaranteed at push time. A push commits the image locally and returns immediately with an `oci-replication: pending` header, so the client never mistakes acceptance for full redundancy. A leader-only heal loop (running roughly every 60 seconds) then replicates layers towards a redundancy target of 2 total copies by default: the node that received the push plus one peer. There is no synchronous mode and no `push_sync` config key. This keeps push latency low and independent of cluster size, at the cost of a short window after a push where the image exists on only one node. In clusters too small to reach the target, the heal loop records that full redundancy can't be met rather than silently claiming success.
 
+Heal counts only copies on live nodes (alive or suspect in gossip). When a node dies, every image it held drops a copy, and the next heal pass has another live node copy the layers straight from a surviving holder; the leader plans but doesn't relay. Decommissioning a node removes it from every holder list. An image whose last live copy is gone is reported as *lost* by `relish status` and `relish wtf`, and a deploy of it fails telling you to re-push it. Old images don't pile up either: a manifest that has had no tag for `gc_retain_days` expires, unless an app or job pins it, and GC reclaims its layers.
+
 ### Resource-aware delegated execution
 
 A thousand queued jobs don't need a thousand simultaneous allocations. Suppose

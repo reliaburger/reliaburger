@@ -76,6 +76,15 @@ warning too: it counts towards quorum but isn't applying the log, which is
 what a voter whose disk filled up looks like. `relish council status` shows
 the same comparison as a table.
 
+For the image registry, `wtf` warns (`registry-redundancy`) when a node's
+registry isn't listening, peers can't reach it, or some layers have fewer live
+copies than `[images] redundancy` asks for. Heal fixes the last on its own
+within a minute or two. A *lost* image is worse: some layer it needs has no
+live copy anywhere, so nothing can pull it. That's a CRITICAL
+`registry-lost-images` finding listing each `repository:tag`, and the only fix
+is to push the image again (or bring back the node that held it). `relish
+status` prints the same list on one line. See `images-and-volumes`.
+
 `relish inspect <app>` uses the same relay to list every instance of an app on
 every node, with the node it runs on, under a `desired` vs `running` replica
 count. A node that doesn't answer, or that gossip already considers dead, gets
