@@ -551,6 +551,11 @@ impl IntentCommands {
                     .await
                     .map_err(io::Error::other)?
             {
+                eprintln!(
+                    "bun: cancelled runtime command {} for {}: an earlier process prepared it but never started it",
+                    id.as_str(),
+                    self.claim.instance.0
+                );
                 continue;
             }
             if tokio::time::Instant::now() >= deadline {
