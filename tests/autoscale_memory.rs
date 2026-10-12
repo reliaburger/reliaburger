@@ -12,6 +12,8 @@
 
 #[path = "support/bun_process.rs"]
 mod bun_process;
+#[path = "support/root_processes.rs"]
+mod root_processes;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -47,37 +49,17 @@ impl Drop for Cleanup {
 }
 
 /// SIGKILL every process whose command line names a path under the root:
-/// Bun and the detached owners it launched.
+/// Bun and the detached owners it launched. Nothing outside this test is
+/// signalled, whatever it holds open (#800).
 fn kill_root_processes(root: &Path) {
-    use nix::sys::signal::{Signal, kill, killpg};
-    use nix::unistd::{Pid, getpgid, getpgrp};
     use std::os::unix::ffi::OsStrExt;
     let mut needle = root.as_os_str().as_bytes().to_vec();
     needle.push(b'/');
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if !command.windows(needle.len()).any(|part| part == needle) {
-            continue;
-        }
-        let pid = Pid::from_raw(pid);
-        match getpgid(Some(pid)) {
-            Ok(group) if group != getpgrp() => {
-                let _ = killpg(group, Signal::SIGKILL);
-            }
-            _ => {
-                let _ = kill(pid, Signal::SIGKILL);
-            }
-        }
-    }
+    let named: Vec<_> = root_processes::matching(&[needle])
+        .into_iter()
+        .filter(|process| process.names_needle)
+        .collect();
+    root_processes::kill_owned(&named);
     std::thread::sleep(Duration::from_millis(500));
 }
 

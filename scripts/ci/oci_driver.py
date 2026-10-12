@@ -47,7 +47,10 @@ def tool_bytes(tools):
 
 
 def namespace_wrapper(tools):
-    return [tools['timeout']['path'], '420s', tools['sudo']['path'],
+    # SIGTERM alone can't end a binary whose exit waits on a thread stuck in
+    # the kernel, and then nothing bounds the step (#800). SIGKILL to sudo
+    # 30 s later returns control to the driver, which records the failure.
+    return [tools['timeout']['path'], '--kill-after=30s', '420s', tools['sudo']['path'],
             tools['unshare']['path'], '--mount', '--net', '--propagation',
             'private', tools['bash']['path'], '-c', SETUP, 'qualification']
 

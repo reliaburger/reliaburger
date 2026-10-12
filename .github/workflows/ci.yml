@@ -277,9 +277,39 @@ jobs:
           path: target/contracts/linux/rootless-linux
           if-no-files-found: error
           retention-days: 14
+      - name: Watch disk and memory during the OCI interruptions
+        # Twice on 11 Oct the runner itself stopped answering in the next
+        # step and GitHub kept no log at all (#800). Record the headroom
+        # every 5 s; the report below prints the low-water marks.
+        run: |
+          nohup bash -c 'while :; do echo "$(date -u +%T) disk_kb=$(df -k --output=avail / | tail -1 | tr -d " ") mem_kb=$(awk "/^MemAvailable/ {print \$2}" /proc/meminfo) load=$(cut -d" " -f1 /proc/loadavg)"; sleep 5; done' > "$RUNNER_TEMP/oci-resources.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/oci-resources.pid"
       - name: Qualify actual Bun OCI interruptions
         id: oci_interruptions
+        # Normally five minutes; the driver allows each of its three binaries
+        # 420 s. Fail the step well inside the job limit, so a hang keeps its
+        # log, its evidence and the report below (#800).
+        timeout-minutes: 25
         run: scripts/release/qualify-oci-interruptions.sh
+      - name: Report the OCI interruptions' headroom and leftovers
+        if: always()
+        timeout-minutes: 3
+        run: |
+          kill "$(cat "$RUNNER_TEMP/oci-resources.pid")" 2>/dev/null || true
+          echo "Lowest free disk and memory while the OCI interruptions ran:"
+          sort -t= -k2 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          sort -t= -k3 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          if [ "${{ steps.oci_interruptions.outcome }}" != success ]; then
+            ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
+            # Kernel stacks of every uninterruptible task, and of every thread
+            # of a test binary, Bun or owner that outlived the step.
+            for pid in $(ps -eo pid=,stat=,args= | awk '$2 ~ /^D/ || /target\/debug\/(deps\/|bun)|upgrade-bin\/bun|__process-owner/ {print $1}'); do
+              for task in /proc/"$pid"/task/*; do
+                echo "== $task ($(sudo cat "$task"/comm 2>/dev/null), $(sudo cat "$task"/wchan 2>/dev/null))"
+                sudo cat "$task"/stack 2>/dev/null || true
+              done
+            done
+          fi
       - name: Retain oci-interruptions current execution envelope
         if: always()
         uses: actions/upload-artifact@v4

@@ -75,7 +75,10 @@ class OciDriver(unittest.TestCase):
         self.assertEqual(plan['selectors'], ['--ignored', '--skip', 'normal_rootless_bun', '--skip', 'actual_host_reboot', '--skip', 'actual_bun_kernel_discovery_host_reboot'])
         self.assertEqual(plan['run_options'], ['--nocapture', '--test-threads=1', '--format=pretty', '--color=never'])
         wrapper = plan['wrapper']
-        self.assertEqual(wrapper[:3], [self.tools['timeout']['path'], '420s', self.tools['sudo']['path']])
+        # A binary that outlives 420 s gets SIGTERM, then SIGKILL 30 s later,
+        # so a test that cannot die from SIGTERM still ends the step (#800).
+        self.assertEqual(wrapper[:4], [self.tools['timeout']['path'], '--kill-after=30s', '420s',
+                                       self.tools['sudo']['path']])
         self.assertIn('--mount', wrapper)
         self.assertIn('--net', wrapper)
         self.assertIn('mount -t tmpfs tmpfs /run/netns', wrapper[-2])

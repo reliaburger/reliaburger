@@ -415,3 +415,24 @@ failed rootless run leaked its `slirp4netns` helper: the helper names only its g
 inherited, including the lock the shared Linux test VM queues its users on, and it held
 that lock for an hour. `RootCleanup` now reads each node's runtime intents for those
 directories and kills whatever names them too.
+
+Cleanup must also stop at what the test owns. The scan reads every process on the host, and
+on a CI runner that includes the runner. Until #800 it killed the whole process group of any
+match outside the test's own group. From #758 on, a match could be any process with a file
+open under the root. A process the test didn't start, sitting in someone else's group, would have taken
+that group down with it. A runner killed that way loses the job and every log it had.
+That is how the privileged Linux job's OCI step failed five times on 11 October, though no
+run proved which process matched. The rule now
+lives in one place, [`tests/support/root_processes.rs`](../../tests/support/root_processes.rs),
+shared by `oci_crash`, `kubernetes_demo` and `autoscale_memory`:
+
+- A process counts as the test's if its command line names one of the test's unique paths,
+  or if it descends from the test process. Holding a file under the root isn't enough.
+- A group is killed only when one of the test's processes leads it, as Bun's detached owners
+  do. Any other process of the test's is killed alone.
+- Anything else is left running, and the cleanup logs that it spared it.
+
+`root_teardown` in the portable suite proves it on Linux. A sleeper started through
+`setsid -f` (its own group, outside the test's tree) holds a file under the root. Next to it
+runs an owner that leads its own group. Teardown must kill the owner and its child and leave
+the sleeper running.
