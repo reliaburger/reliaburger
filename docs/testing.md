@@ -183,9 +183,8 @@ selection contract for the audit fixes and their final lifecycle controls.
 exact original ignored-test identities. The generated
 [matrix](testing/qualification-matrix.md) lists concrete cases once and records
 their applicable gates; it isn't a cross product of every test and every host.
-The accompanying [source provenance](testing/source-provenance.json) records
-hashes and ownership references. Source enumeration cannot prove that a
-particular host/feature combination compiled or ran a case. Actual discovery
+Reading the source can't prove that a particular host/feature combination
+compiled or ran a case. Actual discovery
 must confirm the literal binary and full name before completion can qualify it.
 
 The workflow has eleven owners: Linux portable coverage, macOS portable tests,
