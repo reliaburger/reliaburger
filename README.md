@@ -209,10 +209,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
-- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.1, not in 0.1.6)*
-  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.1, not in 0.1.6)*
-  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.1, not in 0.1.6)*
-  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.1, not in 0.1.6)*
+- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.0, not in 0.1.6)*
+  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.0, not in 0.1.6)*
+  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.0, not in 0.1.6)*
+  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.0, not in 0.1.6)*
 
 **Learn** ([under the hood](docs/manual/06_under-the-hood.md))
 
