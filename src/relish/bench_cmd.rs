@@ -124,14 +124,14 @@ fn render(
                 .map_err(RelishError::SerialiseJson)?
         }
         (OutputFormat::Yaml, Some(comparison)) => {
-            serde_yaml::to_string(&ComparedOutput { report, comparison })
+            yaml_serde::to_string(&ComparedOutput { report, comparison })
                 .map_err(RelishError::SerialiseYaml)?
         }
         (OutputFormat::Json, None) => {
             serde_json::to_string_pretty(report).map_err(RelishError::SerialiseJson)?
         }
         (OutputFormat::Yaml, None) => {
-            serde_yaml::to_string(report).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(report).map_err(RelishError::SerialiseYaml)?
         }
     };
     println!("{rendered}");
