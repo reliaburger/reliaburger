@@ -3640,9 +3640,12 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
         r#"
         [app.web]
         image = "proc-grill:image-ignored"
-        command = ["sh", "-c", "echo broken; exit 3"]
+        command = ["sleep", "600"]
         port = 8080
         replicas = 3
+
+        [app.web.health]
+        path = "/healthz"
 
         [app.web.deploy]
         health_timeout = "5s"
@@ -3702,12 +3705,17 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
     assert_eq!(web.rollout_failed.as_ref(), Some(&failure));
 
     // Re-applying the same spec, as a GitOps re-sync would, keeps the mark.
-    let same = reliaburger::config::Config::parse(&format!(
-        "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = {:?}\nport = 8080\n\
-         replicas = 3\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
-        bad.command.clone()
-    ))
+    let same = reliaburger::config::Config::parse(
+        "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"600\"]\n\
+         port = 8080\nreplicas = 3\n[app.web.health]\npath = \"/healthz\"\n\
+         [app.web.deploy]\nhealth_timeout = \"5s\"\n",
+    )
     .unwrap();
+    assert_eq!(
+        same.app.get("web"),
+        Some(&bad),
+        "the re-apply is the same spec"
+    );
     let _ = tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&same)).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
@@ -3781,6 +3789,17 @@ async fn rollback_works_after_every_node_restarts() {
         }
         drop(stopped);
         let seed = ports[(index + 1) % ports.len()].1;
+        // Like a real restart, the old process is gone (its Raft store
+        // released) before the new one starts.
+        {
+            let observer = nodes[(index + 1) % ports.len()].as_ref().unwrap();
+            let left = wait_until(Duration::from_secs(20), || {
+                peer_state(observer, name) != Some(reliaburger::mustard::state::NodeState::Alive)
+            })
+            .await;
+            assert!(left, "{name} never left gossip");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
         tokens[index] = root.child_token();
         nodes[index] =
             Some(labelled_node(name, port, vec![local(seed)], &tokens[index], &[], true).await);
