@@ -17,7 +17,7 @@ What 0.2.0 doesn't promise yet is the daily number. The whitepaper's target is
 100 million accepted successes a day, and the
 [timed-scenario record](../qualification/2026-10-09-timed-job-scenarios/README.md)
 projects past that from one-minute windows. A projection isn't a qualification:
-the 24-hour run with bounded storage
+the 12-hour run at that rate, with bounded storage
 ([#668](https://github.com/reliaburger/reliaburger/issues/668)) is the evidence
 that will, and until it passes we don't claim it. The end of the chapter lists
 the other gaps still open.
@@ -2193,20 +2193,23 @@ allowance.
 
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
-the hourly saturation measurements and #668's retained-storage/24-hour work
+the hourly saturation measurements and #668's retained-storage and 12-hour work
 answer different questions. No extrapolated daily rate determines a soak pass.
 
-### The exit gate: a day of faults
+### The exit gate: half a day of faults
 
 So when can 0.2.0 say "100 million jobs a day"? The roadmap said the release
 "still requires real-runtime qualification", #668 had one list of conditions
 and the September plan had a table of targets nobody had measured. Three
 answers is no answer. The audit settled it (decision D18-C): #668's list is the
-gate, on at least three nodes. That means 24 hours at 1,158 accepted successes
-a second or more (100 million divided by 86,400 seconds) plus headroom, with
-apps running, several resource profiles, and worker loss, leader loss, delayed
-messages and disk faults along the way. The September table survives as
-measurements every run records, but none of them can fail it.
+gate, on at least three nodes. As written, that meant 24 hours at 1,158
+accepted successes a second or more (100 million divided by 86,400 seconds)
+plus headroom, with apps running, several resource profiles, and worker loss,
+leader loss, delayed messages and disk faults along the way. For 0.2.0 the
+maintainer halved the duration (12 October 2026): 12 hours at the same rate,
+still on the three-node quickstart cluster with every fault, at the default
+1,390 a second, as a reasonable approximation of the day. The September table
+survives as measurements every run records, but none of them can fail it.
 
 We didn't write a new harness for this. The soak controller above already
 admits work idempotently, audits effects and proves fault overlap, so the job
@@ -2542,7 +2545,7 @@ every accepted task used to leave ledger entries, output and executor metadata
 behind with nothing reclaiming them, which is what "Where the bytes went"
 fixed.
 
-What's left isn't code. The 24-hour job qualification on at least three nodes
+What's left isn't code. The 12-hour job qualification on at least three nodes
 ([#668](https://github.com/reliaburger/reliaburger/issues/668)) runs against
 the release candidate, and until it passes, the hundred-million-a-day figure
 stays a target.

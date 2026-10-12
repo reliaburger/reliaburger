@@ -207,7 +207,7 @@ smoke check with `sudo python3 scripts/release/job_soak_linux.py --bun
 /absolute/path/to/bun` on rootful Linux with runc, cgroup v2 and BusyBox.
 The normal staged fast/final runs still need an integrated candidate, including
 #669's correctness fixes. Do not treat a local smoke result as that evidence.
-The global retained-storage bound and 24-hour qualification remain #668.
+The global retained-storage bound and 12-hour qualification remain #668.
 
 ## Job qualification tiers (#686, decision D18-C)
 
@@ -235,7 +235,8 @@ fixes them per tier:
   tasks, and retained logs.
 
 `--tier fast` is the compressed 90-minute schedule (nine node faults, each
-kind on each node once); `--tier final` is the full schedule for 24 hours,
+kind on each node once); `--tier final` is the full schedule for 12 hours
+(the maintainer's decision for 0.2.0, as a reasonable approximation of 24),
 the run #668 needs on the final candidate after #678, #679 and #680. `--plan`
 prints either schedule without touching a cluster, which the CI script tests
 use. Until #678 bounds job storage, a disk-full fault is expected to fail

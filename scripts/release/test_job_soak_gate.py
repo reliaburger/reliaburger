@@ -75,12 +75,12 @@ class JobQualification(unittest.TestCase):
         specials={line[3] for line in lines[1:] if line[2]=="special"}
         self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
 
-    def test_final_tier_runs_a_day_on_the_full_schedule_at_the_requested_rate(self):
+    def test_final_tier_runs_twelve_hours_on_the_full_schedule_at_the_requested_rate(self):
         code,lines,_=self.plan("--tier","final","--target-rate","2000")
         self.assertEqual(code,0)
         header=dict(zip(lines[0][::2],lines[0][1::2]))
-        self.assertEqual((header["schedule"],header["duration"],header["target-rate"]),("full","86400","2000"))
-        self.assertEqual(sum(1 for line in lines[1:] if line[2]=="node-fault"),24)
+        self.assertEqual((header["schedule"],header["duration"],header["target-rate"]),("full","43200","2000"))
+        self.assertEqual(sum(1 for line in lines[1:] if line[2]=="node-fault"),12)
 
     def test_job_tiers_refuse_a_rate_below_a_hundred_million_a_day_or_a_changed_schedule(self):
         code,_,error=self.plan("--tier","fast","--target-rate","1000")

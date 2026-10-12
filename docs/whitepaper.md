@@ -905,7 +905,7 @@ JSON report, and `--compare` with an earlier report of the same scenario fails
 on a drop in the window rate beyond `--tolerance` (10% by default); different
 settings make the comparison informational. A window rate is a regression
 guard, never a daily qualification: the 100-million-a-day claim needs the
-24-hour job qualification on at least three nodes.
+12-hour job qualification on at least three nodes, at that daily rate.
 
 > For test output examples, benchmark methodology, and CI integration, see the design docs for each component.
 

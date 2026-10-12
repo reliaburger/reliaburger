@@ -1247,7 +1247,7 @@ def render(evidence, record):
                   "- Explicit test-operator acknowledgements for known replay-safe fenced fixtures: "+str((job_report or {}).get("totals",{}).get("operator_replay_decisions",0)), ""]
         for node, sample in state.get("job_resources",{}).items():
             lines.append(f"- {node}: latest complete job storage (KiB) {sample.get('storage_kb')}; free {sample.get('available_kb')} KiB; live/peak owners {sample.get('live_owners')}/{sample.get('peak_owners')}; peak storage {sample.get('peak_storage_kb')}")
-        lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 24-hour qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
+        lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 12-hour job qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
         qualification = job_qualification(job_report, state, metadata, elapsed)
         lines += job_qualification_lines(qualification)
         evidence_json = record.with_name(record.stem + ".jobs.json")
