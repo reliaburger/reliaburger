@@ -42,16 +42,19 @@ async fn rootless_cluster_refuses_before_ownership_recovery_for_every_selection(
         );
         assert!(stderr.contains("without --cluster"));
         assert!(stderr.contains("rootful Linux Runc"));
-        for path in [
-            "data/discovery",
-            "data/kernel-policy",
-            "data/instances/runc",
-        ] {
-            assert!(
-                !root.path().join(path).exists(),
-                "unexpected ownership activation: {path}"
-            );
-        }
+        // The refusal comes before Bun touches storage at all: no state
+        // marker, upload lock, upgrade store or runtime ownership (#813).
+        // Work started first, such as hashing the 850 MB debug binary, also
+        // held the exit for up to 16 s on a loaded host.
+        let created: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "node.toml")
+            .collect();
+        assert!(
+            created.is_empty(),
+            "runtime={runtime}: refusal touched storage: {created:?}"
+        );
     }
 }
 

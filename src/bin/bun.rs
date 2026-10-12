@@ -884,6 +884,20 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         )
     );
 
+    // A rootless runc cluster is a contradiction between the command line
+    // and the host, so refuse it before loading config or touching storage.
+    // Refusing later left a state marker and upload lock behind, and Tokio's
+    // shutdown then waited for the self-upgrade hash of Bun's own binary:
+    // up to 16 s for a debug build on a loaded host (#813).
+    #[cfg(target_os = "linux")]
+    if cli.cluster {
+        let rootless = reliaburger::grill::rootless::is_rootless();
+        let runc_installed = rootless
+            && cli.runtime == "auto"
+            && matches!(detect_runtime().await, DetectedRuntime::Runc { .. });
+        refuse_rootless_cluster(&cli.runtime, rootless, runc_installed)?;
+    }
+
     // Load node config
     let config = if let Some(ref path) = cli.config {
         NodeConfig::from_file(path).map_err(|e| anyhow::anyhow!("failed to load config: {e}"))?
@@ -1059,11 +1073,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
             if cli.cluster {
-                anyhow::bail!(
-                    "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
-                     or use rootful Linux Runc with eBPF for a container cluster \
-                     (relish setup --quickstart provisions a managed Linux VM on macOS)"
-                );
+                // Refused at start-up already; this guards a host whose
+                // runc appeared between that check and runtime selection.
+                anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
             }
             (true, false)
         }
@@ -1071,11 +1083,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         AnyGrill::Mixed(runtime) if runtime.container().is_rootless() => {
             if cli.cluster {
-                anyhow::bail!(
-                    "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
-                     or use rootful Linux Runc with eBPF for a container cluster \
-                     (relish setup --quickstart provisions a managed Linux VM on macOS)"
-                );
+                // Refused at start-up already; this guards a host whose
+                // runc appeared between that check and runtime selection.
+                anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
             }
             (true, false)
         }
@@ -3586,6 +3596,34 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
 const APPLE_RUNTIME_DEFERRED: &str = "direct Apple Container is disabled for 0.1.0; use the managed Linux VM with `relish setup --quickstart`";
 
+/// Why a node that would run rootless runc can't start with `--cluster`.
+#[cfg(target_os = "linux")]
+const ROOTLESS_CLUSTER_UNSUPPORTED: &str = "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
+     or use rootful Linux Runc with eBPF for a container cluster \
+     (relish setup --quickstart provisions a managed Linux VM on macOS)";
+
+/// Refuse a cluster node whose `--runtime` selection would be rootless runc.
+///
+/// `rootless` says whether Bun lacks root, and `runc_installed` whether
+/// `auto` would pick runc. Both are facts about the command line and the
+/// host, so the refusal can come before Bun touches any state (#813).
+#[cfg(target_os = "linux")]
+fn refuse_rootless_cluster(
+    selection: &str,
+    rootless: bool,
+    runc_installed: bool,
+) -> anyhow::Result<()> {
+    let selects_runc = match selection {
+        "runc" | "mixed" => true,
+        "auto" => runc_installed,
+        _ => false,
+    };
+    if rootless && selects_runc {
+        anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
+    }
+    Ok(())
+}
+
 async fn select_runtime(
     name: &str,
     instances_dir: &std::path::Path,
@@ -3892,6 +3930,37 @@ mod tests {
         assert!(message.contains("0.1.0"), "{message}");
         assert!(message.contains("managed Linux VM"), "{message}");
         assert!(message.contains("relish setup --quickstart"), "{message}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rootless_cluster_is_refused_for_every_selection_that_picks_runc() {
+        for (selection, runc_installed) in [("runc", false), ("mixed", false), ("auto", true)] {
+            let error = refuse_rootless_cluster(selection, true, runc_installed)
+                .expect_err("rootless runc cannot join a cluster");
+            assert_eq!(
+                error.to_string(),
+                ROOTLESS_CLUSTER_UNSUPPORTED,
+                "{selection}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rootless_cluster_is_allowed_when_no_rootless_runc_is_selected() {
+        // Rootful runc, the process runtime, and `auto` without runc all
+        // cluster; unknown names fail later with their own message.
+        for (selection, rootless, runc_installed) in [
+            ("runc", false, true),
+            ("mixed", false, true),
+            ("auto", false, true),
+            ("process", true, true),
+            ("auto", true, false),
+            ("apple", true, true),
+        ] {
+            refuse_rootless_cluster(selection, rootless, runc_installed).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
