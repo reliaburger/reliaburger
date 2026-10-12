@@ -187,6 +187,45 @@ class MakeOwner(unittest.TestCase):
         with self.assertRaises(c.Invalid):
             self.m.evidence(expected, self.directory, {('reliaburger', 'pickle::tests::bounded')})
 
+    def shard(self):
+        """Shard 1 of 3: one test of its own, one in another shard."""
+        self.entry.update(partition='hash:1/3', selectors=['--profile', 'ci', '--partition', 'hash:1/3'])
+        cases = self.discovery['rust-suites']['reliaburger']['testcases']
+        cases['pickle::tests::elsewhere'] = {'ignored': False,
+                                             'filter-match': {'status': 'mismatch', 'reason': 'partition'}}
+        self.write()
+
+    def test_a_shard_lists_and_runs_only_its_own_partition(self):
+        self.shard()
+        self.assertEqual(self.execute(), 0)
+        actual = [cmd for cmd, _ in self.calls if cmd[0] == self.tools['nextest']['path']]
+        self.assertEqual(len(actual), 2)
+        for command in actual:
+            self.assertEqual(command[3:7], ['--profile', 'ci', '--partition', 'hash:1/3'])
+        make = next(cmd for cmd, _ in self.calls if cmd[0] == 'make')
+        helper = next(argument for argument in make if argument.startswith('NEXTEST='))
+        self.assertTrue(helper.endswith(' --profile ci --partition hash:1/3'), helper)
+        self.assertEqual(self.evidence(), {('reliaburger', 'pickle::tests::bounded')})
+
+    def test_a_shard_owes_only_the_required_cases_in_its_partition(self):
+        self.shard()
+        self.assertEqual(self.execute(), 0)
+        expected = c.read_json(self.directory / 'expected.json')
+        elsewhere = ('reliaburger', 'pickle::tests::elsewhere')
+        self.assertEqual(self.m.evidence(expected, self.directory, {elsewhere}), set())
+        with self.assertRaises(c.Invalid):
+            self.m.evidence(expected, self.directory, {('reliaburger', 'pickle::tests::absent')})
+
+    def test_an_unsharded_owner_still_owes_every_required_case(self):
+        cases = self.discovery['rust-suites']['reliaburger']['testcases']
+        cases['pickle::tests::elsewhere'] = {'ignored': False,
+                                             'filter-match': {'status': 'mismatch', 'reason': 'partition'}}
+        self.write()
+        self.assertEqual(self.execute(), 0)
+        expected = c.read_json(self.directory / 'expected.json')
+        with self.assertRaises(c.Invalid):
+            self.m.evidence(expected, self.directory, {('reliaburger', 'pickle::tests::elsewhere')})
+
     def test_payload_hash_change_refuses(self):
         self.execute()
         self.directory.joinpath('junit.xml').write_text('<testsuites/>')

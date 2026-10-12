@@ -39,6 +39,26 @@ The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
 systems is not promised. macOS builds are not yet Developer ID signed or
 notarised; don't equate an Actions build with clean-host acceptance.
 
+## Merge trains and their CI
+
+Each release collects its changes on a merge-train branch named after the
+version (`release-0-2-1`), and one gate PR takes the train into `main`. CI
+treats the three kinds of run differently ([which jobs run](testing.md#which-jobs-a-pull-request-runs)):
+
+- **A PR into the train** gets the light set: lint and format, minimum Rust,
+  portable Linux with the coverage floor, the demo app and the optimised
+  contract boundaries, in 15–20 minutes. A `full-ci` label still forces
+  everything on the PR.
+- **The merge queue** on `release-*` runs every job, macOS shards and heavy
+  suites included, on the batch merged onto the train, before any of it
+  lands. The queue requires the single check `ignored-test evidence`, which
+  waits for every other job and demands every evidence owner.
+- **The push to the train**, and the gate PR into `main` (its head is a
+  train), run everything again on the result.
+
+So nothing reaches a train, or `main`, without the full set having passed on
+that exact commit.
+
 ## Compiler baseline
 
 The source minimum is Rust 1.97 (`Cargo.toml`); CI checks the locked dependency

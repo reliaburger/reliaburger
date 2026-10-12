@@ -152,6 +152,16 @@ class Contracts(unittest.TestCase):
         self.write()
         self.rejects('empty selected')
 
+    def test_a_partitioned_list_names_its_own_tests_and_every_shards_tests(self):
+        cases = self.discovery['rust-suites']['reliaburger']['testcases']
+        cases['other::shard'] = {'ignored': False, 'filter-match': {'status': 'mismatch', 'reason': 'partition'}}
+        # Filtered out for any other reason, a test is in no shard's list.
+        cases['filtered::out'] = {'ignored': False, 'filter-match': {'status': 'mismatch', 'reason': 'expression'}}
+        cases['ignored::one'] = {'ignored': True, 'filter-match': {'status': 'mismatch', 'reason': 'ignored'}}
+        own, everything = contracts.partitioned(self.discovery)
+        self.assertEqual(own, {('reliaburger', 'pickle::tests::bounded')})
+        self.assertEqual(everything, {('reliaburger', 'pickle::tests::bounded'), ('reliaburger', 'other::shard')})
+
     def test_renamed_case_fails_exact_match(self):
         self.manifest['contracts'][0]['cases'][0]['test'] = 'pickle::tests::renamed'
         self.rejects('absent/mismatched')

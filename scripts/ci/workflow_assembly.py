@@ -51,27 +51,55 @@ OCI_SELECTORS = [
 LINUX_EXCLUDE = '& not binary(owned_runc) & not binary(owned_network)'
 PORTABLE_GATES = ['portable-linux', 'portable-darwin', 'optimized-cron']
 HEAVY_GATES = [name for name in OWNERS if name not in PORTABLE_GATES]
+# Merge-train pull requests wait for these alone; see selected_workflow.
+LIGHT_GATES = ['portable-linux', 'optimized-cron']
+# Owners split across parallel jobs, by nextest hash partition. Compiling the
+# test binaries takes most of a macOS job, so this mostly overlaps the test
+# runs; the merge in workflow_adapter.py proves every test ran exactly once.
+SHARDS = {'portable-darwin': 3}
 
 
-def selected_workflow(expected, *, code, heavy):
-    """Compute required jobs from trusted changes-job outputs, never artifacts."""
+def selected_workflow(expected, *, code, heavy, macos):
+    """Compute required jobs from trusted changes-job outputs, never artifacts.
+
+    `full` runs every owner, `portable` both portable hosts and the optimized
+    boundaries, and `light` (pull requests into a merge train) only portable
+    Linux and the optimized boundaries.
+    """
     c.fields(expected, ('commit', 'run_id', 'attempt'))
     c.require(re.fullmatch('[0-9a-f]{40}', expected['commit']) is not None,
               'actual checkout SHA required')
     for field in ('run_id', 'attempt'):
         c.require(isinstance(expected[field], str) and expected[field].isdigit()
                   and int(expected[field]) > 0, 'current workflow identity required')
-    c.require(code in ('true', 'false') and heavy in ('true', 'false'),
+    c.require(all(value in ('true', 'false') for value in (code, heavy, macos)),
               'trusted literal changes-job outputs required')
     c.require(code == 'true' or heavy == 'false', 'heavy work requires code selection')
     if code == 'false':
         return None
+    c.require(heavy == 'false' or macos == 'true', 'heavy work requires the macOS owner')
+    if macos == 'false':
+        return dict(schema_version=1, **expected, mode='light',
+                    jobs=['changes', 'portable', 'contract-boundaries'], gates=LIGHT_GATES[:])
     full = heavy == 'true'
     jobs = ['changes', 'portable', 'macos', 'contract-boundaries']
     if full:
         jobs += ['linux', 'build-tests', 'cluster', 'acceptance']
     return dict(schema_version=1, **expected, mode='full' if full else 'portable',
                 jobs=jobs, gates=PORTABLE_GATES + (HEAVY_GATES if full else []))
+
+
+def partition(gate, shard):
+    """The nextest partition one shard of a split owner lists and runs.
+
+    Hash partitions keep each test in the same shard whatever else is added,
+    so a failure reproduces locally with the same `--partition`.
+    """
+    if gate not in SHARDS:
+        c.require(shard is None, 'owner is not split into shards')
+        return None
+    c.require(type(shard) is int and 1 <= shard <= SHARDS[gate], 'unknown owner shard')
+    return f'hash:{shard}/{SHARDS[gate]}'
 
 
 def job_results(selection, needs):
@@ -99,7 +127,7 @@ def recipe(text, target):
     return result
 
 
-def make_selection(root, target, *, archived=False):
+def make_selection(root, target, *, archived=False, partition=None):
     """Share the existing recipe suffix for discovery and run.
 
     Actual Make still owns prerequisite builds and image mirror lifetime. The
@@ -128,11 +156,15 @@ def make_selection(root, target, *, archived=False):
         c.require(target == 'test-linux', 'unknown image mirror owner')
         environment['RELIABURGER_TEST_IMAGE_MIRROR'] = '127.0.0.1:5099'
     selectors = (ARCHIVED_SELECTORS[:] if archived else ['--profile', 'ci']) + shlex.split(suffix)
+    if partition is not None:
+        # Right after the helper's own prefix, before the recipe's suffix.
+        count = len(ARCHIVED_SELECTORS) if archived else 2
+        selectors[count:count] = ['--partition', partition]
     c.require('--' not in selectors, 'extra test runner arguments require review')
     return selectors, environment
 
 
-def entry_from_make(root, manifest, gate, host, *, archive_origin=None):
+def entry_from_make(root, manifest, gate, host, *, archive_origin=None, shard=None):
     """Build ordinary nextest selectors from the current committed owner recipe.
 
     This is a plan, not execution. Original Make must still run once around the
@@ -146,7 +178,8 @@ def entry_from_make(root, manifest, gate, host, *, archive_origin=None):
               and host in manifest['gates'][gate]['hosts'], 'wrong manifest owner or host')
     archived = gate in ('cluster-tests', 'slow-tests', 'upgrade-node', 'upgrade-cluster', 'standard-clients')
     c.require(archived == (archive_origin is not None), 'archived owner needs trusted builder outputs')
-    selectors, environment = make_selection(root, owner[1], archived=archived)
+    split = partition(gate, shard) if shard is not None else None
+    selectors, environment = make_selection(root, owner[1], archived=archived, partition=split)
     source_files = sorted({source for family in manifest['contracts'] for case in family['cases']
                            if gate in case['requires'] for source in case['sources']})
     c.require(bool(source_files), 'empty concrete owner source inventory')
@@ -161,6 +194,8 @@ def entry_from_make(root, manifest, gate, host, *, archive_origin=None):
                  junit_source=('tests/contracts/cron/' if gate == 'optimized-cron' else '') + 'target/nextest/ci/junit.xml',
                  selector_context=dict(profile='ci', ignored='only' if '--run-ignored=only' in selectors else 'default',
                                        default_filter='honor'))
+    if split is not None:
+        entry['partition'] = split
     if archived:
         c.require(archive_origin['builder']['command'] == ARCHIVE_COMMAND,
                   'wrong trusted actual archive builder command')
@@ -172,11 +207,11 @@ def entry_from_make(root, manifest, gate, host, *, archive_origin=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('commit', 'run-id', 'attempt', 'code', 'heavy', 'output'):
+    for name in ('commit', 'run-id', 'attempt', 'code', 'heavy', 'macos', 'output'):
         parser.add_argument('--' + name, required=True)
     args = parser.parse_args(argv)
     plan = selected_workflow(dict(commit=args.commit, run_id=args.run_id, attempt=args.attempt),
-                             code=args.code, heavy=args.heavy)
+                             code=args.code, heavy=args.heavy, macos=args.macos)
     c.require(plan is not None, 'no code selected; no qualification plan generated')
     Path(args.output).write_text(json.dumps(plan, indent=2) + '\n')
     return 0
