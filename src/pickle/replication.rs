@@ -1,11 +1,15 @@
 //! Peer replication and background healing for Pickle.
 //!
-//! A committed manifest can still await its configured redundancy. The healer
-//! copies it to peers through the OCI Distribution API, so receiving nodes
-//! validate digests and apply repository ownership before accepting bytes.
+//! A committed manifest can still await its configured redundancy. The
+//! leader's healer plans which live nodes should take another copy; each
+//! chosen node copies the blobs straight from a live holder through the OCI
+//! Distribution API, validating every digest, and confirms its own copy
+//! through Raft.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use super::store::BlobStore;
 use super::types::{Digest, ImageManifest, PickleError};
@@ -29,7 +33,7 @@ impl Default for ReplicationConfig {
 }
 
 /// A cluster peer that can receive replicated layers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     /// Raft node ID.
     pub node_id: u64,
@@ -319,8 +323,8 @@ pub async fn replicate_manifest(
 // The heal loop (Phase 12 B5)
 // ---------------------------------------------------------------------------
 
-/// A manifest that needs more copies, and the nodes currently holding
-/// *all* of its layers. Produced by [`plan_heal`], consumed by
+/// A manifest that needs more copies, and the live nodes currently holding
+/// *all* of its blobs. Produced by [`plan_heal`], consumed by
 /// [`heal_tick`].
 #[derive(Debug)]
 pub struct HealCandidate<'a> {
@@ -330,6 +334,13 @@ pub struct HealCandidate<'a> {
 
 /// Find under-replicated manifests, rarest first.
 ///
+/// Holders count only while they are live (#697): `live` is every node
+/// gossip reports Alive or Suspect, plus the planning node. A node that
+/// died stays in the Raft holder sets until it is decommissioned, and
+/// counting it would leave an image one node loss from gone while heal
+/// thought it was safe. The caller passes the live set in, so this stays a
+/// pure function of its inputs.
+///
 /// "Rarest first" means ascending holder count: the manifests closest
 /// to loss are healed before merely under-replicated ones. The result
 /// is capped at `max_per_tick`, so a freshly joined empty node cannot
@@ -337,6 +348,7 @@ pub struct HealCandidate<'a> {
 /// slice at a time.
 pub fn plan_heal<'a>(
     catalog: &'a super::types::ManifestCatalog,
+    live: &BTreeSet<u64>,
     redundancy: u32,
     max_per_tick: usize,
 ) -> Vec<HealCandidate<'a>> {
@@ -346,7 +358,7 @@ pub fn plan_heal<'a>(
         .filter_map(|(_, manifest)| {
             let mut full_holders: Option<BTreeSet<u64>> = None;
             for digest in manifest.referenced_digests() {
-                let holders = catalog.layer_holders(digest.as_str());
+                let holders = catalog.effective_holders(digest.as_str(), live);
                 full_holders = Some(match full_holders {
                     Some(acc) => acc.intersection(&holders).copied().collect(),
                     None => holders,
@@ -365,179 +377,260 @@ pub fn plan_heal<'a>(
     candidates
 }
 
+/// Choose up to `needed` reachable peers that don't yet hold a full copy.
+///
+/// The planning node (the leader) goes last: it would otherwise end up
+/// holding every image, fill its `max_storage` first and then fail every
+/// heal while followers had room (#697). It is chosen only when no other
+/// peer can take the copy.
+pub fn choose_heal_targets(
+    peers: &[Peer],
+    self_node: u64,
+    full_holders: &BTreeSet<u64>,
+    needed: usize,
+) -> Vec<Peer> {
+    let mut candidates: Vec<&Peer> = peers
+        .iter()
+        .filter(|peer| !full_holders.contains(&peer.node_id))
+        .collect();
+    candidates.sort_by_key(|peer| (peer.node_id == self_node, peer.node_id));
+    candidates.into_iter().take(needed).cloned().collect()
+}
+
 /// What one heal pass did: receiving-node confirmations, and the
 /// per-manifest failures (the caller logs them; a failure on one
 /// manifest never aborts the pass).
 #[derive(Debug, Default)]
 pub struct HealOutcome {
-    /// Images whose local and any successful peer copies were confirmed.
+    /// Images that gained at least one confirmed copy this pass.
     pub confirmed_images: Vec<Digest>,
     pub errors: Vec<String>,
 }
 
-/// One heal pass over the catalog.
+/// Body of a `POST /v2/<name>/replicas/<digest>` request: the peers the
+/// receiving node may copy the image's blobs from, in preference order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaRequest {
+    /// Live nodes holding some or all of the image's blobs.
+    pub sources: Vec<Peer>,
+}
+
+/// The authenticated cluster HTTP client a node uses to copy blobs from
+/// its peers when the leader asks it to take a replica. Installed on the
+/// registry router as an axum extension.
+#[derive(Clone)]
+pub struct ReplicaClient(pub reqwest::Client);
+
+/// How long one replica copy may take end to end, layers included.
+pub const REPLICA_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One heal pass over the catalog. Only the leader runs it.
 ///
 /// For each under-replicated manifest (rarest first, capped at
-/// `max_per_tick`): first pull any layers this node lacks from a
-/// holder — so manifests pushed to, or cache-filled on, *other* nodes
-/// still gain redundancy — then replicate to peers that lack them.
-/// Every receiving node proposes only its own verified copy to Raft.
-#[allow(clippy::too_many_arguments)]
+/// `max_per_tick`) the leader chooses targets among live non-holders, and
+/// each target copies the blobs straight from a live holder and confirms
+/// its own verified copy through Raft (#697). The leader takes a copy
+/// itself only when it is one of the chosen targets, so it never relays
+/// every image through its own disk.
 pub async fn heal_tick(
     catalog: &super::types::ManifestCatalog,
     state: &super::api::PickleState,
     peers: &[Peer],
+    live: &BTreeSet<u64>,
     redundancy: u32,
     max_per_tick: usize,
     client: &reqwest::Client,
 ) -> HealOutcome {
-    let store = state.store.as_ref();
     let self_node = state.node_raft_id;
-    let config = ReplicationConfig {
-        redundancy,
-        peer_timeout: Duration::from_secs(30),
-    };
     let mut outcome = HealOutcome::default();
 
-    for candidate in plan_heal(catalog, redundancy, max_per_tick) {
+    for candidate in plan_heal(catalog, live, redundancy, max_per_tick) {
         let manifest = candidate.manifest;
-        let mut full_holders = candidate.full_holders;
-        let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
-
-        let access = match state
-            .admit_repository_write(&manifest.repository, None, None, true)
-            .await
-        {
-            Ok(access) => access,
-            Err(error) => {
-                outcome
-                    .errors
-                    .push(format!("cannot own {}: {error}", manifest.repository));
-                continue;
-            }
+        let digests = manifest.referenced_digests();
+        let holds_any = |node: u64| {
+            digests.iter().any(|digest| {
+                catalog
+                    .effective_holders(digest.as_str(), live)
+                    .contains(&node)
+            })
         };
-        let mut pulled = Ok(());
-        for digest in &digests {
-            let holders = catalog.layer_holders(digest.as_str());
-            let store = state.store.clone();
-            let check = digest.clone();
-            match tokio::task::spawn_blocking(move || store.revalidate_blob(&check)).await {
-                Ok(Ok(true)) => continue,
-                Ok(Ok(false)) => {}
-                Ok(Err(error)) => {
-                    pulled = Err(error);
-                    break;
-                }
-                Err(error) => {
-                    pulled = Err(PickleError::ReplicationFailed(format!(
-                        "cache verification failed: {error}"
-                    )));
-                    break;
-                }
-            }
-            let Some(peer) = peers
+        let needed = (redundancy as usize).saturating_sub(candidate.full_holders.len());
+        let mut targets = choose_heal_targets(peers, self_node, &candidate.full_holders, needed);
+        // A copy the leader takes can serve the others, so take it first.
+        targets.sort_by_key(|target| target.node_id != self_node);
+        let mut sources: Vec<Peer> = peers
+            .iter()
+            .filter(|peer| holds_any(peer.node_id))
+            .cloned()
+            .collect();
+        sources.sort_by_key(|peer| peer.node_id == self_node);
+
+        let mut confirmed = false;
+        for target in targets {
+            let target_sources: Vec<Peer> = sources
                 .iter()
-                .find(|peer| holders.contains(&peer.node_id) && peer.node_id != self_node)
-            else {
-                pulled = Err(PickleError::ReplicationFailed(format!(
-                    "no peer holds layer {digest}"
-                )));
-                break;
-            };
-            if let Err(error) = state
-                .pull_peer_blob_with_access(
-                    peer,
+                .filter(|source| source.node_id != target.node_id)
+                .cloned()
+                .collect();
+            let result = if target.node_id == self_node {
+                state
+                    .copy_image_from(
+                        &manifest.repository,
+                        &manifest.digest,
+                        &target_sources,
+                        client,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                request_peer_replica(
+                    &target,
                     &manifest.repository,
-                    digest,
+                    &manifest.digest,
+                    &target_sources,
                     client,
-                    config.peer_timeout,
-                    Some(access.clone()),
+                    REPLICA_TIMEOUT,
                 )
                 .await
-            {
-                pulled = Err(error);
-                break;
-            }
-        }
-        if let Err(error) = pulled {
-            outcome
-                .errors
-                .push(format!("cannot pull {}: {error}", manifest.repository));
-            continue;
-        }
-        if let Err(error) = state
-            .confirm_image_copy_with_access(
-                &manifest.repository,
-                &manifest.digest,
-                Some(access.clone()),
-            )
-            .await
-        {
-            outcome
-                .errors
-                .push(format!("cannot confirm {}: {error}", manifest.repository));
-            continue;
-        }
-        full_holders.insert(self_node);
-        let needed = (redundancy as usize).saturating_sub(full_holders.len());
-        let targets = select_peers(peers, self_node, &full_holders, needed);
-        if !targets.is_empty() {
-            match replicate_manifest(manifest, store, &targets, &config, client).await {
-                Ok(result) => {
-                    for (node, error) in result.failed_nodes {
-                        outcome
-                            .errors
-                            .push(format!("replication to {node} failed: {error}"));
-                    }
-                    for target in targets
+                .map(|_| ())
+            };
+            match result {
+                Ok(()) => {
+                    confirmed = true;
+                    if !sources
                         .iter()
-                        .filter(|target| result.successful_nodes.contains(&target.node_id))
+                        .any(|source| source.node_id == target.node_id)
                     {
-                        if let Err(error) = confirm_peer_copy(
-                            target,
-                            &manifest.repository,
-                            &manifest.digest,
-                            client,
-                            config.peer_timeout,
-                        )
-                        .await
-                        {
-                            outcome.errors.push(format!(
-                                "copy confirmation at {} failed: {error}",
-                                target.node_id
-                            ));
-                        }
+                        sources.push(target);
                     }
                 }
                 Err(error) => outcome.errors.push(format!(
-                    "replication of {} failed: {error}",
-                    manifest.repository
+                    "replica of {}@{} on node {} failed: {error}",
+                    manifest.repository,
+                    manifest.digest.as_str(),
+                    target.node_id
                 )),
             }
         }
-        outcome.confirmed_images.push(manifest.digest.clone());
+        if confirmed {
+            outcome.confirmed_images.push(manifest.digest.clone());
+        }
     }
 
     outcome
 }
 
-/// Request proof from the receiving node even when HEAD avoided all uploads.
-/// The client must use the cluster's non-redirecting authenticated transport.
-pub async fn confirm_peer_copy(
-    peer: &Peer,
+impl super::api::PickleState {
+    /// Make one catalogued image complete on this node: copy every blob it
+    /// lacks from `sources` (tried in order, each blob digest-verified on
+    /// arrival), then confirm this node's own verified copy through Raft.
+    ///
+    /// The leader calls it for itself when it is a chosen heal target, and
+    /// every other target runs it when the leader asks over
+    /// `POST /v2/<name>/replicas/<digest>`.
+    pub async fn copy_image_from(
+        &self,
+        repository: &str,
+        digest: &Digest,
+        sources: &[Peer],
+        client: &reqwest::Client,
+    ) -> Result<super::copy::ImageCopyReceipt, PickleError> {
+        let access = self
+            .admit_repository_write(repository, None, None, true)
+            .await?;
+        let catalog = self.catalog_snapshot(repository).await?;
+        let manifest = catalog
+            .get_repository_manifest(repository, digest.as_str())
+            .ok_or_else(|| PickleError::ManifestNotFound {
+                repository: repository.to_string(),
+                tag: digest.to_string(),
+            })?;
+        let timeout = Duration::from_secs(30);
+        for blob in manifest.referenced_digests() {
+            let mut copied = false;
+            let mut last_error = None;
+            for source in sources {
+                match self
+                    .pull_peer_blob_with_access(
+                        source,
+                        repository,
+                        blob,
+                        client,
+                        timeout,
+                        Some(access.clone()),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        copied = true;
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if copied {
+                continue;
+            }
+            // Nothing to copy from, but the bytes may already be here.
+            let store = self.store.clone();
+            let check = blob.clone();
+            let local = tokio::task::spawn_blocking(move || store.revalidate_blob(&check))
+                .await
+                .map_err(|error| {
+                    PickleError::ReplicationFailed(format!("cache verification failed: {error}"))
+                })??;
+            if !local {
+                return Err(last_error.unwrap_or_else(|| {
+                    PickleError::ReplicationFailed(format!("no live source holds blob {blob}"))
+                }));
+            }
+        }
+        self.confirm_image_copy_with_access(repository, digest, Some(access))
+            .await
+    }
+}
+
+/// Ask `target` to copy an image from `sources` and confirm its own copy.
+/// The client must be the cluster's authenticated, non-redirecting
+/// transport: the route only answers the cluster's service principal.
+pub async fn request_peer_replica(
+    target: &Peer,
     repository: &str,
     digest: &Digest,
+    sources: &[Peer],
     client: &reqwest::Client,
     timeout: Duration,
 ) -> Result<super::copy::ImageCopyReceipt, PickleError> {
+    let url = format!(
+        "{}/v2/{repository}/replicas/{}",
+        target.base_url,
+        digest.as_str()
+    );
+    let body = serde_json::to_vec(&ReplicaRequest {
+        sources: sources.to_vec(),
+    })
+    .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?;
+    receipt_from(
+        target,
+        repository,
+        digest,
+        client.post(url).body(body),
+        timeout,
+    )
+    .await
+}
+
+/// Send a copy request and accept only a receipt for exactly this node,
+/// repository and digest.
+async fn receipt_from(
+    peer: &Peer,
+    repository: &str,
+    digest: &Digest,
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<super::copy::ImageCopyReceipt, PickleError> {
     tokio::time::timeout(timeout, async {
-        let url = format!(
-            "{}/v2/{repository}/copies/{}",
-            peer.base_url,
-            digest.as_str()
-        );
-        let mut response = client
-            .post(url)
+        let mut response = request
             .send()
             .await
             .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?;
@@ -577,6 +670,23 @@ pub async fn confirm_peer_copy(
     })
     .await
     .map_err(|_| PickleError::ReplicationFailed("copy confirmation timed out".into()))?
+}
+
+/// Request proof from the receiving node even when HEAD avoided all uploads.
+/// The client must use the cluster's non-redirecting authenticated transport.
+pub async fn confirm_peer_copy(
+    peer: &Peer,
+    repository: &str,
+    digest: &Digest,
+    client: &reqwest::Client,
+    timeout: Duration,
+) -> Result<super::copy::ImageCopyReceipt, PickleError> {
+    let url = format!(
+        "{}/v2/{repository}/copies/{}",
+        peer.base_url,
+        digest.as_str()
+    );
+    receipt_from(peer, repository, digest, client.post(url), timeout).await
 }
 
 #[cfg(test)]
@@ -832,10 +942,66 @@ mod tests {
         catalog
     }
 
+    fn all_live() -> BTreeSet<u64> {
+        BTreeSet::from([1, 2, 3, 4])
+    }
+
+    /// #697: node 2 died. Raft still lists it as a holder of
+    /// `two-copies`, but a dead node's copy can't serve a pull, so the
+    /// image has one effective copy and must be healed.
+    #[test]
+    fn plan_heal_ignores_holders_that_are_not_live() {
+        let catalog = heal_catalog();
+        let live = BTreeSet::from([1, 3, 4]);
+
+        let candidates = plan_heal(&catalog, &live, 2, 10);
+
+        let two = candidates
+            .iter()
+            .find(|c| c.manifest.repository == "two-copies")
+            .expect("a dead holder must not count towards redundancy");
+        assert_eq!(two.full_holders, BTreeSet::from([1]));
+        // `three-copies` still has two live holders (1 and 3).
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.manifest.repository == "three-copies")
+        );
+    }
+
+    /// #697: with the holder dead, the new copy goes to a live node that
+    /// doesn't hold the image, and not to the leader while a follower can
+    /// take it.
+    #[test]
+    fn heal_targets_a_live_non_holder_when_a_holder_died() {
+        let catalog = heal_catalog();
+        // Node 2 died, so gossip no longer offers it as a peer.
+        let live = BTreeSet::from([1, 3, 4]);
+        let peers: Vec<Peer> = test_peers()
+            .into_iter()
+            .filter(|peer| live.contains(&peer.node_id))
+            .collect();
+        let candidate = plan_heal(&catalog, &live, 2, 10)
+            .into_iter()
+            .find(|c| c.manifest.repository == "two-copies")
+            .unwrap();
+        let leader = 3;
+
+        let targets = choose_heal_targets(&peers, leader, &candidate.full_holders, 1);
+
+        assert_eq!(
+            targets.iter().map(|peer| peer.node_id).collect::<Vec<_>>(),
+            vec![4]
+        );
+        // Only when no follower is left does the leader take the copy.
+        let targets = choose_heal_targets(&peers, leader, &BTreeSet::from([1, 4]), 1);
+        assert_eq!(targets[0].node_id, leader);
+    }
+
     #[test]
     fn audit_orders_rarest_first() {
         let catalog = heal_catalog();
-        let candidates = plan_heal(&catalog, 3, 10);
+        let candidates = plan_heal(&catalog, &all_live(), 3, 10);
 
         // three-copies is already at redundancy; the other two come
         // back rarest first.
@@ -850,7 +1016,7 @@ mod tests {
     #[test]
     fn plan_heal_caps_work_per_tick() {
         let catalog = heal_catalog();
-        let candidates = plan_heal(&catalog, 3, 1);
+        let candidates = plan_heal(&catalog, &all_live(), 3, 1);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].manifest.repository, "one-copy");
@@ -859,7 +1025,7 @@ mod tests {
     #[test]
     fn plan_heal_empty_when_redundancy_met() {
         let catalog = heal_catalog();
-        assert!(plan_heal(&catalog, 1, 10).is_empty());
+        assert!(plan_heal(&catalog, &all_live(), 1, 10).is_empty());
     }
 
     /// REG1 upgrade path: a catalogue persisted before manifest blobs
@@ -875,7 +1041,7 @@ mod tests {
             .layer_locations
             .retain(|(d, _)| d != manifest_digest.as_str());
 
-        let candidates = plan_heal(&catalog, 3, 10);
+        let candidates = plan_heal(&catalog, &all_live(), 3, 10);
         assert!(
             candidates
                 .iter()

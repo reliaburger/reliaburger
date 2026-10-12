@@ -176,6 +176,16 @@ pub enum RelishError {
     )]
     ImageNotInRegistry { image: String },
 
+    /// `relish images delete` takes a tag, never a digest or a bare name.
+    #[error(
+        "expected repository:tag (e.g. team/web:v1), got {reference:?}; an image leaves by losing its tags, never by digest"
+    )]
+    InvalidImageTag { reference: String },
+
+    /// The agent reported no registry listener to send the request to.
+    #[error("the agent reports no Pickle registry endpoint")]
+    RegistryUnavailable,
+
     /// Image signing key error (generation, parsing, signing).
     #[error("{0}")]
     ImageSigning(#[from] crate::pickle::signing::SigningError),

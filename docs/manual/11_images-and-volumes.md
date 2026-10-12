@@ -102,6 +102,60 @@ block allocation. Reusing an existing verified blob does not charge its bytes
 twice, but uploading another physical copy needs room for that temporary copy
 until completion.
 
+## Image durability and cleanup
+
+Pickle keeps each image's layers on `[images] redundancy` nodes (2 by
+default). A push lands on the node you pushed to, and the council leader's
+heal loop copies it to more nodes, rarest images first, about once a minute.
+Until that first copy is made the image lives on one node, so there's a short
+unprotected window after every push. On a single node there's nowhere to copy
+to, and `redundancy` greater than one can't be met.
+
+Heal counts only live copies: a node gossip reports alive or suspect. When a
+node dies, every image it held drops a copy, and the next heal pass makes a new
+one from a node that still holds it. Each chosen node copies the layers
+straight from a holder; the leader takes a copy itself only when no other node
+can. `relish decommission-node` also removes the node from every image's holder
+list for good.
+
+```toml
+[images]
+redundancy = 2          # copies of every layer, the pushing node's included
+gc_retain_days = 7      # how long an untagged image is kept
+gc_interval_hours = 1   # how often expiry and GC run
+```
+
+### Deleting a tag
+
+Pushing a tag again moves it to the new image and leaves the old one untagged.
+You can also delete a tag yourself:
+
+```sh
+relish images delete team/web:v1     # or: relish image delete team/web:v1
+```
+
+This is the OCI `DELETE /v2/<name>/manifests/<tag>`, so any client that speaks
+it works too, and it needs the same repository write permission as a push.
+Deleting by digest isn't supported (`405 UNSUPPORTED`): an image leaves by
+losing its tags.
+
+An untagged image stays pullable by digest for `gc_retain_days`, counted from
+the moment it lost its last tag. Then it expires and its layers are garbage
+collected on every node. An image that an app or job pins
+(`web:v1@sha256:…`, which is how an apply stores it) never expires, however
+long ago its tag moved. Expiry is what keeps disk use bounded: without it,
+a CI job pushing `:latest` a few times a day would fill `max_storage` until
+every push and pull got a 413.
+
+### Lost images
+
+An image is *lost* when some layer it needs has no live copy left, for
+example when the only node that held it died before heal copied it. Pickle
+can't rebuild it. `relish status` prints a line naming each lost image,
+`relish wtf` reports it as an error, and a deploy that needs it fails with
+`image … is lost: … re-push it`. Push it again, or bring the node that held it
+back.
+
 ## Building images
 
 `relish build` builds images from your config straight into Pickle:

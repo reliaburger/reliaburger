@@ -310,6 +310,13 @@ pub struct RegistryObservation {
     pub redundancy_possible: bool,
     /// Layers below their configured redundancy target.
     pub under_replicated_layers: usize,
+    /// Images no live node can serve in full (`repository:tag`), as far as
+    /// the node reported them.
+    #[serde(default)]
+    pub lost_images: Vec<String>,
+    /// How many images are Lost, including any the report left unnamed.
+    #[serde(default)]
+    pub lost_image_count: usize,
 }
 
 /// A recent application log line used only for correlation.

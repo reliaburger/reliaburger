@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::pickle::api::{PickleState, router};
-use reliaburger::pickle::replication::{Peer, ReplicationConfig, replicate_manifest};
+use reliaburger::pickle::replication::{
+    Peer, ReplicaClient, ReplicationConfig, replicate_manifest,
+};
 use reliaburger::pickle::store::{BlobStore, compute_sha256};
 use reliaburger::pickle::types::{Digest, ManifestCatalog};
 use tokio::sync::RwLock;
@@ -82,7 +84,8 @@ impl Registry {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();
-        let app = router(state.clone());
+        let app =
+            router(state.clone()).layer(axum::Extension(ReplicaClient(reqwest::Client::new())));
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
             axum::serve(listener, app)
@@ -192,6 +195,7 @@ async fn identical_wire_pushes_keep_independent_repository_metadata() {
     recovered.apply_delete_tag(&reliaburger::pickle::types::DeleteTag {
         repository: "team-copy/app".into(),
         tag: "latest".into(),
+        deleted_at_unix_ms: 1,
     });
     *registry.state.catalog.write().await = recovered;
     let retained =
@@ -425,6 +429,7 @@ async fn heal_tick_replicates_to_new_peer() {
         &catalog,
         &leader.state,
         &peers,
+        &BTreeSet::from([1, 2]),
         2,
         10,
         &reqwest::Client::new(),
@@ -462,11 +467,11 @@ async fn heal_tick_replicates_to_new_peer() {
     }
 }
 
-/// Phase 12 B5: the leader pulls layers it lacks from a holder before
-/// replicating onward, so images pushed to non-leader nodes still gain
-/// redundancy — and the leader records itself as a new holder.
+/// Phase 12 B5: when the leader is the only node that can take another
+/// copy, it pulls the blobs it lacks from a holder and records itself as a
+/// new holder.
 #[tokio::test]
-async fn heal_tick_pulls_missing_layers_first() {
+async fn heal_tick_copies_to_the_leader_when_no_follower_can_take_it() {
     use reliaburger::pickle::replication::heal_tick;
 
     // The image lives only on node 2; the leader (node 1) lacks it.
@@ -477,15 +482,22 @@ async fn heal_tick_pulls_missing_layers_first() {
     let leader = Registry::start(1, false).await;
     *leader.state.catalog.write().await = catalog.clone();
     let leader_store = leader.state.store.clone();
-    let peers = vec![Peer {
-        node_id: 2,
-        base_url: holder.base_url(),
-    }];
+    let peers = vec![
+        Peer {
+            node_id: 1,
+            base_url: leader.base_url(),
+        },
+        Peer {
+            node_id: 2,
+            base_url: holder.base_url(),
+        },
+    ];
 
     let outcome = heal_tick(
         &catalog,
         &leader.state,
         &peers,
+        &BTreeSet::from([1, 2]),
         2,
         10,
         &reqwest::Client::new(),
@@ -519,6 +531,129 @@ async fn heal_tick_pulls_missing_layers_first() {
                 .layer_holders(digest.as_str()),
             BTreeSet::from([1, 2])
         );
+    }
+}
+
+/// #697: heal never relays through the leader. Node 2 holds the image,
+/// node 3 is the chosen target, and node 3 copies straight from node 2;
+/// the leader (node 1) neither stores nor serves a byte of it.
+#[tokio::test]
+async fn heal_copies_from_holder_to_target_without_the_leader() {
+    use reliaburger::pickle::replication::heal_tick;
+
+    let holder = Registry::start(2, false).await;
+    push_test_image(&holder.base_url(), "direct", "v1").await;
+    let catalog = holder.state.catalog.read().await.clone();
+    let (leader, leader_hits) = Registry::start_counted(1).await;
+    *leader.state.catalog.write().await = catalog.clone();
+    let target = Registry::start(3, false).await;
+    // Independent standalone fixtures receive the committed metadata explicitly.
+    *target.state.catalog.write().await = catalog.clone();
+    let peers = vec![
+        Peer {
+            node_id: 1,
+            base_url: leader.base_url(),
+        },
+        Peer {
+            node_id: 2,
+            base_url: holder.base_url(),
+        },
+        Peer {
+            node_id: 3,
+            base_url: target.base_url(),
+        },
+    ];
+
+    let outcome = heal_tick(
+        &catalog,
+        &leader.state,
+        &peers,
+        &BTreeSet::from([1, 2, 3]),
+        2,
+        10,
+        &reqwest::Client::new(),
+    )
+    .await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "heal errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(outcome.confirmed_images.len(), 1);
+    let manifest = catalog.get_manifest_by_tag("direct", "v1").unwrap().clone();
+    for digest in manifest.referenced_digests() {
+        assert!(
+            target.state.store.has_blob(digest),
+            "target missing {digest}"
+        );
+        assert!(
+            !leader.state.store.has_blob(digest),
+            "the leader must not relay {digest}"
+        );
+        assert_eq!(
+            target
+                .state
+                .catalog
+                .read()
+                .await
+                .layer_holders(digest.as_str()),
+            BTreeSet::from([2, 3])
+        );
+    }
+    assert_eq!(
+        leader_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing may fetch through the leader's registry"
+    );
+}
+
+/// #697: after node 2 (a recorded holder) dies, heal counts only live
+/// holders and copies the image to node 3 from the survivor.
+#[tokio::test]
+async fn heal_restores_redundancy_after_a_holder_dies() {
+    use reliaburger::pickle::replication::heal_tick;
+
+    let survivor = Registry::start(1, false).await;
+    push_test_image(&survivor.base_url(), "survives", "v1").await;
+    let mut catalog = survivor.state.catalog.read().await.clone();
+    // Heal had already copied it to node 2, which has since died.
+    let manifest = catalog
+        .get_manifest_by_tag("survives", "v1")
+        .unwrap()
+        .clone();
+    assert!(catalog.add_manifest_holder("survives", &manifest.digest, 2));
+    let replacement = Registry::start(3, false).await;
+    *replacement.state.catalog.write().await = catalog.clone();
+    let peers = vec![
+        Peer {
+            node_id: 1,
+            base_url: survivor.base_url(),
+        },
+        Peer {
+            node_id: 3,
+            base_url: replacement.base_url(),
+        },
+    ];
+
+    let outcome = heal_tick(
+        &catalog,
+        &survivor.state,
+        &peers,
+        &BTreeSet::from([1, 3]),
+        2,
+        10,
+        &reqwest::Client::new(),
+    )
+    .await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "heal errors: {:?}",
+        outcome.errors
+    );
+    for digest in manifest.referenced_digests() {
+        assert!(replacement.state.store.has_blob(digest));
     }
 }
 
@@ -820,6 +955,37 @@ async fn p2p_pull_fails_when_all_holders_unreachable() {
     assert!(result.is_err(), "expected failure, got {result:?}");
 }
 
+/// #697: when gossip offers no node that holds a blob the image needs, the
+/// image is Lost, and the pull says so instead of a generic failure.
+#[tokio::test]
+async fn pulling_a_lost_image_says_to_re_push_it() {
+    let config_digest = compute_sha256(br#"{"architecture":"arm64"}"#);
+    let layer_digest = compute_sha256(b"layer-only-a-dead-node-had");
+    // Node 1 held everything and is gone: it isn't among the live peers.
+    let (_, catalog) = manifest_with_holders("gone", &config_digest, &[layer_digest], &[17], &[1]);
+    let puller = Registry::start(3, false).await;
+    *puller.state.catalog.write().await = catalog;
+    let source = cluster_source_for(&puller);
+
+    let error = source
+        .ensure_image_local_with_peers("gone", "v1", &[])
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            reliaburger::pickle::types::PickleError::ImageLost { .. }
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("lost") && message.contains("re-push it"),
+        "{message}"
+    );
+}
+
 /// C2: a catalog miss returns `None` — the caller falls through to the
 /// external registry path.
 #[tokio::test]
@@ -1044,6 +1210,7 @@ async fn heal_tick_respects_per_tick_cap() {
         &catalog,
         &leader.state,
         &peers,
+        &BTreeSet::from([1, 2]),
         2,
         1,
         &reqwest::Client::new(),
@@ -1494,4 +1661,198 @@ async fn cosign_signature_is_read_through_the_pull_through_cache() {
             .unwrap()
             .is_none()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tag deletion and untagged-image expiry (#697)
+// ---------------------------------------------------------------------------
+
+/// D15-A: deleting the only tag leaves the image pullable by digest; once
+/// it has been untagged for `gc_retain_days` (zero here) expiry removes it,
+/// and the ordinary two-phase GC reclaims every one of its blobs.
+#[tokio::test]
+async fn deleting_a_tag_untags_and_expiry_reclaims_layers() {
+    use reliaburger::pickle::gc::{GcConfig, gc_candidates};
+
+    let registry = Registry::start(1, true).await;
+    let base = registry.base_url();
+    push_test_image(&base, "short-lived", "v1").await;
+    let manifest = registry
+        .state
+        .catalog
+        .read()
+        .await
+        .get_manifest_by_tag("short-lived", "v1")
+        .unwrap()
+        .clone();
+    let client = reqwest::Client::new();
+
+    let deleted = client
+        .delete(format!("{base}/v2/short-lived/manifests/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::ACCEPTED);
+    let by_tag = client
+        .get(format!("{base}/v2/short-lived/manifests/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(by_tag.status(), reqwest::StatusCode::NOT_FOUND);
+    let by_digest = client
+        .get(format!(
+            "{base}/v2/short-lived/manifests/{}",
+            manifest.digest.as_str()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        by_digest.status(),
+        reqwest::StatusCode::OK,
+        "an untagged image stays pullable by digest until it expires"
+    );
+    // The untagging survives a restart.
+    let persisted =
+        ManifestCatalog::load_from(registry.state.persist_path.as_ref().unwrap()).unwrap();
+    assert!(
+        persisted
+            .untagged_since("short-lived", &manifest.digest)
+            .is_some()
+    );
+
+    let expired = registry
+        .state
+        .expire_untagged_manifests(u64::MAX, Duration::ZERO, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].digest, manifest.digest);
+
+    let config = GcConfig {
+        retain_days: 0,
+        node_id: 1,
+        orphan_grace: Duration::ZERO,
+    };
+    let catalog = registry.state.catalog.read().await.clone();
+    let nominated = gc_candidates(
+        &registry.state.store,
+        &catalog,
+        &Default::default(),
+        &config,
+    )
+    .unwrap();
+    let report = nominated.report(1).expect("expired blobs are nominated");
+    let removed = registry.state.collect_garbage(report).await.unwrap();
+    for digest in manifest.referenced_digests() {
+        assert!(removed.contains(digest), "{digest} was not reclaimed");
+        assert!(!registry.state.store.has_blob(digest));
+    }
+}
+
+/// OCI lets a registry refuse manifest deletion by digest; Pickle does, so
+/// an image only ever leaves through untagging and expiry.
+#[tokio::test]
+async fn delete_by_digest_is_unsupported() {
+    let registry = Registry::start(1, false).await;
+    let base = registry.base_url();
+    push_test_image(&base, "pinned", "v1").await;
+    let digest = registry
+        .state
+        .catalog
+        .read()
+        .await
+        .get_manifest_by_tag("pinned", "v1")
+        .unwrap()
+        .digest
+        .clone();
+
+    let response = reqwest::Client::new()
+        .delete(format!("{base}/v2/pinned/manifests/{}", digest.as_str()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "UNSUPPORTED");
+    assert!(
+        registry
+            .state
+            .catalog
+            .read()
+            .await
+            .get_manifest_by_tag("pinned", "v1")
+            .is_some()
+    );
+}
+
+/// Tag deletion is a write: it takes the same repository write scope as a
+/// push. A reader, or a deployer scoped to another namespace, is refused.
+#[tokio::test]
+async fn tag_delete_needs_repository_write_scope() {
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+
+    let registry = Registry::start(1, false).await;
+    push_test_image(&registry.base_url(), "team-a/web", "v1").await;
+    push_test_image(&registry.base_url(), "team-b/web", "v1").await;
+
+    let tokens = reliaburger::sesame::auth::new_token_store();
+    let team_a = TokenScope {
+        apps: None,
+        namespaces: Some(vec!["team-a".into()]),
+    };
+    let mut plaintext = Vec::new();
+    for (name, role, scope) in [
+        ("team-a-ci", ApiRole::Deployer, team_a.clone()),
+        ("reader", ApiRole::ReadOnly, TokenScope::default()),
+    ] {
+        let created = reliaburger::sesame::token::create_token(name, role, scope, None).unwrap();
+        tokens.write().await.push(created.token);
+        plaintext.push(created.plaintext);
+    }
+    let mut authed = registry.state.clone();
+    authed.auth = Some(reliaburger::sesame::auth::AuthState::new(
+        tokens,
+        Some("service-token".into()),
+    ));
+    authed.allow_unauthenticated_bootstrap = false;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(authed)).await.ok();
+    });
+    let client = reqwest::Client::new();
+    let delete = |repository: &str, token: Option<&str>| {
+        let request = client.delete(format!("{base}/v2/{repository}/manifests/v1"));
+        match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    };
+
+    let anonymous = delete("team-a/web", None).send().await.unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let reader = delete("team-a/web", Some(&plaintext[1]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reader.status(), reqwest::StatusCode::FORBIDDEN);
+    let other_namespace = delete("team-b/web", Some(&plaintext[0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_namespace.status(), reqwest::StatusCode::FORBIDDEN);
+    let own_namespace = delete("team-a/web", Some(&plaintext[0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own_namespace.status(), reqwest::StatusCode::ACCEPTED);
+
+    let catalog = registry.state.catalog.read().await;
+    assert!(catalog.get_manifest_by_tag("team-a/web", "v1").is_none());
+    assert!(catalog.get_manifest_by_tag("team-b/web", "v1").is_some());
+    drop(catalog);
+    server.abort();
+    let _ = server.await;
 }
