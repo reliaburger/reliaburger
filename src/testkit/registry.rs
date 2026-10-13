@@ -3,6 +3,7 @@
 use crate::bun::capabilities::Capability;
 
 use super::context::TestContext;
+use super::lease::LeaseScope;
 use super::report::TestGroup;
 
 /// A case's explicit failure or missing-evidence outcome.
@@ -53,6 +54,11 @@ pub struct TestCase {
     /// What the cluster must have for this case to mean anything. A case
     /// missing any of these is skipped with a reason, never failed.
     pub requires: &'static [Capability],
+    /// The kind of server-owned lease the case's resources live under. A
+    /// case that applies jobs needs [`LeaseScope::NodeJobs`]; an
+    /// Applications lease refuses them. The group says where the case is
+    /// reported, not what it owns.
+    pub lease: LeaseScope,
     pub run: TestFn,
 }
 
@@ -166,6 +172,7 @@ mod tests {
             name,
             group,
             requires: &[],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(body),
         }
     }
