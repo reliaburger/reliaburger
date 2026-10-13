@@ -109,6 +109,12 @@
   },
   {
     "source": "src/grill/snapshot.rs",
+    "function": "btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_interrupted_snapshot_is_cleaned_up_on_restart"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
     "function": "btrfs_volumes_with_formerly_colliding_slugs_stay_separate",
     "binary": "reliaburger",
     "test": "grill::snapshot::tests::btrfs_volumes_with_formerly_colliding_slugs_stay_separate"

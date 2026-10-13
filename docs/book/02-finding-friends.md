@@ -2329,6 +2329,43 @@ retain = 24
 
 Off by default. If you don't set `url`, the loop never starts and you pay nothing.
 
+"Each backend's standard credentials" was, for a while, a promise the code didn't keep. `object_store::parse_url` builds an S3 store with `AmazonS3Builder::new()`, which reads no environment at all, so `AWS_REGION` and friends were ignored and S3 quietly fell back to the instance's metadata credentials in `us-east-1` (#695). Chapter 15 has the fix in `object_storage::open`; the short version is that we now hand each builder its own `AWS_*` or `GOOGLE_*` variables.
+
+The other problem was the name. The first version called each object `council-{millis}.backup`, from the leader's `SystemTime::now()`, and both "restore the newest" and "keep the newest 24" sorted by it. Picture a former leader whose clock ran a day fast. Its backups are the "newest" for a day. Once it has written 24 of them, every correct backup the new leader uploads sorts older and is pruned straight after upload, and a restore picks the stale state. The wall clock is the one thing in a cluster nobody agrees on.
+
+Raft already gives us an order everybody agrees on: the log position. So a backup's key is the position of the state inside it.
+
+```rust
+pub struct BackupKey {
+    pub recovery_epoch: u64,
+    pub term: u64,
+    pub index: u64,
+    pub millis: u64,
+    pub recovery_id: Option<RecoveryId>,
+}
+
+impl Ord for BackupKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+```
+
+Recovery epoch first, because a recovered council's state supersedes the dead one's whatever their terms. Then term, then the last applied index, and only then the clock, as a tie-break. `Ord` is the trait behind `sort()` and `<`, a bit like implementing `Less` for Go's `sort.Interface`, except the compiler insists the ordering is total. We write it by hand rather than `#[derive(Ord)]` because a derived one would compare `Option<RecoveryId>`, and `RecoveryId` has no business being ordered. `order()` returns a tuple, and tuples compare field by field, left to right, which is exactly the rule we want. The object name zero-pads every field (`council-e00000000000000000001-t…-i…-m…-r….backup`), so a plain lexicographic listing agrees with `Ord`, and the key's term and index come from the same linearizable read that produced the state, so they can't drift from the bytes.
+
+Why is the recovery id in the name at all, when it doesn't order anything? Two survivors recovered independently from one backup land on the same epoch with fresh logs, so their first backups can agree on epoch, term, index and even the millisecond. Without the id, both councils would write the same object name, and the second upload would silently replace the first. With it, both survive, and `relish council backups` shows which council wrote which. The test `two_recoveries_on_one_epoch_never_share_a_backup_object` builds exactly that pair and checks both payloads come back.
+
+Parsing the name uses a slice pattern:
+
+```rust
+let fields: Vec<&str> = body.split('-').collect();
+let [epoch, term, index, millis, id] = fields.as_slice() else {
+    return None;
+};
+```
+
+`let ... else` binds the five fields if the slice has exactly five elements, and runs the `else` block (which must leave the function) otherwise. An old `council-{millis}.backup` name doesn't parse, so the listing logs it and leaves it alone: no compatibility before 1.0, but no silent deletes either.
+
 A word on `_config` — see the leading underscore? In Rust, an unused function parameter is a warning, and warnings are errors in our CI. The underscore tells the compiler "I know, I'm not using it yet." We keep the parameter because sealing may grow config-driven options later, and changing the signature then would ripple through every caller. It's a small hedge, marked honestly.
 
 ### The honest cost
@@ -2343,6 +2380,8 @@ Recovery is deliberately manual. You run `relish council recover` against a *sto
 relish council recover --data-dir /var/lib/reliaburger/data \
     --from s3://my-bucket/council
 ```
+
+It tries the newest backup first. One that won't download, decode, unseal or parse, or whose state isn't at the position its name claims, gets a log line saying why, and recovery moves on to the next older one. It fails only when every backup fails, and then the error lists each one with its reason. The first version took `latest()` and gave up on the first bad blob, which is exactly the wrong moment to be fussy: when you're restoring a dead cluster, one torn upload shouldn't cost you the 23 good backups behind it. `relish council backups --from <url>` lists them newest first, and `--backup <name>` restores one by name and never falls back, because an operator who names a backup means that one.
 
 It refuses if a council voter still answers, unless you pass `--force` with a loud warning — recovering a cluster that still has a quorum would give you two clusters that both think they're in charge, which is the split-brain we spend the whole chapter avoiding. In a genuine total loss the check simply passes, because there's nothing left to answer.
 

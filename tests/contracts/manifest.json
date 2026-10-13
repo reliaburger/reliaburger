@@ -7715,6 +7715,33 @@
       "boundaries": [
         "The skipped route stays uninstalled until its app is reapplied with a valid ingress."
       ]
+    },
+    {
+      "id": "issue-695-interrupted-snapshot-is-cleaned-up",
+      "issue": 695,
+      "promise": "A volume snapshot whose create was cut between the Btrfs subvolume and its metadata never leaks a hidden subvolume: the next start deletes it, and a metadata-less subvolume without an intent is reported, never silently skipped.",
+      "supported_paths": [
+        "Rootful Linux with Btrfs-backed managed volumes"
+      ],
+      "cases": [
+        {
+          "id": "interrupted-snapshot-btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+          "binary": "reliaburger",
+          "test": "grill::snapshot::tests::btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/snapshot.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A metadata-less subvolume with no intent file is reported and kept, because nothing proves it is safe to delete."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate on a loop-mounted Btrfs; the portable tests cover every intent decision with plain directories. The power cut itself stays with the Btrfs power-cut fixture of #287."
+      ]
     }
   ]
 }

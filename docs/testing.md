@@ -140,7 +140,7 @@ record goes in [`qualification/`](qualification):
 |---|---|---|
 | `make test-apple` | Apple silicon with Apple Container | The maintainer, before any release that touches the Apple Container runtime (`src/grill/apple.rs`) |
 | `make test-gpu` | An NVIDIA GPU and `nvidia-smi` | The maintainer, before any release that touches GPU detection (`src/bun/gpu.rs`) |
-| `make test-s3` | AWS credentials and `RELIABURGER_TEST_S3_URL=s3://bucket/prefix` | The maintainer, before any release that touches log export or the S3 object-store client (`src/ketchup/export.rs`, `src/object_storage.rs`) |
+| `make test-s3` | AWS credentials and `RELIABURGER_TEST_S3_URL=s3://bucket/prefix` | The maintainer, before any release that touches log export, council backups or the S3 object-store client (`src/ketchup/export.rs`, `src/council/backup.rs`, `src/object_storage.rs`). It exports logs to the bucket and round-trips a council backup through it (put, list, prune, restore), with credentials and region from the standard `AWS_*` variables |
 | `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh`, `qualify-storage-power-cut.sh` | A disposable VM that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
 
 ### Benchmarks in CI

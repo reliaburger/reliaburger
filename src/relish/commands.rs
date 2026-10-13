@@ -1074,6 +1074,7 @@ fn print_standalone_council(
 pub async fn council_recover(
     data_dir: &std::path::Path,
     from: Option<&str>,
+    backup: Option<&str>,
     master_key_path: Option<&std::path::Path>,
     api_port: u16,
     force: bool,
@@ -1108,7 +1109,10 @@ pub async fn council_recover(
         .transpose()?;
 
     let source = match from {
-        Some(url) => RecoverySource::BackupUrl(url.to_string()),
+        Some(url) => RecoverySource::BackupUrl {
+            url: url.to_string(),
+            backup: backup.map(str::to_string),
+        },
         None => RecoverySource::NodeDataDir(data_dir.to_path_buf()),
     };
 
@@ -1155,6 +1159,78 @@ pub async fn council_recover(
     println!("this node, nothing can tell them. Re-enrol each one before starting it:");
     println!("  relish council re-enrol --data-dir <its data directory>");
     Ok(())
+}
+
+/// One row of `relish council backups`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct BackupListing {
+    name: String,
+    recovery_epoch: u64,
+    term: u64,
+    index: u64,
+    millis: u64,
+    recovery_id: Option<String>,
+}
+
+/// List the council backups at `from`, newest first: the order
+/// `council recover` tries them in, and the names `--backup` takes (#695).
+/// Lists object names only, so it needs no master key.
+pub async fn council_backups(from: &str, output: OutputFormat) -> Result<(), RelishError> {
+    let store = crate::council::backup::BackupStore::from_url(from)
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    let keys = store
+        .list()
+        .await
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    let rows: Vec<BackupListing> = keys
+        .iter()
+        .rev()
+        .map(|key| BackupListing {
+            name: key.object_name(),
+            recovery_epoch: key.recovery_epoch,
+            term: key.term,
+            index: key.index,
+            millis: key.millis,
+            recovery_id: key.recovery_id.map(|id| id.to_string()),
+        })
+        .collect();
+    match output {
+        OutputFormat::Human => print_backups_human(&rows),
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&rows).map_err(RelishError::SerialiseJson)?;
+            println!("{json}");
+        }
+        OutputFormat::Yaml => {
+            let yaml = yaml_serde::to_string(&rows).map_err(RelishError::SerialiseYaml)?;
+            print!("{yaml}");
+        }
+    }
+    Ok(())
+}
+
+fn print_backups_human(rows: &[BackupListing]) {
+    if rows.is_empty() {
+        println!("no backups");
+        return;
+    }
+    println!(
+        "{:<6} {:<8} {:<10} {:<24} NAME",
+        "EPOCH", "TERM", "INDEX", "TAKEN (UTC)"
+    );
+    for row in rows {
+        let taken =
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(row.millis) * 1_000_000)
+                .ok()
+                .and_then(|at| {
+                    at.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+                .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<6} {:<8} {:<10} {:<24} {}",
+            row.recovery_epoch, row.term, row.index, taken, row.name
+        );
+    }
 }
 
 /// Re-enrol a voter fenced out by `council recover` (#424): offline, against
