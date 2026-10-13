@@ -101,6 +101,8 @@ pub struct Compatibility {
 /// `NodeAssignment::held`, `/v1/rollouts/failed` and the
 /// `ApplyEvent::RolloutAborted` stream event, #692).
 /// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
+/// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
+/// sources with bit 63 set name a job's run identity (#737).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

@@ -174,7 +174,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// instance — which is what makes the connect hook enforce cross-namespace
     /// isolation at all: with the source's namespace unknown the hook lets
     /// every connection through. Writes `firewall_map` for each explicit
-    /// cross-namespace `allow_from` rule. Both maps are rebuilt from scratch
+    /// cross-namespace `allow_from` rule: one per source cgroup for an app,
+    /// and one per named job's run identity, which matches every task cgroup
+    /// the delegated runtime bound to it. Both maps are rebuilt from scratch
     /// each call (a new instance of app A changes rules wherever A is a
     /// *source*), deleting keys no longer desired. A no-op without eBPF.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -276,18 +278,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }))
             .collect();
         let ns_entries = crate::sesame::firewall::resolve_cgroup_namespace_entries(&cgroup_ids);
-        let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(
-            &crate::sesame::firewall::resolve_destination_rules(&destinations, &cgroup_ids),
-        );
+        // Apps are granted by their cgroups; a job's tasks by the run
+        // identity their runtime binds each task cgroup to (#737).
+        let mut rules =
+            crate::sesame::firewall::resolve_destination_rules(&destinations, &cgroup_ids);
+        rules.extend(crate::sesame::firewall::resolve_job_source_rules(
+            &destinations,
+        ));
+        let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(&rules);
         let mut workloads = self.local_workloads(&services);
-        workloads.extend(delegated.addresses.iter().map(|(address, task)| {
-            crate::sesame::firewall::LocalWorkload {
-                address: *address,
-                namespace: task.namespace.clone(),
-                name: task.owner.clone(),
-                app_id: crate::sesame::firewall::workload_app_id(&task.namespace, &task.owner),
-            }
-        }));
+        workloads.extend(
+            delegated
+                .addresses
+                .iter()
+                .map(|(address, task)| task.local_workload(*address)),
+        );
         let addresses = crate::sesame::firewall::destination_entries(
             &services,
             &self.cluster_catalog,

@@ -314,6 +314,18 @@ struct cgroup_ns_value {
 };
 ```
 
+### Supplementary BPF Map: `cgroup_source_map`
+
+Maps a delegated task's cgroup ID to its run identity, `hash(namespace/job)` (#737). A task inherits its namespace from the `/reliaburger/<namespace>` ancestor binding, so it has no `firewall_map` grant of its own cgroup. When the exact `(source cgroup, destination)` grant misses, the hook looks the source cgroup up here and tries again with the key's source set to `SOURCE_IDENTITY_TAG | identity` (`1 << 63`; kernel cgroup ids never reach that bit). Bun writes one such grant for every cross-namespace `namespace/name` an `allow_from` names, whether or not a job of that name is running, so the grant is in place before the first task starts. Only the delegated task runtime binds a cgroup here, after `runc create` and before the task runs; it unbinds it when the task retires, and startup clears whatever the previous Bun left. An app's cgroup is never bound here; apps keep their per-cgroup grants, so the run-identity grant widens nothing an app could already reach.
+
+```
+Type:        BPF_MAP_TYPE_HASH
+Max entries: 65536
+Key size:    8 bytes (cgroup ID)
+Value size:  4 bytes (run identity)
+Flags:       BPF_F_NO_PREALLOC
+```
+
 ### Supplementary BPF Map: `destination_map`
 
 Maps a real IPv4 destination to the namespace and destination identity that own it, so isolation holds at the address `relish resolve` prints as well as at the VIP (#677, decision D3-B).
@@ -984,6 +996,7 @@ Onion connect rewrite is a BPF hash map lookup and a field rewrite on the `struc
 | `backend_map` (5,000 services, avg 4 backends) | ~3.2 MB (8+648 bytes/entry) |
 | `firewall_map` (50,000 rules) | ~1.0 MB (16+4 bytes/entry) |
 | `cgroup_namespace_map` (500 local containers) | ~6 KB |
+| `cgroup_source_map` (500 local tasks) | ~6 KB |
 | eBPF program instructions | ~20 KB |
 | **Total** | **<6 MB for 5,000 services** |
 

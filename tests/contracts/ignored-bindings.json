@@ -499,6 +499,12 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "allow_from_can_name_a_delegated_job_as_its_source",
+    "binary": "reliaburger::ebpf",
+    "test": "allow_from_can_name_a_delegated_job_as_its_source"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "dns_responder_resolves_internal_name",
     "binary": "reliaburger::ebpf",
     "test": "dns_responder_resolves_internal_name"
