@@ -980,6 +980,7 @@ async fn egress_denied_by_default_allowed_when_listed() {
     )
     .expect("write egress entry");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable egress enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port));
 
     // The allowed destination connects.
     let ok = TcpStream::connect_timeout(
@@ -1348,6 +1349,18 @@ impl Drop for ProbeCgroup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir(&self.path);
     }
+}
+
+/// Connect to `address` from the runner's cgroup, where this process and every
+/// other test process started. An egress test's deny policy must never reach
+/// it, or a test that happens to overlap one fails with a spurious EPERM
+/// (#919).
+fn assert_runner_cgroup_unrestricted(address: SocketAddr) {
+    let result = TcpStream::connect_timeout(&address, Duration::from_secs(2));
+    assert!(
+        result.is_ok(),
+        "a process in the runner's cgroup was held to this test's egress policy: {result:?}"
+    );
 }
 
 /// A probe the connect hooks refused: `EPERM`, not a missing listener.
@@ -2149,6 +2162,7 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     )
     .expect("write egress6 entry");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port));
 
     let ok = TcpStream::connect_timeout(
         &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), allowed_port),
@@ -2232,6 +2246,7 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     )
     .expect("write egress entry");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port));
 
     // Native v4: allowed.
     let v4_ok = TcpStream::connect_timeout(
@@ -2312,6 +2327,10 @@ async fn cidr_egress_allowed_via_lpm_trie() {
     egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &dests, &merged)
         .expect("program CIDR destinations");
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+    assert_runner_cgroup_unrestricted(SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, 6).into(),
+        denied_port,
+    ));
 
     let inside_cidr = TcpStream::connect_timeout(
         &SocketAddr::new(Ipv4Addr::new(127, 0, 0, 5).into(), allowed_port),
