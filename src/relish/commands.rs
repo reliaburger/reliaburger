@@ -148,6 +148,7 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
             if let Ok(capabilities) = client.capabilities().await
                 && let Some(placement) = capabilities.placement
             {
+                print!("{}", render_registry_needs_mtls(&placement.registry));
                 print!("{}", render_lost_images(&placement.registry));
             }
             // The council knows why an app isn't placed. That is extra
@@ -167,6 +168,19 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
     }
 
     Ok(())
+}
+
+/// The `relish status` warning for a plaintext cluster's registry (#792):
+/// one line naming the fix, or nothing when the registry can forward.
+pub fn render_registry_needs_mtls(
+    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
+) -> String {
+    if !registry.needs_mtls {
+        return String::new();
+    }
+    "registry: needs mTLS; this plaintext cluster can't push or read cluster images. \
+     Start the cluster with TLS (`relish init`, then `relish join`)\n"
+        .to_string()
 }
 
 /// The `relish status` warning for Lost images (design §7.3): one line

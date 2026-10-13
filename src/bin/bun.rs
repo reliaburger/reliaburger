@@ -255,10 +255,12 @@ fn cluster_params_from_config(
 
 /// Assemble Pickle's live listener, membership and catalogue evidence.
 /// `self_id` always counts as live: this node's own copies can answer.
+/// `needs_mtls` says the cluster is plaintext, so the registry can't forward.
 #[allow(clippy::too_many_arguments)]
 async fn current_registry_capability(
     bind: reliaburger::pickle::capability::RegistryBindPlan,
     tls: bool,
+    needs_mtls: bool,
     p2p_enabled: bool,
     redundancy_target: u32,
     membership: Option<
@@ -283,15 +285,18 @@ async fn current_registry_capability(
         local = catalog.read().await;
         &local
     };
-    reliaburger::pickle::capability::registry_capability_evidence(
-        bind,
-        true,
-        tls,
-        p2p_enabled,
-        redundancy_target,
-        &live_nodes,
-        catalog,
-    )
+    reliaburger::pickle::capability::RegistryCapabilityEvidence {
+        needs_mtls,
+        ..reliaburger::pickle::capability::registry_capability_evidence(
+            bind,
+            true,
+            tls,
+            p2p_enabled,
+            redundancy_target,
+            &live_nodes,
+            catalog,
+        )
+    }
 }
 
 /// The directory this node reads/writes its identity from: the configured
@@ -2906,6 +2911,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     } else {
         None
     };
+    // The leader's registry endpoints accept only mTLS node certificates, so
+    // a plaintext cluster's registry can't forward or replicate (#792). Say
+    // so once here; the reaper, `relish status` and `relish wtf` carry it on.
+    let registry_needs_mtls = registry_forwarder
+        .as_ref()
+        .is_some_and(|forwarder| forwarder.requires_mtls());
+    if registry_needs_mtls {
+        eprintln!(
+            "bun: WARNING — {}",
+            reliaburger::pickle::types::PickleError::RegistryNeedsMtls
+        );
+    }
 
     let app = api::router_with_upgrade(
         cmd_tx,
@@ -3320,6 +3337,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             current_registry_capability(
                 registry_bind,
                 registry_over_tls,
+                registry_needs_mtls,
                 registry_p2p_enabled,
                 config.images.redundancy,
                 replication_membership.as_ref(),
@@ -3352,6 +3370,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         let evidence = current_registry_capability(
                             registry_bind,
                             registry_over_tls,
+                            registry_needs_mtls,
                             registry_p2p_enabled,
                             registry_redundancy,
                             registry_evidence_membership.as_ref(),

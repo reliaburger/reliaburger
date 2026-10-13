@@ -1446,7 +1446,8 @@ fn registry_write_error(error: super::types::PickleError) -> Response {
     let status = match error {
         super::types::PickleError::StorageQuotaExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         super::types::PickleError::LeaseDenied(_) => StatusCode::FORBIDDEN,
-        super::types::PickleError::ReplicationFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
+        super::types::PickleError::ReplicationFailed(_)
+        | super::types::PickleError::RegistryNeedsMtls => StatusCode::SERVICE_UNAVAILABLE,
         super::types::PickleError::ImageLost { .. } => StatusCode::GONE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -3564,10 +3565,13 @@ mod tests {
             }),
             ..Default::default()
         });
-        state.forwarder = Some(RegistryForwarder::new(
-            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
-            rx,
-        ));
+        state.forwarder = Some(
+            RegistryForwarder::new(
+                crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+                rx,
+            )
+            .against_plaintext_stand_in(),
+        );
         let publisher = state.clone();
         let caller = tokio::spawn(async move {
             if copy {
@@ -3650,7 +3654,8 @@ mod tests {
         let forwarder = RegistryForwarder::new(
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
-        );
+        )
+        .against_plaintext_stand_in();
         (forwarder, server)
     }
 
@@ -3782,10 +3787,13 @@ mod tests {
             }),
             ..Default::default()
         });
-        state.forwarder = Some(RegistryForwarder::new(
-            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
-            rx,
-        ));
+        state.forwarder = Some(
+            RegistryForwarder::new(
+                crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+                rx,
+            )
+            .against_plaintext_stand_in(),
+        );
         let gate = state.catalog.write().await;
         let owner = state.clone();
         let collected = digest.clone();
@@ -5651,10 +5659,13 @@ mod tests {
         let (mut state, _dir) = test_state();
         let (_tx, rx) =
             tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory::default());
-        state.forwarder = Some(super::super::authority::RegistryForwarder::new(
-            crate::cluster::ClusterHttp::plaintext(),
-            rx,
-        ));
+        state.forwarder = Some(
+            super::super::authority::RegistryForwarder::new(
+                crate::cluster::ClusterHttp::plaintext(),
+                rx,
+            )
+            .against_plaintext_stand_in(),
+        );
         let app = test_router(state.clone());
         for path in ["/v2/ordinary/manifests/latest", "/v2/ordinary/tags/list"] {
             assert_eq!(

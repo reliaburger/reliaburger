@@ -1035,8 +1035,8 @@ async fn plaintext_cluster_registry_cleanup_is_refused_once_with_the_mtls_answer
         }),
         ..Default::default()
     });
-    let http = reliaburger::cluster::ClusterHttp::plaintext()
-        .with_bearer(Some("internal-token".into()));
+    let http =
+        reliaburger::cluster::ClusterHttp::plaintext().with_bearer(Some("internal-token".into()));
     let root = tempfile::tempdir().unwrap();
     let state = PickleState {
         store: Arc::new(BlobStore::new(root.path().join("blobs"))),

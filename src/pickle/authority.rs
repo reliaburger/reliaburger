@@ -267,6 +267,9 @@ pub struct RegistryForwarder {
     directory: watch::Receiver<NodeDirectory>,
     /// Whole-exchange deadline for one proposal or query.
     timeout: Duration,
+    /// A unit test's plaintext stand-in leader takes no certificate.
+    #[cfg(test)]
+    plaintext_stand_in: bool,
 }
 
 impl RegistryForwarder {
@@ -276,6 +279,8 @@ impl RegistryForwarder {
             http,
             directory,
             timeout: PROPOSAL_TIMEOUT,
+            #[cfg(test)]
+            plaintext_stand_in: false,
         }
     }
 
@@ -285,6 +290,26 @@ impl RegistryForwarder {
     fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Let a unit test drive the forwarding exchange against a plaintext
+    /// stand-in leader, which, unlike the real one, takes no certificate.
+    #[cfg(test)]
+    pub(crate) fn against_plaintext_stand_in(mut self) -> Self {
+        self.plaintext_stand_in = true;
+        self
+    }
+
+    /// Whether this node can't forward at all, because its cluster
+    /// transport is plaintext. The leader's propose and query endpoints
+    /// accept only mTLS node certificates (#792), so a plaintext request
+    /// could only ever be refused.
+    pub fn requires_mtls(&self) -> bool {
+        #[cfg(test)]
+        if self.plaintext_stand_in {
+            return false;
+        }
+        self.http.scheme() != "https"
     }
 
     /// Commit locally when possible, otherwise send directly to the leader.
@@ -350,6 +375,9 @@ impl RegistryForwarder {
         path: &str,
         request: &T,
     ) -> Result<R, PickleError> {
+        if self.requires_mtls() {
+            return Err(PickleError::RegistryNeedsMtls);
+        }
         let address = {
             let directory = self.directory.borrow();
             if let Some(council) = council {
@@ -487,7 +515,8 @@ mod tests {
         let forwarder = RegistryForwarder::new(
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
-        );
+        )
+        .against_plaintext_stand_in();
         assert!(forwarder.write(None, report()).await.is_err());
         tx.send(directory(address)).unwrap();
         assert_eq!(
@@ -536,7 +565,8 @@ mod tests {
                 crate::cluster::ClusterHttp::plaintext_with_client(client)
                     .with_bearer(Some("internal".into())),
                 rx,
-            );
+            )
+            .against_plaintext_stand_in();
             assert!(forwarder.write(None, report()).await.is_err());
             assert!(!followed.load(std::sync::atomic::Ordering::SeqCst));
             task.abort();
@@ -590,6 +620,7 @@ mod tests {
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
         )
+        .against_plaintext_stand_in()
         .with_timeout(Duration::from_secs(2));
         assert!(
             forwarder
