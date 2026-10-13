@@ -1275,6 +1275,23 @@ loads and attaches the object on a real Linux kernel without supplying an object
 directory. This belongs in the privileged eBPF suite; a macOS unit test can't
 prove that a Linux kernel accepts a program.
 
+The rest of the eBPF suite took longer to catch up. Its helper walked the
+target directory and loaded the first `onion_connect.bpf.o` it found. That's
+fine when one checkout owns the directory. Several worktrees sharing one
+`CARGO_TARGET_DIR` each leave an object in there, though, and the walk had no
+way of telling which was ours. A test could pass against another branch's
+program. Now every test loads the embedded copy through `load_embedded`, the
+way Bun does. The one test that covers the `program_dir` override copies this
+build's object into a temporary directory first.
+
+How do we know the object belongs to this build? `OnionEbpf::embedded_object()`
+returns the embedded bytes, and a test that needs no kernel compares them with
+the file in the test's own `OUT_DIR`. Cargo hands the library and its
+integration tests the same build-script directory, so `env!("OUT_DIR")` can't
+point at another tree. The test then reads `ebpf/onion_connect.bpf.c` and checks
+that every map it declares appears as a symbol in the object. Add a map without
+rebuilding the object and this test fails.
+
 ## A route belongs to the cluster
 
 Our first three-VM quickstart started a healthy container and still returned

@@ -384,6 +384,7 @@ fn capacity_options(council: Arc<CouncilNode>) -> HarnessOptions {
             node_id: reliaburger::meat::NodeId::new("node-1"),
             address: "127.0.0.1:9001".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         }]),
         capacity_nodes: vec!["node-1".into()],
         ..Default::default()
@@ -1086,6 +1087,7 @@ async fn follower_forwarding_cannot_bypass_a_failed_cluster_prerequisite() {
             node_id: reliaburger::meat::NodeId::new("node-1"),
             address: format!("127.0.0.1:{}", leader.port).parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         }]),
         ..Default::default()
     })

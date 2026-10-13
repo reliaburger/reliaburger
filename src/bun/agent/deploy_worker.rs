@@ -217,23 +217,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
             }
 
-            // Gate on image signature first (IMG1). A verified image comes back
+            // Gate on image signature first (IMG1), for the app's image and
+            // each init container's own (#701). A verified image comes back
             // pinned to its manifest digest; the pinned spec shadows the
             // original for the rest of this iteration.
-            let pinned_spec;
-            let spec = match self.ops.enforce_image_signature(spec).await {
-                Ok(None) => spec,
-                Ok(Some(pinned_image)) => {
-                    let mut with_pin = spec.clone();
-                    with_pin.image = Some(pinned_image);
-                    pinned_spec = with_pin;
-                    &pinned_spec
-                }
+            let pinned_spec = match self.pin_images(spec).await {
+                Ok(pinned) => pinned,
                 Err(reason) => {
                     let _ = events.send(ApplyEvent::Error { message: reason }).await;
                     return;
                 }
             };
+            let spec = pinned_spec.as_ref().unwrap_or(spec);
 
             // Asked before the new spec replaces the one the replicas run.
             let in_place = self
@@ -471,13 +466,45 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
     }
 
+    /// Check every image `spec` runs against the trust policy: the app's and
+    /// each init container's own. Returns the spec with each verified image
+    /// pinned to its digest, or `None` when nothing needed pinning.
+    async fn pin_images(&self, spec: &AppSpec) -> Result<Option<AppSpec>, String> {
+        let mut pinned: Option<AppSpec> = None;
+        if let Some(image) = self
+            .ops
+            .enforce_image_signature(spec.image.as_deref())
+            .await?
+        {
+            pinned.get_or_insert_with(|| spec.clone()).image = Some(image);
+        }
+        for (index, init) in spec.init.iter().enumerate() {
+            // An init without an image runs the app's, checked above.
+            if init.image.is_none() {
+                continue;
+            }
+            if let Some(image) = self
+                .ops
+                .enforce_image_signature(init.image.as_deref())
+                .await?
+                && let Some(slot) = pinned
+                    .get_or_insert_with(|| spec.clone())
+                    .init
+                    .get_mut(index)
+            {
+                slot.image = Some(image);
+            }
+        }
+        Ok(pinned)
+    }
+
     /// Run the same owned init chain for fresh and rolling replacements.
     pub(super) async fn drive_initialisers(
         &self,
         instance_id: &InstanceId,
         app_name: &str,
-        namespace: &str,
         spec: &AppSpec,
+        app_oci: &crate::grill::oci::OciSpec,
         cgroup_path: &std::path::Path,
     ) -> Result<(), BunError> {
         if spec.init.is_empty() {
@@ -488,14 +515,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
         for (i, init_spec) in spec.init.iter().enumerate() {
             let init_id = self.ops.register_initialiser(instance_id, i).await?;
-            let init_oci = crate::grill::oci::generate_init_oci_spec(
-                &init_spec.command,
-                namespace,
-                app_name,
-                spec.image.as_deref(),
-                &cgroup_path.to_string_lossy(),
-                None,
-            );
+            // Its own image, the app's env and mounts (#701).
+            let init_oci = crate::grill::oci::generate_init_oci_spec(init_spec, app_oci);
             if let Err(error) = self.grill.create(&init_id, &init_oci).await {
                 // A missing init binary fails its parent the way its own would.
                 if let Some(problem) = error.launch_problem() {
@@ -600,7 +621,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // The image pull happens here, off the loop.
         self.create_or_fail(instance_id, &prepared.oci_spec).await?;
         self.ops
-            .store_oci_spec(instance_id, prepared.oci_spec)
+            .store_oci_spec(instance_id, prepared.oci_spec.clone())
             .await;
 
         // create → program → start: the workload never runs ahead of its
@@ -612,8 +633,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             self.drive_initialisers(
                 instance_id,
                 app_name,
-                namespace,
                 spec,
+                &prepared.oci_spec,
                 &prepared.cgroup_path,
             )
             .await?;
@@ -1069,7 +1090,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
             .map_err(|error| format!("failed to program egress for {}: {error}", new_id.0))?;
         let initialised = async {
-            self.drive_initialisers(new_id, app_name, namespace, spec, &cgroup_path)
+            self.drive_initialisers(new_id, app_name, spec, &oci_spec, &cgroup_path)
                 .await?;
             self.ops
                 .transition_state(new_id, ContainerState::Starting)

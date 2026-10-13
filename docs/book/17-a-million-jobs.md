@@ -149,7 +149,7 @@ let run = match arrays.entry(assignment.batch_id) {
 
 `entry` returns a handle to the slot, full or empty, and holding it keeps the map borrowed, so nothing else can change the map between the check and the insert.
 
-On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 100,000 fake tasks through a real single-node council: the whole array cost 51 Raft entries.
+On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 20,000 fake tasks through a real single-node council and allows three Raft entries per thousand tasks; a run usually costs about ten. It used to push 100,000, and the whole array cost 51 entries, but that was 4.4 seconds of CPU in a debug build, and on a laptop shared with other test runs it crept up to the 60-second test timeout. Entries follow chunks and leader ticks, not tasks, so a fifth of the work shows the same ratio (#896).
 
 What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
 
@@ -576,6 +576,26 @@ A million tasks now cost 22.4 bytes of ledger and 25.0 of index on APFS, about 4
 
 That headroom isn't decoration, as the unit test found out a day later. It had also asserted at most 23 allocated bytes a task for the ledger, and it failed about one run in twenty on a Mac (#717). Nothing in the file had changed. Its logical length was 22,079,408 bytes every single time: the 8-byte magic, 245 block headers and a million 22-byte records. What changed was the allocation. APFS keeps up to about 1 MiB allocated past the end of a file that grows by fsynced appends, and how much it keeps varies from run to run, from 8 KiB to 1,000 KiB in forty runs of the same test. Write the same records as one big block and the slack disappears, which is why the test keeps production-sized 4,096-record blocks: a worker's disk pays that slack too. So the test now checks the two things it can know exactly, the logical length of each file to the byte, and leaves allocated bytes to the one bound that allows for the filesystem's choices, 50 a task for the pair. The worst of those forty runs was 47.6.
 
+### What a finished run still needs
+
+Fifty bytes a task was an honest number, but it wasn't the plan's sixteen, and it bugged us (#739). So we asked a different question: what does a run need once it's *over*?
+
+While a run is active the ledger earns every byte. It's how a restarted worker knows which tasks already finished, and its group commit is what lets a chunk report only durable results. The live index beside it gets rewritten in place, so it carries a check to catch a slot torn by a crash. Once the leader marks the run terminal, none of that applies. No chunk will ever start again, so nothing replays the ledger, and nothing writes the index. What readers still ask for is `relish batch results` (outcome, attempts, exit code, run time) and `relish batch logs`, which finds a failure's output by its task index and grant attempt. The leader also merges rows from several workers by grant attempt, so that has to stay.
+
+So a worker now *compacts* a finished run. It writes those fields into a third file, `results`, with one 14-byte slot per task:
+
+```text
+slot = outcome: u8, attempts: u8, exit_code: i32, run_ms: u32, grant_attempt: u32
+```
+
+The slot leaves out three things the live slot carries. The task index goes, because the slot's position already says it. The check goes, because this file is written once, fsynced and renamed into place, so no crash can leave half a slot in it. And the grant attempt shrinks from 64 bits to 32. A chunk's attempt only goes up when a node loss puts it back in the queue, and four billion requeues of one chunk would take a while. If it ever happens anyway, compaction refuses, keeps the ledger and says why, rather than quietly writing the wrong number. Once `results` is durable, the worker deletes the ledger, the live index and the launch fences (`grants.json` and the `started-*` markers), which only guard a run that can still start chunks. Failure output stays.
+
+The order is what makes it safe to crash at any point. The temporary file is thrown away if the worker dies while writing it, and the ledger is still there to start again from. Once the rename lands, `results` is complete, and the next try only deletes what's left over. The ledger is the source, not the live index: a crash between the ledger's fsync and the index's can leave a record in one and not the other, and compaction mustn't lose it.
+
+Two details took a second look. First, *when* is "finished"? The leader's sync lists every array it keeps, and among them the ones still running. An array that's kept but not running is terminal, and terminal is final in the Raft state. The worker cancels the run, but its chunks may still be writing their last records, so it waits for the ledger's group-commit writer to close. The writer closes only when every `LedgerHandle` is gone, the run's and every chunk's, and `JoinHandle::is_finished` asks without waiting, so a sync never blocks on a slow chunk. Second, a reader racing compaction mustn't re-create what it deleted. The live index used to open with `create(true)`; the read path now opens files read-only. A reader that opened the old index just before the unlink keeps reading it: on Unix an unlinked file lives on until its last descriptor closes.
+
+A million finished tasks now cost 14.0 to 14.4 bytes each on APFS, about 13.5 MiB, under the plan's 16 MiB per million. The unit test asserts the logical length to the byte, `tasks * 14`, and the allocated size against `STORAGE_BYTES_PER_TASK`, now 16. An active run still pays about 47, and `ACTIVE_STORAGE_BYTES_PER_TASK` keeps the old bound of 50. We didn't shrink the ledger itself. It's the price of crash-safe, group-committed progress, and a worker pays it only for runs in flight.
+
 Bytes per task only matter if they eventually go away. Workers already deleted a run's directory once the leader stopped listing it, but the leader only forgot a finished run when someone *submitted* something: pruning lived in the registration path. An idle cluster, or one running the same long array all day, kept everything. The fix is a new replicated write:
 
 ```rust
@@ -647,6 +667,117 @@ outcome getting lost. So the wait changed instead. Job tests now share
 on a miss the harness names the state the job was stuck in. A job that never
 runs (one on a disk with less than a gibibyte free, say) still fails. Under
 the same load, 128 of 128 runs passed, the slowest whole run in 13.3 s.
+
+### A fence that moves every tick
+
+"An idle tick now flushes nothing" was true, and it was the wrong case to fix.
+A busy tick isn't idle. The control fence holds the newest control version the
+node has acted on: the recovery epoch, the leader's term and the council's
+applied log index. Every tick that changes anything commits one Raft entry, so
+under load the index moves on every tick and the fence changes on nearly every
+sync. The hung-worker test (above, in "Dispatch at scale") had already had its
+bar lowered because the healthy node's syncs were slow on a busy Mac (#745).
+
+Each change replaced the file the usual safe way: write `control.tmp`,
+flush it, rename it over `control.json`, flush the directory. That's two
+`F_FULLFSYNC`s, plus a create and a rename that, as the previous section found,
+queue behind every other process's flushes. We measured it with a throwaway
+test that syncs one node 200 times, the index one higher each time, on the
+same 10-core Mac. Idle, a sync took 10 to 13 ms at the median. With 40 busy
+loops and four loops each writing 1 MiB and calling `F_FULLFSYNC` (load
+average 90 to 200, sibling builds included), the median was 50 to 61 ms, the
+99th percentile 90 to 124 ms, and one sync took 1.08 s.
+
+Could the node skip the flush? The fence is there so that a delayed sync built
+from an older snapshot can't undo something the node already did. The worst
+case is deletion: a sync's list of known arrays tells the node which array
+directories to delete, and an older list doesn't name newer arrays. That has
+to hold across a restart too, which is what
+`task_array_recovery::stale_control_cannot_delete_ledgers_after_a_restart`
+checks. Keeping the index in memory and persisting only epoch and term changes
+would probably be safe, because the leader waits for each node's answer, or
+gives up on it, before calling that node again. But "probably", resting on how another component happens to behave
+today, is exactly the kind of argument a fence exists to avoid. So every new
+version still reaches stable storage before the node acts on it. What changed
+is how it gets there.
+
+`control.fence` (in `src/bun/control_fence.rs`) is a fixed-size file with two
+32-byte slots, one at offset 0 and one at 512, so each sits in its own disk
+sector. A slot is a magic number, the three `u64`s and a CRC32 of the rest. A
+new version overwrites, in place, the slot that *doesn't* hold the current
+one, and flushes once:
+
+```rust
+file.seek(SeekFrom::Start((1 - current.slot) * SLOT_STRIDE))?;
+file.write_all(&encode(version))?;
+file.sync_data()
+```
+
+No create, no rename and no directory flush, because the file's size and its
+directory entry don't change. `sync_data` is `fdatasync` on Linux, which skips
+the timestamps, and `F_FULLFSYNC` on macOS, just like `sync_all`.
+
+Why is that still safe? A crash during the write can tear the slot being
+written, and the CRC then rejects it. The other slot still holds the previous
+version, which was flushed before the node acted on it. The torn one was never
+acted on: the sync carries on only after `sync_data` returns. Reading takes
+the newer of the valid slots, and the next write goes into whichever slot
+isn't current, so a torn slot is the first to be overwritten. The file only
+appears through the old write, flush and rename dance, once, when it's
+created, so there's never a half-written fence file. And a fence with *no*
+valid slot is an error, not "no fence": reading it as version zero would let
+any delayed sync through. The node refuses every sync until someone looks at
+the disk, exactly as it did with an unreadable `control.json`.
+
+Reading a slot is a nice small example of `Option` and `?` together:
+
+```rust
+fn decode(slot: &[u8]) -> Option<ControlVersion> {
+    let word = |at: usize| Some(u64::from_le_bytes(slot.get(at..at + 8)?.try_into().ok()?));
+    let crc = u32::from_le_bytes(slot.get(28..32)?.try_into().ok()?);
+    if slot.get(..4)? != MAGIC || crc32fast::hash(slot.get(..28)?) != crc {
+        return None;
+    }
+    // ...
+}
+```
+
+`slot.get(range)` returns an `Option<&[u8]>` instead of panicking when the
+range runs off the end, and `?` on an `Option` returns `None` from the
+enclosing function, or here from the closure, which is why `word` wraps its
+result in `Some`. `try_into()` turns a slice into a fixed-size array
+(`[u8; 8]`), which is what `u64::from_le_bytes` takes; it fails only when the
+lengths differ, and `.ok()` turns that `Result` into an `Option` so `?` can
+use it. No `unwrap`, and no way for a short slice to panic.
+
+One detail came from the hung-worker test. It hangs a worker by swapping the
+fence for a FIFO with no writer. A sync that read the real fence just before
+the swap would now open the path to write, and opening a FIFO for writing
+blocks until a reader turns up, which in that test is never. So the write
+opens with `O_NONBLOCK` (through `custom_flags`, from the `OpenOptionsExt`
+trait we met in Chapter 10). For a regular file that flag does nothing; for a
+FIFO the open fails at once with `ENXIO` and the sync answers with a refusal.
+`advancing_a_fence_swapped_for_a_fifo_fails_instead_of_blocking` pins it.
+
+The tests pin the rest. `a_sync_flushes_the_disk_only_when_the_fence_changes`
+now counts three flushes for a new fence file, none to repeat a version and
+one for the next. `a_moving_fence_is_rewritten_in_place_without_a_rename`
+advances the fence 49 times and checks that the file's inode never changes
+(no rename) and that it cost exactly 49 flushes, then restarts the node and
+checks that it refuses version 49 and accepts 50.
+`a_torn_fence_slot_falls_back_to_the_last_acknowledged_version` damages the
+newest slot by hand and checks that the node falls back to the previous
+version, still refuses anything older, and overwrites the torn slot rather
+than the good one. `a_fence_with_no_valid_slot_refuses_every_sync` damages
+both.
+
+Under the same load, the same 200 syncs took 15 to 19 ms at the median, 26
+to 62 ms at the 99th percentile, and at most 100 ms. That's about a third of
+the time, and the second-long outlier is gone. Idle, nothing changed (about
+12 ms): one `F_FULLFSYNC` is the floor for a fence that moves, and we've kept
+it on purpose. The grant fence, `grants.json` in each array's directory, still
+takes the replace-and-rename route on every new grant; it's the obvious next
+candidate for the same treatment.
 
 ### Fair shares: one tenant can't starve the rest
 
@@ -1191,9 +1322,93 @@ common admission path, `admit_definition`, asks the node's executor the same
 `admit` question about host work before writing anything, and a refusal comes
 back as HTTP 422 with the reason. We kept it to host work, the case #777 is
 about; a container run on a node without a container runtime still goes
-through the tick, a second later. A council could do the same if every node
-advertised what it can run, but that's another piece of gossiped state to keep honest.
-A second of delay in a cluster is a fair price for not having it.
+through the tick, a second later.
+
+A cluster had no such shortcut at first. The leader admitted the run, wrote
+it to Raft, and failed it on the next tick. You got a `202 Accepted` and, a
+second later, a `Failed`. That's honest, but it's a strange way to say no.
+The fix (#788) was the piece of gossiped state we'd been putting off: every
+node now tells the others what kinds of job it runs.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCapabilities {
+    pub host: bool,
+    pub host_limits: bool,
+    pub containers: bool,
+    pub singleton_images: bool,
+    pub singleton_image_limits: bool,
+    pub encrypted_env: bool,
+    pub network_policy: bool,
+    pub mount_isolation: bool,
+    pub binaries: bool,
+}
+```
+
+Nine flags, one for each question `admit` asks of the node's runtime and
+`[process_workloads]` policy. `Copy` is new here: it tells the compiler that a
+`JobCapabilities` is plain bits, so assigning one copies it and the original
+stays usable, the way an `int` or a C struct of `bool`s behaves. Without it,
+`let b = a;` would *move* `a`, and touching `a` afterwards wouldn't compile.
+Rust only lets you derive `Copy` when every field is `Copy` too, so a struct
+holding a `String` can't have it.
+
+The summary rides the gossip directory extension, beside the node's labels
+and endpoints, on every probe. Since #696 a probe fills a fixed byte budget,
+and whatever the extension costs is room a membership update can't use. So
+the summary is small on purpose: bincode writes a `bool` as one byte, which
+makes the whole thing ten bytes with its `Option` tag. A test stamps the
+biggest extension a node can send (63-byte names, IPv6 endpoints, sixteen
+labels using the whole label budget, a leader hint, a recovery claim and
+every job flag) and checks the probe still carries a membership update.
+
+What the summary can't carry is the allowlist itself. Paths are long, and a
+node can name dozens. So `binaries` only says whether the allowlist names
+anything at all, since an empty one refuses every host job. The full list
+already reaches the leader another way: since #702 each node's capability
+report on the reporting tree carries its `allowed_binaries`, so the scheduler
+can place `exec` apps. Admission reuses it rather than gossiping a second
+copy. Where the leader holds a node's report, it checks the run's binary
+against the list; where it doesn't, it falls back to the gossiped flag.
+
+The harder problem was keeping the summary honest. If the leader decided from
+the flags with its own logic, the two would drift, and admission would refuse
+runs the nodes would take, or quote a different reason from the tick. So
+there's only one copy of the logic. `capability_refusal` takes the flags, the
+assignment and whether the binary is allowed, and returns the first refusal.
+The node's `admit` now calls it with its *own* flags:
+
+```rust
+let binary_allowed = self.config.policy.is_binary_allowed(&assignment.program);
+if let Some(reason) = capability_refusal(&self.job_capabilities(), assignment, binary_allowed)
+{
+    return Err(reason);
+}
+```
+
+The leader calls the same function with each live member's gossiped flags. A
+test runs a matrix of runs (host arrays, limits, singleton images, image
+arrays, `shared-runc`, egress) against owned, process and fake runners under
+four policies, and checks the advertised verdict matches `admit` word for
+word.
+
+The leader refuses only when it's sure. Every live member has to have
+advertised a summary, and every one of them has to refuse. A member it hasn't
+heard from yet might take the run, so the run is admitted and left to the
+nodes. Without a node's report, the leader assumes a non-empty allowlist
+might allow the binary. In each of those cases the tick from #777 stays the backstop, as it does
+for the races: a node that leaves, or changes its configuration, after
+admission. When admission does refuse, it quotes the reasons through the same
+`quote_reasons` helper the tick uses, so `relish run` prints `no node can run
+job default/render: host jobs don't run under [process_workloads]
+mount_isolation yet …` whether the leader caught it at the door or a tick
+later.
+
+The node publishes its summary through a `tokio::sync::watch` channel, because
+gossip starts long before the task executor exists. Gossip reads the latest
+value whenever it builds a probe, and lists the node in its own directory too:
+the leader is a member like any other, and its own extension never comes back
+to it over the wire.
 
 One more thing was quietly wrong. A node's capability report said it ran
 process workloads whenever its allowlist wasn't empty, even with

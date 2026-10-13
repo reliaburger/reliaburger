@@ -255,6 +255,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         app.egress.as_ref(),
     )?;
     validate_app_ingress(name, app)?;
+    validate_app_honoured_fields(name, app)?;
 
     // Ordinals come from the leader's placements, never from a config file.
     if app.ordinals.is_some() {
@@ -449,6 +450,83 @@ fn validate_app_ingress(name: &str, app: &super::app::AppSpec) -> Result<(), Con
     })
 }
 
+/// Refuse app fields that would parse and then be ignored or half-honoured,
+/// so a valid-looking config can't quietly run something else (#701): a GPU
+/// request no node can back, mounts and a user a process workload never
+/// applies, and a health check that can't probe or can only fail.
+fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let refuse = |field: &str, reason: String| ConfigError::Validation {
+        field: field.to_string(),
+        context: format!("app {name:?}"),
+        reason,
+    };
+
+    // D41: no device passthrough or cluster GPU accounting yet.
+    if app.gpu.is_some_and(|gpu| gpu > 0) {
+        return Err(refuse(
+            "gpu",
+            "GPU workloads aren't supported yet (#359)".to_string(),
+        ));
+    }
+
+    // ProcessGrill runs the host binary as it is: no mounts, no user switch.
+    // Placement asks the same question through `host_binary`.
+    if crate::meat::filter::host_binary(app).is_some() {
+        let ignored = [
+            ("volumes", !app.volumes.is_empty()),
+            ("config_file", !app.config_file.is_empty()),
+            ("run_as_user", app.run_as_user.is_some()),
+            ("run_as_group", app.run_as_group.is_some()),
+        ];
+        if let Some((field, _)) = ignored.iter().find(|(_, set)| *set) {
+            return Err(refuse(
+                field,
+                format!("{field} applies to image workloads; an exec or script app can't use it"),
+            ));
+        }
+    }
+
+    let Some(health) = &app.health else {
+        return Ok(());
+    };
+    if health.port.or(app.port).is_none() {
+        return Err(refuse(
+            "health",
+            "no port to probe: set health.port or the app's port".to_string(),
+        ));
+    }
+    let zero = [
+        ("health.interval", health.interval == Some(0)),
+        ("health.timeout", health.timeout == Some(0)),
+        (
+            "health.threshold_unhealthy",
+            health.threshold_unhealthy == Some(0),
+        ),
+        (
+            "health.threshold_healthy",
+            health.threshold_healthy == Some(0),
+        ),
+    ];
+    if let Some((field, _)) = zero.iter().find(|(_, is_zero)| *is_zero) {
+        return Err(refuse(field, format!("{field} must be at least 1")));
+    }
+    let interval = health
+        .interval
+        .unwrap_or(crate::bun::health::DEFAULT_HEALTH_INTERVAL_SECS);
+    let timeout = health
+        .timeout
+        .unwrap_or(crate::bun::health::DEFAULT_HEALTH_TIMEOUT_SECS);
+    // A probe that may outlast the interval overlaps the next one. Equal is
+    // allowed: seconds are whole, so a 1 s interval needs a 1 s timeout.
+    if timeout > interval {
+        return Err(refuse(
+            "health.timeout",
+            format!("timeout ({timeout}s) must not be longer than interval ({interval}s)"),
+        ));
+    }
+    Ok(())
+}
+
 /// Check the network policy apps and jobs share: every egress entry parses
 /// (without resolving names), and every `allow_from` source is `app` or
 /// `namespace/app` made of workload labels.
@@ -457,6 +535,15 @@ fn validate_network_policy(
     firewall: Option<&super::app::FirewallSpec>,
     egress: Option<&super::app::EgressSpec>,
 ) -> Result<(), ConfigError> {
+    // Cross-cluster egress (Franchise) doesn't exist: every node would refuse
+    // the workload, so refuse it here, at apply and lint (#701).
+    if egress.is_some_and(|egress| !egress.allow_franchise.is_empty()) {
+        return Err(ConfigError::Validation {
+            field: "egress.allow_franchise".to_string(),
+            context: context.to_string(),
+            reason: "cross-cluster egress isn't implemented".to_string(),
+        });
+    }
     for entry in egress.map_or(&[][..], |egress| egress.allow.as_slice()) {
         crate::sesame::egress::validate_egress_entry(entry).map_err(|error| {
             ConfigError::Validation {
@@ -2111,5 +2198,115 @@ exec = "/usr/bin/python3""#,
         ] {
             validate_ingress(ingress).unwrap();
         }
+    }
+
+    /// Validate a one-app config whose `[app.web]` table is `app`.
+    fn validate_app_toml(app: &str) -> Result<(), ConfigError> {
+        Config::parse(&format!("[app.web]\n{app}"))
+            .unwrap()
+            .validate()
+    }
+
+    /// Assert `app` is refused with an error naming `field`.
+    fn assert_app_refused(app: &str, field: &str) {
+        let error = validate_app_toml(app).expect_err(app);
+        assert!(error.to_string().contains(field), "{app}: {error}");
+    }
+
+    #[test]
+    fn process_app_with_volume_is_refused() {
+        // ProcessGrill never mounts anything: the app would run without
+        // the volume it declared (#701).
+        for kind in ["exec = \"/usr/bin/python3\"", "script = \"echo hi\""] {
+            assert_app_refused(
+                &format!("{kind}\n[[app.web.volumes]]\npath = \"/data\""),
+                "volumes",
+            );
+        }
+    }
+
+    #[test]
+    fn process_app_with_config_file_is_refused() {
+        for kind in ["exec = \"/usr/bin/python3\"", "script = \"echo hi\""] {
+            assert_app_refused(
+                &format!(
+                    "{kind}\n[[app.web.config_file]]\npath = \"/etc/x.conf\"\ncontent = \"x\""
+                ),
+                "config_file",
+            );
+        }
+    }
+
+    #[test]
+    fn process_app_with_run_as_user_is_refused() {
+        assert_app_refused(
+            "exec = \"/usr/bin/python3\"\nrun_as_user = 1000",
+            "run_as_user",
+        );
+        assert_app_refused("script = \"echo hi\"\nrun_as_group = 1000", "run_as_group");
+    }
+
+    #[test]
+    fn image_app_keeps_volumes_config_files_and_user() {
+        validate_app_toml(
+            "image = \"web:v1\"\nrun_as_user = 1000\n\
+             [[app.web.volumes]]\npath = \"/data\"\n\
+             [[app.web.config_file]]\npath = \"/etc/x.conf\"\ncontent = \"x\"",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn health_port_without_app_port_is_valid() {
+        // `health.port` is enough on its own: the probe has a port (#701).
+        validate_app_toml("image = \"web:v1\"\n[app.web.health]\npath = \"/healthz\"\nport = 8081")
+            .unwrap();
+    }
+
+    #[test]
+    fn health_without_any_port_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\n[app.web.health]\npath = \"/healthz\"",
+            "health",
+        );
+    }
+
+    #[test]
+    fn zero_health_timeout_is_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        for field in [
+            "timeout",
+            "interval",
+            "threshold_unhealthy",
+            "threshold_healthy",
+        ] {
+            assert_app_refused(&format!("{health}\n{field} = 0"), field);
+        }
+    }
+
+    #[test]
+    fn health_timeout_longer_than_interval_is_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        assert_app_refused(&format!("{health}\ninterval = 5\ntimeout = 6"), "timeout");
+        // The default interval is 10 s, so an 11 s timeout alone is refused too.
+        assert_app_refused(&format!("{health}\ntimeout = 11"), "timeout");
+        // Seconds are whole, so a 1 s interval must allow a 1 s timeout.
+        validate_app_toml(&format!("{health}\ninterval = 1\ntimeout = 1")).unwrap();
+    }
+
+    #[test]
+    fn gpu_request_is_refused() {
+        // D41: no device passthrough or cluster accounting yet (#359).
+        let error = validate_app_toml("image = \"trainer:v1\"\ngpu = 1").unwrap_err();
+        assert!(error.to_string().contains("#359"), "{error}");
+        validate_app_toml("image = \"trainer:v1\"\ngpu = 0").unwrap();
+    }
+
+    #[test]
+    fn allow_franchise_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\n[app.web.egress]\nallow_franchise = [\"redis.prod-west\"]",
+            "allow_franchise",
+        );
     }
 }

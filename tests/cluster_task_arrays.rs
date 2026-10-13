@@ -1167,8 +1167,8 @@ async fn start_hung_node(
 
 /// Hang a worker's sync API without stopping its gossip: swap its control
 /// fence file for a FIFO with no writer, so its next sync blocks reading it
-/// (as on a stuck disk). Retries if a sync in flight renames a fresh fence
-/// over the FIFO.
+/// (as on a stuck disk). Retries if a sync in flight found no fence in the
+/// gap and renamed a fresh one over the FIFO.
 async fn hang_sync(control: &std::path::Path) {
     use std::os::unix::fs::FileTypeExt;
     for _ in 0..50 {
@@ -1345,7 +1345,7 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
         "{entries} Raft entries in {ticks} ticks for {HUNG_ARRAYS} arrays"
     );
 
-    let control = data[victim].path().join("task-arrays/control.json");
+    let control = data[victim].path().join("task-arrays/control.fence");
     hang_sync(&control).await;
 
     // While the victim's API hangs, the leader still hears from the healthy
@@ -1374,8 +1374,8 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
     );
     // Waiting on the hung node's 3 s sync timeout every tick would allow at
     // most two fresh readings in 4 s. The healthy node's own syncs can be
-    // slow on a busy host (each fsyncs its control fence), so don't demand
-    // all twenty ticks.
+    // slow on a busy host (each flushes its moved control fence, and its
+    // grants and ledger), so don't demand all twenty ticks.
     assert!(
         seen.len() >= 5,
         "the healthy node was heard {} times in 4 s",

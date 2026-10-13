@@ -26,7 +26,8 @@ port = 6379
 # Managed volume — Reliaburger creates the host directory automatically.
 [[app.redis.volumes]]
 path = "/data"
-size = "10Gi"
+# No `size`: only a root node on Linux can enforce one, and a node that
+# can't refuses a sized volume rather than run it unbounded.
 
 [app.nginx]
 image = "proc-grill:image-ignored"

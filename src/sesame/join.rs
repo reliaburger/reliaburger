@@ -311,7 +311,8 @@ pub async fn fetch_ca(
 /// cluster CA (see [`fetch_ca`] and `mtls::build_ca_pinned_client`), so the
 /// token travels only over a verified connection. If `expected_fingerprint` is
 /// set, the returned bundle's root CA is re-checked against it as defence in
-/// depth before the identity is ever written to disk.
+/// depth before the identity is ever written to disk. Before the token is
+/// sent, the member's `/v1/cluster/ca` must report this build's formats.
 pub async fn request_join(
     client: &reqwest::Client,
     member_url: &str,
@@ -319,19 +320,22 @@ pub async fn request_join(
     node_id: &str,
     expected_fingerprint: Option<&str>,
 ) -> Result<NodeIdentity, JoinClientError> {
-    // Query the pinned member before sending the one-time credential. Old
-    // development servers ignore unknown JSON fields on a join request.
-    let mut version_url =
+    // Ask the pinned member for its formats before sending the one-time
+    // credential. Its CA endpoint reports them and answers at once. Not
+    // `/v1/version`: that reports the member's binary hash, and a member
+    // that has just started answers only once it has hashed its own
+    // binary, which on a saturated host outlasts this deadline (#884).
+    let mut formats_url =
         reqwest::Url::parse(member_url).map_err(|e| JoinClientError::Malformed(e.to_string()))?;
-    version_url.set_path("/v1/version");
-    version_url.set_query(None);
-    version_url.set_fragment(None);
+    formats_url.set_path("/v1/cluster/ca");
+    formats_url.set_query(None);
+    formats_url.set_fragment(None);
     #[derive(Deserialize)]
-    struct VersionResponse {
+    struct FormatsResponse {
         compatibility: crate::compatibility::Compatibility,
     }
-    let version: VersionResponse = client
-        .get(version_url)
+    let formats: FormatsResponse = client
+        .get(formats_url)
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -341,7 +345,7 @@ pub async fn request_join(
         .json()
         .await
         .map_err(|e| JoinClientError::Malformed(e.to_string()))?;
-    version.compatibility.require_current()?;
+    formats.compatibility.require_current()?;
 
     // Generate our own keypair and CSR. The private key stays here (PKI4).
     let (csr_der, private_key_der) = ca::create_node_csr(node_id)

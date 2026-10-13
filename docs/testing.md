@@ -88,6 +88,11 @@ ignored by default and run by their own targets and CI jobs
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
+The eBPF tests load the object embedded in the library under test, as Bun
+does, and never search the target directory. Worktrees can share one
+`CARGO_TARGET_DIR` without testing each other's programs.
+`tests_load_the_object_this_build_compiled` checks this without a kernel.
+
 ### Who runs an ignored test
 
 Every `#[ignore = "..."]` reason names its owner, and `make check-ignored`
@@ -170,7 +175,11 @@ rest and the runner factor (the median). The means of the 12 October runs are
 a fixture in
 [`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
 `make test-ci-scripts` checks that they pass and that a benchmark pushed to
-2.1× the rest of any of them fails. Its Criterion output and baseline are kept as the
+2.1× the rest of any of them fails. The gate matches benchmarks by name, so
+a benchmark whose workload changes gets a new name (as
+`state/json_encode_1m_x64` did, #872): under its old name it would be
+compared with `main`'s baseline for the old workload, and a new name starts
+fresh. The job's Criterion output and baseline are kept as the
 `criterion-task-arrays` artefact for 90 days, the cost trend #668 reads.
 `test_every_benchmark_target_is_run_by_a_workflow` fails if a `bench` target
 in the `Makefile` isn't run by any workflow.

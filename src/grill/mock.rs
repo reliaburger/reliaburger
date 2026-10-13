@@ -97,6 +97,8 @@ pub struct MockGrill {
     call_delays: Arc<Mutex<HashMap<MockCall, std::time::Duration>>>,
     /// What `logs` returns per instance; empty when unset.
     captured_logs: Arc<Mutex<HashMap<InstanceId, String>>>,
+    /// The spec each instance was last created from.
+    created_specs: Arc<Mutex<HashMap<InstanceId, OciSpec>>>,
     /// Each identity's current launch generation, as a journalling runtime
     /// keeps one: every successful `create` starts a new one.
     generations: Arc<Mutex<HashMap<InstanceId, u64>>>,
@@ -160,6 +162,7 @@ impl Default for MockGrill {
             log_stems: Arc::default(),
             call_delays: Arc::default(),
             captured_logs: Arc::default(),
+            created_specs: Arc::default(),
             generations: Arc::default(),
             last_generation: Arc::default(),
             park_forgets: Arc::default(),
@@ -172,6 +175,11 @@ impl MockGrill {
     /// Create a new MockGrill.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The spec `instance` was last created from, if it was created.
+    pub fn created_spec(&self, instance: &InstanceId) -> Option<OciSpec> {
+        self.created_specs.lock().unwrap().get(instance).cloned()
     }
 
     /// Make every later `call` take `delay`, or no time again with `None`.
@@ -702,6 +710,10 @@ impl super::Grill for MockGrill {
                 .unwrap()
                 .insert(instance.clone(), path);
         }
+        self.created_specs
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), spec.clone());
         let generation = self.last_generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
         self.generations
             .lock()

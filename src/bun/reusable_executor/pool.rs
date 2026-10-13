@@ -1897,6 +1897,7 @@ mod tests {
         let spec = OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: OciRoot {
                 path: "/".into(),

@@ -12,6 +12,11 @@ use crate::config::app::{HealthProtocol, HealthSpec};
 use crate::grill::InstanceId;
 use crate::grill::state::ContainerState;
 
+/// Seconds between probes when `health.interval` is unset.
+pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 10;
+/// Seconds a probe may take when `health.timeout` is unset.
+pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 5;
+
 /// Resolved health check configuration with defaults applied.
 ///
 /// Created from a [`HealthSpec`] (which uses `Option` for every field
@@ -42,12 +47,25 @@ impl HealthCheckConfig {
     /// `app_port` is the app's declared port, used as the fallback when
     /// the health spec doesn't specify its own port.
     pub fn from_spec(spec: &HealthSpec, app_port: u16) -> Self {
+        Self::with_port(spec, spec.port.unwrap_or(app_port))
+    }
+
+    /// The health check `app` declares, if any: probing `health.port`, or
+    /// the app's port when it names none. `None` when the app has no health
+    /// check, or one with no port at all (validation refuses that).
+    pub fn for_app(app: &crate::config::app::AppSpec) -> Option<Self> {
+        let health = app.health.as_ref()?;
+        let port = health.port.or(app.port)?;
+        Some(Self::with_port(health, port))
+    }
+
+    fn with_port(spec: &HealthSpec, port: u16) -> Self {
         Self {
             path: spec.path.clone(),
-            port: spec.port.unwrap_or(app_port),
+            port,
             protocol: spec.protocol,
-            interval: Duration::from_secs(spec.interval.unwrap_or(10)),
-            timeout: Duration::from_secs(spec.timeout.unwrap_or(5)),
+            interval: Duration::from_secs(spec.interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS)),
+            timeout: Duration::from_secs(spec.timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS)),
             threshold_unhealthy: spec.threshold_unhealthy.unwrap_or(3),
             threshold_healthy: spec.threshold_healthy.unwrap_or(1),
             initial_delay: Duration::from_secs(spec.initial_delay.unwrap_or(0)),
@@ -119,8 +137,9 @@ impl HealthStatus {
 }
 
 /// Consecutive failed startup probes after which a HealthWait instance is given
-/// up as Failed (and restarted). At the 1s health interval this is ~1 minute —
-/// long enough for slow starts, short enough to not wait forever.
+/// up as Failed (and restarted). At the default 10 s interval this is about ten
+/// minutes (one minute at a 1 s interval): long enough for slow starts, short
+/// enough to not wait forever.
 const STARTUP_FAILURE_LIMIT: u32 = 60;
 
 /// Evaluate a probe result and determine whether a state transition is needed.

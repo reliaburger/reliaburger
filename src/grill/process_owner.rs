@@ -794,6 +794,7 @@ mod tests {
                 spec: OciSpec {
                     reusable_executor: false,
                     host_process: false,
+                    initialiser: false,
                     root: OciRoot {
                         path: "/".into(),
                         readonly: false,

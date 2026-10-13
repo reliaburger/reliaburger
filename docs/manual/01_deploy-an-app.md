@@ -57,7 +57,75 @@ and the limit to the same thing.
 
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
-`networking`, metrics scraping in `observability`.
+`networking`, metrics scraping in `observability`. Every `[app.*]` field is
+listed in `reference`.
+
+## Health checks
+
+```toml
+[app.api.health]
+path = "/healthz"
+port = 8081               # default: the app's `port`
+interval = 10             # seconds between probes (default 10)
+timeout = 5               # seconds per probe (default 5), at most interval
+threshold_unhealthy = 3   # failed probes before Unhealthy (default 3)
+threshold_healthy = 1     # passing probes before Running (default 1)
+initial_delay = 0         # seconds before the first probe (default 0)
+```
+
+`health.port` works without an app `port`, so an app can probe a separate
+admin listener. `relish apply` refuses a health check with neither, a zero
+interval, timeout or threshold, and a `timeout` longer than the
+`interval`. A new instance that never passes is given up after 60 failed
+probes (about ten minutes at the default interval) and restarted.
+
+## Init containers
+
+```toml
+[[app.api.init]]
+image = "ghcr.io/example/migrate:2.1"   # default: the app's image
+command = ["migrate", "up"]
+```
+
+Init containers run one after another before the app starts, each to
+completion; a failure (or 300 seconds without finishing) fails the instance.
+Each runs its own `image` (pulled, trust-checked and pinned to a digest like
+the app's), or the app's when it has none. It gets the app's environment,
+with secrets decrypted, and the app's volume and config-file mounts, so a
+migration can read `DATABASE_URL` and a config generator can write a volume.
+The volume stays the app's: an init container doesn't take it over, so run it
+as root (most images do) or as the app's user.
+
+## Config files
+
+```toml
+[[app.api.config_file]]
+path = "/etc/api/config.yaml"
+content = """
+log_level: info
+"""
+```
+
+Each instance gets its own read-only copy, so two files with the same name in
+different directories don't clash, and a rollout never changes the file under
+an instance that's already running. The copy goes when the instance does.
+`source` instead of `content` mounts a file from the node itself; see
+`images-and-volumes`.
+
+## What a field can't do
+
+`relish apply` refuses a field it can't honour, rather than run something
+different from the config:
+
+- `gpu` above 0: GPU workloads aren't supported yet
+  ([#359](https://github.com/reliaburger/reliaburger/issues/359)).
+- `egress.allow_franchise`: cross-cluster egress doesn't exist yet.
+- `volumes`, `config_file`, `run_as_user` and `run_as_group` on an `exec` or
+  `script` app: a process workload runs on the host, with no mounts and no
+  user switch.
+- A volume `size` the node can't enforce (see `images-and-volumes`), or a
+  changed `size` on a volume that already exists. Those fail the deploy on
+  that node.
 
 ## Autoscaling
 

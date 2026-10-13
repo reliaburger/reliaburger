@@ -377,6 +377,14 @@ one). A bigger `cpu` or `memory` request doesn't move it, even when its node is
 now short of room. A host-path volume is never chowned: make it readable (or writable) by
 the container's mapped user yourself.
 
+`size` is a hard limit. A node running as root enforces it with a Btrfs quota
+when the volumes directory is on Btrfs, or a loop-mounted ext4 file elsewhere.
+A node that can do neither (rootless, or macOS) refuses a sized volume and
+fails the deploy, rather than run it unbounded; leave `size` out there. The
+size is fixed when the volume is created: a deploy that changes it on an
+existing volume is refused, with a message naming the volume, because
+resizing isn't supported yet.
+
 ### Host paths
 
 A `source` on a volume (mounted read-write) or on a `config_file` (read-only)

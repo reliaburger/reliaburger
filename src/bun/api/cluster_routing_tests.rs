@@ -41,6 +41,7 @@ impl FakeCluster {
             node_id: crate::meat::NodeId::new(name),
             address,
             api_advertised: true,
+            jobs: None,
         });
     }
 
@@ -271,6 +272,7 @@ async fn start_cluster_with_desired(
             node_id: crate::meat::NodeId::new(*name),
             address: listener.local_addr().unwrap(),
             api_advertised: true,
+            jobs: None,
         });
         listeners.push(listener);
     }
@@ -830,6 +832,7 @@ fn known_member(name: &str, port: u16) -> NodeMembershipInfo {
         node_id: crate::meat::NodeId::new(name),
         address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         api_advertised: true,
+        jobs: None,
     }
 }
 
