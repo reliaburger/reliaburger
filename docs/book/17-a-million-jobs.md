@@ -1233,7 +1233,12 @@ every job flag) and checks the probe still carries a membership update.
 
 What the summary can't carry is the allowlist itself. Paths are long, and a
 node can name dozens. So `binaries` only says whether the allowlist names
-anything at all, since an empty one refuses every host job.
+anything at all, since an empty one refuses every host job. The full list
+already reaches the leader another way: since #702 each node's capability
+report on the reporting tree carries its `allowed_binaries`, so the scheduler
+can place `exec` apps. Admission reuses it rather than gossiping a second
+copy. Where the leader holds a node's report, it checks the run's binary
+against the list; where it doesn't, it falls back to the gossiped flag.
 
 The harder problem was keeping the summary honest. If the leader decided from
 the flags with its own logic, the two would drift, and admission would refuse
@@ -1259,8 +1264,8 @@ word.
 The leader refuses only when it's sure. Every live member has to have
 advertised a summary, and every one of them has to refuse. A member it hasn't
 heard from yet might take the run, so the run is admitted and left to the
-nodes. For the binary, the leader assumes a non-empty allowlist might allow
-it. In each of those cases the tick from #777 stays the backstop, as it does
+nodes. Without a node's report, the leader assumes a non-empty allowlist
+might allow the binary. In each of those cases the tick from #777 stays the backstop, as it does
 for the races: a node that leaves, or changes its configuration, after
 admission. When admission does refuse, it quotes the reasons through the same
 `quote_reasons` helper the tick uses, so `relish run` prints `no node can run

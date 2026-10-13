@@ -941,8 +941,8 @@ pub struct AdvertisedNode<'a> {
 /// while any node might take it (#788).
 ///
 /// Admission only refuses when it is sure: every node must have advertised
-/// a summary, and a node with a non-empty allowlist the leader can't see
-/// counts as allowing the binary. The tick ([`unrunnable_reason`]) stays
+/// a summary, and a node with a non-empty allowlist the leader holds no
+/// report of counts as allowing the binary. The tick ([`unrunnable_reason`]) stays
 /// the backstop for whatever this lets through, and for races such as a
 /// node leaving or changing its configuration after admission.
 pub fn admission_refusal(record: &TaskArrayRecord, nodes: &[AdvertisedNode<'_>]) -> Option<String> {

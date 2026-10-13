@@ -462,9 +462,11 @@ no node can run job default/hello: host jobs don't run under
 [process_workloads] mount_isolation yet (on by default on Linux); ...
 ```
 
-The leader refuses only when it's sure. If a node hasn't advertised yet, or
-might allow the binary (gossip says whether a node's allowlist names
-anything, not which paths), the run is admitted, and the leader fails it
+The leader refuses only when it's sure. It checks the binary against each
+node's `allowed_binaries` from that node's capability report; until a node
+has reported, it only knows whether the allowlist names anything. If a node
+hasn't advertised yet, or might allow the binary, the run is admitted, and
+the leader fails it
 within a sync or two once every node it can reach has refused it. The same
 happens when a node leaves or changes its configuration after admission.
 `relish batch-status` and `relish jobs` then show `Failed`, every task not

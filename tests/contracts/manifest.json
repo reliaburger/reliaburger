@@ -7606,7 +7606,7 @@
         "A run any live node might take, or one a node hasn't advertised its capabilities for, is admitted and left to the nodes and the leader's tick."
       ],
       "boundaries": [
-        "Gossip says whether a node's allowed_binaries names anything, not which paths; a binary missing from a non-empty allowlist is caught by the tick, as are nodes that leave or change configuration after admission."
+        "Gossip says whether a node's allowed_binaries names anything; the paths come from its capability report, and until it has reported, a binary missing from a non-empty allowlist is caught by the tick, as are nodes that leave or change configuration after admission."
       ]
     },
     {

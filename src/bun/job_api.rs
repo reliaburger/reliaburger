@@ -150,7 +150,7 @@ fn sole_node_refusal(
 
 /// Why no live member of a cluster can run the definition, judged by the
 /// leader from the job capabilities every member advertises over gossip
-/// (#788). `None` standalone, while any member might run it, or before
+/// (#788) and the allowlists in their capability reports. `None` standalone, while any member might run it, or before
 /// gossip names any member. The leader's tick stays the backstop for runs
 /// this lets through and for nodes that change after admission.
 async fn cluster_refusal(
@@ -161,13 +161,31 @@ async fn cluster_refusal(
 ) -> Option<String> {
     state.council.as_ref()?;
     let record = definition_record(name, namespace, definition)?;
+    // Gossip only says whether a node's allowlist names anything; a node's
+    // capability report (#702) carries the list itself.
+    let allowlists: std::collections::HashMap<crate::meat::NodeId, Vec<std::path::PathBuf>> = state
+        .aggregated_rx
+        .as_ref()
+        .map(|rx| {
+            rx.borrow()
+                .capabilities
+                .iter()
+                .map(|(node, report)| {
+                    (
+                        node.clone(),
+                        report.capabilities.process.allowed_binaries.clone(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let members = state.membership.as_ref()?.read().await;
     let nodes: Vec<_> = members
         .iter()
         .map(|member| super::task_array_leader::AdvertisedNode {
             node: member.node_id.clone(),
             jobs: member.jobs,
-            allowed_binaries: None,
+            allowed_binaries: allowlists.get(&member.node_id).map(Vec::as_slice),
         })
         .collect();
     super::task_array_leader::admission_refusal(&record, &nodes)
