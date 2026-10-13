@@ -399,4 +399,57 @@ mod tests {
         meter.reset_worst_turn();
         assert!(meter.worst_turn().is_none());
     }
+
+    /// The 0.2.0 soak logged `1902 ms in follow_up (consumer_sync)` and
+    /// nothing else (#890): not which step, nor which await. A slow turn's
+    /// line now names the parts it timed, in a fixed order.
+    #[test]
+    fn a_slow_turn_line_says_where_the_time_went() {
+        let meter = LoopTurnMeter::new();
+        let mut turn = meter.begin(LoopBranch::FollowUp, Some("consumer_sync/journal"));
+        turn.started -= Duration::from_millis(1902);
+        meter.add_part(TurnPart::FirewallSync, Duration::from_millis(300));
+        meter.add_part(TurnPart::KernelLock, Duration::from_millis(120));
+        meter.add_part(TurnPart::JournalWrite, Duration::from_millis(1400));
+        meter.add_part(TurnPart::KernelLock, Duration::from_millis(80));
+        assert_eq!(
+            meter.slow_turn_line(&turn, Duration::from_millis(1902)),
+            "bun: agent loop turn took 1902 ms in follow_up (consumer_sync/journal): \
+             journal write 1400 ms, kernel lock wait 200 ms, firewall sync 300 ms"
+        );
+        meter.finish(turn);
+        let last = meter.last_turn().unwrap();
+        assert_eq!(
+            last.part(TurnPart::JournalWrite),
+            Some(Duration::from_millis(1400))
+        );
+        assert_eq!(
+            last.part(TurnPart::KernelLock),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(last.part(TurnPart::ViewInstall), None);
+    }
+
+    #[test]
+    fn a_slow_turn_without_timed_parts_logs_as_before() {
+        let meter = LoopTurnMeter::new();
+        let turn = meter.begin(LoopBranch::Command, Some("status"));
+        assert_eq!(
+            meter.slow_turn_line(&turn, Duration::from_millis(300)),
+            "bun: agent loop turn took 300 ms in command (status)"
+        );
+    }
+
+    #[test]
+    fn each_turn_starts_with_no_timed_parts() {
+        let meter = LoopTurnMeter::new();
+        let turn = meter.begin(LoopBranch::FollowUp, None);
+        meter.add_part(TurnPart::JournalWrite, Duration::from_millis(400));
+        meter.finish(turn);
+        let turn = meter.begin(LoopBranch::HealthTick, None);
+        meter.finish(turn);
+        let last = meter.last_turn().unwrap();
+        assert_eq!(last.branch, LoopBranch::HealthTick);
+        assert_eq!(last.part(TurnPart::JournalWrite), None);
+    }
 }
