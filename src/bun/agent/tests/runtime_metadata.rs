@@ -153,3 +153,89 @@ async fn a_rollout_forgets_the_instances_it_replaced_but_not_their_replacements(
         task.await.unwrap();
     }
 }
+
+/// The generation-checked forgets the runtime has seen so far (#850).
+fn generation_forgets(grill: &MockGrill) -> Vec<InstanceId> {
+    grill
+        .calls()
+        .into_iter()
+        .filter(|(operation, _)| operation == "forget_retired_generation")
+        .map(|(_, id)| id)
+        .collect()
+}
+
+/// Wait until the runtime has been asked to forget a generation of `id`.
+async fn wait_until_generation_forgotten(grill: &MockGrill, id: &InstanceId) {
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !generation_forgets(grill).contains(id) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "runtime never forgot {id:?}; forgotten: {:?}",
+        generation_forgets(grill)
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_app_forgets_its_init_containers_journals() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let init = InstanceId("default__web-0__init-0".into());
+    grill.set_state(&init, ContainerState::Stopped);
+    grill.set_exit_code(&init, Some(0));
+    let task = tokio::spawn(async move { agent.run().await });
+    expect_complete(&send_deploy(&tx, config_with_init_container()).await);
+    assert_eq!(
+        instance_ids(&tx).await,
+        [InstanceId("default__web-0".into())]
+    );
+    assert!(grill.has_launch(&init), "the initialiser never launched");
+
+    send_retire(&tx, "web").await.unwrap();
+    wait_until_generation_forgotten(&grill, &init).await;
+    assert!(
+        !grill.has_launch(&init),
+        "the deleted app's initialiser journal was kept"
+    );
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_immediate_redeploy_still_reads_its_own_init_containers_exit_code() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let init = InstanceId("default__web-0__init-0".into());
+    grill.set_state(&init, ContainerState::Stopped);
+    grill.set_exit_code(&init, Some(0));
+    let task = tokio::spawn(async move { agent.run().await });
+    expect_complete(&send_deploy(&tx, config_with_init_container()).await);
+
+    // The forget the deletion asks for lands late: after the redeploy has
+    // created its own initialiser under the same identity, just before the
+    // redeploy reads that initialiser's exit code.
+    grill.park_forgets();
+    send_retire(&tx, "web").await.unwrap();
+    wait_until_generation_forgotten(&grill, &init).await;
+    expect_complete(&send_deploy(&tx, config_with_init_container()).await);
+    assert_eq!(
+        instance_ids(&tx).await,
+        [InstanceId("default__web-0".into())]
+    );
+    assert!(
+        grill
+            .calls()
+            .contains(&("forget_refused".to_string(), init.clone())),
+        "the late forget never met the successor: {:?}",
+        grill.calls()
+    );
+    assert!(
+        grill.has_launch(&init),
+        "the late forget removed the successor's journal"
+    );
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
