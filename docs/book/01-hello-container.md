@@ -368,7 +368,7 @@ Kubernetes has Deployments, Services, Ingresses, ConfigMaps, Secrets, Persistent
 1. **App** — a long-running containerised process with replicas, health checks, ingress, autoscaling. Replaces Deployment + Service + Ingress + HPA.
 2. **Job** — a run-to-completion task, optionally on a cron schedule. Replaces Job + CronJob.
 3. **Secret** — not a separate resource type. Encrypted values in the `[env]` section, prefixed with `ENC[AGE:`. Lives inline, right next to the plain-text env vars.
-4. **ConfigFile** — a file injected into the container at a specific path. Inline content or a reference to a file in git.
+4. **ConfigFile** — a file injected into the container at a specific path. Inline content, or a `source` naming a file on the node (a host path, not a path in git, so the node gates it like a host-path volume).
 5. **Volume** — local persistent storage. One line: path and size.
 6. **Permission** — who can do what. Actions, apps, optionally scoped to namespaces.
 7. **Namespace** — resource quotas. CPU, memory, GPU limits, max app count.
@@ -983,6 +983,16 @@ for (key, value) in &spec.env {
 `for (key, value) in &spec.env` iterates over the `BTreeMap` by reference. The `&` is important: without it, Rust would try to *move* the map out of `spec`, taking ownership. Since we're borrowing `spec` (the function takes `&AppSpec`, not `AppSpec`), we can only borrow its contents. In Go, `range` over a map copies the key and value — there's no distinction. In Rust, you choose between borrowing (`&`), mutable borrowing (`&mut`), and consuming (no `&`). Most of the time you want borrowing.
 
 You might notice that encrypted values are passed through as the literal `ENC[AGE:...]` string. That's intentional. The decryption infrastructure (Sesame PKI) doesn't exist yet — that's Phase 4. Rather than stubbing it out or adding a no-op decrypt function, we pass the encrypted blob through and leave a `// TODO(Phase 4)` comment. The container will see the encrypted string as its environment variable. That's not useful, but it's honest — and it compiles, tests, and ships.
+
+Inline config files need somewhere on the host to live, because runc can only bind-mount a file that exists. The first version wrote each one to `.config/<namespace>/<app>/<basename>`, and that path had two bugs, both found in the 0.2.1 audit (#701). `/etc/a/config.yaml` and `/etc/b/config.yaml` share a basename, so both mounts got whichever was written last. And every instance of the app shared the file, so a rollout rewrote it under the old instances while they were still serving: they saw the new config before the new version had passed a single health check. Now the copy lives under the instance and a hash of its container path:
+
+```rust
+let digest = sha2::Sha256::digest(cf.path.as_os_str().as_encoded_bytes());
+let host_path = inline_config_dir(base, namespace, app_name, instance_id)
+    .join(hex::encode(&digest[..8]));
+```
+
+A hash rather than the path itself keeps the file name flat and safe however deep or strange the container path is. The directory is removed with the instance, alongside its identity directory.
 
 ## Designing for what doesn't exist yet
 
@@ -2424,6 +2434,31 @@ if !spec.init.is_empty() {
 Each init container gets its own `InstanceId` (e.g., `web-0-init-0`, `web-0-init-1`) and a minimal OCI spec. They run sequentially. `.enumerate()` gives us both the index and the value from the iterator, so we can report which init container failed.
 
 The `loop { ... break ... }` pattern is how you write a polling loop in Rust. The `break` expression evaluates to a value (the boolean `failed`), which becomes the value of the `let failed = loop { ... }` expression. This is another case of "everything is an expression": `loop` produces a value via `break`, just like `if`/`else` produces a value via its branches. In C you'd declare `bool failed` before the loop and assign it inside, which is more fragile because the compiler can't verify that the variable is always assigned before the loop exits.
+
+That first version had a bug that hid for a long time. Look at what it passes: `spec.image`, the *app's* image, and a spec with no environment and only `/proc`, `/dev` and `/sys` mounted. So `[[app.api.init]] image = "migrate:v2"` ran its command in the app's image, couldn't see `DATABASE_URL`, and couldn't write the volume it was meant to prepare. Every use the whitepaper gives for init containers (migrations, config generation, waiting on a dependency) was broken, and the example config hid it by running `echo`, which works in any image. The 0.2.1 audit caught it (#701).
+
+The fix changes what an init spec is *built from*. Instead of the app's raw config, `generate_init_oci_spec` now takes the app's finished `OciSpec`:
+
+```rust
+pub fn generate_init_oci_spec(init: &InitContainerSpec, app: &OciSpec) -> OciSpec {
+    let image = init.image.clone().unwrap_or_else(|| app.root.path.clone());
+    OciSpec {
+        initialiser: true,
+        root: OciRoot { path: image, readonly: false },
+        process: OciProcess {
+            args: init.command.clone(),
+            env: app.process.env.clone(),
+            // ...
+        },
+        mounts: app.mounts.clone(),
+        // ...
+    }
+}
+```
+
+By the time the app's spec exists, its secrets are decrypted, its host paths have passed the node's allowlist, and its image is pinned to the digest the trust policy verified. Borrowing from the finished spec means the init container gets all of that for free, rather than a second copy of the logic that could drift. The deploy worker verifies and pins each init container's own image the same way it does the app's.
+
+`initialiser: true` stops runc handing the app's volumes to the init container's user. Runc gives each managed volume to whichever user a container runs as. If an `alpine` init (root) took the volume over from a `redis` app (uid 999), the app would start and find it couldn't write its own data. Root inside the container's user namespace can write files any mapped user owns, so the init doesn't need the volume to be its own.
 
 The state transition path for apps with init containers is: Pending → Preparing → Initialising → Starting → HealthWait → Running. Without init containers, it's: Pending → Preparing → Starting → HealthWait → Running. The state machine validates both paths because we added Preparing → Initialising and Initialising → Starting as valid transitions.
 

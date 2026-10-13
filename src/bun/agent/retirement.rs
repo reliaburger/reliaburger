@@ -164,6 +164,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await?;
         }
         let identity_dir = self.instance_identity_dir(instance_id);
+        // The instance's own copies of its inline config files (#701).
+        let config_dir = self.supervisor.get_instance(instance_id).map(|instance| {
+            crate::grill::oci::inline_config_dir(
+                &self.volumes_dir,
+                &instance.namespace,
+                &instance.app_name,
+                &instance_id.0,
+            )
+        });
         let records_dir = self.records_dir.clone();
         let id = instance_id.0.clone();
         #[cfg(test)]
@@ -173,6 +182,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             stalls.hold(LoopStall::ArtifactCleanup).await;
             tokio::task::spawn_blocking(move || {
                 crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+                if let Some(directory) = config_dir {
+                    match std::fs::remove_dir_all(&directory) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(directory) = records_dir {
                     crate::grill::records::remove_record(&directory, &id)?;
                 }

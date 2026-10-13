@@ -364,13 +364,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
 
             // Rebuild the health check from the recorded app spec.
-            let health_config = record.app_spec.as_ref().and_then(|spec| {
-                let health = spec.health.as_ref()?;
-                let port = spec.port?;
-                Some(crate::bun::health::HealthCheckConfig::from_spec(
-                    health, port,
-                ))
-            });
+            let health_config = record
+                .app_spec
+                .as_ref()
+                .and_then(crate::bun::health::HealthCheckConfig::for_app);
             if let Some(config) = &health_config {
                 self.supervisor
                     .register_health(instance_id.clone(), config.clone(), now);

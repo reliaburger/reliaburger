@@ -96,7 +96,7 @@ An allowlist always lets the workload reach the node's DNS responder on port
 `.internal` names). Without `[dns]` there's no responder to allow: list your
 resolver yourself. An egress allowlist only works on rootful runc with eBPF,
 and Bun refuses to deploy an app with one anywhere else rather than run it
-unguarded. `allow_franchise` (cross-cluster egress) parses but is refused.
+unguarded. `allow_franchise` (cross-cluster egress) parses, but `relish apply` refuses it.
 Jobs take the same `[job.NAME.egress]` and `[job.NAME.firewall]` tables (see
 [Batch jobs](14_batch-jobs.md)).
 

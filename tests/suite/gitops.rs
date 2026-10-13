@@ -662,6 +662,14 @@ async fn an_unchanged_commit_still_repairs_manual_drift() {
         [app.worker]
         image = "worker:v1"
         replicas = 2
+
+        # The council accepts an autoscale override only for an app that
+        # autoscales (#701).
+        [app.worker.autoscale]
+        metric = "cpu"
+        target = "70%"
+        min = 1
+        max = 10
     "#,
     );
 
