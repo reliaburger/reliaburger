@@ -945,9 +945,10 @@ async fn partition_answers_only_once_every_source_instance_is_covered() {
 // ---------------------------------------------------------------------------
 
 /// With egress enforcement on for a cgroup, a listed destination is
-/// reachable and every other destination is denied (EPERM). We enforce
-/// on the *test's own* cgroup — the process doing the connects — so the
-/// eBPF `bpf_get_current_cgroup_id()` matches what we program.
+/// reachable and every other destination is denied (EPERM). We enforce on a
+/// fresh cgroup that only this test's probes join, as the product does per
+/// workload. The runner's cgroup holds every other test process, so
+/// enforcing there would deny their connects too (#919).
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn egress_denied_by_default_allowed_when_listed() {
@@ -958,13 +959,13 @@ async fn egress_denied_by_default_allowed_when_listed() {
     // Two real listeners: one we'll allow, one we won't.
     let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
-    let denied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let denied_port = denied.local_addr().unwrap().port();
+    let unlisted = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let denied_port = unlisted.local_addr().unwrap().port();
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-default-deny");
+    let cgroup_id = probe.id;
 
-    // Allow only 127.0.0.1:allowed_port for our cgroup, then enforce.
+    // Allow only 127.0.0.1:allowed_port for the probe's cgroup, then enforce.
     let key = EgressKey {
         src_cgroup_id: cgroup_id,
         dst_ip: u32::from(Ipv4Addr::LOCALHOST).to_be(),
@@ -983,9 +984,9 @@ async fn egress_denied_by_default_allowed_when_listed() {
     assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port));
 
     // The allowed destination connects.
-    let ok = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), allowed_port),
-        Duration::from_secs(2),
+    let ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), allowed_port),
     );
     assert!(
         ok.is_ok(),
@@ -993,15 +994,12 @@ async fn egress_denied_by_default_allowed_when_listed() {
     );
 
     // The unlisted destination is denied with EPERM (BPF returns 0).
-    let blocked = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port),
-        Duration::from_secs(2),
+    let blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port),
     );
     assert!(
-        matches!(
-            blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&blocked),
         "unlisted egress destination should be denied with EPERM, got {blocked:?}"
     );
 
@@ -1025,24 +1023,24 @@ async fn egress_denied_by_default_allowed_when_listed() {
         },
     )
     .unwrap();
-    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    assert_eq!(
-        sender
-            .send_to(&[1], (Ipv4Addr::LOCALHOST, udp_allowed_port))
-            .unwrap(),
-        1
+    let udp_ok = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), udp_allowed_port),
     );
-    let udp_blocked = sender.send_to(&[1], (Ipv4Addr::LOCALHOST, udp_denied_port));
     assert!(
-        matches!(
-            udp_blocked.as_ref().map_err(|error| error.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        udp_ok.is_ok(),
+        "listed UDP destination should send: {udp_ok:?}"
+    );
+    let udp_blocked = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), udp_denied_port),
+    );
+    assert!(
+        denied(&udp_blocked),
         "unlisted UDP destination should be denied with EPERM, got {udp_blocked:?}"
     );
 
-    // Lift enforcement so the harness's own connections are unaffected.
-    egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("clear enforcement");
+    egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
     ebpf.detach().unwrap();
 }
 
@@ -1343,6 +1341,97 @@ impl ProbeCgroup {
     fn connect(&self, address: SocketAddr) -> Result<(), String> {
         self.open("tcp", address)
     }
+
+    /// Send over `transport` to `address` from a child of this test binary
+    /// that joins this cgroup before it opens a socket, as a workload sits in
+    /// a cgroup of its own. `Err` carries the error kind and message.
+    fn attempt(&self, transport: Transport, address: SocketAddr) -> Result<(), String> {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "egress_probe_process_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EGRESS_PROBE_CGROUP, &self.path)
+            .env(EGRESS_PROBE_TRANSPORT, transport.as_str())
+            .env(EGRESS_PROBE_ADDRESS, address.to_string())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some(verdict) = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(EGRESS_PROBE_VERDICT))
+        else {
+            panic!("the egress probe reported no verdict: {output:?}");
+        };
+        match verdict {
+            "ok" => Ok(()),
+            refusal => Err(refusal.to_string()),
+        }
+    }
+}
+
+/// What an egress probe sends: a TCP connect, or an unconnected UDP datagram,
+/// which the `sendmsg` hooks police rather than the `connect` ones.
+#[derive(Debug, Clone, Copy)]
+enum Transport {
+    Tcp,
+    Udp,
+}
+
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        }
+    }
+}
+
+const EGRESS_PROBE_CGROUP: &str = "RELIABURGER_EGRESS_PROBE_CGROUP";
+const EGRESS_PROBE_TRANSPORT: &str = "RELIABURGER_EGRESS_PROBE_TRANSPORT";
+const EGRESS_PROBE_ADDRESS: &str = "RELIABURGER_EGRESS_PROBE_ADDRESS";
+const EGRESS_PROBE_VERDICT: &str = "egress-probe-verdict: ";
+
+/// The child [`ProbeCgroup::attempt`] starts. It moves itself into the
+/// probe's cgroup, sends once and prints what the kernel said.
+#[test]
+#[ignore = "subprocess fixture for egress probes from a cgroup of their own"]
+fn egress_probe_process_fixture() {
+    let Some(cgroup) = std::env::var_os(EGRESS_PROBE_CGROUP) else {
+        return;
+    };
+    std::fs::write(
+        PathBuf::from(cgroup).join("cgroup.procs"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    let address: SocketAddr = std::env::var(EGRESS_PROBE_ADDRESS)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let result = match std::env::var(EGRESS_PROBE_TRANSPORT).unwrap().as_str() {
+        "tcp" => TcpStream::connect_timeout(&address, Duration::from_secs(2)).map(drop),
+        "udp" => {
+            let local = if address.is_ipv4() {
+                "127.0.0.1:0"
+            } else {
+                "[::1]:0"
+            };
+            std::net::UdpSocket::bind(local)
+                .and_then(|socket| socket.send_to(&[1], address))
+                .map(drop)
+        }
+        other => panic!("unknown egress probe transport {other:?}"),
+    };
+    let verdict = match result {
+        Ok(()) => "ok".to_string(),
+        Err(error) => format!("{:?}: {error}", error.kind()),
+    };
+    // A leading newline keeps the verdict off libtest's `test ... ` line.
+    println!("\n{EGRESS_PROBE_VERDICT}{verdict}");
 }
 
 impl Drop for ProbeCgroup {
@@ -2132,7 +2221,7 @@ async fn dns_responder_non_internal_times_out() {
 
 /// NET7: with egress enforcement on, a listed IPv6 destination connects
 /// and an unlisted one is denied with EPERM — the connect6 hook, driven
-/// against the test's own cgroup.
+/// from a fresh cgroup of the test's own.
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
@@ -2147,11 +2236,11 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
 
     let allowed = std::net::TcpListener::bind("[::1]:0").unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
-    let denied = std::net::TcpListener::bind("[::1]:0").unwrap();
-    let denied_port = denied.local_addr().unwrap().port();
+    let unlisted = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let denied_port = unlisted.local_addr().unwrap().port();
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-connect6");
+    let cgroup_id = probe.id;
 
     egress::write_egress6_entry(
         &mut ebpf.bpf,
@@ -2164,13 +2253,13 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
     assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port));
 
-    let ok = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), allowed_port),
-        Duration::from_secs(2),
+    let ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), allowed_port),
     );
-    let blocked = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port),
-        Duration::from_secs(2),
+    let blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port),
     );
     let udp_allowed = std::net::UdpSocket::bind("[::1]:0").unwrap();
     let udp_allowed_port = udp_allowed.local_addr().unwrap().port();
@@ -2184,33 +2273,29 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
         },
     )
     .unwrap();
-    let udp_sender = std::net::UdpSocket::bind("[::1]:0").unwrap();
-    let udp_ok = udp_sender.send_to(&[1], (Ipv6Addr::LOCALHOST, udp_allowed_port));
-    let udp_blocked = udp_sender.send_to(&[1], (Ipv6Addr::LOCALHOST, udp_denied_port));
+    let udp_ok = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), udp_allowed_port),
+    );
+    let udp_blocked = probe.attempt(
+        Transport::Udp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), udp_denied_port),
+    );
 
-    // Lift enforcement before asserting, so a failure never leaves the
-    // harness cgroup restricted.
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
     ebpf.detach().unwrap();
 
     assert!(ok.is_ok(), "listed IPv6 destination should connect: {ok:?}");
-    assert_eq!(
-        udp_ok.unwrap(),
-        1,
-        "listed IPv6 UDP destination should send"
+    assert!(
+        udp_ok.is_ok(),
+        "listed IPv6 UDP destination should send: {udp_ok:?}"
     );
     assert!(
-        matches!(
-            blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&blocked),
         "unlisted IPv6 destination should be denied with EPERM, got {blocked:?}"
     );
     assert!(
-        matches!(
-            udp_blocked.as_ref().map_err(|error| error.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&udp_blocked),
         "unlisted IPv6 UDP destination should be denied, got {udp_blocked:?}"
     );
 }
@@ -2234,8 +2319,8 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     let v6_listener = std::net::TcpListener::bind("[::1]:0").unwrap();
     let v6_port = v6_listener.local_addr().unwrap().port();
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-v4-only");
+    let cgroup_id = probe.id;
 
     egress::write_egress_entry(
         &mut ebpf.bpf,
@@ -2249,25 +2334,25 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     assert_runner_cgroup_unrestricted(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port));
 
     // Native v4: allowed.
-    let v4_ok = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), v4_port),
-        Duration::from_secs(2),
+    let v4_ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), v4_port),
     );
     // v4-mapped through connect6: same policy, still allowed.
     let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001);
-    let mapped_ok = TcpStream::connect_timeout(
-        &SocketAddr::V6(SocketAddrV6::new(mapped, v4_port, 0, 0)),
-        Duration::from_secs(2),
+    let mapped_ok = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::V6(SocketAddrV6::new(mapped, v4_port, 0, 0)),
     );
     // Plain IPv6 to an unlisted destination: the old bypass, now denied.
-    let v6_blocked = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port),
-        Duration::from_secs(2),
+    let v6_blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port),
     );
     // v4-mapped to an unlisted v4 port: denied through connect6 too.
-    let mapped_blocked = TcpStream::connect_timeout(
-        &SocketAddr::V6(SocketAddrV6::new(mapped, v6_port, 0, 0)),
-        Duration::from_secs(2),
+    let mapped_blocked = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::V6(SocketAddrV6::new(mapped, v6_port, 0, 0)),
     );
 
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
@@ -2282,17 +2367,11 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
         "listed v4 destination should connect as v4-mapped IPv6: {mapped_ok:?}"
     );
     assert!(
-        matches!(
-            v6_blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&v6_blocked),
         "IPv6 must no longer bypass a v4 allowlist, got {v6_blocked:?}"
     );
     assert!(
-        matches!(
-            mapped_blocked.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&mapped_blocked),
         "unlisted v4-mapped destination should be denied, got {mapped_blocked:?}"
     );
 }
@@ -2312,11 +2391,11 @@ async fn cidr_egress_allowed_via_lpm_trie() {
     // one port is allowed.
     let allowed = std::net::TcpListener::bind("127.0.0.5:0").unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
-    let denied = std::net::TcpListener::bind("127.0.0.6:0").unwrap();
-    let denied_port = denied.local_addr().unwrap().port();
+    let unlisted = std::net::TcpListener::bind("127.0.0.6:0").unwrap();
+    let denied_port = unlisted.local_addr().unwrap().port();
 
-    let cgroup_id =
-        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+    let probe = ProbeCgroup::new("egress-cidr");
+    let cgroup_id = probe.id;
 
     let dests = vec![EgressDestination::Cidr {
         network: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
@@ -2332,13 +2411,13 @@ async fn cidr_egress_allowed_via_lpm_trie() {
         denied_port,
     ));
 
-    let inside_cidr = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::new(127, 0, 0, 5).into(), allowed_port),
-        Duration::from_secs(2),
+    let inside_cidr = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::new(127, 0, 0, 5).into(), allowed_port),
     );
-    let wrong_port = TcpStream::connect_timeout(
-        &SocketAddr::new(Ipv4Addr::new(127, 0, 0, 6).into(), denied_port),
-        Duration::from_secs(2),
+    let wrong_port = probe.attempt(
+        Transport::Tcp,
+        SocketAddr::new(Ipv4Addr::new(127, 0, 0, 6).into(), denied_port),
     );
 
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
@@ -2349,10 +2428,7 @@ async fn cidr_egress_allowed_via_lpm_trie() {
         "address inside the allowed CIDR should connect on the listed port: {inside_cidr:?}"
     );
     assert!(
-        matches!(
-            wrong_port.as_ref().map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        ),
+        denied(&wrong_port),
         "same CIDR on an unlisted port should be denied, got {wrong_port:?}"
     );
 }
