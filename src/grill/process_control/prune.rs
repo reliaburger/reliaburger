@@ -101,7 +101,7 @@ impl ProcessControl {
             std::fs::rename(&directory, &destination)?;
             File::open(&this.root)?.sync_all()?;
             File::open(&garbage)?.sync_all()?;
-            std::fs::remove_dir_all(destination)?;
+            remove_forgotten(&destination)?;
             File::open(&garbage)?.sync_all()
         })
         .await
@@ -109,16 +109,45 @@ impl ProcessControl {
 }
 
 /// Finish deletions an earlier [`ProcessControl::forget_retired`] began.
+///
+/// Forgets of different generations run at once (an executor pool forgets
+/// each executor as it goes idle) and share this directory, so an entry can
+/// vanish under one of them while another deletes it.
 fn reap_forgotten(directory: &Path) -> io::Result<()> {
     validate_directory(directory)?;
     for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        validate_directory(&entry.path())?;
-        // Publication into this private directory already removed the
-        // generation from the inventory; only its bytes remain.
-        std::fs::remove_dir_all(entry.path())?;
+        let path = entry?.path();
+        match validate_directory(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        remove_forgotten(&path)?;
     }
     File::open(directory)?.sync_all()
+}
+
+/// Delete one forgotten generation's bytes, even while a concurrent
+/// [`reap_forgotten`] deletes the same tree (#924).
+///
+/// Publication into the garbage directory already removed the generation
+/// from the inventory, so whichever deletion finishes it, it is gone.
+fn remove_forgotten(path: &Path) -> io::Result<()> {
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            // The other deleter took part of the tree first. Each pass still
+            // removes what is left, so this ends once the tree is gone.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Err(absent) if absent.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(other) => return Err(other),
+                    Ok(_) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn terminal(phase: &OwnerPhase) -> bool {

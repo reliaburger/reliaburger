@@ -75,6 +75,8 @@ pub struct MockGrill {
     fail_kill: Arc<AtomicBool>,
     fail_stop: Arc<AtomicBool>,
     inventory_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// One launch inventory answer read before a concurrent change.
+    stale_inventory: Arc<Mutex<Option<Vec<super::RuntimeLaunch>>>>,
     /// Time each force-kill request takes, as `runc kill` does on a loaded host.
     kill_delay: Arc<Mutex<Option<std::time::Duration>>>,
     pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
@@ -139,6 +141,7 @@ impl Default for MockGrill {
             fail_kill: Arc::default(),
             fail_stop: Arc::default(),
             inventory_delay: Arc::default(),
+            stale_inventory: Arc::default(),
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
             workload_cgroup_delay: Arc::default(),
@@ -444,6 +447,14 @@ impl MockGrill {
         *self.inventory_delay.lock().unwrap() = delay;
     }
 
+    /// Answer the next launch inventory read with `launches`, as a read that
+    /// listed the runtime just before a concurrent change. Later reads see
+    /// the inventory [`Self::set_launch_inventory`] supplies.
+    #[allow(dead_code)]
+    pub fn answer_next_inventory_with(&self, launches: Vec<super::RuntimeLaunch>) {
+        *self.stale_inventory.lock().unwrap() = Some(launches);
+    }
+
     /// Delay every pid read, as a runtime waiting on a busy lifecycle lock would.
     pub fn set_pid_delay(&self, delay: Option<std::time::Duration>) {
         *self.pid_delay.lock().unwrap() = delay;
@@ -520,6 +531,9 @@ impl super::Grill for MockGrill {
         let delay = *self.inventory_delay.lock().unwrap();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
+        }
+        if let Some(stale) = self.stale_inventory.lock().unwrap().take() {
+            return Ok(Some(stale));
         }
         Ok(self.launch_inventory.lock().await.clone())
     }
