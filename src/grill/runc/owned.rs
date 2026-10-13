@@ -949,9 +949,24 @@ impl RuncGrill {
     /// Return original requests independently of agent adoption records.
     /// Delete a retired instance's bundle, journal and lock file (#678).
     /// Refuses, deleting nothing, while its generation is unretired, still
-    /// cached as live, holds an address or has OCI state or a mounted rootfs.
-    pub(super) async fn owned_forget_retired(&self, instance: &InstanceId) -> io::Result<()> {
+    /// cached as live, holds an address or has OCI state or a mounted rootfs,
+    /// and, when the caller names `generation`, while any other generation
+    /// owns the identity (#850).
+    pub(super) async fn owned_forget_retired(
+        &self,
+        instance: &InstanceId,
+        generation: Option<&crate::grill::RuntimeGeneration>,
+    ) -> io::Result<()> {
         let expected = self.intent_journal()?.observe(instance).await?;
+        if let Some(generation) = generation
+            && expected.as_ref().is_some_and(|current| {
+                crate::grill::RuntimeGeneration::runc(current.as_str()) != *generation
+            })
+        {
+            return Err(io::Error::other(
+                "a successor runtime generation owns the identity",
+            ));
+        }
         let runtime = self.clone();
         let id = instance.clone();
         tokio::spawn(async move {
@@ -992,6 +1007,18 @@ impl RuncGrill {
         })
         .await
         .map_err(io::Error::other)?
+    }
+
+    /// The generation of the instance's current runtime intent, if any.
+    pub(super) async fn owned_launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> io::Result<Option<crate::grill::RuntimeGeneration>> {
+        Ok(self
+            .intent_journal()?
+            .observe(instance)
+            .await?
+            .map(|generation| crate::grill::RuntimeGeneration::runc(generation.as_str())))
     }
 
     pub(super) async fn owned_inventory(

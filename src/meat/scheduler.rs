@@ -10,9 +10,9 @@ use crate::config::app::AppSpec;
 use crate::config::types::Replicas;
 
 use super::cluster_state::ClusterStateCache;
-use super::filter::filter_nodes;
+use super::filter::{WorkloadRequirements, filter_nodes, unplaced_reason};
 use super::score::score_nodes;
-use super::types::{AppId, Placement, Resources, SchedulingDecision};
+use super::types::{AppId, Placement, Resources, SchedulingDecision, UnplacedReason};
 
 /// Scheduling errors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
@@ -34,6 +34,26 @@ pub enum ScheduleError {
     InvalidSignature { image: String, reason: String },
 }
 
+/// What placing an app came to: the replicas that found a node, and, when
+/// some didn't, how many and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placed {
+    /// One placement per replica that found a node, reserved in the
+    /// scheduler's cache.
+    pub decision: SchedulingDecision,
+    /// The replicas that found no node. `None` when every one did.
+    pub unplaced: Option<Unplaced>,
+}
+
+/// Replicas the scheduler couldn't place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unplaced {
+    /// How many replicas have no node.
+    pub missing: u32,
+    /// The first hard constraint no node met.
+    pub reason: UnplacedReason,
+}
+
 /// The Meat scheduler.
 pub struct Scheduler {
     /// Mutable cluster state, updated after each placement.
@@ -49,14 +69,6 @@ pub struct Scheduler {
     daemon_credit: HashMap<super::types::NodeId, Resources>,
 }
 
-/// Hard constraints shared by fixed-replica and daemon placement.
-struct WorkloadRequirements<'a> {
-    resources: &'a Resources,
-    labels: &'a BTreeMap<String, String>,
-    requires_egress: bool,
-    requires_dns: bool,
-}
-
 /// The nodes a daemon set can run on, crediting back each node's committed
 /// copy at the footprint it was admitted with (`credit`), so a running copy
 /// never needs room for a second one. Only this eligibility view subtracts
@@ -67,10 +79,7 @@ pub(crate) fn daemon_candidates(
     cluster: &ClusterStateCache,
     app_id: &AppId,
     credit: &HashMap<super::types::NodeId, Resources>,
-    resources: &Resources,
-    labels: &BTreeMap<String, String>,
-    requires_egress: bool,
-    requires_dns: bool,
+    requirements: &WorkloadRequirements,
 ) -> Vec<super::types::NodeId> {
     let mut available = cluster.clone();
     for node in cluster.nodes() {
@@ -80,7 +89,7 @@ pub(crate) fn daemon_candidates(
             available.release(&node.node_id, app_id, committed);
         }
     }
-    filter_nodes(resources, labels, requires_egress, requires_dns, &available)
+    filter_nodes(requirements, &available)
 }
 
 impl Scheduler {
@@ -106,25 +115,44 @@ impl Scheduler {
         self
     }
 
-    /// Schedule an app according to its spec.
+    /// Schedule an app according to its spec, all or nothing.
     ///
-    /// Returns a `SchedulingDecision` with one `Placement` per replica.
-    /// For daemon mode, places one replica on every eligible node.
+    /// Returns a `SchedulingDecision` with one `Placement` per replica, or
+    /// `NoEligibleNodes` when any replica finds no node. For daemon mode,
+    /// places one replica on every eligible node, and fails when there is
+    /// none. Capacity admission asks this; the leader's pass uses
+    /// [`Scheduler::place_app`], which keeps what fits.
     pub fn schedule_app(
         &mut self,
         app_id: &AppId,
         spec: &AppSpec,
     ) -> Result<SchedulingDecision, ScheduleError> {
-        let resources = self.extract_resources(spec);
-        let (required, preferred) = self.parse_labels(spec);
+        let placed = self.place_app(app_id, spec);
+        let daemon_without_a_node =
+            spec.replicas == Replicas::DaemonSet && placed.decision.placements.is_empty();
+        if placed.unplaced.is_some() || daemon_without_a_node {
+            return Err(ScheduleError::NoEligibleNodes {
+                app_id: app_id.clone(),
+            });
+        }
+        Ok(placed.decision)
+    }
+
+    /// Place as many of an app's replicas as fit (#702).
+    ///
+    /// A fixed-size app gets every replica that finds a node, each reserved
+    /// in the cache before the next is placed, and `unplaced` says how many
+    /// found none and why. A daemon set gets one replica on every eligible
+    /// node, which may be none; it is never short, since it wants exactly
+    /// the nodes that can run it.
+    pub fn place_app(&mut self, app_id: &AppId, spec: &AppSpec) -> Placed {
+        let requirements = WorkloadRequirements::for_app(spec, self.require_dns);
+        let preferred = spec
+            .placement
+            .as_ref()
+            .map(|p| parse_label_list(&p.preferred))
+            .unwrap_or_default();
         let image = spec.image.as_deref();
-        let requires_egress = spec.requires_network_policy();
-        let requirements = WorkloadRequirements {
-            resources: &resources,
-            labels: &required,
-            requires_egress,
-            requires_dns: self.require_dns,
-        };
 
         match spec.replicas {
             Replicas::Fixed(n) => self.schedule_fixed(app_id, n, &requirements, &preferred, image),
@@ -132,87 +160,67 @@ impl Scheduler {
         }
     }
 
-    /// Schedule N fixed replicas.
+    /// Schedule N fixed replicas, keeping every one that finds a node.
     fn schedule_fixed(
         &mut self,
         app_id: &AppId,
         replica_count: u32,
-        requirements: &WorkloadRequirements<'_>,
+        requirements: &WorkloadRequirements,
         preferred_labels: &BTreeMap<String, String>,
         image: Option<&str>,
-    ) -> Result<SchedulingDecision, ScheduleError> {
+    ) -> Placed {
         let mut placements = Vec::with_capacity(replica_count as usize);
+        let mut unplaced = None;
 
         for ordinal in 0..replica_count {
             // Phase 1: Filter
-            let candidates = filter_nodes(
-                requirements.resources,
-                requirements.labels,
-                requirements.requires_egress,
-                requirements.requires_dns,
-                &self.cluster,
-            );
-            if candidates.is_empty() {
-                return Err(ScheduleError::NoEligibleNodes {
-                    app_id: app_id.clone(),
-                });
-            }
+            let candidates = filter_nodes(requirements, &self.cluster);
 
             // Phase 2: Score
             let scored = score_nodes(
                 &candidates,
                 app_id,
-                requirements.resources,
+                &requirements.resources,
                 preferred_labels,
                 &self.cluster,
                 image,
             );
 
-            // Phase 3: Select (highest score, deterministic tiebreak)
-            let (selected_node, _score) =
-                scored
-                    .first()
-                    .ok_or_else(|| ScheduleError::NoEligibleNodes {
-                        app_id: app_id.clone(),
-                    })?;
+            // Phase 3: Select (fewest replicas, highest score, deterministic
+            // tiebreak). Nothing left means no later replica fits either:
+            // each one only takes room.
+            let Some((selected_node, _score)) = scored.first() else {
+                unplaced = Some(Unplaced {
+                    missing: replica_count - ordinal,
+                    reason: unplaced_reason(requirements, &self.cluster),
+                });
+                break;
+            };
 
             // Phase 4: Commit (reserve in the cluster state cache)
             self.cluster
-                .reserve(selected_node, app_id, requirements.resources);
+                .reserve(selected_node, app_id, &requirements.resources);
 
             placements.push(Placement {
                 node_id: selected_node.clone(),
-                resources: *requirements.resources,
+                resources: requirements.resources,
                 ordinal,
             });
         }
 
-        Ok(SchedulingDecision {
-            app_id: app_id.clone(),
-            placements,
-        })
+        Placed {
+            decision: SchedulingDecision {
+                app_id: app_id.clone(),
+                placements,
+            },
+            unplaced,
+        }
     }
 
     /// Schedule daemon mode: one replica on every eligible node.
-    fn schedule_daemon(
-        &mut self,
-        app_id: &AppId,
-        requirements: &WorkloadRequirements<'_>,
-    ) -> Result<SchedulingDecision, ScheduleError> {
-        let candidates = daemon_candidates(
-            &self.cluster,
-            app_id,
-            &self.daemon_credit,
-            requirements.resources,
-            requirements.labels,
-            requirements.requires_egress,
-            requirements.requires_dns,
-        );
-        if candidates.is_empty() {
-            return Err(ScheduleError::NoEligibleNodes {
-                app_id: app_id.clone(),
-            });
-        }
+    fn schedule_daemon(&mut self, app_id: &AppId, requirements: &WorkloadRequirements) -> Placed {
+        let candidates =
+            daemon_candidates(&self.cluster, app_id, &self.daemon_credit, requirements);
 
         let mut placements = Vec::with_capacity(candidates.len());
         for (ordinal, node_id) in (0u32..).zip(&candidates) {
@@ -225,44 +233,21 @@ impl Scheduler {
                 self.cluster.release(node_id, app_id, committed);
             }
             self.cluster
-                .reserve(node_id, app_id, requirements.resources);
+                .reserve(node_id, app_id, &requirements.resources);
             placements.push(Placement {
                 node_id: node_id.clone(),
-                resources: *requirements.resources,
+                resources: requirements.resources,
                 ordinal,
             });
         }
 
-        Ok(SchedulingDecision {
-            app_id: app_id.clone(),
-            placements,
-        })
-    }
-
-    /// Extract resource requirements from an AppSpec.
-    ///
-    /// Uses the `request` (minimum) values from cpu/memory ranges.
-    /// Falls back to zero if not specified.
-    fn extract_resources(&self, spec: &AppSpec) -> Resources {
-        crate::meat::admission::app_requests(spec)
-    }
-
-    /// Parse placement labels from the spec.
-    ///
-    /// Labels are stored as `["key=value", ...]` in the config.
-    /// Returns (required, preferred) as BTreeMaps.
-    fn parse_labels(&self, spec: &AppSpec) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-        let required = spec
-            .placement
-            .as_ref()
-            .map(|p| parse_label_list(&p.required))
-            .unwrap_or_default();
-        let preferred = spec
-            .placement
-            .as_ref()
-            .map(|p| parse_label_list(&p.preferred))
-            .unwrap_or_default();
-        (required, preferred)
+        Placed {
+            decision: SchedulingDecision {
+                app_id: app_id.clone(),
+                placements,
+            },
+            unplaced: None,
+        }
     }
 }
 
@@ -1346,5 +1331,234 @@ mod tests {
             matches!(result, Err(ScheduleError::InvalidSignature { .. })),
             "a revoked signing cert must be refused: {result:?}"
         );
+    }
+}
+
+/// Property tests over random clusters and passes (#702): whatever the
+/// cluster looks like, placement never overcommits a node, spreads as evenly
+/// as eligibility allows, is deterministic, and keeps every namespace within
+/// its quota.
+#[cfg(test)]
+mod properties {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::config::types::ResourceRange;
+    use crate::meat::cluster_state::SchedulerNodeState;
+    use crate::meat::types::NodeId;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// One node: allocatable CPU (millicores) and memory (MiB), and how
+    /// much of each is already taken, in percent.
+    #[derive(Debug, Clone)]
+    struct NodeShape {
+        cpu: u64,
+        memory_mib: u64,
+        used_percent: u64,
+    }
+
+    /// One app: per-replica CPU and memory requests, and its replicas.
+    #[derive(Debug, Clone)]
+    struct AppShape {
+        cpu: u64,
+        memory_mib: u64,
+        replicas: u32,
+    }
+
+    fn node_shape() -> impl Strategy<Value = NodeShape> {
+        (500u64..8000, 256u64..16384, 0u64..90).prop_map(|(cpu, memory_mib, used_percent)| {
+            NodeShape {
+                cpu,
+                memory_mib,
+                used_percent,
+            }
+        })
+    }
+
+    fn app_shape() -> impl Strategy<Value = AppShape> {
+        (0u64..2000, 0u64..4096, 1u32..8).prop_map(|(cpu, memory_mib, replicas)| AppShape {
+            cpu,
+            memory_mib,
+            replicas,
+        })
+    }
+
+    fn node(index: usize, shape: &NodeShape) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(format!("n{index:02}")),
+            allocatable: Resources::new(shape.cpu, shape.memory_mib * MIB, 0),
+            allocated: Resources::new(
+                shape.cpu * shape.used_percent / 100,
+                shape.memory_mib * MIB * shape.used_percent / 100,
+                0,
+            ),
+            labels: BTreeMap::new(),
+            ready: true,
+            capabilities: Default::default(),
+            app_replicas: HashMap::new(),
+            uptime_secs: 86400,
+            cached_images: HashSet::new(),
+        }
+    }
+
+    /// The cluster, with nodes inserted in `order`: a plan mustn't depend
+    /// on the order a HashMap happens to iterate in.
+    fn cluster(shapes: &[NodeShape], order: &[usize]) -> ClusterStateCache {
+        let mut cache = ClusterStateCache::new();
+        for &index in order {
+            cache.set_node(node(index, &shapes[index]));
+        }
+        cache
+    }
+
+    fn spec(shape: &AppShape) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "app:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(shape.replicas);
+        spec.cpu = Some(ResourceRange {
+            request: shape.cpu,
+            limit: shape.cpu.max(1),
+        });
+        spec.memory = Some(ResourceRange {
+            request: shape.memory_mib * MIB,
+            limit: (shape.memory_mib * MIB).max(1),
+        });
+        spec
+    }
+
+    fn app_id(index: usize) -> AppId {
+        AppId::new(format!("app{index}"), "default")
+    }
+
+    /// Place every app in turn on one scheduler, as a pass does.
+    fn place_all(cache: ClusterStateCache, apps: &[AppShape]) -> Vec<Placed> {
+        let mut scheduler = Scheduler::new(cache);
+        apps.iter()
+            .enumerate()
+            .map(|(index, shape)| scheduler.place_app(&app_id(index), &spec(shape)))
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn never_overcommits_a_node(
+            shapes in prop::collection::vec(node_shape(), 1..16),
+            apps in prop::collection::vec(app_shape(), 1..10),
+        ) {
+            let order: Vec<usize> = (0..shapes.len()).collect();
+            let start = cluster(&shapes, &order);
+            let placed = place_all(start.clone(), &apps);
+
+            // Add up what landed on each node, independently of the
+            // scheduler's own cache.
+            let mut added: HashMap<NodeId, Resources> = HashMap::new();
+            for placement in placed.iter().flat_map(|p| &p.decision.placements) {
+                let total = added.entry(placement.node_id.clone()).or_default();
+                *total = total.saturating_add(&placement.resources);
+            }
+            for (node_id, extra) in added {
+                let node = start.get_node(&node_id).unwrap();
+                let total = node.allocated.saturating_add(&extra);
+                prop_assert!(
+                    node.allocatable.fits(&total),
+                    "{} holds {} of {}", node_id, total, node.allocatable
+                );
+            }
+        }
+
+        #[test]
+        fn spread_is_at_most_ceil_of_replicas_over_eligible(
+            nodes in 1usize..12,
+            replicas in 1u32..40,
+            cpu in 1u64..200,
+        ) {
+            // Every node has room for every replica, so all stay eligible
+            // and only spread decides.
+            let shape = NodeShape {
+                cpu: cpu * u64::from(replicas) + 100,
+                memory_mib: 1024,
+                used_percent: 0,
+            };
+            let shapes = vec![shape; nodes];
+            let order: Vec<usize> = (0..nodes).collect();
+            let app = AppShape { cpu, memory_mib: 0, replicas };
+            let placed = place_all(cluster(&shapes, &order), &[app]);
+
+            let decision = &placed[0].decision;
+            prop_assert_eq!(decision.placements.len(), replicas as usize);
+            let mut per_node: HashMap<&NodeId, usize> = HashMap::new();
+            for placement in &decision.placements {
+                *per_node.entry(&placement.node_id).or_default() += 1;
+            }
+            let ceiling = (replicas as usize).div_ceil(nodes);
+            prop_assert!(
+                per_node.values().all(|count| *count <= ceiling),
+                "{:?} exceeds {}", per_node, ceiling
+            );
+        }
+
+        #[test]
+        fn same_inputs_give_the_same_plan(
+            shapes in prop::collection::vec(node_shape(), 1..16),
+            apps in prop::collection::vec(app_shape(), 1..10),
+            seed in any::<u64>(),
+        ) {
+            let forward: Vec<usize> = (0..shapes.len()).collect();
+            let mut shuffled = forward.clone();
+            // A cheap deterministic shuffle: rotate by the seed, then reverse.
+            shuffled.rotate_left((seed as usize) % shapes.len());
+            shuffled.reverse();
+
+            let first = place_all(cluster(&shapes, &forward), &apps);
+            let second = place_all(cluster(&shapes, &shuffled), &apps);
+
+            prop_assert_eq!(first, second);
+        }
+
+        #[test]
+        fn quota_never_exceeded(
+            shapes in prop::collection::vec(node_shape(), 1..8),
+            apps in prop::collection::vec(app_shape(), 1..10),
+            budget in 0u64..10_000,
+        ) {
+            use crate::cluster::orchestrate::{PassMembers, plan_pass};
+
+            let mut desired = crate::council::types::DesiredState::default();
+            desired.namespaces.insert(
+                "default".to_string(),
+                crate::config::NamespaceSpec {
+                    cpu: Some(format!("{budget}m")),
+                    memory: None,
+                    gpu: None,
+                    max_apps: None,
+                    max_replicas: None,
+                    secret_key: false,
+                },
+            );
+            for (index, shape) in apps.iter().enumerate() {
+                desired.apps.insert(app_id(index), spec(shape));
+            }
+            let order: Vec<usize> = (0..shapes.len()).collect();
+            let mut cache = cluster(&shapes, &order);
+            let members = PassMembers {
+                alive: cache.node_ids().into_iter().collect(),
+                ..Default::default()
+            };
+            let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+
+            let plan = plan_pass(&mut cache, &desired, &members, &mut quotas, false);
+
+            // The quota charges what an app asks for, placed or not, so
+            // what's placed can only be less.
+            let placed: u64 = plan
+                .decisions
+                .iter()
+                .flat_map(|decision| &decision.placements)
+                .map(|placement| placement.resources.cpu_millicores)
+                .sum();
+            prop_assert!(placed <= budget, "placed {}m of a {}m budget", placed, budget);
+        }
     }
 }

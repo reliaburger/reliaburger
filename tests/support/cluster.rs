@@ -277,6 +277,9 @@ pub struct WiredNodeOptions {
     /// `$TMPDIR/{data_dir_prefix}-{name}-{gossip_port}`.
     pub data_root: Option<PathBuf>,
     pub stale_report_timeout_secs: u64,
+    /// How long the leader holds a stale-but-alive node's placements.
+    /// `None` uses the node default.
+    pub stale_node_grace: Option<Duration>,
     /// `Some(interval)` gives the node a Mayo store with rollups at that
     /// interval, and runs the autoscaler alongside the scheduler.
     pub metrics_rollup: Option<Duration>,
@@ -329,6 +332,9 @@ pub struct WiredNode {
     pub reconciler: JoinHandle<()>,
     /// Cancelling this token kills this node.
     pub shutdown: CancellationToken,
+    /// Cancelling this token stops only the node's agent: gossip and Raft
+    /// carry on, but its reports stop, as when a report worker wedges.
+    pub agent_shutdown: CancellationToken,
     pub _runtime: runtime::ClusterRuntime,
     pub _tasks: TestTasks,
 }
@@ -343,6 +349,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         data_dir_prefix,
         data_root,
         stale_report_timeout_secs,
+        stale_node_grace,
         metrics_rollup,
         scheduler,
         lease_reaper,
@@ -392,6 +399,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
                 report_interval_secs: 1,
                 max_events_per_report: 100,
                 stale_report_timeout_secs,
+                ..Default::default()
             },
             seeds,
             wrapping_ikm: None,
@@ -428,11 +436,14 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     // `Clone` (it owns `snapshot_rx`), so the agent takes it and the node
     // keeps clones of the watch receivers above.
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
+    // The agent stops with the node, or on its own to wedge its reports
+    // while gossip carries on.
+    let agent_shutdown = shutdown.child_token();
     let mut agent = BunAgent::with_cluster(
         ProcessGrill::new(),
         PortAllocator::new(gossip_port + 100, gossip_port + 400),
         cmd_rx,
-        shutdown.clone(),
+        agent_shutdown.clone(),
         handle,
         "default".to_string(),
     );
@@ -465,7 +476,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         "agent",
         true,
         readiness.clone(),
-        shutdown.clone(),
+        agent_shutdown.clone(),
         move |ready| async move { agent.run_with_readiness(ready).await },
     );
     let mut tasks = vec![agent_task];
@@ -505,9 +516,15 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             Arc::clone(&council),
             membership_rx.clone(),
             aggregated_rx.clone(),
-            false,
-            reconstruction,
+            reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+                dns_required: false,
+                reconstruction,
+                stale_node_grace: stale_node_grace.unwrap_or(Duration::from_secs(
+                    ReportingTreeSection::default().stale_node_grace_secs,
+                )),
+            },
             None,
+            Some(Arc::clone(&event_store)),
             shutdown.clone(),
         )
     });
@@ -711,6 +728,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         thinks_leader,
         reconciler,
         shutdown: shutdown.clone(),
+        agent_shutdown,
         _runtime: cluster_runtime,
         _tasks: TestTasks::new(shutdown, tasks),
     }

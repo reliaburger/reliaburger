@@ -580,6 +580,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             service_port: spec.port,
                             blocked: None,
                             volume_home_away: None,
+                            unschedulable: None,
                             rollout_failed: None,
                             volume_homes: Vec::new(),
                         },

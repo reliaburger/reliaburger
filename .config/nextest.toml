@@ -116,6 +116,13 @@ filter = 'binary(placement) & test(autoscaler_scales_up_from_real_collector_cpu)
 test-group = "process-heavy"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
+# The jobs catalogue's override above. CI's coverage run uses this profile,
+# and instrumentation is what makes it slowest.
+[[profile.ci.overrides]]
+filter = 'binary(relish_test_catalogue) & test(secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup)'
+test-group = "process-heavy"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 [[profile.ci.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"

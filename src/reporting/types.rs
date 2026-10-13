@@ -341,6 +341,10 @@ mod tests {
                     ipv6: false,
                     workload_reachable: true,
                 },
+                process: crate::meat::cluster_state::ProcessWorkloadCapability {
+                    enabled: true,
+                    allowed_binaries: vec!["/usr/bin/python3".into()],
+                },
             },
             egress_enforcement: vec![EgressEnforcementEvidence {
                 app_name: "web".to_string(),

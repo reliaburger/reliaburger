@@ -255,6 +255,10 @@ pub fn render(inspection: &Inspection) -> String {
                         "  Waiting:   for {home}, which holds its volume and is out of the cluster"
                     );
                 }
+                // #702: some replicas found no node; say how many and why.
+                if let Some(short) = &app.unschedulable {
+                    let _ = writeln!(out, "  Unplaced:  {short}");
+                }
             }
             (None, Err(reason)) => {
                 let _ = writeln!(
@@ -350,6 +354,7 @@ mod tests {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             volume_homes: Vec::new(),
             rollout_failed: None,
         }
@@ -518,6 +523,34 @@ mod tests {
         assert!(
             output.contains(
                 "  Blocked:   namespace \"default\" would exceed CPU quota: 0+1600 > 1000m\n"
+            ),
+            "{output}"
+        );
+    }
+
+    /// #702: a short app says how much of it is placed and why.
+    #[test]
+    fn a_short_app_says_how_much_is_placed_and_why() {
+        let inspection = Inspection {
+            name: "hello".to_string(),
+            desired: Ok(vec![DesiredAppEvidence {
+                unschedulable: Some(crate::meat::types::Unschedulable {
+                    placed: 1,
+                    wanted: 3,
+                    reason: crate::meat::types::UnplacedReason::NoLabelMatch,
+                }),
+                ..desired(3, &[("node-1", 1)])
+            }]),
+            nodes: vec![NodeReport {
+                node: "node-1".to_string(),
+                answer: NodeAnswer::Answered(Vec::new()),
+            }],
+        };
+
+        let output = render(&inspection);
+        assert!(
+            output.contains(
+                "  Unplaced:  placed 1 of 3 replicas: no ready node has its required labels\n"
             ),
             "{output}"
         );

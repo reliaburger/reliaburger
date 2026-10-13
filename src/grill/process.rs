@@ -898,10 +898,39 @@ impl super::Grill for ProcessGrill {
         Ok(entry.state)
     }
 
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &super::RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        // Without an owner journal there is no generation to compare, and
+        // `launch_generation` never handed one out.
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        control
+            .forget_retired(instance, Some(generation))
+            .await
+            .map_err(|error| owner_error(instance, error))
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::RuntimeGeneration>, GrillError> {
+        let Some(control) = &self.control else {
+            return Ok(None);
+        };
+        control
+            .generation(instance)
+            .await
+            .map_err(|error| owner_error(instance, error))
+    }
+
     async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
         if let Some(control) = &self.control {
             control
-                .forget_retired(instance)
+                .forget_retired(instance, None)
                 .await
                 .map_err(|error| owner_error(instance, error))?;
         }

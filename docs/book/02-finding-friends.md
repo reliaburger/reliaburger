@@ -1907,23 +1907,38 @@ That's the Meat scheduler's job.
 
 Meat uses a four-phase placement pipeline: Filter → Score → Select → Commit. For each replica, the pipeline runs once. After placing a replica, the cluster state cache is updated before placing the next. This prevents the scheduler from accidentally sending all replicas to the same node.
 
-**Phase 1: Filter.** Eliminate nodes that can't run the workload. A node is filtered out if it's not ready (hasn't reported since the leader election, or is being drained), doesn't have enough CPU/memory/GPU capacity, or doesn't match the app's required placement labels.
+**Phase 1: Filter.** Eliminate nodes that can't run the workload. A node is filtered out if it's not ready (hasn't reported since the leader election, or is being drained), doesn't match the app's required placement labels, can't enforce what the app needs, or doesn't have enough CPU/memory/GPU capacity.
 
 ```rust
 pub fn filter_nodes(
-    resources: &Resources,
-    required_labels: &BTreeMap<String, String>,
+    requirements: &WorkloadRequirements,
     cluster: &ClusterStateCache,
 ) -> Vec<NodeId>
 ```
 
+`WorkloadRequirements` gathers every hard constraint an app puts on a node: its request, its `required` labels, whether it needs egress enforcement or internal DNS, and the host binary it runs, if any. The filter isn't its only reader. Daemon placement asks the same question, and so does the leader when it decides whether a committed placement still holds. Before 0.2.1 those three each took their own list of arguments, and they'd drifted: the filter ignored a process workload's binary allowlist entirely.
+
 Required labels are hard constraints. If an app says `required = ["gpu=a100"]`, only nodes with that label are eligible. If no nodes match, the app stays unscheduled. Preferred labels are soft constraints handled in scoring.
+
+The host binary is the newest constraint (#702). Nodes in one cluster can have different `[process_workloads]` policies: one allows `/usr/bin/python3`, another nothing at all. An `exec` app placed on a node that refuses it never starts, and its placement used to hold there for good. Now each node reports its policy in its capability report, next to egress and DNS, and the filter checks it:
+
+```rust
+pub fn host_binary(spec: &AppSpec) -> Option<&Path> {
+    spec.exec.as_deref().or_else(|| {
+        spec.script
+            .as_ref()
+            .map(|_| Path::new(crate::grill::process_workload::SCRIPT_INTERPRETER))
+    })
+}
+```
+
+`spec.exec` is an `Option<PathBuf>`, an owned path. `as_deref()` turns that into an `Option<&Path>`, a borrowed view, without copying anything; `PathBuf` is to `Path` what `String` is to `&str`. `or_else` runs its closure only when the first option is `None`, so a `script` app falls back to the interpreter, `/bin/sh`, which is the binary a node actually runs for it. One function answers "which binary does this app need?", so the node's own refusal, placement and (from #701) app validation can't give three different answers.
 
 **Phase 2: Score.** Rank the surviving candidates. Spread goes first: a node running fewer replicas of this app always beats one running more. Between nodes running the same number, a weighted sum on a 0–90 scale decides:
 
 | Dimension | Weight | Logic |
 |-----------|--------|-------|
-| Bin-packing | 50 | Prefer fuller nodes (maximise density) |
+| Bin-packing | 50 | Prefer nodes fuller in CPU and memory, evenly (maximise density) |
 | Preferred labels | 20 | Prefer nodes matching soft constraints |
 | Image locality | 15 | Prefer nodes with cached images (Phase 5) |
 | Stability | 5 | Prefer longer-running nodes |
@@ -1938,7 +1953,43 @@ scored.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
 
 Each tuple is `(node, replicas, score)`. `cmp` returns an `Ordering` (less, equal or greater), and `then` only looks at the next key when the first says equal. Fewest replicas ascending, then score descending (note the swapped `b` and `a`), then node id ascending. It's the same idea as a SQL `ORDER BY replicas, score DESC, node_id`, and it keeps working however many weights we add later.
 
+Bin-packing scored CPU alone until 0.2.1. Picture a cache that asks for a tenth of a core and a gigabyte of memory. On CPU, two nodes with the same CPU load look identical, so the tie went to the alphabetically first one, even if the other had six gigabytes in use and room for exactly this. Memory-heavy apps spread thin and stranded memory everywhere. The design doc had always described a two-dimensional score, so we built that one (D30):
+
+```rust
+let score = match (cpu, memory) {
+    (Some(cpu), Some(memory)) => {
+        let average = (cpu + memory) / 2;
+        average.saturating_sub(cpu.abs_diff(memory) / 10)
+    }
+    (Some(only), None) | (None, Some(only)) => only,
+    (None, None) => 50,
+};
+```
+
+`cpu` and `memory` are each node's utilisation after the placement, in percent, or `None` when the node reports none of that resource (`checked_div` returns `None` rather than panicking on a zero divisor). The score is their average less a tenth of the gap between them. A node at 90% CPU and 30% memory averages 60 but scores 54; a node at 60% of both scores 60. The lopsided one would strand its memory, because nothing can use memory without CPU to run on.
+
+A few Rust details. `match` on a tuple lets us handle all four combinations of present and absent in one place, and the compiler refuses to build it if we miss one. The `|` in `(Some(only), None) | (None, Some(only))` is an or-pattern: both arms bind `only`, so they share one body. `abs_diff` gives the distance between two unsigned numbers without the underflow that `cpu - memory` would hit when memory is bigger (in debug builds that's a panic, in release a wrap to a huge number). `saturating_sub` stops at zero for the same reason. And the whole thing is integers: a float score could round differently on another machine and break a tie the other way, and determinism is the point of the tiebreak.
+
 **Phase 3: Select.** Pick the first node in that order. Ties end at `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
+
+For a long time this paragraph promised property tests that didn't exist. Example-based tests check the cases we thought of; a scheduler goes wrong in the ones we didn't. Since 0.2.1 `meat::scheduler::properties` generates random clusters (1 to 16 nodes of random size, already up to 90% used) and random apps, and checks four things hold for every one:
+
+```rust
+proptest! {
+    #[test]
+    fn never_overcommits_a_node(
+        shapes in prop::collection::vec(node_shape(), 1..16),
+        apps in prop::collection::vec(app_shape(), 1..10),
+    ) {
+        // place every app, then add up what landed on each node
+        // independently and check it still fits
+    }
+}
+```
+
+`proptest!` is a macro, code that writes code at compile time, a little like a C preprocessor macro but working on Rust syntax rather than text. Each argument names a *strategy*, a recipe for random values: `node_shape()` builds a node, and `prop::collection::vec(…, 1..16)` a list of one to fifteen of them. Proptest runs the body a few hundred times, and when an assertion fails it *shrinks* the input, retrying smaller versions until it finds the simplest one that still fails. That's the case you debug.
+
+The four properties: no node ends up with more allocated than it has; with room everywhere, no node gets more than `ceil(replicas / nodes)` replicas of one app; the same cluster gives the same plan whatever order its nodes were inserted in (a `HashMap` iterates in an order that depends on insertion and hashing, so this checks the tiebreak really does its job); and a whole pass, quotas included, never places more CPU in a namespace than its budget.
 
 **Phase 4: Commit.** Reserve the resources in the cluster state cache and record the placement. `ClusterStateCache::reserve()` adds to the node's allocated resources and counts one more replica of the app there, so the next replica sees it.
 
@@ -1996,6 +2047,34 @@ Clearing needs no special case. The write replaces the whole set, so an app that
 The tests read like the issue: an over-quota app shows its reason, the reason clears when the quota grows or another app leaves, and a cluster that stays over quota for several passes writes once and then nothing (`a_steady_over_quota_cluster_stops_writing_after_the_first_pass`).
 
 The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
+
+### Placing what fits
+
+A quota isn't the only reason an app can't get all its replicas. Ask for three replicas in a cluster with room for two, and until 0.2.1 you got none: `schedule_fixed` returned an error at the first replica that didn't fit, the pass threw away the two it had already placed, and the leader logged `cannot place web` every two seconds. Nothing recorded the reason anywhere `relish status` could see.
+
+Kubernetes places what fits and leaves the rest pending, and that's what we do now (D29). The scheduler's leader-facing entry point says so in its return type:
+
+```rust
+pub struct Placed {
+    pub decision: SchedulingDecision,
+    pub unplaced: Option<Unplaced>,
+}
+
+pub struct Unplaced {
+    pub missing: u32,
+    pub reason: UnplacedReason,
+}
+```
+
+There's no `Result` here, because a short placement isn't an error the caller can bail out on with `?`. It's an answer with two parts: what we placed, and, if anything is left over, how much and why. Capacity admission still wants all or nothing, so `schedule_app` keeps that contract and turns a non-empty `unplaced` into `NoEligibleNodes`.
+
+`UnplacedReason` is an enum of the hard constraints in filter order: no ready node, no node with the labels, no node that can enforce the app's needs or run its binary, no room. `unplaced_reason` walks the nodes once per constraint and stops at the first that nobody passes, so "no node in zone east" isn't misreported as "no room" just because the east nodes don't exist.
+
+The pass keeps every replica that found a node, reservations and all, so the apps planned after it see the room it took. It records `Unschedulable { placed, wanted, reason }` per short app, and the leader writes the set to the council the same way it writes quota blocks: `RaftRequest::Unschedulable`, only when the set changes. `relish status` prints `web (namespace default) is unschedulable: placed 2 of 3 replicas: no node that can run it has room`, `relish inspect` adds an `Unplaced:` line, and `relish wtf` raises an `unschedulable` warning.
+
+Our first version of this had a hole, and CI found it. A lone node restarting into a new binary reported itself not ready for a moment. Its replica stopped holding, there was nowhere else to put it, and "place what fits" placed nothing and committed exactly that: an empty placement list, which retired the node's only workload. The old all-or-nothing code had hidden this by accident, since its error path committed nothing at all. The rule we wanted is narrower: nothing moves unless it has somewhere to go. A replica that no longer holds and finds no other node stays committed where it was (it isn't counted as placed), and moves when a node can take it. `a_replica_with_nowhere_to_go_stays_where_it_was` pins it.
+
+Two more things were needed to keep it quiet. A short app is never converged, so the pass plans it every tick, and every tick it comes up with the same two placements. Committing those again would add a Raft entry every two seconds for nothing, so the pass compares the plan with what's committed and skips an identical one. And the log: the leader compares the recorded set with the planned one and logs only a change (`shortfall_changes`), with a `placement` event when an app becomes short and when it clears. `cannot_place_is_logged_once_per_change` checks that a steady shortfall says nothing.
 
 The `check_quota` function is straightforward: for each limit that's set, check if current usage plus the requested resources exceeds it. No limit means unlimited.
 
@@ -2853,7 +2932,7 @@ Partition a worker from all council members:
 
 1. The worker's apps keep running (data plane is independent of control plane)
 2. The leader stops receiving StateReports from the worker
-3. After the stale timeout, the leader marks the worker as unschedulable
+3. After the stale timeout, the leader stops placing new work on the worker; its running replicas keep their placements for the stale-node grace, then move
 4. When the partition heals, the worker reports again and becomes schedulable
 
 This tests the key invariant: running workloads survive control plane disruption.
@@ -2928,7 +3007,36 @@ fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<
 
 The `*node` is worth a second look. `alive.iter()` yields `&NodeId`, borrowed references into the set, and `filter` hands its closure a reference to each item, so inside the closure `node` is a `&&NodeId`. `contains_key` wants a `&NodeId`, and one `*` peels off the outer layer. At the end, `.cloned()` turns the surviving `&NodeId`s into owned `NodeId`s so they can live in a new set. In Go you'd write the loop and never think about it; in Rust the layers of borrowing are spelled out, which is noisier but means you can't accidentally keep a pointer into a set someone else is about to change.
 
-What still moves a replica is evidence: a node that's dead in gossip, one whose reports went stale, or one that reported itself not ready or unable to enforce what the app needs. Silence while the post is still arriving isn't evidence.
+What still moves a replica is evidence: a node that's dead in gossip, one whose reports have been stale for a while, or one that reported itself not ready or unable to enforce what the app needs. Silence while the post is still arriving isn't evidence.
+
+"For a while" is new in 0.2.1, and it fixed two bugs pointing in opposite directions. A node can be alive in gossip while its reports have stopped: the soak has caught report workers stalling for over a minute while the node and its workloads carried on. The scheduler's cache only holds nodes with a fresh report, so the stale node simply wasn't in it, and `placement_holds` ended in `cache.get_node(..).is_none_or(..)`: no entry, so the placement holds. Forever. Its daemon copies, meanwhile, were dropped at once, because a daemon set was re-planned over the eligible nodes, and a node missing from the cache isn't eligible.
+
+Which is right? Both have a case. Moving at once duplicates a replica just because its reporter wedged, the lesson of #423. Holding forever means a node whose agent died quietly keeps its replicas off the cluster for good. We split the difference (D28): a stale node's placements hold for a grace period, `[reporting_tree] stale_node_grace_secs`, five minutes by default, and then move. Daemon sets get the same rule. The aggregator already knew when it last heard from each node; it now publishes when each stale node went stale, and the leader turns that into the set of *lapsed* nodes:
+
+```rust
+fn lapsed_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState, grace: Duration)
+    -> HashSet<NodeId>
+{
+    let now = tokio::time::Instant::now();
+    alive
+        .iter()
+        .filter(|node| reports.stale_nodes.contains(*node))
+        .filter(|node| {
+            reports
+                .stale_since
+                .get(*node)
+                .is_some_and(|since| now.saturating_duration_since(*since) >= grace)
+        })
+        .cloned()
+        .collect()
+}
+```
+
+A placement on a lapsed node no longer holds; everything else about "holds" is unchanged. Two details. The clock is the leader's own monotonic `Instant`, never anything a node sent, for the same reason the aggregator ignores report timestamps. And a node this leader has never heard from counts from when the leader started listening, so a fresh leader gives every node the full grace instead of moving replicas off nodes whose first report simply hasn't arrived. `saturating_duration_since` returns zero rather than panicking if `since` is somehow in the future.
+
+For a daemon set the pass now keeps the committed copies on nodes it can't judge yet (stale within the grace, suspect, or unheard) and counts them in what the set wants, so it stays converged instead of dropping them. `a_daemon_on_a_stale_node_is_held_then_dropped_like_fixed_replicas` checks both halves.
+
+The grace meets #692's node-by-node rollout in one place. The rollout releases a new spec to one node at a time, waiting on the first node that hasn't converged. A stale node can't converge, so it used to hold the rollout up for as long as its reports stayed away. Once its grace runs out its replica moves and the rollout carries on, which `a_rollout_waiting_on_a_stale_node_moves_on_after_the_grace` pins.
 
 Neither is suspicion. The 0.1.1 tour recording showed node-2's frontend stopped and all three frontends on node-1 after node-3 went away, and the scheduler moved a replica for the same kind of reason in one more place: it only kept placements on nodes gossip called `Alive`. A `Suspect` node is one that missed a probe. SWIM gives it the suspicion timeout (five seconds) to refute that, and a three-node cluster that just lost a member has no third node left to relay an indirect probe, so one slow ack on a loaded laptop is enough to be suspected. The pass now takes the suspect set as well, and a placement on a suspect node holds until gossip declares it dead. Rescheduling a dead node's replicas waits those five seconds longer. That's the price, and we'd rather pay it than stop a healthy replica over a late packet.
 
