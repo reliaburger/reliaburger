@@ -1254,20 +1254,33 @@ Three decisions shape everything that follows, and each earns its keep against t
    other refusal (409: a 4xx from the registry, a failed verification, a
    version the policy refuses) pauses the run at once.
 
+   The binary is never held in memory (#892). The body goes to a private
+   candidate file in the binary directory (`.candidate-*`, owner-only) as
+   it arrives; a local file is copied into one. A failed or timed-out
+   attempt deletes its file, and startup removes candidate files nobody
+   has touched for ten minutes (a killed Bun's leftovers). Pickle serves
+   the blob by streaming the file in 64 KiB pieces, and `relish upgrade
+   start` pushes it the same way, so no step on any node costs a copy of
+   the binary.
+
 3. Verify integrity, in this order:
-   a. SHA-256 of the received bytes matches binary_sha256.
+   a. SHA-256 of the received bytes matches binary_sha256. The checks read
+      the candidate through a read-only memory map: Ed25519 needs the whole
+      message as one slice, and mapped pages are file-backed, reclaimable
+      memory rather than heap.
    b. embedded_signature verifies against the key set compiled into the
       CURRENT running binary.
    c. external_signature verifies against external_signing_key in node.toml
       (required for network upgrades).
-   d. the verified bytes, written to a private temporary file, answer
+   d. the verified candidate file itself (made `0700`) answers
       `--compatibility` with this node's protocol and state pair. The
       candidate has 60 s from launch to answer; the bound is a hang guard,
       wide because macOS assesses the first exec of every new executable
       one file at a time across the host (about a second for a release
       `bun`, longer behind other new executables), and the copy is always
       new. A timeout names how far the candidate got (pid, first output,
-      exit).
+      exit). The probe that passed is the file staged in 4, renamed into
+      place, so the bytes that run are the bytes that were checked.
    Any failure aborts before staging: the node reports failure and does NOT
    swap.
 
@@ -1280,8 +1293,9 @@ Three decisions shape everything that follows, and each earns its keep against t
    Done in place they starved the node's Raft core, which missed the
    leader's heartbeats and called an election just before the exec,
    deposing a healthy leader on every voter swap (#783). So do the other
-   steps whose cost grows with the binary or the disk: writing and deleting
-   the probe's private copy in 3, and syncing the `Staged` marker. On a busy
+   steps whose cost grows with the binary or the disk: copying a local file
+   into its candidate and deleting an unstaged probe in 3, and syncing the
+   `Staged` marker. On a busy
    disk each of those alone held a worker for 0.2 to 0.6 s (#794). The
    worker only launches the probe and waits for its answer.
 

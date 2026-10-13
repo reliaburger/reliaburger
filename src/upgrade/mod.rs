@@ -10,6 +10,7 @@
 //! Detailed design: `docs/plans/archive/2026-07-06-plan-self-upgrade.md` and
 //! `docs/design/agent-bun.md` §5.5.
 
+mod candidate;
 pub(crate) mod compatibility;
 pub mod error;
 pub mod keys;

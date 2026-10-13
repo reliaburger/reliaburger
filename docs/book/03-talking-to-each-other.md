@@ -1133,6 +1133,49 @@ Then we measured the real binary on Linux. A Python forwarder that behaves like 
 
 Its memory was less tidy, and that's worth being honest about. Each round still parks 600 connections at once for 75 seconds, and glibc's allocator spreads those buffers over one arena per thread and doesn't hand fragmented arenas back to the kernel. Resident memory crept up to about 397 MB over eight rounds and flattened out. With `MALLOC_ARENA_MAX=2` the same run levelled off at 284 MB after round two, and the same requests sent directly (every client closes its own socket) left Bun flat at 113 MB, exactly like an idle Bun. So what's left is allocator high-water, not a leak, and the soak's real rate (one poll every 30 seconds) keeps only a handful of idle connections alive at any moment.
 
+### The buffer every connection kept (0.2.0 soak fix)
+
+"A handful" turned out to be optimistic. In the 0.2.0 soak the node that took the cluster's API traffic sat at 600 to 800 MB of resident memory for hours while its two peers sat near 200 MB, and the kernel eventually killed it during an upgrade ([#892](https://github.com/reliaburger/reliaburger/issues/892), and [chapter 14](14-changing-the-tyres.md#a-binary-too-big-to-hold) for the upgrade half). It wasn't the leader. It was simply the node the harness's `relish` and the job controller talked to first, and when it was down and node 2 took the traffic, node 2 climbed to 600 MB and came back down when node 1 returned.
+
+The soak's snapshots record each Bun's resident memory and its open file descriptors every few seconds. Over 2,201 samples across the three nodes the two move together (a correlation of 0.87), at about 2.5 MB of memory per descriptor. The API node held 220 to 320 descriptors, its peers 70 to 145. The job controller runs one `curl` per request, six job polls every two seconds, and each one arrives through Lima's forwarder as a new connection that then sits idle for its 75 seconds. So a couple of hundred idle connections was normal, and something in each one cost megabytes. A TLS session and Hyper's read buffer are tens of kilobytes. What's the rest?
+
+Hyper's source answered it. When Hyper writes an HTTP/1 response, it asks the stream one question first:
+
+```rust
+let strategy = if io.is_write_vectored() {
+    WriteStrategy::Queue
+} else {
+    WriteStrategy::Flatten
+};
+```
+
+`is_write_vectored` is a method on Tokio's `AsyncWrite` trait. A stream that can send several buffers in one system call (`writev`) says `true`, and Hyper then queues the response body's own buffers behind the headers and writes them without copying. A stream that says `false` gets "flatten": Hyper copies every body chunk into its one write buffer, a `Vec<u8>`, however big the chunk is, and writes that. Between requests it empties the `Vec` with `clear()`, which keeps its capacity. So a connection that once sent a 4 MB `wtf` answer or cluster status keeps a 4 MB buffer for as long as it stays open.
+
+TCP sockets and rustls sessions both say `true`. Our wrappers said `false`. `StallGuardedIo` and `LifetimeLimitedIo` implement `poll_write`, `poll_flush` and `poll_shutdown` and nothing else, and the trait gives every method you don't write a default. The default `is_write_vectored` returns `false`, and the default `poll_write_vectored` writes only the first non-empty buffer through `poll_write`. Nothing failed; Hyper just quietly picked the copying path. This is the cost of default methods in Rust traits: they make wrappers short, and they let a wrapper hide what the thing inside it can do. A wrapper around an I/O stream should forward every optional capability, not just the required ones.
+
+The fix forwards both:
+
+```rust
+fn poll_write_vectored(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &[io::IoSlice<'_>],
+) -> Poll<io::Result<usize>> {
+    let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+    self.track_write(cx, poll)
+}
+
+fn is_write_vectored(&self) -> bool {
+    self.inner.is_write_vectored()
+}
+```
+
+`io::IoSlice` is a borrowed buffer laid out like the C `struct iovec` that `writev(2)` takes, so a slice of them goes to the kernel as it is. The stall guard passes the result through `track_write` like any other write, so a vectored write that makes no progress still trips its five-minute limit, and a test pins that down.
+
+`tests/connection_memory.rs` is the test that would have caught it. Like the Mayo and upgrade memory tests, it's a binary with a counting global allocator. It serves a 4 MiB answer (one shared `Bytes`, so the answer itself is never counted twice) on eight kept-alive connections through `serve_http_connection`, reads each answer, leaves the connections open, and divides the heap they still hold by eight. Before the fix each one held 4,217,881 bytes: the answer plus Hyper's bookkeeping. After it, 31,968. The unit tests beside the wrappers check the other half, that each one reports what the socket under it reports.
+
+We haven't rerun the soak with the fix yet, so the 2.5 MB per connection is the soak's number and the 32 KB is the test's. The rest of the API node's extra memory is short-lived work per request: verifying a bearer token hashes it with Argon2, which allocates 19 MiB each time (up to four at once on the blocking pool), and a few handlers copy the council's whole desired state to read one field. Neither grows over time, and glibc keeps some of that memory after it's freed. We left both alone for now; the token cache is a security decision, not a memory one.
+
 ### Count the request before you hide the route
 
 The permit fixed WebSockets that started *during* a drain. It said nothing about a slow request that reached its backend a second *before* the drain began. The tracker had never counted it, so the drain reported "complete" while the request was still waiting for its answer, and Bun stopped the container underneath it. A gated test server that acknowledges a request and then waits to be released made this easy to reproduce.
