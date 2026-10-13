@@ -2173,6 +2173,103 @@ mod tests {
         ));
     }
 
+    /// Sync with `batch_id` known but no longer running until its ledger is
+    /// gone, or fail.
+    async fn sync_until_compacted(node: &TaskArrayNode, batch_id: u64) {
+        let finished = NodeSyncRequest {
+            version: ControlVersion::default(),
+            known: vec![batch_id],
+            arrays: Vec::new(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while node.array_dir(batch_id).join("ledger").exists() {
+            node.sync(&finished).await.unwrap();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "array {batch_id} was never compacted"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_keeps_only_its_compact_results() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(
+            root.path(),
+            FakeRunner::new(Duration::ZERO, |task| AttemptOutcome::Exited {
+                code: i32::from(task.index == 3),
+            }),
+        );
+        let mut array = assignment(1, 20, &[(0, 1), (1, 1)]);
+        array.spec.max_attempts = 1;
+        sync_until_finished(&node, &request(vec![array]), 2).await;
+        let all = node.results(1, false, 100).await.unwrap();
+        let failed = node.results(1, true, 100).await.unwrap();
+        let output = node.task_output(1, 3).await;
+
+        sync_until_compacted(&node, 1).await;
+        let directory = node.array_dir(1);
+        let mut left: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["output", "results"], "only what readers need stays");
+        assert_eq!(node.results(1, false, 100).await.unwrap(), all);
+        assert_eq!(node.results(1, true, 100).await.unwrap(), failed);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].exit_code, Some(1));
+        assert_eq!(
+            format!("{:?}", node.task_output(1, 3).await),
+            format!("{output:?}"),
+            "failure output is still found by its grant"
+        );
+
+        // Pruned: everything goes, as before.
+        node.sync(&NodeSyncRequest::default()).await.unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[tokio::test]
+    async fn a_node_restarted_after_the_run_finished_compacts_it_and_still_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let sync = request(vec![assignment(1, 20, &[(0, 1)])]);
+        let all = {
+            let first = fake_node(root.path(), FakeRunner::always_succeeds());
+            sync_until_finished(&first, &sync, 1).await;
+            first.results(1, false, 100).await.unwrap()
+        };
+        let second = fake_node(root.path(), FakeRunner::always_succeeds());
+        // A reader before the first sync sees the live index...
+        assert_eq!(second.results(1, false, 100).await.unwrap(), all);
+        sync_until_compacted(&second, 1).await;
+        // ...and the compact results after it.
+        assert_eq!(second.results(1, false, 100).await.unwrap(), all);
+        let third = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert_eq!(third.results(1, false, 100).await.unwrap(), all);
+    }
+
+    #[tokio::test]
+    async fn a_compacted_run_is_never_opened_to_run_again() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let sync = request(vec![assignment(1, 20, &[(0, 1)])]);
+        sync_until_finished(&node, &sync, 1).await;
+        sync_until_compacted(&node, 1).await;
+        // A view that lists the finished run as running again can't make
+        // the node start a fresh ledger and run its tasks a second time.
+        let restarted = request(vec![assignment(1, 20, &[(1, 1)])]);
+        let progress = node.sync(&restarted).await.unwrap().arrays.remove(0);
+        assert_eq!(progress.slots, 0);
+        assert!(
+            progress.refused.as_deref().is_some_and(|r| r.contains("finished")),
+            "{progress:?}"
+        );
+        assert!(!node.array_dir(1).join("ledger").exists());
+        assert_eq!(node.results(1, false, 100).await.unwrap().len(), 10);
+    }
+
     #[tokio::test]
     async fn a_failed_process_keeps_its_output() {
         let root = tempfile::tempdir().unwrap();

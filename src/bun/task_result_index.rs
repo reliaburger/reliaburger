@@ -264,6 +264,170 @@ mod tests {
         assert!(index.page(10, 4, false, 2).unwrap().is_empty());
     }
 
+    /// A ledger at `dir/ledger` (with its live index) holding `blocks`.
+    fn ledger_with(dir: &Path, blocks: &[Vec<TaskRecord>]) -> std::path::PathBuf {
+        let path = dir.join("ledger");
+        let mut ledger = task_ledger::Ledger::open(&path).unwrap();
+        for block in blocks {
+            ledger.append(block);
+            ledger.flush().unwrap();
+        }
+        path
+    }
+
+    fn mixed_outcomes() -> Vec<Vec<TaskRecord>> {
+        vec![
+            vec![
+                record(0, 1, TaskFinal::Succeeded),
+                record(1, 1, TaskFinal::Failed),
+                TaskRecord {
+                    exit_code: None,
+                    ..record(2, 1, TaskFinal::NotRun)
+                },
+                TaskRecord {
+                    exit_code: Some(-9),
+                    attempts: 3,
+                    run_ms: u32::MAX,
+                    ..record(3, 1, TaskFinal::Failed)
+                },
+                // Index 4 never ran here: a hole.
+                record(5, 1, TaskFinal::Succeeded),
+                record(9000, 7, TaskFinal::Failed),
+            ],
+            // A newer grant replaces index 1; an older one can't replace 9000.
+            vec![
+                record(1, 2, TaskFinal::Succeeded),
+                record(9000, 6, TaskFinal::Succeeded),
+            ],
+        ]
+    }
+
+    #[test]
+    fn a_compacted_run_answers_every_page_the_live_index_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ledger_with(dir.path(), &mixed_outcomes());
+        let live = TaskResultIndex::open(&ledger.with_extension("index")).unwrap();
+        let queries = [
+            (0, u32::MAX, false, 100),
+            (0, u32::MAX, true, 100),
+            (1, 4, false, 100),
+            (0, u32::MAX, false, 2),
+            (4, 5, false, 100),
+            (9000, 9001, false, 1),
+        ];
+        let before: Vec<_> = queries
+            .iter()
+            .map(|&(start, end, failed, limit)| live.page(start, end, failed, limit).unwrap())
+            .collect();
+        assert_eq!(before[0].len(), 6);
+        assert_eq!(before[0][1].grant_attempt, 2, "the newest grant wins");
+        assert_eq!(before[0][5].grant_attempt, 7);
+        drop(live);
+
+        let results = dir.path().join(RESULTS_FILE);
+        let compacted = compact(&ledger, &results).unwrap().unwrap();
+        assert!(compacted.is_final());
+        let after: Vec<_> = queries
+            .iter()
+            .map(|&(start, end, failed, limit)| {
+                compacted.page(start, end, failed, limit).unwrap()
+            })
+            .collect();
+        assert_eq!(after, before);
+        assert!(!ledger.exists(), "the ledger goes once results are durable");
+        assert!(!ledger.with_extension("index").exists());
+        assert!(!results.with_extension("tmp").exists());
+        // One compact slot per index up to the highest one this node ran.
+        assert_eq!(
+            std::fs::metadata(&results).unwrap().len(),
+            9001 * FINAL_SLOT_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn a_reopened_compacted_run_reads_the_same_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ledger_with(dir.path(), &mixed_outcomes());
+        let results = dir.path().join(RESULTS_FILE);
+        let first = compact(&ledger, &results).unwrap().unwrap();
+        let expected = first.page(0, u32::MAX, false, 100).unwrap();
+        drop(first);
+        // Compacting again (another sync, or a restarted node) only opens it.
+        let again = compact(&ledger, &results).unwrap().unwrap();
+        assert_eq!(again.page(0, u32::MAX, false, 100).unwrap(), expected);
+        let opened = TaskResultIndex::open_final(&results).unwrap();
+        assert_eq!(opened.page(0, u32::MAX, false, 100).unwrap(), expected);
+    }
+
+    #[test]
+    fn compaction_interrupted_by_a_crash_finishes_without_losing_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocks = mixed_outcomes();
+        let ledger = ledger_with(dir.path(), &blocks);
+        let results = dir.path().join(RESULTS_FILE);
+        let expected = TaskResultIndex::open(&ledger.with_extension("index"))
+            .unwrap()
+            .page(0, u32::MAX, false, 100)
+            .unwrap();
+
+        // Crash while writing the temporary file: it's thrown away and
+        // compaction starts again from the ledger.
+        std::fs::write(results.with_extension("tmp"), b"half a file").unwrap();
+        let compacted = compact(&ledger, &results).unwrap().unwrap();
+        assert_eq!(compacted.page(0, u32::MAX, false, 100).unwrap(), expected);
+
+        // Crash after the rename but before the ledger was deleted: the
+        // results are already complete, so only the leftovers go.
+        std::fs::create_dir_all(dir.path().join("again")).unwrap();
+        let ledger = ledger_with(
+            &dir.path().join("again"),
+            &[vec![record(0, 1, TaskFinal::Failed)]],
+        );
+        let moved = dir.path().join("again").join(RESULTS_FILE);
+        std::fs::copy(&results, &moved).unwrap();
+        let reopened = compact(&ledger, &moved).unwrap().unwrap();
+        assert_eq!(reopened.page(0, u32::MAX, false, 100).unwrap(), expected);
+        assert!(!ledger.exists());
+        assert!(!ledger.with_extension("index").exists());
+    }
+
+    #[test]
+    fn a_node_that_never_ran_the_array_has_nothing_to_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger");
+        let results = dir.path().join(RESULTS_FILE);
+        assert!(compact(&ledger, &results).unwrap().is_none());
+        assert!(!results.exists());
+    }
+
+    #[test]
+    fn a_grant_too_large_for_a_compact_slot_keeps_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = u64::from(u32::MAX) + 1;
+        let ledger = ledger_with(dir.path(), &[vec![record(0, huge, TaskFinal::Failed)]]);
+        let results = dir.path().join(RESULTS_FILE);
+        let error = compact(&ledger, &results).unwrap_err().to_string();
+        assert!(error.contains("grant"), "{error}");
+        assert!(!results.exists());
+        assert!(!results.with_extension("tmp").exists());
+        // Nothing was lost: the live index still answers.
+        let live = TaskResultIndex::open(&ledger.with_extension("index")).unwrap();
+        assert_eq!(live.page(0, 1, false, 1).unwrap()[0].grant_attempt, huge);
+    }
+
+    #[test]
+    fn a_damaged_compact_slot_is_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ledger_with(dir.path(), &mixed_outcomes());
+        let results = dir.path().join(RESULTS_FILE);
+        drop(compact(&ledger, &results).unwrap());
+        let mut raw = std::fs::read(&results).unwrap();
+        raw[0] = 0x7f; // an outcome no record has
+        std::fs::write(&results, raw).unwrap();
+        let index = TaskResultIndex::open_final(&results).unwrap();
+        assert!(index.page(0, 4, false, 10).is_err());
+    }
+
     #[test]
     fn a_damaged_slot_is_an_explicit_error() {
         let dir = tempfile::tempdir().unwrap();

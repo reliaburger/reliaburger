@@ -718,15 +718,36 @@ mod tests {
             bytes as f64 / tasks as f64,
             indexed as f64 / tasks as f64,
         );
-        let bound = super::super::task_array_node::STORAGE_BYTES_PER_TASK;
+        let bound = super::super::task_array_node::ACTIVE_STORAGE_BYTES_PER_TASK;
         assert!(
             bytes + indexed <= tasks * bound,
-            "{} bytes is over {bound} per task",
+            "{} bytes is over {bound} per task while the run is active",
             bytes + indexed
         );
         let replayed = replay(&path_in(&dir)).unwrap();
         assert_eq!(replayed.records.len(), 245 * 4096);
         assert_eq!(replayed.finished.range_count(), 1);
+
+        // The run finishes: its results move to the compact file and the
+        // ledger and live index go. That is all a finished run keeps.
+        use super::super::task_result_index::{self, FINAL_SLOT_BYTES, RESULTS_FILE};
+        let results = dir.path().join(RESULTS_FILE);
+        task_result_index::compact(&path_in(&dir), &results)
+            .unwrap()
+            .unwrap();
+        assert!(!path_in(&dir).exists());
+        assert!(!path_in(&dir).with_extension("index").exists());
+        assert_eq!(length(&results), tasks * FINAL_SLOT_BYTES as u64);
+        let kept = allocated(&results);
+        eprintln!(
+            "{tasks} finished tasks: results {kept} bytes ({:.1}/task)",
+            kept as f64 / tasks as f64,
+        );
+        let bound = super::super::task_array_node::STORAGE_BYTES_PER_TASK;
+        assert!(
+            kept <= tasks * bound,
+            "{kept} bytes is over {bound} per finished task"
+        );
     }
 
     #[test]
