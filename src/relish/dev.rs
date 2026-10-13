@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::RelishError;
+use super::local_context::LocalContext;
+use super::quickstart::lima::GuestFile;
+use super::quickstart::runner::JOIN_SCRIPT;
 
 /// Command to launch the bun agent in a cluster VM. `--cluster` is essential:
 /// without it the agent ignores the `[cluster]` config and runs single-node.
@@ -158,6 +161,72 @@ async fn limactl(args: &[&str]) -> Result<String, RelishError> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run a limactl command with `input` on its standard input and return
+/// stdout. Secrets travel this way so they never appear in an argument list.
+async fn limactl_with_input(args: &[&str], input: &[u8]) -> Result<String, RelishError> {
+    use tokio::io::AsyncWriteExt;
+    let failed = |error: std::io::Error| RelishError::LimaError {
+        command: format!("limactl {}", args.join(" ")),
+        stderr: error.to_string(),
+    };
+    let mut child = tokio::process::Command::new("limactl")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(failed)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input).await.map_err(failed)?;
+    }
+    let output = child.wait_with_output().await.map_err(failed)?;
+    if !output.status.success() {
+        return Err(RelishError::LimaError {
+            command: format!("limactl {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// How long `create` waits for the bootstrap node to mint a join token.
+const JOIN_TOKEN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Enrol `node` through the bootstrap node `first`, unless it already holds
+/// an identity from an earlier, interrupted `create`.
+async fn enrol(
+    first: &str,
+    node: &str,
+    fingerprint: &str,
+    first_ip: &str,
+) -> Result<(), RelishError> {
+    let committed = format!("{GUEST_IDENTITY_DIR}/bundle.committed");
+    if limactl(&["shell", node, "sudo", "test", "-f", &committed])
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let mint = join_token_command(first, node);
+    let mint: Vec<&str> = mint.iter().map(String::as_str).collect();
+    // The bootstrap agent needs a few seconds to elect itself and serve.
+    let deadline = std::time::Instant::now() + JOIN_TOKEN_DEADLINE;
+    let token = loop {
+        match limactl(&mint).await {
+            Ok(token) if !token.trim().is_empty() => break token,
+            Ok(_) if std::time::Instant::now() >= deadline => {
+                return Err(invalid_input("the bootstrap node printed no join token"));
+            }
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            _ => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    };
+    let join = join_command(node, fingerprint, first_ip);
+    let join: Vec<&str> = join.iter().map(String::as_str).collect();
+    limactl_with_input(&join, token.trim().as_bytes()).await?;
+    Ok(())
 }
 
 /// Get the inter-VM IP address of a Lima VM.
@@ -319,34 +388,37 @@ async fn install_binary(
     Ok(())
 }
 
-/// Copy a host file into a VM at `dest` with mode 0600 (via a user-writable
-/// temp path + `sudo install`, since `limactl copy` runs unprivileged). Used
-/// for the master key and security bootstrap — both secrets.
-async fn install_secret_file(
+/// Guest script that writes standard input to `$1` with mode `$2`, as root.
+/// The file is created owner-only, so a secret is never readable by anyone
+/// else, even for a moment, and never staged in a shared temporary path.
+const INSTALL_SCRIPT: &str =
+    "set -eu\numask 077\nmkdir -p \"$(dirname \"$1\")\"\ncat > \"$1\"\nchmod \"$2\" \"$1\"\n";
+
+/// Copy a host file into a VM at `dest` with `mode`, through `sudo` and
+/// standard input. Used for the master key, security bootstrap and identity,
+/// and the public root CA.
+async fn install_file(
     vm: &str,
     host_path: &std::path::Path,
     dest: &str,
+    mode: u32,
 ) -> Result<(), RelishError> {
-    let file_name = host_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| RelishError::LimaError {
-            command: "install secret".to_string(),
-            stderr: "non-UTF-8 file name".to_string(),
-        })?;
-    let tmp_dest = format!("/tmp/{file_name}");
-    limactl(&[
-        "copy",
-        host_path.to_str().ok_or_else(|| RelishError::LimaError {
-            command: "install secret".to_string(),
-            stderr: format!("non-UTF-8 path for {dest}"),
-        })?,
-        &format!("{vm}:{tmp_dest}"),
-    ])
-    .await?;
-    limactl(&[
-        "shell", vm, "sudo", "install", "-D", "-m", "600", &tmp_dest, dest,
-    ])
+    let bytes = std::fs::read(host_path)?;
+    let mode = format!("{mode:o}");
+    limactl_with_input(
+        &[
+            "shell",
+            vm,
+            "sudo",
+            "sh",
+            "-c",
+            INSTALL_SCRIPT,
+            "sh",
+            dest,
+            &mode,
+        ],
+        &bytes,
+    )
     .await?;
     Ok(())
 }
@@ -380,19 +452,31 @@ provision:
     )
 }
 
+/// Where a dev node keeps its identity: the first node's comes from the host
+/// bootstrap, every other node's from `relish join`.
+const GUEST_IDENTITY_DIR: &str = "/etc/reliaburger/identity";
+
+/// A world-readable copy of the cluster's root CA certificate, so the
+/// unprivileged Lima user's `relish` can pin the local agent's TLS identity.
+const GUEST_ROOT_CA: &str = "/etc/reliaburger/root-ca.crt";
+
 /// Generate a node.toml config for a cluster node.
 ///
 /// `node_ip` is the node's own shared-network IP; it's advertised so gossip,
 /// Raft, and reporting bind a peer-reachable address (not loopback).
 ///
-/// Every node points at the shared master key. Only the bootstrap node (the
-/// one with an empty `join`) also points at the security bootstrap: it seeds
-/// the `SecurityState` into Raft once, and it replicates to everyone else.
+/// Every node requires mTLS and points at the shared master key and its
+/// identity directory. Only the bootstrap node (the one with an empty
+/// `join`) also points at the security bootstrap: it seeds the
+/// `SecurityState` into Raft once, and it replicates to everyone else.
+/// `peers` lists every dev node's address, so a joiner can reach the first
+/// node's API through the perimeter to enrol before it's a member.
 fn generate_node_config(
     cluster_name: &str,
     node_name: &str,
     node_ip: &str,
     first_node_ip: Option<&str>,
+    peers: &[&str],
 ) -> String {
     let join = match first_node_ip {
         Some(ip) => format!(r#"join = ["{ip}:9443"]"#),
@@ -405,11 +489,14 @@ fn generate_node_config(
     } else {
         ""
     };
+    let peers = peers
+        .iter()
+        .map(|peer| format!("\"{peer}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     format!(
-        r#"# WARNING: DEVELOPMENT-ONLY PLAINTEXT CLUSTER TRANSPORTS.
-# `relish dev create` isolates these nodes in local Lima VMs. Do not reuse
-# this config on a shared or production network.
+        r#"# Generated by `relish dev create`: internal cluster transports require mTLS.
 
 [node]
 name = "{node_name}"
@@ -426,12 +513,91 @@ reporting_port = 9445
 
 [security]
 master_key_path = "/etc/reliaburger/master.key"{bootstrap_line}
-require_mtls = false
-# Deliberate local dev cluster: accept plaintext cluster transports on the
-# inter-VM (routable) network. Never do this on a shared or production network.
-allow_insecure_cluster = true
+identity_dir = "{GUEST_IDENTITY_DIR}"
+require_mtls = true
+bootstrap_peers = [{peers}]
 "#
     )
+}
+
+/// The host directory holding a dev cluster's credentials: the master key,
+/// security bootstrap, administrator token and first identity.
+fn security_directory(state_root: &std::path::Path, cluster_name: &str) -> PathBuf {
+    state_root.join(format!("{cluster_name}.security"))
+}
+
+/// Generate the dev cluster's credentials once, with the same bootstrap code
+/// `relish setup --quickstart` uses, or reuse them on a resumed `create`.
+fn prepare_security(
+    directory: &std::path::Path,
+    cluster_name: &str,
+    first_node: &str,
+) -> Result<crate::relish::quickstart::security::Bootstrap, RelishError> {
+    if let Some(parent) = directory.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::relish::quickstart::security::prepare_in(directory, cluster_name, first_node)
+}
+
+/// Forget a destroyed dev cluster's credentials.
+fn remove_security(directory: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// The private credential files node `index` gets, all mode 0600.
+fn node_security_files(directory: &std::path::Path, index: usize) -> Vec<GuestFile> {
+    crate::relish::quickstart::security::node_security_files(directory, index)
+        .into_iter()
+        .map(|(source, destination)| GuestFile::private(source, &destination))
+        .collect()
+}
+
+/// The context each VM's `relish` loads, so it reaches its local agent over
+/// HTTPS with the administrator token and no flags.
+fn guest_context(cluster_name: &str, token: &str) -> LocalContext {
+    LocalContext {
+        schema: 1,
+        owner: format!("dev-{cluster_name}"),
+        endpoint: "https://127.0.0.1:9117".to_string(),
+        token: token.to_string(),
+        ca_cert: PathBuf::from(GUEST_ROOT_CA),
+        service_endpoints: Default::default(),
+    }
+}
+
+/// `limactl` arguments that mint a five-minute join token for `node` on the
+/// first node, printing only the token on standard output.
+fn join_token_command(first: &str, node: &str) -> Vec<String> {
+    [
+        "shell",
+        first,
+        "relish",
+        "join-token",
+        "create",
+        "--node-id",
+        node,
+        "--ttl",
+        "5m",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// `limactl` arguments that enrol `node` through the first node's API with
+/// the token on standard input, pinning the cluster's root CA.
+fn join_command(node: &str, fingerprint: &str, first_ip: &str) -> Vec<String> {
+    vec![
+        "shell".into(),
+        node.into(),
+        "sudo".into(),
+        "sh".into(),
+        "-c".into(),
+        JOIN_SCRIPT.into(),
+        "sh".into(),
+        node.into(),
+        fingerprint.into(),
+        format!("https://{first_ip}:9117"),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -605,36 +771,34 @@ pub async fn create(
         .ok_or_else(|| invalid_input("bootstrap node has no discovered IP address"))?;
     validate_cluster(&cluster, name)?;
 
-    // Generate the cluster's security material once, on the host. Every node
-    // gets the master key (to build its wrapping IKM); only the bootstrap node
-    // gets the security bootstrap (it seeds SecurityState into Raft, which then
-    // replicates to the rest). Both are written 0600 and installed 0600.
-    println!("  generating security material...");
-    println!("  WARNING: dev-cluster internal transports are plaintext inside the Lima network");
-    let sec_dir = std::env::temp_dir().join(format!("{name}-dev-security"));
-    std::fs::create_dir_all(&sec_dir)?;
-    let init = crate::sesame::init::initialize_cluster(name, &cluster.nodes[0].name, &sec_dir)
-        .map_err(|e| RelishError::InitFailed(e.to_string()))?;
-    let master_key_path = sec_dir.join("master.key");
-    std::fs::write(&master_key_path, hex::encode(init.master_secret))?;
-    let bootstrap_path = sec_dir.join("security-bootstrap.json");
-    std::fs::write(
-        &bootstrap_path,
-        serde_json::to_string(&init.security_state).map_err(RelishError::SerialiseJson)?,
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&master_key_path, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::set_permissions(&bootstrap_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    // Generate the cluster's credentials once, on the host, with the same
+    // bootstrap code as `relish setup --quickstart`: the CA, master key, an
+    // administrator token and the first node's identity. They persist with
+    // the cluster state, so a resumed `create` reuses them.
+    println!("  generating cluster credentials...");
+    let first_name = cluster
+        .nodes
+        .first()
+        .ok_or_else(|| invalid_input("cluster has no nodes"))?
+        .name
+        .clone();
+    let security = security_directory(&state_dir(), name);
+    let bootstrap = prepare_security(&security, name, &first_name)?;
+    let token = std::fs::read_to_string(security.join("admin.token"))?;
+    let context = serde_json::to_vec_pretty(&guest_context(name, token.trim()))
+        .map_err(RelishError::SerialiseJson)?;
+    let peers: Vec<&str> = cluster
+        .nodes
+        .iter()
+        .filter_map(|node| node.ip.as_deref())
+        .collect();
 
-    // Generate and copy node configs + security material
+    // Generate and copy node configs + credentials
     println!("  configuring cluster...");
     for (i, node) in cluster.nodes.iter().enumerate() {
         let join_ip = if i == 0 { None } else { Some(first_ip) };
         let node_ip = node.ip.as_deref().unwrap_or("127.0.0.1");
-        let config = generate_node_config(name, &node.name, node_ip, join_ip);
+        let config = generate_node_config(name, &node.name, node_ip, join_ip, &peers);
 
         // Write config to a temp file, copy to a user-writable path in the VM
         // (limactl copy runs as the unprivileged lima user), then install it
@@ -661,18 +825,33 @@ pub async fn create(
         .await?;
         let _ = std::fs::remove_file(&config_path);
 
-        // Master key on every node; security bootstrap on the bootstrap node.
-        install_secret_file(&node.name, &master_key_path, "/etc/reliaburger/master.key").await?;
-        if i == 0 {
-            install_secret_file(
-                &node.name,
-                &bootstrap_path,
-                "/etc/reliaburger/security-bootstrap.json",
-            )
-            .await?;
+        // Master key on every node; the security bootstrap and the first
+        // identity only on the bootstrap node. The others enrol below.
+        for file in node_security_files(&security, i) {
+            install_file(&node.name, &file.source, &file.destination, file.mode).await?;
         }
+        install_file(
+            &node.name,
+            &security.join("identity/root-ca.crt"),
+            GUEST_ROOT_CA,
+            0o644,
+        )
+        .await?;
+        // The Lima user's relish reads its context from its own home, so
+        // write it there, owner-only, without a temporary copy on disk.
+        limactl_with_input(
+            &[
+                "shell",
+                &node.name,
+                "sh",
+                "-c",
+                "umask 077 && mkdir -p \"$HOME/.reliaburger\" && \
+                 cat > \"$HOME/.reliaburger/context.json\"",
+            ],
+            &context,
+        )
+        .await?;
     }
-    let _ = std::fs::remove_dir_all(&sec_dir);
 
     // Build (or use the provided) Linux binaries, then install on every node.
     let (bun_path, relish_path) = match (bun, relish) {
@@ -689,10 +868,20 @@ pub async fn create(
         install_binary(&node.name, &relish_path, "relish").await?;
     }
 
-    // Start bun agents
+    // Start the bootstrap node, then enrol and start every other node through
+    // it: a join token bound to the node's name, then `relish join`.
     println!("  starting bun agents...");
     let launch = agent_launch_cmd(&cluster.runtime);
-    for node in &cluster.nodes {
+    limactl(&["shell", &first_name, "sudo", "bash", "-c", &launch]).await?;
+    for node in cluster.nodes.iter().skip(1) {
+        println!("  enrolling {}...", node.name);
+        enrol(
+            &first_name,
+            &node.name,
+            &bootstrap.root_fingerprint,
+            first_ip,
+        )
+        .await?;
         limactl(&["shell", &node.name, "sudo", "bash", "-c", &launch]).await?;
     }
 
@@ -840,6 +1029,7 @@ pub async fn destroy(name: &str) -> Result<(), RelishError> {
         limactl(&["delete", &node.name, "-f"]).await?;
     }
     delete_cluster_state(name);
+    remove_security(&security_directory(&state_dir(), name));
     println!("Dev cluster \"{name}\" destroyed.");
 
     // The build VM (`reliaburger-test`) is shared across all dev clusters, so
@@ -1180,6 +1370,8 @@ fn sidecar_sig_path(binary: &std::path::Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    const PEERS: &[&str] = &["192.168.105.2", "192.168.105.3"];
+
     /// A release-signed binary in `dir` plus a separate operator key, as a
     /// release leaves it before the operator countersigns.
     fn released_binary(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -1267,7 +1459,7 @@ mod tests {
 
     #[test]
     fn generate_node_config_first_node_has_empty_join() {
-        let config = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
+        let config = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None, PEERS);
         assert!(config.contains("join = []"));
         assert!(config.contains("gossip_port = 9443"));
         assert!(config.contains(r#"name = "reliaburger-1""#));
@@ -1283,6 +1475,7 @@ mod tests {
             "reliaburger-2",
             "192.168.105.3",
             Some("192.168.105.2"),
+            PEERS,
         );
         assert!(config.contains(r#"join = ["192.168.105.2:9443"]"#));
         assert!(config.contains(r#"name = "reliaburger-2""#));
@@ -1291,12 +1484,13 @@ mod tests {
 
     #[test]
     fn generate_node_config_includes_master_key_path_for_all_nodes() {
-        let first = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
+        let first = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None, PEERS);
         let joiner = generate_node_config(
             "dev",
             "reliaburger-2",
             "192.168.105.3",
             Some("192.168.105.2"),
+            PEERS,
         );
         for config in [first, joiner] {
             assert!(config.contains("[security]"));
@@ -1305,15 +1499,136 @@ mod tests {
     }
 
     #[test]
-    fn generate_node_config_marks_the_deliberate_development_plaintext_mode() {
-        let config = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
-        assert!(config.contains("DEVELOPMENT-ONLY PLAINTEXT CLUSTER TRANSPORTS"));
-        assert!(config.contains("require_mtls = false"));
+    fn generate_node_config_requires_mtls_with_the_enrolled_identity() {
+        let first = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None, PEERS);
+        let joiner = generate_node_config(
+            "dev",
+            "reliaburger-2",
+            "192.168.105.3",
+            Some("192.168.105.2"),
+            PEERS,
+        );
+        for text in [first, joiner] {
+            assert!(!text.contains("PLAINTEXT"), "{text}");
+            let config = crate::config::node::NodeConfig::parse(&text).unwrap();
+            assert!(config.security.require_mtls);
+            assert!(!config.security.allow_insecure_cluster);
+            assert_eq!(
+                config.security.identity_dir.as_deref(),
+                Some(std::path::Path::new(GUEST_IDENTITY_DIR))
+            );
+        }
+    }
+
+    #[test]
+    fn generate_node_config_admits_every_dev_node_as_a_bootstrap_peer() {
+        // A joiner reaches the first node's API to enrol before it's a
+        // member, so the perimeter must already know every dev node.
+        let text = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None, PEERS);
+        let config = crate::config::node::NodeConfig::parse(&text).unwrap();
+        let expected: Vec<std::net::IpAddr> =
+            PEERS.iter().map(|peer| peer.parse().unwrap()).collect();
+        assert_eq!(config.security.bootstrap_peers, expected);
+    }
+
+    #[test]
+    fn dev_security_comes_from_the_quickstart_bootstrap_and_is_reused_on_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = security_directory(root.path(), "dev");
+        let first = prepare_security(&directory, "dev", "reliaburger-dev-1").unwrap();
+        for file in ["master.key", "security-bootstrap.json", "admin.token"] {
+            assert!(directory.join(file).is_file(), "{file} missing");
+        }
+        let token = std::fs::read(directory.join("admin.token")).unwrap();
+        let second = prepare_security(&directory, "dev", "reliaburger-dev-1").unwrap();
+        assert_eq!(first.root_fingerprint, second.root_fingerprint);
+        assert_eq!(std::fs::read(directory.join("admin.token")).unwrap(), token);
+    }
+
+    #[test]
+    fn destroying_a_dev_cluster_forgets_its_security_material() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = security_directory(root.path(), "dev");
+        prepare_security(&directory, "dev", "reliaburger-dev-1").unwrap();
+        remove_security(&directory);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn only_the_bootstrap_node_receives_the_identity_and_bootstrap_state() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = security_directory(root.path(), "dev");
+        prepare_security(&directory, "dev", "reliaburger-dev-1").unwrap();
+        let first = node_security_files(&directory, 0);
+        let joiner = node_security_files(&directory, 1);
+        let destinations = |files: &[GuestFile]| {
+            files
+                .iter()
+                .map(|f| f.destination.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(destinations(&joiner), vec!["/etc/reliaburger/master.key"]);
+        let first_destinations = destinations(&first);
+        assert!(first_destinations.contains(&"/etc/reliaburger/security-bootstrap.json".into()));
+        assert_eq!(
+            first_destinations.last().map(String::as_str),
+            Some("/etc/reliaburger/identity/bundle.committed"),
+            "the identity commit marker goes last"
+        );
+        assert!(first.iter().chain(&joiner).all(|file| file.mode == 0o600));
+        assert!(first.iter().all(|file| file.source.is_file()));
+    }
+
+    #[test]
+    fn guest_relish_reaches_the_local_api_over_mtls_with_the_admin_token() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        guest_context("dev", "rbrg_secret").save(&path).unwrap();
+        let context = crate::relish::local_context::LocalContext::load(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.endpoint, "https://127.0.0.1:9117");
+        assert_eq!(context.token, "rbrg_secret");
+        assert_eq!(context.ca_cert, std::path::Path::new(GUEST_ROOT_CA));
+    }
+
+    #[test]
+    fn joiners_enrol_through_the_first_node_with_a_token_bound_to_their_name() {
+        let mint = join_token_command("reliaburger-dev-1", "reliaburger-dev-2");
+        assert_eq!(
+            mint,
+            [
+                "shell",
+                "reliaburger-dev-1",
+                "relish",
+                "join-token",
+                "create",
+                "--node-id",
+                "reliaburger-dev-2",
+                "--ttl",
+                "5m",
+            ]
+        );
+        let join = join_command("reliaburger-dev-2", "sha256:abc", "192.168.105.2");
+        assert_eq!(
+            &join[..5],
+            ["shell", "reliaburger-dev-2", "sudo", "sh", "-c"]
+        );
+        assert!(join[5].contains("relish join --token-file"));
+        assert_eq!(
+            &join[6..],
+            [
+                "sh",
+                "reliaburger-dev-2",
+                "sha256:abc",
+                "https://192.168.105.2:9117"
+            ]
+        );
     }
 
     #[test]
     fn generate_node_config_includes_bootstrap_path_only_for_first_node() {
-        let first = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
+        let first = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None, PEERS);
         assert!(
             first.contains(r#"bootstrap_path = "/etc/reliaburger/security-bootstrap.json""#),
             "bootstrap node must load the security bootstrap"
@@ -1327,6 +1642,7 @@ mod tests {
             "reliaburger-2",
             "192.168.105.3",
             Some("192.168.105.2"),
+            PEERS,
         );
         assert!(
             !joiner.contains("bootstrap_path"),

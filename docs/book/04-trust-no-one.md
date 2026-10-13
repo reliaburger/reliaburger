@@ -80,9 +80,39 @@ That normal command now writes `require_mtls = true` into the generated
 start cluster mode without it. You don't generate keys and then quietly run
 plaintext because you missed one Boolean. If you really need plaintext for an
 isolated experiment, you must say `--development-plaintext`; the generated
-file and both commands warn you. `relish dev create` makes the same explicit
-trade for its local Lima network because that provisioner doesn't enrol a
-separate identity in every VM yet. Subtle, it isn't.
+file and both commands warn you. Subtle, it isn't.
+
+The default goes the same way. `SecuritySection` used to derive `Default`,
+which gave `require_mtls` the `bool` default of `false`. So a config that left
+out `[security]` got plaintext without anyone asking for it. Now the struct
+implements `Default` by hand:
+
+```rust
+impl Default for SecuritySection {
+    fn default() -> Self {
+        Self {
+            require_mtls: true,
+            master_key_path: None,
+            // ... every other field at its ordinary default
+        }
+    }
+}
+```
+
+`#[serde(default)]` on the struct means serde fills every missing field from
+this `Default` value, not from each field type's own default. That's the Rust
+detail that matters here. A missing `require_mtls` key now reads as `true`, and
+`bun --cluster` with no identity stops with "run `relish init`". Single-node
+`bun` never reads the field, so it's unaffected. Plaintext is now something you
+write down, `require_mtls = false`, and nothing gives it to you by omission.
+
+`relish dev create` used to be the awkward exception. Its Lima provisioner
+didn't enrol an identity in every VM, so it wrote plaintext configs. It now
+reuses the laptop quickstart's bootstrap code: the CA, master key and an
+administrator token come from the same `security::prepare_in`, the first VM
+gets the first identity, and every other VM enrols with a join token and
+`relish join`, exactly as you would by hand. One less special case, and the dev
+cluster finally has a registry, which needs mTLS.
 
 The generated master key and security-bootstrap JSON both land as `0600`.
 That second file used to land as `0644`, while Bun's loader quite reasonably

@@ -235,6 +235,8 @@ advertise_address = "127.0.0.1"
 
 [security]
 master_key_path = "{master_key}"
+# A loopback upgrade fixture with no node certificates: plaintext on purpose.
+require_mtls = false
 
 [storage]
 data = "{node_root}/data"
