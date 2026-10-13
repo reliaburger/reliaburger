@@ -14,6 +14,7 @@ pub mod apply;
 pub mod backup;
 pub mod durable_log;
 pub mod fence;
+pub mod handover;
 pub mod log_store;
 pub mod network;
 pub mod node;
@@ -95,6 +96,13 @@ pub enum CouncilError {
          the other"
     )]
     Split { epoch: u64 },
+    /// A voter campaigned to take over leadership, and nobody but the
+    /// previous leader led before the deadline (#755).
+    #[error("leadership did not move off {previous} within {waited:?}")]
+    HandoverTimedOut {
+        previous: String,
+        waited: std::time::Duration,
+    },
 }
 
 #[cfg(test)]

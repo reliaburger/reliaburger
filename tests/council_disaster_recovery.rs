@@ -52,15 +52,15 @@ async fn wait_until(timeout: Duration, cond: impl FnMut() -> bool) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The deposition mechanism this whole theme builds on: openraft 0.9 has no
-/// graceful leadership transfer, so a leader that must leave triggers an
-/// election on itself (or a chosen healthy voter). The campaign runs at a
-/// higher term and the previous leader steps down. Here the *leader itself*
-/// campaigns, which is enough to prove the term advances and leadership can
-/// move; the recovery code chooses a healthy follower to campaign instead so
-/// the resigning leader actually hands off.
+/// graceful leadership transfer, so a follower's campaign at a higher term
+/// deposes the leader. This shows only that the term advances and a single
+/// leader settles; that leader may be the old one, because the election
+/// after a deposition favours the longest log. Moving leadership needs the
+/// old leader to hold its elections too, which
+/// `leadership_moves_off_the_leader_every_time_under_write_load` shows (#755).
 #[tokio::test]
 #[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
-async fn trigger_elect_advances_term_and_can_move_leadership() {
+async fn trigger_elect_advances_the_term_and_leadership_settles() {
     assert!(
         cluster_tests_enabled(),
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
@@ -83,8 +83,8 @@ async fn trigger_elect_advances_term_and_can_move_leadership() {
 
     let term_before = nodes[leader].metrics().borrow().current_term;
 
-    // Pick a healthy follower and make it campaign. It should win with a
-    // higher term and depose the current leader.
+    // Pick a healthy follower and make it campaign. Its higher term deposes
+    // the current leader; who wins the next election is not decided here.
     let follower = (0..3).find(|i| rid(*i) != leader_id).unwrap();
     nodes[follower].raft().trigger().elect().await.unwrap();
 
@@ -166,11 +166,23 @@ async fn pressured_leader_resigns_and_leadership_moves() {
         );
     }
 
+    // Writes in flight while the follower campaigns, as in #646: the leader
+    // often holds an entry the candidate lacks, so the candidate loses and
+    // the old leader would win the next election if it could campaign.
+    let writing = CancellationToken::new();
+    let writer = spawn_writer(&nodes[..3], writing.clone());
+    let term_before = nodes[leader].metrics().borrow().current_term;
+
     // Flag the leader as resigning under disk pressure.
     pressure_tx.send(BTreeSet::from([leader_id])).unwrap();
 
-    // Leadership moves off the pressured node.
+    // Leadership moves off the pressured node, and the pressured node never
+    // wins it back in the meantime: a moved term alone isn't a handover.
     let moved = wait_until(Duration::from_secs(10), || {
+        assert!(
+            leading_term(&nodes, leader_id).is_none_or(|term| term <= term_before),
+            "the pressured leader won leadership back"
+        );
         nodes[leader]
             .metrics()
             .borrow()
@@ -178,6 +190,8 @@ async fn pressured_leader_resigns_and_leadership_moves() {
             .is_some_and(|l| l != leader_id)
     })
     .await;
+    writing.cancel();
+    let _ = writer.await;
     assert!(moved, "leadership did not move off the pressured leader");
 
     // A single leader settled, and it's a voter that isn't the pressured node.
@@ -196,6 +210,100 @@ async fn pressured_leader_resigns_and_leadership_moves() {
     assert!(settled, "leadership did not settle on a new voter");
 
     shutdown.cancel();
+    for node in &nodes {
+        let _ = node.shutdown().await;
+    }
+}
+
+/// The highest term at which `id` was seen leading, sampled from `nodes`.
+fn leading_term(nodes: &[Arc<reliaburger::council::CouncilNode>], id: u64) -> Option<u64> {
+    nodes
+        .iter()
+        .map(|node| node.metrics().borrow().clone())
+        .filter(|metrics| metrics.current_leader == Some(id))
+        .map(|metrics| metrics.current_term)
+        .max()
+}
+
+/// Keep writing to whichever voter leads until `stop`, so elections happen
+/// while the leader holds entries its followers haven't received yet.
+fn spawn_writer(
+    nodes: &[Arc<reliaburger::council::CouncilNode>],
+    stop: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let nodes: Vec<_> = nodes.to_vec();
+    tokio::spawn(async move {
+        let mut sequence = 0u64;
+        while !stop.is_cancelled() {
+            for node in &nodes {
+                sequence += 1;
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    node.write(RaftRequest::ConfigSet {
+                        key: "load".to_string(),
+                        value: sequence.to_string(),
+                    }),
+                )
+                .await;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+}
+
+/// The handover `POST /v1/cluster/elect` and disk-pressure deposition rely
+/// on (#755): the leader holds its elections and another voter campaigns
+/// until it leads. Five handovers in a row, under constant writes, must each
+/// move leadership, and no old leader may win it back on the way.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn leadership_moves_off_the_leader_every_time_under_write_load() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+
+    let (nodes, _router) = build_council().await;
+    let voters = &nodes[..3];
+    let mut leader = initial_voter_leader_index(&nodes)
+        .await
+        .expect("no leader elected");
+    let writing = CancellationToken::new();
+    let writer = spawn_writer(voters, writing.clone());
+
+    for round in 0..5 {
+        let leader_id = rid(leader);
+        let term_before = voters[leader].metrics().borrow().current_term;
+        // The voter taking over is one of the others; which one wins is
+        // Raft's choice by log length, and either is a handover.
+        let candidate = (0..3).find(|index| *index != leader).unwrap();
+        voters[leader].hold_elections_until(Instant::now() + Duration::from_secs(30));
+        let new_leader = voters[candidate]
+            .campaign_until_leadership_moves(
+                Some(leader_id),
+                Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert_ne!(
+            new_leader, leader_id,
+            "round {round}: leadership did not move"
+        );
+        assert!(
+            leading_term(voters, leader_id).is_none_or(|term| term <= term_before),
+            "round {round}: the old leader won leadership back"
+        );
+        let released =
+            wait_until(Duration::from_secs(5), || !voters[leader].elections_held()).await;
+        assert!(
+            released,
+            "round {round}: the old leader's hold outlived the handover"
+        );
+        leader = (0..3).find(|index| rid(*index) == new_leader).unwrap();
+    }
+
+    writing.cancel();
+    let _ = writer.await;
     for node in &nodes {
         let _ = node.shutdown().await;
     }

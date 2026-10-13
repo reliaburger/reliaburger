@@ -5470,9 +5470,9 @@
           ]
         },
         {
-          "id": "legacy-ci-reliaburger-council_disaster_recovery-trigger_elect_advances_term_and_can_move_leadership",
+          "id": "legacy-ci-reliaburger-council_disaster_recovery-trigger_elect_advances_the_term_and_leadership_settles",
           "binary": "reliaburger::council_disaster_recovery",
-          "test": "trigger_elect_advances_term_and_can_move_leadership",
+          "test": "trigger_elect_advances_the_term_and_leadership_settles",
           "requires": [
             "cluster-tests"
           ],
@@ -5484,6 +5484,17 @@
           "id": "legacy-ci-reliaburger-council_disaster_recovery-pressured_leader_resigns_and_leadership_moves",
           "binary": "reliaburger::council_disaster_recovery",
           "test": "pressured_leader_resigns_and_leadership_moves",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-council_disaster_recovery-leadership_moves_off_the_leader_every_time_under_write_load",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "leadership_moves_off_the_leader_every_time_under_write_load",
           "requires": [
             "cluster-tests"
           ],

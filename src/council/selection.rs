@@ -361,8 +361,9 @@ pub struct CouncilObservation<'a> {
     /// replaceable-but-not-yet-evictable: it grows a healthy replacement in
     /// first (add-before-remove) and only evicts the pressured seat once the
     /// replacement is a voter and quorum can spare it. A pressured *leader*
-    /// deposes itself via `trigger().elect()` before it ever appears here as
-    /// an ordinary voter, so the planner never has to remove a leader.
+    /// is deposed first (a healthy voter campaigns while the leader holds its
+    /// own elections, #755), so it only appears here as an ordinary voter and
+    /// the planner never has to remove a leader.
     pub disk_pressured: &'a BTreeSet<u64>,
 }
 

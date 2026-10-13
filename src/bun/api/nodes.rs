@@ -2,30 +2,153 @@
 //! manual elections.
 
 use super::*;
+use crate::council::handover::HANDOVER_HOLD;
 
-/// Ask this node to call a Raft election on itself (admin; manual
-/// recovery tool — e.g. to move leadership off a node before maintenance).
+/// Marks the request a voter taking over leadership sends the current
+/// leader first: hold your elections, so you can't win back the election my
+/// campaign starts (#755).
+pub(super) const ELECT_HOLD_HEADER: &str = "x-reliaburger-elect-hold";
+
+/// How long the voter taking over keeps campaigning. Shorter than the
+/// leader's [`HANDOVER_HOLD`], so the hold outlasts every campaign.
+const TAKE_OVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the leader may take to accept a hold.
+const HOLD_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Move leadership to this voter, or at least off the current leader
+/// (admin; for planned maintenance on the leader's node).
+///
+/// openraft 0.9 has no leadership transfer, so this node first asks the
+/// leader to hold its elections, then campaigns until another voter leads.
+/// The winner is usually this node; a voter whose log is longer than this
+/// node's can win instead, which still moves leadership off the old leader.
+/// Answers with the new leader once one leads. With [`ELECT_HOLD_HEADER`]
+/// set, this is that hold request: this node holds its elections and answers
+/// at once.
 pub(super) async fn cluster_elect_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
         return resp;
     }
     let Some(council) = &state.council else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no council on this node" })),
-        )
-            .into_response();
+        return elect_error(StatusCode::SERVICE_UNAVAILABLE, "no council on this node");
     };
-    match council.raft().trigger().elect().await {
-        Ok(()) => Json(serde_json::json!({ "status": "election triggered" })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+    if headers.contains_key(ELECT_HOLD_HEADER) {
+        council.hold_elections_until(std::time::Instant::now() + HANDOVER_HOLD);
+        return Json(serde_json::json!({ "status": "holding elections" })).into_response();
+    }
+    let (self_id, previous, is_voter) = {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        let is_voter = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id == metrics.id);
+        (metrics.id, metrics.current_leader, is_voter)
+    };
+    if previous == Some(self_id) {
+        return elect_error(
+            StatusCode::CONFLICT,
+            "this node already leads; send the request to the voter that should take over",
+        );
+    }
+    if !is_voter {
+        return elect_error(
+            StatusCode::CONFLICT,
+            "this node is not a council voter, so it can't lead",
+        );
+    }
+    if previous.is_some()
+        && let Err(response) =
+            ask_leader_to_hold(&state, council, directory.as_deref(), &headers).await
+    {
+        return response;
+    }
+    let deadline = std::time::Instant::now() + TAKE_OVER_DEADLINE;
+    match council
+        .campaign_until_leadership_moves(previous, deadline)
+        .await
+    {
+        Ok(leader) => Json(serde_json::json!({
+            "status": "leadership moved",
+            "leader": council_member_name(council, leader),
+            "previous_leader": previous.map(|id| council_member_name(council, id)),
+        }))
+        .into_response(),
+        Err(error @ crate::council::CouncilError::HandoverTimedOut { .. }) => {
+            elect_error(StatusCode::GATEWAY_TIMEOUT, &error.to_string())
+        }
+        Err(error) => elect_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+fn elect_error(status: StatusCode, error: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+/// A council member's node name, or its Raft id when the membership doesn't
+/// name it.
+fn council_member_name(council: &crate::council::CouncilNode, id: u64) -> String {
+    let metrics = council.metrics();
+    let metrics = metrics.borrow();
+    metrics
+        .membership_config
+        .membership()
+        .get_node(&id)
+        .map(|node| node.name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// Ask the current leader to hold its elections before this node campaigns.
+///
+/// The caller's own credential travels with the request, so the leader
+/// repeats the cluster-admin check. Without the hold the old leader often
+/// wins back the election this node's campaign starts, so a refusal ends
+/// the request rather than campaigning anyway.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+async fn ask_leader_to_hold(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let Some(leader_url) = super::upgrade::leader_base_url(state, council, directory).await else {
+        return Err(elect_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no cluster leader known yet; retry shortly",
+        ));
+    };
+    let request = state
+        .cluster_http
+        .client()
+        .post(format!("{leader_url}/v1/cluster/elect"))
+        .header(ELECT_HOLD_HEADER, "1");
+    let request = copy_forwarded_auth(request, headers);
+    match tokio::time::timeout(HOLD_REQUEST_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) if response.status().is_success() => Ok(()),
+        Ok(Ok(response)) => {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            Err(elect_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("the leader refused to hold its elections ({status}): {detail}"),
+            ))
+        }
+        Ok(Err(error)) => Err(elect_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("failed to ask the leader to hold its elections: {error}"),
+        )),
+        Err(_) => Err(elect_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "the leader did not answer the hold request in time",
+        )),
     }
 }
 
