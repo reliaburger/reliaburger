@@ -3734,7 +3734,8 @@ async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy(
 /// #692 (D11-B): a version that fails its health check on the first node
 /// is marked `RolloutFailed`. No other node ever gets it, nothing retries
 /// it, every replica keeps serving the old version, and a different spec
-/// clears the mark.
+/// clears the mark. A scale change counts as different (#929): it starts a
+/// new rollout of the version, which fails and is marked again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
@@ -3830,6 +3831,46 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
     assert!(
         web_rollouts(nodes[0]).await.unwrap().failed.is_some(),
         "an identical re-apply must not clear RolloutFailed"
+    );
+
+    // #929: a scale change is a different spec. It clears the mark and
+    // starts a new rollout of the version, which fails again and is marked
+    // again, later.
+    // Built from the applied spec, so only `replicas` changes.
+    let mut scaled = reliaburger::config::Config::default();
+    let mut scaled_web = bad.clone();
+    scaled_web.replicas = reliaburger::config::Replicas::Fixed(2);
+    scaled.app.insert("web".into(), scaled_web);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while desired_web(nodes[0]).await.map(|spec| spec.replicas)
+        != Some(reliaburger::config::Replicas::Fixed(2))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the council never took the scaled web spec"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&scaled)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let before = tried.len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let again = loop {
+        let (_, generated) = web_rollout_view(&nodes).await;
+        tried.extend(generated);
+        let failed = web_rollouts(nodes[0]).await.and_then(|r| r.failed);
+        if let Some(again) = failed.filter(|again| again.at_unix_ms > failure.at_unix_ms) {
+            break again;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a scale change never started a new rollout that failed again: {tried:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(again.fingerprint, failure.fingerprint);
+    assert!(
+        tried.len() > before,
+        "the scale change's rollout started a new instance of the version: {tried:?}"
     );
 
     // A fixed spec clears it and rolls out everywhere.

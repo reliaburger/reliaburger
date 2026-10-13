@@ -414,8 +414,17 @@ web (namespace default) RolloutFailed on node-2: default__web-g3-0 failed its he
 ```
 
 `relish wtf` reports it as a warning. Applying the same spec again (a GitOps
-re-sync, say) doesn't clear it, since it would only fail the same way. Apply a
-fixed spec, or `relish rollback web`, and the mark goes.
+re-sync, say) doesn't clear it, since it would only fail the same way, and
+`relish apply` says so:
+
+```text
+warning: app 'web' in namespace 'default' is RolloutFailed on node-2 (default__web-g3-0 failed its health check); the same spec again isn't retried. Change the spec, or run relish rollback
+```
+
+Any change to the spec clears the mark and starts a new rollout: a fixed image,
+`relish rollback web`, or even just a different `replicas`. A scale change
+releases the same version node by node again, so if it's still broken it fails
+again and is marked again.
 
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
 in-flight step to finish. It works on a single node only: a cluster `apply`

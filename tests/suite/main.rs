@@ -74,6 +74,7 @@ mod registry_standard_clients;
 mod registry_upload;
 mod relish_cli;
 mod reporting_tree;
+mod rollout_failed;
 #[cfg(target_os = "linux")]
 mod root_teardown;
 mod runtime_executor;

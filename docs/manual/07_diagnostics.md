@@ -104,8 +104,8 @@ An app whose current spec failed to roll out on a node is marked
 `RolloutFailed`: the leader holds its other nodes on the previous version and
 won't try the failed spec again. `wtf` reports it as a `rollout-failed`
 warning naming the node and the reason, and `relish status` prints the same
-line. Applying a different spec, or `relish rollback`, clears it; applying the
-same spec again doesn't (see `deploy-an-app`).
+line. Applying a different spec (a scale change counts), or `relish rollback`,
+clears it; applying the same spec again doesn't (see `deploy-an-app`).
 
 An instance whose binary isn't on its node, or isn't executable, is `failed`
 with the reason, such as `binary not found: /usr/local/bin/ghost-server`.
