@@ -1896,11 +1896,11 @@ mod tests {
         let id = InstanceId(name.into());
         let spec = OciSpec {
             reusable_executor: false,
-            host_process: false,
+            host_process: true,
             initialiser: false,
             port_mapping: None,
             root: OciRoot {
-                path: "/".into(),
+                path: crate::grill::oci::HOST_ROOT.into(),
                 readonly: false,
             },
             process: OciProcess {
