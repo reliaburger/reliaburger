@@ -236,10 +236,16 @@ pub struct StartArgs {
     pub allow_downgrade: bool,
 }
 
-/// One platform's target binary with its bytes, ready to push or stage.
+/// One platform's target binary, on disk, ready to push or stage.
+///
+/// A build is a file rather than bytes so pushing it streams from disk
+/// (#892): relish often runs on a node, and a release binary is over 100 MB.
 struct Build {
     binary: PlatformBinary,
-    bytes: Vec<u8>,
+    /// Where the binary is: the operator's `--binary`, or a staged download.
+    path: PathBuf,
+    /// Keeps a downloaded binary's private file until the build is dropped.
+    _staged: Option<StagedBinary>,
 }
 
 /// Where `relish upgrade start` gets the binary from.
@@ -327,6 +333,10 @@ async fn start_from_release(
         }
         let external_signature =
             external_signature_for(artifact, &bytes, envelope.as_ref(), external_key.as_deref())?;
+        // Countersigning needs the bytes; nothing after it does, so they go
+        // to a private file here and the memory is freed per platform.
+        let staged = StagedBinary::new(&bytes, &version.file_name("bun"))?;
+        drop(bytes);
         builds.push(Build {
             binary: PlatformBinary {
                 platform: platform.to_string(),
@@ -334,7 +344,8 @@ async fn start_from_release(
                 embedded_signature: artifact.embedded_signature.clone(),
                 external_signature: Some(external_signature),
             },
-            bytes,
+            path: staged.path().to_path_buf(),
+            _staged: Some(staged),
         });
     }
 
@@ -346,10 +357,9 @@ async fn start_from_release(
                     "a single node runs on one platform".to_string(),
                 ));
             };
-            // Stage the download where the local bun can read it. The
+            // The download is staged where the local bun can read it. The
             // directory is private and removed once the node has answered
-            // (it reads the file before it does).
-            let staged = StagedBinary::new(&build.bytes, &version.file_name("bun"))?;
+            // (it copies the file before it does).
             let directive = UpgradeDirective {
                 upgrade_id: format!("cli-{}", build.binary.sha256),
                 target_version: version.clone(),
@@ -357,7 +367,7 @@ async fn start_from_release(
                 embedded_signature: build.binary.embedded_signature.clone(),
                 external_signature: build.binary.external_signature.clone(),
                 source: BinarySource::LocalFile {
-                    path: staged.path().to_path_buf(),
+                    path: build.path.clone(),
                 },
                 // Downloaded, so still a network upgrade that needs the
                 // external signature, though it arrives as a file (M5).
@@ -425,7 +435,6 @@ async fn start_from_file(
     topology: &Topology,
     path: &Path,
 ) -> Result<(), RelishError> {
-    let bytes = std::fs::read(path)?;
     let sig_path = args.sig.clone().unwrap_or_else(|| sidecar_sig_path(path));
     let envelope = SignatureEnvelope::load(&sig_path)?;
     let version = version_from_file_name(path).ok_or_else(|| {
@@ -434,7 +443,9 @@ async fn start_from_file(
             path.display()
         ))
     })?;
-    let binary_sha256 = signing::sha256_hex(&bytes);
+    // Hashed a piece at a time, and pushed from the file below: a release
+    // binary never sits in relish's memory (#892).
+    let binary_sha256 = signing::sha256_file(path)?;
 
     match topology {
         Topology::Cluster(_) => {
@@ -456,7 +467,8 @@ async fn start_from_file(
                     embedded_signature: envelope.embedded,
                     external_signature: envelope.external,
                 },
-                bytes,
+                path: path.to_path_buf(),
+                _staged: None,
             };
             start_cluster(client, args, &version, std::slice::from_ref(&build)).await
         }
@@ -514,7 +526,7 @@ async fn start_cluster(
         push_blob(
             client,
             &route.push_origin,
-            &build.bytes,
+            &build.path,
             &build.binary.sha256,
         )
         .await?;
@@ -997,17 +1009,24 @@ pub(crate) async fn download(url: &str) -> Result<Vec<u8>, RelishError> {
 async fn push_blob(
     client: &BunClient,
     origin: &str,
-    bytes: &[u8],
+    path: &Path,
     sha256: &str,
 ) -> Result<(), RelishError> {
     let url = format!(
         "{origin}/v2/{}/blobs/uploads/?digest=sha256:{sha256}",
         crate::upgrade::BINARY_BLOB_REPO
     );
+    // Streamed from the file with its length declared, so the push holds a
+    // read buffer, never the binary (#892). The registry checks the digest,
+    // so a file changed since it was hashed is refused, not stored.
+    let file = tokio::fs::File::open(path).await?;
+    let length = file.metadata().await?.len();
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
     let response = client
         .http()?
         .post(&url)
-        .body(bytes.to_vec())
+        .header(reqwest::header::CONTENT_LENGTH, length)
+        .body(body)
         .send()
         .await
         .map_err(|e| RelishError::FormatFailed(format!("blob push failed: {e}")))?;
@@ -1097,6 +1116,56 @@ fn hypothetical_roles(size: usize) -> (usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #892: the push streams the binary from its file. The registry gets
+    /// every byte, in order, under a declared length (a stock registry
+    /// needs one for a monolithic upload), and the digest in the URL.
+    #[tokio::test]
+    async fn a_binary_push_streams_the_file_with_its_length() {
+        use futures_util::StreamExt as _;
+        type Seen = std::sync::Arc<tokio::sync::Mutex<Option<(String, Option<String>, Vec<u8>)>>>;
+        let seen: Seen = Default::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/v2/{*rest}",
+            axum::routing::post(
+                move |uri: axum::http::Uri,
+                      headers: axum::http::HeaderMap,
+                      body: axum::body::Body| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let length = headers
+                            .get(axum::http::header::CONTENT_LENGTH)
+                            .map(|value| value.to_str().unwrap().to_string());
+                        let mut received = Vec::new();
+                        let mut frames = body.into_data_stream();
+                        while let Some(frame) = frames.next().await {
+                            received.extend_from_slice(&frame.unwrap());
+                        }
+                        *recorder.lock().await = Some((uri.to_string(), length, received));
+                        axum::http::StatusCode::CREATED
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bun-v0.2.0");
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let sha256 = signing::sha256_hex(&bytes);
+
+        push_blob(&BunClient::new(&origin), &origin, &path, &sha256)
+            .await
+            .unwrap();
+
+        let (uri, length, received) = seen.lock().await.take().unwrap();
+        assert!(uri.ends_with(&format!("?digest=sha256:{sha256}")), "{uri}");
+        assert_eq!(length, Some(bytes.len().to_string()));
+        assert!(received == bytes, "the registry received other bytes");
+    }
 
     #[test]
     fn plan_renders_all_three_groups() {

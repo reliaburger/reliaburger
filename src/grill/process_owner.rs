@@ -473,38 +473,40 @@ struct OwnedChild {
 }
 
 impl OwnedChild {
+    /// Send `signal` to the root, then to the rest of its process group.
+    ///
+    /// The root goes first because its exit code is the one retirement
+    /// records. macOS delivers a group signal to one member at a time,
+    /// newest first, so a group-only kill reaches a shell's children before
+    /// the shell. A shell blocked in `wait` then wakes and can `exit 0`
+    /// before its own SIGKILL lands, and a killed command would read as a
+    /// clean exit (#916). Signalled first, the root can't run again, so it
+    /// reports the signal unless it had already exited on its own.
     fn signal(&self, signal: Signal) -> io::Result<()> {
         if self.reaped {
             return Ok(());
         }
-        // No other thread reaps this child, so its group identifier cannot
-        // be recycled between observing exit and sending the signal.
-        match kill(Pid::from_raw(-(self.child.id() as i32)), signal) {
+        // The root is this owner's unreaped child and no other thread reaps
+        // it, so neither its PID nor its group identifier can be recycled
+        // between observing exit and sending the signal.
+        let root = self.child.id() as i32;
+        if observe_exit(self.child.id())?.is_none() {
+            match kill(Pid::from_raw(root), signal) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        match kill(Pid::from_raw(-root), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            // XNU answers EPERM when no member of the group accepts the
+            // signal, and it skips zombies and processes already exiting.
+            // The root, which was just signalled directly, stays in that exit
+            // window until `waitid` can report it, so the owner's next tick
+            // lands there under load (#318). A real permission refusal on the
+            // root already failed above, and complete retirement still checks
+            // every group member before the owner publishes absence.
             #[cfg(target_os = "macos")]
-            Err(nix::errno::Errno::EPERM) => self.signal_refused_group(signal),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Decide whether a group signal macOS refused with EPERM still reached
-    /// every member that needs it.
-    ///
-    /// XNU answers EPERM when no member of the group accepts the signal, and
-    /// it skips zombies and processes already exiting. A root that has been
-    /// sent SIGKILL stays in that exit window until `waitid` can report it,
-    /// so the owner's next tick lands there under load (#318). The root is
-    /// this owner's unreaped child, so its PID can't be recycled: signalling
-    /// it directly succeeds while it runs or exits, and fails only on a real
-    /// permission refusal. Complete retirement still checks every group
-    /// member before the owner publishes absence.
-    #[cfg(target_os = "macos")]
-    fn signal_refused_group(&self, signal: Signal) -> io::Result<()> {
-        if observe_exit(self.child.id())?.is_some() {
-            return Ok(());
-        }
-        match kill(Pid::from_raw(self.child.id() as i32), signal) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(nix::errno::Errno::EPERM) => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
