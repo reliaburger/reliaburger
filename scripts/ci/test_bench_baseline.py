@@ -2,7 +2,9 @@
 from pathlib import Path
 import json
 import random
+import re
 import statistics
+import sys
 import tempfile
 import unittest
 
@@ -37,6 +39,24 @@ def absolute_gate_fails(current, baseline, max_ratio):
     """What the gate did before #857: any benchmark above `max_ratio` alone fails."""
     return any(mean / baseline[name] > max_ratio for name, mean in current.items()
                if name in baseline)
+
+
+# Stands in for `cargo bench --bench task_arrays -- FILTER`: logs the filter it
+# was given and, like Criterion, writes new results only for the benchmarks the
+# filter matches, with the means in the JSON file it is pointed at.
+FAKE_BENCH = """
+import json, re, sys
+from pathlib import Path
+criterion, means, log, pattern = sys.argv[1:5]
+with open(log, "a") as handle:
+    handle.write(pattern + "\\n")
+for name, mean in json.loads(Path(means).read_text()).items():
+    if re.search(pattern, name):
+        directory = Path(criterion) / name / "new"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "estimates.json").write_text(json.dumps(
+            {"mean": {"point_estimate": mean, "standard_error": 1.0}}))
+"""
 
 
 class BenchBaselineTests(unittest.TestCase):
@@ -206,6 +226,71 @@ class BenchBaselineTests(unittest.TestCase):
                                       "--summary", str(summary)])
         self.assertEqual(status, 0)
         self.assertIn("runner factor 1.87", summary.read_text())
+
+    def remeasure_setup(self, first, second):
+        """A Criterion run of the whole suite at `first` times the baseline,
+        and a fake re-run that measures `second` times it."""
+        self.baseline.parent.mkdir()
+        self.baseline.write_text(json.dumps({"schema": 1, "benchmarks": self.suite}))
+        self.criterion = self.root / "suite"
+        for name, mean in scaled(self.suite, first).items():
+            estimate(self.criterion, name, mean)
+        means = self.root / "remeasured.json"
+        means.write_text(json.dumps(scaled(self.suite, second)))
+        fake = self.root / "fake_bench.py"
+        fake.write_text(FAKE_BENCH)
+        self.log = self.root / "filters.log"
+        self.summary = self.root / "summary.md"
+        command = f"{sys.executable} {fake} {self.criterion} {means} {self.log}"
+        return ["compare", "--criterion", str(self.criterion), "--baseline", str(self.baseline),
+                "--max-ratio", "2", "--summary", str(self.summary), "--remeasure", command]
+
+    def filters(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_a_benchmark_over_the_limit_once_then_fine_passes_as_remeasured(self):
+        argv = self.remeasure_setup({"storage/ledger_and_index_64k": 2.89}, {})
+        self.assertEqual(bench_baseline.main(argv), 0)
+        self.assertEqual(len(self.filters()), 1)
+        text = self.summary.read_text()
+        self.assertIn("re-measured", text)
+        # Both measurements of the re-measured benchmark, against the rest.
+        self.assertRegex(text, r"\| `storage/ledger_and_index_64k` \| 2\.89 \| 1\.00 \| passed")
+
+    def test_a_benchmark_over_the_limit_twice_fails(self):
+        argv = self.remeasure_setup({"storage/ledger_and_index_64k": 2.89},
+                                    {"storage/ledger_and_index_64k": 2.5})
+        self.assertEqual(bench_baseline.main(argv), 1)
+        self.assertEqual(len(self.filters()), 1)
+        self.assertRegex(self.summary.read_text(),
+                         r"\| `storage/ledger_and_index_64k` \| 2\.89 \| 2\.50 \| failed")
+
+    def test_the_remeasure_runs_only_the_benchmarks_over_the_limit(self):
+        over = ["executor/process_true_256/1", "storage/ledger_and_index_64k"]
+        argv = self.remeasure_setup({name: 3.0 for name in over}, {})
+        self.assertEqual(bench_baseline.main(argv), 0)
+        [pattern] = self.filters()
+        self.assertEqual([name for name in SUITE if re.search(pattern, name)], over)
+        # Criterion matches the filter anywhere in the name, so it is anchored:
+        # a longer benchmark that merely contains a failing name is not re-run.
+        self.assertIsNone(re.search(pattern, "executor/process_true_256/16"))
+        self.assertIsNone(re.search(pattern, "x/storage/ledger_and_index_64k"))
+
+    def test_nothing_is_remeasured_when_nothing_is_over_the_limit(self):
+        argv = self.remeasure_setup({"storage/ledger_and_index_64k": 1.9}, {})
+        self.assertEqual(bench_baseline.main(argv), 0)
+        self.assertEqual(self.filters(), [])
+        self.assertNotIn("re-measured", self.summary.read_text())
+
+    def test_a_whole_run_too_slow_is_not_remeasured_and_still_fails(self):
+        argv = self.remeasure_setup({name: 2.5 for name in SUITE}, {})
+        self.assertEqual(bench_baseline.main(argv), 1)
+        self.assertEqual(self.filters(), [])
+
+    def test_a_failed_remeasure_fails_the_gate(self):
+        argv = self.remeasure_setup({"storage/ledger_and_index_64k": 2.89}, {})
+        argv[-1] = f"{sys.executable} -c 'import sys; sys.exit(3)'"
+        self.assertEqual(bench_baseline.main(argv), 1)
 
     def test_an_empty_criterion_directory_is_an_error(self):
         empty = self.root / "empty"

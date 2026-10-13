@@ -469,6 +469,13 @@ class BenchmarkTests(unittest.TestCase):
         compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
         self.assertIn("--max-ratio", compare)
 
+    def test_task_array_benchmarks_over_the_limit_are_measured_again_once(self):
+        # A disk stall during one benchmark is not a regression (#936): the
+        # compare step re-runs just the benchmarks over the limit, once.
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertIn("--remeasure 'cargo bench --bench task_arrays --'", compare)
+
     def test_only_main_saves_the_task_array_baseline(self):
         job = self.jobs["task-array-benchmarks"]
         restore = next(step for step in steps(job) if "actions/cache/restore@" in step)

@@ -194,8 +194,15 @@ the same run (counted as at least 1, so a fast runner never tightens the
 bound), and fails when a benchmark is more than twice as slow as the rest of
 its run. It also fails when the run's median ratio is above 2, since a slow
 runner and a regression across most of the suite look the same from inside
-one run. The job summary shows each benchmark's ratio, its ratio against the
-rest and the runner factor (the median). The means of the 12 October runs are
+one run. A disk-bound benchmark can still cross the limit on its own when the
+runner's disk stalls during it (`storage/ledger_and_index_64k` did twice on 13
+October, #936), so a benchmark over the limit gets one more chance: the step
+re-runs just those benchmarks (`--remeasure`, which appends an anchored
+Criterion filter naming them to `cargo bench --bench task_arrays --`), compares
+again, and fails a benchmark only when it's over the limit on both
+measurements. The median check isn't re-measured. The job summary shows each
+benchmark's ratio, its ratio against the rest and the runner factor (the
+median), plus both measurements of any benchmark it re-measured. The means of the 12 October runs are
 a fixture in
 [`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
 `make test-ci-scripts` checks that they pass and that a benchmark pushed to

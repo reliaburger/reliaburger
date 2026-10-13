@@ -9,9 +9,16 @@ that recorded the baseline (#857). So CI fails only when a benchmark is more
 than `--max-ratio` times slower than the rest of the same run (see compare),
 or the whole run's median is. Everything is kept as an artefact for the trend.
 
+A disk stall during one benchmark can still push it over the limit on a run
+with no regression (#936). So with `--remeasure COMMAND`, the benchmarks over
+the limit are measured once more, by COMMAND with a Criterion filter naming
+just them appended, and a benchmark fails only when both measurements are over
+the limit. The run's median is not re-measured.
+
     bench_baseline.py save    --criterion target/criterion --baseline FILE
     bench_baseline.py compare --criterion target/criterion --baseline FILE \\
-                              [--max-ratio 2] [--summary $GITHUB_STEP_SUMMARY]
+                              [--max-ratio 2] [--summary $GITHUB_STEP_SUMMARY] \\
+                              [--remeasure 'cargo bench --bench task_arrays --']
 
 A benchmark is named by its directory under target/criterion
 (`group/function[/parameter]`); its result is `new/estimates.json`.
@@ -19,10 +26,13 @@ A benchmark is named by its directory under target/criterion
 Fixtures: scripts/ci/test_bench_baseline.py.
 """
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import re
+import shlex
 import statistics
+import subprocess
 import sys
 from typing import Optional
 
@@ -66,11 +76,14 @@ class Comparison:
     `rows` are (name, baseline mean or None, current mean, ratio or None,
     ratio against the rest or None). `runner` is the median ratio, how much
     slower this runner was overall, or None when nothing compares.
+    `remeasured` holds, for each benchmark measured a second time, its ratio
+    against the rest on the first and on the second measurement.
     """
     rows: list
     runner: Optional[float]
     regressions: list
     run_too_slow: bool
+    remeasured: dict = field(default_factory=dict)
 
     @property
     def failed(self):
@@ -105,6 +118,39 @@ def compare(current, baseline, max_ratio):
     return Comparison(rows, runner, regressions, runner is not None and runner > max_ratio)
 
 
+def criterion_filter(names):
+    """A Criterion filter that selects exactly these benchmarks.
+
+    Criterion runs every benchmark whose name the regular expression matches
+    anywhere, so it is anchored at both ends.
+    """
+    return "^(" + "|".join(re.escape(name) for name in sorted(names)) + ")$"
+
+
+def settle(first, second):
+    """The verdict once the first run's regressions have been measured again.
+
+    `second` compares the same run with those benchmarks' new means. A
+    benchmark stays a regression only when it was one on both measurements;
+    the run's median is the first run's, since only a few benchmarks ran again.
+    """
+    relative = {row[0]: row[4] for row in second.rows}
+    remeasured = {}
+    for name in first.regressions:
+        first_relative = next(row[4] for row in first.rows if row[0] == name)
+        remeasured[name] = (first_relative, relative.get(name))
+    regressions = [name for name in first.regressions if name in second.regressions]
+    return Comparison(first.rows, first.runner, regressions, first.run_too_slow, remeasured)
+
+
+def remeasure(command, names):
+    """Run `command` with a filter for `names` appended, so Criterion measures
+    just those benchmarks again. Returns the command's exit status."""
+    argv = shlex.split(command) + [criterion_filter(names)]
+    print(f"measuring {len(names)} benchmark(s) again: {shlex.join(argv)}", flush=True)
+    return subprocess.run(argv, check=False).returncode
+
+
 def table(comparison, max_ratio):
     runner = comparison.runner
     runner_text = f"runner factor {runner:.2f}" if runner is not None else "no runner factor"
@@ -119,6 +165,16 @@ def table(comparison, max_ratio):
         relative_text = f"{relative:.2f}" if relative is not None else "new"
         lines.append(f"| `{name}` | {before_text} | {mean / 1e6:.3f} ms | {ratio_text} "
                      f"| {relative_text} |")
+    if comparison.remeasured:
+        lines += ["", f"Over {max_ratio:g}x the rest on the first measurement, so re-measured "
+                  "once. A benchmark fails only when both measurements are over the limit; "
+                  "the table above shows the first.", "",
+                  "| Benchmark | First, against the rest | Second, against the rest | Verdict |",
+                  "|---|---:|---:|---|"]
+        for name, (first, second) in sorted(comparison.remeasured.items()):
+            second_text = f"{second:.2f}" if second is not None else "missing"
+            verdict = "failed" if name in comparison.regressions else "passed"
+            lines.append(f"| `{name}` | {first:.2f} | {second_text} | {verdict} |")
     return "\n".join(lines) + "\n"
 
 
@@ -132,6 +188,9 @@ def main(argv=None):
         if name == "compare":
             command.add_argument("--max-ratio", type=float, default=2.0)
             command.add_argument("--summary", type=Path)
+            command.add_argument("--remeasure", metavar="COMMAND",
+                                 help="measure benchmarks over the limit once more with "
+                                      "COMMAND, a Criterion filter appended")
     arguments = parser.parse_args(argv)
 
     if arguments.command == "save":
@@ -145,14 +204,22 @@ def main(argv=None):
         print(f"no baseline at {arguments.baseline} yet; nothing to compare")
         baseline = {}
     comparison = compare(current, baseline, arguments.max_ratio)
+    if comparison.regressions and arguments.remeasure:
+        status = remeasure(arguments.remeasure, comparison.regressions)
+        if status != 0:
+            print(f"re-measuring failed with exit status {status}", file=sys.stderr)
+            return 1
+        second = compare(read_means(arguments.criterion), baseline, arguments.max_ratio)
+        comparison = settle(comparison, second)
     report = table(comparison, arguments.max_ratio)
     print(report)
     if arguments.summary:
         with arguments.summary.open("a") as summary:
             summary.write(report)
     for name in comparison.regressions:
+        again = " on both measurements" if name in comparison.remeasured else ""
         print(f"{name}: more than {arguments.max_ratio:g}x slower than main's baseline, "
-              "against the rest of this run", file=sys.stderr)
+              f"against the rest of this run{again}", file=sys.stderr)
     if comparison.run_too_slow:
         print(f"the whole run is {comparison.runner:.2f}x slower than main's baseline "
               f"(its median), above {arguments.max_ratio:g}x", file=sys.stderr)
