@@ -101,6 +101,8 @@ pub struct Compatibility {
 /// `NodeAssignment::held`, `/v1/rollouts/failed` and the
 /// `ApplyEvent::RolloutAborted` stream event, #692).
 /// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
+/// A task-array node's control fence is `control.fence`, two checksummed
+/// slots rewritten in place, not `control.json` (#745).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,
