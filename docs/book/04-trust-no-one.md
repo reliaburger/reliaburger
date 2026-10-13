@@ -114,6 +114,28 @@ gets the first identity, and every other VM enrols with a join token and
 `relish join`, exactly as you would by hand. One less special case, and the dev
 cluster finally has a registry, which needs mTLS.
 
+The first mTLS dev cluster formed a healthy council and then failed every
+linearizable read on the leader. Pulls failed, and `relish wtf` said the leader
+wasn't the leader. The cause was a timing budget. Our Raft transport opens a
+fresh TCP and TLS connection for every RPC, and when openraft checks that it's
+still the leader, it gives each follower's heartbeat just `heartbeat_interval`,
+150 ms, to answer. `relish dev` VMs run debug builds, and Cargo's dev profile
+compiles `ring`, the crypto under rustls, without optimisation. A handshake
+between VMs on Lima's user-mode network, plus unoptimised elliptic-curve maths
+at both ends, blew the budget every time. The fix is two lines in `Cargo.toml`:
+
+```toml
+[profile.dev.package.ring]
+opt-level = 3
+```
+
+A `[profile.<name>.package.<crate>]` table overrides settings for one
+dependency only, so `ring` is optimised while our own code keeps fast debug
+builds. We'd already done the same for the SHA-256 and Argon2 crates. Release
+builds, which `relish setup --quickstart` uses, were never affected. Reusing
+Raft connections would remove the cause rather than this symptom, but that's a
+bigger change for another day.
+
 The generated master key and security-bootstrap JSON both land as `0600`.
 That second file used to land as `0644`, while Bun's loader quite reasonably
 refused to read it. The result was security with a certain slapstick quality:
