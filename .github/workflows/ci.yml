@@ -666,9 +666,11 @@ jobs:
     # benches/task_arrays.rs: the leader's cost for a 1M-task array, the node
     # pool's overhead per task and this runner's fork/exec floor. Nightly on
     # main, and on pull requests that touch what it measures (select-jobs.sh).
-    # Hosted runners vary from run to run, so it fails only when a benchmark
-    # is more than twice as slow as the baseline main last saved; the full
-    # Criterion output is kept for the trend #668 reads.
+    # Hosted runners vary from run to run, so it measures each benchmark
+    # against main's last baseline relative to the rest of this run, and fails
+    # only when one is more than twice as slow as the rest, or the run's
+    # median is more than twice as slow (#857); the full Criterion output is
+    # kept for the trend #668 reads.
     name: task-array benchmarks
     needs: changes
     if: needs.changes.outputs.task_arrays == 'true'

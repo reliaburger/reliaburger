@@ -5,7 +5,7 @@
 #   gossip       - the gossip protocol or its benchmarks changed
 #   heavy        - run the acceptance suites (cluster, upgrade, privileged Linux)
 #   task_arrays  - the task-array leader, node pool, executor or their
-#                  benchmarks changed
+#                  benchmarks changed, or the script that gates on them
 #   macos        - run the portable suite on macOS (three shards)
 #
 # Pushes, merge-queue groups, schedules and manual runs get everything. Pull
@@ -75,10 +75,12 @@ while IFS= read -r file; do
         src/mustard/* | benches/gossip* | benches/support/* | tests/gossip_*) gossip=true ;;
     esac
     # What benches/task_arrays.rs measures: range sets, the leader's state
-    # machine, the node pool and the process runner.
+    # machine, the node pool and the process runner; and the script that
+    # gates on its numbers.
     case "$file" in
         src/bun/task_array* | src/bun/task_executor* | src/meat/task_array* | \
-            src/meat/index_set* | benches/task_arrays.rs) task_arrays=true ;;
+            src/meat/index_set* | benches/task_arrays.rs | \
+            scripts/ci/bench_baseline.py) task_arrays=true ;;
     esac
 done <<<"$changed"
 
