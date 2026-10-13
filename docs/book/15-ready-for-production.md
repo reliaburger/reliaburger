@@ -691,6 +691,13 @@ The real win is the light set. A pull request into a train no longer touches mac
 and hears back in 15 to 20 minutes instead of about 50. Making macOS itself faster means
 compiling once, not testing in parallel.
 
+The `full-ci` label turned out to be the leak. Most train pull requests touch privileged
+Linux, the cluster or acceptance, so most of them wore it, and each one then asked for three
+macOS runners that queued for over an hour. So on a pull request into a train, `full-ci` now
+means every heavy job except macOS: select jobs says `heavy=true, macos=false`, and the
+aggregator calls that selection `train-full`, accepted, like the light set, only when the
+event is `pull_request`. The queue and the push to the train still demand all three shards.
+
 ## Dependencies are code too
 
 The lockfile is part of the programme. A perfectly tested call into a vulnerable archive
@@ -1053,6 +1060,7 @@ TestCase {
     name: "schedule_fixed_replicas_across_nodes",
     group: TestGroup::Scheduling,
     requires: &[Capability::Cluster, Capability::MultiNode],
+    lease: LeaseScope::Applications,
     run: testkit_case!(schedule_fixed_replicas_across_nodes),
 }
 ```
@@ -1061,6 +1069,15 @@ TestCase {
 final form: the runner compares it against `/v1/capabilities` *before* running
 the body, so an unsupported case is skipped without side effects rather than
 failing halfway through setup.
+
+`lease` says what kind of server-owned lease the case's resources live under
+(more on leases below). An application lease refuses jobs, so a case that
+applies one says `LeaseScope::NodeJobs`. That used to be implied by the group:
+the runner gave a job lease to the `jobs` group and an application lease to
+everything else. The `process-workloads` group has two job cases too, so they
+failed at their very first apply, before any job ran (#742). A group is where
+a case is *reported*; what it owns is a separate fact, so now each case says
+it, and a unit test pins which cases take a job lease.
 
 ### A prefix as a safety net
 

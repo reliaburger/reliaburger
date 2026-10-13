@@ -11,7 +11,8 @@ on:
     # (scripts/ci/select-jobs.sh), and the merge queue and the push to the
     # train run everything.
     branches: [main, "codex/**", "fix/**", "release-*"]
-    # labeled lets a `full-ci` label start the whole of CI on any PR.
+    # labeled lets a `full-ci` label start the heavy suites on any PR (on a
+    # PR into a train, everything but the macOS shards).
     types: [opened, synchronize, reopened, labeled]
   merge_group:
     # The merge queue on release-* tests each batch, merged onto the train,

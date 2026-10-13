@@ -13,6 +13,7 @@
       "required_in": [
         "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -42,6 +43,7 @@
       "required_in": [
         "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -55,6 +57,7 @@
         "test-rootless-runc"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -68,6 +71,7 @@
         "test-linux"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -80,6 +84,7 @@
         "scripts/release/qualify-oci-interruptions.sh"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -93,6 +98,7 @@
         "test-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -106,6 +112,7 @@
         "test-slow"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -119,6 +126,7 @@
         "test-upgrade-node"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -132,6 +140,7 @@
         "test-upgrade-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -145,6 +154,7 @@
         "test-standard-clients"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     }
