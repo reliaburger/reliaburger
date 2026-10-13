@@ -71,6 +71,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.publish_backend_kernel(id, services).await
     }
 
+    /// Take the eBPF handle's lock, timing the wait as the turn's kernel
+    /// lock wait: job tasks, faults and traces hold it too (#890).
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) async fn lock_kernel<'a>(
+        &self,
+        handle: &'a tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>,
+    ) -> tokio::sync::MutexGuard<'a, crate::onion::ebpf::loader::OnionEbpf> {
+        let started = std::time::Instant::now();
+        let guard = handle.lock().await;
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::KernelLock,
+            started.elapsed(),
+        );
+        guard
+    }
+
     /// Publish a validated candidate before exposing it to userspace readers.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn publish_backend_kernel(
@@ -89,7 +105,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .as_ref()
                 .map_or("", |cluster| cluster.local_node_id.0.as_str()),
         );
-        let mut ebpf = handle.lock().await;
+        let mut ebpf = self.lock_kernel(handle).await;
         bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
             .map_err(|error| BunError::BackendPublication {
                 service: id.clone(),
@@ -134,7 +150,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let id = crate::onion::service_id::ServiceId::new(&entry.namespace, &entry.app_name);
         let (vip, port, destination) = (entry.vip, entry.port, entry.app_id);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
-        let mut ebpf = handle.lock().await;
+        let mut ebpf = self.lock_kernel(handle).await;
         bpf.remove_backends_bpf(&mut ebpf, vip, port)
             .map_err(|error| BunError::BackendRetirement {
                 service: id.clone(),
@@ -168,8 +184,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
-    ///
+    /// Reconcile the namespace-firewall eBPF maps against current state
+    /// (NET5), timed as the turn's firewall sync (#890).
+    pub(super) async fn sync_firewall_ebpf(&mut self) {
+        let started = std::time::Instant::now();
+        self.reconcile_namespace_firewall().await;
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::FirewallSync,
+            started.elapsed(),
+        );
+    }
+
     /// Writes `cgroup_namespace_map` (cgroup → namespace) for every running
     /// instance — which is what makes the connect hook enforce cross-namespace
     /// isolation at all: with the source's namespace unknown the hook lets
@@ -178,7 +203,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// each call (a new instance of app A changes rules wherever A is a
     /// *source*), deleting keys no longer desired. A no-op without eBPF.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    pub(super) async fn sync_firewall_ebpf(&mut self) {
+    async fn reconcile_namespace_firewall(&mut self) {
         if self.egress_store_uncertain {
             return;
         }
@@ -297,7 +322,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &crate::sesame::firewall::isolation_plan(&workloads, &destinations),
         );
 
-        let mut ebpf = handle.lock().await;
+        let mut ebpf = self.lock_kernel(&handle).await;
         // Grants and source identities first, then the destinations they
         // protect: a new destination never appears before its grants.
         let reconciled = crate::sesame::firewall::reconcile_firewall_maps(
@@ -364,7 +389,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    pub(super) async fn sync_firewall_ebpf(&mut self) {}
+    async fn reconcile_namespace_firewall(&mut self) {}
 
     /// Whether a delegated job runtime changed its addresses or allowlists
     /// since the last look, so the kernel maps need reconciling.

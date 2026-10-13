@@ -1168,7 +1168,10 @@ async fn consumer_sync_turns(
         turns.push(agent.loop_meter.last_turn().unwrap());
     }
     let update = reply.await.unwrap().unwrap();
-    assert!(update.published, "generation {generation} was not published");
+    assert!(
+        update.published,
+        "generation {generation} was not published"
+    );
     turns
 }
 
@@ -1209,7 +1212,8 @@ async fn each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits() {
         let writes = turn.detail != Some("consumer_sync/candidate")
             && turn.detail != Some("consumer_sync/compact");
         assert_eq!(
-            turn.part(TurnPart::JournalWrite).is_some_and(|took| took >= write),
+            turn.part(TurnPart::JournalWrite)
+                .is_some_and(|took| took >= write),
             writes,
             "{turn}'s journal write: {:?}",
             turn.part(TurnPart::JournalWrite)

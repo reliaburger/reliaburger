@@ -5,6 +5,7 @@ use crate::bun::consumer_owners::{
     ConsumerIdentity, ConsumerOwnership, ConsumerPhase, ConsumerPublication, ConsumerReceipt,
     ReceiptPhase,
 };
+use crate::bun::loop_meter::TurnPart;
 use crate::cluster::orchestrate::IngressAssignment;
 use crate::onion::{
     catalog::EndpointCatalog, service_id::ServiceId, service_map::ServiceMap, types::ServiceEntry,
@@ -111,6 +112,23 @@ impl ConsumerSyncs {
     pub(super) fn end_turn(&mut self) -> bool {
         self.stepped_last = std::mem::take(&mut self.stepped_now);
         self.stepped_last
+    }
+
+    /// What the next turn's step is called, for the turn meter: the
+    /// candidate view of a waiting answer, or the next step of the one
+    /// under way.
+    pub(super) fn next_step_label(&self) -> &'static str {
+        let Some(sync) = &self.current else {
+            return "consumer_sync/candidate";
+        };
+        match sync.next {
+            ConsumerStep::Journal { .. } => "consumer_sync/journal",
+            ConsumerStep::Withdraw(_) => "consumer_sync/withdraw",
+            ConsumerStep::ProveReceipts(_) => "consumer_sync/prove_receipts",
+            ConsumerStep::Publish(_) => "consumer_sync/publish",
+            ConsumerStep::Activate => "consumer_sync/activate",
+            ConsumerStep::Compact => "consumer_sync/compact",
+        }
     }
 
     /// The view the synchronisation under way will publish, while the
@@ -247,7 +265,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return Ok(());
         };
         let value = crate::onion::types::ViewLeaseValue::from_lease(&self.view_lease);
-        let mut ebpf = handle.lock().await;
+        let mut ebpf = self.lock_kernel(handle).await;
         crate::onion::ebpf::maps::BpfServiceMap::new()
             .write_view_lease(&mut ebpf, value)
             .map_err(failure)
@@ -790,6 +808,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Point the kernel, then DNS and Wrapper, at `services`, updating each
     /// service's entry in place.
     async fn install_consumer_view(
+        &mut self,
+        services: &[ServiceEntry],
+        ingress: &[IngressAssignment],
+    ) -> Result<(), BunError> {
+        let started = std::time::Instant::now();
+        let installed = self.install_view(services, ingress).await;
+        self.loop_meter
+            .add_part(TurnPart::ViewInstall, started.elapsed());
+        installed
+    }
+
+    async fn install_view(
         &mut self,
         services: &[ServiceEntry],
         ingress: &[IngressAssignment],
