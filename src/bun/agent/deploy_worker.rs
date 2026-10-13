@@ -497,6 +497,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 None,
             );
             self.grill.create(&init_id, &init_oci).await?;
+            // The parent's retirement forgets this launch's journal by its
+            // generation. One the runtime can't say is kept, for the next
+            // start's adoption to forget.
+            if let Ok(Some(generation)) = self.grill.launch_generation(&init_id).await {
+                self.ops
+                    .record_initialiser_generation(instance_id, &init_id, generation)
+                    .await;
+            }
             self.grill.start(&init_id).await?;
 
             // Bounded wait: a hung init can't wedge the deploy forever (and

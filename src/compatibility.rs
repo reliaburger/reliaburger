@@ -100,7 +100,17 @@ pub struct Compatibility {
 /// `RolloutFailed` and `RolloutReleased` requests, `StateReport::rollouts`,
 /// `NodeAssignment::held`, `/v1/rollouts/failed` and the
 /// `ApplyEvent::RolloutAborted` stream event, #692).
+/// Scheduler policy (#702): each node's process-workload policy in its
+/// capability report (`NodeCapabilities::process`), the apps placed only in
+/// part (`RaftRequest::Unschedulable`, `DesiredState::unschedulable` and
+/// `DesiredAppEvidence::unschedulable`), and the `placement` event kind.
 /// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
+/// Gossip robustness (#696): `GossipMessage::sequence` for replay
+/// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
+/// its own name) in place of `relayed`, and the reporting
+/// `ReportingMessage::AggregatedReport` variant is gone.
+/// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
+/// sources with bit 63 set name a job's run identity (#737).
 /// Compacted task results (#739): a worker rewrites a finished run's ledger
 /// and live index into `task-arrays/<id>/results`, 14-byte slots, and
 /// deletes both, so a finished run no longer has a ledger to replay.

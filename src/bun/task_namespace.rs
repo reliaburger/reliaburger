@@ -3,8 +3,9 @@
 //! journal only after startup has retired all old delegated runtime owners.
 //!
 //! A lease also carries the rest of a task's network policy: the egress
-//! allowlist of its cgroup and the namespace ownership of its address. Both
-//! are released with the lease once the runtime has retired.
+//! allowlist of its cgroup, the namespace ownership of its address, and the
+//! run identity (namespace plus job) its cgroup answers to as an `allow_from`
+//! source. All are released with the lease once the runtime has retired.
 use crate::onion::ebpf::loader::OnionEbpf;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,8 +58,24 @@ pub struct DelegatedAddress {
     pub namespace: String,
     /// The runtime instance holding the address; its destination identity.
     pub owner: String,
+    /// The job the task runs for, when known: the name another app's
+    /// `allow_from` names it by as a source.
+    pub job: Option<String>,
     /// Sources in other namespaces the job's `allow_from` admits.
     pub allow_from: Option<Vec<String>>,
+}
+
+impl DelegatedAddress {
+    /// This task as a local workload at `address`. It answers to its job's
+    /// name as a source, and keeps its owner's destination identity.
+    pub fn local_workload(&self, address: Ipv4Addr) -> crate::sesame::firewall::LocalWorkload {
+        crate::sesame::firewall::LocalWorkload {
+            address,
+            namespace: self.namespace.clone(),
+            name: self.job.clone().unwrap_or_else(|| self.owner.clone()),
+            app_id: crate::sesame::firewall::workload_app_id(&self.namespace, &self.owner),
+        }
+    }
 }
 
 impl DelegatedNetwork {
@@ -94,11 +111,22 @@ pub struct NamespaceLease {
     namespace: String,
     egress_cgroup: Option<u64>,
     address: Option<Ipv4Addr>,
+    source: Option<(u64, String)>,
 }
 impl NamespaceLease {
     /// Call only after runtime retirement is confirmed. Lifts the task's
-    /// egress allowlist and address ownership before the namespace binding.
+    /// egress allowlist, address ownership and run identity before the
+    /// namespace binding.
     pub async fn retired(self) {
+        if let Some((cgroup, _)) = &self.source {
+            let mut kernel = self.policy.kernel.lock().await;
+            if let Err(error) =
+                crate::sesame::firewall::delete_cgroup_source_entry(&mut kernel.bpf, *cgroup)
+            {
+                // Startup recovery clears every binding a retired task left.
+                eprintln!("sesame: retired task cgroup {cgroup} keeps its run identity: {error}");
+            }
+        }
         if let Some(cgroup) = self.egress_cgroup {
             let mut kernel = self.policy.kernel.lock().await;
             if let Err(error) =
@@ -181,6 +209,31 @@ impl NamespaceLease {
             .map_err(std::io::Error::other)
     }
 
+    /// Bind the task cgroup at `cgroup` to its run's identity, this lease's
+    /// namespace plus `job`, before anything runs in it. Another namespace's
+    /// `allow_from` that names `namespace/job` then admits the task (#737).
+    /// The identity adds grants only: the cgroup's namespace stays the one
+    /// it inherits.
+    pub async fn bind_source(&mut self, cgroup: &Path, job: &str) -> std::io::Result<()> {
+        // `allow_from` sources are workload labels, so no grant can name any
+        // other job name, and binding one would only cost a map entry.
+        if !crate::config::valid_workload_label(job) {
+            return Ok(());
+        }
+        let cgroup_id = crate::sesame::egress::cgroup_id_of_path(cgroup)
+            .ok_or_else(|| std::io::Error::other("task cgroup identity is unavailable"))?;
+        // Remember the binding before writing it, so retirement lifts even a
+        // write that failed halfway.
+        self.source = Some((cgroup_id, job.to_string()));
+        let mut kernel = self.policy.kernel.lock().await;
+        crate::sesame::firewall::write_cgroup_source_entry(
+            &mut kernel.bpf,
+            cgroup_id,
+            crate::sesame::firewall::job_source_identity(&self.namespace, job),
+        )
+        .map_err(std::io::Error::other)
+    }
+
     /// Record that the task's container `address` belongs to this lease's
     /// namespace on every port, with the job's `allow_from` grants.
     pub async fn publish_address(
@@ -194,6 +247,7 @@ impl NamespaceLease {
         let entry = DelegatedAddress {
             namespace: namespace.clone(),
             owner: owner.to_string(),
+            job: self.source.as_ref().map(|(_, job)| job.clone()),
             allow_from,
         };
         self.policy
@@ -279,6 +333,10 @@ impl TaskNamespacePolicy {
                 }
             }
         }
+        // Run identities only add grants, so clearing one a live task still
+        // held would refuse it, never open it.
+        crate::sesame::firewall::clear_cgroup_source_map(&mut kernel.lock().await.bpf)
+            .map_err(std::io::Error::other)?;
         let policy = Arc::new(Self {
             kernel,
             bindings: Mutex::new(BTreeMap::new()),
@@ -386,6 +444,7 @@ impl TaskNamespacePolicy {
             namespace: namespace.into(),
             egress_cgroup: None,
             address: None,
+            source: None,
         })
     }
     /// A lost source binding must stop the original owner before another attempt.
@@ -466,6 +525,31 @@ mod tests {
             boot: BOOT.into(),
             namespaces: BTreeMap::from([("default".into(), 42)]),
         }
+    }
+    #[test]
+    fn a_task_address_answers_to_its_job_name_as_a_source() {
+        let address = Ipv4Addr::new(10, 88, 0, 9);
+        let task = DelegatedAddress {
+            namespace: "batch".into(),
+            owner: "batch__executor-ab-3".into(),
+            job: Some("report".into()),
+            allow_from: None,
+        };
+        let workload = task.local_workload(address);
+        assert_eq!(workload.address, address);
+        assert_eq!(workload.namespace, "batch");
+        // The forward path matches `allow_from` sources by name, so a task
+        // answers to its job's; its destination identity stays its owner's.
+        assert_eq!(workload.name, "report");
+        assert_eq!(
+            workload.app_id,
+            crate::sesame::firewall::workload_app_id("batch", "batch__executor-ab-3")
+        );
+        let anonymous = DelegatedAddress { job: None, ..task };
+        assert_eq!(
+            anonymous.local_workload(address).name,
+            "batch__executor-ab-3"
+        );
     }
     #[test]
     fn recorded_delegated_sources_require_the_original_namespace_inode_and_boot() {

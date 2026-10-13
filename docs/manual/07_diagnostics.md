@@ -93,6 +93,13 @@ namespace quota keeps unplaced gets a `Blocked:` line with the quota it would
 break (see `deploy-an-app`), and `wtf` reports it as a `quota-blocked` warning
 rather than a generic under-replication.
 
+An app the scheduler could place only in part gets an `Unplaced:` line saying
+how many of its replicas found a node and why the rest didn't: no ready node,
+no node with its required labels, none that can enforce its needs or run its
+host binary, or no room. `relish status` prints the same line, and `wtf`
+reports it as an `unschedulable` warning with that reason (see
+`deploy-an-app`).
+
 An app whose current spec failed to roll out on a node is marked
 `RolloutFailed`: the leader holds its other nodes on the previous version and
 won't try the failed spec again. `wtf` reports it as a `rollout-failed`
@@ -182,6 +189,7 @@ check it.
 ```sh
 relish test                                  # every group, four at a time
 relish test --filter scheduling,firewall     # just these groups
+relish test --filter process_job_with_exit_zero_succeeds   # just this case
 relish test --profile full-runc              # stricter acceptance profile
 relish --output json test                    # report for CI
 ```
@@ -189,7 +197,9 @@ relish --output json test                    # report for CI
 Group names are `scheduling`, `service-discovery`, `deployments`,
 `health-checks`, `secrets-config`, `firewall`, `workload-identity`, `ingress`,
 `volumes`, `process-workloads`, `jobs`, `image-registry` and
-`cluster-coordination`. The default `development` profile accepts a skip with
+`cluster-coordination`. A `--filter` entry can also be an exact case name,
+as the report prints it, to run one case on its own; groups and case names
+mix. The default `development` profile accepts a skip with
 a known reason, such as a capability this node lacks. A node with
 `[process_workloads] mount_isolation` on, the Linux default, doesn't advertise
 host workloads, because it refuses them until #714 lands; its host

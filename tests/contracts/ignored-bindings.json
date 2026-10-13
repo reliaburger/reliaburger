@@ -259,6 +259,12 @@
   },
   {
     "source": "tests/cluster_gossip.rs",
+    "function": "nodes_with_maximal_labels_stay_alive_during_churn",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "nodes_with_maximal_labels_stay_alive_during_churn"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
     "function": "three_node_council_elects_leader_and_grows",
     "binary": "reliaburger::cluster_gossip",
     "test": "three_node_council_elects_leader_and_grows"
@@ -514,6 +520,12 @@
     "function": "job_egress_allowlist_is_enforced",
     "binary": "reliaburger::ebpf",
     "test": "job_egress_allowlist_is_enforced"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "allow_from_can_name_a_delegated_job_as_its_source",
+    "binary": "reliaburger::ebpf",
+    "test": "allow_from_can_name_a_delegated_job_as_its_source"
   },
   {
     "source": "tests/ebpf.rs",
@@ -1030,6 +1042,18 @@
     "function": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
     "binary": "reliaburger::oci_crash",
     "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+    "binary": "reliaburger::owned_runc",
+    "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+    "binary": "reliaburger::owned_runc",
+    "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds"
   },
   {
     "source": "tests/owned_network.rs",
@@ -1762,5 +1786,11 @@
     "function": "crane_pulls_layers_back_with_ca_verification",
     "binary": "reliaburger::suite",
     "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+    "binary": "reliaburger::placement",
+    "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace"
   }
 ]

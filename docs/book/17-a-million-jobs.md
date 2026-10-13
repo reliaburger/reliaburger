@@ -501,6 +501,61 @@ The agent's kernel reconciliation has to know about all of this, or its sweep wo
 
 A node that can't enforce either refuses the whole array at admission instead of failing every attempt, and `runtime = "process"` refuses both: a host task shares the node's network and runs as root, so an allowlist or a grant there would promise a boundary the task can step out of. `job_egress_allowlist_is_enforced` runs a task lease in the Lima VM.
 
+### A job as the source
+
+That gave a job a way to be reached. It didn't give it a way to be *named*. Say the `vault` namespace runs a secrets service, and the nightly report job in `reports` needs it. You'd write `allow_from = ["reports/nightly"]` on the service, and the kernel would refuse the job anyway (#737).
+
+Here's why. `firewall_map` keys a grant on `(source cgroup, destination)`, and the agent fills in the source half from the cgroups of running app instances. A task isn't an app instance. It runs in a cgroup of its own under `/reliaburger/reports/`, and gets its namespace from that ancestor's binding, so the hook knows it belongs to `reports`. But the agent has no idea which job owns the cgroup, and there's nothing to key a grant on. Worse, tasks come and go thousands of times a minute. A grant that waited for the agent's next tick to notice each new task would race every short task's first `connect()`, and lose.
+
+So we turned it round: grant the job, then tell the kernel which cgroups belong to it. A new map, `cgroup_source_map`, binds a task's cgroup to its *run identity*, a hash of `namespace/job`. The task's `NamespaceLease` writes it with `bind_source`, after `runc create` and before `start`, right next to the egress allowlist. On the agent side, `resolve_job_source_rules` writes one grant per cross-namespace name in every `allow_from`, keyed on the identity instead of a cgroup:
+
+```rust
+pub fn resolve_job_source_rules(
+    destinations: &[IsolatedDestination<'_>],
+) -> Vec<ResolvedFirewallRule> {
+    let mut rules = Vec::new();
+    for destination in destinations {
+        for source in destination.allow_from.unwrap_or_default() {
+            let Some((namespace, job)) = source.split_once('/') else {
+                continue;
+            };
+            if namespace == destination.namespace {
+                continue;
+            }
+            rules.push(ResolvedFirewallRule {
+                src_cgroup_id: job_source_key(namespace, job),
+                dst_app_id: destination.app_id,
+                action: FIREWALL_ALLOW,
+            });
+        }
+    }
+    rules
+}
+```
+
+`allow_from` is an `Option<&[String]>`, and `unwrap_or_default()` turns `None` into an empty slice (a `&[T]` has a `Default`, the empty one), so a destination without `allow_from` just loops zero times. The let-else (Chapter 2) skips a bare name: one with no `/` lives in the destination's own namespace, which isolation never refuses, so it needs no grant.
+
+The grant doesn't care whether any task of the job exists. It's sitting in the map before the first one starts, and a task only has to be bound to match it. Nobody waits for a tick.
+
+The key needs care, because the identity and real cgroup ids share one `u64` field. Kernel cgroup ids never reach bit 63, so `job_source_key` sets it: `1 << 63 | identity`. In the hook, the change is one extra lookup, taken only when the exact grant misses:
+
+```c
+struct firewall_value *fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
+if (!fw) {
+    __u32 *identity = bpf_map_lookup_elem(&cgroup_source_map, &cg);
+    if (identity) {
+        fw_key.src_cgroup_id = SOURCE_IDENTITY_TAG | (__u64)*identity;
+        fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
+    }
+}
+```
+
+None of this widens what an app may receive. The binding only adds grants: a task's namespace still comes from its ancestor, and only the task runtime ever binds a cgroup, so no app cgroup can match an identity key. Startup clears the whole map, because a stale binding can only refuse traffic, never open it.
+
+Reusable executors needed one more change. An executor's commands all land in its `task` cgroup, and executors with the same template were shared between jobs. Bind that cgroup to one job and the next job's commands would borrow its grants. So `ExecutorKey::for_job` folds the job's name into the key, and two jobs never share an executor. `tasks_of_different_jobs_never_share_an_executor` pins it. The forward-path table needed nothing new: a task's address now answers to its job's name there too, so a source the hooks admit isn't then dropped between veths.
+
+`allow_from_can_name_a_delegated_job_as_its_source` runs it in the VM: two task cgroups in one namespace, one bound to the named job and one to another, plus an app cgroup in the same namespace. Only the named job's task gets through.
+
 ### Where the bytes went
 
 The October qualification rig lost about 82 bytes of free disk for every task it accepted, five times the plan's budget, and got none of it back between runs. At the target rate that's several gigabytes a day, and when a worker's storage fails it stops taking work until someone repairs it. So "a million jobs" quietly meant "a million jobs, then a full disk". Nobody had broken the number down, so that's where we started: a unit test that pushes a million outcomes through the real ledger and its index and prints each file's allocated size.

@@ -717,6 +717,25 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
                 .push(volume_home_away_finding(app, home, running));
             continue;
         }
+        // #702: the scheduler placed what fits and recorded why the rest
+        // has no node. That's the finding, with the reason it gave.
+        if let Some(reason) = &app.unschedulable {
+            report.warnings.push(WtfFinding {
+                id: "unschedulable".to_string(),
+                title: format!(
+                    "app {}/{} is unschedulable: {running} of {} replicas running",
+                    app.app, app.namespace, app.desired_replicas
+                ),
+                details: vec![reason.clone()],
+                suggestion: "add nodes or free room on the ones there, relax the app's \
+                             required labels, or allow its binary in [process_workloads]; \
+                             the scheduler places the rest as soon as a node can take them"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
+            continue;
+        }
         let replicas = |count: u32| {
             if count == 1 {
                 "1 replica".to_string()
@@ -1544,6 +1563,7 @@ mod tests {
                     unanswered: Vec::new(),
                     blocked: None,
                     volume_home_away: None,
+                    unschedulable: None,
                     rollout_failed: None,
                 }]),
                 alerts: available(Vec::new()),
@@ -2467,6 +2487,7 @@ mod tests {
             unanswered: vec!["node-3".to_string()],
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: None,
         }]);
 
@@ -2496,6 +2517,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: None,
         }]);
         let report = diagnose(&inputs);
@@ -2523,6 +2545,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: None,
         }]);
         let report = diagnose(&inputs);
@@ -2534,6 +2557,47 @@ mod tests {
         assert_eq!(
             finding.details,
             ["1 replica placed on node-3 is not running (node-3 is not a live member)"]
+        );
+    }
+
+    /// #702: an app the scheduler placed only in part is its own finding,
+    /// saying how much is placed and why the rest has no node.
+    #[test]
+    fn an_unschedulable_app_says_why_its_replicas_have_no_node() {
+        let mut inputs = healthy_inputs();
+        let reason = "placed 1 of 3 replicas: no ready node has its required labels";
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "web".to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: 3,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::from([("node-1".to_string(), 1)]),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+            unschedulable: Some(reason.to_string()),
+            rollout_failed: None,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "unschedulable")
+            .expect("a short app is a warning");
+        assert_eq!(
+            finding.title,
+            "app web/prod is unschedulable: 1 of 3 replicas running"
+        );
+        assert_eq!(finding.details, [reason]);
+        assert_eq!(finding.affected_resource, "app.web/prod");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "under-replicated"),
+            "the unschedulable finding replaces the generic one"
         );
     }
 
@@ -2552,6 +2616,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: Some(reason.to_string()),
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: None,
         }]);
 
@@ -2593,6 +2658,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: Some(crate::meat::deploy_types::RolloutFailure {
                 fingerprint: "abc".to_string(),
                 node: "node-1".to_string(),
@@ -2631,6 +2697,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: Some("node-2".to_string()),
+            unschedulable: None,
             rollout_failed: None,
         }]);
 
@@ -2673,6 +2740,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: None,
         }]);
         let report = diagnose(&inputs);
@@ -2692,6 +2760,7 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: None,
         }]);
         let report = diagnose(&inputs);

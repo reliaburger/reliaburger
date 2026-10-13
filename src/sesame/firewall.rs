@@ -110,6 +110,49 @@ pub fn resolve_destination_rules(
     rules
 }
 
+/// Set in a `firewall_map` source that names a job's run identity rather
+/// than one cgroup. Kernel cgroup ids never reach bit 63, so the two kinds of
+/// source can't collide.
+pub const SOURCE_IDENTITY_TAG: u64 = 1 << 63;
+
+/// The run identity a delegated task's cgroup is bound to in
+/// `cgroup_source_map`: its namespace plus its job's name.
+pub fn job_source_identity(namespace: &str, job: &str) -> u32 {
+    crate::onion::vip::name_to_id(&format!("{namespace}/{job}"))
+}
+
+/// The `firewall_map` source that matches every task of `namespace/job`.
+pub fn job_source_key(namespace: &str, job: &str) -> u64 {
+    SOURCE_IDENTITY_TAG | u64::from(job_source_identity(namespace, job))
+}
+
+/// Grants that let a job's tasks reach the destinations whose `allow_from`
+/// names the job (#737). Each names a run identity, not a cgroup, so it
+/// holds before any task of the job starts, and only a cgroup the delegated
+/// runtime bound to that identity matches it. A name in the destination's
+/// own namespace needs no grant: isolation never refuses it.
+pub fn resolve_job_source_rules(
+    destinations: &[IsolatedDestination<'_>],
+) -> Vec<ResolvedFirewallRule> {
+    let mut rules = Vec::new();
+    for destination in destinations {
+        for source in destination.allow_from.unwrap_or_default() {
+            let Some((namespace, job)) = source.split_once('/') else {
+                continue;
+            };
+            if namespace == destination.namespace {
+                continue;
+            }
+            rules.push(ResolvedFirewallRule {
+                src_cgroup_id: job_source_key(namespace, job),
+                dst_app_id: destination.app_id,
+                action: FIREWALL_ALLOW,
+            });
+        }
+    }
+    rules
+}
+
 /// A destination namespace isolation protects, and who may reach it from
 /// other namespaces. Services and jobs both become one.
 #[derive(Debug, Clone, Copy)]
@@ -408,6 +451,59 @@ mod maps {
         deletion_result(map.remove(&cgroup_id))
     }
 
+    fn cgroup_source_map(
+        bpf: &mut aya::Ebpf,
+    ) -> Result<HashMap<&mut aya::maps::MapData, u64, u32>, FirewallMapError> {
+        Ok(HashMap::try_from(bpf.map_mut("cgroup_source_map").ok_or(
+            FirewallMapError::MapNotFound {
+                map_name: "cgroup_source_map",
+            },
+        )?)?)
+    }
+
+    /// Bind a delegated task's cgroup to its run identity (see
+    /// [`super::job_source_identity`]), so grants that name its job match it.
+    pub fn write_cgroup_source_entry(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+        identity: u32,
+    ) -> Result<(), FirewallMapError> {
+        cgroup_source_map(bpf)?.insert(cgroup_id, identity, 0)?;
+        Ok(())
+    }
+
+    /// Unbind a retired task's cgroup, accepting only confirmed deletion or
+    /// absence.
+    pub fn delete_cgroup_source_entry(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+    ) -> Result<(), FirewallMapError> {
+        deletion_result(cgroup_source_map(bpf)?.remove(&cgroup_id))
+    }
+
+    /// The run identity a cgroup is bound to, if any.
+    pub fn read_cgroup_source_entry(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+    ) -> Result<Option<u32>, FirewallMapError> {
+        match cgroup_source_map(bpf)?.get(&cgroup_id, 0) {
+            Ok(identity) => Ok(Some(identity)),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Unbind every task cgroup. Only delegated runtimes bind them, so once
+    /// startup has retired the previous Bun's runtimes, every binding left
+    /// in the pinned map belongs to a cgroup that is gone.
+    pub fn clear_cgroup_source_map(bpf: &mut aya::Ebpf) -> Result<(), FirewallMapError> {
+        let keys: Vec<u64> = cgroup_source_map(bpf)?.keys().collect::<Result<_, _>>()?;
+        for key in keys {
+            delete_cgroup_source_entry(bpf, key)?;
+        }
+        Ok(())
+    }
+
     /// List every cgroup id currently recorded in `cgroup_namespace_map`
     /// — the kernel truth the periodic sweep compares against the ids the
     /// reconcile pass last wrote, so entries for departed cgroups get
@@ -558,6 +654,23 @@ mod maps {
         Ok(())
     }
 
+    fn read_firewall_action(
+        bpf: &mut aya::Ebpf,
+        key: FirewallKey,
+    ) -> Result<Option<u32>, FirewallMapError> {
+        let firewall_map: HashMap<_, FirewallKey, FirewallValue> = HashMap::try_from(
+            bpf.map_mut("firewall_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "firewall_map",
+                })?,
+        )?;
+        match firewall_map.get(&key, 0) {
+            Ok(value) => Ok(Some(value.action)),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Read the exact namespace and allow values the live connect hook would
     /// consult for one source/destination pair.
     pub fn read_firewall_state(
@@ -579,22 +692,25 @@ mod maps {
             }
         };
 
-        let firewall_map: HashMap<_, FirewallKey, FirewallValue> = HashMap::try_from(
-            bpf.map_mut("firewall_map")
-                .ok_or(FirewallMapError::MapNotFound {
-                    map_name: "firewall_map",
-                })?,
-        )?;
         let key = FirewallKey {
             src_cgroup_id: source_cgroup_id,
             dst_app_id: destination_app_id,
             _pad: 0,
         };
-        let action = match firewall_map.get(&key, 0) {
-            Ok(value) => Some(value.action),
-            Err(aya::maps::MapError::KeyNotFound) => None,
-            Err(error) => return Err(error.into()),
-        };
+        let mut action = read_firewall_action(bpf, key)?;
+        // Like the hook: without a grant of its own, a task cgroup answers
+        // to the run identity it is bound to.
+        if action.is_none()
+            && let Some(identity) = read_cgroup_source_entry(bpf, source_cgroup_id)?
+        {
+            action = read_firewall_action(
+                bpf,
+                FirewallKey {
+                    src_cgroup_id: super::SOURCE_IDENTITY_TAG | u64::from(identity),
+                    ..key
+                },
+            )?;
+        }
 
         Ok(LiveFirewallState {
             source_namespace_id,
@@ -971,6 +1087,47 @@ mod tests {
         let mut deletes = keys_to_delete(&previous, &desired);
         deletes.sort();
         assert_eq!(deletes, vec![2001]);
+    }
+
+    #[test]
+    fn allow_from_grants_a_named_job_by_its_run_identity() {
+        let services = [make_service(
+            "db",
+            "backend",
+            2,
+            200,
+            Some(vec!["batch/report".into(), "api".into()]),
+        )];
+        let destinations: Vec<_> = services.iter().map(IsolatedDestination::from).collect();
+        let rules = resolve_job_source_rules(&destinations);
+        // "api" lives in the destination's own namespace, which isolation
+        // never refuses, so only the cross-namespace job needs a grant.
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0].src_cgroup_id, job_source_key("batch", "report"));
+        assert_eq!(rules[0].dst_app_id, 2);
+        assert_eq!(rules[0].action, FIREWALL_ALLOW);
+    }
+
+    #[test]
+    fn namespace_default_destinations_grant_no_job_identity() {
+        let services = [
+            make_service("db", "backend", 2, 200, None),
+            make_service("cache", "backend", 3, 200, Some(Vec::new())),
+        ];
+        let destinations: Vec<_> = services.iter().map(IsolatedDestination::from).collect();
+        assert!(resolve_job_source_rules(&destinations).is_empty());
+    }
+
+    #[test]
+    fn job_source_keys_never_equal_a_cgroup_id_and_differ_by_namespace() {
+        let key = job_source_key("batch", "report");
+        assert_ne!(key & SOURCE_IDENTITY_TAG, 0, "cgroup ids never set bit 63");
+        assert_eq!(
+            key & !SOURCE_IDENTITY_TAG,
+            u64::from(job_source_identity("batch", "report"))
+        );
+        assert_ne!(key, job_source_key("other", "report"));
+        assert_ne!(key, job_source_key("batch", "other"));
     }
 
     #[test]

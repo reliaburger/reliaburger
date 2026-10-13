@@ -5,18 +5,47 @@
 /// reads this cache during the Filter and Score phases and updates
 /// it after each placement to reflect reserved resources.
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::types::{AppId, NodeId, Resources};
 
 /// Live node capabilities that affect placement correctness.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilities {
     /// Kernel hooks and runtime support for pre-start egress allowlists.
     pub egress: crate::sesame::egress::EgressEnforcementCapability,
     /// Ready resolver transports and workload reachability.
     pub dns: crate::onion::dns::DnsCapability,
+    /// The host process workloads (`exec` and `script` apps) the node runs.
+    #[serde(default)]
+    pub process: ProcessWorkloadCapability,
+}
+
+/// Which host process workloads a node runs: the `[process_workloads]`
+/// policy it enforces, reported so the scheduler places an `exec` or
+/// `script` app only where the node will start it (#702).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessWorkloadCapability {
+    /// The node runs host processes at all: its runtime can, and
+    /// `[process_workloads] mount_isolation` is off, since a node refuses
+    /// every host workload under mount isolation until #714 implements it.
+    pub enabled: bool,
+    /// `[process_workloads] allowed_binaries`: the only absolute paths it
+    /// runs. A `script` app runs the interpreter, `/bin/sh`.
+    pub allowed_binaries: Vec<PathBuf>,
+}
+
+impl ProcessWorkloadCapability {
+    /// Whether the node runs `binary` as a host process workload.
+    pub fn runs(&self, binary: &Path) -> bool {
+        self.enabled
+            && self
+                .allowed_binaries
+                .iter()
+                .any(|allowed| allowed == binary)
+    }
 }
 
 /// Per-node state as seen by the scheduler.

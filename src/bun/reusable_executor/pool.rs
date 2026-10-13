@@ -508,6 +508,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         &self,
         context: &mut Context,
         template: &JobSpec,
+        job: Option<&str>,
         profile: ExecutorProfile,
         stop: &CancellationToken,
     ) -> Result<(), ExecutorError> {
@@ -584,6 +585,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         let base = context.base.clone();
         blocking(move || prepare_cgroups(&base, profile)).await?;
+        bind_task_source(context, job).await?;
         let mut spec = crate::grill::oci::generate_job_oci_spec(
             "executor",
             template.namespace.as_deref().unwrap_or("default"),
@@ -684,11 +686,12 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         &self,
         context: &mut Context,
         template: &JobSpec,
+        job: Option<&str>,
         profile: ExecutorProfile,
         stop: &CancellationToken,
     ) -> Result<(), ExecutorError> {
         if self.runtime.host() {
-            return self.start_host(context, template, profile, stop).await;
+            return self.start_host(context, template, job, profile, stop).await;
         }
         let Runtime::Container(runtime) = &self.runtime else {
             return Err(ExecutorError::Configuration("container backend missing"));
@@ -764,6 +767,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 )
                 .await?;
         }
+        bind_task_source(context, job).await?;
         let path = context.base.join("helper");
         let mut spec = crate::grill::oci::generate_job_oci_spec(
             "executor",
@@ -884,8 +888,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 ran: None,
             }
         };
+        let job = task.run.as_ref().and_then(|run| run.job_name.as_deref());
         let key = match ExecutorKey::new(&template) {
-            Ok(key) => key,
+            Ok(key) => key.for_job(job),
             Err(error) => return failed(error),
         };
         let profile = match ExecutorProfile::new(&template) {
@@ -1044,7 +1049,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             // that call left behind.
             let stop = CancellationToken::new();
             let startup = {
-                let started = self.start(new, &template, profile, &stop);
+                let started = self.start(new, &template, job, profile, &stop);
                 tokio::pin!(started);
                 tokio::select! { biased;
                     outcome = interrupted() => {
@@ -1098,7 +1103,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         };
         if let Some(refresh) = refresh {
             let refreshed = refresh().await.ok().filter(|template| {
-                ExecutorKey::new(template).is_ok_and(|live| live == context.key)
+                ExecutorKey::new(template).is_ok_and(|live| live.for_job(job) == context.key)
             });
             let Some(refreshed) = refreshed else {
                 checkout.retire().await;
@@ -1517,6 +1522,19 @@ fn host_socket_directory() -> std::io::Result<PathBuf> {
         }
     }
     Ok(directory)
+}
+
+/// Bind the executor's `task` cgroup, where every command it runs lands, to
+/// its job's run identity. The executor key carries the job, so the binding
+/// holds for every command the executor will ever run.
+async fn bind_task_source(context: &mut Context, job: Option<&str>) -> Result<(), ExecutorError> {
+    #[cfg(feature = "ebpf")]
+    if let (Some(lease), Some(job)) = (context.namespace.as_mut(), job) {
+        lease.bind_source(&context.base.join("task"), job).await?;
+    }
+    #[cfg(not(feature = "ebpf"))]
+    let _ = (context, job);
+    Ok(())
 }
 
 fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()> {

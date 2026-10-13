@@ -574,7 +574,32 @@ impl super::Grill for RuncGrill {
     }
 
     async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        self.owned_forget_retired(instance)
+        self.owned_forget_retired(instance, None)
+            .await
+            .map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })
+    }
+
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &super::RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        self.owned_forget_retired(instance, Some(generation))
+            .await
+            .map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::RuntimeGeneration>, GrillError> {
+        self.owned_launch_generation(instance)
             .await
             .map_err(|error| GrillError::StateUnavailable {
                 instance: instance.clone(),

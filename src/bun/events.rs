@@ -112,6 +112,9 @@ pub enum EventKind {
     /// The API refused a request to an audited route, or summarises the
     /// refusals it suppressed (#798).
     Refusal,
+    /// The scheduler couldn't place every replica of an app, or now has
+    /// (#702).
+    Placement,
 }
 
 /// Importance of an event.

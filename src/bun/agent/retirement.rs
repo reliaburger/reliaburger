@@ -248,17 +248,43 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// has decided not to adopt it. A stopped replica that `relish stop`
     /// keeps owned must keep its metadata, since a later apply rolls over it.
     ///
+    /// Its init containers go too (#850), each by the generation it
+    /// launched: an immediate redeploy can reuse an initialiser's identity,
+    /// and its own init container's exit code must survive a forget that
+    /// lands late. One a live or pending parent has registered again is
+    /// left alone.
+    ///
     /// The deletion runs in a task, so no turn waits on its fsyncs. The
     /// runtime refuses, and keeps everything, while the identity may still
     /// own a process or an address, including when a successor generation
     /// of the same identity has started since. What a refusal or a crash
     /// leaves is retired and forgotten again by the next start's adoption.
-    pub(super) fn forget_runtime_metadata(&self, instance_id: &InstanceId) {
+    pub(super) fn forget_runtime_metadata(&mut self, instance_id: &InstanceId) {
+        let initialisers: Vec<_> = self
+            .initialiser_generations
+            .remove(instance_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(initialiser, _)| {
+                !self
+                    .initialisers
+                    .values()
+                    .any(|children| children.contains(initialiser))
+            })
+            .collect();
         let grill = self.supervisor.grill().clone();
         let id = instance_id.clone();
         tokio::spawn(async move {
             if let Err(error) = grill.forget_retired(&id).await {
                 eprintln!("bun: {id}: runtime metadata kept: {error}");
+            }
+            for (initialiser, generation) in initialisers {
+                if let Err(error) = grill
+                    .forget_retired_generation(&initialiser, &generation)
+                    .await
+                {
+                    eprintln!("bun: {initialiser}: runtime metadata kept: {error}");
+                }
             }
         });
     }

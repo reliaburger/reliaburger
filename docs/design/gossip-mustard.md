@@ -111,6 +111,12 @@ Node A                    Node B                    Node C
 
 Each PING/ACK message piggybacks a bounded number of membership updates (new joins, suspects, deaths, leader changes). This piggybacking is how information propagates in O(log N) rounds without dedicated broadcast messages.
 
+**A relay never blocks.** When C receives A's PING-REQ for B, it sends B a PING, records "forward B's ACK to A" with a deadline of one `probe_timeout`, and returns. B's ACK arrives through the ordinary message handler, which forwards it to A as an ACK that C sends in its own name with `relayed_for: Some(B)`. Every message a node receives while it waits for its own probe's ACK goes through the same handler, so a node in the middle of a probe still answers PINGs, merges syncs and serves relays. (The first version waited inline for B and dropped everything else that arrived meanwhile, so a busy relay stopped acknowledging its own probers and got itself suspected.)
+
+**Byte budget.** A datagram is at most 1,400 bytes (`MAX_DATAGRAM_BYTES`). A probe is built header first, then the sender's directory extension (§4.1), then piggybacked updates in priority order until the next one doesn't fit; the rest stay queued with their broadcast counts untouched. `MAX_PIGGYBACK_UPDATES` (8) caps the count, but the byte budget is what bounds the size, so a node with 63-byte names, IPv6 addresses and a full label set sends fewer updates per probe instead of oversized datagrams the transport refuses. The budget is measured from the encoded message, not computed from constants, so a field added to the header or extension later is accounted for automatically. In the worst case (16 labels using the whole 512-byte label budget) a PING still carries one update; a PING-REQ or relayed ACK may carry none, and anti-entropy, which sends no extension, makes up the difference. If an extension alone would not fit, the probe goes without it. A failed send is counted and logged at most every ten seconds, never discarded.
+
+**Refutation first.** The dissemination queue sends this node's own refutation (Alive about itself at a raised incarnation) ahead of everything else, then Dead/Left, Suspect and Alive about others. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
+
 **Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 73 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
 
 ```
@@ -212,7 +218,7 @@ Leader swaps R in for C in one membership change (count stays odd)
 
 ### 3.5 Hierarchical Reporting Tree
 
-> **Status: the shipped topology is a flat star to the leader, not the two-level tree below.** What runs today (`src/cluster/runtime.rs`) has **every worker report directly to the leader**. The runtime's `spawn_leader_target_maintainer` pushes a *single-element* council list containing only the leader, and each `ReportWorker` runs the same `assign_parent(worker_id, council)` helper over that one-element list — so the hash always resolves to the leader. The two-level consistent-hash tree (workers → council member → leader) is deliberate MVP scaffolding that exists in the code (`src/reporting/assignment.rs`, `src/reporting/aggregator.rs`) but is **not wired into the running topology**. The fan-in arithmetic and diagram below describe that **planned** two-level design.
+> **Status: the shipped topology is a flat star to the leader, not the two-level tree below.** What runs today (`src/cluster/runtime.rs`) has **every worker report directly to the leader**. The runtime's `spawn_leader_target_maintainer` pushes a *single-element* council list containing only the leader, and each `ReportWorker` runs the same `assign_parent(worker_id, council)` helper over that one-element list — so the hash always resolves to the leader. The two-level consistent-hash tree (workers → council member → leader) is deliberate MVP scaffolding that exists in the code (`src/reporting/assignment.rs`, `src/reporting/aggregator.rs`) but is **not wired into the running topology**. The fan-in arithmetic and diagram below describe that **planned** two-level design. The council-to-leader message the tree would need is gone: `ReportingMessage::AggregatedReport` bundled many nodes' reports with no identity binding, so any authenticated peer could forge another node's state through it, and production never sent it (#696). If the tree is built, that message comes back with council-peer authentication.
 
 In the planned tree, each non-council node is assigned to a specific council member as its parent, deterministically: `parent = council_members[hash(node_id) % council_size]`, distributing the reporting load evenly.
 
@@ -242,29 +248,40 @@ When (in the planned tree) a council member departs, its assigned workers re-has
 ### 4.1 Gossip Message Types
 
 ```rust
-/// Top-level gossip message, always fixed-size.
-/// Sent as a single UDP datagram (max 1400 bytes to avoid fragmentation).
+/// Top-level gossip message.
+/// Sent as a single UDP datagram of at most MAX_DATAGRAM_BYTES (1400) to
+/// avoid fragmentation; probes fill what the header and extension leave
+/// with piggybacked updates (§3.2, "Byte budget").
 #[derive(Serialize, Deserialize)]
 struct GossipMessage {
-    /// Protocol version for forward compatibility.
+    /// Protocol version; a node refuses any other generation.
     version: u8,
-    /// Sender's node ID.
+    /// Durable state generation required for cluster admission.
+    state_format: u32,
+    /// Sender's node ID. Always the node that built and sent the datagram.
     sender: NodeId,
     /// Monotonic incarnation number (incremented on refutation).
     incarnation: u64,
-    /// HMAC-SHA256 over the serialised payload, keyed by the shared gossip key
-    /// derived from the node's mTLS certificate.
+    /// The sender's message counter (§8.1): seeded from wall-clock
+    /// microseconds at process start, +1 per message. Receivers drop a
+    /// message at or below the highest sequence seen from its sender.
+    sequence: u64,
+    /// HMAC-SHA256 over the message with this field zeroed, keyed by the
+    /// gossip key derived from the cluster master key.
     hmac: [u8; 32],
     /// The message payload.
     payload: GossipPayload,
+    /// Directory extension (endpoints, leader hint, labels, disk pressure,
+    /// recovery claim), encoded after the body with its own HMAC.
+    /// Not serialised inside the body.
+    extension: Option<DirectoryExtension>,
 }
 
 #[derive(Serialize, Deserialize)]
 enum GossipPayload {
     Ping {
-        /// Target node being probed.
-        target: NodeId,
-        /// Piggybacked membership updates (bounded to MAX_PIGGYBACK_UPDATES).
+        /// Piggybacked membership updates (byte-budgeted, at most
+        /// MAX_PIGGYBACK_UPDATES).
         updates: Vec<MembershipUpdate>,
     },
     PingReq {
@@ -275,9 +292,10 @@ enum GossipPayload {
         updates: Vec<MembershipUpdate>,
     },
     Ack {
-        /// Responding to a PING or PING-REQ for this target.
-        target: NodeId,
         updates: Vec<MembershipUpdate>,
+        /// `Some(target)` when a relay forwards the target's ACK in its own
+        /// name; `None` when the sender answers for itself.
+        relayed_for: Option<NodeId>,
     },
     /// Anti-entropy push-pull: up to MAX_PIGGYBACK_UPDATES entries of the
     /// sender's full membership table. Only the first datagram of a request
@@ -288,8 +306,11 @@ enum GossipPayload {
     },
 }
 
-/// Maximum number of piggybacked membership updates per gossip message.
-/// Bounded to keep message size constant.
+/// Largest datagram any node sends.
+const MAX_DATAGRAM_BYTES: usize = 1400;
+
+/// Most piggybacked membership updates per gossip message. The byte
+/// budget is the real limit; this bounds the work per message.
 const MAX_PIGGYBACK_UPDATES: usize = 8;
 
 /// A single membership update piggybacked on gossip messages.
@@ -551,7 +572,7 @@ struct EncryptedRecoveryCandidateList {
 
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
-| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation) |
+| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
 | Mustard anti-entropy (Sync push-pull) | UDP | bincode (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
 | Raft (AppendEntries, RequestVote) | TCP + mTLS | bincode | Unbounded (log entries can contain app specs) |
 | Reporting tree (StateReports) | TCP + mTLS | bincode | 1 MiB (bounded by max events per report) |
@@ -1129,7 +1150,7 @@ UDP is unreliable. Mustard handles this through redundancy:
 - Each membership update is piggybacked on multiple messages (a dissemination count of `ceil(log(N))` ensures each update is sent enough times for probabilistic reliability).
 - Indirect probing (PING-REQ) provides a second path when direct probes fail.
 - The suspicion subprotocol prevents premature failure declarations from transient loss.
-- *(Planned)* A periodic TCP full-state sync between random node pairs as a consistency backstop. This is not implemented today; convergence relies on UDP piggyback and indirect probing alone.
+- A periodic push-pull exchange of membership tables between random node pairs (§3.2, "Anti-entropy push-pull") is the consistency backstop. It runs over the same UDP transport, not TCP.
 
 At 10,000 nodes with 0.1% UDP packet loss, the expected convergence time increases by less than one additional protocol period (~500ms).
 
@@ -1142,6 +1163,10 @@ At 10,000 nodes with 0.1% UDP packet loss, the expected convergence time increas
 When the node has a cluster master key (`[security] master_key_path`, produced by `relish init` and provisioned onto every clustered node by the operator), every Mustard gossip message carries an HMAC-SHA256 tag computed over the message with the `hmac` field zeroed. Every node derives the same key from the master key with HKDF-SHA256 (`sesame::mtls::gossip_hmac::derive_gossip_key`), and the transport drops datagrams whose tag doesn't verify. A host without the master key can't forge or inject gossip messages.
 
 A node started without a master key (single-node and pre-security configurations) gossips unauthenticated. Generated secure clusters always have one.
+
+**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it rises across restarts. A receiver keeps the highest sequence it has accepted from each sender and drops any message at or below it before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
+
+The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error. A node whose clock stepped backwards across a restart is not heard until its old record is reaped (suspicion plus `cleanup_timeout`), because reaping a member forgets its sequence.
 
 **TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 
@@ -1161,7 +1186,7 @@ In transit, Raft messages are protected by mTLS (all inter-council communication
 
 ### 8.4 Reporting Tree Authentication
 
-All reporting tree connections use mTLS via Sesame's Node CA. A council member verifies that the reporting worker's node ID (from the certificate common name) matches the claimed `node_id` in the StateReport. This prevents a compromised worker from reporting state on behalf of another node.
+All reporting connections use mTLS via Sesame's Node CA. In the shipped flat star (§3.5) every worker reports straight to the leader, which verifies that the worker's node ID (from the certificate) matches the `node_id` claimed in every message that carries node state: `Report`, `MetricsRollup`, `CapabilityReport` and `NodeReadinessReport`. This prevents a compromised worker from reporting state on behalf of another node. There is no message that carries several nodes' reports: `AggregatedReport` was removed because it bypassed exactly this check (#696).
 
 ---
 
@@ -1321,7 +1346,7 @@ Nomad uses Raft for consensus among server nodes and a gossip protocol (Serf) fo
 
 - [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol (Das et al., 2002)](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf) -- The protocol that Mustard implements. Proves O(log N) convergence and O(1) per-node overhead.
 - [In Search of an Understandable Consensus Algorithm (Ongaro & Ousterhout, 2014)](https://raft.github.io/raft.pdf) -- The Raft paper. Our Raft implementation follows this specification.
-- [Lifeguard: Local Health Awareness for More Accurate Failure Detection (Hashimoto, 2017)](https://arxiv.org/abs/1707.00788) -- Improvements to SWIM used in Consul's memberlist. We adopt the suspicion subprotocol and local health awareness piggybacking.
+- [Lifeguard: Local Health Awareness for More Accurate Failure Detection (Hashimoto, 2017)](https://arxiv.org/abs/1707.00788) -- Improvements to SWIM used in Consul's memberlist. Mustard does not implement Lifeguard: it has SWIM's own suspicion subprotocol with a fixed suspicion timeout, and no local health awareness or dynamic timeouts.
 
 ---
 
