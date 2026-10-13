@@ -345,7 +345,7 @@ async fn spawn_issuer(
         // than a joiner waits (#884). The join must not depend on it.
         .route(
             "/v1/version",
-            axum::routing::get(|| std::future::pending::<Json<serde_json::Value>>()),
+            axum::routing::get(std::future::pending::<Json<serde_json::Value>>),
         )
         .route("/v1/cluster/join", post(issue))
         .with_state(issuer);
