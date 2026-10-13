@@ -19,6 +19,7 @@ use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNode
 use reliaburger::bun::task_executor::{AttemptOutcome, FakeRunner, ProcessRunner};
 use reliaburger::bun::task_ledger::GroupCommit;
 use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
+use reliaburger::meat::job_capability::JobCapabilities;
 use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
 use reliaburger::council::node::CouncilNode;
@@ -30,6 +31,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::task_harness::TestTasks;
 
+/// The live members the leader's API sees, as `bun` builds them from gossip.
+type Members = Arc<tokio::sync::RwLock<Vec<api::NodeMembershipInfo>>>;
+
 const SHELL: &str = "/bin/sh";
 const NODE: &str = "node-1";
 /// Finished runs stay readable this long unless a test shortens it.
@@ -39,6 +43,8 @@ struct Harness {
     base_url: String,
     http: reqwest::Client,
     council: Option<Arc<CouncilNode>>,
+    /// The job capabilities this harness's node advertises (#788).
+    job_capabilities: JobCapabilities,
     _data: tempfile::TempDir,
     _tasks: TestTasks,
 }
@@ -131,12 +137,26 @@ impl Harness {
         tokens: Option<reliaburger::sesame::auth::TokenStore>,
         data: tempfile::TempDir,
     ) -> Self {
-        Self::start_in_with_cron_clock(options, tokens, data, CronClock::System).await
+        Self::start_in_with_cron_clock(options, tokens, data, CronClock::System, None).await
+    }
+
+    /// A harness whose leader sees `membership` as the cluster's live
+    /// members, as `bun` builds it from gossip.
+    async fn start_with_membership(options: Options, membership: Members) -> Self {
+        Self::start_in_with_cron_clock(
+            options,
+            None,
+            tempfile::tempdir().unwrap(),
+            CronClock::System,
+            Some(membership),
+        )
+        .await
     }
 
     /// A harness whose leader fires cron schedules at `clock`'s time.
     async fn start_with_cron_clock(options: Options, clock: CronClock) -> Self {
-        Self::start_in_with_cron_clock(options, None, tempfile::tempdir().unwrap(), clock).await
+        Self::start_in_with_cron_clock(options, None, tempfile::tempdir().unwrap(), clock, None)
+            .await
     }
 
     async fn start_in_with_cron_clock(
@@ -144,6 +164,7 @@ impl Harness {
         tokens: Option<reliaburger::sesame::auth::TokenStore>,
         data: tempfile::TempDir,
         cron_clock: CronClock,
+        membership: Option<Members>,
     ) -> Self {
         let shutdown = CancellationToken::new();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
@@ -182,6 +203,7 @@ impl Harness {
             },
             options.runner,
         );
+        let job_capabilities = node.job_capabilities();
         let service = Arc::new(
             TaskArrayService::with_timings(
                 Some(Arc::new(node)),
@@ -213,7 +235,7 @@ impl Harness {
             tokens,
             None,
             None,
-            None,
+            membership,
             None,
             None,
             port,
@@ -246,6 +268,7 @@ impl Harness {
             base_url: format!("http://127.0.0.1:{port}"),
             http: reqwest::Client::new(),
             council,
+            job_capabilities,
             _data: data,
             _tasks: TestTasks::new(shutdown, vec![agent, server]),
         }
@@ -579,6 +602,172 @@ async fn host_runs_under_mount_isolation_are_refused_with_the_reason() {
     assert_eq!(summary["not_run"], 20, "{summary}");
     let reason = summary["unrunnable_reason"].as_str().unwrap();
     assert!(reason.contains("mount_isolation"), "{reason}");
+}
+
+/// Two nodes gossiping in memory, as `bun` wires them for #788: `NODE`,
+/// the harness's leader, and a peer, each advertising its job capabilities
+/// through a watch.
+struct GossipPair {
+    peer_jobs: tokio::sync::watch::Sender<Option<JobCapabilities>>,
+    _leader_jobs: tokio::sync::watch::Sender<Option<JobCapabilities>>,
+    directory: tokio::sync::watch::Receiver<reliaburger::mustard::directory::NodeDirectory>,
+    membership:
+        tokio::sync::watch::Receiver<Vec<reliaburger::mustard::membership::MembershipSnapshot>>,
+    _tasks: TestTasks,
+}
+
+const PEER: &str = "node-2";
+
+impl GossipPair {
+    async fn start(leader: JobCapabilities, peer: JobCapabilities) -> Self {
+        use reliaburger::meat::NodeId;
+        use reliaburger::mustard::transport::InMemoryNetwork;
+        use reliaburger::mustard::{GossipConfig, MustardNode};
+        use tokio::sync::watch;
+
+        let config = GossipConfig {
+            protocol_interval: Duration::from_millis(20),
+            probe_timeout: Duration::from_millis(50),
+            suspicion_timeout: Duration::from_secs(5),
+            indirect_probe_count: 1,
+            cleanup_timeout: Duration::from_secs(30),
+            push_pull_interval: Duration::from_millis(200),
+        };
+        let net = InMemoryNetwork::new();
+        let leader_address = "127.0.0.1:17901".parse().unwrap();
+        let peer_address = "127.0.0.1:17902".parse().unwrap();
+        let mut leader_node = MustardNode::new(
+            NodeId::new(NODE),
+            leader_address,
+            config.clone(),
+            net.register(leader_address).await,
+        );
+        let mut peer_node = MustardNode::new(
+            NodeId::new(PEER),
+            peer_address,
+            config,
+            net.register(peer_address).await,
+        );
+        // Port 9 refuses connections, so the leader's syncs to the peer
+        // fail at once rather than hanging.
+        leader_node.set_advertised_endpoints(9, 9, BTreeMap::new());
+        peer_node.set_advertised_endpoints(9, 9, BTreeMap::new());
+        let (leader_jobs, leader_jobs_rx) = watch::channel(Some(leader));
+        leader_node.set_job_capabilities_watch(leader_jobs_rx);
+        let (peer_jobs, peer_jobs_rx) = watch::channel(Some(peer));
+        peer_node.set_job_capabilities_watch(peer_jobs_rx);
+        let (directory_tx, directory) = watch::channel(Default::default());
+        leader_node.set_directory_watch(directory_tx);
+        let (membership_tx, membership) = watch::channel(Vec::new());
+        leader_node.set_membership_watch(membership_tx);
+        leader_node.add_seed(NodeId::new(PEER), peer_address);
+
+        let shutdown = CancellationToken::new();
+        let leader_shutdown = shutdown.clone();
+        let peer_shutdown = shutdown.clone();
+        let tasks = vec![
+            tokio::spawn(async move { leader_node.run(leader_shutdown).await }),
+            tokio::spawn(async move { peer_node.run(peer_shutdown).await }),
+        ];
+        Self {
+            peer_jobs,
+            _leader_jobs: leader_jobs,
+            directory,
+            membership,
+            _tasks: TestTasks::new(shutdown, tasks),
+        }
+    }
+
+    /// Whether the leader has heard the peer advertising `peer`, and lists
+    /// itself and the peer as members.
+    fn heard(&self, peer: &JobCapabilities) -> bool {
+        let node = reliaburger::meat::NodeId::new(PEER);
+        let directory = self.directory.borrow();
+        directory.jobs.get(&node) == Some(peer)
+            && directory
+                .jobs
+                .contains_key(&reliaburger::meat::NodeId::new(NODE))
+            && self
+                .membership
+                .borrow()
+                .iter()
+                .any(|member| member.node_id == node)
+    }
+
+    /// Wait until the leader's directory has learned the peer advertising
+    /// `peer`, then publish the live members to `members` as `bun` does.
+    async fn publish_once_peer_advertises(&self, peer: JobCapabilities, members: &Members) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !self.heard(&peer) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader never heard the peer's job capabilities"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let directory = self.directory.borrow().clone();
+        let live: Vec<api::NodeMembershipInfo> = self
+            .membership
+            .borrow()
+            .iter()
+            .filter(|member| member.state == reliaburger::mustard::state::NodeState::Alive)
+            .map(|member| api::NodeMembershipInfo::from_gossip(member, &directory, 0))
+            .collect();
+        *members.write().await = live;
+    }
+}
+
+/// #788: in a cluster the leader refuses a run no live node can take at
+/// submission, with HTTP 422 and the reason its tick would give, using the
+/// job capabilities every node advertises over gossip. Once one node could
+/// take the run, it is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_refuses_a_run_no_live_node_can_take_at_submission() {
+    let members: Members = Arc::default();
+    let harness = Harness::start_with_membership(
+        Options {
+            mount_isolation: true,
+            ..Options::processes(true)
+        },
+        Arc::clone(&members),
+    )
+    .await;
+    let isolated = harness.job_capabilities;
+    assert!(isolated.mount_isolation);
+    let gossip = GossipPair::start(isolated, isolated).await;
+    gossip.publish_once_peer_advertises(isolated, &members).await;
+
+    let started = tokio::time::Instant::now();
+    let (status, answer) = harness.submit(shell_array(20, 10, "exit 0")).await;
+    assert_eq!(status, 422, "{answer}");
+    let error = answer["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("no node can run job default/render: "),
+        "{error}"
+    );
+    assert_eq!(
+        error.matches("host jobs don't run under").count(),
+        1,
+        "both nodes give one reason, quoted once: {error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let response = harness
+        .http
+        .post(format!("{}/v1/jobs/runs", harness.base_url))
+        .json(&json!({"name":"single","request_id":"one","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+
+    // The peer turns mount isolation off, so it could take the run.
+    let open = JobCapabilities {
+        mount_isolation: false,
+        ..isolated
+    };
+    gossip.peer_jobs.send(Some(open)).unwrap();
+    gossip.publish_once_peer_advertises(open, &members).await;
+    harness.submit_ok(shell_array(20, 10, "exit 0")).await;
 }
 
 /// One Raft submission accepts all profiles; the summary list never expands indexes.

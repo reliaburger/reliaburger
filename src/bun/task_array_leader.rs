@@ -918,6 +918,26 @@ pub fn unrunnable_reason(
     Some(format!("no node can run it: {}", quoted.join("; ")))
 }
 
+/// A live node as the leader sees it when it admits a job run (#788).
+pub struct AdvertisedNode<'a> {
+    /// The node.
+    pub node: NodeId,
+    /// The kinds of job it advertises over gossip, or `None` if the leader
+    /// hasn't heard.
+    pub jobs: Option<crate::meat::job_capability::JobCapabilities>,
+    /// Its `[process_workloads] allowed_binaries`, from its capability
+    /// report, when the leader holds one.
+    pub allowed_binaries: Option<&'a [std::path::PathBuf]>,
+}
+
+/// Why no live node can run `record`, from what the nodes advertise: each
+/// distinct reason, quoted as [`unrunnable_reason`] quotes them. `None`
+/// while any node might take it (#788).
+pub fn admission_refusal(record: &TaskArrayRecord, nodes: &[AdvertisedNode<'_>]) -> Option<String> {
+    let _ = (record, nodes);
+    None
+}
+
 /// One node's answer to a sync call, with the `known` list it was sent.
 pub struct SyncAnswer {
     /// The node.
@@ -1566,6 +1586,7 @@ mod tests {
     use super::*;
     use crate::config::job::JobSpec;
     use crate::meat::index_set::IndexRangeSet;
+    use crate::meat::job_capability::JobCapabilities;
     use crate::meat::task_array::TaskArraySpec;
     use crate::meat::task_array_state::{ChunkResult, TaskArrayState};
 
@@ -2134,6 +2155,165 @@ mod tests {
         )));
         // Nobody answered at all.
         assert!(!unrunnable(&plan_tick(&arrays, None, &inputs(&[], &heard))));
+    }
+
+    /// A node that runs every kind of job, with `/usr/bin/render` among
+    /// others on its allowlist.
+    fn capable() -> JobCapabilities {
+        JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: true,
+            singleton_images: true,
+            singleton_image_limits: true,
+            encrypted_env: true,
+            network_policy: true,
+            mount_isolation: false,
+            binaries: true,
+        }
+    }
+
+    fn isolated() -> JobCapabilities {
+        JobCapabilities {
+            mount_isolation: true,
+            ..capable()
+        }
+    }
+
+    fn advertised(name: &str, jobs: Option<JobCapabilities>) -> AdvertisedNode<'static> {
+        AdvertisedNode {
+            node: node(name),
+            jobs,
+            allowed_binaries: None,
+        }
+    }
+
+    /// #788: when every live node advertises that it can't take a run, the
+    /// leader refuses it at submission, naming each distinct reason once.
+    #[test]
+    fn admission_refuses_a_run_every_live_node_advertises_it_cannot_take() {
+        let record = record(20, 10);
+        let no_host = JobCapabilities {
+            host: false,
+            ..capable()
+        };
+        let nodes = [
+            advertised("a", Some(isolated())),
+            advertised("b", Some(isolated())),
+            advertised("c", Some(no_host)),
+        ];
+        let reason = admission_refusal(&record, &nodes).expect("no node can take it");
+        assert_eq!(reason.matches("mount_isolation").count(), 1, "{reason}");
+        assert!(reason.contains("host arrays require"), "{reason}");
+    }
+
+    /// #788: admission and the tick backstop quote the same reasons, so a
+    /// user sees the same words whichever of them refuses the run.
+    #[test]
+    fn admission_quotes_the_reasons_the_tick_would() {
+        let arrays = running_arrays(1);
+        let running = arrays.get(1).unwrap();
+        let assignment = assignment_for(1, running, &node("a"));
+        let refused =
+            crate::bun::task_array_node::capability_refusal(&isolated(), &assignment, true)
+                .expect("an isolated node refuses host work");
+        let answers = [
+            (node("a"), refusal_for(&arrays, &refused, true)),
+            (node("b"), refusal_for(&arrays, &refused, true)),
+        ];
+        let heard = HashMap::new();
+        let writes = plan_tick(&arrays, None, &inputs(&answers, &heard));
+        let [TaskArrayWrite::Unrunnable { reason: ticked, .. }] = &writes[..] else {
+            panic!("expected one unrunnable write, got {writes:?}");
+        };
+        let admitted = admission_refusal(
+            running,
+            &[
+                advertised("a", Some(isolated())),
+                advertised("b", Some(isolated())),
+            ],
+        )
+        .expect("both nodes refuse it");
+        assert_eq!(*ticked, format!("no node can run it: {admitted}"));
+    }
+
+    /// #788: admission only refuses when it is sure. A node that might take
+    /// the run, or one whose capabilities the leader hasn't heard yet,
+    /// leaves the decision to the nodes and the tick.
+    #[test]
+    fn admission_admits_a_run_any_live_node_might_take() {
+        let record = record(20, 10);
+        assert_eq!(
+            admission_refusal(
+                &record,
+                &[
+                    advertised("a", Some(isolated())),
+                    advertised("b", Some(capable()))
+                ]
+            ),
+            None
+        );
+        assert_eq!(
+            admission_refusal(
+                &record,
+                &[advertised("a", Some(isolated())), advertised("b", None)]
+            ),
+            None,
+            "a node that hasn't said might take it"
+        );
+        assert_eq!(admission_refusal(&record, &[]), None, "no members known");
+    }
+
+    /// #788: a container run nobody can start is refused too, not only
+    /// host work.
+    #[test]
+    fn admission_refuses_containers_where_no_node_runs_them() {
+        let mut record = record(100, 10);
+        record.template.runtime = crate::config::job::JobRuntime::Runc;
+        record.template.exec = None;
+        record.template.image = Some("fixture:v1".into());
+        let process_only = JobCapabilities {
+            containers: false,
+            singleton_images: false,
+            singleton_image_limits: false,
+            ..capable()
+        };
+        let reason = admission_refusal(&record, &[advertised("a", Some(process_only))]).unwrap();
+        assert!(reason.contains("container tasks require"), "{reason}");
+        assert_eq!(
+            admission_refusal(&record, &[advertised("a", Some(isolated()))]),
+            None,
+            "mount isolation doesn't stop containers"
+        );
+    }
+
+    /// #788: the gossip summary only says whether a node allows any binary.
+    /// Where the leader holds the node's capability report, it checks the
+    /// run's binary against the full allowlist; without it, a node with a
+    /// non-empty allowlist might allow the binary.
+    #[test]
+    fn admission_checks_the_binary_against_a_reported_allowlist() {
+        let record = record(20, 10);
+        let elsewhere = [std::path::PathBuf::from("/usr/bin/true")];
+        let reported = AdvertisedNode {
+            allowed_binaries: Some(&elsewhere),
+            ..advertised("a", Some(capable()))
+        };
+        let reason = admission_refusal(&record, &[reported]).unwrap();
+        assert!(
+            reason.contains("/usr/bin/render isn't in this node's [process_workloads] allowed_binaries"),
+            "{reason}"
+        );
+        assert_eq!(
+            admission_refusal(&record, &[advertised("a", Some(capable()))]),
+            None
+        );
+        let empty = JobCapabilities {
+            binaries: false,
+            ..capable()
+        };
+        let reason = admission_refusal(&record, &[advertised("a", Some(empty))]).unwrap();
+        assert!(reason.contains("allowed_binaries"), "{reason}");
     }
 
     #[test]

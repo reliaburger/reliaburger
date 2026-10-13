@@ -14,6 +14,8 @@ use std::net::SocketAddr;
 use crate::council::types::RecoveryClaim;
 use crate::meat::NodeId;
 
+use crate::meat::job_capability::JobCapabilities;
+
 use super::message::{DirectoryExtension, LeaderHint};
 
 /// A node's advertised control-plane endpoints, learned via gossip.
@@ -45,6 +47,10 @@ pub struct NodeDirectory {
     /// `None` for a node that holds no epoch yet. The id is `None` at epoch
     /// 0, which no recovery started.
     pub recovery_claims: HashMap<NodeId, Option<RecoveryClaim>>,
+    /// The kinds of job each node says it runs (#788). A node that
+    /// advertises no summary has no entry: the leader treats it as one that
+    /// might run anything, never as one that runs nothing.
+    pub jobs: HashMap<NodeId, JobCapabilities>,
     /// Best known leader: newest recovery epoch first, then highest term.
     pub leader: Option<LeaderHint>,
 }
@@ -179,6 +185,7 @@ mod tests {
             disk_pressured: false,
             recovery_epoch: None,
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         }
     }
@@ -196,6 +203,7 @@ mod tests {
             disk_pressured: false,
             recovery_epoch: None,
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         }
     }
@@ -210,6 +218,7 @@ mod tests {
             disk_pressured: pressured,
             recovery_epoch: None,
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         }
     }
@@ -300,6 +309,57 @@ mod tests {
         dir.observe(&extension_with_labels("n1", 9117, &[("zone", "us-east")]));
         dir.prune(&[NodeId::new("n1")]);
         assert!(!dir.labels.contains_key(&NodeId::new("n1")));
+    }
+
+    fn extension_with_jobs(node: &str, jobs: Option<JobCapabilities>) -> DirectoryExtension {
+        DirectoryExtension {
+            jobs,
+            ..extension(node, 9117, None)
+        }
+    }
+
+    fn isolated_jobs() -> JobCapabilities {
+        JobCapabilities {
+            host: true,
+            host_limits: false,
+            containers: false,
+            singleton_images: true,
+            singleton_image_limits: true,
+            encrypted_env: true,
+            network_policy: false,
+            mount_isolation: true,
+            binaries: true,
+        }
+    }
+
+    /// #788: the leader reads each node's job summary from here, and a node
+    /// whose configuration changes must be republished.
+    #[test]
+    fn observe_records_job_capabilities_and_reports_change() {
+        let mut dir = NodeDirectory::default();
+        let isolated = isolated_jobs();
+        assert!(dir.observe(&extension_with_jobs("n1", Some(isolated))));
+        assert_eq!(dir.jobs.get(&NodeId::new("n1")), Some(&isolated));
+        assert!(!dir.observe(&extension_with_jobs("n1", Some(isolated))));
+
+        let open = JobCapabilities {
+            mount_isolation: false,
+            ..isolated
+        };
+        assert!(dir.observe(&extension_with_jobs("n1", Some(open))));
+        assert_eq!(dir.jobs.get(&NodeId::new("n1")), Some(&open));
+
+        // A node that stops saying is unknown again, not still capable.
+        assert!(dir.observe(&extension_with_jobs("n1", None)));
+        assert!(!dir.jobs.contains_key(&NodeId::new("n1")));
+    }
+
+    #[test]
+    fn prune_drops_reaped_node_job_capabilities() {
+        let mut dir = NodeDirectory::default();
+        dir.observe(&extension_with_jobs("n1", Some(isolated_jobs())));
+        dir.prune(&[NodeId::new("n1")]);
+        assert!(!dir.jobs.contains_key(&NodeId::new("n1")));
     }
 
     #[test]

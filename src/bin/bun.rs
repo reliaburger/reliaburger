@@ -1689,15 +1689,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         .borrow()
                         .iter()
                         .map(|m| api::RosterMember {
-                            info: api::NodeMembershipInfo {
-                                node_id: m.node_id.clone(),
-                                address: directory.api_address(
-                                    &m.node_id,
-                                    m.address,
-                                    gossip_to_api_offset,
-                                ),
-                                api_advertised: directory.endpoints.contains_key(&m.node_id),
-                            },
+                            info: api::NodeMembershipInfo::from_gossip(
+                                m,
+                                &directory,
+                                gossip_to_api_offset,
+                            ),
                             gossip_address: m.address,
                             state: m.state,
                             incarnation: m.incarnation,

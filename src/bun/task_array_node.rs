@@ -146,6 +146,17 @@ pub struct NodeArrayCounters {
     pub start_lag_ms_counts: [u64; 16],
 }
 
+/// Why a node advertising `capabilities` refuses `assignment` for good, or
+/// `None` if it might run it (#788).
+pub fn capability_refusal(
+    capabilities: &crate::meat::job_capability::JobCapabilities,
+    assignment: &ArrayAssignment,
+    binary_allowed: bool,
+) -> Option<String> {
+    let _ = (capabilities, assignment, binary_allowed);
+    None
+}
+
 /// A node's answer about one array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArrayProgress {
@@ -697,6 +708,22 @@ impl TaskArrayNode {
         let default = self.config.default_concurrency.max(1);
         spec.per_node_concurrency
             .map_or(default, |cap| cap.min(default).max(1))
+    }
+
+    /// The kinds of job this node runs, as it advertises them over gossip
+    /// (#788).
+    pub fn job_capabilities(&self) -> crate::meat::job_capability::JobCapabilities {
+        crate::meat::job_capability::JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: true,
+            singleton_images: true,
+            singleton_image_limits: true,
+            encrypted_env: true,
+            network_policy: true,
+            mount_isolation: false,
+            binaries: true,
+        }
     }
 
     /// Why this node can never run `assignment`, if it can't: the same
@@ -1594,6 +1621,115 @@ mod tests {
             allow_from: vec!["frontend/web".into()],
         });
         assert!(node.admit(&task).unwrap_err().contains("allow_from"));
+    }
+
+    /// Runs a node is asked about in the advertisement tests, each named.
+    fn judged_runs() -> Vec<(&'static str, ArrayAssignment)> {
+        let with = |count: u32, template: &str| {
+            let mut task = assignment(1, count, &[]);
+            let template: crate::config::job::JobSpec = toml::from_str(template).unwrap();
+            task.program = template.exec.clone().unwrap_or_default();
+            task.template = Some(Box::new(template));
+            task
+        };
+        vec![
+            ("bare host array", assignment(1, 20, &[])),
+            (
+                "host template",
+                with(20, "runtime='process'\nexec='/bin/sh'\ncommand=['-c','true']"),
+            ),
+            (
+                "host template with limits",
+                with(
+                    20,
+                    "runtime='process'\nexec='/bin/sh'\ncommand=['-c','true']\ncpu='100m'",
+                ),
+            ),
+            (
+                "host binary off the allowlist",
+                with(20, "runtime='process'\nexec='/usr/bin/true'"),
+            ),
+            ("image singleton", with(1, "image='fixture:v1'")),
+            (
+                "image singleton with limits",
+                with(1, "image='fixture:v1'\nmemory='64Mi'"),
+            ),
+            ("image array", with(100, "image='fixture:v1'")),
+            (
+                "shared-runc array",
+                with(100, "runtime='shared-runc'\nimage='fixture:v1'"),
+            ),
+            (
+                "image with egress",
+                with(
+                    1,
+                    "image='fixture:v1'\n[egress]\nallow=['192.0.2.1:443']",
+                ),
+            ),
+        ]
+    }
+
+    /// #788: the leader judges a run from what each node advertises, so the
+    /// advertisement must reach the node's own verdict, word for word.
+    /// Otherwise admission would refuse a run the node would take, or quote
+    /// a different reason from the one the leader's tick would.
+    #[tokio::test]
+    async fn what_a_node_advertises_reaches_its_own_verdict_on_every_run() {
+        let root = tempfile::tempdir().unwrap();
+        let policies: [(&[&str], bool); 4] = [
+            (&[BINARY], false),
+            (&[BINARY], true),
+            (&[], false),
+            (&["/usr/bin/true"], false),
+        ];
+        for (allowed, mount_isolation) in policies {
+            let owned = super::super::task_runtime::OwnedRunner::new(
+                crate::grill::AnyGrill::Process(crate::grill::ProcessGrill::new()),
+            );
+            let runners = [
+                ("owned", NodeRunner::Owned(Box::new(owned))),
+                ("fake", NodeRunner::Fake(FakeRunner::always_succeeds())),
+                ("process", NodeRunner::Process(ProcessRunner::default())),
+            ];
+            for (runner_name, runner) in runners {
+                let node = TaskArrayNode::new(
+                    config(root.path(), policy(allowed, mount_isolation)),
+                    runner,
+                );
+                let advertised = node.job_capabilities();
+                assert_eq!(advertised.mount_isolation, mount_isolation);
+                assert_eq!(advertised.binaries, !allowed.is_empty());
+                for (run, task) in judged_runs() {
+                    let binary_allowed = node.config.policy.is_binary_allowed(&task.program);
+                    assert_eq!(
+                        capability_refusal(&advertised, &task, binary_allowed),
+                        node.refusal(&task),
+                        "{run} on a {runner_name} node allowing {allowed:?}, \
+                         mount_isolation = {mount_isolation}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #788: an owned node without the rootful Linux runtime says so, so the
+    /// leader refuses container arrays nobody can run at admission.
+    #[tokio::test]
+    async fn an_owned_process_node_advertises_no_containers() {
+        let root = tempfile::tempdir().unwrap();
+        let owned = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
+            crate::grill::ProcessGrill::new(),
+        ));
+        let node = TaskArrayNode::new(
+            config(root.path(), policy(&[BINARY], false)),
+            NodeRunner::Owned(Box::new(owned)),
+        );
+        let advertised = node.job_capabilities();
+        assert!(advertised.host);
+        assert!(!advertised.containers);
+        assert!(!advertised.singleton_images);
+        assert!(advertised.encrypted_env);
+        assert!(!advertised.network_policy);
     }
 
     #[tokio::test]

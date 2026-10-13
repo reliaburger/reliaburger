@@ -205,6 +205,11 @@ pub struct MustardNode<T: MustardTransport> {
     /// outgoing extension so the leader learns this voter should resign.
     /// `None` until wired — then the bit is always `false`.
     disk_pressured_rx: Option<watch::Receiver<bool>>,
+    /// The kinds of job this node runs (#788), published once its task
+    /// executor exists. Every outgoing extension advertises the latest value,
+    /// and the local directory lists it under this node. `None` until wired.
+    job_capabilities_rx:
+        Option<watch::Receiver<Option<crate::meat::job_capability::JobCapabilities>>>,
     /// This node's recovery fence (#424), whose claimed epoch every outgoing
     /// extension advertises. `None` until wired: then no epoch is claimed.
     recovery_fence_rx: Option<watch::Receiver<crate::council::fence::FenceSnapshot>>,
@@ -288,6 +293,7 @@ impl<T: MustardTransport> MustardNode<T> {
             advertised_labels: BTreeMap::new(),
             leader_hint_rx: None,
             disk_pressured_rx: None,
+            job_capabilities_rx: None,
             recovery_fence_rx: None,
             council_roles_rx: None,
             directory: NodeDirectory::default(),
@@ -357,6 +363,17 @@ impl<T: MustardTransport> MustardNode<T> {
     /// `disk_pressured` so the leader's reconciler can replace this voter.
     pub fn set_disk_pressured_watch(&mut self, rx: watch::Receiver<bool>) {
         self.disk_pressured_rx = Some(rx);
+    }
+
+    /// Wire the kinds of job this node runs (#788): the runtime publishes
+    /// them once its task executor exists, and every outgoing extension then
+    /// advertises the latest value, so the leader can refuse a run no live
+    /// node could take at submission.
+    pub fn set_job_capabilities_watch(
+        &mut self,
+        rx: watch::Receiver<Option<crate::meat::job_capability::JobCapabilities>>,
+    ) {
+        self.job_capabilities_rx = Some(rx);
     }
 
     /// Wire this node's recovery fence (#424): every outgoing extension then
@@ -430,6 +447,7 @@ impl<T: MustardTransport> MustardNode<T> {
             disk_pressured,
             recovery_epoch: recovery_claim.map(|claim| claim.epoch),
             recovery_id: recovery_claim.and_then(|claim| claim.id),
+            jobs: None,
             hmac: [0u8; 32],
         })
     }
@@ -2502,6 +2520,7 @@ mod tests {
             disk_pressured: false,
             recovery_epoch: None,
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         };
 
@@ -2560,6 +2579,7 @@ mod tests {
             disk_pressured: false,
             recovery_epoch: None,
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         });
         node.handle_message(addr(2), msg).await;
@@ -2591,6 +2611,81 @@ mod tests {
                 .disk_pressured
                 .contains(&NodeId::new("n2")),
             "n1 must learn n2's advertised disk pressure from gossip"
+        );
+    }
+
+    fn job_summary(mount_isolation: bool) -> crate::meat::job_capability::JobCapabilities {
+        crate::meat::job_capability::JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: false,
+            singleton_images: false,
+            singleton_image_limits: false,
+            encrypted_env: true,
+            network_policy: false,
+            mount_isolation,
+            binaries: true,
+        }
+    }
+
+    /// #788: n2 advertises the kinds of job it runs; n1 probes it and
+    /// learns them, which is what the leader's admission reads.
+    #[tokio::test(start_paused = true)]
+    async fn advertised_job_capabilities_reach_a_remote_member_via_gossip() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        node2.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        let (_jobs_tx, jobs_rx) = watch::channel(Some(job_summary(true)));
+        node2.set_job_capabilities_watch(jobs_rx);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+
+        probe_answered_by(&mut node1, answer(&mut node2)).await;
+
+        assert_eq!(
+            node1.directory().jobs.get(&NodeId::new("n2")),
+            Some(&job_summary(true)),
+            "n1 must learn n2's job capabilities from gossip"
+        );
+    }
+
+    /// #788: a node counts itself. The leader is a member too, and its own
+    /// summary never arrives over the wire, so it goes in the local
+    /// directory, and a change to it is published.
+    #[tokio::test]
+    async fn a_node_lists_its_own_job_capabilities_and_republishes_a_change() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
+        node.set_directory_watch(directory_tx);
+        node.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        let (jobs_tx, jobs_rx) = watch::channel(None);
+        node.set_job_capabilities_watch(jobs_rx);
+
+        node.run_one_cycle().await;
+        assert!(!directory_rx.borrow().jobs.contains_key(&NodeId::new("n1")));
+
+        jobs_tx.send(Some(job_summary(true))).unwrap();
+        node.run_one_cycle().await;
+        assert_eq!(
+            directory_rx.borrow().jobs.get(&NodeId::new("n1")),
+            Some(&job_summary(true))
+        );
+        let ping = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        assert_eq!(
+            ping.extension.and_then(|extension| extension.jobs),
+            Some(job_summary(true))
+        );
+
+        jobs_tx.send(Some(job_summary(false))).unwrap();
+        node.run_one_cycle().await;
+        assert_eq!(
+            directory_rx.borrow().jobs.get(&NodeId::new("n1")),
+            Some(&job_summary(false))
         );
     }
 
@@ -3036,6 +3131,7 @@ mod tests {
                 disk_pressured: false,
                 recovery_epoch: Some(epoch),
                 recovery_id: None,
+                jobs: None,
                 hmac: [0u8; 32],
             });
             message
@@ -3068,6 +3164,7 @@ mod tests {
             disk_pressured: true,
             recovery_epoch: Some(9),
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         });
         node.handle_message(addr(2), message).await;
@@ -3228,5 +3325,51 @@ mod tests {
             "the byte budget, not the count, must have stopped selection"
         );
         assert_eq!(node.dissemination.len(), queued, "nothing was dropped");
+    }
+
+    /// #788: the job summary joins a full label set and 63-byte names
+    /// without pushing the extension out of the probe, and the probe still
+    /// carries a membership update.
+    #[tokio::test]
+    async fn probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram() {
+        let long = |tag: &str| NodeId::new(format!("{}{tag}", "n".repeat(63 - tag.len())));
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(long("self"), addr(1), fast_config(), t1);
+        let labels = (0..16)
+            .map(|i| (format!("{i:0>16}"), "v".repeat(16)))
+            .collect();
+        node.set_advertised_endpoints(9117, 9445, labels);
+        let every = crate::meat::job_capability::JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: true,
+            singleton_images: true,
+            singleton_image_limits: true,
+            encrypted_env: true,
+            network_policy: true,
+            mount_isolation: true,
+            binaries: true,
+        };
+        let (_jobs_tx, jobs_rx) = watch::channel(Some(every));
+        node.set_job_capabilities_watch(jobs_rx);
+        for i in 0..20 {
+            node.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: long(&i.to_string()),
+                    address: addr(100 + i),
+                    state: NodeState::Suspect,
+                    incarnation: u64::MAX,
+                },
+                20,
+            );
+        }
+        let ping = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        assert_eq!(
+            ping.extension.as_ref().and_then(|extension| extension.jobs),
+            Some(every)
+        );
+        assert!(ping.encoded_len() <= super::super::message::MAX_DATAGRAM_BYTES);
+        assert!(!ping.payload.updates().is_empty());
     }
 }
