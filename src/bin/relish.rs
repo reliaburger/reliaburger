@@ -1464,7 +1464,7 @@ enum FaultAction {
         #[command(flatten)]
         targeting: reliaburger::relish::fault::FaultTargeting,
     },
-    /// Throttle bandwidth to a service.
+    /// Throttle bandwidth to a service (not implemented yet: Bun refuses it, #366).
     Bandwidth {
         /// Target service name.
         target: String,

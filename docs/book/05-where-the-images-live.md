@@ -678,8 +678,12 @@ backpressure: a slow disk slows the sender. Completion hashes the file with a
 content-addressed store. The digest must match before the blob becomes visible.
 Manifests still need parsing in memory, so they have a separate 4 MiB limit.
 
-A semaphore allows four simultaneous write requests. A fifth receives HTTP 429
-with `Retry-After: 1`; it doesn't sit in a queue retaining its body. Each upload
+A semaphore allows four simultaneous write requests. A fifth waits up to a
+minute for a slot, then receives HTTP 429 with `Retry-After: 1`. While it waits
+its body stays unread on the socket, so the queue costs a connection, not
+memory. (It used to get the 429 at once. Then docker pushed its layers in
+parallel and gave up on the whole image. "Four clients, no `--insecure`"
+below has the story.) Each upload
 also owns a one-permit semaphore, so a PATCH can't change a file while a PUT
 verifies it. An `OwnedSemaphorePermit` holds its semaphore through an `Arc`
 (shared ownership), rather than borrowing the request's stack. Moving it into
@@ -1064,6 +1068,45 @@ That test failed on its first run, and not on authentication. crane asks `HEAD /
 
 That's why the crane test exists at all. The spec says a registry "MUST" support manifest `HEAD`, and we could have read that sentence a dozen times and still missed that we didn't. A real client doesn't miss it.
 
+### Four clients, no `--insecure`
+
+Look at that crane test again, though. It passed `--insecure`, so crane never checked the certificate. It pushed with `append` and read back only the manifest, never a layer. And it ran behind a gate. Meanwhile the manual promised `docker push`, and the design doc added podman, skopeo and oras for good measure. For anyone wiring Reliaburger into their own CI, `docker push` is the first thing they'll try. So in 0.2.1 we made the claim earn its keep: CI now runs docker, podman, skopeo and crane against a Pickle TLS listener. Each one verifies the cluster CA the way a user would set it up, logs in with an API token, pushes a two-layer image, pulls every layer back and compares digests. Each is also refused three ways: a wrong token, another cluster's CA, and a scoped token pushing outside its namespace.
+
+Setting that up honestly took more thought than the tests did. docker treats every registry on `127.0.0.0/8` as insecure. It skips the certificate check and falls back to plaintext, which would hide exactly the failure we wanted to catch. So the tests can't use `localhost`. `scripts/standard-clients-host.sh --provision` maps `pickle-clients.test` to the machine's own LAN address in `/etc/hosts`, and each test issues a node certificate with that name, listens on that address, and drops its root CA into `/etc/docker/certs.d/<host:port>/ca.crt` (or the podman equivalent) for the length of the test.
+
+That last step is a nice excuse for `Drop`. The test holds a `TrustedCa` value, and Rust runs its `drop` method when the value goes out of scope, panic or no panic:
+
+```rust
+impl Drop for TrustedCa {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+```
+
+A C programmer would write a `goto cleanup`; Go has `defer`. Here the cleanup belongs to the type, so no test can forget it. A failed assertion unwinds the stack, every value on it is dropped, and the CA leaves `certs.d` either way.
+
+How do you prove a pull downloaded the layers rather than finding them in a local cache? Ask the server. The test wraps Pickle's router in one more `from_fn` layer that records every successful blob `GET` into an `Arc<Mutex<Vec<String>>>`. The mutex is `std::sync::Mutex`, not tokio's: the critical section is a single `push`, and nothing awaits while holding it. podman pulls into a second, empty image store. docker deletes the image and prunes its build cache first. Then each test asserts that every layer digest shows up in the log.
+
+docker found two bugs, and neither was one we were looking for.
+
+The first showed up only on CI's docker 28, which still uses the classic image store and pushes Docker's own schema 2 manifest, not an OCI one. Pickle stored it faithfully and then served it back as `application/vnd.oci.image.manifest.v1+json`, because the code that picked a `Content-Type` only knew two answers: an OCI index or an OCI manifest. docker compares the header with the `mediaType` inside the body and refused the pull: `mediaType in manifest should be 'application/vnd.oci.image.manifest.v1+json' not 'application/vnd.docker.distribution.manifest.v2+json'`. The push had worked. The pull of the very same image didn't. Now a manifest that names its own media type is served as that type, and `a_docker_schema_2_manifest_is_served_as_its_own_media_type` pins it for `GET` and `HEAD`.
+
+The second needed docker 29. With the containerd image store, docker 29 opens an upload for every blob of the image at once and streams them in parallel. Our little image was enough to fill all four of Pickle's write slots. The next request got a 429, and docker didn't retry it: the whole image failed with `unexpected status ... 429 Too Many Requests`. The slots were there to bound memory, not to turn clients away. A request waiting for a slot hasn't read its body, so it holds a socket and nothing else. So admission now waits:
+
+```rust
+match tokio::time::timeout(WRITE_ADMISSION_WAIT, writers.acquire_owned()).await {
+    Ok(Ok(permit)) => Some(permit),
+    Ok(Err(_)) | Err(_) => { /* 429 with Retry-After: 1, as before */ }
+}
+```
+
+`acquire_owned` returns a future that resolves when a permit frees up. `tokio::time::timeout` races it against a one-minute clock and gives back `Err(Elapsed)` if the clock wins. The inner `Result` is the semaphore's own: it fails only if someone closes the semaphore, which nobody does, but the type says it can happen, so the `match` handles it. The unit test `an_excess_writer_waits_for_a_free_slot_instead_of_failing` holds all four slots with uploads whose bodies never arrive, starts a fifth, then frees one slot and checks the fifth is admitted. It uses `#[tokio::test(start_paused = true)]`, so the minute-long timeout in its sibling test takes no wall-clock time at all.
+
+The rest were already right, and now there are tests to keep them that way. docker's anonymous `GET /v2/` gets the `Basic` challenge and an OCI error body. It now also gets `Docker-Distribution-API-Version: registry/2.0`, which the spec asks for and docker reads to tell a v2 registry from anything else. A blob `HEAD` returns the digest and the real length. And when skopeo copies an image between two repositories, it offers a cross-repository mount (`POST …/blobs/uploads/?mount=<digest>&from=<repo>`). Pickle doesn't mount. It answers `202` with an ordinary upload location, which the spec allows, and skopeo uploads the bytes instead. All three have portable tests next to the client ones, so you don't need docker installed to break them.
+
+oras speaks the same API, but nothing runs it, so the manual calls it untested. A claim you haven't checked belongs in the docs as a guess.
+
 The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients need a TLS listener, which a cluster node with an identity has and a plaintext node doesn't. Node certificates name the node rather than an address, so a hostname-verifying client has to reach the registry by the node's name and trust the cluster root CA. And a loopback-only TLS listener answers docker's anonymous probe with 200, so docker never learns to send credentials there. Clustered listeners are routable, so that last one only bites hand-built setups.
 
 Opening the door to docker also showed us who else could walk through it. The Basic middleware makes every client take the bearer path, and the bearer path checked the token's role but never its scope, so a Deployer scoped to one namespace could push to any repository. Repositories now map to namespaces (`team-a/web` belongs to `team-a`), and a scoped token can only push and pull inside its own. Chapter 10 has the rule and the awkward cases, like what a bare `web` belongs to.
@@ -1246,7 +1289,7 @@ The 104 tests in `src/pickle/` cover:
 - **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
 - **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
 - **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
-- **Standard clients** — a Deployer token as a Basic password over TLS pushes (`deployer_token_as_basic_password_over_tls_may_push`), a ReadOnly one is forbidden, an unknown one gets a 401 with a fresh `Basic` challenge, and a valid token over plaintext is still refused (`basic_credentials_over_plaintext_are_refused_even_with_a_valid_token`). `tests/suite/registry_standard_clients.rs` repeats the push through the real TLS listener, and its ignored `crane` test runs with `cargo nextest run --test suite --run-ignored=only -E 'test(crane)'` on a machine with crane installed.
+- **Standard clients** — a Deployer token as a Basic password over TLS pushes (`deployer_token_as_basic_password_over_tls_may_push`), a ReadOnly one is forbidden, an unknown one gets a 401 with a fresh `Basic` challenge, and a valid token over plaintext is still refused (`basic_credentials_over_plaintext_are_refused_even_with_a_valid_token`). `tests/suite/registry_standard_clients.rs` repeats the push through the real TLS listener and pins what docker relies on: the anonymous probe's challenge and version header, `HEAD` on a blob, and the mount fallback. Its ignored tests run real docker, podman, skopeo and crane with `make test-standard-clients` on a Linux host prepared by `scripts/standard-clients-host.sh`.
 - **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/suite/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
 - **Multi-platform builds** — fake OCI layouts written by the tests drive `read_oci_layout` (an index lists every platform; a missing, platformless or nested entry is refused) and `check_exported_platforms` (`an_export_missing_a_requested_platform_fails` is the original bug), and `drop_foreign_platform_variants` (`a_builder_stage_variant_is_dropped_from_the_foreign_architecture` is the Buildah one). `registry_routable_push::a_multi_platform_layout_publishes_every_platform` uploads a two-platform layout to a real registry and pulls each platform by digest, and `pickle_cluster::a_multi_platform_image_pulls_the_nodes_own_platform` pulls the same image as an amd64 node and as an arm64 one. The gated `buildah_build_lands_in_the_catalog` runs the real Buildah on CI's privileged Linux job and checks the index, both platform manifests, and that no containers or images stay behind.
 
@@ -1269,10 +1312,11 @@ An explicitly requested suite asserts its prerequisites and fails if they are mi
 never returns early and appears green without running. Chapter 15 explains the distinction
 between `#[cfg]`, `#[ignore]` and an executed test in detail.
 
-For an end-to-end smoke test of a real push and pull through Pickle on macOS:
+For an end-to-end push and pull with real clients, on Linux:
 
 ```sh
-make pickle-test-macos    # push/pull a real Docker image through Pickle (needs Docker Desktop)
+sudo scripts/standard-clients-host.sh --provision   # once per machine
+make test-standard-clients                          # docker, podman, skopeo, crane
 ```
 
 ### Running them

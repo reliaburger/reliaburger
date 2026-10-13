@@ -647,7 +647,10 @@ auto_rollback = false
         let deploy = app.deploy.as_ref().unwrap();
         assert_eq!(deploy.max_unavailable, Some(0));
         assert_eq!(deploy.auto_rollback, Some(false));
-        assert_eq!(deploy.strategy.as_deref(), Some("rolling"));
+        assert_eq!(
+            deploy.strategy,
+            Some(crate::meat::deploy_types::DeployStrategy::Rolling)
+        );
         let encoded = toml::to_string(&result.config).unwrap();
         assert_eq!(
             crate::config::Config::parse(&encoded).unwrap(),

@@ -202,7 +202,9 @@ pub fn replica_evidence(
     let paused = FaultType::Pause.to_string();
     let faulted_replicas = faults
         .iter()
-        .filter(|fault| fault.target_service == request.target_service)
+        .filter(|fault| {
+            fault.target_service == request.target_service && fault.namespace == request.namespace
+        })
         .filter(|fault| fault.fault_type == paused)
         .count() as u32;
     ReplicaEvidence {
@@ -443,5 +445,27 @@ mod tests {
                 faulted_replicas: 2,
             }
         );
+    }
+
+    #[test]
+    fn replica_evidence_ignores_pauses_in_another_namespace() {
+        let pause = |namespace: &str| FaultSummary {
+            id: 1,
+            fault_type: "pause".to_string(),
+            target_service: "web".to_string(),
+            namespace: Some(namespace.to_string()),
+            target_instance: None,
+            target_node: None,
+            remaining_secs: 30,
+            injected_by: "ops".to_string(),
+            node: None,
+            routed: Vec::new(),
+        };
+        let evidence = replica_evidence(
+            &request(FaultType::Kill { count: 1 }),
+            &spread(),
+            &[pause("team-b"), pause("team-b"), pause("default")],
+        );
+        assert_eq!(evidence.faulted_replicas, 1);
     }
 }

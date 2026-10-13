@@ -6,7 +6,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use reliaburger::council::{
-    CouncilConfig, CouncilNode, CouncilNodeInfo,
+    CouncilConfig, CouncilNode, CouncilNodeInfo, DesiredState,
     log_store::MemLogStore,
     network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter},
     state_machine::CouncilStateMachine,
@@ -75,6 +75,7 @@ fn router_for_council(
                 timestamp: SystemTime::UNIX_EPOCH,
                 running_apps: vec![],
                 cached_specs: vec![],
+                rollouts: Vec::new(),
                 resource_usage: reliaburger::reporting::types::ResourceUsage {
                     cpu_total_millicores: 8000,
                     memory_total_mb: 16384,
@@ -759,6 +760,32 @@ async fn scoped_admin_cannot_release_another_credentials_lease() {
     check_lease_admin_override("DELETE", StatusCode::NO_CONTENT).await;
 }
 
+/// The top-level desired-state fields that differ between two reads,
+/// ignoring what the leader writes on its own (#849). The router's
+/// task-array leader loop records each new wall-clock minute it observes
+/// (`CronObserve`): its first tick lands late under load, and later ones
+/// whenever a request straddles a minute boundary. That entry moves the log
+/// position and `cron_observed_minute`, so neither can show whether a
+/// request wrote.
+fn changed_desired_fields(before: &DesiredState, after: &DesiredState) -> Vec<String> {
+    let fields = |state: &DesiredState| {
+        let serde_json::Value::Object(mut fields) = serde_json::to_value(state).unwrap() else {
+            panic!("desired state serialises as an object");
+        };
+        fields.remove("last_applied_log");
+        if let Some(serde_json::Value::Object(arrays)) = fields.get_mut("task_arrays") {
+            arrays.remove("cron_observed_minute");
+        }
+        fields
+    };
+    let (before, after) = (fields(before), fields(after));
+    before
+        .keys()
+        .filter(|key| before.get(*key) != after.get(*key))
+        .cloned()
+        .collect()
+}
+
 /// Router configuration from the existing api_tokens fixture, with its command
 /// sender exposed for authority observations. No runtime/terminal proof is claimed.
 fn shared_authority_router(
@@ -905,6 +932,7 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             timestamp: SystemTime::UNIX_EPOCH,
             running_apps: vec![],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: reliaburger::reporting::types::ResourceUsage {
                 cpu_total_millicores: 8000,
                 memory_total_mb: 16384,
@@ -1129,9 +1157,12 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
                     .unwrap()
                     .unwrap();
                 let after = leader.desired_state().await;
-                assert_eq!(after.last_applied_log, before.last_applied_log);
                 assert_eq!(after.apps, before.apps);
-                assert_eq!(after.task_arrays, before.task_arrays);
+                assert_eq!(
+                    changed_desired_fields(&before, &after),
+                    Vec::<String>::new(),
+                    "denied pair changed desired state"
+                );
                 assert_eq!(
                     dispatches.load(Ordering::SeqCst),
                     dispatched_before,

@@ -1760,7 +1760,11 @@ fn render_status(
         .iter()
         .filter_map(|app| app.volume_home_away.as_ref().map(|home| (app, home)))
         .collect();
-    if !blocked.is_empty() || !waiting.is_empty() {
+    let failed: Vec<_> = desired
+        .iter()
+        .filter_map(|app| app.rollout_failed.as_ref().map(|failure| (app, failure)))
+        .collect();
+    if !blocked.is_empty() || !waiting.is_empty() || !failed.is_empty() {
         output.push('\n');
     }
     for (app, reason) in blocked {
@@ -1776,6 +1780,14 @@ fn render_status(
             output,
             "{} (namespace {}) waits for {home}, which holds its volume and is out of the cluster",
             app.app, app.namespace
+        );
+    }
+    // #692: the leader won't try this spec again until a different one is applied.
+    for (app, failure) in failed {
+        let _ = writeln!(
+            output,
+            "{} (namespace {}) RolloutFailed on {}: {}; apply a different spec or roll back",
+            app.app, app.namespace, failure.node, failure.reason
         );
     }
     output
@@ -4311,6 +4323,7 @@ spec:
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            rollout_failed: None,
             volume_homes: Vec::new(),
         }
     }
@@ -4337,12 +4350,35 @@ spec:
         );
     }
 
+    /// #692: an app whose rollout failed shows `RolloutFailed`, where and
+    /// why, and how to clear it.
+    #[test]
+    fn status_names_an_app_whose_rollout_failed() {
+        let failed = crate::bun::diagnostics::DesiredAppEvidence {
+            rollout_failed: Some(crate::meat::deploy_types::RolloutFailure {
+                fingerprint: "abc".to_string(),
+                node: "node-3".to_string(),
+                reason: "web-g2-0 failed its health check".to_string(),
+                at_unix_ms: 1,
+            }),
+            ..evidence("web", 3)
+        };
+        let output = render_status(&[], &[evidence("fine", 1), failed]);
+        assert_eq!(
+            output,
+            "no workloads running\n\n\
+             web (namespace prod) RolloutFailed on node-3: web-g2-0 failed its health check; \
+             apply a different spec or roll back\n"
+        );
+    }
+
     /// #423: an app waiting for the node that holds its volume isn't just
     /// missing from the table; status says which node it waits for.
     #[test]
     fn status_names_a_volume_app_waiting_for_its_home_node() {
         let waiting = crate::bun::diagnostics::DesiredAppEvidence {
             volume_home_away: Some("node-2".to_string()),
+            rollout_failed: None,
             ..evidence("db", 1)
         };
         let output = render_status(&[], &[evidence("fine", 1), waiting]);

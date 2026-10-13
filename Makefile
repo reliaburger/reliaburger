@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -67,8 +67,9 @@ test-upgrade-cluster: ## Run only the cluster self-upgrade tests
 test-apple: ## Run deferred Apple adapter development tests on Apple silicon
 	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(/^grill::apple::tests::/)'
 
-test-standard-clients: ## Push and pull through Pickle's TLS listener with crane (needs crane on PATH)
-	$(NEXTEST) --run-ignored=only -E 'binary(suite) & test(/^registry_standard_clients::crane_/)'
+test-standard-clients: ## Push and pull through Pickle's TLS listener with docker, podman, skopeo and crane (Linux; prepare with scripts/standard-clients-host.sh)
+	scripts/standard-clients-host.sh
+	$(NEXTEST) --run-ignored=only -E 'binary(suite) & test(/^registry_standard_clients::/)'
 
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
@@ -139,9 +140,6 @@ kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
 
 toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
-
-pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
-	./scripts/pickle-push-test.sh
 
 test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'

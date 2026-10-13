@@ -1421,6 +1421,9 @@ fn principal_body(path: &str) -> Option<&'static str> {
         "/v1/logs/export" => r#"{"destination":"/nonexistent/reliaburger-export"}"#,
         "/v1/nodes/decommission" => r#"{"node_id":"","workloads_stopped":true,"reason":"test"}"#,
         "/v1/batch/run" => r#"{"batch_id":1,"callback_base_url":null,"jobs":[]}"#,
+        "/v1/rollouts/failed" => {
+            r#"{"app_name":"web","namespace":"default","node":"node-1","fingerprint":"0","reason":"test"}"#
+        }
         "/v1/batch/{id}/report" => {
             r#"{"job_name":"job","namespace":"default","exit_code":0,"status":"completed"}"#
         }

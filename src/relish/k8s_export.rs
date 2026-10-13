@@ -196,7 +196,7 @@ fn export_app(
 
         let mut strategy = None;
         if let Some(ref deploy) = app.deploy {
-            if deploy.strategy.as_deref() == Some("rolling") {
+            if deploy.strategy == Some(crate::meat::deploy_types::DeployStrategy::Rolling) {
                 let mut rolling = RollingUpdateDeployment::default();
                 if let Some(surge) = deploy.max_surge {
                     rolling.max_surge = Some(IntOrString::Int(surge as i32));

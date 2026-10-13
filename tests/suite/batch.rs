@@ -158,6 +158,7 @@ impl Harness {
                         timestamp: std::time::SystemTime::UNIX_EPOCH,
                         running_apps: vec![],
                         cached_specs: vec![],
+                        rollouts: Vec::new(),
                         resource_usage: reliaburger::reporting::types::ResourceUsage {
                             cpu_total_millicores: 8000,
                             cpu_used_millicores: 0,
