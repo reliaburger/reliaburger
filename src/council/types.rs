@@ -936,7 +936,6 @@ mod tests {
             RaftRequest::CreateApiToken(crate::sesame::types::ApiToken {
                 name: "ci-deploy".to_string(),
                 token_hash: vec![1, 2, 3],
-                token_salt: vec![4, 5, 6],
                 role: crate::sesame::types::ApiRole::Deployer,
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
@@ -949,7 +948,6 @@ mod tests {
             RaftRequest::RotateApiToken(crate::sesame::types::TokenRotation {
                 name: "ci-deploy".to_string(),
                 token_hash: vec![7, 8, 9],
-                token_salt: vec![1, 1, 1],
                 rotated_at: std::time::SystemTime::UNIX_EPOCH,
                 expires_at: None,
                 previous_valid_until: Some(std::time::SystemTime::UNIX_EPOCH),

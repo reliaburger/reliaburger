@@ -7,7 +7,7 @@
 //! doesn't grant the route's action.
 //!
 //! The principals are injected as [`AuthContext`]s by a small test layer, so
-//! a single router can play every caller without paying Argon2 per request.
+//! a single router can play every caller without minting a token for each.
 //! The contexts are the same shapes the auth middleware builds: a bearer
 //! token, a read-only browser session (cookie), the internal system
 //! principal. `bearer_and_cookie_identities_hit_the_same_log_and_metric_gates`

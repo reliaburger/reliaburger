@@ -108,7 +108,6 @@ async fn a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file()
     let token = reliaburger::sesame::types::ApiToken {
         name: "admin".into(),
         token_hash: vec![1],
-        token_salt: vec![2],
         role: reliaburger::sesame::types::ApiRole::Admin,
         scope: Default::default(),
         expires_at: None,

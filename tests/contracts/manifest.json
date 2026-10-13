@@ -1204,22 +1204,22 @@
     {
       "id": "issue-539",
       "issue": 539,
-      "promise": "Registry token verification shares bounded asynchronous API admission.",
+      "promise": "Registry token verification uses the shared API token check.",
       "supported_paths": [
-        "Bearer and Basic credentials on registry reads and writes resume after admission becomes available."
+        "Bearer and Basic credentials on registry reads and writes authenticate through the shared API token check."
       ],
       "refused_paths": [
-        "Malformed credentials return unauthorized without waiting for expensive verification admission."
+        "Malformed credentials return unauthorized before any hashing."
       ],
       "boundaries": [
-        "A saturated verifier does not execute verification before acquiring a permit.",
+        "Registry credentials go through the API token check, which hashes once with SHA-256 and runs inline since #912, so there is no admission permit to wait for.",
         "Related TLS lifecycle fixtures check pooled connection retirement at the credential deadline, with a disabled-retirement negative control."
       ],
       "cases": [
         {
-          "id": "issue-539-malformed_registry_credentials_do_not_wait_for_verification_admission",
+          "id": "issue-539-malformed_registry_credentials_are_refused_before_hashing",
           "binary": "reliaburger",
-          "test": "pickle::api::tests::malformed_registry_credentials_do_not_wait_for_verification_admission",
+          "test": "pickle::api::tests::malformed_registry_credentials_are_refused_before_hashing",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -1229,9 +1229,9 @@
           ]
         },
         {
-          "id": "issue-539-registry_reads_and_writes_share_the_api_verification_admission",
+          "id": "issue-539-registry_reads_and_writes_authenticate_bearer_and_basic_credentials",
           "binary": "reliaburger",
-          "test": "pickle::api::tests::registry_reads_and_writes_share_the_api_verification_admission",
+          "test": "pickle::api::tests::registry_reads_and_writes_authenticate_bearer_and_basic_credentials",
           "requires": [
             "portable-linux",
             "portable-darwin"

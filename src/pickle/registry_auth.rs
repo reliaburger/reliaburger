@@ -80,7 +80,7 @@ pub async fn authenticate_writer(
         return Ok(Some(crate::sesame::auth::system_context()));
     }
 
-    let tokens = { auth.tokens.read().await.clone() };
+    let tokens = auth.tokens.read().await;
     if allow_unauthenticated_bootstrap && tokens.is_empty() && auth.service_token.is_none() {
         return Ok(None);
     }
@@ -88,7 +88,7 @@ pub async fn authenticate_writer(
     let Some(bearer) = bearer else {
         return Err(WriteDenied::Unauthenticated);
     };
-    match crate::sesame::auth::authenticate_off_lock(bearer, tokens).await {
+    match crate::sesame::auth::authenticate(bearer, &tokens) {
         Ok(ctx) => {
             // A registry push is a deploy-class mutation.
             if crate::sesame::token::check_role(ctx.role, ApiRole::Deployer).is_ok() {
@@ -130,10 +130,8 @@ pub async fn authorise_read(
     let Some(bearer) = bearer else {
         return Err(WriteDenied::Unauthenticated);
     };
-    let tokens = { auth.tokens.read().await.clone() };
-    crate::sesame::auth::authenticate_off_lock(bearer, tokens)
-        .await
-        .map_err(|_| WriteDenied::Unauthenticated)
+    let tokens = auth.tokens.read().await;
+    crate::sesame::auth::authenticate(bearer, &tokens).map_err(|_| WriteDenied::Unauthenticated)
 }
 
 /// Why a write was refused.

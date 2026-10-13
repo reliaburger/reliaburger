@@ -1,6 +1,6 @@
 # Locking It Down
 
-Phase 4 gave us the cryptographic foundation: a four-tier CA hierarchy, mTLS between nodes, API tokens with Argon2id hashing, secret encryption with age, and Raft log encryption at rest. That's solid infrastructure. But there's a piece missing that any serious distributed system needs: workload identity.
+Phase 4 gave us the cryptographic foundation: a four-tier CA hierarchy, mTLS between nodes, API tokens stored only as hashes, secret encryption with age, and Raft log encryption at rest. That's solid infrastructure. But there's a piece missing that any serious distributed system needs: workload identity.
 
 When your API server calls your database, how does the database know it's really the API server? When your payment processor talks to an external cloud service, how does it prove who it is? In Kubernetes, you'd reach for ServiceAccounts, IRSA, or Workload Identity Federation. We're going to build the equivalent from scratch.
 
@@ -492,7 +492,7 @@ When a node needs to sign a workload CSR or issue a join certificate, it reads t
 
 ## Token management
 
-API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (Argon2id-hashed before storage), `relish token list` shows active tokens via the `/v1/token/list` endpoint, `relish token rotate` gives one a new secret via `/v1/token/rotate`, and `relish token revoke` removes a token via `/v1/token/revoke`.
+API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (only its SHA-256 digest is stored), `relish token list` shows active tokens via the `/v1/token/list` endpoint, `relish token rotate` gives one a new secret via `/v1/token/rotate`, and `relish token revoke` removes a token via `/v1/token/revoke`.
 
 `relish token list` used to print `created_at` exactly as the API sent it, Unix seconds, and ignored `expires_at` altogether, so the one thing you most want to know about a CI token (when does it stop working?) was missing. The client now deserialises the response into a typed `TokenSummary` with `expires_at: Option<u64>` instead of poking at a `serde_json::Value`, and the table shows UTC times plus `never`, `(in 30d)` or `(expired)`. The `time` crate, already a dependency for certificate validity windows, does the calendar arithmetic: `OffsetDateTime::from_unix_timestamp` returns a `Result`, because an `i64` of seconds can land outside the years it can represent. The rendering is a pure function of the token list and "now", so an `insta` inline snapshot pins the whole table, and a change in the output shows up as a diff in the test source rather than a vague assertion failure.
 
@@ -559,7 +559,7 @@ pub enum MatchedSecret {
 
 The answer matters because of the principal. Back in "When was this token last used?" a token's principal became `token:<sha256 of its hash>`, so that a reused name never inherits anything. Rotation changes the hash, so it changes the principal, and the old secret keeps its own. A dashboard session is keyed by the principal that logged in, so a session opened with the old secret checks the *old* secret's `valid_until` on every request and ends with it. We didn't write any session-ending code for rotation. The identity we chose earlier did the work.
 
-Like the sweep, the rotation is decided before it reaches Raft. The node that takes the request mints the secret, hashes it (on the blocking pool, Argon2 being slow on purpose), reads the clock once and proposes a `RotateApiToken(TokenRotation)` carrying the new hash, the new expiry and the old secret's grace end. The state machine just installs it:
+Like the sweep, the rotation is decided before it reaches Raft. The node that takes the request mints the secret, hashes it, reads the clock once and proposes a `RotateApiToken(TokenRotation)` carrying the new hash, the new expiry and the old secret's grace end. The state machine just installs it:
 
 ```rust
 pub fn apply_rotation(token: &mut ApiToken, rotation: &TokenRotation) {
@@ -905,6 +905,8 @@ let ctx = tokio::task::spawn_blocking(move || {
 ```
 
 A `Semaphore` is a counter of permits: `acquire()` waits until one is free, and the permit is released when it drops. We hand it to the blocking closure so it's held for exactly the hashing and no longer. `spawn_blocking` moves CPU-heavy work off the async runtime's worker threads onto a dedicated pool; running Argon2 directly on an async task would stall every other task sharing that thread. Now a burst of bad bearers is turned away by a string check, the few that get through hash off-lock and at most four at a time, and an honest caller's request isn't stuck behind anyone's brute-force attempt.
+
+That held until 0.2.1, when we asked why the hash was slow at all. Chapter 4's "Token validation" tells that story: our tokens are 256 random bits, not passwords, so Argon2id bought no security and cost every request tens of milliseconds and about 19 MiB. With SHA-256 in its place a verification takes microseconds, which is less than the semaphore and the thread hop cost on their own, so both went (#912). `authenticate` checks the shape, hashes once and compares digests inline on the request's own task. Two of the three changes stayed: the middleware still clones the token list out from under the read lock (the handler it calls next can be slow, even if the hash isn't), and the shape check still turns junk away before any hashing.
 
 ### Escaping for the context you're in
 

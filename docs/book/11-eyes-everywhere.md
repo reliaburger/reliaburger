@@ -778,6 +778,8 @@ crate::sesame::auth::authenticate_off_lock(&form.token, tokens)
 
 Two tests pin both halves. With every permit held (a test-only `hold_all_verify_permits` calls `acquire_many` on the semaphore), a login of `nope` still comes back `401` inside the timeout, so it never went near Argon2. A well-shaped login under the same conditions is still pending after 200 ms, and finishes with a redirect once we drop the permits. A bound only works if every path to the expensive thing goes through it. Two copies of the same check is one too many.
 
+In 0.2.1 the expensive thing went away. Tokens are now stored as SHA-256 digests (Chapter 4 explains why Argon2 was the wrong hash for random tokens), so verifying one costs microseconds and the semaphore was removed with it. The lesson about a single path stayed: the login handler and the bearer middleware both call `sesame::auth::authenticate`, which does the shape check itself. The permit test went too, and `a_malformed_login_is_refused_promptly` is what's left.
+
 ### Node detail page
 
 Navigate to `/ui/node/node-01` for per-node resource charts (system CPU and memory from Mayo) and a table of all running instances on that node. App names link back to their detail pages.

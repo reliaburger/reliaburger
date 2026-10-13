@@ -7206,45 +7206,18 @@ fn login_request(token: &str) -> axum::http::Request<Body> {
 }
 
 #[tokio::test]
-async fn a_malformed_login_is_refused_without_touching_argon2() {
-    // Every verification permit is held, so any login that reached the
-    // Argon2 path would block. A junk token must be refused by the shape
-    // check alone, promptly (B12).
+async fn a_malformed_login_is_refused_promptly() {
+    // A junk token is refused by the shape check alone, before any hashing
+    // (B12).
     let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
-    let _permits = crate::sesame::auth::hold_all_verify_permits().await;
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         app.clone().oneshot(login_request("nope")),
     )
     .await
-    .expect("a malformed login must not wait for an Argon2 permit")
+    .expect("a malformed login must be refused promptly")
     .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    shutdown.cancel();
-}
-
-#[tokio::test]
-async fn a_well_shaped_login_shares_the_argon2_concurrency_bound() {
-    // With every permit held, a login that looks like a real token has to
-    // queue for the same semaphore the bearer path uses (B12) rather than
-    // hashing on the blocking pool unbounded.
-    let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
-    let permits = crate::sesame::auth::hold_all_verify_permits().await;
-    let pending = tokio::spawn(app.clone().oneshot(login_request(&token)));
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(
-        !pending.is_finished(),
-        "login verified without waiting for a permit"
-    );
-
-    // Releasing the permits lets the queued login finish normally.
-    drop(permits);
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
-        .await
-        .expect("login should proceed once a permit frees up")
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     shutdown.cancel();
 }
 

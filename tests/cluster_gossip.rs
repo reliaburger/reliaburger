@@ -1219,7 +1219,6 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
     let operator = ApiToken {
         name: "operator".into(),
         token_hash: vec![1; 32],
-        token_salt: vec![2; 16],
         role: ApiRole::Admin,
         scope: TokenScope::default(),
         expires_at: None,
@@ -1247,7 +1246,6 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
     let token = ApiToken {
         name: "rbtest-leader-scope".into(),
         token_hash: vec![3; 32],
-        token_salt: vec![4; 16],
         role: ApiRole::Deployer,
         scope: TokenScope {
             apps: None,

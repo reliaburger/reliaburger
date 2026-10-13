@@ -344,10 +344,8 @@ impl TokenScope {
 pub struct ApiToken {
     /// Human-readable name for the token.
     pub name: String,
-    /// Argon2id hash of the token secret.
+    /// SHA-256 digest of the full token secret (see `sesame::token::hash_secret`).
     pub token_hash: Vec<u8>,
-    /// Salt used for hashing.
-    pub token_salt: Vec<u8>,
     /// The role granted to this token.
     pub role: ApiRole,
     /// Optional scope restrictions.
@@ -368,10 +366,8 @@ pub struct ApiToken {
 /// clients can move to the new secret without an outage (F05 I3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreviousSecret {
-    /// Argon2id hash of the old secret.
+    /// SHA-256 digest of the old secret.
     pub token_hash: Vec<u8>,
-    /// Salt the old secret was hashed with.
-    pub token_salt: Vec<u8>,
     /// When the old secret stops working.
     pub valid_until: SystemTime,
 }
@@ -383,10 +379,8 @@ pub struct PreviousSecret {
 pub struct TokenRotation {
     /// The token being rotated.
     pub name: String,
-    /// Argon2id hash of the new secret.
+    /// SHA-256 digest of the new secret.
     pub token_hash: Vec<u8>,
-    /// Salt the new secret was hashed with.
-    pub token_salt: Vec<u8>,
     /// When the new secret was issued.
     pub rotated_at: SystemTime,
     /// When the new secret expires.
