@@ -355,3 +355,32 @@ pub(super) fn require_acceptance(
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_log_reports_each_new_problem_once_and_the_recovery() {
+        let mut log = RegistryCleanupLog::default();
+        assert_eq!(log.record(&Ok(())), None);
+
+        let refused = Err(PickleError::RegistryNeedsMtls);
+        let first = log.record(&refused).unwrap();
+        assert!(first.contains("the registry needs mTLS"), "{first}");
+        for _ in 0..10 {
+            assert_eq!(log.record(&refused), None);
+        }
+
+        let other = Err(unavailable("no advertised registry leader endpoint"));
+        assert!(log.record(&other).unwrap().contains("leader endpoint"));
+        assert_eq!(log.record(&other), None);
+
+        assert_eq!(
+            log.record(&Ok(())).as_deref(),
+            Some("pickle: registry cleanup resumed")
+        );
+        assert_eq!(log.record(&Ok(())), None);
+        assert!(log.record(&refused).is_some(), "a returning problem is news");
+    }
+}

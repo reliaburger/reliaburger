@@ -2234,6 +2234,45 @@ mod tests {
         }
     }
 
+    /// #792: a plaintext cluster's registry can't forward or replicate.
+    /// Every node says so, but the operator reads it once, with the fix.
+    #[test]
+    fn a_plaintext_cluster_registry_is_one_warning_naming_the_mtls_fix() {
+        let mut inputs = healthy_inputs();
+        let node = |node_id: &str| RegistryObservation {
+            node_id: node_id.to_string(),
+            clustered: true,
+            ready: true,
+            peer_reachable: true,
+            redundancy_possible: true,
+            under_replicated_layers: 0,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
+            needs_mtls: true,
+        };
+        inputs.cluster.registry = available(vec![node("node-1"), node("node-2")]);
+
+        let report = diagnose(&inputs);
+
+        let findings: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|item| item.id == "registry-needs-mtls")
+            .collect();
+        assert_eq!(findings.len(), 1, "{:?}", report.warnings);
+        assert!(findings[0].title.contains("mTLS"), "{}", findings[0].title);
+        assert!(
+            findings[0].suggestion.contains("relish init"),
+            "{}",
+            findings[0].suggestion
+        );
+        assert_eq!(
+            findings[0].details,
+            vec!["node-1".to_string(), "node-2".to_string()]
+        );
+        assert!(!report.ok.iter().any(|item| item.id == "registry"));
+    }
+
     #[test]
     fn app_scope_omits_cluster_checks_and_filters_other_apps() {
         let mut inputs = healthy_inputs();

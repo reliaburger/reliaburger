@@ -4747,6 +4747,20 @@ spec:
     }
 
     #[test]
+    fn status_says_once_that_a_plaintext_registry_needs_mtls() {
+        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
+        assert_eq!(render_registry_needs_mtls(&registry), "");
+
+        registry.needs_mtls = true;
+
+        let line = render_registry_needs_mtls(&registry);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.starts_with("registry: "), "{line}");
+        assert!(line.contains("needs mTLS"), "{line}");
+        assert!(line.contains("relish init"), "{line}");
+    }
+
+    #[test]
     fn image_delete_reads_repository_and_tag() {
         assert_eq!(parse_image_tag("web:v1").unwrap(), ("web", "v1"));
         assert_eq!(
