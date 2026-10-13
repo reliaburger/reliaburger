@@ -232,10 +232,24 @@ def fresh_activity(root):
     return active
 
 
-def validate(value, now, boot=None):
+# A proof taken this long before its snapshot started says nothing about it.
+MAX_AGE = 90
+# Guest and host stamp whole seconds from separately synced clocks.
+CLOCK_SKEW = 2
+
+
+def validate(value, started, boot=None, collected=None):
+    """The guest's proof, if it is complete and belongs to this snapshot.
+
+    The harness stamps the snapshot (`started`) before it asks the guests and
+    finishes collecting at `collected`, so a fresh proof is stamped between
+    the two. One from more than MAX_AGE before the start, or from after the
+    collection ended, is refused. Without `collected` the window closes at
+    `started`."""
     if not isinstance(value,dict) or value.get("schema")!=1 or value.get("complete") is not True:
         raise InvalidInventory("complete job kernel/storage inventory missing")
-    if not 0 <= now-value.get("ts",0) <= 90 or boot and value.get("boot")!=boot:
+    end=(started if collected is None else collected)+CLOCK_SKEW
+    if not started-MAX_AGE <= value.get("ts",0) <= end or boot and value.get("boot")!=boot:
         raise InvalidInventory("job inventory stale or from another boot")
     if value.get("errors"): raise InvalidInventory("; ".join(value["errors"][:4]))
     if type(value.get("available_kb")) is not int or value["available_kb"] < 256*1024:
