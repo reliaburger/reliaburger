@@ -4028,6 +4028,125 @@ async fn a_refused_launch_fails_the_deploy_and_the_instance_with_its_reason() {
     );
 }
 
+/// #905: a binary deleted between the pre-launch check and the owner gate's
+/// `exec` fails the deploy and the instance with the gate's reason, as one
+/// missing at `create` does, instead of leaving the instance in `starting`.
+#[tokio::test]
+async fn a_launch_refused_at_exec_fails_the_deploy_and_the_instance_with_its_reason() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_refused_start(Some(crate::grill::LaunchProblem::BinaryNotFound(
+        "/opt/ghost/server".into(),
+    )));
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    let Some(ApplyEvent::Error { message }) = events.last() else {
+        panic!("the deploy must fail: {events:?}");
+    };
+    assert!(
+        message.contains("binary not found: /opt/ghost/server"),
+        "{message}"
+    );
+
+    let (response, result) = oneshot::channel();
+    tx.send(AgentCommand::Status { response }).await.unwrap();
+    let instances = result.await.unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    let web = instances
+        .iter()
+        .find(|instance| instance.app_name == "web")
+        .expect("the failed instance stays listed");
+    assert_eq!(web.state, "failed");
+    assert_eq!(
+        web.reason.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+}
+
+/// What an instance looks like after restart ticks the runtime refused.
+struct RefusedRestart {
+    id: InstanceId,
+    state: ContainerState,
+    launch_failure: Option<String>,
+    retry_pending: bool,
+    restart_count: u32,
+}
+
+/// The instance after restart ticks that the runtime refused (#905).
+async fn restart_refused_by(
+    refuse: impl FnOnce(&MockGrill, crate::grill::LaunchProblem),
+) -> (RefusedRestart, MockGrill) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    // The binary vanishes while the app runs, then the app exits.
+    refuse(
+        &grill,
+        crate::grill::LaunchProblem::BinaryNotFound("/opt/ghost/server".into()),
+    );
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.drive_pending_restarts_to_completion().await;
+    // Later ticks must not spend the restart budget on it.
+    agent.check_apps().await;
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    let refused = RefusedRestart {
+        id: id.clone(),
+        state: instance.state,
+        launch_failure: instance.launch_failure.clone(),
+        retry_pending: instance.retry_pending,
+        restart_count: instance.restart_count,
+    };
+    (refused, grill)
+}
+
+/// #905: a restart the runtime refuses at `create` because the binary has
+/// gone is terminal, with the reason, as a fresh deploy's is. It doesn't
+/// spend the restart budget and end `Failed` without saying why.
+#[tokio::test]
+async fn a_restart_after_the_binary_vanished_fails_at_once_with_binary_not_found() {
+    let (instance, grill) =
+        restart_refused_by(|grill, problem| grill.set_refused_launch(Some(problem))).await;
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert_eq!(
+        instance.launch_failure.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+    assert!(!instance.retry_pending, "a refused launch is not retried");
+    assert_eq!(
+        instance.restart_count, 1,
+        "one attempt, not the whole budget"
+    );
+    let creates = grill
+        .calls()
+        .iter()
+        .filter(|(call, id)| call == "create" && id == &instance.id)
+        .count();
+    assert_eq!(creates, 2, "the deploy's create and one restart's");
+}
+
+/// #905: a restart whose `exec` the owner gate reports failed is terminal
+/// with the reason too.
+#[tokio::test]
+async fn a_restart_refused_at_exec_fails_at_once_with_binary_not_found() {
+    let (instance, _grill) =
+        restart_refused_by(|grill, problem| grill.set_refused_start(Some(problem))).await;
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert_eq!(
+        instance.launch_failure.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+    assert!(!instance.retry_pending, "a refused launch is not retried");
+    assert_eq!(
+        instance.restart_count, 1,
+        "one attempt, not the whole budget"
+    );
+}
+
 /// DEP4/codex-M3: a deploy that blocks on a slow image pull must not
 /// wedge the command loop. While one deploy is stuck inside `create`,
 /// a `Status` command on the running loop still answers promptly. With

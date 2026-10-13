@@ -84,6 +84,9 @@ pub struct MockGrill {
     fail_create: Arc<AtomicBool>,
     /// When set, `create` refuses the launch as a missing binary would (#881).
     refused_launch: Arc<Mutex<Option<super::LaunchProblem>>>,
+    /// When set, `start` refuses the launch as the owner gate's failed
+    /// `exec` would (#905).
+    refused_start: Arc<Mutex<Option<super::LaunchProblem>>>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
@@ -154,6 +157,7 @@ impl Default for MockGrill {
             fail_pid: Arc::default(),
             fail_create: Arc::default(),
             refused_launch: Arc::default(),
+            refused_start: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
@@ -238,6 +242,12 @@ impl MockGrill {
     /// Refuse every later `create` with this launch problem, or stop refusing.
     pub fn set_refused_launch(&self, problem: Option<super::LaunchProblem>) {
         *self.refused_launch.lock().unwrap() = problem;
+    }
+
+    /// Refuse every later `start` with this launch problem, as a binary
+    /// deleted between `create` and the gate's `exec` does, or stop refusing.
+    pub fn set_refused_start(&self, problem: Option<super::LaunchProblem>) {
+        *self.refused_start.lock().unwrap() = problem;
     }
 
     /// Fail start after recording the attempted runtime mutation.
@@ -741,6 +751,13 @@ impl super::Grill for MockGrill {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "injected start failure".into(),
+            });
+        }
+        let refused = self.refused_start.lock().unwrap().clone();
+        if let Some(problem) = refused {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
             });
         }
         Ok(())
