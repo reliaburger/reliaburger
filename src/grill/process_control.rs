@@ -76,6 +76,23 @@ impl ProcessControl {
         Ok(self.root.join(&id.0))
     }
 
+    // An inventory's read of an entry it enumerated, or none once it is gone.
+    // Only a forget or a prune removes an owner directory, and only a retired
+    // one, renamed away whole, so a vanished entry owned nothing (#877). A
+    // directory that is still there but unreadable is corrupt and refuses.
+    fn load_enumerated(&self, id: &InstanceId) -> io::Result<Option<OwnerRecord>> {
+        match self.load(id) {
+            Ok(record) => Ok(Some(record)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(self.directory(id)?) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                    _ => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn load(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
         let directory = self.directory(id)?;
         validate_directory(&self.root)?;
@@ -134,7 +151,9 @@ impl ProcessControl {
                             continue;
                         }
                         let instance_id = InstanceId(name);
-                        let record = this.load(&instance_id)?;
+                        let Some(record) = this.load_enumerated(&instance_id)? else {
+                            continue;
+                        };
                         let launch = record.launch;
                         launches.push(super::RuntimeLaunch {
                             generation: super::RuntimeGeneration::process(&record.nonce),
@@ -1054,6 +1073,32 @@ mod tests {
             control.load(&running).unwrap().phase,
             OwnerPhase::Running { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn owner_forgotten_after_enumeration_is_absent_from_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("executor-0".into());
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        assert_eq!(control.inventory().await.unwrap().len(), 1);
+        // An inventory has enumerated the owner while a forget, such as the
+        // one startup spawns for each retirement it finishes, deletes it.
+        control.forget_retired(&id).await.unwrap();
+        assert!(control.load_enumerated(&id).unwrap().is_none());
+        assert!(control.inventory().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_without_its_record_still_refuses_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("executor-0".into());
+        control.prepare(&id, &spec()).await.unwrap();
+        std::fs::remove_file(control.directory(&id).unwrap().join("owner.json")).unwrap();
+        assert!(control.load_enumerated(&id).is_err());
+        assert!(control.inventory().await.is_err());
     }
 
     #[tokio::test]

@@ -265,9 +265,9 @@ impl IntentJournal {
                     // No caller may allocate resources until atomic publication.
                     continue;
                 }
-                inventory.push(journal.load(&InstanceId(name))?.ok_or_else(|| {
-                    io::Error::other("runtime intent disappeared during inventory")
-                })?);
+                if let Some(record) = journal.load_published(&name, &entry.path())? {
+                    inventory.push(record);
+                }
             }
             inventory.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
             Ok(inventory)
@@ -289,6 +289,23 @@ impl IntentJournal {
             return Err(io::Error::other("invalid runtime intent configuration"));
         }
         Ok(())
+    }
+
+    // One published record an inventory enumerated at `path`, or none once
+    // it is gone. Only `IntentClaim::forget` removes a published record: it
+    // renames a retired generation away whole, under the instance's lock, so
+    // a record that vanished owned nothing and the inventory leaves it out,
+    // as it would have a moment later. Startup spawns that forget for every
+    // retirement it finishes and then reads the inventory, so the two do
+    // meet (#877). A directory that is still there but unreadable is corrupt
+    // and still refuses.
+    fn load_published(&self, name: &str, path: &Path) -> io::Result<Option<RuntimeIntent>> {
+        match self.load(&InstanceId(name.to_owned())) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !existing_directory(path)? => {
+                Ok(None)
+            }
+            result => result,
+        }
     }
 
     fn load(&self, instance: &InstanceId) -> io::Result<Option<RuntimeIntent>> {
@@ -645,8 +662,8 @@ fn create_directory(path: &Path) -> io::Result<()> {
 
 // A staging name may disappear between enumeration and atomic publication.
 // It has never authorised resource allocation. Every surviving entry still
-// needs the same private-directory checks, and published names never take this
-// exception.
+// needs the same private-directory checks. Published names never take this
+// exception; `IntentJournal::load_published` handles a forgotten one.
 fn unpublished_entry(name: &str, path: &Path) -> io::Result<bool> {
     if !name.starts_with(".preparing-") {
         return Ok(false);
@@ -661,6 +678,96 @@ fn unpublished_entry(name: &str, path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    fn journal(root: &Path) -> IntentJournal {
+        IntentJournal::new(
+            root.join("intents"),
+            IntentConfiguration {
+                bundle_directory: root.join("bundles"),
+                state_directory: root.join("state"),
+                image_directory: root.join("images"),
+                runc_program: "runc".into(),
+                rootless: false,
+                dns_nameserver: None,
+                node_index: 1,
+            },
+        )
+    }
+
+    fn spec() -> OciSpec {
+        use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
+        OciSpec {
+            reusable_executor: false,
+            host_process: false,
+            root: OciRoot {
+                path: "/".into(),
+                readonly: false,
+            },
+            process: OciProcess {
+                rlimits: Vec::new(),
+                args: vec!["sleep".into(), "60".into()],
+                env: vec![],
+                cwd: "/".into(),
+                user: OciUser { uid: 0, gid: 0 },
+                capabilities: None,
+                overrides: None,
+            },
+            mounts: vec![],
+            linux: OciLinux {
+                namespaces: vec![],
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+            port_mapping: None,
+        }
+    }
+
+    // Publishes and retires one generation, as a finished workload leaves it.
+    async fn retired_record(journal: &IntentJournal, instance: &InstanceId) -> IntentGeneration {
+        let claim = journal.claim(instance, None).await.unwrap();
+        let claim = claim.publish(&spec()).await.unwrap();
+        let claim = claim.retire(Some(0)).await.unwrap();
+        claim.record().unwrap().generation.clone()
+    }
+
+    #[tokio::test]
+    async fn record_forgotten_after_enumeration_is_absent_from_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        let instance = InstanceId("default__web-0".into());
+        let generation = retired_record(&journal, &instance).await;
+        let entry = std::fs::read_dir(journal.directory.join("records"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // An inventory has enumerated the record while a forget, such as the
+        // one startup spawns for each retirement it finishes, deletes it.
+        let claim = journal.claim(&instance, Some(generation)).await.unwrap();
+        claim.forget().await.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        assert!(
+            journal
+                .load_published(&name, &entry.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(journal.inventory().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn published_record_without_its_intent_still_refuses_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        let instance = InstanceId("default__web-0".into());
+        retired_record(&journal, &instance).await;
+        let directory = journal.directory.join("records").join(&instance.0);
+        std::fs::remove_file(directory.join("intent.json")).unwrap();
+        assert!(journal.load_published(&instance.0, &directory).is_err());
+        assert!(journal.inventory().await.is_err());
+    }
 
     #[test]
     fn vanished_prepublication_directory_has_never_authorised_a_launch() {
