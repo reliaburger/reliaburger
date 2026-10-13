@@ -282,19 +282,23 @@ fn observe_child_exit(entry: &mut ProcessEntry) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Signal an owned child's process group after `observe_child_exit` saw it
-/// still running.
+/// Signal an owned child, then its process group, after
+/// `observe_child_exit` saw it still running.
+///
+/// The child goes first because its exit code is the one we record. macOS
+/// delivers a group signal one member at a time, newest first, so a
+/// group-only signal reaches a shell's children before the shell, which can
+/// wake from `wait` and `exit 0` before its own signal lands: a killed
+/// workload would read as a clean exit (#916). Signalled first, the child
+/// reports the signal unless it had already exited on its own.
 ///
 /// The child is unreaped, so its process identifier (and the group named
-/// after it) can't be recycled while we hold it. A child that exits after
-/// the exit check is a zombie by the time the signal goes out. Linux
-/// delivers the group signal (or answers ESRCH) either way. macOS answers
-/// EPERM instead, because XNU skips zombies and exiting processes and
-/// reports EPERM when no member of the group accepted the signal (#723).
-/// On macOS an EPERM therefore checks the child again: if it has exited,
-/// its exit is recorded and there is nothing left to signal. If it hasn't,
-/// the child itself is signalled directly, which succeeds while it runs
-/// or exits, so only a genuine permission refusal comes back as an error.
+/// after it) can't be recycled while we hold it. A direct signal succeeds
+/// while the child runs or exits, so an error from it is a genuine
+/// permission refusal. The group signal can then still fail on macOS with
+/// EPERM, because XNU skips zombies and exiting processes and reports EPERM
+/// when no member of the group accepted the signal (#723). That refusal
+/// only re-checks the child, recording its exit if it has one.
 fn signal_child_group(
     entry: &mut ProcessEntry,
     signal: nix::sys::signal::Signal,
@@ -302,6 +306,10 @@ fn signal_child_group(
     let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) else {
         return Ok(());
     };
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => return Err(error.into()),
+    }
     #[cfg(unix)]
     let group = nix::unistd::Pid::from_raw(-(pid as i32));
     #[cfg(not(unix))]
@@ -309,16 +317,7 @@ fn signal_child_group(
     match nix::sys::signal::kill(group, signal) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         #[cfg(target_os = "macos")]
-        Err(nix::errno::Errno::EPERM) => {
-            observe_child_exit(entry)?;
-            if entry.state == ContainerState::Stopped {
-                return Ok(());
-            }
-            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-                Err(error) => Err(error.into()),
-            }
-        }
+        Err(nix::errno::Errno::EPERM) => observe_child_exit(entry),
         Err(error) => Err(error.into()),
     }
 }
@@ -1535,6 +1534,44 @@ mod tests {
         })
         .await
         .expect("stopping the workload left its shell descendant alive");
+    }
+
+    /// A killed shell that was waiting on its children must record the kill,
+    /// not the `exit 0` it runs if a group signal reaches its children first.
+    /// macOS signals a group one member at a time, newest first, so the
+    /// kill goes to the shell before its group (#916).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_records_a_shell_waiting_on_killed_children_as_killed() {
+        for round in 0..30 {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let script = format!(
+                "i=0; while [ $i -lt 400 ]; do sleep 60 & i=$((i+1)); done; \
+                 sleep 60 & touch '{}'; wait $!; exit 0",
+                ready.display()
+            );
+            let grill = ProcessGrill::new();
+            let id = InstanceId(format!("killed-shell-{round}"));
+            grill
+                .create(
+                    &id,
+                    &spec_with_args(vec!["sh".to_string(), "-c".to_string(), script]),
+                )
+                .await
+                .unwrap();
+            grill.start(&id).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !ready.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shell never started its children");
+            grill.kill(&id).await.unwrap();
+            wait_for_state(&grill, &id, ContainerState::Stopped).await;
+            assert_eq!(grill.exit_code(&id).await.unwrap(), None, "round {round}");
+        }
     }
 
     #[cfg(unix)]
