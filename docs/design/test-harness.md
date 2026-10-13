@@ -431,6 +431,15 @@ inherited, including the lock the shared Linux test VM queues its users on, and 
 that lock for an hour. `RootCleanup` now reads each node's runtime intents for those
 directories and kills whatever names them too.
 
+Cleanup also removes the root, mounts and all. A rootful Bun mounts a `reliaburger-identity`
+tmpfs for each workload beneath its volumes directory, and the mounts outlive Bun. Until
+#780 `RootCleanup` never removed the root, so every rootful run left its identity tmpfs
+mounted under `/tmp`. It now finishes with `clear_fixture_dir` from
+[`tests/support/fixture_dir.rs`](../../tests/support/fixture_dir.rs), the helper the
+cluster fixtures use, which unmounts everything beneath the root deepest first and then
+removes it. A root it can't remove fails a passing test; while a failed test unwinds, the
+error goes to stderr, because a second panic would abort the test binary.
+
 Cleanup must also stop at what the test owns. The scan reads every process on the host, and
 on a CI runner that includes the runner. Until #800 it killed the whole process group of any
 match outside the test's own group. From #758 on, a match could be any process with a file

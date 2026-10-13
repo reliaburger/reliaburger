@@ -6,7 +6,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use super::types::{FaultId, FaultRequest, FaultRule, FaultSummary};
+use super::types::{FaultId, FaultRequest, FaultRule, FaultSummary, FaultType};
 
 /// In-memory registry of active faults on this node.
 ///
@@ -187,11 +187,18 @@ impl FaultRegistry {
         self.faults.iter()
     }
 
-    /// Count faults targeting a specific service.
-    pub fn count_by_service(&self, service: &str) -> usize {
+    /// Count the pause faults on one namespace's service: the replicas the
+    /// replica-minimum rail treats as already out of service.
+    ///
+    /// Only a pause keeps a replica out for the fault's lifetime. A kill is
+    /// instantaneous, and a network or resource fault leaves the replica
+    /// running, so counting them refused faults that left plenty of replicas
+    /// serving. A same-named service in another namespace is someone else's.
+    pub fn count_paused(&self, namespace: Option<&str>, service: &str) -> usize {
         self.faults
             .iter()
-            .filter(|f| f.target_service == service)
+            .filter(|f| f.target_service == service && f.namespace.as_deref() == namespace)
+            .filter(|f| matches!(f.fault_type, FaultType::Pause))
             .count()
     }
 
@@ -217,7 +224,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::smoker::types::FaultType;
 
     fn delay_request(service: &str, duration_secs: u64) -> FaultRequest {
         FaultRequest {
@@ -489,16 +495,39 @@ mod tests {
         assert_eq!(summaries[1].target_service, "web");
     }
 
-    #[test]
-    fn count_by_service() {
-        let mut reg = FaultRegistry::new();
-        reg.insert(&delay_request("redis", 60));
-        reg.insert(&kill_request("redis"));
-        reg.insert(&delay_request("api", 60));
+    fn pause_request(service: &str, namespace: &str) -> FaultRequest {
+        FaultRequest {
+            fault_type: FaultType::Pause,
+            namespace: Some(namespace.into()),
+            ..kill_request(service)
+        }
+    }
 
-        assert_eq!(reg.count_by_service("redis"), 2);
-        assert_eq!(reg.count_by_service("api"), 1);
-        assert_eq!(reg.count_by_service("web"), 0);
+    #[test]
+    fn rail_counts_only_pauses_as_faulted_replicas() {
+        let mut reg = FaultRegistry::new();
+        let in_default = |mut request: FaultRequest| {
+            request.namespace = Some("default".into());
+            request
+        };
+        reg.insert(&in_default(delay_request("redis", 60)));
+        reg.insert(&in_default(kill_request("redis")));
+        reg.insert(&pause_request("redis", "default"));
+        reg.insert(&pause_request("api", "default"));
+
+        assert_eq!(reg.count_paused(Some("default"), "redis"), 1);
+        assert_eq!(reg.count_paused(Some("default"), "api"), 1);
+        assert_eq!(reg.count_paused(Some("default"), "web"), 0);
+    }
+
+    #[test]
+    fn rail_ignores_faults_in_another_namespace() {
+        let mut reg = FaultRegistry::new();
+        reg.insert(&pause_request("redis", "team-a"));
+        reg.insert(&pause_request("redis", "team-a"));
+
+        assert_eq!(reg.count_paused(Some("team-a"), "redis"), 2);
+        assert_eq!(reg.count_paused(Some("team-b"), "redis"), 0);
     }
 
     #[test]

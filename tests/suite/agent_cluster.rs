@@ -173,6 +173,7 @@ fn job_filled_report(
         timestamp: std::time::SystemTime::now(),
         running_apps: vec![],
         cached_specs: vec![],
+        rollouts: Vec::new(),
         resource_usage: reliaburger::reporting::types::ResourceUsage {
             cpu_total_millicores: 4000,
             memory_total_mb: 8192,
@@ -527,6 +528,7 @@ async fn tcp_reporting_transport_round_trip() {
         timestamp: SystemTime::now(),
         running_apps: vec![],
         cached_specs: vec![],
+        rollouts: Vec::new(),
         resource_usage: ResourceUsage::default(),
         event_log: vec![],
         job_reservations: Default::default(),

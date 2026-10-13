@@ -96,6 +96,10 @@ pub struct Compatibility {
 /// `DeleteTag::deleted_at_unix_ms` (deleting a tag now untags), the
 /// `ExpireManifest` request and `RegistryMutation::DeleteTag`; the registry
 /// `Usage` query is gone.
+/// Node-by-node rollouts and `RolloutFailed` (`DesiredState::rollouts`, the
+/// `RolloutFailed` and `RolloutReleased` requests, `StateReport::rollouts`,
+/// `NodeAssignment::held`, `/v1/rollouts/failed` and the
+/// `ApplyEvent::RolloutAborted` stream event, #692).
 /// Gossip robustness (#696): `GossipMessage::sequence` for replay
 /// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
 /// its own name) in place of `relayed`, and the reporting

@@ -847,7 +847,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             steps_total: new_ids.len(),
             spec: Some(Box::new(spec.clone())),
         };
-        self.deploy_history.write().await.push(entry);
+        super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
         Ok(())
     }
 

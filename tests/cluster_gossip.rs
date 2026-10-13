@@ -91,6 +91,7 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                         capacity_memory_mb: 8192,
                         job_reservations: Default::default(),
                         capacity_refusals: Vec::new(),
+                        rollouts: Vec::new(),
                     });
                 }
             }

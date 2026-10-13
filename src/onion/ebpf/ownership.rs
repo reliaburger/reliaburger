@@ -379,6 +379,12 @@ pub(super) fn load(
         }
         map_ids.insert(info.id());
     }
+    // The pinned maps outlive the Bun that wrote them, and faults don't:
+    // the new Bun's registry starts empty, so it would never delete a drop
+    // or partition entry its predecessor left, and the hook would keep
+    // applying it until its expiry with nothing in `fault list` (#699).
+    // Policy maps are kept; they are what this recovery exists to preserve.
+    crate::smoker::bpf_maps::cleanup_all_fault_maps(&mut bpf);
     let cgroup = File::open(&ownership.manifest.cgroup_path)?;
     for (index, name) in REQUIRED_PROGRAMS.iter().enumerate() {
         let program: &mut CgroupSockAddr = bpf

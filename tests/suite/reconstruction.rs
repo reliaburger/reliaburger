@@ -105,6 +105,7 @@ fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedStat
                 timestamp: SystemTime::now(),
                 running_apps,
                 cached_specs: vec![],
+                rollouts: Vec::new(),
                 resource_usage: ResourceUsage::default(),
                 event_log: vec![],
                 job_reservations: Default::default(),
