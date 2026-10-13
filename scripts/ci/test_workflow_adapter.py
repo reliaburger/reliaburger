@@ -200,6 +200,100 @@ class WorkflowAdapter(unittest.TestCase):
         self.needs['changes']['outputs']['macos'] = 'true'
         self.assertEqual(len(self.aggregate(event='pull_request')), 3)
 
+    def heavy_owners(self, macos):
+        """Add every heavy owner, sealed and successful, to the synthetic run.
+
+        Returns the calls the legacy ignored-owner check received, which the
+        tests patch out: its own fixtures live in test_oci_legacy_owner.py
+        and test_ignored_owners.py.
+        """
+        self.root.joinpath('Makefile').write_text(''.join(
+            f'{command[1]}:\n\ttrue\n' for command in self.a.w.OWNERS.values() if command[0] == 'make'))
+        script = self.root / self.a.w.OWNERS['oci-interruptions'][0]
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text('#!/bin/sh\n')
+        self.root.joinpath('scripts/ci').mkdir(parents=True, exist_ok=True)
+        self.root.joinpath('scripts/ci/legacy-oci-aliases.json').write_text('{}')
+        self.bindings = self.root / 'ignored-bindings.json'
+        self.bindings.write_text('[]')
+        for job in ['linux', 'build-tests', 'cluster', 'acceptance']:
+            self.needs[job] = dict(result='success', outputs={})
+        for gate in self.a.w.HEAVY_GATES:
+            self.manifest['gates'][gate] = dict(mode='ci', hosts=['linux'], command=self.a.w.OWNERS[gate],
+                                                required_in=['train-full', 'full'])
+            self.manifest['contracts'].append(dict(id=gate, issue=555, promise='synthetic heavy owner',
+                                                   supported_paths=['success'], refused_paths=['failure'],
+                                                   boundaries=['completion'],
+                                                   cases=[dict(id=gate + '-case', binary='reliaburger',
+                                                               test='tests::' + gate, requires=[gate],
+                                                               sources=['src/contract.rs'])]))
+        for gate in ['portable-linux', 'optimized-cron']:
+            self.manifest['gates'][gate]['required_in'].append('train-full')
+        self.manifest_path.write_text(json.dumps(self.manifest))
+        for gate, declaration in self.manifest['gates'].items():
+            for shard in ([1, 2, 3] if gate == 'portable-darwin' else [None]):
+                self.envelope(gate, declaration['hosts'][0], shard)
+        self.needs['changes']['outputs'].update(heavy='true', macos=macos)
+        if macos == 'false':
+            del self.needs['macos']
+            for shard in (1, 2, 3):
+                shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
+        return []
+
+    def aggregate_heavy(self, legacy, event='pull_request'):
+        legacy_owner = importlib.import_module('oci_legacy_owner')
+        ignored = importlib.import_module('ignored_owners')
+
+        def problems(root, incoming, bindings, owned):
+            legacy.append(set(owned))
+            return []
+
+        with patch.object(self.a.gates, 'candidate_sources'), patch.object(self.a, 'verify_owner', self.oracle), \
+                patch.object(legacy_owner, 'qualify', return_value=set()), \
+                patch.object(ignored, 'evidence_problems', problems):
+            return self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs,
+                                    self.bindings, event=event)
+
+    def test_a_full_ci_train_pull_request_needs_every_heavy_owner_but_not_macos(self):
+        legacy = self.heavy_owners(macos='false')
+        verified = self.aggregate_heavy(legacy)
+        self.assertEqual(set(verified), {(gate, self.manifest['gates'][gate]['hosts'][0])
+                                         for gate in self.a.w.OWNERS if gate != 'portable-darwin'})
+        # The heavy owners' ignored cases are still checked case by case.
+        self.assertEqual(len(legacy), 1)
+        self.assertIn(('make', 'test-cluster'), legacy[0])
+
+    def test_a_full_ci_train_pull_request_still_refuses_a_missing_heavy_owner(self):
+        self.heavy_owners(macos='false')
+        digest = self.needs['cluster']['outputs'].pop(self.a.output_name('cluster-tests'))
+        with self.assertRaisesRegex(c.Invalid, 'missing successful owner step output'):
+            self.aggregate_heavy([])
+        self.needs['cluster']['outputs'][self.a.output_name('cluster-tests')] = digest
+        self.needs['acceptance']['result'] = 'skipped'
+        with self.assertRaises(c.Invalid):
+            self.aggregate_heavy([])
+
+    def test_push_and_merge_queue_still_demand_the_macos_owners(self):
+        # Only a pull request may leave the macOS shards out: the train push,
+        # the merge queue, schedules and manual runs need every owner.
+        legacy = self.heavy_owners(macos='false')
+        for event in ['push', 'merge_group', 'schedule', 'workflow_dispatch']:
+            with self.subTest(event=event), self.assertRaisesRegex(c.Invalid, 'every owner'):
+                self.aggregate_heavy(legacy, event=event)
+        # Claiming macOS ran without its shards' sealed outputs fails too.
+        self.needs['changes']['outputs']['macos'] = 'true'
+        self.needs['macos'] = dict(result='success', outputs={})
+        for event in ['push', 'merge_group']:
+            with self.subTest(event=event, macos='claimed'), \
+                    self.assertRaisesRegex(c.Invalid, 'missing successful owner step output'):
+                self.aggregate_heavy(legacy, event=event)
+
+    def test_push_and_merge_queue_pass_with_every_owner_macos_included(self):
+        legacy = self.heavy_owners(macos='true')
+        for event in ['push', 'merge_group']:
+            with self.subTest(event=event):
+                self.assertEqual(len(self.aggregate_heavy(legacy, event=event)), len(self.a.w.OWNERS))
+
     def test_missing_job_cannot_be_inferred_completed_from_reports(self):
         del self.needs['macos']
         with self.assertRaises(c.Invalid):

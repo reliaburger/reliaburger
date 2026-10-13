@@ -104,6 +104,7 @@ pub struct Compatibility {
 /// capability report (`NodeCapabilities::process`), the apps placed only in
 /// part (`RaftRequest::Unschedulable`, `DesiredState::unschedulable` and
 /// `DesiredAppEvidence::unschedulable`), and the `placement` event kind.
+/// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

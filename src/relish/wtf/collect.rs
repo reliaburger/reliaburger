@@ -936,6 +936,7 @@ fn collect_registry(
                     under_replicated_layers: registry.under_replicated_layers,
                     lost_images: registry.lost_images,
                     lost_image_count: registry.lost_image_count,
+                    needs_mtls: registry.needs_mtls,
                 });
             }
         }

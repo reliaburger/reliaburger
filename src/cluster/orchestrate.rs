@@ -1098,7 +1098,6 @@ pub fn plan_pass(
             .with_daemon_credit(committed_footprints(desired, app_id));
         let Placed { decision, unplaced } = scheduler.place_app(app_id, &effective_spec);
         *cache = scheduler.cluster;
-        let mut kept = kept;
         if let Some(unplaced) = unplaced {
             unschedulable.insert(
                 app_id.clone(),

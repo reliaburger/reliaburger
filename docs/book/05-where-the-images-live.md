@@ -1278,6 +1278,51 @@ pub fn image_pin_digest(image: &str) -> Option<&str> {
 
 Deleting by digest answers `405 UNSUPPORTED`. The OCI spec allows a registry to refuse, and refusing keeps one rule: an image leaves by losing its tags, and only after the retention window. That window is your undo. An untagged image stays pullable by digest for a week by default, and `relish rollback` can still reach it.
 
+### A plaintext cluster has no registry
+
+While building all this we kept seeing one line in the upgrade fixture's logs, once a second, forever: `pickle: registry cleanup pending: replication failed: registry leader refused proposal: 403 Forbidden`. A missing token? No. The fixture runs a cluster with a master key but no node certificates, like every `relish dev` cluster. A node sends its registry proposals and queries to the leader's `/v1/registry/propose` and `/v1/registry/query`, and the leader works out *which node is asking* from the TLS client certificate. No certificate, no answer. The lease reaper asks every second, so it got refused every second.
+
+We had three ways out. Accept the service token alone on plaintext clusters, and any holder of the token could claim to be any node and report copies it doesn't have. Have the leader answer its own queries locally, and the followers stay broken. Or keep the endpoints mTLS-only and say so clearly. We took the last one. A plaintext cluster is a development convenience, and a registry that trusts whoever claims to be node 3 isn't something we want to grow a second code path for.
+
+Saying so clearly turned out to be most of the work. The forwarder already knows its transport, so it refuses before sending anything:
+
+```rust
+pub fn requires_mtls(&self) -> bool {
+    #[cfg(test)]
+    if self.plaintext_stand_in {
+        return false;
+    }
+    self.http.scheme() != "https"
+}
+```
+
+`#[cfg(test)]` isn't only for whole modules. It can sit on a struct field, a statement or an `if`, and the compiler drops whatever it marks from a normal build, so production code has no way to switch the check off. The unit tests that drive the forwarder against a plaintext stand-in for the leader (an axum handler that takes no certificate) opt in with `against_plaintext_stand_in()`.
+
+Every proposal and query on a plaintext cluster now ends in `PickleError::RegistryNeedsMtls`, whose message names the fix: start the cluster with TLS, `relish init` then `relish join`. A push answers 503 with that text, `relish status` prints `registry: needs mTLS`, and `relish wtf` raises one `registry-needs-mtls` warning listing the nodes, rather than one per node.
+
+That leaves the once-a-second log line. The reaper keeps running (a transient leader loss should still clear itself up), but it logs through a small struct that remembers the last thing it said:
+
+```rust
+pub fn record(&mut self, result: &Result<(), PickleError>) -> Option<String> {
+    match result {
+        Ok(()) => self
+            .last
+            .take()
+            .map(|_| "pickle: registry cleanup resumed".to_string()),
+        Err(error) => {
+            let line = format!("pickle: registry cleanup pending: {error}");
+            if self.last.as_ref() == Some(&line) {
+                return None;
+            }
+            self.last = Some(line.clone());
+            Some(line)
+        }
+    }
+}
+```
+
+`Option::take` moves the value out and leaves `None` behind, in one step. It's how you empty an `Option` you only borrow mutably: the borrow checker won't let you move out of `&mut self` and leave a hole, so `take` swaps in a valid value as it goes. `as_ref` turns `&Option<String>` into `Option<&String>`, so the comparison borrows instead of cloning. A new problem prints, a repeat prints nothing, and the first success afterwards prints once. `plaintext_cluster_registry_cleanup_is_refused_once_with_the_mtls_answer` serves the real Bun API without TLS, counts the requests it receives, runs six reaper ticks and checks for exactly one line and zero requests. Over mTLS, `worker_and_follower_pushes_commit_through_the_advertised_leader` runs the same tick and watches the retirement apply.
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.

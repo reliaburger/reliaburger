@@ -116,14 +116,14 @@ the repositories the caller may read. Before this, a namespace-scoped Deployer c
 to any repository through `docker push`, and a bare build destination counted as
 `default`.
 
-What works where, in 0.1.0:
+What works where:
 
 | Listener | Bearer clients (`relish build`) | Basic clients (docker, crane) |
 |----------|--------------------------------|-------------------------------|
 | Standalone, loopback, no API token yet | open (bootstrap window) | anonymous push works; Basic refused |
 | Standalone, loopback, tokens exist | token | refused: plaintext |
 | Cluster with node identity (TLS, routable) | token | `docker login` / `crane auth login` with a token |
-| Cluster without node identity (plaintext) | token | refused: plaintext |
+| Cluster without node identity (plaintext) | refused: the registry needs mTLS (§8.5) | refused: plaintext |
 
 Node certificates name the node (its node id), not an IP address or `localhost`, so a
 client that verifies hostnames (docker, crane) must reach the registry by the node's name
@@ -1241,6 +1241,14 @@ anonymous access for that host. Credentials are:
 ### 8.4 Inter-Node Layer Transfer
 
 All layer transfers between nodes occur over the cluster's mTLS connections (Sesame node certificates). No layer data travels in plaintext. Node identity is verified by the certificate common name, preventing a rogue node from intercepting layer transfers.
+
+### 8.5 Registry Control Traffic Needs mTLS
+
+Every catalogue change and every authoritative read goes through the council leader. A follower or worker sends `POST /v1/registry/propose` (manifest commits, writer claims, copy confirmations, GC reports, retirements, tag deletes) and `POST /v1/registry/query` (GC generation, image list, repository view, lease owner, retirements) to the leader's API. Both endpoints require the internal service token **and** a TLS client certificate. The leader takes the proposing node's identity from that certificate's URI SAN and builds the Raft request for that node, so a node can only report its own copies and its own cleanup. The service token alone can't, because any holder of the token could then claim to be any node (#792).
+
+So a plaintext cluster (`require_mtls = false` with no node identities, as `relish dev` and the upgrade fixture run) has no cluster registry. `RegistryForwarder::requires_mtls` is true when its transport is plaintext, and the forwarder then answers every proposal and query with `PickleError::RegistryNeedsMtls` without sending anything: "the registry needs mTLS … start the cluster with TLS (`relish init`, then `relish join` on each node)". Registry writes answer 503 with that message. The leader's own local proposals (heal, expiry) still commit, because they don't forward, but pushes, builds, catalogue reads and Pickle-resolved pulls all need a query, so they fail. Bun logs the refusal once at start-up. The 1 s lease reaper logs through `RegistryCleanupLog`, which prints a problem once, stays quiet while it repeats, and prints "registry cleanup resumed" when a pass succeeds. The capability evidence carries `needs_mtls`, `relish status` prints `registry: needs mTLS`, and `relish wtf` raises one `registry-needs-mtls` warning listing the nodes.
+
+A standalone node (no `--cluster`) has no forwarder: it commits to its local catalogue and is unaffected.
 
 ---
 

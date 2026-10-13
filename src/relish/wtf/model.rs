@@ -325,6 +325,10 @@ pub struct RegistryObservation {
     /// How many images are Lost, including any the report left unnamed.
     #[serde(default)]
     pub lost_image_count: usize,
+    /// Whether the node's registry can't forward or replicate because the
+    /// cluster runs plaintext transports (#792).
+    #[serde(default)]
+    pub needs_mtls: bool,
 }
 
 /// A recent application log line used only for correlation.

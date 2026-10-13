@@ -691,6 +691,13 @@ The real win is the light set. A pull request into a train no longer touches mac
 and hears back in 15 to 20 minutes instead of about 50. Making macOS itself faster means
 compiling once, not testing in parallel.
 
+The `full-ci` label turned out to be the leak. Most train pull requests touch privileged
+Linux, the cluster or acceptance, so most of them wore it, and each one then asked for three
+macOS runners that queued for over an hour. So on a pull request into a train, `full-ci` now
+means every heavy job except macOS: select jobs says `heavy=true, macos=false`, and the
+aggregator calls that selection `train-full`, accepted, like the light set, only when the
+event is `pull_request`. The queue and the push to the train still demand all three shards.
+
 ## Dependencies are code too
 
 The lockfile is part of the programme. A perfectly tested call into a vulnerable archive

@@ -323,15 +323,54 @@ impl PickleState {
         Ok(())
     }
 
+    /// One reaper pass, returning the line to log, if any. The reaper runs
+    /// every second, so a problem that persists is logged once, not once a
+    /// tick (#792).
+    pub async fn reap_registry_leases_tick(&self, log: &mut RegistryCleanupLog) -> Option<String> {
+        let result = self.reap_registry_leases_once().await;
+        log.record(&result)
+    }
+
     /// Reclaim only this node's obligations until shutdown, retaining uncertain work.
     pub async fn run_registry_lease_reaper(self, shutdown: tokio_util::sync::CancellationToken) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut log = RegistryCleanupLog::default();
         loop {
             tokio::select! { _ = shutdown.cancelled() => return, _ = ticker.tick() => {} }
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                result = self.reap_registry_leases_once() => if let Err(error) = result { eprintln!("pickle: registry cleanup pending: {error}"); }
+                line = self.reap_registry_leases_tick(&mut log) => if let Some(line) = line { eprintln!("{line}"); }
+            }
+        }
+    }
+}
+
+/// What the registry lease reaper last reported, so a persistent problem,
+/// such as a plaintext cluster's registry needing mTLS, is logged once
+/// rather than every second.
+#[derive(Debug, Default)]
+pub struct RegistryCleanupLog {
+    /// The problem line last logged, until a pass succeeds.
+    last: Option<String>,
+}
+
+impl RegistryCleanupLog {
+    /// The line to log for one pass's outcome: a new or changed problem, or
+    /// the first success after one. A repeat of the last problem is `None`.
+    pub fn record(&mut self, result: &Result<(), PickleError>) -> Option<String> {
+        match result {
+            Ok(()) => self
+                .last
+                .take()
+                .map(|_| "pickle: registry cleanup resumed".to_string()),
+            Err(error) => {
+                let line = format!("pickle: registry cleanup pending: {error}");
+                if self.last.as_ref() == Some(&line) {
+                    return None;
+                }
+                self.last = Some(line.clone());
+                Some(line)
             }
         }
     }
@@ -353,5 +392,37 @@ pub(super) fn require_acceptance(
         other => Err(unavailable(format!(
             "registry lease proposal refused: {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_log_reports_each_new_problem_once_and_the_recovery() {
+        let mut log = RegistryCleanupLog::default();
+        assert_eq!(log.record(&Ok(())), None);
+
+        let refused = Err(PickleError::RegistryNeedsMtls);
+        let first = log.record(&refused).unwrap();
+        assert!(first.contains("the registry needs mTLS"), "{first}");
+        for _ in 0..10 {
+            assert_eq!(log.record(&refused), None);
+        }
+
+        let other = Err(unavailable("no advertised registry leader endpoint"));
+        assert!(log.record(&other).unwrap().contains("leader endpoint"));
+        assert_eq!(log.record(&other), None);
+
+        assert_eq!(
+            log.record(&Ok(())).as_deref(),
+            Some("pickle: registry cleanup resumed")
+        );
+        assert_eq!(log.record(&Ok(())), None);
+        assert!(
+            log.record(&refused).is_some(),
+            "a returning problem is news"
+        );
     }
 }
