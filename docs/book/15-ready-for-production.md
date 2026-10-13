@@ -3024,6 +3024,13 @@ still be fenced. So `recent_observation` only offers a snapshot younger than
 four stale windows (two minutes by default). After that the worker goes
 quiet and the leader does what it did before.
 
+What it did before changed in 0.2.1 (#702). A stale node used to keep its
+fixed replicas for good while losing its daemon copies at once. Now both hold
+for `[reporting_tree] stale_node_grace_secs`, five minutes by default, and
+then move, so a node whose worker wedged for good doesn't keep its replicas
+off the cluster forever, and one that stalls for a minute moves nothing.
+Chapter 2 has the details.
+
 `recent_observation` returns `Option<&ObservedSnapshot>`, a reference into the
 worker's own field. The `&` means the caller borrows the snapshot rather than
 taking it. The report builder consumes its snapshot by value, so the call

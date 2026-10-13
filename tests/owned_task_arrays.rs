@@ -3295,6 +3295,7 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
                 data_dir_prefix: "rb-leader-loss",
                 data_root: Some(root.clone()),
                 stale_report_timeout_secs: 10,
+                stale_node_grace: None,
                 metrics_rollup: None,
                 scheduler: None,
                 lease_reaper: false,

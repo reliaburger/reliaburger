@@ -7822,6 +7822,34 @@
       "boundaries": [
         "Run through the real Linux gate on a loop-mounted Btrfs; the portable tests cover every intent decision with plain directories. The power cut itself stays with the Btrfs power-cut fixture of #287."
       ]
+    },
+    {
+      "id": "issue-702-stale-node-grace",
+      "issue": 702,
+      "promise": "A node alive in gossip whose reports stopped keeps its replicas for the stale-node grace, then loses them to the survivors.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs, with one node's agent stopped while its gossip and Raft carry on"
+      ],
+      "refused_paths": [
+        "The silent node's replica never moves before its reports have been stale for the grace."
+      ],
+      "boundaries": [
+        "The grace is measured on the leader's clock from when the node's reports went stale; a node the leader never heard from counts from when it started listening."
+      ],
+      "cases": [
+        {
+          "id": "stale-node-grace-replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "binary": "reliaburger::placement",
+          "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ]
     }
   ]
 }

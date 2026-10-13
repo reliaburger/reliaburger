@@ -1786,5 +1786,11 @@
     "function": "crane_pulls_layers_back_with_ca_verification",
     "binary": "reliaburger::suite",
     "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+    "binary": "reliaburger::placement",
+    "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace"
   }
 ]

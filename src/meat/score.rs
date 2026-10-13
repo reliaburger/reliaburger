@@ -3,7 +3,8 @@
 /// Ranks candidate nodes. Spread comes first: a node running fewer replicas
 /// of the app always outranks one running more. Among nodes that run the
 /// same number, a weighted score on a 0–90 scale decides (higher is better):
-/// - Bin-packing (50): prefer fuller nodes to maximise density
+/// - Bin-packing (50): prefer nodes fuller in CPU and memory, evenly, to
+///   maximise density
 /// - Preferred labels (20): prefer nodes matching soft constraints
 /// - Image locality (15): prefer nodes with cached images
 /// - Stability (5): prefer longer-running nodes
@@ -66,16 +67,7 @@ fn compute_score(
         None => return 0,
     };
 
-    // Bin-packing: prefer nodes that will be more utilised after placement.
-    // Score = utilisation_after / allocatable * 100
-    // Nodes with zero allocatable CPU get a neutral score of 50.
-    let bin_pack = {
-        let allocated_after = node.allocated.cpu_millicores + resources.cpu_millicores;
-        (allocated_after * 100)
-            .checked_div(node.allocatable.cpu_millicores)
-            .map(|v| v.min(100) as u32)
-            .unwrap_or(50u32)
-    };
+    let bin_pack = bin_packing_score(node, resources);
 
     // Preferred labels: proportion of preferred labels that match.
     let preferred = if preferred_labels.is_empty() {
@@ -109,6 +101,54 @@ fn compute_score(
         + stability * WEIGHT_STABILITY;
 
     total / 100
+}
+
+/// Bin-packing (D30): prefer the node that is fuller in both CPU and memory
+/// after placement, 0-100.
+///
+/// The score is the average of the two utilisations, less a tenth of the gap
+/// between them. Filling one dimension and leaving the other empty strands
+/// the empty one, since nothing can use memory without CPU to run on, so a
+/// lopsided node scores lower than a balanced one at the same average. A
+/// node that reports none of a resource is scored on the other alone, and
+/// one that reports neither gets a neutral 50.
+///
+/// Integer percentages keep the score deterministic on every platform: a
+/// float could round differently and break ties another way.
+fn bin_packing_score(
+    node: &super::cluster_state::SchedulerNodeState,
+    resources: &Resources,
+) -> u32 {
+    let cpu = utilisation_after(
+        node.allocated.cpu_millicores,
+        resources.cpu_millicores,
+        node.allocatable.cpu_millicores,
+    );
+    let memory = utilisation_after(
+        node.allocated.memory_bytes,
+        resources.memory_bytes,
+        node.allocatable.memory_bytes,
+    );
+    let score = match (cpu, memory) {
+        (Some(cpu), Some(memory)) => {
+            let average = (cpu + memory) / 2;
+            average.saturating_sub(cpu.abs_diff(memory) / 10)
+        }
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => 50,
+    };
+    // At most 100, so the conversion can't fail.
+    u32::try_from(score).unwrap_or(100)
+}
+
+/// How full a resource is once `request` joins `allocated`, as a percentage
+/// of `allocatable` capped at 100. `None` when the node has none of it.
+fn utilisation_after(allocated: u64, request: u64, allocatable: u64) -> Option<u64> {
+    allocated
+        .saturating_add(request)
+        .saturating_mul(100)
+        .checked_div(allocatable)
+        .map(|percent| percent.min(100))
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +205,52 @@ mod tests {
         // "full" should score higher due to bin-packing preference
         assert_eq!(scored[0].0, NodeId::new("full"));
         assert!(scored[0].1 > scored[1].1);
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A node with `cpu_used` of 1000m and `memory_used` of 8 GiB taken.
+    fn loaded(name: &str, cpu_used: u64, memory_used: u64) -> SchedulerNodeState {
+        let mut node = node_state(name, 1000, cpu_used, BTreeMap::new());
+        node.allocatable.memory_bytes = 8 * GIB;
+        node.allocated.memory_bytes = memory_used;
+        node
+    }
+
+    /// D30: a cache asks for little CPU and a lot of memory. CPU alone
+    /// can't tell the two nodes apart, so the memory-full one must win on
+    /// memory, not lose the tiebreak to the emptier one.
+    #[test]
+    fn memory_heavy_app_packs_onto_the_memory_full_node() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(loaded("a-empty", 300, GIB));
+        cluster.set_node(loaded("b-full", 300, 6 * GIB));
+
+        let candidates = vec![NodeId::new("a-empty"), NodeId::new("b-full")];
+        let app = AppId::new("cache", "prod");
+        let res = Resources::new(100, GIB, 0);
+
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
+
+        assert_eq!(scored[0].0, NodeId::new("b-full"), "{scored:?}");
+    }
+
+    /// D30: both nodes end up 60% used on average, but one would be 90% CPU
+    /// and 30% memory, stranding memory nobody can use without CPU. The
+    /// imbalance penalty prefers the balanced node.
+    #[test]
+    fn imbalance_penalty_prefers_balanced_nodes() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(loaded("a-skewed", 800, GIB * 16 / 10));
+        cluster.set_node(loaded("b-balanced", 500, 4 * GIB));
+
+        let candidates = vec![NodeId::new("a-skewed"), NodeId::new("b-balanced")];
+        let app = AppId::new("api", "prod");
+        let res = Resources::new(100, GIB * 8 / 10, 0);
+
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
+
+        assert_eq!(scored[0].0, NodeId::new("b-balanced"), "{scored:?}");
     }
 
     #[test]

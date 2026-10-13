@@ -100,6 +100,10 @@ pub struct Compatibility {
 /// `RolloutFailed` and `RolloutReleased` requests, `StateReport::rollouts`,
 /// `NodeAssignment::held`, `/v1/rollouts/failed` and the
 /// `ApplyEvent::RolloutAborted` stream event, #692).
+/// Scheduler policy (#702): each node's process-workload policy in its
+/// capability report (`NodeCapabilities::process`), the apps placed only in
+/// part (`RaftRequest::Unschedulable`, `DesiredState::unschedulable` and
+/// `DesiredAppEvidence::unschedulable`), and the `placement` event kind.
 /// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
 /// Gossip robustness (#696): `GossipMessage::sequence` for replay
 /// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
