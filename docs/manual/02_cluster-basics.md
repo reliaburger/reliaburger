@@ -157,12 +157,13 @@ still be sending traffic to addresses the cluster would then hand out again.
 ## Contributors: clusters from a checkout
 
 `relish dev create` builds `bun` and `relish` from your source tree inside a
-Lima build VM and starts a cluster from them. It's for working on Reliaburger
-itself; everyone else wants the quickstart.
+Lima build VM and starts a cluster from them. Like any cluster it runs mTLS:
+it creates the CA on your machine and enrols each VM with `relish join`. It's
+for working on Reliaburger itself; everyone else wants the quickstart.
 
 ```sh
 relish dev create --nodes 3
-relish dev shell reliaburger-1
+relish dev shell reliaburger-default-1
 relish dev destroy
 ```
 

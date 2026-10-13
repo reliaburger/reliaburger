@@ -2246,25 +2246,25 @@ You don't need three machines, or even three terminals, to watch this happen. On
 $ relish dev create mycluster --nodes 3
 ```
 
-It builds `bun` and `relish` for Linux from your *current* source tree (in a reusable build VM, so the first run is slow and later ones are incremental — no cross-toolchain on your Mac needed), installs them on each node, and starts every agent with `--cluster`. What you test locally is the exact binary that runs in the VMs. There's a `--bun <path>` / `--relish <path>` escape hatch if you'd rather supply a prebuilt Linux binary and skip the build.
+It builds `bun` and `relish` for Linux from your *current* source tree (in a reusable build VM, so the first run is slow and later ones are incremental — no cross-toolchain on your Mac needed), installs them on each node, gives every node an mTLS identity, and starts every agent with `--cluster`. What you test locally is the exact binary that runs in the VMs. There's a `--bun <path>` / `--relish <path>` escape hatch if you'd rather supply a prebuilt Linux binary and skip the build.
 
-The VMs sit on Lima's `user-v2` network, which gives them VM-to-VM connectivity with no `socket_vmnet` or `sudo` dance, and each node advertises its own address on that network. That network isn't routable from the host, though, so you check on the cluster from *inside* a node, where `relish` reaches the local agent on `127.0.0.1:9117`:
+The VMs sit on Lima's `user-v2` network, which gives them VM-to-VM connectivity with no `socket_vmnet` or `sudo` dance, and each node advertises its own address on that network. That network isn't routable from the host, though, so you check on the cluster from *inside* a node, where `relish` reaches the local agent on `127.0.0.1:9117`. It does so over HTTPS: `dev create` leaves each VM's `relish` a context file with the cluster's root CA and an administrator token, so you don't pass either by hand (chapter 4 covers how the VMs get their identities):
 
 ```
-$ limactl shell reliaburger-1 relish council
-Leader: reliaburger-1
+$ limactl shell reliaburger-mycluster-1 relish council
+Leader: reliaburger-mycluster-1
 Term:   1
 
-RAFT_ID              NAME            ADDRESS
-2169132481472150103  reliaburger-1   192.168.104.1:9444
-2169132481472150104  reliaburger-2   192.168.104.3:9444
-2169132481472150105  reliaburger-3   192.168.104.4:9444
+RAFT_ID              NAME                      ADDRESS
+2169132481472150103  reliaburger-mycluster-1   192.168.104.1:9444
+2169132481472150104  reliaburger-mycluster-2   192.168.104.3:9444
+2169132481472150105  reliaburger-mycluster-3   192.168.104.4:9444
 
-$ limactl shell reliaburger-1 relish nodes
-NODE           ADDRESS               STATE   COUNCIL  LEADER
-reliaburger-1  192.168.104.1:9443    alive   yes      yes
-reliaburger-2  192.168.104.3:9443    alive   yes      -
-reliaburger-3  192.168.104.4:9443    alive   yes      -
+$ limactl shell reliaburger-mycluster-1 relish nodes
+NODE                     ADDRESS               STATE   COUNCIL  LEADER
+reliaburger-mycluster-1  192.168.104.1:9443    alive   yes      yes
+reliaburger-mycluster-2  192.168.104.3:9443    alive   yes      -
+reliaburger-mycluster-3  192.168.104.4:9443    alive   yes      -
 ```
 
 One thing you'll notice: the council forms in seconds, not the ten minutes the eligibility walk-through above would suggest. That ten-minute `min_node_age` gate belongs to `select_council_candidates()` — the careful, age-and-zone-aware selection meant for a production cluster that's already humming. The cluster *runtime* that `bun --cluster` actually runs sets `min_node_age` to zero, so a fresh node is eligible right away; age still orders candidates, it just doesn't block them. The reconciler then walks members in, one membership action per two-second tick, up to the council size cap. For a dev cluster you want to see form now, that's the right trade-off, and it's the same reconcile loop a production cluster runs.

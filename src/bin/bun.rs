@@ -4547,13 +4547,27 @@ mod tests {
     }
 
     #[test]
-    fn mtls_mode_accepts_a_bootstrap_node_without_mtls_required() {
+    fn mtls_mode_accepts_a_bootstrap_node_that_opts_into_plaintext() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = NodeConfig::default();
         config.storage.data = dir.path().to_path_buf();
-        // require_mtls defaults to false — plaintext is allowed.
+        // Plaintext is an explicit opt-in, never the default.
+        config.security.require_mtls = false;
         let params = cluster_params_from_config(&config).unwrap();
         assert!(enforce_mtls_mode(&config, &params).is_ok());
+    }
+
+    #[test]
+    fn a_default_cluster_config_without_an_identity_refuses_and_names_relish_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = dir.path().to_path_buf();
+        let params = cluster_params_from_config(&config).unwrap();
+        let err = enforce_mtls_mode(&config, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("relish init"),
+            "an omitted [security] section must fail closed, got: {err}"
+        );
     }
     #[tokio::test]
     async fn api_tls_connection_drains_inflight_work_before_retiring() {

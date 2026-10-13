@@ -391,7 +391,7 @@ impl IngressSection {
 /// clustered node needs `master_key_path` (to build its wrapping IKM); only the
 /// bootstrap node needs `bootstrap_path` (it seeds the initial `SecurityState`
 /// into Raft, which then replicates to everyone else).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecuritySection {
     /// Path to the hex-encoded 32-byte cluster master key (`{cluster}-master.key`).
@@ -405,7 +405,9 @@ pub struct SecuritySection {
     /// Require mTLS on the internal listeners (Raft RPC, agent API,
     /// reporting). With this set a node refuses to bootstrap without an
     /// identity on disk, and a joiner starts in enrollment mode until
-    /// `relish join` installs one.
+    /// `relish join` installs one. Defaults to `true`, so a config that
+    /// omits it fails closed; `false` is the explicit plaintext opt-in.
+    /// Single-node `bun` (no `--cluster`) doesn't read it.
     pub require_mtls: bool,
     /// Known joining peers allowed through the perimeter to management and cluster
     /// ports before membership exists. Does not change protocol authentication.
@@ -424,8 +426,8 @@ pub struct SecuritySection {
     /// address unless this is explicitly set — otherwise any host that can
     /// reach the ports could inject Raft RPCs, forge reports or gossip a
     /// poison leader hint. Loopback-only plaintext clusters (single-host dev)
-    /// don't need it; `relish init --development-plaintext` and `relish dev`
-    /// set it for their deliberately-insecure local clusters.
+    /// don't need it; `relish init --development-plaintext` sets it for its
+    /// deliberately-insecure local cluster.
     pub allow_insecure_cluster: bool,
 
     /// Development-only: shorten the node leaf and cluster-issued ingress leaf
@@ -439,6 +441,25 @@ pub struct SecuritySection {
 
     /// API token defaults (`[security.tokens]`).
     pub tokens: TokensSection,
+}
+
+// Written by hand rather than derived: a derived `Default` would give
+// `require_mtls` the `bool` default of `false`, and `#[serde(default)]` fills
+// a missing key from this value, so an omitted setting would mean plaintext.
+impl Default for SecuritySection {
+    fn default() -> Self {
+        Self {
+            master_key_path: None,
+            bootstrap_path: None,
+            identity_dir: None,
+            require_mtls: true,
+            bootstrap_peers: Vec::new(),
+            operator_cidrs: Vec::new(),
+            allow_insecure_cluster: false,
+            leaf_lifetime_override_secs: None,
+            tokens: TokensSection::default(),
+        }
+    }
 }
 
 /// API token defaults (`[security.tokens]`).
@@ -2059,11 +2080,37 @@ mod tests {
     }
 
     #[test]
-    fn security_section_defaults_to_none() {
+    fn security_section_defaults_to_no_paths_and_mtls_required() {
         let nc = NodeConfig::parse("").unwrap();
         assert!(nc.security.master_key_path.is_none());
         assert!(nc.security.bootstrap_path.is_none());
         assert!(nc.security.identity_dir.is_none());
+        assert!(nc.security.require_mtls, "clusters fail closed by default");
+        assert!(!nc.security.allow_insecure_cluster);
+    }
+
+    #[test]
+    fn a_security_section_that_omits_require_mtls_still_requires_it() {
+        let nc = NodeConfig::parse(
+            r#"
+            [security]
+            master_key_path = "/etc/reliaburger/master.key"
+        "#,
+        )
+        .unwrap();
+        assert!(nc.security.require_mtls);
+        assert!(NodeConfig::default().security.require_mtls);
+    }
+
+    #[test]
+    fn plaintext_cluster_transports_are_an_explicit_opt_in() {
+        let nc = NodeConfig::parse(
+            r#"
+            [security]
+            require_mtls = false
+        "#,
+        )
+        .unwrap();
         assert!(!nc.security.require_mtls);
     }
 

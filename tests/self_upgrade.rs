@@ -117,7 +117,7 @@ retain_versions = 3
             use std::io::Write;
             let ports = bun_process::reserve_port_block_lease(3);
             writeln!(std::fs::OpenOptions::new().append(true).open(&config_path).unwrap(),
-                "\n[cluster]\ngossip_port = {}\nraft_port = {}\nreporting_port = {}\n[network]\nadvertise_address = \"127.0.0.1\"",
+                "\n[cluster]\ngossip_port = {}\nraft_port = {}\nreporting_port = {}\n[network]\nadvertise_address = \"127.0.0.1\"\n[security]\nrequire_mtls = false",
                 ports.base, ports.base + 1, ports.base + 2).unwrap();
             held_ports.push(ports);
         }

@@ -180,8 +180,9 @@ and the leader takes them only from a node that shows its cluster certificate.
 That's how it knows which node is asking, so one node can't claim another's
 copies. There's no token-only way in.
 
-A plaintext cluster (`[security] require_mtls = false`, which is what
-`relish dev` sets up) has no certificates, so it has no cluster registry.
+A plaintext cluster (`[security] require_mtls = false`, which only
+`relish init --development-plaintext` or a hand-written config sets up) has no
+certificates, so it has no cluster registry.
 Pushes, `relish build`, `relish images`, and pulls of images Pickle would
 resolve (Docker Hub names such as `web:v1` or `nginx:1.27`) fail with:
 
@@ -195,9 +196,12 @@ each node)
 Each node logs it once at start-up and once from its cleanup loop, not every
 second. `relish status` prints `registry: needs mTLS`, and `relish wtf` warns
 `registry-needs-mtls`, naming the nodes. An image with an explicit registry
-host (`ghcr.io/org/app:v1`) still pulls straight from that registry. To use
-Pickle, start the cluster with TLS. A standalone node (no `--cluster`) keeps its own loopback registry
-and needs none of this.
+host (`ghcr.io/org/app:v1`) still pulls straight from that registry. A short
+name never falls back to a direct Docker Hub pull: Pickle is the only way to
+Docker Hub, so short-name images need mTLS. To use Pickle, start the cluster
+with TLS, which is the default: `relish init`, `relish setup --quickstart` and
+`relish dev create` all do. A standalone node (no `--cluster`) keeps its own
+loopback registry and needs none of this.
 
 ## Building images
 

@@ -1330,7 +1330,8 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
                 .to_string(),
             details: plaintext,
             suggestion: "start the cluster with TLS (`relish init`, then `relish join` on each \
-                         node); plaintext clusters such as `relish dev` have no cluster registry"
+                         node); a plaintext cluster from `relish init --development-plaintext` has no \
+                         cluster registry"
                 .to_string(),
             correlated_events: Vec::new(),
             affected_resource: "registry".to_string(),
