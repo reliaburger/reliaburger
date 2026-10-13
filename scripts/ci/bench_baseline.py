@@ -4,8 +4,10 @@
 The task-array benchmarks (benches/task_arrays.rs) run nightly on hosted
 runners, whose speed varies from run to run. Criterion's own change report
 flags differences of a few per cent, which would make a gate a flake source,
-so CI fails only when a benchmark's mean is more than `--max-ratio` times its
-baseline mean. Everything else is kept as an artefact for the trend.
+and on 12 October 2026 a runner was uniformly 1.4-2.1x slower than the one
+that recorded the baseline (#857). So CI fails only when a benchmark is more
+than `--max-ratio` times slower than the rest of the same run (see compare),
+or the whole run's median is. Everything is kept as an artefact for the trend.
 
     bench_baseline.py save    --criterion target/criterion --baseline FILE
     bench_baseline.py compare --criterion target/criterion --baseline FILE \\
@@ -17,9 +19,12 @@ A benchmark is named by its directory under target/criterion
 Fixtures: scripts/ci/test_bench_baseline.py.
 """
 import argparse
+from dataclasses import dataclass
 import json
 from pathlib import Path
+import statistics
 import sys
+from typing import Optional
 
 SCHEMA = 1
 
@@ -54,29 +59,66 @@ def load(baseline):
     return {name: float(mean) for name, mean in document["benchmarks"].items()}
 
 
-def compare(current, baseline, max_ratio):
-    """Rows of (name, baseline mean or None, current mean, ratio or None), and the regressions.
+@dataclass
+class Comparison:
+    """One run measured against the baseline.
 
-    A regression is a benchmark whose mean exceeds `max_ratio` times its
-    baseline. Benchmarks that are new, or gone, have nothing to compare.
+    `rows` are (name, baseline mean or None, current mean, ratio or None,
+    ratio against the rest or None). `runner` is the median ratio, how much
+    slower this runner was overall, or None when nothing compares.
     """
+    rows: list
+    runner: Optional[float]
+    regressions: list
+    run_too_slow: bool
+
+    @property
+    def failed(self):
+        return bool(self.regressions) or self.run_too_slow
+
+
+def compare(current, baseline, max_ratio):
+    """Measure each benchmark against its baseline, allowing for the runner's speed.
+
+    A hosted runner can be uniformly slower than the one that recorded the
+    baseline, so each benchmark's ratio is divided by the median ratio of the
+    other benchmarks in the same run, its "ratio against the rest", and a
+    regression is a benchmark more than `max_ratio` times slower than the
+    rest. A faster runner never tightens the bound: the median counts as at
+    least 1. A slow runner and a regression in most benchmarks look the same
+    from inside one run, so the run also fails when its median ratio is above
+    `max_ratio`. Benchmarks that are new, or gone, have nothing to compare.
+    """
+    ratios = {name: mean / baseline[name] for name, mean in current.items()
+              if baseline.get(name)}
     rows, regressions = [], []
     for name, mean in sorted(current.items()):
-        before = baseline.get(name)
-        ratio = mean / before if before else None
-        rows.append((name, before, mean, ratio))
-        if ratio is not None and ratio > max_ratio:
-            regressions.append(name)
-    return rows, regressions
+        ratio = ratios.get(name)
+        relative = None
+        if ratio is not None:
+            rest = [other for key, other in ratios.items() if key != name]
+            relative = ratio / max(1.0, statistics.median(rest) if rest else 1.0)
+            if relative > max_ratio:
+                regressions.append(name)
+        rows.append((name, baseline.get(name), mean, ratio, relative))
+    runner = statistics.median(ratios.values()) if ratios else None
+    return Comparison(rows, runner, regressions, runner is not None and runner > max_ratio)
 
 
-def table(rows, max_ratio):
-    lines = [f"Task-array benchmarks against main's baseline (fails above {max_ratio:g}x)", "",
-             "| Benchmark | Baseline mean | This run | Ratio |", "|---|---:|---:|---:|"]
-    for name, before, mean, ratio in rows:
+def table(comparison, max_ratio):
+    runner = comparison.runner
+    runner_text = f"runner factor {runner:.2f}" if runner is not None else "no runner factor"
+    lines = [f"Task-array benchmarks against main's baseline, {runner_text} (the median ratio). "
+             f"A benchmark fails above {max_ratio:g}x the rest of the run, and the run fails "
+             f"when its median is above {max_ratio:g}x.", "",
+             "| Benchmark | Baseline mean | This run | Ratio | Against the rest |",
+             "|---|---:|---:|---:|---:|"]
+    for name, before, mean, ratio, relative in comparison.rows:
         before_text = f"{before / 1e6:.3f} ms" if before is not None else "none"
         ratio_text = f"{ratio:.2f}" if ratio is not None else "new"
-        lines.append(f"| `{name}` | {before_text} | {mean / 1e6:.3f} ms | {ratio_text} |")
+        relative_text = f"{relative:.2f}" if relative is not None else "new"
+        lines.append(f"| `{name}` | {before_text} | {mean / 1e6:.3f} ms | {ratio_text} "
+                     f"| {relative_text} |")
     return "\n".join(lines) + "\n"
 
 
@@ -102,16 +144,19 @@ def main(argv=None):
     if baseline is None:
         print(f"no baseline at {arguments.baseline} yet; nothing to compare")
         baseline = {}
-    rows, regressions = compare(current, baseline, arguments.max_ratio)
-    report = table(rows, arguments.max_ratio)
+    comparison = compare(current, baseline, arguments.max_ratio)
+    report = table(comparison, arguments.max_ratio)
     print(report)
     if arguments.summary:
         with arguments.summary.open("a") as summary:
             summary.write(report)
-    for name in regressions:
-        print(f"{name}: more than {arguments.max_ratio:g}x slower than main's baseline",
-              file=sys.stderr)
-    return 1 if regressions else 0
+    for name in comparison.regressions:
+        print(f"{name}: more than {arguments.max_ratio:g}x slower than main's baseline, "
+              "against the rest of this run", file=sys.stderr)
+    if comparison.run_too_slow:
+        print(f"the whole run is {comparison.runner:.2f}x slower than main's baseline "
+              f"(its median), above {arguments.max_ratio:g}x", file=sys.stderr)
+    return 1 if comparison.failed else 0
 
 
 if __name__ == "__main__":
