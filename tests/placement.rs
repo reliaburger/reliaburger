@@ -3836,12 +3836,11 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
     // #929: a scale change is a different spec. It clears the mark and
     // starts a new rollout of the version, which fails again and is marked
     // again, later.
-    let scaled = reliaburger::config::Config::parse(
-        "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"600\"]\n\
-         port = 8080\nreplicas = 2\n[app.web.health]\npath = \"/healthz\"\n\
-         [app.web.deploy]\nhealth_timeout = \"5s\"\n",
-    )
-    .unwrap();
+    // Built from the applied spec, so only `replicas` changes.
+    let mut scaled = reliaburger::config::Config::default();
+    let mut scaled_web = bad.clone();
+    scaled_web.replicas = reliaburger::config::Replicas::Fixed(2);
+    scaled.app.insert("web".into(), scaled_web);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while desired_web(nodes[0]).await.map(|spec| spec.replicas)
         != Some(reliaburger::config::Replicas::Fixed(2))
