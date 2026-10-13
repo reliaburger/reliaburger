@@ -1338,7 +1338,9 @@ digest, not `latest`. The index resolves to `linux/amd64` under runc and
 `linux/arm64` under Apple Container. Both runtime gates create, start and
 execute the pinned workload; a pull, platform-selection or exec failure fails
 the gate. ProcessGrill remains a separate profile and launches `bun testapp`
-from each node.
+from each node as an `exec` app of `/usr/local/bin/bun`, which the node's
+`[process_workloads] allowed_binaries` must name: the process runtime runs no
+images (#914).
 
 Every case reports exactly one of `Pass`, `Fail`, `Skipped` or `Unknown`.
 `Pass` needs directly observed evidence. `Skipped` means a known missing

@@ -3740,10 +3740,15 @@ async fn wait_for_released_web(node: &Node, count: usize) {
 /// Apply `toml` through `node` until the council holds its `web` spec.
 async fn apply_web(node: &Node, toml: &str) {
     let config = reliaburger::config::Config::parse(toml).unwrap();
-    let wanted = config.app.get("web").unwrap().command.clone();
+    // A host `script` app's version is its script (#914).
+    let web = config.app.get("web").unwrap();
+    let wanted = (web.command.clone(), web.script.clone());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if desired_web(node).await.map(|spec| spec.command) == Some(wanted.clone()) {
+        let desired = desired_web(node)
+            .await
+            .map(|spec| (spec.command, spec.script));
+        if desired == Some(wanted.clone()) {
             return;
         }
         assert!(

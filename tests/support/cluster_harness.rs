@@ -69,19 +69,10 @@ impl TestHarness {
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
         // The process runtime runs only host workloads (#914), so fixture apps
-        // are `script` apps through `/bin/sh` or `exec` apps of these binaries.
+        // are `script` apps through `/bin/sh`.
         agent.set_process_config(
             reliaburger::config::process_workloads::ProcessWorkloadsConfig {
-                allowed_binaries: [
-                    "/bin/sh",
-                    "/bin/sleep",
-                    "/bin/echo",
-                    "/bin/false",
-                    "/usr/bin/true",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+                allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
                 ..Default::default()
             },
