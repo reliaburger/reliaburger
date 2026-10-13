@@ -7510,6 +7510,106 @@
       ]
     },
     {
+      "id": "issue-788-cluster-admission-refuses-unrunnable-jobs",
+      "issue": 788,
+      "promise": "In a cluster the leader refuses a job run no live node can take at submission, with HTTP 422 and the reason the leader's tick would give, from a compact job-capability summary every node advertises over gossip.",
+      "supported_paths": [
+        "Councils on every platform"
+      ],
+      "cases": [
+        {
+          "id": "issue-788-a_cluster_refuses_a_run_no_live_node_can_take_at_submission",
+          "binary": "reliaburger::suite",
+          "test": "task_arrays::a_cluster_refuses_a_run_no_live_node_can_take_at_submission",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_refuses_a_run_every_live_node_advertises_it_cannot_take",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_refuses_a_run_every_live_node_advertises_it_cannot_take",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_quotes_the_reasons_the_tick_would",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_quotes_the_reasons_the_tick_would",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_admits_a_run_any_live_node_might_take",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_admits_a_run_any_live_node_might_take",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-what_a_node_advertises_reaches_its_own_verdict_on_every_run",
+          "binary": "reliaburger",
+          "test": "bun::task_array_node::tests::what_a_node_advertises_reaches_its_own_verdict_on_every_run",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_node.rs"
+          ]
+        },
+        {
+          "id": "issue-788-probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram",
+          "binary": "reliaburger",
+          "test": "mustard::protocol::tests::probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/mustard/protocol.rs"
+          ]
+        },
+        {
+          "id": "issue-788-advertised_job_capabilities_reach_a_remote_member_via_gossip",
+          "binary": "reliaburger",
+          "test": "mustard::protocol::tests::advertised_job_capabilities_reach_a_remote_member_via_gossip",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/mustard/protocol.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A run any live node might take, or one a node hasn't advertised its capabilities for, is admitted and left to the nodes and the leader's tick."
+      ],
+      "boundaries": [
+        "Gossip says whether a node's allowed_binaries names anything; the paths come from its capability report, and until it has reported, a binary missing from a non-empty allowlist is caught by the tick, as are nodes that leave or change configuration after admission."
+      ]
+    },
+    {
       "id": "issue-699-faults-revert-after-bun-restart",
       "issue": 699,
       "promise": "A chaos fault never outlives the Bun that injected it: CPU and memory caps, paused processes and pinned eBPF fault entries are undone when the next Bun adopts its workloads, and CPU and memory faults restore the workload's own cgroup values when they expire.",

@@ -98,6 +98,7 @@ fn router_for_council(
                 node_id: reliaburger::meat::NodeId::new("local"),
                 address: "127.0.0.1:1".parse().unwrap(),
                 api_advertised: true,
+                jobs: None,
             },
         ])))
     } else {
@@ -452,6 +453,7 @@ async fn follower_batch_submission_preserves_the_callers_credential_for_leader_a
             node_id: reliaburger::meat::NodeId::new("leader"),
             address,
             api_advertised: true,
+            jobs: None,
         },
     ]));
     let router = router_for_council(
@@ -909,11 +911,13 @@ async fn same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authori
             node_id: reliaburger::meat::NodeId::new(leader_name),
             address: leader_address,
             api_advertised: true,
+            jobs: None,
         },
         reliaburger::bun::api::NodeMembershipInfo {
             node_id: reliaburger::meat::NodeId::new(follower_name),
             address: follower_address,
             api_advertised: true,
+            jobs: None,
         },
     ]));
     let node = reliaburger::meat::NodeId::new(leader_name);

@@ -370,6 +370,11 @@ pub struct DirectoryExtension {
     /// separate recoveries; each fences itself as a split when it sees the
     /// other's advertisement.
     pub recovery_id: Option<crate::council::types::RecoveryId>,
+    /// The kinds of job the stamping node runs (#788), or `None` while it
+    /// has no task executor to say. The leader refuses a job run at
+    /// submission when every live node's summary refuses it. Nine bytes, so
+    /// it never crowds out the membership updates beside it.
+    pub jobs: Option<crate::meat::job_capability::JobCapabilities>,
     /// HMAC-SHA256 over the carrying message's canonical bytes plus this
     /// extension with `hmac` zeroed. Zeroed when gossip runs unkeyed.
     pub hmac: [u8; 32],
@@ -756,8 +761,54 @@ mod tests {
             disk_pressured: true,
             recovery_epoch: Some(u64::MAX),
             recovery_id: Some(crate::council::types::RecoveryId(u128::MAX)),
+            jobs: Some(every_job_capability()),
             hmac: [0xff; 32],
         }
+    }
+
+    /// The job summary with every flag set (#788).
+    fn every_job_capability() -> crate::meat::job_capability::JobCapabilities {
+        crate::meat::job_capability::JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: true,
+            singleton_images: true,
+            singleton_image_limits: true,
+            encrypted_env: true,
+            network_policy: true,
+            mount_isolation: true,
+            binaries: true,
+        }
+    }
+
+    /// #788: the job summary stays small, since it rides every probe.
+    #[test]
+    fn the_job_summary_costs_ten_bytes_at_most() {
+        let cost = bincode::serialized_size(&Some(every_job_capability())).unwrap();
+        assert!(cost <= 10, "job summary costs {cost} bytes");
+    }
+
+    /// #788: a node with a 63-byte name, IPv6 endpoints, a leader hint, a
+    /// recovery claim and a full label set still fits its job summary in a
+    /// probe, with room left for a membership update.
+    #[test]
+    fn a_worst_case_extension_with_job_capabilities_still_carries_an_update() {
+        assert!(worst_case_extension().jobs.is_some());
+        let mut message = GossipMessage::new(
+            longest_name(1),
+            u64::MAX,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        message.sequence = u64::MAX;
+        message.attach_extension(worst_case_extension());
+        assert_eq!(
+            message
+                .extension
+                .as_ref()
+                .and_then(|extension| extension.jobs),
+            Some(every_job_capability())
+        );
+        assert!(fill_worst_case(GossipPayload::Ping { updates: vec![] }) >= 1);
     }
 
     fn worst_case_update(tag: u64) -> MembershipUpdate {
@@ -888,6 +939,7 @@ mod tests {
             disk_pressured: false,
             recovery_epoch: None,
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         }
     }
@@ -983,6 +1035,34 @@ mod tests {
         let datagram = encode_datagram(&msg).unwrap();
         let decoded = decode_datagram(&datagram).unwrap();
         assert!(decoded.extension.unwrap().disk_pressured);
+    }
+
+    /// #788: the job summary survives the wire, and the extension HMAC
+    /// covers it, so nobody can make a node look able to run what it
+    /// refuses.
+    #[test]
+    fn job_capabilities_round_trip_under_the_extension_hmac() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let msg = a_message().signed(&key).unwrap();
+        let canonical = msg.canonical_bytes().unwrap();
+        let mut ext = an_extension();
+        ext.jobs = Some(crate::meat::job_capability::JobCapabilities {
+            containers: false,
+            ..every_job_capability()
+        });
+        let signed = ext.signed(&key, &canonical).unwrap();
+        assert!(signed.verify_hmac(&key, &canonical));
+
+        let mut carrying = msg.clone();
+        carrying.extension = Some(signed.clone());
+        let decoded = decode_datagram(&encode_datagram(&carrying).unwrap()).unwrap();
+        assert_eq!(decoded.extension.unwrap().jobs, signed.jobs);
+
+        let mut tampered = signed;
+        if let Some(jobs) = tampered.jobs.as_mut() {
+            jobs.containers = true;
+        }
+        assert!(!tampered.verify_hmac(&key, &canonical));
     }
 
     #[test]

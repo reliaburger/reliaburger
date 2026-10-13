@@ -5570,11 +5570,13 @@ async fn dashboard_nodes_fragment_reflects_real_membership() {
             node_id: crate::meat::NodeId::new("node-alpha"),
             address: "127.0.0.1:9101".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         },
         NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("node-beta"),
             address: "127.0.0.1:9102".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         },
     ]));
     // No token store, so the request is open; membership at position 11.
@@ -6165,6 +6167,7 @@ async fn cluster_status_refuses_to_report_success_when_a_member_is_unreachable()
         node_id: crate::meat::NodeId::new("unresponsive"),
         address,
         api_advertised: true,
+        jobs: None,
     }]));
     let app = router(
         cmd_tx,
@@ -6258,6 +6261,7 @@ async fn namespace_scoped_token_sees_only_its_namespace_in_status() {
         node_id: crate::meat::NodeId::new("peer"),
         address: peer_address,
         api_advertised: true,
+        jobs: None,
     }]));
     let app = router(
         cmd_tx,
@@ -6761,6 +6765,7 @@ async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
             node_id: crate::meat::NodeId::new("one"),
             address: "[::1]:19117".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         },
         // Known to gossip, but its own directory extension hasn't
         // arrived: the address is only a port-offset guess.
@@ -6768,6 +6773,7 @@ async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
             node_id: crate::meat::NodeId::new("guessed"),
             address: "[::1]:19999".parse().unwrap(),
             api_advertised: false,
+            jobs: None,
         },
     ]));
     let app = router(
@@ -6824,6 +6830,7 @@ async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
             node_id: crate::meat::NodeId::new(name),
             address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             api_advertised: true,
+            jobs: None,
         },
         gossip_address: std::net::SocketAddr::from(([127, 0, 0, 1], port - 3)),
         state,
@@ -8951,6 +8958,7 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
             node_id: crate::meat::NodeId::new(&name),
             address,
             api_advertised: true,
+            jobs: None,
         });
         let node = Arc::new(
             crate::council::CouncilNode::new(

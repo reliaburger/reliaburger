@@ -209,6 +209,7 @@ async fn start_node_with(
             backup: Default::default(),
             labels,
             self_disk_pressured_rx: None,
+            job_capabilities_rx: None,
             readiness: None,
             recovery_probe_window: None,
         },
@@ -292,6 +293,7 @@ async fn start_mtls_node(
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
+            job_capabilities_rx: None,
             readiness: None,
             recovery_probe_window: None,
         },
@@ -1073,6 +1075,7 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
             node_id: reliaburger::meat::NodeId::new(names[index]),
             address,
             api_advertised: true,
+            jobs: None,
         });
     }
     let local_api = members[worker_index].address;
@@ -1491,6 +1494,7 @@ async fn rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing(
             node_id: reliaburger::meat::NodeId::new(names[index]),
             address,
             api_advertised: true,
+            jobs: None,
         });
     }
     let members_table = Arc::new(tokio::sync::RwLock::new(members.clone()));
