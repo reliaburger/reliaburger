@@ -156,8 +156,11 @@ pub struct DnsSection {
     pub enabled: bool,
     /// Listen address, e.g. "0.0.0.0:53" for rootful runc.
     pub listen: String,
-    /// Upstream resolver for non-`.internal` names.
-    pub upstream: String,
+    /// Upstream resolver for non-`.internal` names, as `address:port`.
+    ///
+    /// `None` (the default) uses the host's own resolvers: the `nameserver`
+    /// lines of `/etc/resolv.conf`, tried in order.
+    pub upstream: Option<String>,
     /// Restrict the `.internal` zone to container-reachable (loopback /
     /// private-range) sources. On by default so the internal topology
     /// isn't exposed to public clients; disable only for debugging.
@@ -169,34 +172,74 @@ impl Default for DnsSection {
         Self {
             enabled: false,
             listen: "0.0.0.0:53".to_string(),
-            upstream: "8.8.8.8:53".to_string(),
+            upstream: None,
             restrict_sources: true,
         }
     }
 }
 
+/// The host's resolver configuration, read when `[dns] upstream` is unset.
+pub const HOST_RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// The port every `nameserver` in a resolver file answers on: the format
+/// can't name another one.
+pub const NAMESERVER_PORT: u16 = 53;
+
 impl DnsSection {
-    /// Convert into the Onion DNS responder's config type.
+    /// Convert into the Onion DNS responder's config type, reading the
+    /// host's resolvers from [`HOST_RESOLV_CONF`] when `upstream` is unset.
     ///
-    /// Fails when the listen or upstream addresses don't parse.
+    /// Fails when the listen or upstream addresses don't parse, or when no
+    /// upstream is usable.
     pub fn to_dns_config(&self) -> Result<crate::onion::dns::DnsConfig, super::error::ConfigError> {
-        let listen_addr =
+        self.to_dns_config_from(std::path::Path::new(HOST_RESOLV_CONF), NAMESERVER_PORT)
+    }
+
+    /// [`Self::to_dns_config`] with the resolver file at `resolv_conf`, whose
+    /// nameservers answer on `nameserver_port` ([`NAMESERVER_PORT`] outside
+    /// tests).
+    pub fn to_dns_config_from(
+        &self,
+        resolv_conf: &std::path::Path,
+        nameserver_port: u16,
+    ) -> Result<crate::onion::dns::DnsConfig, super::error::ConfigError> {
+        let listen_addr: std::net::SocketAddr =
             self.listen
                 .parse()
                 .map_err(|_| super::error::ConfigError::InvalidValue {
                     field: "dns.listen".to_string(),
                     value: self.listen.clone(),
                 })?;
-        let upstream =
-            self.upstream
-                .parse()
-                .map_err(|_| super::error::ConfigError::InvalidValue {
-                    field: "dns.upstream".to_string(),
-                    value: self.upstream.clone(),
-                })?;
+        let upstreams = match &self.upstream {
+            Some(upstream) => {
+                vec![
+                    upstream
+                        .parse()
+                        .map_err(|_| super::error::ConfigError::InvalidValue {
+                            field: "dns.upstream".to_string(),
+                            value: upstream.clone(),
+                        })?,
+                ]
+            }
+            None => {
+                // A missing file is the same as one with no nameservers.
+                let contents = std::fs::read_to_string(resolv_conf).unwrap_or_default();
+                resolv_conf_nameservers(&contents, nameserver_port, listen_addr)
+            }
+        };
+        if upstreams.is_empty() {
+            return Err(super::error::ConfigError::Validation {
+                field: "dns.upstream".to_string(),
+                context: "node config".to_string(),
+                reason: format!(
+                    "{} names no usable nameserver; set [dns] upstream",
+                    resolv_conf.display()
+                ),
+            });
+        }
         Ok(crate::onion::dns::DnsConfig {
             listen_addr,
-            upstream,
+            upstreams,
             upstream_timeout: std::time::Duration::from_secs(2),
             source_namespaces: tokio::sync::watch::channel(
                 crate::onion::dns::DnsSourceNamespaces::default(),
@@ -207,6 +250,30 @@ impl DnsSection {
             },
         })
     }
+}
+
+/// The `nameserver` addresses in a resolver file, in order, each on `port`.
+///
+/// Skips any equal to `own_listen`, Bun's own DNS address, so the responder
+/// never forwards to itself. Lines that aren't an IP address (comments, a
+/// link-local address with a `%zone`) are skipped too.
+pub fn resolv_conf_nameservers(
+    contents: &str,
+    port: u16,
+    own_listen: std::net::SocketAddr,
+) -> Vec<std::net::SocketAddr> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("nameserver"), Some(address)) => address.parse().ok(),
+                _ => None,
+            }
+        })
+        .map(|ip: std::net::IpAddr| std::net::SocketAddr::new(ip, port))
+        .filter(|address| *address != own_listen)
+        .collect()
 }
 
 /// eBPF data-path configuration (Onion service resolution, Smoker
@@ -707,10 +774,16 @@ pub struct NetworkSection {
 }
 
 /// Port range for container port mapping.
+///
+/// The default, 10000 up to (not including) 32767, stays below Linux's
+/// ephemeral range (32768–60999), so a published port never collides with
+/// the source port of an outgoing connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortRange {
+    /// First allocatable port.
     pub start: u16,
+    /// One past the last allocatable port.
     pub end: u16,
 }
 
@@ -718,7 +791,7 @@ impl Default for PortRange {
     fn default() -> Self {
         Self {
             start: 10000,
-            end: 60000,
+            end: 32767,
         }
     }
 }
@@ -1357,6 +1430,78 @@ mod tests {
         );
     }
 
+    /// Write `contents` as a resolver file in a fresh temp directory.
+    fn resolv_conf(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn dns_upstream_defaults_to_host_resolvers() {
+        // #700: the default was 8.8.8.8, which fails on networks that block
+        // outbound port 53 and leaks every lookup to Google.
+        let nc = NodeConfig::parse("[dns]\nenabled = true\n").unwrap();
+        assert_eq!(nc.dns.upstream, None);
+        let (_dir, path) = resolv_conf(
+            "# managed by the host\nsearch corp.example\nnameserver 10.0.0.2\n\
+             nameserver 10.0.0.3 # backup\noptions edns0\nnameserver fd00::53\n",
+        );
+        let config = nc.dns.to_dns_config_from(&path, 53).unwrap();
+        assert_eq!(
+            config.upstreams,
+            vec![
+                "10.0.0.2:53".parse::<std::net::SocketAddr>().unwrap(),
+                "10.0.0.3:53".parse().unwrap(),
+                "[fd00::53]:53".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_dns_upstream_overrides_host_resolvers() {
+        let nc =
+            NodeConfig::parse("[dns]\nenabled = true\nupstream = \"192.0.2.53:5353\"\n").unwrap();
+        let (_dir, path) = resolv_conf("nameserver 10.0.0.2\n");
+        let config = nc.dns.to_dns_config_from(&path, 53).unwrap();
+        assert_eq!(config.upstreams, vec!["192.0.2.53:5353".parse().unwrap()]);
+    }
+
+    #[test]
+    fn resolv_conf_parser_skips_own_listen_address() {
+        let own: std::net::SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let found = resolv_conf_nameservers(
+            "nameserver 10.0.0.1\nnameserver not-an-address\nnameserver fe80::1%eth0\n\
+             ;nameserver 10.0.0.9\nnameserver 10.0.0.2\n",
+            53,
+            own,
+        );
+        assert_eq!(found, vec!["10.0.0.2:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn dns_without_usable_upstream_refuses_to_start() {
+        let nc = NodeConfig::parse("[dns]\nenabled = true\nlisten = \"10.0.0.1:53\"\n").unwrap();
+        for contents in [
+            None,
+            Some(""),
+            Some("search example\n"),
+            Some("nameserver 10.0.0.1\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resolv.conf");
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            }
+            let error = nc.dns.to_dns_config_from(&path, 53).unwrap_err();
+            assert!(
+                error.to_string().contains("[dns] upstream"),
+                "{contents:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn dns_rejects_node_default_namespace_override() {
         let error = NodeConfig::parse("[dns]\ndefault_namespace = \"payments\"\n").unwrap_err();
@@ -1373,7 +1518,7 @@ mod tests {
             nc.network.port_range,
             PortRange {
                 start: 10000,
-                end: 60000
+                end: 32767
             }
         );
         assert!(nc.cluster.join.is_empty());

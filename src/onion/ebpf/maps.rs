@@ -302,7 +302,7 @@ fn ip_to_network_byte_order(ip: Ipv4Addr) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::onion::types::{BackendInstance, DnsMapKey, ServiceEntry};
+    use crate::onion::types::{BackendInstance, ServiceEntry};
     use crate::onion::vip::VirtualIP;
 
     fn test_entry() -> ServiceEntry {
@@ -398,14 +398,6 @@ mod tests {
         assert!(err.to_string().contains("backend_map"));
     }
 
-    #[test]
-    fn dns_key_matches_internal_suffix() {
-        let key = DnsMapKey::from_name("redis.internal");
-        let name = std::str::from_utf8(&key.name)
-            .unwrap()
-            .trim_end_matches('\0');
-        assert_eq!(name, "redis.internal");
-    }
     fn oversized_entry() -> ServiceEntry {
         let mut entry = test_entry();
         entry.backends = (0..96)

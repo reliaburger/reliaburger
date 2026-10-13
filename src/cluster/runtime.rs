@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bun::agent::ClusterHandle;
 use crate::cluster::identity;
 use crate::config::node::ReportingTreeSection;
+use crate::council::handover::{HANDOVER_HOLD, pressured_voter_holds};
 use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc_with_node_gate};
 use crate::council::node::CouncilNode;
 use crate::council::selection::{
@@ -49,6 +50,14 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 /// Upper bound on a single reconciler membership operation. A peer whose Raft
 /// port is unreachable must not block the reconciler forever — on timeout we
 /// log and retry on the next tick.
+///
+/// An operation is a fixed number of commits: the guard no-op, then one
+/// membership entry (adding or removing a learner) or two (the joint and
+/// uniform steps of a voter change). With a log store that takes 20 ms per
+/// entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion
+/// 147 ms, so five seconds leaves room for a busy leader's apply queue. A new learner's catch-up, which grows with its log gap, is not part
+/// of any operation: it runs between ticks, and the planner promotes the
+/// learner only once it's caught up (#779).
 const RECONCILE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns resources that must outlive `start()` for the cluster to keep
@@ -1119,9 +1128,10 @@ pub struct CouncilReconcilerConfig {
     pub selection: CouncilSelectionConfig,
     /// How often to reconcile the council against gossip membership.
     pub tick_interval: Duration,
-    /// Upper bound on a single membership operation. A peer whose Raft port
-    /// is unreachable must not block the reconciler forever — on timeout we
-    /// log and retry on the next tick.
+    /// Upper bound on a single membership operation: the guard no-op plus
+    /// one or two membership commits, never a learner's catch-up. A peer
+    /// whose Raft port is unreachable must not block the reconciler forever —
+    /// on timeout we log and retry on the next tick.
     pub op_timeout: Duration,
 }
 
@@ -1380,12 +1390,26 @@ async fn reconcile_council_once(
     // deposes the pressured leader by Raft's own rules, after which the ex-
     // leader is an ordinary voter the new leader's planner replaces. Runs on
     // followers (before the leader gate) so exactly the deposition target acts.
+    //
+    // The deposition only removes the old leader; the election after it
+    // favours the longest log, which is usually the old leader's. So the
+    // pressured node holds its own elections while it leads or nobody does,
+    // and can't win that election (#755). The hold ends once another voter
+    // leads, or HANDOVER_HOLD after the last tick that renewed it.
     let current_leader = metrics.current_leader;
+    if pressured_voter_holds(
+        self_id,
+        current_leader,
+        disk_pressured.contains(&self_id),
+        pick_deposition_target(&voters, &health, self_id, disk_pressured).is_some(),
+    ) {
+        council.hold_elections_until(now + HANDOVER_HOLD);
+    }
     deposition_throttle.clear_when_resolved(current_leader, disk_pressured);
     if let Some(leader) = current_leader
         && leader != self_id
         && disk_pressured.contains(&leader)
-        && pick_deposition_target(&voters, &health, leader) == Some(self_id)
+        && pick_deposition_target(&voters, &health, leader, disk_pressured) == Some(self_id)
     {
         // `trigger().elect()` starts a campaign; it does not wait for the
         // election to settle. Retrying every reconciler tick continually
@@ -1452,7 +1476,7 @@ async fn reconcile_council_once(
     // A pressured leader never plans its own removal; it waits for a follower
     // to depose it (above), then gets replaced as an ordinary voter.
     if disk_pressured.contains(&self_id) {
-        if pick_deposition_target(&voters, &health, self_id).is_none() {
+        if pick_deposition_target(&voters, &health, self_id, disk_pressured).is_none() {
             eprintln!(
                 "council reconciler: leader {self_id} under disk pressure but no healthy voter to hand off to; holding"
             );
@@ -1485,20 +1509,23 @@ async fn reconcile_council_once(
     execute_council_action(council, action, &voters, &directory, config.op_timeout).await;
 }
 
-/// Pick a healthy voter (not the leader itself) for the leader to hand off to
-/// when resigning under disk pressure. Prefers a stably-alive voter; returns
-/// `None` when the leader is the only viable voter, in which case resignation
-/// waits rather than risking an election no one can win.
+/// Pick a healthy voter (not the leader itself, and not under disk pressure)
+/// for the leader to hand off to when resigning under disk pressure. Returns
+/// `None` when no other voter is fit to lead, in which case resignation waits
+/// rather than risking an election no one can win, or handing leadership to a
+/// voter that would have to resign in turn.
 fn pick_deposition_target(
     voters: &BTreeSet<u64>,
     health: &HashMap<u64, crate::council::selection::MemberHealth>,
     leader_id: u64,
+    disk_pressured: &BTreeSet<u64>,
 ) -> Option<u64> {
     use crate::council::selection::MemberHealth;
-    voters
-        .iter()
-        .copied()
-        .find(|id| *id != leader_id && matches!(health.get(id), Some(MemberHealth::Alive { .. })))
+    voters.iter().copied().find(|id| {
+        *id != leader_id
+            && !disk_pressured.contains(id)
+            && matches!(health.get(id), Some(MemberHealth::Alive { .. }))
+    })
 }
 
 /// Execute a single planner action against the council, bounded by
@@ -1694,6 +1721,120 @@ mod tests {
             .get_joint_config()
             .clone();
         assert_eq!(configs, vec![BTreeSet::from([1, 2])]);
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciler_grows_onto_slow_learners_without_timing_out() {
+        // #779: on a slow disk, a new learner's catch-up takes as long as its
+        // log gap needs. The reconciler waited for it inside its bounded
+        // operation, so every add timed out. Each operation is now a few
+        // commits; the catch-up runs between ticks, and promotion waits for it.
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+
+        let router = InMemoryRaftRouter::new();
+        let names = ["node-1", "node-2", "node-3"];
+        let mut nodes = Vec::new();
+        for name in names {
+            let id = raft_id_from_name(name);
+            let log_store = MemLogStore::new();
+            if name != "node-1" {
+                // 8,000 entries at half a millisecond each: four seconds to
+                // catch up, 1.5 s of it before the learner is within
+                // openraft's 5,000-entry `replication_lag_threshold`.
+                log_store.slow_entry_writes(Duration::from_micros(500));
+            }
+            let node = CouncilNode::new(
+                id,
+                CouncilConfig {
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 200,
+                    election_timeout_max_ms: 400,
+                    ..CouncilConfig::default()
+                },
+                InMemoryRaftNetworkFactory::new(id, router.clone()),
+                log_store,
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        let self_id = raft_id_from_name("node-1");
+        let self_info = info("node-1", 9444);
+        nodes[0]
+            .initialize(BTreeMap::from([(self_id, self_info.clone())]))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !nodes[0].is_leader().await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..8_000 {
+            nodes[0]
+                .write(crate::council::RaftRequest::Noop)
+                .await
+                .unwrap();
+        }
+
+        let now = Instant::now();
+        let mut peer_a = snap("node-2", 9445, now);
+        peer_a.first_seen = now - Duration::from_secs(600);
+        let mut peer_b = snap("node-3", 9447, now);
+        peer_b.first_seen = now - Duration::from_secs(600);
+        let (_membership_tx, membership_rx) = watch::channel(vec![peer_a, peer_b]);
+
+        let mut config = fast_reconciler_config();
+        config.op_timeout = Duration::from_secs(1);
+        config.selection.max_promotion_lag = 8;
+        let mut tracker = HealthTracker::default();
+        let mut deposition_throttle = DepositionThrottle::default();
+        let no_pressure = BTreeSet::new();
+        let expected: BTreeSet<u64> = names.iter().map(|n| raft_id_from_name(n)).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let started = tokio::time::Instant::now();
+            reconcile_council_once(
+                &nodes[0],
+                &membership_rx,
+                1,
+                self_id,
+                &self_info,
+                &config,
+                &mut tracker,
+                &mut deposition_throttle,
+                &no_pressure,
+            )
+            .await;
+            assert!(
+                started.elapsed() < config.op_timeout,
+                "a reconciler operation ran into its bound"
+            );
+
+            let voters: BTreeSet<u64> = nodes[0]
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .collect();
+            if voters == expected {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "council did not grow to 3 voters; got {voters:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         for node in &nodes {
             node.shutdown().await.unwrap();
         }
@@ -2051,5 +2192,146 @@ mod tests {
             .voter_ids()
             .collect();
         assert_eq!(voters, BTreeSet::from([1]));
+    }
+
+    /// A three-voter in-memory council whose nodes are named `node-1..3`,
+    /// returned with the index of its leader.
+    async fn named_council_of_three() -> (Vec<CouncilNode>, usize) {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+
+        let router = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        let mut members = BTreeMap::new();
+        for (index, name) in ["node-1", "node-2", "node-3"].into_iter().enumerate() {
+            let id = raft_id_from_name(name);
+            let node = CouncilNode::new(
+                id,
+                crate::council::types::CouncilConfig {
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 200,
+                    election_timeout_max_ms: 400,
+                    snapshot_threshold: 100,
+                    max_in_snapshot_log_to_keep: 50,
+                },
+                InMemoryRaftNetworkFactory::new(id, router.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, node.raft().clone()).await;
+            members.insert(id, info(name, 9444 + 2 * index as u16));
+            nodes.push(node);
+        }
+        nodes[0].initialize(members).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(index) = nodes.iter().position(|node| {
+                let metrics = node.raft().metrics().borrow().clone();
+                metrics.current_leader == Some(metrics.id)
+            }) {
+                return (nodes, index);
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no leader elected");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// One reconciler tick on `nodes[index]`, with gossip showing `alive`
+    /// and `pressured` resigning under disk pressure.
+    async fn tick_with_pressure(
+        nodes: &[CouncilNode],
+        index: usize,
+        alive: &[usize],
+        pressured: &BTreeSet<u64>,
+    ) {
+        let name = format!("node-{}", index + 1);
+        let now = Instant::now();
+        let peers = alive
+            .iter()
+            .filter(|peer| **peer != index)
+            .map(|peer| {
+                let mut peer = snap(&format!("node-{}", peer + 1), 9444 + 2 * *peer as u16, now);
+                peer.first_seen = now - Duration::from_secs(600);
+                peer
+            })
+            .collect();
+        let (_membership_tx, membership_rx) = watch::channel(peers);
+        reconcile_council_once(
+            &nodes[index],
+            &membership_rx,
+            1,
+            raft_id_from_name(&name),
+            &info(&name, 9444 + 2 * index as u16),
+            &fast_reconciler_config(),
+            &mut HealthTracker::default(),
+            &mut DepositionThrottle::default(),
+            pressured,
+        )
+        .await;
+    }
+
+    /// The deposed leader must not win the election its deposition starts
+    /// (#755), so it holds its elections before any follower campaigns.
+    #[tokio::test]
+    async fn a_pressured_leader_holds_its_elections_before_it_is_deposed() {
+        let (nodes, leader) = named_council_of_three().await;
+        let leader_id = raft_id_from_name(&format!("node-{}", leader + 1));
+        let pressured = BTreeSet::from([leader_id]);
+
+        tick_with_pressure(&nodes, leader, &[0, 1, 2], &pressured).await;
+        assert!(nodes[leader].elections_held());
+        // The followers keep theirs: one of them has to win.
+        for follower in (0..3).filter(|index| *index != leader) {
+            assert!(!nodes[follower].elections_held());
+        }
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pressured_leader_with_no_healthy_successor_keeps_its_elections() {
+        let (nodes, leader) = named_council_of_three().await;
+        let leader_id = raft_id_from_name(&format!("node-{}", leader + 1));
+
+        // Gossip sees neither follower, so nobody else could lead.
+        tick_with_pressure(&nodes, leader, &[leader], &BTreeSet::from([leader_id])).await;
+        assert!(!nodes[leader].elections_held());
+
+        // Nor does a successor that is itself under pressure count.
+        let everyone: BTreeSet<u64> = (1..=3)
+            .map(|index| raft_id_from_name(&format!("node-{index}")))
+            .collect();
+        tick_with_pressure(&nodes, leader, &[0, 1, 2], &everyone).await;
+        assert!(!nodes[leader].elections_held());
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn a_pressured_voter_is_never_chosen_to_depose_the_leader() {
+        use crate::council::selection::MemberHealth;
+        let now = Instant::now();
+        let voters = BTreeSet::from([1, 2, 3]);
+        let health: HashMap<u64, MemberHealth> = voters
+            .iter()
+            .map(|id| (*id, MemberHealth::Alive { since: now }))
+            .collect();
+        assert_eq!(
+            pick_deposition_target(&voters, &health, 1, &BTreeSet::from([1])),
+            Some(2)
+        );
+        assert_eq!(
+            pick_deposition_target(&voters, &health, 1, &BTreeSet::from([1, 2])),
+            Some(3)
+        );
+        assert_eq!(
+            pick_deposition_target(&voters, &health, 1, &BTreeSet::from([1, 2, 3])),
+            None
+        );
     }
 }

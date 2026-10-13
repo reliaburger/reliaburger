@@ -2358,6 +2358,12 @@ That last sentence hid a stall, and it took a slow disk to find it. openraft cha
 
 openraft says as much in its docs: a caller that goes away between the steps leaves the cluster in the joint config. So the reconciler now finishes it. Before planning, the leader asks `unfinished_membership_change()`, which returns the target voter set when the membership is joint *and* that entry has been applied (so it committed). If there is one, the leader proposes that target as the next change. openraft turns a request for the joint config's own second half into the uniform config, so this is exactly the step the abandoned caller would have taken. It covers a leader that failed over between the two steps too, which no amount of patience in the caller could. The regression test makes the stall deterministic with the in-memory router. It partitions the learner so the joint step can't commit inside a 500 ms bound, heals the partition, waits for the joint step to commit, and then runs one reconciler tick, which must land the council on `{a, b}`.
 
+The same slow disk raised a second question: what else was inside that five-second bound? We measured each phase against a test log store that takes 20 ms per entry. Every operation starts with a guard no-op (46 ms), the barrier that makes an earlier node-fault grant visible before membership moves. Then come one membership entry for adding a learner (90 ms in all) or two for a promotion (147 ms). Those costs are fixed: a handful of commits, whatever the size of the log. The one cost that wasn't fixed was hiding in `add_learner`. We called openraft's `add_learner(id, node, true)`, and that `true` means "block until the learner is up to speed", where up to speed is openraft's `replication_lag_threshold`, 5,000 entries. A learner joining a busy council with a long log, or one that needs a snapshot first, could spend the whole bound there, and the operation timed out (#779).
+
+The wait was redundant anyway. The planner already refuses to promote a learner until it's within `max_promotion_lag` (64) entries of the leader. So `add_learner` now passes `false` and returns once the membership entry commits. The catch-up runs between ticks, where it can take as long as the log gap needs without holding anything up, and the next ticks plan nothing until the learner is ready. The bound stays at five seconds: it now covers a known number of commits, with plenty of room for a leader whose apply queue is busy. The regression test gives two learners a log store that takes half a millisecond per entry and an 8,000-entry gap, sets the bound to one second, and asserts that no reconciler tick reaches it while the council grows to three voters. Before the change, the first `add_learner` ran into it.
+
+The test needed a slow store, and `MemLogStore` already had one test hook, `fail_appends`, for the full-disk case. We added a second beside it, `slow_entry_writes`, which sleeps in `append` for each entry it writes. Both hooks are fields marked `#[cfg(test)]`, so they exist only when the crate is compiled for its own unit tests. A production build has neither the fields nor the code that reads them, unlike Go, where a test hook usually stays in the binary behind a flag. The delay is per entry rather than per call because catch-up time has to grow with the log gap, which is the thing we were testing.
+
 ## When the whole council dies
 
 Self-healing has a floor. It keeps the council alive while a majority survives, because every membership change it proposes has to commit through Raft, and Raft needs a quorum to commit anything. Kill two of three voters and the planner does exactly nothing — there's no majority left to vote a replacement in. Kill all three and the cluster is, on paper, dead. Workers keep running whatever they were running, but nothing can elect a leader, schedule a new app, or answer a query about cluster state. There's no quorum to heal from.
@@ -2402,6 +2408,43 @@ retain = 24
 
 Off by default. If you don't set `url`, the loop never starts and you pay nothing.
 
+"Each backend's standard credentials" was, for a while, a promise the code didn't keep. `object_store::parse_url` builds an S3 store with `AmazonS3Builder::new()`, which reads no environment at all, so `AWS_REGION` and friends were ignored and S3 quietly fell back to the instance's metadata credentials in `us-east-1` (#695). Chapter 15 has the fix in `object_storage::open`; the short version is that we now hand each builder its own `AWS_*` or `GOOGLE_*` variables.
+
+The other problem was the name. The first version called each object `council-{millis}.backup`, from the leader's `SystemTime::now()`, and both "restore the newest" and "keep the newest 24" sorted by it. Picture a former leader whose clock ran a day fast. Its backups are the "newest" for a day. Once it has written 24 of them, every correct backup the new leader uploads sorts older and is pruned straight after upload, and a restore picks the stale state. The wall clock is the one thing in a cluster nobody agrees on.
+
+Raft already gives us an order everybody agrees on: the log position. So a backup's key is the position of the state inside it.
+
+```rust
+pub struct BackupKey {
+    pub recovery_epoch: u64,
+    pub term: u64,
+    pub index: u64,
+    pub millis: u64,
+    pub recovery_id: Option<RecoveryId>,
+}
+
+impl Ord for BackupKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+```
+
+Recovery epoch first, because a recovered council's state supersedes the dead one's whatever their terms. Then term, then the last applied index, and only then the clock, as a tie-break. `Ord` is the trait behind `sort()` and `<`, a bit like implementing `Less` for Go's `sort.Interface`, except the compiler insists the ordering is total. We write it by hand rather than `#[derive(Ord)]` because a derived one would compare `Option<RecoveryId>`, and `RecoveryId` has no business being ordered. `order()` returns a tuple, and tuples compare field by field, left to right, which is exactly the rule we want. The object name zero-pads every field (`council-e00000000000000000001-t…-i…-m…-r….backup`), so a plain lexicographic listing agrees with `Ord`, and the key's term and index come from the same linearizable read that produced the state, so they can't drift from the bytes.
+
+Why is the recovery id in the name at all, when it doesn't order anything? Two survivors recovered independently from one backup land on the same epoch with fresh logs, so their first backups can agree on epoch, term, index and even the millisecond. Without the id, both councils would write the same object name, and the second upload would silently replace the first. With it, both survive, and `relish council backups` shows which council wrote which. The test `two_recoveries_on_one_epoch_never_share_a_backup_object` builds exactly that pair and checks both payloads come back.
+
+Parsing the name uses a slice pattern:
+
+```rust
+let fields: Vec<&str> = body.split('-').collect();
+let [epoch, term, index, millis, id] = fields.as_slice() else {
+    return None;
+};
+```
+
+`let ... else` binds the five fields if the slice has exactly five elements, and runs the `else` block (which must leave the function) otherwise. An old `council-{millis}.backup` name doesn't parse, so the listing logs it and leaves it alone: no compatibility before 1.0, but no silent deletes either.
+
 A word on `_config` — see the leading underscore? In Rust, an unused function parameter is a warning, and warnings are errors in our CI. The underscore tells the compiler "I know, I'm not using it yet." We keep the parameter because sealing may grow config-driven options later, and changing the signature then would ripple through every caller. It's a small hedge, marked honestly.
 
 ### The honest cost
@@ -2416,6 +2459,8 @@ Recovery is deliberately manual. You run `relish council recover` against a *sto
 relish council recover --data-dir /var/lib/reliaburger/data \
     --from s3://my-bucket/council
 ```
+
+It tries the newest backup first. One that won't download, decode, unseal or parse, or whose state isn't at the position its name claims, gets a log line saying why, and recovery moves on to the next older one. It fails only when every backup fails, and then the error lists each one with its reason. The first version took `latest()` and gave up on the first bad blob, which is exactly the wrong moment to be fussy: when you're restoring a dead cluster, one torn upload shouldn't cost you the 23 good backups behind it. `relish council backups --from <url>` lists them newest first, and `--backup <name>` restores one by name and never falls back, because an operator who names a backup means that one.
 
 It refuses if a council voter still answers, unless you pass `--force` with a loud warning — recovering a cluster that still has a quorum would give you two clusters that both think they're in charge, which is the split-brain we spend the whole chapter avoiding. In a genuine total loss the check simply passes, because there's nothing left to answer.
 
@@ -2650,20 +2695,79 @@ A resigning *leader* is the hard case, and it's where openraft 0.9 fought us.
 
 openraft 0.9 has no graceful leadership transfer. You cannot say "hand off to node 2 and step down." The self-healing planner worked around this by making "never remove the leader" an absolute rule and leaving the transfer seam for later. Later is now.
 
-The trick is to abuse the one lever openraft *does* give us: `trigger().elect()`, which forces a node to start a fresh election at a higher term:
+The trick is to abuse the one lever openraft *does* give us: `trigger().elect()`, which forces a node to start a fresh election at a higher term. A node can only trigger an election on itself, so the leader can't push anyone. Instead every voter's reconciler works out the same deposition target, a healthy voter that isn't under pressure itself, and that voter campaigns:
 
 ```rust
-if disk_pressured.contains(&self_id) {
-    if let Some(target) = pick_deposition_target(&voters, &health, self_id) {
-        council.raft().trigger().elect().await?;   // a healthy voter campaigns
-    }
-    return;   // never plan our own removal
+if let Some(leader) = current_leader
+    && leader != self_id
+    && disk_pressured.contains(&leader)
+    && pick_deposition_target(&voters, &health, leader, disk_pressured) == Some(self_id)
+{
+    council.raft().trigger().elect().await?;   // the chosen voter campaigns
+    return;
 }
 ```
 
-A follower campaigning at a higher term deposes the current leader by the normal rules of Raft — the leader sees a higher term and steps down. So a pressured leader picks a healthy voter, tells it to campaign, and gets demoted to an ordinary follower. Once it's an ordinary follower, the *new* leader's planner sees it as a pressured voter and replaces it with the follower path above. No new consensus primitive, no fork of openraft, just Raft's own term rules pointed at a useful outcome.
+A follower campaigning at a higher term deposes the current leader by the normal rules of Raft: the leader sees a higher term and steps down. Once it's an ordinary follower, the *new* leader's planner sees it as a pressured voter and replaces it with the follower path above. No new consensus primitive, no fork of openraft, just Raft's own term rules pointed at a useful outcome.
 
-Before building anything on this, we verified it actually works against openraft 0.9 in a gated test: elect a leader, make a healthy follower campaign, and assert the term advances and leadership moves. It does. Had it not, the fallback was an openraft version bump — a wire-and-storage compatibility risk we'd have flagged before taking. It held, so we didn't have to.
+Before building anything on this, we checked the lever against openraft 0.9 in a gated test: elect a leader, make a healthy follower campaign, and assert that the term advances and a single leader settles. It does. Had it not, the fallback was an openraft version bump, a wire-and-storage compatibility risk we'd have flagged before taking.
+
+Read that assertion again, though. It says *a* leader settles, not a *different* one. For a long time this chapter claimed the test showed leadership moving. It didn't, and the difference bit us.
+
+### Deposed is not replaced
+
+Deposing a leader only removes it. Who wins the election that follows is Raft's call, and Raft gives its vote to the most up-to-date log. On a busy cluster that's usually the old leader's: it wrote the newest entries, and a follower that campaigns a few milliseconds before receiving the latest one has the shorter log. The old leader and the other follower both refuse it. Its higher term still deposes the leader, and then the old leader's own election timer fires, it campaigns with the longest log, and it wins. The term went up, nothing moved.
+
+The cron test in chapter 17 hit exactly this (#646), and its fix pointed at the production one (#755). openraft exposes a runtime switch, `raft.runtime_config().elect(false)`, that stops a node starting elections on its own timer. It still votes, still replicates, and still leads if it's the leader. It just never campaigns. So a node that must give up leadership *holds its elections* first, and the only voters left in the race are the ones we want.
+
+Holding forever would be its own outage, so the hold is a little state machine with two ways out. The pure part is one function:
+
+```rust
+pub fn hold_ends(self_id: u64, current_leader: Option<u64>, now: Instant, until: Instant) -> bool {
+    current_leader.is_some_and(|leader| leader != self_id) || now >= until
+}
+```
+
+Another voter leads, so the handover worked and this node may campaign again. Or the deadline passed (30 seconds), so nobody else could win and the council needs this node back in the race. `Option::is_some_and` runs a test on the value if there is one and returns `false` for `None`, so "some other node leads" fits in one expression.
+
+The impure part lives in `ElectionHold`, which `CouncilNode` owns. It keeps the deadline in a `tokio::sync::watch` channel rather than behind a mutex:
+
+```rust
+pub(crate) fn hold_until(&self, until: Instant) {
+    let mut started = false;
+    self.until.send_modify(|held| {
+        started = held.is_none();
+        *held = Some(held.map_or(until, |current| current.max(until)));
+        self.raft.runtime_config().elect(false);
+    });
+    if started {
+        tokio::spawn(release_when_settled(/* ... */));
+    }
+}
+```
+
+`send_modify` runs the closure while it holds the channel's write lock, and the release task flips elections back on inside `send_if_modified` under the same lock. So a hold and a release can't interleave and leave elections switched on with a hold in place. The closure mutates `started`, a local outside it: Rust lets a closure borrow a local mutably as long as nothing else touches it until the closure is gone, and the compiler checks that for us. A repeated hold only pushes the deadline out (`max`), and only the first one spawns the release task, which waits on the Raft metrics watch and on the deadline, whichever moves first.
+
+The reconciler renews the hold on every tick while the pressured node leads *or nobody does*:
+
+```rust
+if pressured_voter_holds(
+    self_id,
+    current_leader,
+    disk_pressured.contains(&self_id),
+    pick_deposition_target(&voters, &health, self_id, disk_pressured).is_some(),
+) {
+    council.hold_elections_until(now + HANDOVER_HOLD);
+}
+```
+
+That "or nobody does" matters. The follower's campaign and the leader's tick race each other, and if the follower deposes the leader first, the leader is no longer a leader on its next tick. It still has to hold, because the election it must not win is the one happening right now. And the hold only starts when there's a successor that could lead and isn't under disk pressure itself. Three pressured voters holding each other's elections would be a council with no leader at all, so `pick_deposition_target` now skips pressured voters too.
+
+The admin endpoint got the same treatment. `POST /v1/cluster/elect` used to make the node that received it campaign once and report "election triggered", whoever won. Now the receiving voter first asks the leader to hold its elections (a forwarded call carrying the caller's own credential, so the leader repeats the admin check), then campaigns every one and a half leader leases until someone other than the old leader leads, and answers with who that is. Usually it's the node you asked. If another voter's log is longer, Raft picks that one instead, and that's still a handover. Sent to the leader itself, the request is refused: a leader can't campaign itself out of office.
+
+The new tests check the thing that matters, the identity of the next leader, not the term. A unit test builds the #646 situation on purpose: one follower misses an entry and campaigns at a higher term with the shorter log. Without the hold, the old leader wins back leadership on every run; with it, the up-to-date follower wins on every run. A gated test does five handovers in a row while a writer hammers whoever leads, and asserts each one moves leadership and no old leader ever leads at a later term. With the hold switched off, its first round never completes: under constant writes the old leader wins every election for 20 seconds straight.
+
+Is there anything here a reconciler timeout could abandon, the way #758 found a membership change left half done? No. `trigger().elect()` returns as soon as the campaign starts, and the hold is local state with its own deadline, so a slow tick leaves nothing half applied. A deposition in the middle of a membership change is #758's other case, a leader failing over between the two steps, and the new leader finishes it.
 
 ### Getting the signal to the person who can act on it
 
@@ -2729,7 +2833,7 @@ On the testing side, `relish test` now waits out a short leader change. Lease cr
 
 ### Testing the whole thing
 
-The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler and watches leadership move off it, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
+The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler, keeps writes flowing, and watches leadership move off it without the old leader ever winning it back, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
 
 The three field bugs each got a test that failed first. `security_state_init_never_replaces_an_initialised_security_state` applies a bootstrap on top of a state holding a token, and `a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file` starts a real node, bootstrap file and all, on a recovered directory. `durable_consumer_follows_a_recovered_council_and_still_refuses_the_replaced_one` drives a node's real durable consumer through the old council's generation, the recovered one, and the old one again. And `a_voter_that_never_snapshotted_recovers_from_its_committed_log` runs a one-voter council on durable, encrypted stores, writes fifty entries, stops it and recovers from what's on disk, with unit tests beside it for the commit point, the tail after a snapshot and the missing key.
 

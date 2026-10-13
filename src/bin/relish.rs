@@ -789,9 +789,16 @@ enum CouncilCommand {
         data_dir: std::path::PathBuf,
         /// Restore from a sealed backup at this object-store URL
         /// (`file://`, `s3://`, `gs://`). Omit to restore from the node's own
-        /// snapshot and committed Raft log under `data_dir`.
+        /// snapshot and committed Raft log under `data_dir`. Credentials and
+        /// region come from the backend's standard environment variables
+        /// (`AWS_*`, `GOOGLE_*`). Without `--backup`, the newest backup
+        /// that unseals is restored; unusable ones are skipped and logged.
         #[arg(long)]
         from: Option<String>,
+        /// Restore exactly this backup object (a name from `relish council
+        /// backups`) instead of the newest usable one.
+        #[arg(long, requires = "from")]
+        backup: Option<String>,
         /// Path to the cluster master key file (32-byte hex), needed to
         /// unseal a backup or read an encrypted Raft log. Defaults to
         /// `/etc/reliaburger/master.key`.
@@ -808,6 +815,16 @@ enum CouncilCommand {
         /// recovering a live cluster splits the brain.
         #[arg(long)]
         force: bool,
+    },
+    /// List the sealed council backups at an object-store URL.
+    ///
+    /// Newest first, in the order `council recover --from` tries them:
+    /// by recovery epoch, then Raft term, then log index. The names are
+    /// what `council recover --backup` takes. Needs no master key.
+    Backups {
+        /// The backup destination (`file://`, `s3://`, `gs://`).
+        #[arg(long)]
+        from: String,
     },
     /// Re-enrol a voter fenced out by `council recover`.
     ///
@@ -1767,9 +1784,13 @@ async fn main() -> ExitCode {
             Some(CouncilCommand::ReEnrol { data_dir, force }) => {
                 commands::council_reenrol(data_dir, *force)
             }
+            Some(CouncilCommand::Backups { from }) => {
+                commands::council_backups(from, cli.output).await
+            }
             Some(CouncilCommand::Recover {
                 data_dir,
                 from,
+                backup,
                 master_key,
                 api_port,
                 force,
@@ -1777,6 +1798,7 @@ async fn main() -> ExitCode {
                 commands::council_recover(
                     data_dir,
                     from.as_deref(),
+                    backup.as_deref(),
                     master_key.as_deref(),
                     *api_port,
                     *force,
@@ -3677,6 +3699,53 @@ mod tests {
                 action: Some(CouncilCommand::Recover { force: true, .. })
             }
         ));
+    }
+
+    #[test]
+    fn parse_council_recover_of_a_named_backup_needs_its_destination() {
+        let cli = parse(&[
+            "relish",
+            "council",
+            "recover",
+            "--data-dir",
+            "/var/lib/reliaburger/data",
+            "--from",
+            "s3://backups/council",
+            "--backup",
+            "council-e1.backup",
+        ])
+        .unwrap();
+        let Command::Council {
+            action: Some(CouncilCommand::Recover { backup, .. }),
+        } = cli.command
+        else {
+            panic!("expected council recover");
+        };
+        assert_eq!(backup.as_deref(), Some("council-e1.backup"));
+        assert!(
+            parse(&[
+                "relish",
+                "council",
+                "recover",
+                "--data-dir",
+                "/d",
+                "--backup",
+                "council-e1.backup",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_council_backups_command() {
+        let cli = parse(&["relish", "council", "backups", "--from", "gs://b/council"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Council {
+                action: Some(CouncilCommand::Backups { .. })
+            }
+        ));
+        assert!(parse(&["relish", "council", "backups"]).is_err());
     }
 
     #[test]

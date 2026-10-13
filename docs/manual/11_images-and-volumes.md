@@ -47,6 +47,13 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+Once a node has pulled and unpacked a digest-pinned image, it doesn't ask any
+registry about it again. Bun keeps the index, manifest and config it verified
+and checks each against its digest before reusing it, so a burst of
+containers or job executors from that image can't trip a registry's rate
+limit. A tag reference, or a pin whose local copy is missing or no longer
+matches its digest, goes to the registry as usual.
+
 ## Tags bind to digests at apply
 
 A tag moves. `nginx:1.27` today needn't be `nginx:1.27` next week, so the
@@ -452,6 +459,16 @@ right copy into place and delete the `<volume>.restore.json` journal.
 `relish snapshot list` reports an error, rather than a shorter list, when
 snapshot metadata can't be read.
 
+Taking a snapshot is two steps: Btrfs makes the read-only copy, then Bun
+writes its metadata. A power cut between the two used to leave a copy nobody
+could see, list, upload or prune, holding disk forever. Now Bun writes a
+`<name>.pending` file before the copy and removes it after the metadata. When
+it starts, and at the start of every scheduled sweep, it deletes any copy that
+still has a `.pending` file and no metadata: nothing ever reported it as
+taken. A copy with neither (made by hand, or left by Reliaburger 0.2.0 or
+earlier) isn't Bun's to delete, so the sweep logs it each time instead. Look
+at it, then remove it with `btrfs subvolume delete` if nothing needs it.
+
 `--volume` must be one of the app's own managed volumes, named by its
 container mount path. A custom `--name` is 1 to 128 characters from
 `A-Z a-z 0-9 . _ -` and can't start with a dot. Anything else is refused with
@@ -474,7 +491,10 @@ upload_timeout_secs = 3600            # deadline for archiving, then for uploadi
 ```
 
 Object-storage credentials come from each backend's standard environment
-variables.
+variables in Bun's environment: `AWS_*` (including `AWS_REGION` and
+`AWS_ENDPOINT`) for S3, `GOOGLE_SERVICE_ACCOUNT` or
+`GOOGLE_APPLICATION_CREDENTIALS` for GCS (see "Backing up the council" in
+`operations` for the full list).
 
 Each sweep takes new snapshots, uploads every snapshot the destination hasn't
 confirmed, then prunes past `retain`. A snapshot that hasn't reached the

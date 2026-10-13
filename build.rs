@@ -76,7 +76,6 @@ fn compile_ebpf() {
 
     let programs = [
         ("onion_connect.bpf.c", "onion_connect.bpf.o", false),
-        ("onion_dns.bpf.c", "onion_dns.bpf.o", false),
         ("onion_connect.bpf.c", "onion_connect_owned.bpf.o", true),
     ];
 

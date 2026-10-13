@@ -15,7 +15,7 @@ Bun's responsibilities on every node:
 
 - **Container management (Grill):** Start, stop, health-check, and monitor OCI containers via the Grill abstraction layer. Grill drives the runtimes directly (runc on Linux, Apple Container on macOS, and a `process` mode with no runtime at all); it does not shell through containerd.
 - **Process workload management:** Start, stop, and health-check non-container workloads (host binaries and inline scripts), gated by a deny-by-default binary allowlist. (The namespace/cgroup isolation stack for these host processes is planned; see §5.2.)
-- **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000-60000) and map them to container-internal ports.
+- **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000 up to, not including, 32767: below Linux's ephemeral range) and map them to container-internal ports. Ports a host daemon already listens on are skipped.
 - **eBPF service discovery (Onion):** Load and maintain the Onion eBPF programs and kernel maps for socket-level service discovery and firewall enforcement.
 - **Log collection (Ketchup):** Capture stdout/stderr from all workloads and feed them into the structured log pipeline.
 - **Metrics collection (Mayo):** Scrape per-workload metrics endpoints and feed them into the time-series store.
@@ -814,7 +814,7 @@ pub struct NetworkConfig {
     /// Default: auto-detected from the default route interface.
     pub advertise_address: Option<IpAddr>,
     /// Ephemeral port range for container port mapping.
-    pub port_range: PortRange,   // default: 10000-60000
+    pub port_range: PortRange,   // default: 10000..32767 (end exclusive)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1041,8 +1041,8 @@ before their Phase 15 cases can use this contract.
 
 1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler via the reporting tree).
 2. Transition state to `Pending`.
-3. **Prepare image:** Check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
-4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000-60000) and marks it as in-use.
+3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.11). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
+4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000..32767), skips any port a TCP bind on the host shows is already taken, and marks it as in-use.
 5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a request, the request-derived soft controls `cpu.weight` and `memory.high` in the `linux.resources.unified` map (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
@@ -1224,7 +1224,7 @@ Three decisions shape everything that follows, and each earns its keep against t
 
 1. **Directives travel over the node HTTP API, not the reporting tree.** The reporting tree is upstream-only (reports and acks flow towards the leader). Adding a downstream command path would have changed its bincode wire format mid-phase, and mixed-version wire formats are exactly what an upgrade creates. So the leader POSTs to each node's token-authenticated `/v1/upgrade/apply` instead.
 2. **Version discovery polls `GET /v1/version`, not gossip.** Adding a version field to the gossip `MembershipUpdate` would break bincode decoding for the old nodes still running during the mixed-version window. Polling an HTTP endpoint carries no such wire-format risk. Rejoin is confirmed separately (see the orchestrator's completion gate below): a node is only "done" once it is back in the gossip mesh *and* HTTP-healthy at the target version.
-3. **The leader upgrades in place; there is no leadership transfer.** openraft 0.9 has no graceful transfer, and a naive `raft.trigger().elect()` on a follower can't win against a live leader's heartbeats (anti-disruption / leader-stickiness). So the leader execs itself LAST: exec is sub-second, a council of ≥3 keeps quorum through the bounce, and the returning node re-establishes leadership and finishes the run via the orchestrator's poll-first idempotency. (`POST /v1/cluster/elect` stays a manual admin recovery tool; the upgrade path does not use it.)
+3. **The leader upgrades in place; there is no leadership transfer.** openraft 0.9 has no graceful transfer, and a naive `raft.trigger().elect()` on a follower can't win against a live leader's heartbeats (anti-disruption / leader-stickiness). So the leader execs itself LAST: exec is sub-second, a council of ≥3 keeps quorum through the bounce, and the returning node re-establishes leadership and finishes the run via the orchestrator's poll-first idempotency. (`POST /v1/cluster/elect` stays a manual admin tool for moving leadership before maintenance; the upgrade path does not use it. Since 0.2.1 it holds the old leader's elections before campaigning, so the move sticks: see `gossip-mustard.md` §5.2, "Moving leadership off a voter".)
 
 **Node-level upgrade sequence (executed on each node that receives a directive):**
 
@@ -1403,7 +1403,7 @@ join = ["10.0.1.5:9443"]
 | `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
 | `[resources]` | `gpu_enabled` | `true` | bool | Auto-detect NVIDIA GPUs (probe `/dev/nvidia0`, parse `nvidia-smi`) at startup. When false, GPU workloads are refused on this node. |
 | `[network]` | `advertise_address` | auto-detect | IP address | IP address this node advertises to the cluster. |
-| `[network]` | `port_range` | `"10000-60000"` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
+| `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
 | `[images]` | `max_storage` | `"50Gi"` | resource string (bytes) | Maximum disk space for Pickle image layers. |
 | `[images]` | `redundancy` | `2` | 1-10 | Number of peers to replicate pushed images to immediately. |
 | `[images]` | `gc_retain_tags` | `10` | 1-1000 | Keep this many most-recent tags per repository. |
@@ -1494,7 +1494,8 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 - Task data under `<data>/task-arrays/<id>/` is a 22-byte-per-task ledger, a dense result index of 24-byte slots (a sparse file, so a worker pays only for the tasks it ran) and kept failure output: one append-only segment per chunk grant, holding the head and tail of the first 16 failed tasks, written with one fsync per batch. A million tasks measure about 47 bytes per task (`make bench-task-arrays` fails above 50). The index replaced a redb B-tree that measured 87 bytes per task, four times the ledger; ledger plus index, about 109 bytes per task, is the same order as the 82 bytes per accepted task the October qualification rig lost, and nothing else on the task path grows per task.
 - The leader prunes finished runs an hour after they finish with a replicated `Prune` write on its one-second tick, not only on the next registration, and each worker deletes a run's directory once the leader stops listing it. An idle cluster therefore returns to its baseline disk use.
 - Task data counts toward disk pressure, and so does the audit log under `{data}/audit` (#798; `disk_pressure::node_data_bytes`). When they pass a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
-- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. Ordinary app instances don't call it yet, so their route and journal files still outlive a deleted app.
+- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it.
+- App instance metadata is collected too (#738). App instances share none of the executor path: the agent asks the runtime to forget an instance once the supervisor has let it go, which happens when its app is deleted, when a scale-down or a rollout retires it (including a retirement that waited for remote release), and when startup retires a launch it doesn't adopt. A plain `relish stop` forgets nothing, because its stopped replicas stay owned until an apply rolls over them, and an adopted instance keeps everything. The deletion runs in a task, so no agent turn waits on its fsyncs, and the same refusal rules apply, including against a successor generation of a reused identity. Anything a refusal or a crash leaves behind is a retired launch with no adoption record, which the next start retires and forgets. Init containers (`<id>__init-<n>`) are not forgotten in the loop yet: a successor of a reused identity may still need a finished initialiser's exit code, so deleting its journal needs a generation check the runtime doesn't take today. Startup forgets any that a restart finds without a record.
 
 ### 7.4 Process Workload Binary Missing
 
@@ -1570,6 +1571,16 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 **Impact:** One blocking thread, not one per retry (#770). Dropping the HTTP request drops the worker's handler, but the stuck call keeps running and holds the worker's single sync claim (`SyncClaim` in `task_array_node.rs`, one `OwnedSemaphorePermit` shared by the sync and every blocking call it starts). While the claim is held, later syncs fail at once with `SyncBusy`, answered as `503 Service Unavailable`, without touching the disk. Before this, each sync the leader gave up on left one more thread blocked on the disk, until the blocking pool filled and stalled unrelated work in Bun. The leader counts a busy answer as a failed sync, exactly like a timeout, so the node stops counting towards a run's eligible nodes and its held chunks move elsewhere after the 30-second silence timeout. Chunks already running on the worker carry on as long as their own disk writes do.
 
 **Recovery:** Automatic. When the stuck call returns, the claim frees itself and the next sync runs normally.
+
+### 7.11 Registry Rate-Limits a Burst of Cold Starts
+
+**What happens:** Dozens of reusable executors cold-start together, and each one prepares its image twice: once in the pool, to resolve the command against the image config, and once in runc's create, to build the bundle. An anonymous registry such as `public.ecr.aws` answers `TOOMANYREQUESTS`.
+
+**Detection:** The registry client retries four times with backoff, then the pull fails with `ImageError::ManifestPull` and the attempt with `SpawnFailed`, its reason in the task's output.
+
+**Impact:** None for a digest-pinned image this node has already pulled and unpacked (#790). `ImageStore::pull_and_unpack` first resolves a pin from local storage: the raw index, platform manifest and config it verified on the first pull, kept under `metadata/sha256/{digest}` and re-hashed against the digest that names them on every read, plus a rootfs generation with its `.complete` marker. Then neither pull sends a request. Only the first pull of an image on a node, a tag reference, or a pin whose local metadata or rootfs is missing or fails verification asks the registry.
+
+**Recovery:** Automatic for a warm pin. For a cold one, the task fails after the client's retries and the task pool retries the attempt as usual. Configure `[images] mirrors` to keep a public registry's rate limit out of the path.
 
 ---
 
@@ -1691,7 +1702,7 @@ The default seccomp profile blocks the following syscall families (identical for
 
 **10,000 nodes:** Bun itself is not affected by cluster size. The reporting tree ensures that each Bun instance communicates only with its parent (a council member), not with all other nodes. The Onion service map on each node contains entries for all workloads in the cluster (~5M at max density), which fits comfortably in kernel memory (~80 bytes per entry = ~400 MB, well within typical server memory).
 
-**Port allocation at density:** The default port range of 10000-60000 provides 50,000 ports. At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum = 2% utilisation. Port exhaustion is not a concern.
+**Port allocation at density:** The default port range of 10000..32767 provides about 22,700 ports, all below Linux's ephemeral range (32768-60999). At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum, about 4% utilisation. Port exhaustion is not a concern.
 
 ### 9.3 Memory Budget
 

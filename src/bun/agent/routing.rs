@@ -465,9 +465,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut ingress = self.ingress_configs.clone();
         ingress.extend(cluster_ingress.clone());
         let mut candidate = crate::wrapper::routing::RoutingTable::new();
-        candidate
-            .rebuild(&merged, &ingress)
-            .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
+        // One app's invalid route must not refuse the whole generation: that
+        // froze discovery and ingress for every app in the cluster (#700).
+        // The rebuild already left the bad route out.
+        if let Err(error) = candidate.rebuild(&merged, &ingress) {
+            eprintln!("wrapper: cluster catalogue {generation} skipped invalid routes: {error}");
+        }
 
         // Readers may retain old request guards. This commits the new views,
         // but is not evidence that those older requests have drained.

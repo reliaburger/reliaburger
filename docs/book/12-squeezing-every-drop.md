@@ -519,6 +519,30 @@ One smaller fix rode along. Snapshot directories were named by flattening the mo
 
 These changes alter the on-disk layout, so the state generation went up: a 0.1.1 node refuses 0.1.0's state, and you start a fresh cluster. Before 1.0 that's the policy (Chapter 14), and it spared us a migration nobody would have tested properly.
 
+The power-cut work (#287) closed one more gap, in 0.2.1 (#695). Taking a snapshot is two steps: `btrfs subvolume snapshot`, then `write_meta`. Cut the power between them and you have a read-only subvolume with no `.meta.json`. `list` only reads metadata files, so that subvolume is never listed, never uploaded and never pruned. It just holds disk, forever, and nobody is told.
+
+The fix is the same trick the restore journal uses: say what you're about to do before you do it. `create` now writes `<name>.pending` atomically before the subvolume, and removes it after the metadata. Bun sweeps the snapshot store at startup and at the start of every scheduled sweep, and the decision for each name is a pure function of three facts:
+
+```rust
+pub fn plan_interrupted_snapshot(
+    subvolume: bool,
+    meta: bool,
+    intent: IntentOwner,
+) -> InterruptedSnapshot {
+    match (intent, subvolume, meta) {
+        (IntentOwner::ThisProcess, _, _) => InterruptedSnapshot::Settled,
+        (IntentOwner::Abandoned, true, false) => InterruptedSnapshot::DeleteSubvolume,
+        (IntentOwner::Abandoned, _, _) => InterruptedSnapshot::DropIntent,
+        (IntentOwner::None, true, false) => InterruptedSnapshot::Unexplained,
+        (IntentOwner::None, _, _) => InterruptedSnapshot::Settled,
+    }
+}
+```
+
+Matching on a tuple lets one `match` cover every combination, and `_` says "any value here". The compiler checks the arms are exhaustive, so a missing case is a build error rather than a forgotten branch. A subvolume with an abandoned intent and no metadata was never acknowledged to anyone, so deleting it loses nothing. A subvolume with neither is a different story: it might predate intents, or an operator might have made it by hand, so the sweep reports it every time instead of deleting it.
+
+`IntentOwner::ThisProcess` is there because the sweep and `relish snapshot create` can run at the same time in one Bun. Without it, a sweep could find a create half-way through (intent and subvolume, no metadata yet) and delete it from under itself. So the intent records a random token drawn once per process (a `OnceLock<String>`, which initialises on first use and is read-only after that), and the sweep leaves this process's intents alone. A create that fails rewrites its intent with no owner and settles it on the spot, so a failure in a long-running Bun doesn't wait for a restart. The unit tests run the whole decision on plain directories, and `btrfs_interrupted_snapshot_is_cleaned_up_on_restart` repeats it on a loop-mounted Btrfs in `make test-linux`. The power cut itself is still #287's fixture to build.
+
 ## A thousand jobs, fifty envelopes
 
 The `/v1/batch` endpoint has returned 501 since Phase 8, with the batch scheduler and tracker sitting library-complete beside it. Wiring it forced the one design question this chapter had left open: *how does the leader tell another node to run something?*

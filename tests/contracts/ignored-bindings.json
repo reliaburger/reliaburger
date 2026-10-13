@@ -109,6 +109,12 @@
   },
   {
     "source": "src/grill/snapshot.rs",
+    "function": "btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_interrupted_snapshot_is_cleaned_up_on_restart"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
     "function": "btrfs_volumes_with_formerly_colliding_slugs_stay_separate",
     "binary": "reliaburger",
     "test": "grill::snapshot::tests::btrfs_volumes_with_formerly_colliding_slugs_stay_separate"
@@ -229,6 +235,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+    "binary": "reliaburger::cluster_failover",
+    "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "lease_retirement_waits_for_paused_worker_across_leader_change",
     "binary": "reliaburger::cluster_failover",
     "test": "lease_retirement_waits_for_paused_worker_across_leader_change"
@@ -289,15 +301,21 @@
   },
   {
     "source": "tests/council_disaster_recovery.rs",
-    "function": "trigger_elect_advances_term_and_can_move_leadership",
+    "function": "trigger_elect_advances_the_term_and_leadership_settles",
     "binary": "reliaburger::council_disaster_recovery",
-    "test": "trigger_elect_advances_term_and_can_move_leadership"
+    "test": "trigger_elect_advances_the_term_and_leadership_settles"
   },
   {
     "source": "tests/council_disaster_recovery.rs",
     "function": "pressured_leader_resigns_and_leadership_moves",
     "binary": "reliaburger::council_disaster_recovery",
     "test": "pressured_leader_resigns_and_leadership_moves"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "leadership_moves_off_the_leader_every_time_under_write_load",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "leadership_moves_off_the_leader_every_time_under_write_load"
   },
   {
     "source": "tests/council_disaster_recovery.rs",
@@ -1192,6 +1210,12 @@
     "function": "runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor",
     "binary": "reliaburger::owned_task_arrays",
     "test": "runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests"
   },
   {
     "source": "tests/placement.rs",

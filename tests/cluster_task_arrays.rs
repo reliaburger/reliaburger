@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reliaburger::bun::task_array_leader::TaskArrayService;
+use reliaburger::bun::task_array_leader::{CronClock, TaskArrayService};
 use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
 use reliaburger::bun::task_executor::{AttemptOutcome, FakeRunner};
 use reliaburger::bun::task_ledger::GroupCommit;
@@ -535,15 +535,23 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     root.cancel();
 }
 
+/// How a common cluster's nodes treat jobs: how long each fake task takes,
+/// and the clock the leader fires cron schedules at.
+struct CommonJobs {
+    delay: Duration,
+    cron_clock: CronClock,
+}
+
 async fn start_common_node(
     ports: &PortBlockReservation,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
     data: &std::path::Path,
-    delay: Duration,
+    jobs: &CommonJobs,
     operator: &reliaburger::sesame::types::ApiToken,
 ) -> WiredNode {
+    let delay = jobs.delay;
     let executor = TaskArrayNode::new(
         TaskArrayNodeConfig {
             root: data.join("task-arrays"),
@@ -579,11 +587,14 @@ async fn start_common_node(
         fault_injection: false,
         labels: Default::default(),
         keep_data_dir: false,
-        task_arrays: Some(Arc::new(TaskArrayService::with_timings(
-            Some(Arc::new(executor)),
-            Duration::from_millis(100),
-            Duration::from_secs(3),
-        ))),
+        task_arrays: Some(Arc::new(
+            TaskArrayService::with_timings(
+                Some(Arc::new(executor)),
+                Duration::from_millis(100),
+                Duration::from_secs(3),
+            )
+            .with_cron_clock(jobs.cron_clock.clone()),
+        )),
         task_arrays_on_agent_budget: None,
     })
     .await
@@ -591,6 +602,21 @@ async fn start_common_node(
 
 async fn common_cluster(
     delay: Duration,
+) -> (
+    CancellationToken,
+    Vec<tempfile::TempDir>,
+    Vec<PortBlockReservation>,
+    Vec<WiredNode>,
+    String,
+) {
+    common_cluster_with_cron_clock(delay, CronClock::System).await
+}
+
+/// A common cluster whose nodes all fire cron schedules at `cron_clock`'s
+/// time, whichever of them leads.
+async fn common_cluster_with_cron_clock(
+    delay: Duration,
+    cron_clock: CronClock,
 ) -> (
     CancellationToken,
     Vec<tempfile::TempDir>,
@@ -608,6 +634,7 @@ async fn common_cluster(
     let root = CancellationToken::new();
     let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let ports = lease_node_ports(3);
+    let jobs = CommonJobs { delay, cron_clock };
     let mut nodes = Vec::new();
     for (index, directory) in data.iter().enumerate() {
         nodes.push(
@@ -621,7 +648,7 @@ async fn common_cluster(
                 },
                 &root,
                 directory.path(),
-                delay,
+                &jobs,
                 &operator.token,
             )
             .await,
@@ -833,8 +860,14 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
         MAX_ACTIVE_ARRAYS, MAX_ACTIVE_RUNS_PER_NAMESPACE, RESERVED_TRIGGERED_RUNS,
     };
     assert!(cluster_tests_enabled());
+    // The cron clock stands still until every bulk slot is full, so the
+    // occurrence can't come round early and take one of their slots, however
+    // slow the machine is (#748). Every node shares it, whichever leads.
+    let start = reliaburger::meat::batch_ids::epoch_now_secs() / 60 * 60;
+    let clock = CronClock::manual(start);
     // Every task takes far longer than the test, so every array stays active.
-    let (root, _data, _ports, nodes, token) = common_cluster(Duration::from_secs(600)).await;
+    let (root, _data, _ports, nodes, token) =
+        common_cluster_with_cron_clock(Duration::from_secs(600), clock.clone()).await;
     let leader = nodes
         .iter()
         .position(|node| *node.thinks_leader.borrow())
@@ -843,11 +876,10 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
     let http = reqwest::Client::new();
     let api = |index: usize| format!("http://127.0.0.1:{}", nodes[index].api_port);
 
-    // The bulk submissions below take a few seconds and must all land before
-    // the occurrence fires, or it takes one of their slots. Skip to the minute
-    // after next when the next one is less than 30 seconds away.
-    let now = time::OffsetDateTime::now_utc();
-    let next = now + time::Duration::minutes(if now.second() >= 30 { 2 } else { 1 });
+    // Well past the wall-clock minute registration lands in, which a schedule
+    // never fires in.
+    let occurrence = start + 30 * 60;
+    let next = time::OffsetDateTime::from_unix_timestamp(occurrence as i64).unwrap();
     let expression = format!(
         "{} {} {} {} *",
         next.minute(),
@@ -892,10 +924,22 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
         .unwrap_or_default()
         .to_string();
     assert!(reason.contains("cron fires and deployments"), "{reason}");
+    assert!(
+        !nodes[leader]
+            .council
+            .desired_state()
+            .await
+            .task_arrays
+            .jobs()
+            .runs()
+            .any(|(_, run)| run.name == "nightly"),
+        "the occurrence fired before the cron clock reached it"
+    );
 
+    clock.set(occurrence);
     wait_until(
         "the cron occurrence admitted into the reserved headroom",
-        Duration::from_secs(135),
+        Duration::from_secs(30),
         async || {
             nodes[leader]
                 .council

@@ -64,6 +64,45 @@ pub fn sync_deadline(interval: Duration) -> Duration {
 /// (the entry may still commit; every write is safe to repeat or drop).
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Where the leader reads the time it fires cron schedules at.
+///
+/// Production always uses [`CronClock::System`]. A test that needs an
+/// occurrence to come round at an exact point, say after it has filled the
+/// cluster with other work, holds a [`CronClock::Manual`] still and moves it
+/// on with [`CronClock::set`], instead of racing the wall clock (#748).
+#[derive(Debug, Clone, Default)]
+pub enum CronClock {
+    /// The host's UTC wall clock.
+    #[default]
+    System,
+    /// Seconds since the Unix epoch, shared by every clone and changed only
+    /// by [`CronClock::set`].
+    Manual(Arc<std::sync::atomic::AtomicU64>),
+}
+
+impl CronClock {
+    /// A manual clock that stands at `epoch_secs` until it is set.
+    pub fn manual(epoch_secs: u64) -> Self {
+        Self::Manual(Arc::new(std::sync::atomic::AtomicU64::new(epoch_secs)))
+    }
+
+    /// Move a manual clock, and every clone of it, to `epoch_secs`. The
+    /// system clock can't be moved, so this does nothing to it.
+    pub fn set(&self, epoch_secs: u64) {
+        if let Self::Manual(time) = self {
+            time.store(epoch_secs, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Seconds since the Unix epoch, by this clock.
+    pub fn now_epoch_secs(&self) -> u64 {
+        match self {
+            Self::System => crate::meat::batch_ids::epoch_now_secs(),
+            Self::Manual(time) => time.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+}
+
 /// The latest word from one node about one array, for status views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeView {
@@ -101,6 +140,8 @@ pub struct TaskArrayService {
     pub silence_timeout: Duration,
     /// How long a finished run stays readable before the leader prunes it.
     pub retention: Duration,
+    /// The time cron schedules fire at.
+    cron_clock: CronClock,
     /// Standalone copy of the arrays (unused with a council).
     local: Mutex<TaskArrays>,
     /// The id counter for `local`. With a council the counter lives in Raft.
@@ -165,6 +206,7 @@ impl TaskArrayService {
             sync_interval,
             silence_timeout,
             retention: Duration::from_secs(crate::meat::task_array_store::TERMINAL_RETENTION_SECS),
+            cron_clock: CronClock::System,
             local: Mutex::new(TaskArrays::default()),
             local_ids: Mutex::new(crate::meat::batch_ids::BatchIds::default()),
             views: Mutex::new(HashMap::new()),
@@ -177,6 +219,13 @@ impl TaskArrayService {
     /// hour. Tests use a short window to watch collection happen.
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Fire cron schedules at `clock`'s time instead of the wall clock's.
+    /// Tests use a manual clock to say exactly when an occurrence comes round.
+    pub fn with_cron_clock(mut self, clock: CronClock) -> Self {
+        self.cron_clock = clock;
         self
     }
 
@@ -1136,7 +1185,7 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
 }
 
 async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
-    let now = crate::meat::batch_ids::epoch_now_secs();
+    let now = state.task_arrays.cron_clock.now_epoch_secs();
     let Ok(minute) = i64::try_from(now / 60) else {
         return;
     };
@@ -1519,6 +1568,30 @@ mod tests {
     use crate::meat::index_set::IndexRangeSet;
     use crate::meat::task_array::TaskArraySpec;
     use crate::meat::task_array_state::{ChunkResult, TaskArrayState};
+
+    #[test]
+    fn a_manual_cron_clock_holds_its_time_until_set_and_its_clones_share_it() {
+        let clock = CronClock::manual(1_000);
+        let shared = clock.clone();
+        assert_eq!(clock.now_epoch_secs(), 1_000);
+        shared.set(4_600);
+        assert_eq!(clock.now_epoch_secs(), 4_600);
+    }
+
+    #[test]
+    fn the_system_cron_clock_follows_the_wall_clock() {
+        let before = crate::meat::batch_ids::epoch_now_secs();
+        let now = CronClock::System.now_epoch_secs();
+        assert!(now >= before);
+        assert!(now <= crate::meat::batch_ids::epoch_now_secs());
+    }
+
+    #[test]
+    fn setting_the_system_cron_clock_changes_nothing() {
+        let clock = CronClock::System;
+        clock.set(5);
+        assert!(clock.now_epoch_secs() > 5);
+    }
 
     fn record(count: u32, chunk_size: u32) -> TaskArrayRecord {
         let mut env = BTreeMap::new();

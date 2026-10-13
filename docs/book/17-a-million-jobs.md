@@ -315,7 +315,8 @@ favours the longest log, so the old leader won it a second later and the test
 waited 30 seconds for a handover that never came. Now the helper switches off
 the old leader's elections (openraft's `runtime_config().elect(false)`) and has
 the most up-to-date other voter campaign every 3 seconds until one of them
-leads. The test also registers its schedule early in a minute: the minute a
+leads. Production deposition had the same flaw, and 0.2.1 gave it the same fix
+(chapter 2, "Deposed is not replaced"). The test also registers its schedule early in a minute: the minute a
 schedule lands in counts as already seen, so a request sent at 59 seconds could
 miss the occurrence it was waiting for.
 
@@ -701,6 +702,40 @@ every active run, a cron fire uses the reserved headroom, a refused one is
 recorded as skipped, daily named arrays keep working past the definition cap,
 and on a real three-node cluster a cron job fires while other tenants fill
 every bulk slot.
+
+That last test first raced the wall clock. Its 96 bulk submissions had to land
+before the occurrence's minute came round, or the cron run took one of their
+slots, which is correct behaviour and a failed test. So it scheduled the
+occurrence for the next minute, or the one after when fewer than 30 seconds
+were left, and then waited for real time to pass: up to about 110 seconds
+against nextest's 120-second kill (#748). Giving it more slack would only move
+the cliff. Instead the leader now reads cron time from a `CronClock` on the
+task-array service:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub enum CronClock {
+    #[default]
+    System,
+    Manual(Arc<std::sync::atomic::AtomicU64>),
+}
+```
+
+Production never touches it, so `#[default]` makes `System` what
+`TaskArrayService` starts with. The test gives all three nodes clones of one
+`Manual` clock, which hold the same `Arc` and so the same counter, whichever
+node leads. It pins the clock to the current minute, schedules the occurrence
+half an hour later, fills the bulk slots, checks nothing has fired, and only
+then calls `set`. `set` takes `&self`, not `&mut self`, because the atomic
+gives us interior mutability: the leader loop reads the clock through its own
+`Arc` while the test moves it. The `Release` store pairs with the leader's
+`Acquire` load, so a leader that sees the new time also sees everything the
+test did before setting it. The wait went from up to two minutes to about
+seventeen seconds, most of it starting the cluster, and twelve runs in a row
+under eight busy loops all took the same time. Only the cron loop reads this
+clock. Registration, retention and the run timestamps stay on the wall clock,
+which is why the occurrence sits half an hour out: a schedule never fires in
+the wall-clock minute it was registered in.
 
 ### Watching a million jobs
 
@@ -1666,6 +1701,60 @@ and the pool left that empty. A failed shared-runc task showed no reason in
 the fresh-launch path always did. The unit test
 `a_command_that_never_starts_says_why_in_its_output` asks the pool for more
 than its node can hold and checks that the refusal is the task's output.
+
+The mirror only hid the rate limit, though. At a million jobs the same burst
+happens in production, against whatever registry a customer's images live in,
+and no mirror stands in front of it. So in 0.2.1 we fixed the pull itself
+(#790). Think about what the two manifest reads were for. A digest names exact
+bytes. If the node already holds bytes that hash to that digest, and has
+already unpacked the layers they name, what could the registry possibly tell
+it? Nothing. It can only be slow, or say no.
+
+Now a pull that verifies a digest-pinned image also keeps the raw bytes it
+verified, each under the digest that names it, in `metadata/sha256/` beside
+the layer blobs: the index the pin names (if it names one), the platform
+manifest and the config. The next pull of that pin starts with
+`pinned_image_from_local`. It reads the pinned root and hashes it, picks the
+platform entry exactly as a registry pull does, reads that manifest and
+checks its hash and size, then does the same for the config. If the rootfs
+generation those layer digests name has its `.complete` marker, that's the
+image: no request leaves the node. Any miss (a file that's absent, a byte
+that's changed, a generation that never finished unpacking) returns `None`,
+and the pull goes to the registry as before and rewrites the files it
+verified. The pool's pull and runc's create both call `pull_and_unpack`, so
+both get it for free. A cold executor for a warm pin costs zero registry
+requests instead of two.
+
+We kept two rules from the registry path. First, local bytes are trusted only
+because their hash matches the digest the job asked for, never because of a
+file name or a tag. `metadata_path` refuses anything but a well-formed sha256
+digest, so a hostile descriptor can't steer it outside the directory either.
+Second, a tag reference never takes this path. `nginx:1.29` today may be a
+different image from `nginx:1.29` yesterday, and only the registry knows
+which. This is one more reason the job API insists on digest pins.
+
+`Option` makes the fallback easy to read. Every step of the local lookup can
+miss, so it returns `Option<PulledImage>` and uses `?` on each one. In a
+function that returns `Option`, `?` on a `None` returns `None` straight away,
+and `.ok()?` turns a `Result` into an `Option` first, dropping its error. It's
+the same early return that `?` does for errors, without inventing an error
+type for "not here, ask the registry".
+
+The tests use the image store's counting fake registry, which now counts
+every request. `a_warm_digest_pinned_pull_makes_no_registry_requests` pulls a
+pin once, then pulls it again through a second store over the same directory
+(what runc's create sees after the pool's pull) and expects zero requests,
+for a pinned manifest and a pinned index.
+`warm_pinned_cold_starts_survive_a_registry_that_rate_limits_every_request`
+switches the registry to `429` for everything after the warm-up and runs 32
+pulls at once: all succeed, with no request. Before the fix they waited out
+the client's retries and failed. Two more tests pin down the security side:
+tampered local metadata is ignored, refetched and verified, and a tag always
+asks the registry. On Linux,
+`runc_warm_pinned_executor_cold_starts_make_no_registry_requests` puts a
+counting proxy in front of the test mirror, warms the image, makes the proxy
+answer `429` to everything and cold-starts four shared-runc executors at
+once. Every task runs, and the proxy sees no connection at all.
 
 The failed run also left executor network namespaces behind. A test that
 panics drops its nodes without retiring their executors, and the next runc

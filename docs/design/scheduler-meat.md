@@ -1080,7 +1080,7 @@ Admission caps sit in the replicated store (`src/meat/task_array_store.rs`, deci
 
 A run's trigger decides its class: `Cron` and `Hook` triggers are *triggered*, everything else is *bulk*. A cron `Fire` refused even with the headroom is recorded rather than failed: the cursor advances, the definition keeps `skipped: {minute, reason: capacity}` and a count, and the leader emits a `job-skipped` event. `control_state_stays_within_budget_at_the_global_cap` justifies 128: at the cap, with the largest template and saturated failure ranges, job state stays under 32 MiB (half a Raft frame) and one node's sync call under its 8 MiB body limit. 256 would not.
 
-Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop takes at most sixteen due schedules per tick and starts each tick after the last one it fired, so a long list takes turns.
+Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop takes at most sixteen due schedules per tick and starts each tick after the last one it fired, so a long list takes turns. It reads the minute from the service's `CronClock`: the UTC wall clock in production, a shared manual clock in tests (`TaskArrayService::with_cron_clock`), so a test decides exactly when an occurrence comes round instead of waiting for a real minute (#748). Only cron firing uses it; registration baselines, retention and run timestamps stay on the wall clock.
 
 #### The task-array leader loop at scale
 
@@ -1166,7 +1166,7 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 | `resources.reserved_cpu` | `"500m"` | CPU reserved for system and Bun overhead on each node. |
 | `resources.reserved_memory` | `"512Mi"` | Memory reserved for system and Bun overhead. |
 | `resources.reserved_disk` | `"10Gi"` | Disk reserved for system use. |
-| `network.port_range` | `"10000-60000"` | Ephemeral port range for host port allocation. |
+| `network.port_range` | `{ start = 10000, end = 32767 }` | Host port range for container port allocation, below Linux's ephemeral range. |
 
 ---
 

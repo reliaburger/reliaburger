@@ -254,6 +254,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         app.firewall.as_ref(),
         app.egress.as_ref(),
     )?;
+    validate_app_ingress(name, app)?;
 
     // Ordinals come from the leader's placements, never from a config file.
     if app.ordinals.is_some() {
@@ -432,6 +433,20 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     }
 
     Ok(())
+}
+
+/// Refuse an ingress route every node's routing rebuild would skip, so a
+/// typo like `tls = "acme"` fails at apply and lint instead of silently
+/// serving no route (#700).
+fn validate_app_ingress(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let Some(ingress) = &app.ingress else {
+        return Ok(());
+    };
+    crate::wrapper::routing::validate_ingress(ingress).map_err(|reason| ConfigError::Validation {
+        field: "ingress".to_string(),
+        context: format!("app {name:?}"),
+        reason,
+    })
 }
 
 /// Check the network policy apps and jobs share: every egress entry parses
@@ -2043,5 +2058,58 @@ exec = "/usr/bin/python3""#,
     fn same_namespace_prerequisites_are_valid() {
         Config::parse("[app.web]\nimage='web'\nnamespace='production'\n[job.migrate]\nimage='migrate'\nnamespace='production'\nrun_before=['app.web']\n")
             .unwrap().validate().unwrap();
+    }
+
+    /// Validate a one-app config whose `[app.web.ingress]` table is `ingress`.
+    fn validate_ingress(ingress: &str) -> Result<(), ConfigError> {
+        Config::parse(&format!(
+            "[app.web]\nimage = \"web:v1\"\nport = 8080\n[app.web.ingress]\nhost = \"web.example.com\"\n{ingress}"
+        ))
+        .unwrap()
+        .validate()
+    }
+
+    fn assert_ingress_refused(ingress: &str, reason_contains: &str) {
+        let error = validate_ingress(ingress).expect_err(ingress);
+        assert!(
+            matches!(error, ConfigError::Validation { ref field, .. } if field == "ingress"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains(reason_contains), "{error}");
+    }
+
+    #[test]
+    fn ingress_with_unknown_tls_mode_is_rejected() {
+        // ACME is deferred: the route would be refused on every node, so
+        // apply and lint refuse it first (#700).
+        for mode in ["acme", "auto", "letsencrypt"] {
+            assert_ingress_refused(&format!("tls = \"{mode}\""), "tls");
+        }
+    }
+
+    #[test]
+    fn ingress_with_zero_rate_limit_is_rejected() {
+        assert_ingress_refused("rate_limit_rps = 0", "rate_limit_rps");
+        assert_ingress_refused(
+            "rate_limit_rps = 10\nrate_limit_burst = 0",
+            "rate_limit_burst",
+        );
+    }
+
+    #[test]
+    fn ingress_rate_limit_without_a_derivable_burst_is_rejected() {
+        assert_ingress_refused(&format!("rate_limit_rps = {}", u32::MAX), "burst");
+    }
+
+    #[test]
+    fn ingress_with_supported_settings_is_valid() {
+        for ingress in [
+            "",
+            "tls = \"cluster\"",
+            "tls = \"explicit\"\nrate_limit_rps = 50",
+            "tls = \"none\"\nrate_limit_rps = 5\nrate_limit_burst = 20",
+        ] {
+            validate_ingress(ingress).unwrap();
+        }
     }
 }

@@ -62,6 +62,20 @@ impl WiredNode {
         rx.await.ok().flatten()
     }
 
+    /// The ingress routes this node's Wrapper would serve.
+    async fn routes(&self) -> Vec<reliaburger::wrapper::types::RouteInfo> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(reliaburger::bun::agent::AgentCommand::Routes { response: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
     async fn is_leader(&self) -> bool {
         self.council.is_leader().await
     }
@@ -488,6 +502,136 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
         },
     )
     .await;
+
+    fixture.root.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// A ported service with an ingress route on `host`, plus `extra` ingress
+/// settings.
+fn ingress_service_spec(port: u16, host: &str, extra: &str) -> reliaburger::config::app::AppSpec {
+    toml::from_str(&format!(
+        r#"
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        replicas = 1
+        port = {port}
+        [ingress]
+        host = "{host}"
+        {extra}
+        "#
+    ))
+    .unwrap()
+}
+
+/// #700: one app with an ingress route no node can install (`tls =
+/// "acme"`) made every node refuse every later catalogue, so discovery and
+/// ingress froze cluster-wide. `relish apply` now refuses that spec; the
+/// test writes it straight to the council to stand for one admitted before
+/// the check. Every node must skip that one route and keep publishing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+
+    let mut fixture = Fixture::new();
+    const N: usize = 3;
+    let all: Vec<usize> = (0..N).collect();
+    let mut nodes = Vec::with_capacity(N);
+    nodes.push(fixture.start_node(200, vec![], true, None).await);
+    for index in 201..(200 + N) {
+        let seed = fixture.gossip(200);
+        nodes.push(fixture.start_node(index, vec![seed], true, None).await);
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&pick(&nodes, &all)).is_some_and(|voters| voters.len() == N),
+    )
+    .await;
+    wait_until(
+        "all nodes reporting to the leader",
+        Duration::from_secs(60),
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| state.reports.len() == N)
+        },
+    )
+    .await;
+
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
+            app_id: AppId::new("broken", "default"),
+            spec: Box::new(ingress_service_spec(6380, "broken.local", "tls = \"acme\"")),
+        },
+    )
+    .await;
+    wait_until(
+        "broken running on some node",
+        Duration::from_secs(90),
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .and_then(|state| node_running_app(&state, "broken"))
+                .is_some()
+        },
+    )
+    .await;
+
+    // Deployed after the bad route: it reaches every node only if the
+    // catalogue keeps advancing past it.
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
+            app_id: AppId::new("redis", "default"),
+            spec: Box::new(ingress_service_spec(6379, "redis.local", "")),
+        },
+    )
+    .await;
+    wait_until(
+        "redis resolves and routes on every node",
+        Duration::from_secs(90),
+        async || {
+            for node in &nodes {
+                let resolves = node
+                    .resolve("redis")
+                    .await
+                    .is_some_and(|info| info.healthy_backends >= 1);
+                let routes = node.routes().await;
+                let routed = routes
+                    .iter()
+                    .any(|route| route.host == "redis.local" && route.healthy_backends >= 1);
+                if !resolves || !routed {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    for node in &nodes {
+        assert!(
+            node.resolve("broken").await.is_some(),
+            "{}: the bad app's own service must still resolve",
+            node.name
+        );
+        assert!(
+            !node
+                .routes()
+                .await
+                .iter()
+                .any(|route| route.host == "broken.local"),
+            "{}: the invalid route must never be installed",
+            node.name
+        );
+    }
 
     fixture.root.cancel();
     tokio::time::sleep(Duration::from_millis(500)).await;

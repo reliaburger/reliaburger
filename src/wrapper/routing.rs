@@ -496,6 +496,17 @@ fn build_path_route(
     })
 }
 
+/// Check an ingress config the way a routing rebuild will: the TLS mode
+/// parses, and the rate limit and burst are usable.
+///
+/// Config validation calls this so `relish apply` and `relish lint` refuse a
+/// route every node would skip. Returns the reason the route is invalid.
+pub fn validate_ingress(ingress: &IngressSpec) -> Result<(), String> {
+    TlsMode::parse(ingress.tls.as_deref()).map_err(|e| e.to_string())?;
+    build_rate_limit(ingress.rate_limit_rps, ingress.rate_limit_burst)?;
+    Ok(())
+}
+
 /// Validate and build a rate-limit config.
 ///
 /// `rps` must be positive (a zero rate would divide by zero when computing

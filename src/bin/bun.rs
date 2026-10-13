@@ -1471,14 +1471,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Settle any snapshot restore a previous Bun died in the middle of,
     // before anything can snapshot, mount or adopt those volumes. A volume
     // recovery can't settle keeps its journal, so it refuses to mount.
+    // Then delete the half-made snapshots of creates it died in (#695).
     let recovery_dir = config.storage.volumes.clone();
-    let unsettled = tokio::task::spawn_blocking(move || {
-        reliaburger::grill::snapshot::SnapshotManager::new(recovery_dir).recover_restores()
+    let (unsettled, interrupted) = tokio::task::spawn_blocking(move || {
+        let snapshots = reliaburger::grill::snapshot::SnapshotManager::new(recovery_dir);
+        (snapshots.recover_restores(), snapshots.sweep_interrupted())
     })
     .await
     .context("snapshot restore recovery task")?;
-    for error in unsettled {
+    for error in unsettled.iter().chain(&interrupted.errors) {
         eprintln!("bun: {error}");
+    }
+    for path in &interrupted.removed {
+        eprintln!("bun: deleted interrupted snapshot {}", path.display());
+    }
+    for path in &interrupted.unexplained {
+        eprintln!(
+            "bun: {} is a snapshot subvolume with no metadata and no intent; it is never \
+             listed, uploaded or pruned",
+            path.display()
+        );
     }
 
     // Scheduled volume snapshots ([storage.snapshots], Phase 12 E3).
@@ -3903,6 +3915,15 @@ async fn prepare_dns_runtime(
     }
     if config.listen_addr.ip().is_unspecified() {
         config.listen_addr.set_ip(nameserver.into());
+    }
+    // Only now is the address workloads query known; forwarding to it would
+    // loop every external lookup back into this responder.
+    let own_listen = config.listen_addr;
+    config.upstreams.retain(|upstream| *upstream != own_listen);
+    if config.upstreams.is_empty() {
+        anyhow::bail!(
+            "dns: every upstream resolver is this node's own DNS address {own_listen}; set [dns] upstream"
+        );
     }
 
     #[cfg(target_os = "linux")]

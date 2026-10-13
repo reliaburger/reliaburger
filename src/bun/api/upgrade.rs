@@ -155,6 +155,24 @@ pub(super) const UPGRADE_FORWARDED_HEADER: &str = "x-reliaburger-upgrade-forward
 /// its Raft write, so the budget is well above that.
 pub(super) const UPGRADE_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The leader's API base URL: the address it advertises over gossip, else
+/// one derived from its Raft address ([`leader_api_url`]).
+pub(super) async fn leader_base_url(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+) -> Option<String> {
+    let advertised = directory.and_then(|LeaderDirectory(directory)| {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
+    });
+    match advertised {
+        Some(address) => Some(state.cluster_http.url(&address.to_string(), "")),
+        None => leader_api_url(state, council).await,
+    }
+}
+
 /// Send an upgrade control call on to the leader when this node isn't it.
 ///
 /// Only the leader can record a run, and openraft doesn't forward client
@@ -191,17 +209,8 @@ pub(super) async fn forward_upgrade_to_leader(
             "this node was named the leader but isn't; retry once the election settles",
         ));
     }
-    let advertised = directory.and_then(|LeaderDirectory(directory)| {
-        let metrics = council.metrics();
-        let metrics = metrics.borrow();
-        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
-    });
-    let leader_url = match advertised {
-        Some(address) => state.cluster_http.url(&address.to_string(), ""),
-        None => match leader_api_url(state, council).await {
-            Some(url) => url,
-            None => return Some(unavailable("no cluster leader known yet; retry shortly")),
-        },
+    let Some(leader_url) = leader_base_url(state, council, directory).await else {
+        return Some(unavailable("no cluster leader known yet; retry shortly"));
     };
     let request = state
         .cluster_http

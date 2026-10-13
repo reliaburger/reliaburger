@@ -616,10 +616,39 @@ branch skips the acceptance suites unless someone labels it `full-ci`; it gets t
 targets `main`. From 0.1.4 on, each release collects its pull requests on one `release-*`
 merge-train branch, and from 0.2.1 those pull requests get a lighter set, for reasons the next
 section explains. Benchmarks run on `main`, nightly, and on changes to the code they measure.
-The gossip numbers gate nothing. The task-array benchmarks gate on one thing: a benchmark
-more than twice as slow as the baseline the last `main` run saved. Why twice, and not
-Criterion's own few per cent? Because a hosted runner is a different machine every night, and
-a gate that trips on the runner's mood is just another flake.
+The gossip numbers gate nothing. The task-array benchmarks gate on a regression, measured
+against the baseline the last `main` run saved. Why not Criterion's own few per cent? Because a
+hosted runner is a different machine every night, and a gate that trips on the runner's mood
+is just another flake.
+
+At first the gate was absolute: fail when any benchmark is more than twice as slow as the
+baseline. That held until the night of 12 October 2026, when five runs in a row failed it,
+on `main` and on the 0.2.1 train alike. Every benchmark was 1.4 to 2.1 times slower, including
+`index_set/insert_sequential_1m`, at 2.07 in each run, and nobody had touched that code. The
+runner was slow, not our code. Once the merge queue requires the final gate, that's every merge
+blocked by a cloud provider's bad night.
+
+So now each run measures its own runner. `bench_baseline.py` takes each benchmark's ratio to
+the baseline, then divides it by the median ratio of the *other* benchmarks in the same run. A
+uniformly slower machine cancels out, and a benchmark fails only when it's more than twice as
+slow as the rest of its run. We kept the real numbers from those five runs as a test fixture:
+the worst of them, a 0.1 ms JSON encode at 2.93 times the baseline, comes out at 1.86 against
+the rest, and passes.
+
+Two details came from the same data. First, a fast runner never tightens the bound: the median
+counts as at least 1. Two earlier runs that day had fast CPUs and a slow disk, with the median
+benchmark at 0.82 and the storage one at 1.66. Divided by the median, storage would have been
+2.05 and failed a run that was fine. Second, a slow runner and a change that slows down most of
+the suite look exactly the same from inside one run, and the median would quietly absorb that
+second one. So the run also fails when its median ratio is above two. That's the old absolute
+gate, asked of the median rather than of every benchmark, so the new gate passes everything the
+old one did.
+
+Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
+alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
+slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
+which kind of loop we picked, and on that one loop's own noise. A new workload would also have
+no history to test against, and no entry in `main`'s baseline until the train landed.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
@@ -5557,8 +5586,58 @@ pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), objec
 a Go interface value), and the `Box` puts it on the heap, because the compiler
 can't know how big an unknown type is. That's why we can hand back either the
 `parse_url` result or our own `LocalFileSystem`: both fit behind the same
-pointer. Cloud schemes pass through untouched, because S3 and GCS don't
+pointer. Cloud schemes passed through untouched, because S3 and GCS don't
 acknowledge a write until they've stored it.
+
+"Untouched" turned out to be the next bug (#695). `parse_url` builds an S3
+store with `AmazonS3Builder::new()`, and `new()` reads nothing from the
+environment; that's what `from_env()` is for. So `AWS_REGION`,
+`AWS_ACCESS_KEY_ID` and the rest, which the manual told you to set, did
+nothing. S3 fell back to the instance metadata service in `us-east-1`, which
+works on exactly one kind of machine in exactly one region, and no test
+noticed, because no test could talk to S3. Now `open` builds the cloud stores
+itself:
+
+```rust
+pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error> {
+    open_with_env(url, std::env::vars())
+}
+
+pub(crate) fn open_with_env<I>(url: &url::Url, env: I) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let (scheme, prefix) = ObjectStoreScheme::parse(url)?;
+    let store: Box<dyn ObjectStore> = match scheme {
+        ObjectStoreScheme::Local => Box::new(LocalFileSystem::new().with_fsync(true)),
+        ObjectStoreScheme::AmazonS3 => Box::new(s3_builder(url, env).build()?),
+        ObjectStoreScheme::GoogleCloudStorage => Box::new(gcs_builder(url, env).build()?),
+        _ => return object_store::parse_url(url),
+    };
+    Ok((store, prefix))
+}
+```
+
+Why not just call `from_env()`? Because then the only way to test it is
+`std::env::set_var`, and in Rust 2024 that function is `unsafe`. Setting an
+environment variable while another thread reads the environment is undefined
+behaviour in C's `setenv`, and the test runner runs tests on many threads.
+Taking the environment as an argument sidesteps the whole question: the real
+call passes `std::env::vars()`, the tests pass a `Vec` of pairs, and the
+builders' `get_config_value` shows what they picked up. `s3_builder` keeps
+only `AWS_*` variables and `gcs_builder` only `GOOGLE_*` (plus the bare
+`SERVICE_ACCOUNT` the crate's own `from_env` honours), so an S3 store never
+reads a Google setting that happens to share a lowercase name.
+
+`I: IntoIterator<Item = (String, String)>` is a generic bound: `env` can be
+any type that turns into an iterator of string pairs. `std::env::vars()`
+returns an iterator, a `Vec<(String, String)>` can become one, and the
+compiler generates a copy of `open_with_env` for each. It's the closest thing
+Rust has to Python's duck typing, checked at compile time.
+
+The unit tests never talk to a cloud. `make test-s3` does: with real
+credentials and `RELIABURGER_TEST_S3_URL`, it exports logs to the bucket and
+round-trips a council backup through it, put, list, prune and restore.
 
 The regression tests are less satisfying than we'd like. Nothing a unit test
 can observe changes when an `fsync` is missing, so each caller's test checks

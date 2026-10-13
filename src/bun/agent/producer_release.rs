@@ -32,6 +32,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Ok(()) => {
                     // LOOP-INLINE: in-memory lock, no I/O
                     self.supervisor.retire_instance(&id).await;
+                    self.forget_runtime_metadata(&id);
                     self.deferred_retirements.remove(&id);
                     self.sync_firewall_ebpf().await;
                     self.rebuild_routing_table().await;

@@ -1842,7 +1842,7 @@ async fn dns_responder_resolves_internal_name() {
     // Use a high port to avoid needing root for port 53
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
-        upstream: "8.8.8.8:53".parse().unwrap(),
+        upstreams: vec!["192.0.2.1:53".parse().unwrap()],
         upstream_timeout: Duration::from_secs(2),
         source_namespaces: tokio::sync::watch::channel(
             reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
@@ -1906,7 +1906,7 @@ async fn dns_responder_non_internal_times_out() {
     let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
-        upstream: upstream.local_addr().unwrap(),
+        upstreams: vec![upstream.local_addr().unwrap()],
         upstream_timeout: Duration::from_millis(500),
         source_namespaces: tokio::sync::watch::channel(
             reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
@@ -5303,7 +5303,9 @@ async fn check_backend_retirement(
                             "rollout retired the original destination before confirmed backend withdrawal");
                     } else {
                         anyhow::ensure!(completed, "rollout did not complete");
-                        anyhow::ensure!(runtime.state(&id).await? == reliaburger::grill::ContainerState::Stopped,
+                        // Retired, and possibly forgotten already (#738).
+                        anyhow::ensure!(matches!(runtime.state(&id).await,
+                            Ok(reliaburger::grill::ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })),
                             "confirmed rollout did not retire the original destination");
                     }
                 } else {
@@ -5701,7 +5703,12 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if runtime.state(&old).await? == ContainerState::Stopped { return Ok::<(), anyhow::Error>(()); }
+                // Retired, and possibly forgotten already (#738).
+                match runtime.state(&old).await {
+                    Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. }) => return Ok::<(), anyhow::Error>(()),
+                    Ok(_) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await??;

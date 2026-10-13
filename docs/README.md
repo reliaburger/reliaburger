@@ -439,7 +439,8 @@ gossip benchmarks when it touches `src/mustard/` or the gossip benches, and the
 task-array benchmarks when it touches the task-array leader, node pool,
 executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
 nothing; the task-array job fails only on a benchmark more than twice as slow
-as main's last baseline, and keeps its Criterion output for 90 days
+against main's last baseline as the rest of its run, or on a run whose median
+benchmark is, and keeps its Criterion output for 90 days
 ([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
@@ -920,7 +921,7 @@ other combination before it adopts or creates a workload.
 [dns]
 enabled = true
 listen = "0.0.0.0:53"       # derive and bind this node's runc gateway
-upstream = "8.8.8.8:53"
+# upstream = "10.0.0.2:53"  # default: the host's /etc/resolv.conf nameservers
 restrict_sources = true
 
 [ebpf]
@@ -933,6 +934,10 @@ Linux `IP_FREEBIND` before the first workload creates the interface. This avoids
 host loopback, which a container namespace can't reach, and avoids claiming
 wildcard port 53 from `systemd-resolved`. `/etc/resolv.conf` has no port syntax,
 so other ports are rejected.
+
+Names outside `.internal` go to the host's own resolvers, in the order its
+`/etc/resolv.conf` lists them, so split-horizon and corporate DNS keep working.
+Set `upstream` to override that. With no usable resolver, Bun refuses to start.
 
 Short names such as `redis.internal` use the namespace of the isolated source
 workload, as published by the runtime. Unknown or ambiguous source addresses are

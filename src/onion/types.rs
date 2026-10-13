@@ -26,37 +26,6 @@ pub const FIREWALL_DENY: u32 = 0;
 // BPF map key/value structs (#[repr(C)] — must match ebpf/onion_common.h)
 // ---------------------------------------------------------------------------
 
-/// Key for the `dns_map` BPF hash map.
-///
-/// The name is null-terminated, lowercase-normalised, max 255 chars + null.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct DnsMapKey {
-    pub name: [u8; 256],
-}
-
-impl DnsMapKey {
-    /// Create a key from a service name, normalising to lowercase
-    /// and null-terminating.
-    pub fn from_name(name: &str) -> Self {
-        let mut key = DnsMapKey { name: [0u8; 256] };
-        let lower = name.to_ascii_lowercase();
-        let bytes = lower.as_bytes();
-        let len = bytes.len().min(255);
-        key.name[..len].copy_from_slice(&bytes[..len]);
-        // Remaining bytes are already zero (null terminator)
-        key
-    }
-}
-
-/// Value for the `dns_map` BPF hash map.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct DnsMapValue {
-    /// Virtual IP in network byte order.
-    pub vip: u32,
-}
-
 /// Key for the `backend_map` BPF hash map.
 ///
 /// # Safety
@@ -221,10 +190,6 @@ unsafe impl aya::Pod for BackendEndpoint {}
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BackendValue {}
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-unsafe impl aya::Pod for DnsMapKey {}
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
-unsafe impl aya::Pod for DnsMapValue {}
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for FirewallKey {}
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for FirewallValue {}
@@ -380,16 +345,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dns_map_key_size() {
-        assert_eq!(std::mem::size_of::<DnsMapKey>(), 256);
-    }
-
-    #[test]
-    fn dns_map_value_size() {
-        assert_eq!(std::mem::size_of::<DnsMapValue>(), 4);
-    }
-
-    #[test]
     fn backend_key_size() {
         assert_eq!(std::mem::size_of::<BackendKey>(), 8);
     }
@@ -424,30 +379,6 @@ mod tests {
         assert_eq!(key.ip, u32::from(Ipv4Addr::new(10, 0, 2, 2)).to_be());
         assert_eq!(key.port, 8080u16.to_be());
         assert_eq!(DestinationKey::any_port(Ipv4Addr::LOCALHOST).port, 0);
-    }
-
-    #[test]
-    fn dns_key_from_name_normalises_to_lowercase() {
-        let key = DnsMapKey::from_name("Redis.INTERNAL");
-        let name = std::str::from_utf8(&key.name)
-            .unwrap()
-            .trim_end_matches('\0');
-        assert_eq!(name, "redis.internal");
-    }
-
-    #[test]
-    fn dns_key_from_name_null_terminates() {
-        let key = DnsMapKey::from_name("redis.internal");
-        assert_eq!(key.name[14], 0); // byte after the name
-    }
-
-    #[test]
-    fn dns_key_from_name_max_length() {
-        let long_name = "a".repeat(300);
-        let key = DnsMapKey::from_name(&long_name);
-        // Should truncate to 255 chars
-        let name_bytes: Vec<u8> = key.name.iter().take_while(|&&b| b != 0).copied().collect();
-        assert_eq!(name_bytes.len(), 255);
     }
 
     #[test]

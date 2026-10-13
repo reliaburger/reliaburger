@@ -4236,12 +4236,20 @@ async fn workload_admission_fixture(
             crate::bun::task_executor::FakeRunner::always_succeeds(),
         ),
     );
+    // The leader loop ticks every 10ms. On the wall clock, an every-minute
+    // schedule applied just before a minute boundary would fire mid-test.
+    // Holding cron time still at the fixture's start means no occurrence can
+    // come due: apply stamps a schedule with the wall-clock minute, which is
+    // never earlier than this one (#868).
+    let cron_clock =
+        crate::bun::task_array_leader::CronClock::manual(crate::meat::batch_ids::epoch_now_secs());
     let service = Arc::new(
         crate::bun::task_array_leader::TaskArrayService::with_timings(
             Some(Arc::new(node)),
             std::time::Duration::from_millis(10),
             std::time::Duration::from_secs(30),
-        ),
+        )
+        .with_cron_clock(cron_clock),
     );
     let app = router_with_upgrade(
         tx,
@@ -8357,6 +8365,10 @@ async fn cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immedi
             .expression,
         "* * * * *"
     );
+    // Let the leader tick a few times in the applied minute: a schedule never
+    // fires in the minute it lands in.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let desired = council.desired_state().await;
     assert_eq!(desired.task_arrays.jobs().runs().count(), 0);
     assert!(commands.try_recv().is_err());
     council.shutdown().await.unwrap();
@@ -9139,4 +9151,167 @@ async fn ca_rotation_routes_hand_out_a_csr_and_refuse_bad_steps() {
             .is_none()
     );
     shutdown.cancel();
+}
+
+/// `POST /v1/cluster/elect` on a follower holds the leader's elections, then
+/// campaigns until another voter leads, and names the leader that took over
+/// (#755). Before, it fired one campaign that the old leader often won back.
+#[tokio::test]
+async fn electing_on_a_follower_moves_leadership_off_the_leader() {
+    let nodes = council_of(3).await;
+    let leader_id = nodes[0].current_leader().await.unwrap();
+    let leader = nodes[(leader_id - 1) as usize].clone();
+    let follower = nodes
+        .iter()
+        .find(|node| node.raft().metrics().borrow().id != leader_id)
+        .unwrap()
+        .clone();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while follower.current_leader().await != Some(leader_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("follower must know the elected leader before the HTTP request");
+    leader
+        .write(crate::council::RaftRequest::Noop)
+        .await
+        .unwrap();
+
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let follower_address = follower_listener.local_addr().unwrap();
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let holds_reached_leader = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shutdown = CancellationToken::new();
+    let mut servers = Vec::new();
+    for (node, listener, is_leader) in [
+        (leader.clone(), leader_listener, true),
+        (follower.clone(), follower_listener, false),
+    ] {
+        let (commands, _receiver) = mpsc::channel(4);
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(token.clone());
+        let mut app = router(
+            commands,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(node),
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            leader_port,
+            None,
+        );
+        if is_leader {
+            let reached = holds_reached_leader.clone();
+            app = app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let reached = reached.clone();
+                    async move {
+                        if request.uri().path() == "/v1/cluster/elect"
+                            && request
+                                .headers()
+                                .contains_key(super::nodes::ELECT_HOLD_HEADER)
+                        {
+                            reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+        }
+        let stop = shutdown.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await
+                .unwrap();
+        }));
+    }
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{follower_address}/v1/cluster/elect"))
+        .bearer_auth(&plaintext)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(
+        holds_reached_leader.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the leader must hold its elections before the campaign"
+    );
+    let new_leader = leader.current_leader().await.unwrap();
+    assert_ne!(new_leader, leader_id, "leadership did not move");
+    assert_eq!(body["previous_leader"], format!("node-{leader_id}"));
+    assert_eq!(body["leader"], format!("node-{new_leader}"));
+
+    shutdown.cancel();
+    for server in servers {
+        server.await.unwrap();
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A leader can't campaign itself out of office: the caller must ask the
+/// voter that should take over.
+#[tokio::test]
+async fn electing_on_the_leader_is_refused() {
+    let (app, shutdown, tok) =
+        setup_with_role("cluster-admin", crate::sesame::types::ApiRole::Admin).await;
+    let status = post_status(app, "/v1/cluster/elect", &tok, "").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    shutdown.cancel();
+}
+
+/// A forwarded hold makes the receiving node stop campaigning.
+#[tokio::test]
+async fn a_hold_request_holds_this_nodes_elections() {
+    let nodes = council_of(1).await;
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.push(token);
+    let (commands, _receiver) = mpsc::channel(4);
+    let app = router(
+        commands,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(nodes[0].clone()),
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/cluster/elect")
+                .header("authorization", format!("Bearer {plaintext}"))
+                .header(super::nodes::ELECT_HOLD_HEADER, "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(nodes[0].elections_held());
+    nodes[0].shutdown().await.unwrap();
 }
