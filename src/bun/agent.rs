@@ -647,6 +647,13 @@ pub struct BunAgent<G: Grill> {
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// The runtime generation each parent's initialisers last launched, so
+    /// the parent's retirement can forget exactly those journals and never
+    /// a successor's under the same identity (#850).
+    initialiser_generations: std::collections::HashMap<
+        InstanceId,
+        std::collections::HashMap<InstanceId, crate::grill::RuntimeGeneration>,
+    >,
     /// Captured before startup; a recovered runtime hold needs original discovery
     /// reconciliation rather than an empty in-memory map authorising release.
     /// Original executions awaiting cluster cleanup after the API becomes available.
@@ -900,6 +907,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
@@ -1059,6 +1067,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),

@@ -429,7 +429,7 @@ for the audit, exact suite contracts and CI mapping.
 Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.
 
 ```sh
-make bench         # reproducible transport and 5-250 node measurements
+make bench         # reproducible transport and 5-250 node measurements, then one scheduling pass on 1k and 10k nodes
 make bench-large   # reproducible 500 and 1,000 node measurements
 make bench-task-arrays  # in-process task-array costs and the fork/exec floor
 ```
@@ -1117,6 +1117,8 @@ source = "/srv/import"              # host path: never chowned by Bun
 ```
 
 A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning. A node mounts a host path only under a prefix in its `[storage] allowed_host_paths` (empty by default, so every host path is refused) and never its own storage or security directories; a token with a `[permission]` block also needs `host-exec` to deploy one.
+
+In a cluster the scheduler places every replica that fits. An app it can place only in part shows `is unschedulable: placed N of M replicas` and why in `relish status`, `relish inspect` and `relish wtf`. An `exec` or `script` app only goes to nodes whose `[process_workloads]` allowlist names its binary. A live node whose reports stop keeps its replicas for `[reporting_tree] stale_node_grace_secs` (five minutes), then they move.
 
 A managed volume stays on its node, and so does its app: restarting Bun, rebooting or losing the node from gossip never moves it to a node with an empty volume. While its node is away the app waits, `relish status` and `relish inspect` name the node, and `relish wtf` reports it as critical. `relish decommission-node <node> --workloads-stopped --reason <why>` (or new `placement.required` labels) is the explicit way to move it, onto a new, empty volume.
 

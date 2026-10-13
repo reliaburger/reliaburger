@@ -1819,3 +1819,22 @@ answer
 Taking `Probe` by value means the caller can't keep it, so the delete can only happen in one place. `close()` is `TempPath`'s explicit delete. It returns the I/O error that `Drop` would have swallowed, and we ignore it the same way: the answer is what the caller needs, and a stray temporary file doesn't change it. Staging got the marker. The manager builds the `UpgradeMarker` first, moves it into the staging closure, and the closure stores it after the binary and hands it back, as the verification closure hands back the bytes. The rollback path had the same delete and the same syncs on its worker, so it got the same treatment.
 
 How we measured mattered too. The first timestamps went out with `eprintln!`, and on the loaded Mac a line to the log file sometimes took 270 ms by itself, which looked like yet another stall. The fixture's own `upgrade-fixture phase=...` lines do the same under `--no-capture`. Pushing the timestamps onto an in-memory list and printing it once at the end gave clean readings. (CI captures each test's output through a pipe, so it doesn't pay this; the timestamps did.) Two control tests, a ticker beside a bare two-second sleep and a ticker beside a blocking-pool hash of 96 MB, never saw more than 25 ms on the same loaded machine. So the bound wasn't too tight for the machine, and it stayed at 250 ms. After the fix the same 200-run loop, under the same load, passed 200 times out of 200.
+
+### The probe's launch
+
+One more step sat in the same timeline without causing the election: about 4 s between `verified` and `probe-end` ([#793](https://github.com/reliaburger/reliaburger/issues/793)). Most of that is the launch. `tokio::process::Command::spawn` looks async because it lives in `tokio`, but it's a plain function: no `.await`, and it returns only once the kernel has exec'd the new program. On macOS the first exec of a new file waits while the host assesses it, and the probe's private copy is always new. So the worker sat in `spawn` for seconds, exactly as it had sat in the hashing.
+
+The launch now goes to the blocking pool, with the same hand-over-and-hand-back as the bytes:
+
+```rust
+let launched = tokio::task::spawn_blocking(move || {
+    let launched = command.spawn();
+    (command, launched)
+})
+.await
+.map_err(std::io::Error::other)?;
+```
+
+The command comes back because a launch that fails with `ETXTBSY` is retried. Blocking-pool threads carry the runtime's context, so the child is still one the runtime can wait on, and if the upgrade is cancelled mid-launch, the child is dropped when the launch finishes and `kill_on_drop` stops it. We had two other patterns to hand. The managed-status check pays the assessment ahead of time by running the binary once early, but here the probe *is* that first run, so there's nothing earlier to move it to. The boot-time hash runs on a detached `std::thread` so that a start-up error doesn't wait for it, but the probe's answer is the very next thing the upgrade needs, and a plain thread has no runtime to register the child with. `spawn_blocking` is the simplest of the three.
+
+`upgrade::compatibility`'s `a_slow_probe_launch_leaves_the_runtime_free` is the same ticker test, around a launch made slow on purpose. It can't rely on Gatekeeper being slow (CI's Linux has no Gatekeeper at all), and a script that sleeps doesn't help: `spawn` returns as soon as exec succeeds, before the script's first line runs. Instead the test gives the command a `pre_exec` hook, which runs in the forked child just before exec, that sleeps for a second. The parent's `spawn` waits that second on any host. Before the change the ticker saw a 1.0 s gap; now it sees milliseconds. The first draft of the test passed against the old code, though. On a one-thread runtime the ticker doesn't start until the test yields, and the old launch blocked before its first `.await`, so the ticker missed it entirely. A `tokio::task::yield_now().await` before the launch lets it take its first reading.

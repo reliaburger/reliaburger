@@ -252,7 +252,11 @@ impl<G: Grill + Clone> OwnedRunner<G> {
 
     /// Compatible idle contexts already own their complete resource request.
     #[cfg(target_os = "linux")]
-    pub(crate) async fn reusable_capacity(&self, template: &crate::config::job::JobSpec) -> u32
+    pub(crate) async fn reusable_capacity(
+        &self,
+        template: &crate::config::job::JobSpec,
+        job: Option<&str>,
+    ) -> u32
     where
         G: 'static,
     {
@@ -270,7 +274,8 @@ impl<G: Grill + Clone> OwnedRunner<G> {
                 .resolve_template(template)
                 .await
                 .ok()
-                .and_then(|resolved| ExecutorKey::new(&resolved).ok());
+                .and_then(|resolved| ExecutorKey::new(&resolved).ok())
+                .map(|key| key.for_job(job));
             return pool.available_slots(key, profile.reservation).await;
         }
         let budget = self
@@ -893,6 +898,11 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         .enforce_egress(&cgroup, egress_allow(template))
                         .await
                         .map_err(failed)?;
+                    // Another namespace's `allow_from` names the task by
+                    // its job, so bind the cgroup to that before it runs.
+                    if let Some(job) = task.run.as_ref().and_then(|run| run.job_name.as_deref()) {
+                        lease.bind_source(&cgroup, job).await.map_err(failed)?;
+                    }
                     if let Some(address) = self.runtime.container_ip(&id).await {
                         lease
                             .publish_address(address, &id.0, allow_from(template))

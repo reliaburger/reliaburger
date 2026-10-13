@@ -1106,9 +1106,14 @@ impl TaskArrayNode {
                     .min(available.memory_bytes / resources.memory_bytes);
                 #[cfg(target_os = "linux")]
                 let fits = match (reusable, self.runner.as_ref()) {
-                    (Some(template), NodeRunner::Owned(runner)) => {
-                        u64::from(runner.reusable_capacity(template).await)
-                    }
+                    (Some(template), NodeRunner::Owned(runner)) => u64::from(
+                        runner
+                            .reusable_capacity(
+                                template,
+                                super::task_executor::job_name(&assignment.env),
+                            )
+                            .await,
+                    ),
                     _ => fits,
                 };
                 let cap = slot_cap(

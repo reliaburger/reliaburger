@@ -132,8 +132,7 @@ async fn start_node_with_auth(
         seeds,
         shutdown,
         auth,
-        Default::default(),
-        false,
+        NodeSetup::default(),
     )
     .await
 }
@@ -172,16 +171,36 @@ async fn labelled_node(
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-    start_node_with(
-        name,
-        gossip_port,
-        seeds,
-        shutdown,
-        None,
+    let setup = NodeSetup {
         labels,
         keep_data_dir,
-    )
-    .await
+        ..NodeSetup::default()
+    };
+    start_node_with(name, gossip_port, seeds, shutdown, None, setup).await
+}
+
+/// What a test node starts with beyond its ports and seeds.
+struct NodeSetup {
+    /// Node labels, for placement constraints.
+    labels: std::collections::BTreeMap<String, String>,
+    /// Come back on an earlier run's data directory.
+    keep_data_dir: bool,
+    /// When a report counts as stale.
+    stale_report_timeout_secs: u64,
+    /// How long the leader holds a stale node's placements; `None` uses
+    /// the node default.
+    stale_node_grace: Option<Duration>,
+}
+
+impl Default for NodeSetup {
+    fn default() -> Self {
+        Self {
+            labels: Default::default(),
+            keep_data_dir: false,
+            stale_report_timeout_secs: 30,
+            stale_node_grace: None,
+        }
+    }
 }
 
 async fn start_node_with(
@@ -190,9 +209,14 @@ async fn start_node_with(
     seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
     auth: Option<NodeFaultAuth>,
-    labels: std::collections::BTreeMap<String, String>,
-    keep_data_dir: bool,
+    setup: NodeSetup,
 ) -> Node {
+    let NodeSetup {
+        labels,
+        keep_data_dir,
+        stale_report_timeout_secs,
+        stale_node_grace,
+    } = setup;
     let wired = start_wired_node(WiredNodeOptions {
         name: name.to_string(),
         gossip_port,
@@ -200,7 +224,8 @@ async fn start_node_with(
         shutdown: shutdown.clone(),
         data_dir_prefix: "rb-placement",
         data_root: None,
-        stale_report_timeout_secs: 30,
+        stale_report_timeout_secs,
+        stale_node_grace,
         metrics_rollup: Some(Duration::from_millis(500)),
         // Fast learning period so the test doesn't wait long.
         scheduler: Some(reliaburger::config::node::ReconstructionSection {
@@ -3937,4 +3962,137 @@ async fn rollback_works_after_every_node_restarts() {
             council.shutdown().await.ok();
         }
     }
+}
+
+/// The nodes the council places `web` on, as `node` sees desired state.
+async fn web_placements(node: &Node) -> Vec<String> {
+    let Some(council) = &node.handle.council else {
+        return Vec::new();
+    };
+    council
+        .desired_state()
+        .await
+        .scheduling
+        .get(&reliaburger::meat::AppId::new("web", "default"))
+        .map(|placements| placements.iter().map(|p| p.node_id.0.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// #702, D28: a worker's agent stops, so its reports stop, but gossip still
+/// lists it alive. For the stale-node grace its replica stays placed there:
+/// the reporter may only be wedged, with the replica still serving. After
+/// the grace the leader moves it to a survivor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn replicas_move_off_a_node_whose_reports_stopped_after_the_grace() {
+    const STALE_SECS: u64 = 3;
+    const GRACE: Duration = Duration::from_secs(15);
+
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let start = |index: u16| {
+        let shutdown = shutdown.child_token();
+        async move {
+            let seeds = if index == 0 {
+                vec![]
+            } else {
+                vec![local(base)]
+            };
+            let setup = NodeSetup {
+                stale_report_timeout_secs: STALE_SECS,
+                stale_node_grace: Some(GRACE),
+                ..NodeSetup::default()
+            };
+            start_node_with(
+                &format!("sg{}", index + 1),
+                base + index * PORTS_PER_NODE,
+                seeds,
+                &shutdown,
+                None,
+                setup,
+            )
+            .await
+        }
+    };
+    let nodes = [start(0).await, start(1).await, start(2).await];
+    let all: Vec<&Node> = nodes.iter().collect();
+    let elected = wait_until(Duration::from_secs(30), || {
+        all.iter().any(|node| *node.thinks_leader.borrow())
+    })
+    .await;
+    assert!(elected, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        replicas = 3
+    "#,
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_apply: Option<tokio::time::Instant> = None;
+    while nodes_running_web(&all).await < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "web never spread one replica per node"
+        );
+        if last_apply.is_none_or(|at| at.elapsed() >= Duration::from_secs(8)) {
+            let _ =
+                tokio::time::timeout(Duration::from_secs(15), nodes[0].client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let target = nodes
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .expect("a worker exists");
+    let observer = nodes
+        .iter()
+        .find(|node| node.name != target.name)
+        .expect("a survivor exists");
+    assert!(web_placements(observer).await.contains(&target.name));
+
+    // Stop only the agent: gossip and Raft carry on, the reports don't.
+    target._wired.agent_shutdown.cancel();
+    let stopped = tokio::time::Instant::now();
+
+    // Within the grace the replica stays placed on the silent node.
+    let hold_until = stopped + Duration::from_secs(STALE_SECS) + GRACE - Duration::from_secs(3);
+    while tokio::time::Instant::now() < hold_until {
+        let placed = web_placements(observer).await;
+        assert!(
+            placed.contains(&target.name),
+            "{} lost its replica {}s into the grace: {placed:?}",
+            target.name,
+            stopped.elapsed().as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // After it, the replica moves and three run on the survivors.
+    let survivors: Vec<&Node> = nodes
+        .iter()
+        .filter(|node| node.name != target.name)
+        .collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let placed = web_placements(observer).await;
+        let moved = placed.len() == 3 && !placed.contains(&target.name);
+        if moved && running_web_instances(&survivors).await >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replica never left {} after the grace: placed {placed:?}",
+            target.name
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    shutdown.cancel();
 }

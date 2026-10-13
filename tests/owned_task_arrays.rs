@@ -8,6 +8,8 @@ use reliaburger::grill::{ContainerState, Grill, ImageStore};
 use std::path::Path;
 use std::time::Duration;
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
 
@@ -3082,6 +3084,8 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
 
 /// Each task fails its first attempt when its index ends in 07, so the
 /// accepted retry count is exact and every retry has a known cause.
+/// Ports each leader-loss node takes: gossip, then Raft, reporting and API.
+const LEADER_LOSS_PORTS_PER_NODE: u16 = 4;
 const LEADER_LOSS_SCRIPT: &str = "sleep 0.05; [ \"$RELIABURGER_TASK_ATTEMPT\" -gt 1 ] || [ $((RELIABURGER_TASK_INDEX % 100)) -ne 7 ]";
 const LEADER_LOSS_TASKS: u64 = 3000;
 
@@ -3199,7 +3203,7 @@ fn remove_cgroup_tree(path: &std::path::Path) {
 /// handover while its executor keeps running. Those commands may finish,
 /// but no report of theirs can ever be accepted: the new leader must take
 /// back exactly the chunks it held and count every task once.
-async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
+async fn leader_loss_mid_array(template: serde_json::Value) {
     use reliaburger::bun::task_array_leader::TaskArrayService;
     use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
     use reliaburger::bun::task_ledger::GroupCommit;
@@ -3252,6 +3256,11 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         template["image"] = json!(image);
     }
 
+    // Leased for the whole test, so neither another test on the host nor
+    // another worktree's run binds them (#852). Node `n` takes four ports
+    // from `base + 4n`: gossip, Raft, reporting and API.
+    let ports = bun_process::reserve_port_block_lease(3 * LEADER_LOSS_PORTS_PER_NODE);
+    let gossip_port = |index: usize| ports.base + index as u16 * LEADER_LOSS_PORTS_PER_NODE;
     let shutdown = CancellationToken::new();
     let mut nodes = Vec::new();
     for index in 0..3usize {
@@ -3276,16 +3285,17 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         nodes.push(
             cluster_support::start_wired_node(cluster_support::WiredNodeOptions {
                 name: format!("loss{index}"),
-                gossip_port: base_port + index as u16 * 10,
+                gossip_port: gossip_port(index),
                 seeds: if index == 0 {
                     vec![]
                 } else {
-                    vec![cluster_support::local(base_port)]
+                    vec![cluster_support::local(gossip_port(0))]
                 },
                 shutdown: shutdown.child_token(),
                 data_dir_prefix: "rb-leader-loss",
-                data_root: None,
+                data_root: Some(root.clone()),
                 stale_report_timeout_secs: 10,
+                stale_node_grace: None,
                 metrics_rollup: None,
                 scheduler: None,
                 lease_reaper: false,
@@ -3528,22 +3538,20 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
     // Retirement tears each executor's network down with it (#786).
     assert_eq!(residue.namespaces(), Vec::<String>::new());
     drop(residue);
-    std::fs::remove_dir_all(root).unwrap();
+    // The nodes' data lives here too, volumes and all.
+    cluster_support::clear_fixture_dir(&root).unwrap();
 }
 
 /// The leader loses its control plane while shared-runc chunks run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires root, runc, cgroup v2 and the pinned test image; run with make test-linux"]
 async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors() {
-    leader_loss_mid_array(
-        serde_json::json!({
-            "runtime": "shared-runc",
-            "command": ["/bin/sh", "-c", LEADER_LOSS_SCRIPT],
-            "cpu": "100m",
-            "memory": "32Mi",
-        }),
-        24510,
-    )
+    leader_loss_mid_array(serde_json::json!({
+        "runtime": "shared-runc",
+        "command": ["/bin/sh", "-c", LEADER_LOSS_SCRIPT],
+        "cpu": "100m",
+        "memory": "32Mi",
+    }))
     .await;
 }
 
@@ -3551,15 +3559,12 @@ async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_exe
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires root, runc, cgroup v2 and the pinned test image; run with make test-linux"]
 async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors() {
-    leader_loss_mid_array(
-        serde_json::json!({
-            "runtime": "process",
-            "exec": "/bin/sh",
-            "command": ["-c", LEADER_LOSS_SCRIPT],
-            "cpu": "100m",
-            "memory": "32Mi",
-        }),
-        24610,
-    )
+    leader_loss_mid_array(serde_json::json!({
+        "runtime": "process",
+        "exec": "/bin/sh",
+        "command": ["-c", LEADER_LOSS_SCRIPT],
+        "cpu": "100m",
+        "memory": "32Mi",
+    }))
     .await;
 }

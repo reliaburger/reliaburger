@@ -418,7 +418,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
     fn build_capability_report(&self, snapshot: &AgentSnapshot) -> NodeCapabilityReport {
         NodeCapabilityReport {
             node_id: self.node_id.clone(),
-            capabilities: snapshot.capabilities,
+            capabilities: snapshot.capabilities.clone(),
             egress_enforcement: snapshot
                 .instances
                 .iter()
@@ -464,6 +464,7 @@ mod tests {
             report_interval_secs: 1,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 
@@ -574,6 +575,7 @@ mod tests {
             report_interval_secs: 5,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 

@@ -1281,6 +1281,12 @@ impl ProbeCgroup {
         Self { path, id }
     }
 
+    /// Probe from an existing cgroup, such as a delegated task's.
+    fn at(path: PathBuf) -> Self {
+        let id = reliaburger::sesame::egress::cgroup_id_of_path(&path).unwrap();
+        Self { path, id }
+    }
+
     /// Open `kind` (`tcp` or `udp`) to `address` from a fresh process in
     /// this cgroup. `Err` carries what the shell said when it was refused.
     fn open(&self, kind: &str, address: SocketAddr) -> Result<(), String> {
@@ -1819,6 +1825,134 @@ async fn job_egress_allowlist_is_enforced() {
     assert!(claimed, "the sweep would scrub an unclaimed task allowlist");
     assert!(enforced && listed, "the task cgroup was not programmed");
     assert!(lifted && released, "retirement left the task's allowlist");
+}
+
+/// #737: another namespace's `allow_from` can name a job as its source. A
+/// task's cgroup is bound to its run's identity (namespace plus job) before
+/// the task starts, and the grant names that identity, so it holds before
+/// any task of the job exists. Another job in the same namespace, and an
+/// app cgroup that merely shares the job's namespace, stay refused.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn allow_from_can_name_a_delegated_job_as_its_source() {
+    use reliaburger::bun::task_namespace::{DelegatedNetwork, TaskNamespacePolicy};
+    use reliaburger::sesame::firewall;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let (_listener, vault) = private_listener(77);
+    let SocketAddr::V4(vault_v4) = vault else {
+        unreachable!()
+    };
+    let mut services = ServiceMap::new();
+    let id = ServiceId::new("vault", "secrets");
+    services
+        .register(&id, vault.port(), Some(vec!["default/report".to_string()]))
+        .unwrap();
+    services
+        .add_backend(
+            &id,
+            BackendInstance {
+                instance_id: "vault__secrets-0".into(),
+                node_ip: *vault_v4.ip(),
+                host_port: vault.port(),
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+    let entries: Vec<_> = services.resolve_all().into_iter().cloned().collect();
+    let destinations: Vec<_> = entries
+        .iter()
+        .map(firewall::IsolatedDestination::from)
+        .collect();
+    let grants = firewall::rules_to_bpf_entries(&firewall::resolve_job_source_rules(&destinations));
+    let mut destination_keys = std::collections::HashSet::new();
+    {
+        let mut e = ebpf.lock().await;
+        firewall::reconcile_destination_map(
+            &mut e.bpf,
+            &firewall::destination_entries(&entries, &Default::default(), &[]),
+            &mut destination_keys,
+        )
+        .unwrap();
+        for (key, value) in &grants {
+            firewall::write_firewall_entry(&mut e.bpf, *key, *value).unwrap();
+        }
+    }
+
+    // Two delegated tasks in "default": one of the named job, one not.
+    let data = tempfile::tempdir().unwrap();
+    let network = Arc::new(DelegatedNetwork::default());
+    let policy = TaskNamespacePolicy::recover(ebpf.clone(), data.path(), network.clone(), None)
+        .await
+        .unwrap();
+    let task_name = root_app_name("source", data.path());
+    let _task_cgroups = AppCgroups::new("default", &task_name);
+    let mut leases = Vec::new();
+    let mut probes = Vec::new();
+    for (ordinal, job) in [(0, "report"), (1, "render")] {
+        let cgroup = reliaburger::grill::cgroup::cgroup_path("default", &task_name, ordinal);
+        let mut lease = policy.acquire("default", &cgroup).await.unwrap();
+        std::fs::create_dir_all(&cgroup).unwrap();
+        lease.bind_source(&cgroup, job).await.unwrap();
+        leases.push(lease);
+        probes.push(ProbeCgroup::at(cgroup));
+    }
+    let bound = {
+        let mut e = ebpf.lock().await;
+        firewall::read_cgroup_source_entry(&mut e.bpf, probes[0].id).unwrap()
+    };
+    let named = probes[0].connect(vault);
+    let other_job = probes[1].connect(vault);
+
+    // An app cgroup in the same namespace has no run identity to match.
+    let app = ProbeCgroup::new("job-source-app");
+    let app_keys = isolate_probe(
+        &mut *ebpf.lock().await,
+        &app,
+        "default",
+        &Default::default(),
+    );
+    let app_refused = app.connect(vault);
+    release_probe(&mut *ebpf.lock().await, &app, app_keys);
+
+    let mut unbound = Vec::new();
+    for (lease, probe) in leases.into_iter().zip(&probes) {
+        lease.retired().await;
+        let mut e = ebpf.lock().await;
+        unbound.push(firewall::read_cgroup_source_entry(&mut e.bpf, probe.id).unwrap());
+    }
+    {
+        let mut e = ebpf.lock().await;
+        for (key, _) in &grants {
+            firewall::delete_firewall_entry(&mut e.bpf, *key).unwrap();
+        }
+        firewall::reconcile_destination_map(&mut e.bpf, &Default::default(), &mut destination_keys)
+            .unwrap();
+    }
+    drop(probes);
+    drop(policy);
+    TaskNamespacePolicy::recover(ebpf.clone(), data.path(), network, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bound,
+        Some(firewall::job_source_identity("default", "report")),
+        "the task cgroup was not bound to its run's identity"
+    );
+    assert!(named.is_ok(), "the job allow_from names: {named:?}");
+    assert!(
+        denied(&other_job),
+        "another job in its namespace: {other_job:?}"
+    );
+    assert!(
+        denied(&app_refused),
+        "an app in its namespace: {app_refused:?}"
+    );
+    assert_eq!(unbound, vec![None, None], "retirement left a run identity");
 }
 
 // ---------------------------------------------------------------------------
