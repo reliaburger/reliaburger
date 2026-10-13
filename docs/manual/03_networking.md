@@ -58,6 +58,9 @@ allow_from = ["shop/api"]
 
 `allow_from` only opens cross-namespace paths; it doesn't restrict callers in
 the same namespace. One grant covers the VIP and the real addresses alike.
+A source can be a job as well as an app: `allow_from = ["reports/nightly"]`
+admits every task of the `nightly` job in `reports`, including tasks that
+haven't started yet.
 
 The eBPF hooks enforce all of this, so isolation needs `[ebpf]`. `relish init`
 turns `[ebpf]` and `[dns]` on when it runs as root on Linux with `runc`

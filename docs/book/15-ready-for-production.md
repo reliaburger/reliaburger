@@ -1317,8 +1317,11 @@ named, the `match` is exhaustive, and there's no magic integer floating around
 that a reader has to decode.
 
 Two smaller choices round out the command. Selection: `--filter
-scheduling,firewall` parses to a list of groups and picks those; no filter runs
-everything. And the human report renders as plain aligned text with word labels
+scheduling,firewall` picks those groups, and an entry that names an exact case,
+such as `process_job_with_exit_zero_succeeds`, picks just that case; no filter
+runs everything. Case names came later, when a qualification test had to run a
+group's two job cases without its app case, which needs a `bun` the fixture
+doesn't install and spent its whole budget waiting for it (#742). And the human report renders as plain aligned text with word labels
 rather than colour:
 
 ```
@@ -3024,6 +3027,13 @@ still be fenced. So `recent_observation` only offers a snapshot younger than
 four stale windows (two minutes by default). After that the worker goes
 quiet and the leader does what it did before.
 
+What it did before changed in 0.2.1 (#702). A stale node used to keep its
+fixed replicas for good while losing its daemon copies at once. Now both hold
+for `[reporting_tree] stale_node_grace_secs`, five minutes by default, and
+then move, so a node whose worker wedged for good doesn't keep its replicas
+off the cluster forever, and one that stalls for a minute moves nothing.
+Chapter 2 has the details.
+
 `recent_observation` returns `Option<&ObservedSnapshot>`, a reference into the
 worker's own field. The `&` means the caller borrows the snapshot rather than
 taking it. The report builder consumes its snapshot by value, so the call
@@ -3848,6 +3858,48 @@ change it failed after five seconds with `command-… is Prepared`, the same
 words a Lima loop of the rootless test printed three times in 29 rounds. With
 it, Bun logs `cancelled runtime command …` and carries on; the same loop
 passed every round, and caught the cancellation doing its job twice.
+
+Short commands weren't the only thing an exec could catch halfway (#778).
+A rootless container also has a long-lived network helper, `slirp4netns`,
+and Bun replaces it when it dies. Replacing it takes the same steps as a short
+command, with one more in the middle: prepare the new helper, bind it in the
+generation's intent as the current helper, then start it. Two refusals were
+still immediate. An exec between binding and starting left the new helper
+bound and `Prepared`, and the next Bun's adoption failed with "prepared
+rootless helper requires retirement", every time, because nothing would ever
+start it. And replacing a helper whose owner still reported it running (it
+can, for a moment, while it reaps the process) refused with "runtime network
+helper is still running".
+
+Both now get the treatment short commands got. Supervision asks
+`settle_network_helper` instead of reading the helper's state: it cancels a
+bound helper that nobody is starting, with the same `cancel_unstarted` fence,
+and gives one whose owner holds the lock up to five seconds to come up.
+Replacement waits up to the same five seconds for an earlier helper to retire:
+
+```rust
+CommandState::Running { .. } if tokio::time::Instant::now() < deadline => {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+CommandState::Running { pid } => {
+    return Err(io::Error::other(format!(
+        "runtime network helper {} is still running (pid {pid})",
+        id.as_str()
+    )));
+}
+```
+
+It's the match guard from Chapter 5 again: a running helper matches the
+first arm only before the deadline, and after it falls through to the second,
+which refuses.
+A helper that keeps running is a live owner, and starting a second one would
+put two `slirp4netns` processes on one container, so the bound matters as
+much as the wait. Three tests in `tests/runc_roles.rs` cover it: one binds a
+prepared helper by hand and drops the claim the way an exec would (it failed
+with `Prepared` before the change), one releases a helper 300 ms after its
+replacement is asked for (it failed with "still running"), and one checks
+that a helper which never exits still refuses its replacement and keeps
+running.
 
 #### The tick reads in parallel
 

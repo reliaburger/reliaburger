@@ -120,7 +120,7 @@ This is the big one. `MustardNode::run_one_cycle()` is a single SWIM protocol pe
 
 The `run()` method wraps this in a `tokio::select!` loop: protocol ticks on an interval, incoming messages handled immediately, shutdown via `CancellationToken`. On shutdown, it calls `leave()` to announce graceful departure before exiting.
 
-One subtlety worth noting: `wait_for_ack()` drains the transport while waiting. Messages that arrive during the wait aren't dropped. They're processed (piggybacked updates are applied), but only an ACK from the specific target counts as success. The `wait_for_relay_ack()` variant avoids calling `handle_message()` recursively to prevent async recursion issues.
+One subtlety worth noting: `wait_for_ack()` drains the transport while waiting. Messages that arrive during the wait aren't dropped. They're processed in full by `handle_message()` (PINGs answered, relays served, updates applied), but only an accepted ACK from the specific target, or a relay's ACK vouching for it, counts as success. A relay doesn't wait at all: it records the request and forwards the target's ACK when `handle_message()` sees it. (It used to wait inline in a `wait_for_relay_ack()` that dropped everything but the target's ACK, to dodge async recursion; Chapter 2's "Three holes in the probe cycle" tells that story.)
 
 **Critical path**: `MustardNode::run()` --> `run_one_cycle()` --> picks random peer --> sends PING --> waits for ACK --> marks Suspect on timeout.
 

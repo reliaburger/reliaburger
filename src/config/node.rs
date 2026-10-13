@@ -811,6 +811,11 @@ pub struct ReportingTreeSection {
     pub max_events_per_report: usize,
     /// Time after which a report is considered stale (seconds).
     pub stale_report_timeout_secs: u64,
+    /// How long the leader holds the placements of a node that gossip
+    /// still lists as alive but whose reports went stale, before it moves
+    /// them to other nodes (seconds). The node may only have a wedged
+    /// report worker, with its replicas still serving.
+    pub stale_node_grace_secs: u64,
 }
 
 impl Default for ReportingTreeSection {
@@ -819,6 +824,7 @@ impl Default for ReportingTreeSection {
             report_interval_secs: 5,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 }

@@ -131,22 +131,27 @@ The reporting tree already sends `StateReport` messages from workers to council 
 pub enum ReportingMessage {
     Report(StateReport),
     Ack { node_id: NodeId },
-    AggregatedReport { reports: HashMap<NodeId, StateReport> },
     MetricsRollup(NodeRollup),   // new
 }
 ```
 
-The `ReportAggregator` on each council member already handles `Report` and `AggregatedReport`. We add a case for `MetricsRollup`:
+The `ReportAggregator` already handles `Report`. We add a case for `MetricsRollup`:
 
 ```rust
-Some((_, ReportingMessage::MetricsRollup(rollup))) => {
-    if let Some(ref store) = self.rollup_store {
+Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
+    if Self::report_identity_ok(&peer, &rollup.node_id)
+        && let Some(ref store) = self.rollup_store
+    {
         store.write().await.ingest(&rollup);
     }
 }
 ```
 
-That's it. One match arm. The existing transport handles framing, serialisation, and delivery. The existing assignment logic routes rollups to the right council member. No new transport layer needed.
+`peer` is the node id the connection's mTLS certificate proves, and `report_identity_ok` refuses a rollup that claims to be from anyone else. Without that check node X could send a rollup for node Y, poisoning Y's metrics and pre-claiming Y's dedup keys so Y's real rollups were dropped as duplicates.
+
+The enum used to have one more variant, `AggregatedReport { reports: HashMap<NodeId, StateReport> }`, for a council member forwarding its workers' reports to the leader. It carried many nodes' reports, so it couldn't be bound to one certificate, and the aggregator stored every report in it unchecked. Production never sent it (every worker reports straight to the leader), but any authenticated peer could, and keep a dead node "fresh" or inject endpoints for it. We deleted it in 0.2.1. If the two-level tree is ever built, the forwarding message comes back with council-peer authentication rather than trust.
+
+So the rollup path is one match arm. The existing transport handles framing, serialisation, and delivery, and the existing assignment logic routes rollups to the aggregator (today, the leader). No new transport layer needed.
 
 ## The RollupWorker
 

@@ -130,6 +130,23 @@ impl ClaimedCommandExecutor {
             .await
     }
 
+    /// Observe the bound network helper after cancelling one that an earlier
+    /// process bound but never started; see
+    /// [`IntentCommands::settle_network_helper`](crate::grill::runc_intent::IntentCommands::settle_network_helper).
+    pub async fn settle_network_helper(&self) -> io::Result<Option<CommandState>> {
+        if self.cleanup {
+            return Err(io::Error::other(
+                "cleanup handle cannot settle runtime roles",
+            ));
+        }
+        let guard = self.commands.lock().await;
+        guard
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .settle_network_helper()
+            .await
+    }
+
     /// Run auxiliary work without holding the adapter mutex during its lifetime.
     /// Cancellation closes the caller's owner socket; sealing can retire the role
     /// concurrently and waits for its accepted auxiliary children to disappear.

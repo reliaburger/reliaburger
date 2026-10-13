@@ -206,7 +206,10 @@ impl RuncGrill {
         let socket = directory.join("api.sock");
         let mut started = 0;
         loop {
-            match context.role_state(RuntimeRole::RootlessNetwork).await? {
+            // A Bun that exec'd mid-replacement can leave the bound helper
+            // Prepared. Settling cancels it if nothing will start it, or waits
+            // briefly for an owner that is starting it (#778).
+            match context.settle_network_helper().await? {
                 Some(CommandState::Running { .. }) => {}
                 // Only terminal roles (or fenced, never-started preparations) may
                 // replace this socket. start_role performs the final admission check.

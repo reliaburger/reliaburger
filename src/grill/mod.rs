@@ -416,6 +416,32 @@ pub trait Grill: Send + Sync {
         std::future::ready(Ok(()))
     }
 
+    /// [`Grill::forget_retired`], for one known generation of a reused
+    /// identity: it also refuses while the identity's current generation is
+    /// any other, so a late request can't forget a successor's launch, such
+    /// as an init container whose exit code a redeploy still has to read
+    /// (#850).
+    fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &RuntimeGeneration,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send {
+        let _ = (instance, generation);
+        std::future::ready(Ok(()))
+    }
+
+    /// The generation of the instance's current launch, for a later
+    /// [`Grill::forget_retired_generation`]. `None` when this runtime keeps
+    /// no launch for it, or keeps no per-instance metadata at all.
+    fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<RuntimeGeneration>, GrillError>> + Send
+    {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
     /// Identities this runtime keeps metadata for although no backend has a
     /// launch for them, so nothing they record can still run. Candidates for
     /// [`Grill::forget_retired`] at startup; most runtimes have none.
@@ -827,6 +853,37 @@ impl Grill for AnyGrill {
             AnyGrill::Mixed(g) => g.forget_retired(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.forget_retired(instance).await,
+        }
+    }
+
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.forget_retired_generation(instance, generation).await,
+        }
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<RuntimeGeneration>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.launch_generation(instance).await,
         }
     }
 

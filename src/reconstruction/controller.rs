@@ -296,6 +296,7 @@ mod tests {
             receive_deadlines: Default::default(),
             reports,
             stale_nodes: vec![],
+            stale_since: Default::default(),
             capabilities: HashMap::new(),
             readiness: HashMap::new(),
         }
