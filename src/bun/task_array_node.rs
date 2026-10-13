@@ -15,7 +15,10 @@
 //! segment per chunk grant, see [`super::task_output`]). The node keeps it
 //! while the cluster still lists the array, so `relish batch results` and
 //! `relish batch logs` work after the array finishes, and deletes it once
-//! the leader stops listing the array. The leader stops listing a finished
+//! the leader stops listing the array. In between, once the array is
+//! terminal (listed but no longer running) and its ledger has closed, the
+//! node compacts the ledger and index into one small results file (see
+//! [`super::task_result_index::compact`]). The leader stops listing a finished
 //! array an hour after it finishes, on a timer, whether or not anyone
 //! submits more work.
 //!
@@ -50,11 +53,18 @@ pub const TASK_ARRAYS_DIR: &str = "task-arrays";
 /// Most result rows one request returns.
 pub const MAX_RESULT_ROWS: usize = 1000;
 
-/// Most disk bytes a worker holds per finished task while the cluster still
-/// lists its run: a 22-byte ledger record plus a 24-byte result-index slot,
-/// rounded up for block headers and filesystem blocks. Kept failure output
-/// comes on top, bounded per chunk. Everything goes once the run retires.
-pub const STORAGE_BYTES_PER_TASK: u64 = 50;
+/// Most disk bytes a worker holds per task of a finished run while the
+/// cluster still lists it: one 14-byte compact result slot
+/// ([`super::task_result_index::FINAL_SLOT_BYTES`]), with room for
+/// filesystem blocks. Kept failure output comes on top, bounded per chunk.
+/// Everything goes once the run retires.
+pub const STORAGE_BYTES_PER_TASK: u64 = 16;
+
+/// Most disk bytes a worker holds per finished task while the run is still
+/// active: a 22-byte ledger record plus a 24-byte live result-index slot,
+/// rounded up for block headers and filesystem blocks. Once the run is
+/// terminal the node compacts both into [`STORAGE_BYTES_PER_TASK`].
+pub const ACTIVE_STORAGE_BYTES_PER_TASK: u64 = 50;
 
 /// Tasks examined by a detail page, even when its failure filter returns no rows.
 pub const RESULT_PAGE_SPAN: u32 = 4096;
@@ -218,6 +228,10 @@ pub enum TaskArrayNodeError {
     Join(#[from] tokio::task::JoinError),
     #[error("busy: an earlier sync's disk work has not finished, so this node's disk may be stuck")]
     SyncBusy,
+    #[error(
+        "task array {batch_id} already finished on this node and its results are compacted; it can't run again"
+    )]
+    AlreadyFinished { batch_id: u64 },
 }
 
 /// Runs task attempts: real processes on a node, a fake in tests.
@@ -326,6 +340,9 @@ impl TaskArrayNodeConfig {
 struct ArrayRun {
     pool: Arc<TaskPool<NodeRunner>>,
     ledger: LedgerHandle,
+    /// The ledger's group-commit writer. It returns once every handle,
+    /// this run's and its chunks', is dropped, after its last fsync.
+    writer: tokio::task::JoinHandle<Result<Ledger, LedgerError>>,
     cancel: CancellationToken,
     /// Chunks started, by chunk id: the attempt and its cancel token.
     chunks: HashMap<u32, (u64, CancellationToken)>,
@@ -378,6 +395,19 @@ impl SyncClaim {
     }
 }
 
+/// How long a finished run whose compaction failed waits before the next
+/// try: every try rereads the whole ledger.
+const COMPACTION_RETRY: Duration = Duration::from_secs(60);
+
+/// Finished runs on their way to compact results (#739).
+#[derive(Default)]
+struct Compaction {
+    /// Ledger writers still closing, by run.
+    closing: HashMap<u64, tokio::task::JoinHandle<Result<Ledger, LedgerError>>>,
+    /// When compacting a run last failed.
+    failed: HashMap<u64, tokio::time::Instant>,
+}
+
 enum ControlCheck {
     Accepted,
     Stale,
@@ -392,6 +422,7 @@ pub struct TaskArrayNode {
     slots: Arc<Semaphore>,
     budget: Arc<super::execution_budget::ExecutionBudget>,
     indexes: Mutex<HashMap<u64, Arc<super::task_result_index::TaskResultIndex>>>,
+    compaction: Mutex<Compaction>,
     telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
     output_syncs: Arc<std::sync::atomic::AtomicU64>,
     /// fsyncs the control fence has cost, for [`Self::control_syncs`].
@@ -423,6 +454,7 @@ impl TaskArrayNode {
             slots,
             budget,
             indexes: Mutex::new(HashMap::new()),
+            compaction: Mutex::new(Compaction::default()),
             telemetry: Default::default(),
             output_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             control_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -638,16 +670,18 @@ impl TaskArrayNode {
             .collect();
         for id in finished_ids {
             // Finished or forgotten: stop anything still going. The
-            // directory stays while the cluster lists the array.
-            if request.known.contains(&id) {
-                if let Some(run) = arrays.get(&id) {
-                    run.cancel.cancel();
-                }
-            } else if let Some(run) = arrays.remove(&id) {
+            // directory stays while the cluster lists the array; a finished
+            // run's ledger closes once its last chunk lets go of it.
+            if let Some(run) = arrays.remove(&id) {
                 run.cancel.cancel();
+                if request.known.contains(&id) {
+                    self.compaction.lock().await.closing.insert(id, run.writer);
+                }
             }
         }
         self.delete_unknown(&claim, &request.known).await;
+        self.compact_finished(&claim, &request.known, &running)
+            .await;
         self.telemetry.retain_runs(|id| running.contains(&id));
         let root = self.config.root.clone();
         let audit_dir = self.config.audit_dir.clone();
@@ -852,11 +886,20 @@ impl TaskArrayNode {
         assignment: &ArrayAssignment,
     ) -> Result<ArrayRun, TaskArrayNodeError> {
         let directory = self.array_dir(assignment.batch_id);
+        let batch_id = assignment.batch_id;
         let spec = assignment.spec.clone();
         let held: std::collections::BTreeSet<_> =
             assignment.held.iter().map(|h| h.chunk.0).collect();
         let (ledger, resumed, highest) = claim
             .spawn_blocking(move || {
+                // Compaction deleted the ledger: a fresh one would run
+                // finished tasks again.
+                if directory
+                    .join(super::task_result_index::RESULTS_FILE)
+                    .try_exists()?
+                {
+                    return Err(TaskArrayNodeError::AlreadyFinished { batch_id });
+                }
                 std::fs::create_dir_all(directory.join("output"))?;
                 let parent = directory
                     .parent()
@@ -891,7 +934,7 @@ impl TaskArrayNode {
             .lock()
             .await
             .insert(assignment.batch_id, ledger.index());
-        let (handle, _writer) = task_ledger::spawn_writer(ledger, self.config.group_commit);
+        let (handle, writer) = task_ledger::spawn_writer(ledger, self.config.group_commit);
         let config = PoolConfig {
             concurrency: self.concurrency(&assignment.spec),
             backoff_base: self.config.backoff.0,
@@ -907,6 +950,7 @@ impl TaskArrayNode {
                 .with_budget(Arc::clone(&self.budget), assignment.resources),
             ),
             ledger: handle,
+            writer,
             cancel: CancellationToken::new(),
             chunks: HashMap::new(),
             finished: Arc::new(Mutex::new(HashMap::new())),
@@ -1185,6 +1229,89 @@ impl TaskArrayNode {
         }
     }
 
+    /// Compact the results of every run the cluster still lists but no
+    /// longer runs, so a finished run keeps [`STORAGE_BYTES_PER_TASK`]
+    /// instead of its ledger and live index (#739). A run waits until its
+    /// ledger writer has closed, so nothing appends after the copy.
+    async fn compact_finished(&self, claim: &SyncClaim, known: &[u64], running: &[u64]) {
+        let mut compaction = self.compaction.lock().await;
+        compaction.closing.retain(|id, _| known.contains(id));
+        compaction.failed.retain(|id, _| known.contains(id));
+        let compacted: Vec<u64> = self
+            .indexes
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, index)| index.is_final())
+            .map(|(id, _)| *id)
+            .collect();
+        let mut due = Vec::new();
+        for &batch_id in known {
+            if running.contains(&batch_id) || compacted.contains(&batch_id) {
+                continue;
+            }
+            if compaction
+                .failed
+                .get(&batch_id)
+                .is_some_and(|at| at.elapsed() < COMPACTION_RETRY)
+            {
+                continue;
+            }
+            if let Some(writer) = compaction.closing.remove(&batch_id) {
+                if !writer.is_finished() {
+                    compaction.closing.insert(batch_id, writer);
+                    continue;
+                }
+                // A writer that stopped on an error left a ledger whose
+                // durable blocks are still good: compaction reads only those.
+                match writer.await {
+                    Ok(Ok(_closed)) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("bun: task array {batch_id}: ledger writer stopped: {error}")
+                    }
+                    Err(error) => {
+                        eprintln!("bun: task array {batch_id}: ledger writer failed: {error}")
+                    }
+                }
+            }
+            due.push((batch_id, self.array_dir(batch_id)));
+        }
+        if due.is_empty() {
+            return;
+        }
+        let results = claim
+            .spawn_blocking(move || {
+                due.into_iter()
+                    .map(|(batch_id, directory)| (batch_id, compact_run(&directory)))
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let results = match results {
+            Ok(results) => results,
+            Err(error) => {
+                eprintln!("bun: task arrays: compaction task failed: {error}");
+                return;
+            }
+        };
+        let mut indexes = self.indexes.lock().await;
+        for (batch_id, result) in results {
+            match result {
+                Ok(Some(index)) => {
+                    indexes.insert(batch_id, index);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "bun: task array {batch_id}: can't compact finished results: {error}"
+                    );
+                    compaction
+                        .failed
+                        .insert(batch_id, tokio::time::Instant::now());
+                }
+            }
+        }
+    }
+
     /// The durable outcome of every task this node ran for the array, in
     /// index order, at most `limit` rows; with `failed_only`, just the
     /// failures.
@@ -1211,27 +1338,18 @@ impl TaskArrayNode {
         let index = match indexes.entry(batch_id) {
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
-                let path = self.array_dir(batch_id).join("ledger");
-                if !path.exists() {
-                    return Err(TaskArrayNodeError::UnknownArray { batch_id });
-                }
-                let index_path = path.with_extension("index");
-                if !index_path.exists() {
-                    return Err(std::io::Error::other(
-                        "result index unavailable; recover the worker ledger before reading detail",
-                    )
-                    .into());
-                }
+                let directory = self.array_dir(batch_id);
+                // Accepted outcomes already required the live index's durable
+                // commit. Recovery rebuilds active writers; a read never
+                // scans the historical ledger merely to open a valid index.
                 let index = tokio::task::spawn_blocking(move || {
-                    let index = super::task_result_index::TaskResultIndex::open(
-                        &path.with_extension("index"),
-                    )?;
-                    // Accepted outcomes already required this index's durable
-                    // commit. Recovery rebuilds active writers; a read never
-                    // scans the historical ledger merely to open a valid index.
-                    Ok::<_, LedgerError>(index)
+                    super::task_result_index::open_for_reading(
+                        &directory.join("ledger"),
+                        &directory.join(super::task_result_index::RESULTS_FILE),
+                    )
                 })
-                .await??;
+                .await??
+                .ok_or(TaskArrayNodeError::UnknownArray { batch_id })?;
                 entry.insert(index).clone()
             }
         };
@@ -1305,6 +1423,30 @@ impl TaskArrayNode {
             Err(TaskArrayNodeError::NoOutput { index })
         }
     }
+}
+
+/// Compact one finished run's directory: results instead of the ledger and
+/// live index, and no launch fences, which only guard a run that can still
+/// start chunks. Failure output stays. `None` when this node never ran it.
+/// Blocking I/O.
+fn compact_run(
+    directory: &Path,
+) -> Result<Option<Arc<super::task_result_index::TaskResultIndex>>, TaskArrayNodeError> {
+    use super::task_result_index::{RESULTS_FILE, compact};
+    let Some(index) = compact(&directory.join("ledger"), &directory.join(RESULTS_FILE))? else {
+        return Ok(None);
+    };
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if matches!(name, "grants.json" | "grants.tmp") || name.starts_with("started-") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(Some(index))
 }
 
 fn persist_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
@@ -2176,6 +2318,106 @@ mod tests {
             node.results(1, false, 100).await,
             Err(TaskArrayNodeError::UnknownArray { batch_id: 1 })
         ));
+    }
+
+    /// Sync with `batch_id` known but no longer running until its ledger is
+    /// gone, or fail.
+    async fn sync_until_compacted(node: &TaskArrayNode, batch_id: u64) {
+        let finished = NodeSyncRequest {
+            version: ControlVersion::default(),
+            known: vec![batch_id],
+            arrays: Vec::new(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while node.array_dir(batch_id).join("ledger").exists() {
+            node.sync(&finished).await.unwrap();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "array {batch_id} was never compacted"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_keeps_only_its_compact_results() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(
+            root.path(),
+            FakeRunner::new(Duration::ZERO, |task| AttemptOutcome::Exited {
+                code: i32::from(task.index == 3),
+            }),
+        );
+        let mut array = assignment(1, 20, &[(0, 1), (1, 1)]);
+        array.spec.max_attempts = 1;
+        sync_until_finished(&node, &request(vec![array]), 2).await;
+        let all = node.results(1, false, 100).await.unwrap();
+        let failed = node.results(1, true, 100).await.unwrap();
+        let output = node.task_output(1, 3).await;
+
+        sync_until_compacted(&node, 1).await;
+        let directory = node.array_dir(1);
+        let mut left: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["output", "results"], "only what readers need stays");
+        assert_eq!(node.results(1, false, 100).await.unwrap(), all);
+        assert_eq!(node.results(1, true, 100).await.unwrap(), failed);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].exit_code, Some(1));
+        assert_eq!(
+            format!("{:?}", node.task_output(1, 3).await),
+            format!("{output:?}"),
+            "failure output is still found by its grant"
+        );
+
+        // Pruned: everything goes, as before.
+        node.sync(&NodeSyncRequest::default()).await.unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[tokio::test]
+    async fn a_node_restarted_after_the_run_finished_compacts_it_and_still_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let sync = request(vec![assignment(1, 20, &[(0, 1)])]);
+        let all = {
+            let first = fake_node(root.path(), FakeRunner::always_succeeds());
+            sync_until_finished(&first, &sync, 1).await;
+            first.results(1, false, 100).await.unwrap()
+        };
+        let second = fake_node(root.path(), FakeRunner::always_succeeds());
+        // A reader before the first sync sees the live index...
+        assert_eq!(second.results(1, false, 100).await.unwrap(), all);
+        sync_until_compacted(&second, 1).await;
+        // ...and the compact results after it.
+        assert_eq!(second.results(1, false, 100).await.unwrap(), all);
+        let third = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert_eq!(third.results(1, false, 100).await.unwrap(), all);
+    }
+
+    #[tokio::test]
+    async fn a_compacted_run_is_never_opened_to_run_again() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let sync = request(vec![assignment(1, 20, &[(0, 1)])]);
+        sync_until_finished(&node, &sync, 1).await;
+        sync_until_compacted(&node, 1).await;
+        // A view that lists the finished run as running again can't make
+        // the node start a fresh ledger and run its tasks a second time.
+        let restarted = request(vec![assignment(1, 20, &[(1, 1)])]);
+        let progress = node.sync(&restarted).await.unwrap().arrays.remove(0);
+        assert_eq!(progress.slots, 0);
+        assert!(
+            progress
+                .refused
+                .as_deref()
+                .is_some_and(|r| r.contains("finished")),
+            "{progress:?}"
+        );
+        assert!(!node.array_dir(1).join("ledger").exists());
+        assert_eq!(node.results(1, false, 100).await.unwrap().len(), 10);
     }
 
     #[tokio::test]

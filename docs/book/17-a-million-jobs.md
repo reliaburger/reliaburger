@@ -576,6 +576,26 @@ A million tasks now cost 22.4 bytes of ledger and 25.0 of index on APFS, about 4
 
 That headroom isn't decoration, as the unit test found out a day later. It had also asserted at most 23 allocated bytes a task for the ledger, and it failed about one run in twenty on a Mac (#717). Nothing in the file had changed. Its logical length was 22,079,408 bytes every single time: the 8-byte magic, 245 block headers and a million 22-byte records. What changed was the allocation. APFS keeps up to about 1 MiB allocated past the end of a file that grows by fsynced appends, and how much it keeps varies from run to run, from 8 KiB to 1,000 KiB in forty runs of the same test. Write the same records as one big block and the slack disappears, which is why the test keeps production-sized 4,096-record blocks: a worker's disk pays that slack too. So the test now checks the two things it can know exactly, the logical length of each file to the byte, and leaves allocated bytes to the one bound that allows for the filesystem's choices, 50 a task for the pair. The worst of those forty runs was 47.6.
 
+### What a finished run still needs
+
+Fifty bytes a task was an honest number, but it wasn't the plan's sixteen, and it bugged us (#739). So we asked a different question: what does a run need once it's *over*?
+
+While a run is active the ledger earns every byte. It's how a restarted worker knows which tasks already finished, and its group commit is what lets a chunk report only durable results. The live index beside it gets rewritten in place, so it carries a check to catch a slot torn by a crash. Once the leader marks the run terminal, none of that applies. No chunk will ever start again, so nothing replays the ledger, and nothing writes the index. What readers still ask for is `relish batch results` (outcome, attempts, exit code, run time) and `relish batch logs`, which finds a failure's output by its task index and grant attempt. The leader also merges rows from several workers by grant attempt, so that has to stay.
+
+So a worker now *compacts* a finished run. It writes those fields into a third file, `results`, with one 14-byte slot per task:
+
+```text
+slot = outcome: u8, attempts: u8, exit_code: i32, run_ms: u32, grant_attempt: u32
+```
+
+The slot leaves out three things the live slot carries. The task index goes, because the slot's position already says it. The check goes, because this file is written once, fsynced and renamed into place, so no crash can leave half a slot in it. And the grant attempt shrinks from 64 bits to 32. A chunk's attempt only goes up when a node loss puts it back in the queue, and four billion requeues of one chunk would take a while. If it ever happens anyway, compaction refuses, keeps the ledger and says why, rather than quietly writing the wrong number. Once `results` is durable, the worker deletes the ledger, the live index and the launch fences (`grants.json` and the `started-*` markers), which only guard a run that can still start chunks. Failure output stays.
+
+The order is what makes it safe to crash at any point. The temporary file is thrown away if the worker dies while writing it, and the ledger is still there to start again from. Once the rename lands, `results` is complete, and the next try only deletes what's left over. The ledger is the source, not the live index: a crash between the ledger's fsync and the index's can leave a record in one and not the other, and compaction mustn't lose it.
+
+Two details took a second look. First, *when* is "finished"? The leader's sync lists every array it keeps, and among them the ones still running. An array that's kept but not running is terminal, and terminal is final in the Raft state. The worker cancels the run, but its chunks may still be writing their last records, so it waits for the ledger's group-commit writer to close. The writer closes only when every `LedgerHandle` is gone, the run's and every chunk's, and `JoinHandle::is_finished` asks without waiting, so a sync never blocks on a slow chunk. Second, a reader racing compaction mustn't re-create what it deleted. The live index used to open with `create(true)`; the read path now opens files read-only. A reader that opened the old index just before the unlink keeps reading it: on Unix an unlinked file lives on until its last descriptor closes.
+
+A million finished tasks now cost 14.0 to 14.4 bytes each on APFS, about 13.5 MiB, under the plan's 16 MiB per million. The unit test asserts the logical length to the byte, `tasks * 14`, and the allocated size against `STORAGE_BYTES_PER_TASK`, now 16. An active run still pays about 47, and `ACTIVE_STORAGE_BYTES_PER_TASK` keeps the old bound of 50. We didn't shrink the ledger itself. It's the price of crash-safe, group-committed progress, and a worker pays it only for runs in flight.
+
 Bytes per task only matter if they eventually go away. Workers already deleted a run's directory once the leader stopped listing it, but the leader only forgot a finished run when someone *submitted* something: pruning lived in the registration path. An idle cluster, or one running the same long array all day, kept everything. The fix is a new replicated write:
 
 ```rust

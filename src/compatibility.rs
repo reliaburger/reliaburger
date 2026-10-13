@@ -111,6 +111,9 @@ pub struct Compatibility {
 /// `ReportingMessage::AggregatedReport` variant is gone.
 /// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
 /// sources with bit 63 set name a job's run identity (#737).
+/// Compacted task results (#739): a worker rewrites a finished run's ledger
+/// and live index into `task-arrays/<id>/results`, 14-byte slots, and
+/// deletes both, so a finished run no longer has a ledger to replay.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

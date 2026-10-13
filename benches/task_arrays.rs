@@ -14,6 +14,8 @@
 ///   real process runner at concurrency 1, 4 and 16;
 /// - a worker's disk cost per task: 1M outcomes through the real ledger and
 ///   result index, broken down per file, failing above
+///   `ACTIVE_STORAGE_BYTES_PER_TASK` while the run is active, then the
+///   compacted results of the finished run, failing above
 ///   `STORAGE_BYTES_PER_TASK`.
 ///
 /// Every benchmark reports tasks (or elements) per second.
@@ -25,13 +27,15 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reliaburger::bun::task_array_leader::{TickInputs, plan_tick, tick_entries};
 use reliaburger::bun::task_array_node::{
-    ArrayProgress, NodeArrayCounters, NodeSyncResponse, STORAGE_BYTES_PER_TASK,
+    ACTIVE_STORAGE_BYTES_PER_TASK, ArrayProgress, NodeArrayCounters, NodeSyncResponse,
+    STORAGE_BYTES_PER_TASK,
 };
 use reliaburger::bun::task_executor::{
     AttemptOutcome, ChunkWork, FakeRunner, PoolConfig, ProcessRunner, TaskFinal, TaskPool,
     TaskRecord, TaskRunner,
 };
 use reliaburger::bun::task_ledger::Ledger;
+use reliaburger::bun::task_result_index;
 use reliaburger::meat::NodeId;
 use reliaburger::meat::index_set::IndexRangeSet;
 use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
@@ -368,15 +372,33 @@ fn bench_storage(c: &mut Criterion) {
     let (ledger, index) = write_outcomes(directory.path(), MILLION);
     let per_task = (ledger + index) as f64 / f64::from(MILLION);
     eprintln!(
-        "storage per 1M tasks: ledger {:.1} MiB ({:.1} B/task), result index {:.1} MiB ({:.1} B/task), total {per_task:.1} B/task",
+        "storage per 1M tasks while the run is active: ledger {:.1} MiB ({:.1} B/task), result index {:.1} MiB ({:.1} B/task), total {per_task:.1} B/task",
         ledger as f64 / 1048576.0,
         ledger as f64 / f64::from(MILLION),
         index as f64 / 1048576.0,
         index as f64 / f64::from(MILLION),
     );
     assert!(
-        ledger + index <= u64::from(MILLION) * STORAGE_BYTES_PER_TASK,
-        "{per_task:.1} bytes per task is over the {STORAGE_BYTES_PER_TASK}-byte bound"
+        ledger + index <= u64::from(MILLION) * ACTIVE_STORAGE_BYTES_PER_TASK,
+        "{per_task:.1} bytes per task is over the {ACTIVE_STORAGE_BYTES_PER_TASK}-byte bound"
+    );
+    // The run finishes: the node compacts both files into its results.
+    let results = directory.path().join(task_result_index::RESULTS_FILE);
+    task_result_index::compact(&directory.path().join("ledger"), &results)
+        .unwrap()
+        .unwrap();
+    let kept = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&results).unwrap().blocks() * 512
+    };
+    let per_task = kept as f64 / f64::from(MILLION);
+    eprintln!(
+        "storage per 1M tasks once the run finishes: results {:.1} MiB ({per_task:.1} B/task)",
+        kept as f64 / 1048576.0,
+    );
+    assert!(
+        kept <= u64::from(MILLION) * STORAGE_BYTES_PER_TASK,
+        "{per_task:.1} bytes per finished task is over the {STORAGE_BYTES_PER_TASK}-byte bound"
     );
 
     let mut group = c.benchmark_group("storage");
