@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -141,18 +142,21 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::MultiNode,
                 Capability::ProcessRuntime,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(rolling_deploy_keeps_the_app_running),
         },
         TestCase {
             name: "failed_deploy_rolls_back_automatically",
             group: TestGroup::Deployments,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(failed_deploy_rolls_back_automatically),
         },
         TestCase {
             name: "deploy_history_records_each_version",
             group: TestGroup::Deployments,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(deploy_history_records_each_version),
         },
     ]

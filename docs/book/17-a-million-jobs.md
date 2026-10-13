@@ -2627,6 +2627,15 @@ forgets its definition, then waits until the leader has settled the cancelled
 deployment before it removes the lease record. Standalone nodes keep the lease
 in their own store and do the same through the node's task arrays.
 
+An application lease, meanwhile, refuses jobs outright, and that caught out
+the test runner itself. It chose the lease kind by group, so the two job cases
+in the `process-workloads` group asked for an application lease and failed at
+apply before a job ever ran (#742). Each catalogue case now declares its
+`lease` (Chapter 15), and a qualification test runs the `process-workloads`
+group against a real secure node, checking that both job cases pass and
+confirm their cleanup. The refusal stays: a case that applies a job under the
+wrong lease fails loudly rather than slipping through.
+
 ### Lessons
 
 **Two schedulers sharing a ledger must share a view of it.** The budget was

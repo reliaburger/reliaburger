@@ -76,7 +76,7 @@ def inventory(row, root):
         require(set(gate['hosts']) <= {'linux', 'darwin'}, 'unsupported host')
         if 'required_in' in gate:
             require(
-                set(strings(gate['required_in'], 'required_in')) <= {'light', 'portable', 'full'},
+                set(strings(gate['required_in'], 'required_in')) <= {'light', 'portable', 'train-full', 'full'},
                 'unknown gate-plan mode',
             )
         argv(gate['command'])
