@@ -20,9 +20,10 @@ pub(super) enum DeployOp {
         created_at: Instant,
         status: Result<crate::bun::health::HealthStatus, crate::bun::probe::ProbeError>,
     },
-    /// Enforce the image trust policy; returns the digest-pinned image, if any.
+    /// Enforce the image trust policy on one image reference (an app's or an
+    /// init container's); returns the digest-pinned image, if any.
     EnforceImageSignature {
-        spec: Box<AppSpec>,
+        image: Option<String>,
         reply: oneshot::Sender<Result<Option<String>, String>>,
     },
     /// Admit the app kind before recording the deployed spec for the Brioche UI.
@@ -477,11 +478,11 @@ impl DeployOps {
 
     pub(super) async fn enforce_image_signature(
         &self,
-        spec: &AppSpec,
+        image: Option<&str>,
     ) -> Result<Option<String>, String> {
         self.call(
             |reply| DeployOp::EnforceImageSignature {
-                spec: Box::new(spec.clone()),
+                image: image.map(String::from),
                 reply,
             },
             Err("agent shutting down".to_string()),
@@ -1103,9 +1104,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.complete_health_probe(instance_id, created_at, status)
                     .await;
             }
-            DeployOp::EnforceImageSignature { spec, reply } => {
-                let verdict = self.enforce_image_signature(&spec).await;
-                let check = self.cosign_check(spec.image.as_deref()).await;
+            DeployOp::EnforceImageSignature { image, reply } => {
+                let verdict = self.enforce_image_signature(image.as_deref()).await;
+                let check = self.cosign_check(image.as_deref()).await;
                 answer_after_cosign(verdict, check, reply);
             }
             DeployOp::StoreDeployedSpec {
@@ -1485,11 +1486,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         owner.retry_pending = false;
                         owner.oci_spec = Some(instance.oci_spec);
                         let health_config =
-                            instance.spec.health.as_ref().zip(instance.spec.port).map(
-                                |(health, port)| {
-                                    crate::bun::health::HealthCheckConfig::from_spec(health, port)
-                                },
-                            );
+                            crate::bun::health::HealthCheckConfig::for_app(&instance.spec);
                         owner.health_config = health_config.clone();
                         if let Some(config) = health_config {
                             self.supervisor
