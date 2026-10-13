@@ -4235,12 +4235,20 @@ async fn workload_admission_fixture(
             crate::bun::task_executor::FakeRunner::always_succeeds(),
         ),
     );
+    // The leader loop ticks every 10ms. On the wall clock, an every-minute
+    // schedule applied just before a minute boundary would fire mid-test.
+    // Holding cron time still at the fixture's start means no occurrence can
+    // come due: apply stamps a schedule with the wall-clock minute, which is
+    // never earlier than this one (#868).
+    let cron_clock =
+        crate::bun::task_array_leader::CronClock::manual(crate::meat::batch_ids::epoch_now_secs());
     let service = Arc::new(
         crate::bun::task_array_leader::TaskArrayService::with_timings(
             Some(Arc::new(node)),
             std::time::Duration::from_millis(10),
             std::time::Duration::from_secs(30),
-        ),
+        )
+        .with_cron_clock(cron_clock),
     );
     let app = router_with_upgrade(
         tx,
@@ -8354,6 +8362,10 @@ async fn cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immedi
             .expression,
         "* * * * *"
     );
+    // Let the leader tick a few times in the applied minute: a schedule never
+    // fires in the minute it lands in.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let desired = council.desired_state().await;
     assert_eq!(desired.task_arrays.jobs().runs().count(), 0);
     assert!(commands.try_recv().is_err());
     council.shutdown().await.unwrap();

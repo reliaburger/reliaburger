@@ -866,7 +866,10 @@ async fn manual_singletons_use_common_runs_and_repeat_requests_keep_the_same_ide
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cron_registration_is_durable_without_launching_a_manual_run() {
-    let harness = Harness::start(Options::processes(true)).await;
+    // Cron time held at the start, so the every-minute schedule can't come
+    // due if the test crosses a minute boundary (#868).
+    let clock = CronClock::manual(reliaburger::meat::batch_ids::epoch_now_secs());
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock).await;
     let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     let response = harness
         .http
@@ -1058,7 +1061,10 @@ async fn finite_batches_are_common_singletons_and_repeated_submissions_keep_the_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jobs_inventory_and_stop_use_durable_schedule_definitions() {
-    let harness = Harness::start(Options::processes(true)).await;
+    // Cron time held at the start, so the every-minute schedule can't come
+    // due if the test crosses a minute boundary (#868).
+    let clock = CronClock::manual(reliaburger::meat::batch_ids::epoch_now_secs());
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock).await;
     let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     assert_eq!(
         harness
