@@ -434,7 +434,10 @@ struct ArrayRun {
     /// Records read back from an earlier run's ledger, by chunk, used
     /// once when that chunk starts again.
     resumed: HashMap<u32, Vec<TaskRecord>>,
+    /// The highest attempt accepted per chunk, as in the grant fence.
     highest: BTreeMap<u32, u64>,
+    /// Where the grant fence's newest slot sits; `None` before the first.
+    grant_fence: Option<super::fence_file::Position>,
     failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -510,6 +513,8 @@ pub struct TaskArrayNode {
     output_syncs: Arc<std::sync::atomic::AtomicU64>,
     /// fsyncs the control fence has cost, for [`Self::control_syncs`].
     control_syncs: Arc<std::sync::atomic::AtomicU64>,
+    /// fsyncs the grant fences have cost, for [`Self::grant_syncs`].
+    grant_syncs: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this process has made `root`'s directory entry durable.
     root_durable: Arc<std::sync::atomic::AtomicBool>,
     /// One permit, for [`SyncClaim`].
@@ -541,6 +546,7 @@ impl TaskArrayNode {
             telemetry: Default::default(),
             output_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             control_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grant_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_gate: Arc::new(Semaphore::new(1)),
             runner: Arc::new(runner),
@@ -610,6 +616,11 @@ impl TaskArrayNode {
     /// this node.
     pub fn control_syncs(&self) -> u64 {
         self.control_syncs.load(Ordering::Relaxed)
+    }
+
+    /// How many fsyncs the per-array grant fences have cost on this node.
+    pub fn grant_syncs(&self) -> u64 {
+        self.grant_syncs.load(Ordering::Relaxed)
     }
 
     /// Whether task data and the audit log, or the filesystem holding them,
@@ -714,16 +725,12 @@ impl TaskArrayNode {
                 }
                 // Durable before the node acts on it: a restarted node must
                 // still refuse anything older.
-                match fence {
-                    Some(fence) if version > previous => {
-                        super::control_fence::advance(&path, &fence, version)?;
-                        syncs.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Some(_) => {}
-                    None => {
-                        super::control_fence::create(&path, version)?;
-                        // The fence file and its directory.
-                        syncs.fetch_add(2, Ordering::Relaxed);
+                match &fence {
+                    Some(_) if version <= previous => {}
+                    current => {
+                        let flushes =
+                            super::control_fence::write(&path, current.as_ref(), version)?;
+                        syncs.fetch_add(flushes, Ordering::Relaxed);
                     }
                 }
                 Ok::<_, std::io::Error>(ControlCheck::Accepted)
@@ -944,7 +951,7 @@ impl TaskArrayNode {
         let spec = assignment.spec.clone();
         let held: std::collections::BTreeSet<_> =
             assignment.held.iter().map(|h| h.chunk.0).collect();
-        let (ledger, resumed, highest) = claim
+        let (ledger, resumed, (highest, grant_fence)) = claim
             .spawn_blocking(move || {
                 // Compaction deleted the ledger: a fresh one would run
                 // finished tasks again.
@@ -975,13 +982,12 @@ impl TaskArrayNode {
                 } else {
                     HashMap::new()
                 };
-                let fence = directory.join("grants.json");
-                let highest = match std::fs::read(&fence) {
-                    Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-                    Err(error) => return Err(error.into()),
+                let fence = directory.join(super::grant_fence::FILE_NAME);
+                let grants = match super::grant_fence::read(&fence)? {
+                    Some((highest, position)) => (highest, Some(position)),
+                    None => (BTreeMap::new(), None),
                 };
-                Ok::<_, TaskArrayNodeError>((Ledger::open(&path)?, resumed, highest))
+                Ok::<_, TaskArrayNodeError>((Ledger::open(&path)?, resumed, grants))
             })
             .await??;
         self.indexes
@@ -1010,6 +1016,7 @@ impl TaskArrayNode {
             finished: Arc::new(Mutex::new(HashMap::new())),
             resumed,
             highest,
+            grant_fence,
             failure: Arc::new(Mutex::new(None)),
         })
     }
@@ -1044,16 +1051,30 @@ impl TaskArrayNode {
         }
         if changed {
             run.pool.counters().unknown.store(false, Ordering::Relaxed);
-            let path = self.array_dir(assignment.batch_id).join("grants.json");
+            let path = self
+                .array_dir(assignment.batch_id)
+                .join(super::grant_fence::FILE_NAME);
             let highest = run.highest.clone();
+            let current = run.grant_fence;
+            // Durable before the node acts on it: a restarted node must
+            // never start an older attempt of a chunk granted again.
             let persisted = claim
-                .spawn_blocking(move || persist_json(&path, &highest))
+                .spawn_blocking(move || {
+                    super::grant_fence::write(&path, current.as_ref(), &highest)
+                })
                 .await;
-            if !matches!(persisted, Ok(Ok(()))) {
-                let reason = "cannot persist the grant fence".to_string();
-                *run.failure.lock().await = Some(reason.clone());
-                run.cancel.cancel();
-                return refused(assignment.batch_id, reason);
+            match persisted {
+                Ok(Ok(written)) => {
+                    run.grant_fence = Some(written.position);
+                    self.grant_syncs
+                        .fetch_add(written.flushes, Ordering::Relaxed);
+                }
+                _ => {
+                    let reason = "cannot persist the grant fence".to_string();
+                    *run.failure.lock().await = Some(reason.clone());
+                    run.cancel.cancel();
+                    return refused(assignment.batch_id, reason);
+                }
             }
         }
 
@@ -1496,7 +1517,9 @@ fn compact_run(
         let Some(name) = name.to_str() else {
             continue;
         };
-        if matches!(name, "grants.json" | "grants.tmp") || name.starts_with("started-") {
+        if matches!(name, super::grant_fence::FILE_NAME | "grants.tmp")
+            || name.starts_with("started-")
+        {
             std::fs::remove_file(entry.path())?;
         }
     }
@@ -2031,16 +2054,16 @@ mod tests {
         assert!(root.join("control.fence").exists());
     }
 
-    /// Damage one slot of the control fence, as a write torn by a crash
-    /// would.
-    fn tear_fence_slot(root: &Path, slot: u64) {
+    /// Damage one slot of a fence file with 512-byte slots, as a write torn
+    /// by a crash would.
+    fn tear_fence_slot(path: &Path, slot: u64) {
         use std::io::{Read, Seek, SeekFrom, Write};
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(root.join("control.fence"))
+            .open(path)
             .unwrap();
-        let offset = slot * 512 + 12;
+        let offset = slot * 512 + 16;
         let mut byte = [0u8];
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.read_exact(&mut byte).unwrap();
@@ -2105,7 +2128,7 @@ mod tests {
         assert!(fence_accepts(&node, 2).await);
         // A crash tore the write of 2 before its flush returned, so the
         // node never acted on it: the other slot still holds 1.
-        tear_fence_slot(root.path(), 1);
+        tear_fence_slot(&root.path().join("control.fence"), 1);
         assert!(
             !fence_accepts(&node, 0).await,
             "a torn slot reset the fence"
@@ -2113,7 +2136,7 @@ mod tests {
         assert!(fence_accepts(&node, 1).await);
         // The next fence overwrites the torn slot, never the good one.
         assert!(fence_accepts(&node, 3).await);
-        tear_fence_slot(root.path(), 1);
+        tear_fence_slot(&root.path().join("control.fence"), 1);
         assert!(fence_accepts(&node, 2).await);
     }
 
@@ -2122,8 +2145,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let node = fake_node(root.path(), FakeRunner::always_succeeds());
         assert!(fence_accepts(&node, 5).await);
-        tear_fence_slot(root.path(), 0);
-        tear_fence_slot(root.path(), 1);
+        tear_fence_slot(&root.path().join("control.fence"), 0);
+        tear_fence_slot(&root.path().join("control.fence"), 1);
         // Reading it as no fence at all would let any delayed control
         // message through.
         assert!(!fence_accepts(&node, 4).await);
@@ -2259,7 +2282,7 @@ mod tests {
             .filter(|path| {
                 matches!(
                     path.file_name().and_then(|name| name.to_str()),
-                    Some("ledger" | "grants.json")
+                    Some("ledger" | "grants.fence")
                 )
             })
             .map(|path| (path.clone(), std::fs::read(path).unwrap()))
@@ -2316,7 +2339,7 @@ mod tests {
         node.sync(&request(vec![assignment(1, 10, &[])]))
             .await
             .unwrap();
-        let fence = node.array_dir(1).join("grants.json");
+        let fence = node.array_dir(1).join("grants.fence");
         std::fs::create_dir(&fence).unwrap();
         let grant = request(vec![assignment(1, 10, &[(0, 1)])]);
         let first = node.sync(&grant).await.unwrap().arrays.remove(0);
@@ -2326,6 +2349,103 @@ mod tests {
         assert!(later.refused.unwrap().contains("grant fence"));
         assert!(later.finished.is_empty());
         assert_eq!(later.counters.attempts_started, 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_grant_rewrites_the_grant_fence_in_place_with_one_flush() {
+        // Under load the leader grants chunks every tick. A create and a
+        // rename each queue behind other processes' flushes on macOS, and
+        // the rename needs its directory flushed too (#902).
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let mut held = vec![(0, 1)];
+        node.sync(&request(vec![assignment(1, 400, &held)]))
+            .await
+            .unwrap();
+        // The first grant creates the fence: the file and its directory.
+        assert_eq!(node.grant_syncs(), 2);
+        let fence = node.array_dir(1).join("grants.fence");
+        let first = std::fs::metadata(&fence).unwrap();
+        for chunk in 1..30u32 {
+            held.push((chunk, u64::from(chunk) + 1));
+            node.sync(&request(vec![assignment(1, 400, &held)]))
+                .await
+                .unwrap();
+        }
+        // Grants the node already holds cost nothing.
+        node.sync(&request(vec![assignment(1, 400, &held)]))
+            .await
+            .unwrap();
+        let last = std::fs::metadata(&fence).unwrap();
+        assert_eq!(first.ino(), last.ino(), "the grant fence was replaced");
+        assert_eq!(first.len(), last.len());
+        assert_eq!(node.grant_syncs() - 2, 29, "one flush per new grant");
+        // A restarted node still runs chunk 29 at its newest attempt, not
+        // the older one a delayed sync names.
+        drop(node);
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let stale = request(vec![assignment(1, 400, &[(29, 1)])]);
+        let progress = sync_until_finished(&restarted, &stale, 1).await;
+        assert_eq!(progress.finished[0].attempt, 30);
+    }
+
+    #[tokio::test]
+    async fn a_torn_grant_fence_slot_falls_back_to_the_last_acknowledged_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let fence = root.path().join("1").join("grants.fence");
+        let stale = request(vec![assignment(1, 20, &[(0, 1)])]);
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        node.sync(&request(vec![assignment(1, 20, &[(0, 2)])]))
+            .await
+            .unwrap();
+        node.sync(&request(vec![assignment(1, 20, &[(0, 3)])]))
+            .await
+            .unwrap();
+        drop(node);
+        // A crash tore the write of attempt 3 before its flush returned, so
+        // the node never started it: the other slot still holds attempt 2.
+        tear_fence_slot(&fence, 1);
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let progress = sync_until_finished(&restarted, &stale, 1).await;
+        assert_eq!(
+            progress.finished[0].attempt, 2,
+            "a torn slot reset the grant fence"
+        );
+        // The next grant overwrites the torn slot, never the good one.
+        restarted
+            .sync(&request(vec![assignment(1, 20, &[(0, 4)])]))
+            .await
+            .unwrap();
+        drop(restarted);
+        tear_fence_slot(&fence, 1);
+        let again = fake_node(root.path(), FakeRunner::always_succeeds());
+        let progress = sync_until_finished(&again, &stale, 1).await;
+        assert_eq!(progress.finished[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn a_grant_fence_with_no_valid_slot_refuses_its_run() {
+        let root = tempfile::tempdir().unwrap();
+        let fence = root.path().join("1").join("grants.fence");
+        let grant = request(vec![assignment(1, 20, &[(0, 1)])]);
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        node.sync(&grant).await.unwrap();
+        drop(node);
+        tear_fence_slot(&fence, 0);
+        tear_fence_slot(&fence, 1);
+        // Reading it as no grants at all would let a delayed sync start an
+        // older attempt again.
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let progress = restarted.sync(&grant).await.unwrap().arrays.remove(0);
+        assert!(
+            progress
+                .refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("grants.fence")),
+            "{progress:?}"
+        );
+        assert_eq!(progress.counters.attempts_started, 0);
     }
 
     #[tokio::test]

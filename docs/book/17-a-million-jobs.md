@@ -588,7 +588,7 @@ So a worker now *compacts* a finished run. It writes those fields into a third f
 slot = outcome: u8, attempts: u8, exit_code: i32, run_ms: u32, grant_attempt: u32
 ```
 
-The slot leaves out three things the live slot carries. The task index goes, because the slot's position already says it. The check goes, because this file is written once, fsynced and renamed into place, so no crash can leave half a slot in it. And the grant attempt shrinks from 64 bits to 32. A chunk's attempt only goes up when a node loss puts it back in the queue, and four billion requeues of one chunk would take a while. If it ever happens anyway, compaction refuses, keeps the ledger and says why, rather than quietly writing the wrong number. Once `results` is durable, the worker deletes the ledger, the live index and the launch fences (`grants.json` and the `started-*` markers), which only guard a run that can still start chunks. Failure output stays.
+The slot leaves out three things the live slot carries. The task index goes, because the slot's position already says it. The check goes, because this file is written once, fsynced and renamed into place, so no crash can leave half a slot in it. And the grant attempt shrinks from 64 bits to 32. A chunk's attempt only goes up when a node loss puts it back in the queue, and four billion requeues of one chunk would take a while. If it ever happens anyway, compaction refuses, keeps the ledger and says why, rather than quietly writing the wrong number. Once `results` is durable, the worker deletes the ledger, the live index and the launch fences (`grants.fence` and the `started-*` markers), which only guard a run that can still start chunks. Failure output stays.
 
 The order is what makes it safe to crash at any point. The temporary file is thrown away if the worker dies while writing it, and the ledger is still there to start again from. Once the rename lands, `results` is complete, and the next try only deletes what's left over. The ledger is the source, not the live index: a crash between the ledger's fsync and the index's can leave a record in one and not the other, and compaction mustn't lose it.
 
@@ -701,15 +701,17 @@ today, is exactly the kind of argument a fence exists to avoid. So every new
 version still reaches stable storage before the node acts on it. What changed
 is how it gets there.
 
-`control.fence` (in `src/bun/control_fence.rs`) is a fixed-size file with two
-32-byte slots, one at offset 0 and one at 512, so each sits in its own disk
-sector. A slot is a magic number, the three `u64`s and a CRC32 of the rest. A
-new version overwrites, in place, the slot that *doesn't* hold the current
-one, and flushes once:
+`control.fence` is a file with two slots, one at offset 0 and one at 512, so
+each sits in its own disk sector. A slot is a magic number, a generation that
+counts the writes, the payload's length, the payload (here the three `u64`s)
+and a CRC32 of the rest. A new version overwrites, in place, the slot that
+*doesn't* hold the current one, and flushes once. This is `rewrite_slot` in
+`src/bun/fence_file.rs`, which the control fence shares with the grant fences
+we'll meet in a moment:
 
 ```rust
-file.seek(SeekFrom::Start((1 - current.slot) * SLOT_STRIDE))?;
-file.write_all(&encode(version))?;
+file.seek(SeekFrom::Start((1 - current.slot) * current.stride))?;
+file.write_all(slot)?;
 file.sync_data()
 ```
 
@@ -721,7 +723,7 @@ Why is that still safe? A crash during the write can tear the slot being
 written, and the CRC then rejects it. The other slot still holds the previous
 version, which was flushed before the node acted on it. The torn one was never
 acted on: the sync carries on only after `sync_data` returns. Reading takes
-the newer of the valid slots, and the next write goes into whichever slot
+the valid slot with the higher generation, and the next write goes into whichever slot
 isn't current, so a torn slot is the first to be overwritten. The file only
 appears through the old write, flush and rename dance, once, when it's
 created, so there's never a half-written fence file. And a fence with *no*
@@ -732,23 +734,28 @@ the disk, exactly as it did with an unreadable `control.json`.
 Reading a slot is a nice small example of `Option` and `?` together:
 
 ```rust
-fn decode(slot: &[u8]) -> Option<ControlVersion> {
-    let word = |at: usize| Some(u64::from_le_bytes(slot.get(at..at + 8)?.try_into().ok()?));
-    let crc = u32::from_le_bytes(slot.get(28..32)?.try_into().ok()?);
-    if slot.get(..4)? != MAGIC || crc32fast::hash(slot.get(..28)?) != crc {
+fn decode<'a>(magic: &[u8; 4], slot: &'a [u8]) -> Option<(u64, &'a [u8])> {
+    let generation = u64::from_le_bytes(slot.get(4..12)?.try_into().ok()?);
+    let length = u32::from_le_bytes(slot.get(12..HEADER_LEN)?.try_into().ok()?);
+    let end = HEADER_LEN.checked_add(usize::try_from(length).ok()?)?;
+    let crc = u32::from_le_bytes(slot.get(end..end + CHECK_LEN)?.try_into().ok()?);
+    if slot.get(..4)? != magic || crc32fast::hash(slot.get(..end)?) != crc {
         return None;
     }
-    // ...
+    Some((generation, slot.get(HEADER_LEN..end)?))
 }
 ```
 
 `slot.get(range)` returns an `Option<&[u8]>` instead of panicking when the
 range runs off the end, and `?` on an `Option` returns `None` from the
-enclosing function, or here from the closure, which is why `word` wraps its
-result in `Some`. `try_into()` turns a slice into a fixed-size array
+enclosing function. `try_into()` turns a slice into a fixed-size array
 (`[u8; 8]`), which is what `u64::from_le_bytes` takes; it fails only when the
 lengths differ, and `.ok()` turns that `Result` into an `Option` so `?` can
-use it. No `unwrap`, and no way for a short slice to panic.
+use it. A torn length can't send the read off the end either: the payload's
+end comes from `checked_add`, and `get` refuses a range past the slot. No
+`unwrap`, and no way for a damaged slot to panic. The `'a` says the payload
+handed back borrows from `slot`, the caller's bytes, so decoding copies
+nothing; the caller copies the one payload it keeps.
 
 One detail came from the hung-worker test. It hangs a worker by swapping the
 fence for a FIFO with no writer. A sync that read the real fence just before
@@ -757,7 +764,7 @@ blocks until a reader turns up, which in that test is never. So the write
 opens with `O_NONBLOCK` (through `custom_flags`, from the `OpenOptionsExt`
 trait we met in Chapter 10). For a regular file that flag does nothing; for a
 FIFO the open fails at once with `ENXIO` and the sync answers with a refusal.
-`advancing_a_fence_swapped_for_a_fifo_fails_instead_of_blocking` pins it.
+`writing_a_fence_swapped_for_a_fifo_fails_instead_of_blocking` pins it.
 
 The tests pin the rest. `a_sync_flushes_the_disk_only_when_the_fence_changes`
 now counts three flushes for a new fence file, none to repeat a version and
@@ -775,9 +782,70 @@ Under the same load, the same 200 syncs took 15 to 19 ms at the median, 26
 to 62 ms at the 99th percentile, and at most 100 ms. That's about a third of
 the time, and the second-long outlier is gone. Idle, nothing changed (about
 12 ms): one `F_FULLFSYNC` is the floor for a fence that moves, and we've kept
-it on purpose. The grant fence, `grants.json` in each array's directory, still
-takes the replace-and-rename route on every new grant; it's the obvious next
-candidate for the same treatment.
+it on purpose.
+
+#### Grants too
+
+The control fence wasn't the only file that moved every tick. Each array's
+directory holds a grant fence: the highest attempt the node has accepted for
+each chunk it was granted. When the leader takes a chunk back and grants it
+again, the attempt goes up, and the fence makes sure that a delayed sync
+naming the older attempt can't start that one again, across a restart too.
+It changes on every new grant, and under load the leader hands out chunks
+every tick. It was `grants.json`, written by the same replace-and-rename
+routine the control fence had just stopped using: two `F_FULLFSYNC`s, a
+create and a rename per grant (#902).
+
+The control fence's file couldn't simply be copied. Its payload is always 24
+bytes; the grant fence is a map that grows by one entry per chunk, 12 bytes
+each (a `u32` chunk and a `u64` attempt). So we pulled the two-slot logic out
+into `src/bun/fence_file.rs`, which knows nothing about what it stores, and
+left two small wrappers: `control_fence.rs` encodes a `ControlVersion`,
+`grant_fence.rs` the map. That's where the generation came from. The control
+fence could pick the newer slot by comparing versions, but two grant maps
+have no natural order, so every slot now carries a write counter and the
+higher one wins.
+
+A growing payload needs room. Each file has a stride, a power of two of at
+least 512 bytes: slot 0 sits at offset 0, slot 1 at the stride, and the file
+is two strides long. When a payload no longer fits, the write falls back to
+the safe route once: a new file whose slots have at least twice the room the
+slot needs (rounded up to a power of two), written beside the old one, flushed, renamed into place, its directory
+flushed. That's two flushes per doubling, so a node granted 200 chunks of one
+array pays it at the first grant and at the 42nd and 170th, and one flush for
+each of the other 197. The rename keeps the old guarantee: the old file stays
+whole until the new one replaces it.
+
+The node keeps the slot position in memory, in the run's `grant_fence` field,
+next to the map it mirrors. It reads the file once, when it opens the run,
+and from then on each new grant writes the other slot and stores the new
+position. A write that fails marks the run failed for good, as before, so a
+stale position is never written through. Compaction (#739) deletes
+`grants.fence` (and a leftover `grants.tmp`) with the other launch fences, and
+`a_finished_run_keeps_only_its_compact_results` still checks that only
+`output` and `results` remain.
+
+Tests first, as always. `a_new_grant_rewrites_the_grant_fence_in_place_with_one_flush`
+grants 30 chunks one sync at a time and checks the file's inode and size never
+change and that the 29 grants after the first cost exactly 29 flushes (the
+first costs two, the file and its directory, counted by the new
+`TaskArrayNode::grant_syncs`). Then it restarts the node and sends a stale
+attempt, which the node raises to the newest one. `a_torn_grant_fence_slot_falls_back_to_the_last_acknowledged_grants`
+tears the newest slot, restarts, and checks that the node falls back to the
+previous attempt rather than forgetting the chunk, and that the next grant
+overwrites the torn slot. `a_grant_fence_with_no_valid_slot_refuses_its_run`
+damages both slots: the run is refused and starts nothing.
+`fence_file`'s own tests cover a payload outgrowing its slot (a new file, two
+flushes, then in place again), a fence of the wrong kind, and the FIFO.
+
+The same throwaway measurement, rewritten for grants: one node, 200 syncs,
+each granting one more chunk of one array whose tasks never finish (so the
+ledger stays quiet and the grant fence is the only flush). With the 40 busy
+loops and four flushing loops (load average 50 to 80), interleaving old and
+new builds four times each, the old code took 38 to 39 ms per sync at the
+median, 52 to 60 ms at the 99th percentile and at most 68 ms. The new code
+took 15 to 16 ms at the median, 25 to 29 ms at the 99th percentile and at most
+53 ms. That's 203 flushes for 200 grants instead of 400.
 
 ### Fair shares: one tenant can't starve the rest
 
