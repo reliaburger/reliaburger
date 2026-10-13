@@ -16,7 +16,7 @@ test:
 test-cluster:
 \tRELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) '
 test-linux:
-\t$(CARGO) build --features ebpf --bin bun
+\t$(CARGO) test --no-run --features ebpf
 \tRELIABURGER_RUNC_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(owned_runc) | binary(test_storage)) $(LINUX_EXCLUDE)'
 test-rootless-runc:
 \tRELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless)'
