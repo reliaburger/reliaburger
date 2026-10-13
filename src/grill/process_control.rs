@@ -1151,7 +1151,7 @@ mod tests {
         assert_eq!(control.inventory().await.unwrap().len(), 1);
         // An inventory has enumerated the owner while a forget, such as the
         // one startup spawns for each retirement it finishes, deletes it.
-        control.forget_retired(&id).await.unwrap();
+        control.forget_retired(&id, None).await.unwrap();
         assert!(control.load_enumerated(&id).unwrap().is_none());
         assert!(control.inventory().await.unwrap().is_empty());
     }
