@@ -98,71 +98,39 @@ pub fn chaos_cases() -> Vec<TestCase> {
     super::chaos::scenarios()
 }
 
-/// Parse `--filter scheduling,firewall` into groups.
+/// Keep the cases `--filter` names, preserving catalogue order.
 ///
-/// An empty or whitespace-only filter selects everything, which is what
-/// omitting the flag does — so `--filter ""` can't silently run nothing.
-pub fn parse_filter(filter: &str) -> Result<Vec<TestGroup>, String> {
-    let trimmed = filter.trim();
-    if trimmed.is_empty() {
-        return Ok(TestGroup::ALL.to_vec());
-    }
-    trimmed
+/// Each comma-separated entry is a group (`scheduling`) or an exact case
+/// name (`process_job_with_exit_zero_succeeds`). An empty or
+/// whitespace-only filter selects everything, which is what omitting the
+/// flag does — so `--filter ""` can't silently run nothing. An entry that is
+/// neither is an error naming the valid groups.
+pub fn select(cases: Vec<TestCase>, filter: &str) -> Result<Vec<TestCase>, String> {
+    let entries: Vec<&str> = filter
         .split(',')
         .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| part.parse::<TestGroup>())
-        .collect()
-}
-
-/// Keep only the cases in `groups`, preserving catalogue order.
-pub fn select(cases: Vec<TestCase>, groups: &[TestGroup]) -> Vec<TestCase> {
-    cases
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return Ok(cases);
+    }
+    let mut groups = Vec::new();
+    let mut names = Vec::new();
+    for entry in entries {
+        match entry.parse::<TestGroup>() {
+            Ok(group) => groups.push(group),
+            Err(_) if cases.iter().any(|case| case.name == entry) => names.push(entry),
+            Err(error) => return Err(format!("{error}; or an exact case name")),
+        }
+    }
+    Ok(cases
         .into_iter()
-        .filter(|case| groups.contains(&case.group))
-        .collect()
+        .filter(|case| groups.contains(&case.group) || names.contains(&case.name))
+        .collect())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_empty_filter_selects_every_group() {
-        assert_eq!(parse_filter("").unwrap(), TestGroup::ALL.to_vec());
-        assert_eq!(parse_filter("   ").unwrap(), TestGroup::ALL.to_vec());
-    }
-
-    #[test]
-    fn a_single_group_parses() {
-        assert_eq!(
-            parse_filter("scheduling").unwrap(),
-            vec![TestGroup::Scheduling]
-        );
-    }
-
-    #[test]
-    fn several_comma_separated_groups_parse() {
-        assert_eq!(
-            parse_filter("scheduling,firewall,jobs").unwrap(),
-            vec![TestGroup::Scheduling, TestGroup::Firewall, TestGroup::Jobs]
-        );
-    }
-
-    #[test]
-    fn surrounding_whitespace_is_tolerated() {
-        assert_eq!(
-            parse_filter(" scheduling , jobs ").unwrap(),
-            vec![TestGroup::Scheduling, TestGroup::Jobs]
-        );
-    }
-
-    #[test]
-    fn an_unknown_group_is_rejected_and_names_the_valid_ones() {
-        let error = parse_filter("scheduling,nonsense").unwrap_err();
-        assert!(error.contains("nonsense"), "{error}");
-        assert!(error.contains("scheduling"), "{error}");
-    }
 
     fn fixture(name: &'static str, group: TestGroup) -> TestCase {
         async fn body(_ctx: TestContext) -> Result<(), String> {
@@ -177,22 +145,77 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_keeps_only_the_named_groups_in_catalogue_order() {
-        let cases = vec![
+    fn catalogue() -> Vec<TestCase> {
+        vec![
             fixture("a", TestGroup::Scheduling),
             fixture("b", TestGroup::Jobs),
             fixture("c", TestGroup::Scheduling),
             fixture("d", TestGroup::Ingress),
-        ];
-        let selected = select(cases, &[TestGroup::Scheduling, TestGroup::Ingress]);
-        let names: Vec<&str> = selected.iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["a", "c", "d"]);
+        ]
+    }
+
+    fn names(filter: &str) -> Vec<&'static str> {
+        select(catalogue(), filter)
+            .unwrap()
+            .iter()
+            .map(|case| case.name)
+            .collect()
     }
 
     #[test]
-    fn selecting_no_groups_yields_no_cases() {
-        let cases = vec![fixture("a", TestGroup::Scheduling)];
-        assert!(select(cases, &[]).is_empty());
+    fn an_empty_filter_selects_every_case() {
+        assert_eq!(names(""), vec!["a", "b", "c", "d"]);
+        assert_eq!(names("   "), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_single_group_selects_its_cases() {
+        assert_eq!(names("scheduling"), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn several_groups_keep_catalogue_order() {
+        assert_eq!(names("ingress,scheduling"), vec!["a", "c", "d"]);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_tolerated() {
+        assert_eq!(names(" scheduling , jobs "), vec!["a", "b", "c"]);
+    }
+
+    /// An exact case name runs just that case, so a fixture can leave out a
+    /// sibling it can't support (#742).
+    #[test]
+    fn an_exact_case_name_selects_only_that_case() {
+        assert_eq!(names("c"), vec!["c"]);
+    }
+
+    #[test]
+    fn groups_and_case_names_combine_in_catalogue_order() {
+        assert_eq!(names("d,jobs"), vec!["b", "d"]);
+    }
+
+    #[test]
+    fn naming_a_case_and_its_group_selects_it_once() {
+        assert_eq!(names("a,scheduling"), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn an_unknown_name_is_rejected_and_names_the_valid_groups() {
+        let Err(error) = select(catalogue(), "scheduling,nonsense") else {
+            panic!("an unknown name was accepted");
+        };
+        assert!(error.contains("nonsense"), "{error}");
+        assert!(error.contains("scheduling"), "{error}");
+        assert!(error.contains("case name"), "{error}");
+    }
+
+    #[test]
+    fn every_real_case_name_selects_exactly_itself() {
+        for case in all_cases() {
+            let selected = select(all_cases(), case.name).unwrap();
+            assert_eq!(selected.len(), 1, "{}", case.name);
+            assert_eq!(selected[0].name, case.name);
+        }
     }
 }

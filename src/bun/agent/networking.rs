@@ -14,6 +14,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
                     egress,
                     dns: self.supervisor.dns_capability(),
+                    process: self.supervisor.process_capability(),
                 })
                 .await;
         }
@@ -34,6 +35,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return (
                 crate::meat::cluster_state::NodeCapabilities {
                     dns: self.supervisor.dns_capability(),
+                    process: self.supervisor.process_capability(),
                     ..Default::default()
                 },
                 Default::default(),
@@ -49,6 +51,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 pre_start: self.supervisor.grill().honours_cgroup_path(),
             },
             dns: self.supervisor.dns_capability(),
+            process: self.supervisor.process_capability(),
         };
         let enforced_cgroups =
             crate::sesame::egress::list_enforced_cgroups(&mut ebpf.bpf).unwrap_or_default();
@@ -77,6 +80,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         (
             crate::meat::cluster_state::NodeCapabilities {
                 dns: self.supervisor.dns_capability(),
+                process: self.supervisor.process_capability(),
                 ..Default::default()
             },
             Default::default(),

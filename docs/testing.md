@@ -86,7 +86,7 @@ ignored by default and run by their own targets and CI jobs
 | Self-upgrade | Rolling binary upgrades and rollbacks with real signed binaries, workloads kept running | [`tests/self_upgrade.rs`](../tests/self_upgrade.rs), [`tests/self_upgrade_cluster.rs`](../tests/self_upgrade_cluster.rs) | `make test-upgrade` |
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
-| Benchmarks | Gossip convergence from 5 to 1,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
+| Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
 The eBPF tests load the object embedded in the library under test, as Bun
 does, and never search the target directory. Worktrees can share one
@@ -151,7 +151,9 @@ record goes in [`qualification/`](qualification):
 ### Benchmarks in CI
 
 The `benchmarks` job in [`ci.yml`](../.github/workflows/ci.yml) runs `make
-bench` and `make bench-large`, and the `task-array benchmarks` job runs `make
+bench` (the gossip benchmarks, then [`benches/scheduler.rs`](../benches/scheduler.rs):
+a leader pass placing 150 replicas, and a converged pass, on 1,000 and 10,000
+nodes) and `make bench-large`, and the `task-array benchmarks` job runs `make
 bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
 request runs the first when it touches the gossip protocol or its benchmarks,
 and the second when it touches what `benches/task_arrays.rs` measures: the

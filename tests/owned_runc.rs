@@ -1255,6 +1255,9 @@ async fn owned_runc_unit_stop_fixture() {
 #[path = "support/task_harness.rs"]
 mod capacity_task_harness;
 
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
+
 mod capacity_contract {
 
     use std::collections::BTreeMap;
@@ -1281,11 +1284,40 @@ mod capacity_contract {
     use super::capacity_task_harness::TestTasks;
     const TEST_SERVICE_TOKEN: &str = "rbrg_test_service_token";
 
+    /// One node's agent and API over the actual runc runtime.
+    ///
+    /// The harness owns the agent's volumes directory for its whole life.
+    /// A rootful agent mounts a workload identity tmpfs beneath it, and a
+    /// `TempDir` dropped over a mount fails to remove it without a word, so
+    /// [`Drop`] stops the agent first, then unmounts and removes the
+    /// directory with `clear_fixture_dir` (#852).
     struct Harness {
         client: BunClient,
-        _tasks: TestTasks,
+        /// `Some` until `Drop` stops the tasks.
+        tasks: Option<TestTasks>,
         _capacity_publisher:
             tokio::sync::watch::Sender<reliaburger::reporting::aggregator::AggregatedState>,
+        volumes: PathBuf,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            // Nothing may mount beneath the volumes while they're cleared.
+            drop(self.tasks.take());
+            if let Err(error) = super::fixture_dir::clear_fixture_dir(&self.volumes) {
+                let message = format!(
+                    "capacity harness cleanup: cannot remove {}: {error}",
+                    self.volumes.display()
+                );
+                // A second panic while unwinding aborts the binary and hides
+                // the first failure.
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
+        }
     }
 
     impl Harness {
@@ -1301,8 +1333,8 @@ mod capacity_contract {
             agent.set_node_capacity(8000, 16384);
             agent.set_records_dir(records);
             agent.adopt_recorded_instances().await.unwrap();
-            let volumes = tempfile::tempdir().unwrap();
-            agent.set_volumes_dir(volumes.path().to_path_buf());
+            let volumes = tempfile::tempdir().unwrap().keep();
+            agent.set_volumes_dir(volumes.clone());
             let deploy_history = agent.deploy_history_handle();
             let status_reader = agent.status_reader();
             let job_data = tempfile::tempdir().unwrap();
@@ -1328,7 +1360,6 @@ mod capacity_contract {
             let agent_task = tokio::spawn(async move {
                 agent.run().await;
                 drop(agent);
-                drop(volumes);
                 drop(job_data);
             });
 
@@ -1427,8 +1458,9 @@ mod capacity_contract {
             );
             Self {
                 client,
-                _tasks: tasks,
+                tasks: Some(tasks),
                 _capacity_publisher: capacity_tx,
+                volumes,
             }
         }
     }
@@ -1842,5 +1874,79 @@ mod capacity_contract {
         drop(release);
         drop(harness);
         cleanup.finish().await;
+    }
+
+    /// Start a capacity harness on a runtime with no images, for tests of
+    /// the harness itself.
+    async fn bare_harness(root: &Path) -> (Harness, CouncilCleanup) {
+        let runtime = RuncGrill::new(
+            root.join("bundles"),
+            ImageStore::new(root.join("images")),
+            false,
+            root.join("state"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        )
+        .unwrap();
+        let council = single_node_leader().await;
+        let cleanup = CouncilCleanup(council.clone());
+        let harness = Harness::start(council, runtime, root.join("records")).await;
+        (harness, cleanup)
+    }
+
+    /// Mount workload identity tmpfs beneath `volumes` the way the agent
+    /// does for a rootful workload, one nested inside the other.
+    fn mount_identity(volumes: &Path) {
+        let outer = reliaburger::sesame::identity::instance_identity_dir(volumes, "a");
+        for dir in [&outer, &outer.join("nested")] {
+            reliaburger::sesame::identity::prepare_identity_dir(dir).unwrap();
+        }
+        assert_eq!(mounts_under(volumes).len(), 2, "identity tmpfs not mounted");
+    }
+
+    /// The mount points `/proc/self/mountinfo` lists at or beneath `root`.
+    fn mounts_under(root: &Path) -> Vec<PathBuf> {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        super::fixture_dir::mounts_beneath(&mountinfo, root)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
+    async fn runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes() {
+        assert!(nix::unistd::geteuid().is_root());
+        let root = tempfile::tempdir().unwrap();
+        let (harness, _council) = bare_harness(root.path()).await;
+        let volumes = harness.volumes.clone();
+        mount_identity(&volumes);
+        drop(harness);
+        assert_eq!(mounts_under(&volumes), Vec::<PathBuf>::new());
+        assert!(
+            !volumes.exists(),
+            "{} survived the harness",
+            volumes.display()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
+    async fn runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds() {
+        assert!(nix::unistd::geteuid().is_root());
+        let root = tempfile::tempdir().unwrap();
+        let (volumes_tx, volumes_rx) = tokio::sync::oneshot::channel();
+        let root_path = root.path().to_path_buf();
+        let failed = tokio::spawn(async move {
+            let (harness, _council) = bare_harness(&root_path).await;
+            mount_identity(&harness.volumes);
+            volumes_tx.send(harness.volumes.clone()).unwrap();
+            panic!("a failed assertion with identity tmpfs still mounted");
+        })
+        .await;
+        assert!(failed.unwrap_err().is_panic());
+        let volumes = volumes_rx.await.unwrap();
+        assert_eq!(mounts_under(&volumes), Vec::<PathBuf>::new());
+        assert!(
+            !volumes.exists(),
+            "{} survived the harness",
+            volumes.display()
+        );
     }
 }

@@ -625,7 +625,15 @@ so `allow_from` names the apps in other namespaces that may reach the task's
 own container address. Both need a container task on rootful Linux runc with
 eBPF: nodes that can't enforce them refuse the array, and `runtime =
 "process"` refuses both. Without eBPF, namespace network enforcement is
-unavailable, as it is for ordinary apps. The worker caches at most 256
+unavailable, as it is for ordinary apps.
+
+It works the other way round too: an app's (or another job's) `allow_from`
+can name a job as `namespace/job`. Each task's cgroup is bound to its job
+before its command runs, and the grant names the job rather than a running
+task, so it already holds for tasks that haven't started. Other jobs in the
+same namespace stay refused. Reused
+executors serve one job each, so a grant never reaches another job's
+commands. The worker caches at most 256
 namespace bindings, evicts only idle bindings, and journals them for cleanup
 after old executors retire at startup. Losing the source binding stops its
 original runtime owner.

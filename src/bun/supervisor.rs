@@ -224,6 +224,21 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.capabilities.dns
     }
 
+    /// The host process workloads this node runs, as `admit_app` judges
+    /// them: the runtime must run host processes, mount isolation must be
+    /// off (#714), and only the allowlisted binaries run. The leader
+    /// places `exec` and `script` apps on this (#702).
+    pub fn process_capability(&self) -> crate::meat::cluster_state::ProcessWorkloadCapability {
+        let config = self.process_manager.config();
+        crate::meat::cluster_state::ProcessWorkloadCapability {
+            enabled: self
+                .grill
+                .supports_runtime(crate::grill::records::RuntimeKind::Process)
+                && !config.mount_isolation,
+            allowed_binaries: config.allowed_binaries.clone(),
+        }
+    }
+
     /// Replace the process-workloads policy (host-exec/script allowlist,
     /// mount isolation, script dir). The binary feeds the parsed
     /// `[process_workloads]` config here so the deny-by-default allowlist

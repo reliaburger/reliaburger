@@ -1193,6 +1193,14 @@ impl StateMachineInner {
                     .cloned()
                     .collect();
             }
+            RaftRequest::Unschedulable { apps } => {
+                // As for `QuotaBlocked`: no reason outlives its app.
+                self.state.unschedulable = apps
+                    .iter()
+                    .filter(|(app_id, _)| self.state.apps.contains_key(app_id))
+                    .cloned()
+                    .collect();
+            }
             RaftRequest::UpgradeUpdate { state } => {
                 // Reject starting a *different* upgrade while one is actively in
                 // progress (M13). The start/rollback handlers check
@@ -2499,6 +2507,7 @@ impl StateMachineInner {
         self.state.scheduling.remove(app_id);
         self.state.last_placed_nodes.remove(app_id);
         self.state.quota_blocked.remove(app_id);
+        self.state.unschedulable.remove(app_id);
         self.state.gitops_owned.apps.remove(app_id);
         // A deleted app leaves no baseline for an override to sit
         // above; drop it so a re-created app of the same name starts
@@ -6939,6 +6948,47 @@ mod tests {
         let json = serde_json::to_vec(&inner.state).unwrap();
         let restored: DesiredState = serde_json::from_slice(&json).unwrap();
         assert_eq!(restored.quota_blocked.get(&web), Some(&cpu_block("prod")));
+    }
+
+    fn short_of_room(placed: u32) -> crate::meat::types::Unschedulable {
+        crate::meat::types::Unschedulable {
+            placed,
+            wanted: 3,
+            reason: crate::meat::types::UnplacedReason::NoRoom,
+        }
+    }
+
+    /// #702: the leader replaces the set of short apps, which survives a
+    /// snapshot, keeps no ghost and goes with its app.
+    #[test]
+    fn unschedulable_replaces_the_set_and_goes_with_its_app() {
+        let mut inner = StateMachineInner::default();
+        apply_app(&mut inner, "web", "prod");
+        apply_app(&mut inner, "api", "prod");
+        let web = crate::meat::types::AppId::new("web", "prod");
+        let api = crate::meat::types::AppId::new("api", "prod");
+        let ghost = crate::meat::types::AppId::new("ghost", "prod");
+
+        inner.apply_request(&RaftRequest::Unschedulable {
+            apps: vec![
+                (web.clone(), short_of_room(2)),
+                (ghost.clone(), short_of_room(1)),
+            ],
+        });
+        assert_eq!(inner.state.unschedulable.get(&web), Some(&short_of_room(2)));
+        assert!(!inner.state.unschedulable.contains_key(&ghost));
+
+        let json = serde_json::to_vec(&inner.state).unwrap();
+        let restored: DesiredState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.unschedulable.get(&web), Some(&short_of_room(2)));
+
+        inner.apply_request(&RaftRequest::Unschedulable {
+            apps: vec![(api.clone(), short_of_room(0))],
+        });
+        assert!(!inner.state.unschedulable.contains_key(&web));
+
+        inner.apply_request(&RaftRequest::AppDelete { app_id: api });
+        assert!(inner.state.unschedulable.is_empty());
     }
 
     #[test]

@@ -391,6 +391,12 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
+    /// Replace the set of fixed-size apps the leader's scheduling pass placed
+    /// only part of, each with how many and why (#702). Proposed only when
+    /// the set changes, like `QuotaBlocked`.
+    Unschedulable {
+        apps: Vec<(AppId, crate::meat::types::Unschedulable)>,
+    },
     /// Remove the API tokens that expired more than
     /// [`crate::sesame::token::EXPIRED_TOKEN_GRACE`] before `now_unix_ms`.
     /// The leader proposes it on a timer; the state machine decides what to
@@ -603,6 +609,15 @@ pub struct DesiredState {
         deserialize_with = "map_as_vec::deserialize"
     )]
     pub quota_blocked: HashMap<AppId, crate::meat::quota::QuotaError>,
+    /// Fixed-size apps the leader's last scheduling pass placed only part
+    /// of: how many replicas found a node, out of how many, and why the rest
+    /// didn't (#702). It clears once every replica is placed.
+    #[serde(
+        default,
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub unschedulable: HashMap<AppId, crate::meat::types::Unschedulable>,
     /// Each app's rollout record (#692): the fully rolled-out specs that
     /// `relish rollback` and the leader's node-by-node release fall back on,
     /// and the spec whose rollout failed. Survives every node restarting.

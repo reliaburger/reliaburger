@@ -118,6 +118,7 @@ fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedStat
         receive_deadlines: Default::default(),
         reports,
         stale_nodes: vec![],
+        stale_since: Default::default(),
         capabilities: HashMap::new(),
         readiness: HashMap::new(),
     }

@@ -4486,6 +4486,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-allow_from_can_name_a_delegated_job_as_its_source",
+          "binary": "reliaburger::ebpf",
+          "test": "allow_from_can_name_a_delegated_job_as_its_source",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-dns_responder_resolves_internal_name",
           "binary": "reliaburger::ebpf",
           "test": "dns_responder_resolves_internal_name",
@@ -7088,6 +7099,33 @@
       ]
     },
     {
+      "id": "issue-696-gossip-datagram-budget",
+      "issue": 696,
+      "promise": "Gossip probes from nodes with the longest names and a full label set fit the 1,400-byte datagram, so those nodes keep acknowledging and stay alive through churn.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime over loopback UDP"
+      ],
+      "cases": [
+        {
+          "id": "gossip-budget-nodes_with_maximal_labels_stay_alive_during_churn",
+          "binary": "reliaburger::cluster_gossip",
+          "test": "nodes_with_maximal_labels_stay_alive_during_churn",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_gossip.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A directory extension that cannot fit beside the header is left off the datagram rather than sent oversize."
+      ],
+      "boundaries": [
+        "A maximally labelled node piggybacks fewer updates per probe; anti-entropy, which carries no extension, makes up the difference."
+      ]
+    },
+    {
       "id": "issue-759-executor-start-retries-on-a-fresh-executor",
       "issue": 759,
       "promise": "An executor start that misses a runtime command's bound retires that executor and runs the command once on a fresh one, within the command's deadline.",
@@ -7333,6 +7371,48 @@
       ],
       "refused_paths": [
         "A root that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
+      "id": "issue-852-capacity-harness-volumes",
+      "issue": 852,
+      "promise": "The owned-runc capacity harness keeps its volumes directory until it stops, then unmounts and removes it, whether the test passed or panicked.",
+      "supported_paths": [
+        "Rootful agents that leave workload identity tmpfs mounted beneath the harness's volumes directory"
+      ],
+      "cases": [
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        },
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A volumes directory that can't be removed fails a passing test instead of being left behind."
       ],
       "boundaries": [
         "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
@@ -7741,6 +7821,34 @@
       ],
       "boundaries": [
         "Run through the real Linux gate on a loop-mounted Btrfs; the portable tests cover every intent decision with plain directories. The power cut itself stays with the Btrfs power-cut fixture of #287."
+      ]
+    },
+    {
+      "id": "issue-702-stale-node-grace",
+      "issue": 702,
+      "promise": "A node alive in gossip whose reports stopped keeps its replicas for the stale-node grace, then loses them to the survivors.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs, with one node's agent stopped while its gossip and Raft carry on"
+      ],
+      "refused_paths": [
+        "The silent node's replica never moves before its reports have been stale for the grace."
+      ],
+      "boundaries": [
+        "The grace is measured on the leader's clock from when the node's reports went stale; a node the leader never heard from counts from when it started listening."
+      ],
+      "cases": [
+        {
+          "id": "stale-node-grace-replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "binary": "reliaburger::placement",
+          "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
       ]
     }
   ]
