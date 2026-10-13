@@ -831,6 +831,171 @@ mod tests {
         toml::from_str(r#"image = "test:v1""#).unwrap()
     }
 
+    fn init_container(image: Option<&str>, command: &[&str]) -> crate::config::app::InitContainerSpec {
+        crate::config::app::InitContainerSpec {
+            image: image.map(String::from),
+            command: command.iter().map(|part| part.to_string()).collect(),
+        }
+    }
+
+    /// The spec Bun would generate for instance `default__web-0` of `app`.
+    fn app_oci(app: &AppSpec) -> OciSpec {
+        generate_oci_spec("web", "default", app, "default__web-0", None, "/cg", None, None)
+    }
+
+    #[test]
+    fn init_spec_uses_its_own_image() {
+        // #701: `[[app.api.init]] image = "migrate:v2"` used to run its
+        // command in the app's image.
+        let app: AppSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
+        let app = app_oci(&app);
+        let init = generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+        assert_eq!(init.root.path, "migrate:v2");
+        assert_eq!(init.process.args, vec!["migrate".to_string()]);
+        assert_eq!(
+            init.process.overrides.unwrap().command,
+            vec!["migrate".to_string()]
+        );
+
+        // Without an image of its own it inherits the app's.
+        let inherited = generate_init_oci_spec(&init_container(None, &["true"]), &app);
+        assert_eq!(inherited.root.path, "myapp:v1");
+    }
+
+    #[test]
+    fn init_spec_gets_app_env_and_volume_mounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "myapp:v1"
+            env = { DATABASE_URL = "postgres://db/app" }
+
+            [[volumes]]
+            path = "/data"
+
+            [[config_file]]
+            path = "/etc/myapp/app.conf"
+            content = "key = value"
+            "#,
+        )
+        .unwrap();
+        let app = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(tmp.path()),
+            None,
+        );
+        let init = generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+
+        assert_eq!(init.process.env, app.process.env);
+        assert!(
+            init.process
+                .env
+                .contains(&"DATABASE_URL=postgres://db/app".to_string()),
+            "{:?}",
+            init.process.env
+        );
+        for destination in ["/data", "/etc/myapp/app.conf"] {
+            let app_mount = app
+                .mounts
+                .iter()
+                .find(|m| m.destination == Path::new(destination))
+                .unwrap();
+            assert!(
+                init.mounts.contains(app_mount),
+                "init is missing the app's {destination} mount: {:?}",
+                init.mounts
+            );
+        }
+        assert_eq!(init.linux.cgroups_path, app.linux.cgroups_path);
+        // The app owns its volumes; an init borrowing them must not take
+        // their ownership away from the app's user.
+        assert!(init.initialiser && !app.initialiser);
+        assert_eq!(init.port_mapping, None);
+    }
+
+    #[test]
+    fn inline_config_files_with_same_basename_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "myapp:v1"
+
+            [[config_file]]
+            path = "/etc/a/config.yaml"
+            content = "a"
+
+            [[config_file]]
+            path = "/etc/b/config.yaml"
+            content = "b"
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(tmp.path()),
+            None,
+        );
+        let content = |destination: &str| {
+            let mount = oci
+                .mounts
+                .iter()
+                .find(|m| m.destination == Path::new(destination))
+                .unwrap();
+            std::fs::read_to_string(mount.source.as_ref().unwrap()).unwrap()
+        };
+        assert_eq!(content("/etc/a/config.yaml"), "a");
+        assert_eq!(content("/etc/b/config.yaml"), "b");
+    }
+
+    #[test]
+    fn inline_config_files_are_kept_per_instance() {
+        // A rollout writes the new content for the new instance only: the
+        // old instance keeps reading the file it started with (#701).
+        let tmp = tempfile::tempdir().unwrap();
+        let app = |content: &str| -> AppSpec {
+            toml::from_str(&format!(
+                "image = \"myapp:v1\"\n[[config_file]]\npath = \"/etc/app.conf\"\ncontent = {content:?}\n"
+            ))
+            .unwrap()
+        };
+        let source = |instance: &str, content: &str| {
+            let oci = generate_oci_spec(
+                "web",
+                "default",
+                &app(content),
+                instance,
+                None,
+                "/cg",
+                Some(tmp.path()),
+                None,
+            );
+            oci.mounts
+                .iter()
+                .find(|m| m.destination == Path::new("/etc/app.conf"))
+                .and_then(|m| m.source.clone())
+                .unwrap()
+        };
+        let old = source("default__web-0", "old");
+        let new = source("default__web-g1-0", "new");
+        assert_ne!(old, new);
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "new");
+        assert_eq!(
+            old.parent().unwrap(),
+            inline_config_dir(tmp.path(), "default", "web", "default__web-0")
+        );
+    }
+
     #[test]
     fn generate_minimal_app() {
         let spec = minimal_app();
@@ -981,14 +1146,8 @@ mod tests {
 
     #[test]
     fn init_containers_and_jobs_resolve_against_their_image_too() {
-        let init = generate_init_oci_spec(
-            &["migrate".to_string()],
-            "default",
-            "web",
-            Some("web:v1"),
-            "/cg",
-            None,
-        );
+        let app: AppSpec = toml::from_str(r#"image = "web:v1""#).unwrap();
+        let init = generate_init_oci_spec(&init_container(None, &["migrate"]), &app_oci(&app));
         assert_eq!(
             init.process.overrides.unwrap().command,
             vec!["migrate".to_string()]
@@ -1846,7 +2005,19 @@ mod tests {
                 None,
             ),
             generate_job_oci_spec("web", "test", &minimal_job(), path, None),
-            generate_init_oci_spec(&["true".into()], "test", "web", None, path, None),
+            generate_init_oci_spec(
+                &init_container(None, &["true"]),
+                &generate_oci_spec(
+                    "web",
+                    "test",
+                    &minimal_app(),
+                    "test__web-3",
+                    None,
+                    path,
+                    None,
+                    None,
+                ),
+            ),
         ];
         for specification in specifications {
             assert_eq!(
@@ -1862,7 +2033,8 @@ mod tests {
 
     #[test]
     fn recovered_cgroup_paths_refuse_ambiguous_or_legacy_identity() {
-        let mut specification = generate_init_oci_spec(&[], "test", "web", None, "/unused", None);
+        let mut specification =
+            generate_init_oci_spec(&init_container(None, &[]), &app_oci(&minimal_app()));
         for invalid in [
             "",
             "/",

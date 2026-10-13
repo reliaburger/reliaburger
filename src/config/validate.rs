@@ -2112,4 +2112,111 @@ exec = "/usr/bin/python3""#,
             validate_ingress(ingress).unwrap();
         }
     }
+
+    /// Validate a one-app config whose `[app.web]` table is `app`.
+    fn validate_app_toml(app: &str) -> Result<(), ConfigError> {
+        Config::parse(&format!("[app.web]\n{app}")).unwrap().validate()
+    }
+
+    /// Assert `app` is refused with an error naming `field`.
+    fn assert_app_refused(app: &str, field: &str) {
+        let error = validate_app_toml(app).expect_err(app);
+        assert!(error.to_string().contains(field), "{app}: {error}");
+    }
+
+    #[test]
+    fn process_app_with_volume_is_refused() {
+        // ProcessGrill never mounts anything: the app would run without
+        // the volume it declared (#701).
+        for kind in ["exec = \"/usr/bin/python3\"", "script = \"echo hi\""] {
+            assert_app_refused(
+                &format!("{kind}\n[[app.web.volumes]]\npath = \"/data\""),
+                "volumes",
+            );
+        }
+    }
+
+    #[test]
+    fn process_app_with_config_file_is_refused() {
+        for kind in ["exec = \"/usr/bin/python3\"", "script = \"echo hi\""] {
+            assert_app_refused(
+                &format!(
+                    "{kind}\n[[app.web.config_file]]\npath = \"/etc/x.conf\"\ncontent = \"x\""
+                ),
+                "config_file",
+            );
+        }
+    }
+
+    #[test]
+    fn process_app_with_run_as_user_is_refused() {
+        assert_app_refused(
+            "exec = \"/usr/bin/python3\"\nrun_as_user = 1000",
+            "run_as_user",
+        );
+        assert_app_refused("script = \"echo hi\"\nrun_as_group = 1000", "run_as_group");
+    }
+
+    #[test]
+    fn image_app_keeps_volumes_config_files_and_user() {
+        validate_app_toml(
+            "image = \"web:v1\"\nrun_as_user = 1000\n\
+             [[app.web.volumes]]\npath = \"/data\"\n\
+             [[app.web.config_file]]\npath = \"/etc/x.conf\"\ncontent = \"x\"",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn health_port_without_app_port_is_valid() {
+        // `health.port` is enough on its own: the probe has a port (#701).
+        validate_app_toml("image = \"web:v1\"\n[app.web.health]\npath = \"/healthz\"\nport = 8081")
+            .unwrap();
+    }
+
+    #[test]
+    fn health_without_any_port_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\n[app.web.health]\npath = \"/healthz\"",
+            "health",
+        );
+    }
+
+    #[test]
+    fn zero_health_timeout_is_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        for field in [
+            "timeout",
+            "interval",
+            "threshold_unhealthy",
+            "threshold_healthy",
+        ] {
+            assert_app_refused(&format!("{health}\n{field} = 0"), field);
+        }
+    }
+
+    #[test]
+    fn health_timeout_not_below_interval_is_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        assert_app_refused(&format!("{health}\ninterval = 5\ntimeout = 5"), "timeout");
+        // The default interval is 10 s, so a 10 s timeout alone is refused too.
+        assert_app_refused(&format!("{health}\ntimeout = 10"), "timeout");
+        validate_app_toml(&format!("{health}\ninterval = 5\ntimeout = 4")).unwrap();
+    }
+
+    #[test]
+    fn gpu_request_is_refused() {
+        // D41: no device passthrough or cluster accounting yet (#359).
+        let error = validate_app_toml("image = \"trainer:v1\"\ngpu = 1").unwrap_err();
+        assert!(error.to_string().contains("#359"), "{error}");
+        validate_app_toml("image = \"trainer:v1\"\ngpu = 0").unwrap();
+    }
+
+    #[test]
+    fn allow_franchise_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\n[app.web.egress]\nallow_franchise = [\"redis.prod-west\"]",
+            "allow_franchise",
+        );
+    }
 }

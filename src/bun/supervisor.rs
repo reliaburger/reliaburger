@@ -1794,7 +1794,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gpu_workload_runs_when_gpu_available() {
+    async fn gpu_workload_refused_even_where_a_gpu_is_detected() {
+        // D41: without device passthrough a `gpu = 1` workload would start
+        // with no device, and two of them would share one card on paper.
+        // Validation refuses it first; this is the agent's second line.
         let mut sup = test_supervisor();
         sup.set_capabilities(PlatformCapabilities {
             gpu_count: 2,
@@ -1805,11 +1808,11 @@ mod tests {
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
-        let ids = sup
+        let err = sup
             .deploy_app("trainer", "default", &spec, Instant::now())
             .await
-            .expect("a GPU workload should run where a device exists");
-        assert_eq!(ids.len(), 1);
+            .unwrap_err();
+        assert!(err.to_string().contains("#359"), "{err}");
     }
 
     #[tokio::test]

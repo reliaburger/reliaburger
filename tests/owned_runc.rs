@@ -572,16 +572,9 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
         root.path(),
         "/bin/busybox cat /proc/self/cgroup > /work/cgroup; exec /bin/busybox sleep 60",
     );
-    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
-        &specification.process.args,
-        "default",
-        "cgroup-check",
-        None,
+    specification.linux.cgroups_path = Some(reliaburger::grill::oci::hierarchy_cgroup_path(
         &host_path,
-        None,
-    )
-    .linux
-    .cgroups_path;
+    ));
     runtime.create(&id, &specification).await.unwrap();
     install_fixture(root.path(), &id);
     // Model Bun's pre-start policy: the cgroup must be the same kernel object
@@ -671,32 +664,18 @@ async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
     let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
     let first_path =
         reliaburger::grill::cgroup::instance_cgroup_path("default", &app_name, &first_id).unwrap();
-    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
-        &specification.process.args,
-        "default",
-        &app_name,
-        None,
+    specification.linux.cgroups_path = Some(reliaburger::grill::oci::hierarchy_cgroup_path(
         first_path.to_str().unwrap(),
-        None,
-    )
-    .linux
-    .cgroups_path;
+    ));
     runtime.create(&first_id, &specification).await.unwrap();
     install_fixture(root.path(), &first_id);
     runtime.start(&first_id).await.unwrap();
     let successor_path =
         reliaburger::grill::cgroup::instance_cgroup_path("default", &app_name, &successor_id)
             .unwrap();
-    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
-        &specification.process.args,
-        "default",
-        &app_name,
-        None,
+    specification.linux.cgroups_path = Some(reliaburger::grill::oci::hierarchy_cgroup_path(
         successor_path.to_str().unwrap(),
-        None,
-    )
-    .linux
-    .cgroups_path;
+    ));
     runtime.create(&successor_id, &specification).await.unwrap();
     install_fixture(root.path(), &successor_id);
     let started = runtime.start(&successor_id).await;

@@ -941,22 +941,49 @@ mod tests {
     }
 
     #[test]
-    fn create_managed_volume_with_size_without_root() {
+    fn unenforceable_size_is_refused() {
         assert!(
             !super::is_root(),
-            "the rootless fallback test requires a non-root runner"
+            "the unenforced-size test requires a non-root runner"
         );
 
         let dir = tempfile::tempdir().unwrap();
         let vm = VolumeManager::new(dir.path());
 
-        // Without root (or on macOS), this creates a plain directory
-        // with a warning instead of a loop mount.
-        let path = vm
+        // Without root (or on macOS) only a plain directory is possible,
+        // which can't hold a size limit: refuse rather than warn (#701).
+        let error = vm
             .create_managed_volume("default", "redis", Path::new("/data"), Some("10Gi"))
+            .unwrap_err();
+        assert!(
+            matches!(error, VolumeError::SizeUnenforceable { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("10Gi"), "{error}");
+        assert!(
+            !dir.path().join("default/redis/data").exists(),
+            "a refused volume must not be provisioned"
+        );
+    }
+
+    #[test]
+    fn changing_size_of_existing_volume_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        vm.create_managed_volume("default", "redis", Path::new("/data"), None)
             .unwrap();
 
-        assert!(path.exists());
+        // Resizing is a separate feature; an existing volume keeps the
+        // size it was created with, so a changed `size` is refused (#701).
+        let error = vm
+            .create_managed_volume("default", "redis", Path::new("/data"), Some("10Gi"))
+            .unwrap_err();
+        assert!(matches!(error, VolumeError::SizeChanged { .. }), "{error:?}");
+        assert!(error.to_string().contains("/data"), "{error}");
+
+        // The size it was created with is still accepted.
+        vm.create_managed_volume("default", "redis", Path::new("/data"), None)
+            .unwrap();
     }
 
     fn mapped(container: u32) -> VolumeOwner {

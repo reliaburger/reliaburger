@@ -7850,6 +7850,245 @@
           ]
         }
       ]
+    },
+    {
+      "id": "issue-701",
+      "issue": 701,
+      "promise": "Every [app.*] field is honoured as written or refused with a reason; none is parsed and then silently dropped.",
+      "supported_paths": [
+        "An init container runs its own image (or the app's) with the app's env, decrypted secrets, and volume and config-file mounts.",
+        "Inline config files are per instance and keyed on the container path, and go with the instance.",
+        "health.port without an app port is probed at deploy and by the rollout gate.",
+        "Removing [autoscale] clears its override; narrowing its bounds clamps it."
+      ],
+      "refused_paths": [
+        "volumes, config_file, run_as_user and run_as_group on exec or script apps.",
+        "A health check with no port, a zero interval, timeout or threshold, or a timeout not below the interval.",
+        "gpu above 0 and egress.allow_franchise.",
+        "A volume size the node cannot enforce, or a changed size on an existing volume."
+      ],
+      "boundaries": [
+        "Running an init container's own image needs the provisioned Linux root gate; portable cases check the generated spec and the agent's wiring.",
+        "Volume size is refused on the node at deploy, not at apply."
+      ],
+      "cases": [
+        {
+          "id": "issue-701-runc_init_container_runs_its_own_image_with_app_env",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_init_container_runs_its_own_image_with_app_env",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_spec_uses_its_own_image",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::init_spec_uses_its_own_image",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_spec_gets_app_env_and_volume_mounts",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::init_spec_gets_app_env_and_volume_mounts",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_container_runs_its_own_image_with_the_app_env_and_mounts",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::init_container_runs_its_own_image_with_the_app_env_and_mounts",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/deploy_worker.rs"
+          ]
+        },
+        {
+          "id": "issue-701-inline_config_files_with_same_basename_do_not_collide",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::inline_config_files_with_same_basename_do_not_collide",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-stop_removes_each_instances_inline_config_files",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::stop_removes_each_instances_inline_config_files",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/retirement.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_volume_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_volume_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_config_file_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_config_file_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_run_as_user_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_run_as_user_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-removing_autoscale_clears_the_override",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::removing_autoscale_clears_the_override",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-701-narrowing_autoscale_bounds_clamps_the_override",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::narrowing_autoscale_bounds_clamps_the_override",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-701-health_port_without_app_port_is_valid",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::health_port_without_app_port_is_valid",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-zero_health_timeout_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::zero_health_timeout_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-rollout_gate_probes_health_port_without_app_port",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::rollout_gate_probes_health_port_without_app_port",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/health_checks.rs"
+          ]
+        },
+        {
+          "id": "issue-701-changing_size_of_existing_volume_is_refused",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::changing_size_of_existing_volume_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-701-unenforceable_size_is_refused",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::unenforceable_size_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-701-gpu_request_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::gpu_request_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-allow_franchise_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::allow_franchise_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        }
+      ]
     }
   ]
 }

@@ -8299,6 +8299,169 @@ async fn failing_init_container_reports_the_runtimes_stderr() {
     );
 }
 
+/// #701: an init container runs its own image, with the app's env and the
+/// app's volume and config-file mounts. It used to run in the app's image
+/// with no env and only the standard mounts, so a migration couldn't see
+/// `DATABASE_URL` and a config generator couldn't write a volume.
+#[tokio::test]
+async fn init_container_runs_its_own_image_with_the_app_env_and_mounts() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let own = InstanceId("default__web-0__init-0".to_string());
+    let inherited = InstanceId("default__web-0__init-1".to_string());
+    for init in [&own, &inherited] {
+        grill.set_state(init, ContainerState::Stopped);
+        grill.set_exit_code(init, Some(0));
+    }
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let config = Config::parse(
+        r#"
+            [app.web]
+            image = "myapp:v1"
+            env = { DATABASE_URL = "postgres://db/app" }
+
+            [[app.web.volumes]]
+            path = "/data"
+
+            [[app.web.config_file]]
+            path = "/etc/web/app.conf"
+            content = "key = value"
+
+            [[app.web.init]]
+            image = "migrate:v2"
+            command = ["migrate"]
+
+            [[app.web.init]]
+            command = ["echo", "inherits the app image"]
+        "#,
+    )
+    .unwrap();
+    let events = send_deploy(&tx, config).await;
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    expect_complete(&events);
+
+    let own = grill.created_spec(&own).expect("the first init was created");
+    assert_eq!(own.root.path, "migrate:v2");
+    assert_eq!(own.process.args, vec!["migrate".to_string()]);
+    assert!(
+        own.process
+            .env
+            .contains(&"DATABASE_URL=postgres://db/app".to_string()),
+        "{:?}",
+        own.process.env
+    );
+    for destination in ["/data", "/etc/web/app.conf"] {
+        assert!(
+            own.mounts
+                .iter()
+                .any(|m| m.destination == std::path::Path::new(destination)),
+            "init is missing {destination}: {:?}",
+            own.mounts
+        );
+    }
+    let inherited = grill
+        .created_spec(&inherited)
+        .expect("the second init was created");
+    assert_eq!(inherited.root.path, "myapp:v1");
+}
+
+/// #701: each instance reads its own copy of an inline config file, and the
+/// copy goes when the instance does.
+#[tokio::test]
+async fn stop_removes_each_instances_inline_config_files() {
+    let (mut agent, tx, shutdown) = test_agent();
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let config = Config::parse(
+        r#"
+            [app.web]
+            image = "myapp:v1"
+            replicas = 2
+
+            [[app.web.config_file]]
+            path = "/etc/web/app.conf"
+            content = "key = value"
+        "#,
+    )
+    .unwrap();
+    expect_complete(&send_deploy(&tx, config).await);
+    for instance in ["default__web-0", "default__web-1"] {
+        let dir =
+            crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1, "{instance} has its own copy");
+    }
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AgentCommand::Stop {
+        app_name: "web".to_string(),
+        namespace: "default".to_string(),
+        response: resp_tx,
+    })
+    .await
+    .unwrap();
+    resp_rx.await.unwrap().unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    for instance in ["default__web-0", "default__web-1"] {
+        let dir =
+            crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        assert!(!dir.exists(), "{} survived the stop", dir.display());
+    }
+}
+
+/// #701: `health.port` defaults the probe's port, not the app's `port`.
+/// The rollout gate used to skip the probe when the app had no `port`, so
+/// a failing replacement was announced healthy.
+#[tokio::test]
+async fn rollout_gate_probes_health_port_without_app_port() {
+    let port = spawn_health_responder(500).await;
+    let (mut agent, tx, shutdown, _grill) = test_agent_with_grill();
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let v1 = Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+    expect_complete(&send_deploy(&tx, v1).await);
+    let v2 = Config::parse(&format!(
+        r#"
+            [app.web]
+            image = "myapp:v2"
+
+            [app.web.health]
+            path = "/healthz"
+            port = {port}
+
+            [app.web.deploy]
+            strategy = "rolling"
+            health_timeout = "1s"
+        "#
+    ))
+    .unwrap();
+    let events = send_deploy(&tx, v2).await;
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    let error = events
+        .iter()
+        .find_map(|e| match e {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the gate must probe health.port and refuse the failing replacement");
+    assert!(error.contains("failed its health check"), "{error}");
+}
+
 #[test]
 fn tail_lines_empty_string() {
     assert_eq!(super::tail_lines("", 5), "");
