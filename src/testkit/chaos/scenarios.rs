@@ -10,6 +10,7 @@ use crate::relish::client::BunClient;
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType};
 use crate::testkit::TestContext;
 use crate::testkit::context::{PINNED_TEST_WORKLOAD_IMAGE, container_http_script};
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::{CleanupOutcome, TestGroup};
 
@@ -580,6 +581,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(leader_failure_elects_new_leader_and_cluster_recovers),
         },
         TestCase {
@@ -591,6 +593,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(dead_worker_node_has_workloads_rescheduled),
         },
         TestCase {
@@ -602,6 +605,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(minority_partition_degrades_and_heals),
         },
         TestCase {
@@ -613,6 +617,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodePressure,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(resource_exhaustion_degrades_gracefully),
         },
         TestCase {
@@ -624,6 +629,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::ContainerRuntime,
                 Capability::NodeKill,
             ],
+            lease: LeaseScope::Applications,
             run: crate::testkit_case!(node_death_during_deploy_ends_clean),
         },
     ]
