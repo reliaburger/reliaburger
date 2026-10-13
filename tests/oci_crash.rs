@@ -573,14 +573,34 @@ command = ["/bin/busybox", "sh", "-c", "printf 'second\\n' >> /work/second"]
     config
 }
 
+/// How long a fixture waits for a workload to write its marker.
+///
+/// A first deploy here starts two init containers and the main one, and
+/// gives each its own network: about forty privileged commands, each run by
+/// a freshly spawned process owner. In the Lima VM that took about 9 s, but
+/// 41 to 58 s while the host was saturated, so the old 25 s often failed
+/// the clustered test on its first deploy (#908). This only bounds
+/// how long a broken deploy takes to report.
+const FIXTURE_WAIT: Duration = Duration::from_secs(90);
+
 async fn wait_file(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(25), async {
+    tokio::time::timeout(FIXTURE_WAIT, async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("fixture never reached {}", path.display()));
+    .unwrap_or_else(|_| {
+        // The Bun log of the test root the file lives in says why the
+        // workload never got there; without it the failure is a bare path.
+        let log = path
+            .ancestors()
+            .map(|directory| directory.join("bun.log"))
+            .find(|log| log.exists())
+            .and_then(|log| std::fs::read_to_string(log).ok())
+            .unwrap_or_default();
+        panic!("fixture never reached {}\nbun.log:\n{log}", path.display())
+    });
 }
 
 /// An app name unique to this test root.
