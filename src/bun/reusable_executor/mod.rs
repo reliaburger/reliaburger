@@ -44,6 +44,11 @@ pub(crate) struct ExecutorProfile {
 pub(crate) enum ExecutorError {
     #[error("executor refused: {0}")]
     Configuration(&'static str),
+    /// The executor or its slot isn't usable right now: an old executor
+    /// hasn't retired, or the helper's state is missing. Not the job's fault.
+    #[cfg(any(target_os = "linux", test))]
+    #[error("executor unavailable: {0}")]
+    Unavailable(&'static str),
     #[cfg(any(target_os = "linux", test))]
     #[error("cannot encode executor configuration: {0}")]
     Encoding(#[from] serde_json::Error),
@@ -65,8 +70,37 @@ impl ExecutorError {
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Configuration(_) | Self::Encoding(_) => false,
-            Self::Io(_) | Self::Runtime(_) | Self::Protocol(_) => true,
+            Self::Runtime(error) => !error.refuses_spec(),
+            Self::Io(_) | Self::Unavailable(_) | Self::Protocol(_) => true,
         }
+    }
+}
+
+/// How an attempt ends when the helper couldn't spawn the command, from the
+/// `errno` it reported. An executable that is missing, not executable or
+/// malformed is the job's spec, so the task is refused. Anything else (no
+/// memory, no processes left, too many open files) is the host, and the
+/// command never ran, so it's a launch failure the task pool retries (#889).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn helper_spawn_outcome(errno: u32) -> crate::bun::task_executor::AttemptOutcome {
+    use crate::bun::task_executor::AttemptOutcome;
+    use nix::errno::Errno;
+    let code = i32::try_from(errno).unwrap_or(i32::MAX);
+    let reason = format!(
+        "atomic cgroup launch: {}",
+        std::io::Error::from_raw_os_error(code)
+    );
+    match Errno::from_raw(code) {
+        Errno::ENOENT
+        | Errno::ENOTDIR
+        | Errno::EACCES
+        | Errno::EPERM
+        | Errno::ENOEXEC
+        | Errno::E2BIG
+        | Errno::ELOOP
+        | Errno::ENAMETOOLONG
+        | Errno::EISDIR => AttemptOutcome::Refused { reason },
+        _ => AttemptOutcome::LaunchFailed { reason },
     }
 }
 
@@ -239,6 +273,51 @@ mod tests {
         assert!(!ExecutorError::Configuration("an image is required").is_transient());
         let encoding = serde_json::from_str::<u8>("x").unwrap_err();
         assert!(!ExecutorError::Encoding(encoding).is_transient());
+        // A slot whose old executor is still retiring is not the job's fault.
+        assert!(
+            ExecutorError::Unavailable("the slot's previous executor has not retired")
+                .is_transient()
+        );
+        // A registry failure while pulling is transient; an unusable image
+        // reference is the job's spec (#889).
+        let pull = |error| ExecutorError::Runtime(crate::grill::GrillError::ImagePull(error));
+        assert!(
+            pull(crate::grill::image::ImageError::ManifestPull {
+                image: "busybox".into(),
+                reason: "503 Service Unavailable".into(),
+            })
+            .is_transient()
+        );
+        assert!(
+            !pull(crate::grill::image::ImageError::InvalidReference(
+                "empty image reference".into()
+            ))
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn a_helper_that_cannot_exec_the_command_refuses_it_but_host_limits_retry() {
+        use crate::bun::task_executor::AttemptOutcome;
+        for errno in [nix::libc::ENOENT, nix::libc::EACCES, nix::libc::ENOEXEC] {
+            let outcome = helper_spawn_outcome(errno as u32);
+            assert!(
+                matches!(outcome, AttemptOutcome::Refused { .. }),
+                "{errno}: {outcome:?}"
+            );
+        }
+        for errno in [nix::libc::EAGAIN, nix::libc::ENOMEM, nix::libc::EMFILE] {
+            let outcome = helper_spawn_outcome(errno as u32);
+            assert!(
+                matches!(outcome, AttemptOutcome::LaunchFailed { .. }),
+                "{errno}: {outcome:?}"
+            );
+        }
+        let AttemptOutcome::Refused { reason } = helper_spawn_outcome(nix::libc::ENOENT as u32)
+        else {
+            unreachable!()
+        };
+        assert!(reason.starts_with("atomic cgroup launch: "), "{reason}");
     }
     #[test]
     fn host_commands_share_only_a_namespace_and_resource_profile() {

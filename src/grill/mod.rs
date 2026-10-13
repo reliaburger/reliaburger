@@ -249,6 +249,26 @@ pub enum GrillError {
     ImagePull(#[from] image::ImageError),
 }
 
+impl GrillError {
+    /// Whether this error says the workload's spec can't run as written,
+    /// so another launch would fail the same way: an image reference that
+    /// doesn't parse, or an image whose digest-verified config is invalid.
+    ///
+    /// Every other error is the runtime, the host or a registry failing
+    /// (a pull, a runc call, disk, network setup), which a later attempt
+    /// may get past. When it isn't clear which, the answer is `false`: a
+    /// launch that never ran its command is safe to retry, and the retry
+    /// is bounded by the job's `max_attempts` (#889).
+    pub fn refuses_spec(&self) -> bool {
+        matches!(
+            self,
+            Self::ImagePull(
+                image::ImageError::InvalidReference(_) | image::ImageError::InvalidConfig { .. }
+            )
+        )
+    }
+}
+
 /// Non-secret identity of one original runtime execution generation.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String")]
@@ -1093,6 +1113,57 @@ async fn which_exists(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_unusable_image_spec_refuses_a_launch() {
+        use super::image::ImageError;
+        let instance = InstanceId("default__job-0".into());
+        let refusals = [
+            GrillError::ImagePull(ImageError::InvalidReference("no tag".into())),
+            GrillError::ImagePull(ImageError::InvalidConfig {
+                digest: "sha256:00".into(),
+                reason: "not JSON".into(),
+            }),
+        ];
+        for error in &refusals {
+            assert!(error.refuses_spec(), "{error}");
+        }
+        let transient = [
+            GrillError::ImagePull(ImageError::ManifestPull {
+                image: "busybox".into(),
+                reason: "registry leader refused proposal: 503 Service Unavailable".into(),
+            }),
+            GrillError::ImagePull(ImageError::LayerPull {
+                digest: "sha256:00".into(),
+                reason: "connection reset".into(),
+            }),
+            GrillError::ImagePull(ImageError::DigestMismatch {
+                digest: "sha256:00".into(),
+                expected: "a".into(),
+                actual: "b".into(),
+            }),
+            GrillError::ImagePull(ImageError::UnpackFailed {
+                digest: "sha256:00".into(),
+                reason: "No space left on device".into(),
+            }),
+            GrillError::ImagePull(ImageError::Io(std::io::Error::other("disk"))),
+            GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "runc create: exit status 1".into(),
+            },
+            GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "runtime command did not finish within 5s".into(),
+            },
+            GrillError::InventoryUnavailable {
+                reason: "journal unreadable".into(),
+            },
+            GrillError::NotFound { instance },
+        ];
+        for error in &transient {
+            assert!(!error.refuses_spec(), "{error}");
+        }
+    }
+
     #[test]
     fn runtime_generation_wire_values_require_canonical_fingerprints() {
         let original = RuntimeGeneration::process("private-generation");

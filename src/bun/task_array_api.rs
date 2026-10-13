@@ -1708,6 +1708,7 @@ mod tests {
         let causes = crate::meat::task_array_state::RetryCauses {
             exit_code: 1,
             signal: 2,
+            launch: 1,
             ..Default::default()
         };
         state
@@ -1720,7 +1721,7 @@ mod tests {
                     failed_count: 0,
                     failed_indices: IndexRangeSet::new(),
                     not_run: 0,
-                    retried: 3,
+                    retried: 4,
                     retry_causes: causes,
                     duration_counts: [0; 16],
                 },
@@ -1736,10 +1737,10 @@ mod tests {
             unrunnable: None,
         };
         let summary = array_summary(9, &record, &[]);
-        assert_eq!(summary["retried"], 3);
+        assert_eq!(summary["retried"], 4);
         assert_eq!(
             summary["retry_causes"],
-            serde_json::json!({"exit_code":1,"signal":2,"timeout":0,"unknown":0,"unrecorded":0})
+            serde_json::json!({"exit_code":1,"signal":2,"timeout":0,"unknown":0,"launch":1,"unrecorded":0})
         );
     }
 }

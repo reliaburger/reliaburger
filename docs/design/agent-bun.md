@@ -1555,11 +1555,23 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **What happens:** A cold reusable executor (shared-runc or native host) fails while starting, before its helper connects: a runtime command misses its five-second bound on a loaded host, an I/O call fails, or the helper never connects. The job's command hasn't been sent anywhere yet.
 
-**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O and helper failures from refusals about the job itself.
+**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O, helper and slot-availability (`Unavailable`) failures from refusals about the job itself. A runtime error is a refusal only when `GrillError::refuses_spec` says so (see §7.10).
 
-**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second failure, or any refusal, fails the attempt with the runtime's reason as `SpawnFailed`.
+**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second transient failure ends the attempt as `LaunchFailed`, which the task pool retries within `max_attempts` (§7.10); a refusal ends it as `Refused`. Either way the reason is the attempt's output.
 
 **Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
+
+---
+
+### 7.10 Task Attempt Fails to Launch
+
+**What happens:** A task attempt fails before its command is authorised to run: an image pull fails (a registry answering 503 during a Pickle leader change, a rate limit, a reset connection), a runc call or network setup fails, the disk fills while unpacking or preparing capture, or a reusable slot's previous executor hasn't retired. The command never ran. Or the spec can't run here at all: an image reference that doesn't parse, an image whose config is invalid, a missing or unusable executable, a runtime or network policy the node can't provide, revoked namespace credentials.
+
+**Detection:** The fresh path classifies its typed launch error (`LaunchError::outcome` in `src/bun/task_runtime.rs`); the reusable pools use `ExecutorError::is_transient`, and `helper_spawn_outcome` for the helper's `exec` errno. `GrillError::refuses_spec` is the one place that decides a runtime error is the spec's fault: `ImagePull` with `InvalidReference` or `InvalidConfig`. Errors that could be either (runc, disk, network setup) count as transient, because the command provably didn't run and the retry is bounded.
+
+**Impact:** A transient failure is `AttemptOutcome::LaunchFailed`: the task pool retries it with the ordinary backoff, under cancellation, counted against `max_attempts` and as a `launch` retry cause. A singleton without `replay_unknown` retries it too, since nothing ran. A permanent one is `AttemptOutcome::Refused` and fails the task at once. The reason is the attempt's output, kept for a failed task, and Bun logs `batch B task I attempt A/M: …` on stderr, at most 20 lines per run per minute plus a count of the rest (#889).
+
+**Recovery:** Automatic for transient failures, within the attempt budget. A refusal needs the spec fixed and the job resubmitted.
 
 ---
 

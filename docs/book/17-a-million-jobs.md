@@ -1634,6 +1634,8 @@ dozens of cold executors read manifests from `public.ecr.aws` at once. Its
 anonymous rate limit answered `TOOMANYREQUESTS`. The registry client retried
 that four times with backoff, which is the 7.8 seconds, and then gave up. An
 image that can't be pulled is a `SpawnFailed`, so the task failed for good.
+(Until #889, that is: "A task that failed before it ran", below, splits that
+outcome in two.)
 
 The test now refuses to start without the mirror and says why. The real bug
 was that nobody could see any of this. The pool's `SpawnFailed` carried its
@@ -2347,19 +2349,21 @@ pub struct RetryCauses {
     pub signal: u64,
     pub timeout: u64,
     pub unknown: u64,
+    pub launch: u64,
     pub unrecorded: u64,
 }
 
 impl RetryCauses {
     pub fn total(&self) -> Option<u64> {
-        [self.signal, self.timeout, self.unknown, self.unrecorded]
+        [self.signal, self.timeout, self.unknown, self.launch, self.unrecorded]
             .into_iter()
             .try_fold(self.exit_code, u64::checked_add)
     }
 }
 ```
 
-Five numbers per chunk, never a row per task. `try_fold` walks the array with
+Six numbers per chunk, never a row per task (`launch` came later, for the
+failure in the next section). `try_fold` walks the array with
 an accumulator and stops at the first `None`, and `u64::checked_add` returns
 `None` on overflow, so `total()` can't wrap around to a small number the way
 an unsigned `a + b` does in C (and in a Rust release build, where overflow
@@ -2399,6 +2403,147 @@ same scenario and fails on a drop beyond `--tolerance`. A different window or
 concurrency makes the verdict informational, because comparing unlike runs is
 how the misleading numbers above happened. The five-round rerun's forty reports
 are committed as the first baselines.
+
+### A task that failed before it ran
+
+Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of
+hundreds, on its *first* attempt. The run allowed three, and it retried none.
+Node 2 was powered off at the time and node 3 was logging pull-through cache
+fallbacks: `registry leader refused proposal: 503 Service Unavailable`. And
+that was all we had. Bun didn't log a failed attempt's reason, the harness
+didn't fetch it, and the run's details expired after an hour (#889).
+
+The code told us more than the logs. In `TaskAttempts::run`, every outcome
+except one went back round the retry loop. That one was `SpawnFailed`, whose
+doc comment said "The process couldn't be started. Retrying can't fix that."
+That's true of a binary that doesn't exist. But the fresh-runc path turned
+*every* error before the command was authorised to start into `SpawnFailed`:
+the namespace policy lease, `runtime.create` (which pulls the image), egress
+enforcement, address publication and capture reset. An image pull that hit a
+registry mid-election cost the task all of its attempts. It's the same mistake
+the reusable pool had made with a slow `runc state` call, earlier in this
+chapter, one layer up.
+
+The maintainer's rule was short. An attempt whose launch fails on an image pull
+or a registry error is transient, and retries against `max_attempts` like any
+other failed attempt. A spec that is invalid or unsupported is permanent, and
+fails at once. Either way Bun logs the error, and the task keeps it.
+
+So `SpawnFailed` is gone, and the one outcome became two:
+
+```rust
+pub enum AttemptOutcome {
+    // ...
+    /// The attempt was refused before its command ran, because the job's
+    /// spec is invalid or unsupported here.
+    Refused { reason: String },
+    /// The runtime, the host or a registry failed before the command ran.
+    LaunchFailed { reason: String },
+    // ...
+}
+```
+
+`is_retryable` lists `LaunchFailed` beside exits, signals, timeouts and unknown
+outcomes, and leaves `Refused` out. Because it's a new enum variant, every
+`match` on `AttemptOutcome` stopped compiling until it said what to do with it.
+The retry-cause counter was one of them, which is how `RetryCauses` grew its
+`launch` field. In C, a `switch` with a forgotten `case` compiles happily, and
+here the gap would have been quiet: the chunk summary files any retry it can't
+explain under "not recorded across a restart", so a registry outage would have
+looked like a node restart.
+
+The harder question is which errors are which. We didn't want to match on
+error strings, so the classification lives on the types. `GrillError`, the
+runtime's error, answers one question:
+
+```rust
+pub fn refuses_spec(&self) -> bool {
+    matches!(
+        self,
+        Self::ImagePull(
+            image::ImageError::InvalidReference(_) | image::ImageError::InvalidConfig { .. }
+        )
+    )
+}
+```
+
+The `|` inside a pattern means "either of these", and `{ .. }` matches a struct
+variant whatever its fields hold. An image reference that doesn't parse, or an
+image whose digest-verified config isn't valid, will fail the same way every
+time. Everything else (a manifest or layer pull, a digest mismatch, a full
+disk while unpacking, a runc call, network setup) is the runtime or the host,
+and a later attempt may get past it.
+
+What about errors that could be either? A runc failure might be a bug in the
+spec or a busy host. A full disk might clear in a minute. We picked "retry"
+as the default, for two reasons. Every one of these errors happens before the
+command is authorised to start, so a retry can't run the user's command twice.
+And the retry is bounded: the existing backoff, cancellation and
+`max_attempts` all apply, so a fault that persists costs at most two more
+launches of a three-attempt task. Failing a task for good on a transient fault
+loses the work. Retrying a doomed one costs a few hundred milliseconds.
+
+The fresh path's launch block had one error type, `GrillError`, and one refusal
+that isn't a runtime error at all: a job whose namespace credentials were
+revoked while it waited. A small private enum gives it a home:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+enum LaunchError {
+    #[error(transparent)]
+    Runtime(#[from] crate::grill::GrillError),
+    #[error("{0}")]
+    Refused(&'static str),
+}
+```
+
+`#[from]` makes `thiserror` write a `From<GrillError>` impl, so the `?` on
+`self.runtime.create(&id, &oci).await?` still works inside the block: `?`
+calls `From::from` on the error before returning it. `#[error(transparent)]`
+passes `Display` straight through to the wrapped error. One method,
+`LaunchError::outcome(authorised)`, then picks `Unknown` once the command was
+authorised (it may have run), `Refused` for a refusal or a spec the runtime
+won't accept, and `LaunchFailed` for the rest.
+
+The reusable pools already had `ExecutorError::is_transient` for their own
+cold-start retry. Two changes made it agree. A runtime error now asks
+`refuses_spec` instead of counting as transient wholesale, and a pull failure
+keeps its type instead of being flattened into a `Protocol` string. And a
+handful of errors that were filed as `Configuration`, "the job's fault", plainly
+weren't: "the slot's previous executor has not retired" is a slot racing its
+own retirement. They moved to a new `Unavailable` variant, which retries. When
+the helper can't `exec` the command it reports an `errno`, and
+`helper_spawn_outcome` refuses the task for the ones that mean the executable
+is missing or unusable (`ENOENT`, `EACCES`, `ENOEXEC` and friends) and retries
+the ones that mean the host is short of something (`EAGAIN`, `ENOMEM`,
+`EMFILE`).
+
+Then the cause. Every launch failure and refusal is now the attempt's output,
+so `relish batch logs` on a failed task says why, even when the command never
+ran. And Bun logs it:
+
+```
+batch 26 task 20 attempt 1/3: launch failed, will retry: image pull failed: ...
+```
+
+A million-task array whose image can't be pulled would write three million of
+those lines, so each array's pool logs at most twenty a minute and then
+counts. The next line it logs says how many it left out. The limiter's state
+sits behind a `std::sync::Mutex`, not tokio's: the critical section is a few
+integer updates in a synchronous call, and it's never held across an `.await`,
+which is the one thing that makes a blocking mutex dangerous in async code.
+
+The tests are unit tests for each layer: `refuses_spec` against every image
+error and a few runtime errors; the fresh path with a mock runtime whose
+`create` fails as a 503 pull (a launch failure, reason as output) and as an
+unparseable reference (a refusal); and the task pool, where a `FakeRunner`
+that always fails to launch is tried exactly `max_attempts` times, with every
+retry counted as `launch`, while a refusal runs once. Cancelling during the
+retry's backoff starts no further attempt, and a singleton without
+`replay_unknown` retries a launch failure at once, because unlike an unknown
+outcome there's nothing for an operator to decide. The portable suite runs the
+same through the API, Raft and the leader's chunk check:
+`a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once`.
 
 ## One budget, two schedulers
 
@@ -2687,6 +2832,13 @@ binding, then treated the `pending` instance with no PID as a running process
 missing one. The waiter now waits through non-running states but still fails
 at once if a known running process has no PID. We kept the cases separate, so
 fixing the test couldn't hide the real missing-PID bug it was written to catch.
+
+**"Couldn't start" isn't one thing.** A missing binary and a registry in the
+middle of an election both stop a command before it runs, and for a while we
+gave them the same name and the same fate. Ask whether the command could have
+run, then whether a second try could go differently. When you can't tell, and
+the command provably never ran, retry within the budget: that's cheap, and
+failing for good isn't.
 
 **Write the gate down before you run it.** Three documents had three
 different "million-task gates", so no run could have passed all of them. One
