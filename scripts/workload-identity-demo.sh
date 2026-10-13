@@ -37,8 +37,10 @@ echo "  4. Identity bundle + tmpfs delivery"
 echo "  5. Rotation state machine"
 echo ""
 
+# Build the test as `cargo test` will run it: a plain `cargo build` resolves
+# features without the dev-dependencies, so the run compiled everything again.
 cmd "building"
-cargo build --manifest-path "${REPO_DIR}/Cargo.toml" --quiet 2>&1
+cargo test --manifest-path "${REPO_DIR}/Cargo.toml" --test identity_demo --no-run --quiet 2>&1
 
 cmd "running identity demo"
 cargo test --manifest-path "${REPO_DIR}/Cargo.toml" \

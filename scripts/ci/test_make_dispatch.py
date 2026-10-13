@@ -29,7 +29,7 @@ NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
 WITH_TEST_IMAGES = python3 mirror.py run --cache "$(TEST_IMAGE_CACHE)" --listen 127.0.0.1:5099 --
 .PHONY: test-linux
 test-linux:
-\t$(CARGO) build --features ebpf --bin bun
+\t$(CARGO) test --no-run --features ebpf
 \tRELIABURGER_RUNC_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(test_storage) $(LINUX_EXCLUDE)'
 ''')
         self.tools = {}
