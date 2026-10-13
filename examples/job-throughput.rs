@@ -176,7 +176,7 @@ mod linux {
                     }],
                 };
                 loop {
-                    let progress = node.sync(&request).await.arrays.remove(0);
+                    let progress = node.sync(&request).await?.arrays.remove(0);
                     if let Some(reason) = progress.refused {
                         anyhow::bail!("worker refused: {reason}");
                     }

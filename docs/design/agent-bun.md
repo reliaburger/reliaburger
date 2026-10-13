@@ -1041,7 +1041,7 @@ before their Phase 15 cases can use this contract.
 
 1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler via the reporting tree).
 2. Transition state to `Pending`.
-3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.10). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
+3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.11). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
 4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000-60000) and marks it as in-use.
 5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a request, the request-derived soft controls `cpu.weight` and `memory.high` in the `linux.resources.unified` map (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
@@ -1561,7 +1561,17 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
 
-### 7.10 Registry Rate-Limits a Burst of Cold Starts
+### 7.10 Task-Array Sync on a Stuck Disk
+
+**What happens:** A worker's disk stops answering (a hung device, a dead network filesystem) while the leader's once-a-second task-array sync is reading or writing the worker's control fence, grant fences, ledgers or launch markers. Each of those calls runs on a tokio blocking thread, and a blocked `read` can't be interrupted, not even by a signal.
+
+**Detection:** The leader's per-tick deadline and its 3-second `NODE_SYNC_TIMEOUT`. It drops the call and marks the node failing.
+
+**Impact:** One blocking thread, not one per retry (#770). Dropping the HTTP request drops the worker's handler, but the stuck call keeps running and holds the worker's single sync claim (`SyncClaim` in `task_array_node.rs`, one `OwnedSemaphorePermit` shared by the sync and every blocking call it starts). While the claim is held, later syncs fail at once with `SyncBusy`, answered as `503 Service Unavailable`, without touching the disk. Before this, each sync the leader gave up on left one more thread blocked on the disk, until the blocking pool filled and stalled unrelated work in Bun. The leader counts a busy answer as a failed sync, exactly like a timeout, so the node stops counting towards a run's eligible nodes and its held chunks move elsewhere after the 30-second silence timeout. Chunks already running on the worker carry on as long as their own disk writes do.
+
+**Recovery:** Automatic. When the stuck call returns, the claim frees itself and the next sync runs normally.
+
+### 7.11 Registry Rate-Limits a Burst of Cold Starts
 
 **What happens:** Dozens of reusable executors cold-start together, and each one prepares its image twice: once in the pool, to resolve the command against the image config, and once in runc's create, to build the bundle. An anonymous registry such as `public.ecr.aws` answers `TOOMANYREQUESTS`.
 

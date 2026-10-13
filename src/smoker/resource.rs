@@ -2,8 +2,11 @@
 ///
 /// CPU stress, memory pressure, and disk I/O throttling use the same
 /// cgroup hierarchy that Bun already manages for container isolation.
-/// All functions in this module are Linux-only.
+/// The fault functions are Linux-only; restoring a workload's recorded
+/// limits is plain file I/O, so it builds (and is tested) everywhere.
 use std::path::Path;
+
+use crate::grill::oci::OciResources;
 
 /// Errors from resource fault injection.
 #[derive(Debug, thiserror::Error)]
@@ -268,9 +271,150 @@ pub fn restore_memory_high(_cgroup_path: &Path, _saved: &str) -> Result<(), Reso
     Err(ResourceFaultError::UnsupportedPlatform)
 }
 
+/// The `cpu.max` a workload's runtime gives it from its recorded resources:
+/// its CPU limit as a quota, or unlimited when it declares none.
+pub fn recorded_cpu_max(resources: Option<&OciResources>) -> String {
+    match resources.and_then(|resources| resources.cpu.as_ref()) {
+        Some(cpu) if cpu.quota > 0 => format!("{} {}", cpu.quota, cpu.period),
+        Some(cpu) => format!("max {}", cpu.period),
+        None => format!("max {CPU_PERIOD_US}"),
+    }
+}
+
+/// The `memory.high` a workload's runtime gives it from its recorded
+/// resources: its memory request, or unlimited when it declares none.
+pub fn recorded_memory_high(resources: Option<&OciResources>) -> String {
+    resources
+        .and_then(|resources| resources.unified.get("memory.high"))
+        .cloned()
+        .unwrap_or_else(|| "max".to_string())
+}
+
+/// Put a workload's cgroup back to the limits its recorded specification
+/// gives it, undoing any CPU, memory or disk-I/O fault an earlier Bun left.
+///
+/// Bun keeps a fault's saved values only in memory, so a Bun that crashes
+/// or upgrades mid-fault can't restore them. The recorded specification is
+/// the source of truth instead: `cpu.max` and `memory.high` are rewritten
+/// from it, and every `io.max` throttle is lifted, since Bun never sets one.
+/// A file the cgroup doesn't have (its controller isn't enabled) is skipped.
+pub fn restore_recorded_limits(
+    cgroup_path: &Path,
+    resources: Option<&OciResources>,
+) -> Result<(), ResourceFaultError> {
+    write_if_present(&cgroup_path.join("cpu.max"), &recorded_cpu_max(resources))?;
+    write_if_present(
+        &cgroup_path.join("memory.high"),
+        &recorded_memory_high(resources),
+    )?;
+    let io_max = cgroup_path.join("io.max");
+    let throttles = match std::fs::read_to_string(&io_max) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    // cgroup v2 takes one device per write.
+    for device in throttles
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        std::fs::write(
+            &io_max,
+            format!("{device} rbps=max wbps=max riops=max wiops=max"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Write `value` to an existing cgroup file; a missing file is left alone.
+fn write_if_present(path: &Path, value: &str) -> Result<(), ResourceFaultError> {
+    // Opening without `create` keeps a missing controller file missing
+    // instead of leaving a stray regular file behind.
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    std::io::Write::write_all(&mut file, value.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- restoring recorded limits (portable: plain files) --------------------
+
+    fn recorded_resources() -> OciResources {
+        OciResources {
+            cpu: Some(crate::grill::oci::OciCpuResources {
+                quota: 50_000,
+                period: 100_000,
+            }),
+            memory: Some(crate::grill::oci::OciMemoryResources {
+                limit: 128 * 1024 * 1024,
+            }),
+            unified: std::collections::BTreeMap::from([(
+                "memory.high".to_string(),
+                "33554432".to_string(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn restoring_recorded_limits_rewrites_cpu_max_and_memory_high() {
+        let dir = tempfile::tempdir().unwrap();
+        // What a CPU and a memory fault left behind.
+        std::fs::write(dir.path().join("cpu.max"), "1000 100000").unwrap();
+        std::fs::write(dir.path().join("memory.high"), "1024").unwrap();
+
+        restore_recorded_limits(dir.path(), Some(&recorded_resources())).unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(read("cpu.max"), "50000 100000");
+        assert_eq!(read("memory.high"), "33554432");
+    }
+
+    #[test]
+    fn a_workload_without_limits_is_restored_to_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cpu.max"), "1000 100000").unwrap();
+        std::fs::write(dir.path().join("memory.high"), "1024").unwrap();
+
+        restore_recorded_limits(dir.path(), None).unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(read("cpu.max"), "max 100000");
+        assert_eq!(read("memory.high"), "max");
+    }
+
+    #[test]
+    fn restoring_recorded_limits_lifts_the_io_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("io.max"),
+            "8:0 rbps=1048576 wbps=1048576 riops=max wiops=max\n",
+        )
+        .unwrap();
+
+        restore_recorded_limits(dir.path(), None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("io.max")).unwrap(),
+            "8:0 rbps=max wbps=max riops=max wiops=max"
+        );
+    }
+
+    #[test]
+    fn restoring_recorded_limits_skips_files_the_cgroup_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        restore_recorded_limits(dir.path(), Some(&recorded_resources())).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[cfg(not(target_os = "linux"))]
     #[test]

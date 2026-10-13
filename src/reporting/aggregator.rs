@@ -488,6 +488,7 @@ mod tests {
             timestamp: SystemTime::now(),
             running_apps: vec![],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
             job_reservations: Default::default(),

@@ -360,9 +360,12 @@ pub(super) async fn deploys_history_handler(
 /// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
 /// successful spec (X3).
 ///
-/// "Previous" means the last-but-one distinct successful deploy: the
-/// most recent completed entry is the *current* version, so rollback
-/// targets the one before it. Re-applies through the same path as
+/// On a cluster, "previous" is the newest spec in the council's rollout
+/// record (#692) that differs from the current one. Without one (a single
+/// node, or an app that never finished rolling out) it is the last-but-one
+/// distinct successful deploy in the nodes' histories: the most recent
+/// completed entry is the *current* version, so rollback targets the one
+/// before it. Re-applies through the same path as
 /// `apply` (Raft in cluster mode, local deploy otherwise). The recorded
 /// spec carries the digest it ran, so the rollback runs those bytes; only
 /// a record from before binding (a bare tag) is resolved again.
@@ -410,24 +413,38 @@ pub(super) async fn rollback_handler(
         return refusal;
     }
 
-    // Every node's records, not just this one's: the node asked may never
-    // have run the app. The spec in Raft is the current version.
-    let history: Vec<DeployHistoryEntry> = cluster_deploy_history(&state, &app, &namespace, false)
-        .await
-        .history
-        .into_iter()
-        .map(|tagged| tagged.row)
-        .collect();
-    let current = match &state.council {
-        Some(council) => council
-            .desired_state()
-            .await
-            .apps
-            .get(&crate::meat::AppId::new(&app, &namespace))
-            .cloned(),
-        None => None,
+    // On a cluster the council keeps the specs that rolled out everywhere
+    // (#692), which survive every node restarting. The spec in Raft is the
+    // current version.
+    let (current, released) = match &state.council {
+        Some(council) => {
+            let desired = council.desired_state().await;
+            let app_id = crate::meat::AppId::new(&app, &namespace);
+            let current = desired.apps.get(&app_id).cloned();
+            let released = current.as_ref().and_then(|current| {
+                desired.rollouts.get(&app_id).and_then(|rollouts| {
+                    crate::bun::cluster_view::released_rollback_target(rollouts, current)
+                })
+            });
+            (current, released)
+        }
+        None => (None, None),
     };
-    let target_spec = crate::bun::cluster_view::rollback_target(&history, current.as_ref());
+    let target_spec = match released {
+        Some(target) => Some(target),
+        None => {
+            // Every node's records, not just this one's: the node asked may
+            // never have run the app.
+            let history: Vec<DeployHistoryEntry> =
+                cluster_deploy_history(&state, &app, &namespace, false)
+                    .await
+                    .history
+                    .into_iter()
+                    .map(|tagged| tagged.row)
+                    .collect();
+            crate::bun::cluster_view::rollback_target(&history, current.as_ref())
+        }
+    };
 
     let Some(mut spec) = target_spec else {
         return (

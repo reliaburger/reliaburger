@@ -1724,7 +1724,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
     };
     let progress = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let progress = node.sync(&request).await.arrays.remove(0);
+            let progress = node.sync(&request).await.unwrap().arrays.remove(0);
             if !progress.finished.is_empty() {
                 break progress;
             }
@@ -1752,7 +1752,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
     })
     .await;
     assert_eq!(
-        node.sync(&request).await.arrays[0].slots,
+        node.sync(&request).await.unwrap().arrays[0].slots,
         0,
         "warm capacity must yield to a queued owner"
     );
@@ -2672,7 +2672,12 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
     // Wait until both executors are busy and the other callers are queued.
     let progress = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let progress = node.sync(&assignment(false)).await.arrays.remove(0);
+            let progress = node
+                .sync(&assignment(false))
+                .await
+                .unwrap()
+                .arrays
+                .remove(0);
             if progress.counters.active_commands == Some(2) && progress.counters.running > 2 {
                 break progress;
             }
@@ -2688,7 +2693,7 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
         progress.counters.running
     );
     tokio::time::timeout(Duration::from_secs(60), async {
-        while node.sync(&assignment(true)).await.arrays[0]
+        while node.sync(&assignment(true)).await.unwrap().arrays[0]
             .finished
             .is_empty()
         {
@@ -3023,7 +3028,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     let mut last = None;
     let found = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            last = Some(node.sync(&request(false)).await);
+            last = Some(node.sync(&request(false)).await.unwrap());
             let targets = telemetry.usage_targets();
             if targets.get(&labels).is_some_and(|(_, targets)| {
                 targets
@@ -3047,7 +3052,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     collector.refresh();
     telemetry.sample_usage(&collector, &mut cgroups, "node-a");
     tokio::time::sleep(Duration::from_secs(1)).await;
-    node.sync(&request(false)).await;
+    node.sync(&request(false)).await.unwrap();
     collector.refresh();
     let samples = telemetry.sample_usage(&collector, &mut cgroups, "node-a");
     let value = |name: &str| {
@@ -3064,7 +3069,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     assert!(usage.running >= 1, "{usage:?}");
 
     tokio::time::timeout(Duration::from_secs(60), async {
-        while node.sync(&request(true)).await.arrays[0]
+        while node.sync(&request(true)).await.unwrap().arrays[0]
             .finished
             .is_empty()
         {

@@ -1081,6 +1081,7 @@ fn volume_app(homes: &[&str]) -> crate::bun::diagnostics::DesiredAppEvidence {
         service_port: None,
         blocked: None,
         volume_home_away: None,
+        rollout_failed: None,
         volume_homes: homes.iter().map(ToString::to_string).collect(),
     }
 }

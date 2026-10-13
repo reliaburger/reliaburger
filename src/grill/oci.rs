@@ -184,6 +184,12 @@ impl OciLinux {
     /// Relative, root, non-canonical and legacy host-prefixed paths refuse:
     /// none gives Reliaburger an unambiguous workload identity.
     pub fn host_cgroup_path(&self) -> Option<PathBuf> {
+        self.cgroup_path_under(Path::new("/sys/fs/cgroup"))
+    }
+
+    /// [`Self::host_cgroup_path`] under a cgroup v2 mount other than
+    /// `/sys/fs/cgroup`, so tests can stand a directory in for it.
+    pub fn cgroup_path_under(&self, mount: &Path) -> Option<PathBuf> {
         let path = self.cgroups_path.as_deref()?;
         let relative = path.strip_prefix('/')?;
         if relative.is_empty()
@@ -194,7 +200,7 @@ impl OciLinux {
         {
             return None;
         }
-        Some(Path::new("/sys/fs/cgroup").join(relative))
+        Some(mount.join(relative))
     }
 }
 

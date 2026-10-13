@@ -48,7 +48,7 @@ on routable reads. Clients reach it in one of two envelopes:
 - **Bearer.** `Authorization: Bearer <token>`. `relish`, the build runner and peer
   replication use it. Accepted over TLS and plaintext.
 - **HTTP Basic.** `Authorization: Basic base64(<anything>:<token>)`, which is what
-  `docker login`/`docker push`, `crane`, `podman`, `skopeo` and `oras` send. The password
+  docker, podman, skopeo, crane and oras send. The password
   is the API token; the username is ignored. Accepted **only on a TLS connection**: the
   TLS listener tags each request, and a Basic header on an untagged (plaintext) request is
   refused with 401 even when the token is good. A Basic credential over TLS is rewritten
@@ -59,7 +59,28 @@ Every 401 from a TLS listener carries `WWW-Authenticate: Basic realm="reliaburge
 is what makes docker offer its stored credential. Plaintext 401s carry no challenge.
 Pickle does not implement the Docker token service (`WWW-Authenticate: Bearer realm=…`):
 every client above speaks Basic, and a token service would add a second credential type
-with nothing to gain over the API token it would be exchanged for.
+with nothing to gain over the API token it would be exchanged for. Every `/v2/` response
+also carries `Docker-Distribution-API-Version: registry/2.0`, as the distribution spec asks.
+A manifest is served with the `Content-Type` its own `mediaType` names (Docker schema 2 or
+OCI, image or index), because docker refuses a pull whose header and body disagree; one
+with no `mediaType` is served as an OCI index if it lists manifests, else an OCI manifest.
+
+**Tested clients.** `make test-standard-clients` (`tests/suite/registry_standard_clients.rs`,
+run by CI's acceptance job) drives docker, podman, skopeo and crane against a TLS listener
+on a non-loopback address, named `pickle-clients.test` by `scripts/standard-clients-host.sh`.
+docker treats `127.0.0.0/8` registries as insecure and would skip the certificate check.
+Each client trusts the cluster root the way users do (`/etc/docker/certs.d`,
+`/etc/containers/certs.d`, skopeo `--cert-dir`, crane `SSL_CERT_FILE`), logs in with a token,
+pushes a two-layer image and pulls every layer back. A request log on the router proves the
+pull fetched the layers. Each client is also refused for a wrong token, another cluster's
+CA, and a scoped token outside its namespace. skopeo's repository-to-repository copy
+exercises the declined cross-repository mount. oras and buildah are not tested. Versions
+are whatever the runner image ships; the gate logs them.
+
+**Write admission.** At most four write requests (`POST`, `PATCH`, `PUT`, `DELETE`) run at
+once. A fifth waits up to 60 seconds for a slot, with its body unread, and only then gets
+429 with `Retry-After: 1`. Refusing at once broke `docker push`: docker 29 with the
+containerd image store uploads every blob of an image in parallel and doesn't retry a 429.
 
 **Token scope.** A token created with `--apps` or `--namespaces` is also held to its
 scope, on every write (blob upload start, chunk and completion, manifest `PUT`, and the
@@ -107,7 +128,8 @@ What works where, in 0.1.0:
 Node certificates name the node (its node id), not an IP address or `localhost`, so a
 client that verifies hostnames (docker, crane) must reach the registry by the node's name
 and trust the cluster root CA. On the laptop quickstart that means an `/etc/hosts` entry
-for node 1's name pointing at `127.0.0.1` and the port forward on `15050`. A loopback-only
+for node 1's name and the port forward on `15050`. For docker on Linux that entry must be
+a non-loopback address of the machine, for the insecure-registry reason above. A loopback-only
 TLS listener answers anonymous `GET /v2/` with 200, so docker (which only offers
 credentials after a challenge on that probe) can't push to one; clustered listeners are
 routable, so this only affects hand-built configurations.
@@ -805,7 +827,7 @@ Pickle splits cleanup in two. **Expiry** decides that an *image* is gone and rem
 - an app or job in desired state pins it (`repo:tag@sha256:…`: app and init-container images, job definitions, task-array templates), directly or through a pinned multi-platform index;
 - it's a platform of a multi-platform index still in the catalogue.
 
-An accepted expiry removes the manifest and drops the holder records of every blob no other manifest references. That last step matters: the GC arbiter never approves deleting a blob's last advertised holder, so without it one copy of every expired blob would live forever. A standalone node applies the same rule to its own catalogue, counting the images its instances run as pinned. Persisted deploy history will also count as pinned once it's in Raft (#692).
+An accepted expiry removes the manifest and drops the holder records of every blob no other manifest references. That last step matters: the GC arbiter never approves deleting a blob's last advertised holder, so without it one copy of every expired blob would live forever. A standalone node applies the same rule to its own catalogue, counting the images its instances run as pinned. On a cluster the rollback targets in each app's rollout record (the last ten specs that rolled out everywhere, #692) count as pinned too, so `relish rollback` can always pull them.
 
 **GC (per node, two-phase).**
 
@@ -1457,7 +1479,7 @@ Traditional container registries (Docker Hub, GitHub Container Registry, Amazon 
 
 **Reference:** [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec)
 
-Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. `crane` is exercised end to end by `tests/suite/registry_standard_clients.rs`. Not implemented: manifest and blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API and the catalogue endpoint.
+Pickle implements the push and pull subset of the OCI Distribution Specification (blob `HEAD`/`GET`, monolithic and chunked uploads, manifest `HEAD`/`GET`/`PUT`, tag listing). Tools that speak it (docker, crane, buildah, podman, skopeo, oras) should work without modification, subject to the authentication rules in §1.2: Basic-auth clients need a TLS listener and an API token. docker, podman, skopeo and crane are exercised end to end with CA verification by `tests/suite/registry_standard_clients.rs` (§1.2, "Tested clients"); buildah and oras are not. Tag `DELETE` exists (§5.5). Not implemented: manifest `DELETE` by digest, blob `DELETE`, cross-repository mounts (a `mount` request falls back to an ordinary upload, as the spec allows), the referrers API and the catalogue endpoint.
 
 ---
 

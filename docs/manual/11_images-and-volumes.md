@@ -216,22 +216,32 @@ from outside the cluster, and that includes a build step trying to reach the
 node's API or registry. Add `--network=none` to `RUN` steps that don't need
 the network.
 
-## Pushing with docker or crane
+## Pushing with docker, podman, skopeo or crane
 
-Pickle speaks the standard registry API, so `docker push`, `crane` and other
-OCI clients work against a cluster whose nodes have mTLS identities (every
-`relish init` cluster and the quickstart). Log in with an API token of role
-`deployer` or above as the password; the username is ignored:
+Pickle speaks the standard registry API, so stock OCI clients push to and
+pull from a cluster whose nodes have mTLS identities (every `relish init`
+cluster and the quickstart). Log in with an API token of role `deployer` or
+above as the password; the username is ignored. A `read-only` token pulls.
 
 ```sh
 TOKEN="$(relish token create --name laptop-push --role deployer)"
-crane auth login NODE:5050 -u push -p "$TOKEN"
-crane push app.tar NODE:5050/api:v1
+docker login NODE:5050 -u push --password-stdin <<<"$TOKEN"
+docker push NODE:5050/api:v1
+docker pull NODE:5050/api:v1
 ```
 
-`docker login NODE:5050 -u push --password-stdin <<<"$TOKEN"` then
-`docker push NODE:5050/api:v1` works the same way. Apps refer to the image
-by its bare name, `api:v1`.
+podman takes the same `login`, `push` and `pull`. skopeo takes the token as
+`--creds push:"$TOKEN"` (or `--src-creds` and `--dest-creds` on a `copy`),
+and crane as `crane auth login NODE:5050 -u push -p "$TOKEN"`. Apps refer to
+the image by its bare name, `api:v1`.
+
+CI runs all four against a Pickle TLS listener:
+docker, podman and skopeo as the Ubuntu runner image ships them, and a pinned
+crane. Each one logs in with a token, verifies the cluster CA, pushes a
+two-layer image, pulls every layer back and checks the digests. Each is also
+refused with a wrong token, with another cluster's CA, and when a scoped token
+pushes outside its namespace. oras and buildah speak the same API but nothing
+tests them.
 
 A token made with `--apps` or `--namespaces` is held to repositories named
 `<namespace>/<app>`, for pushes and pulls alike: the first path segment is the
@@ -244,20 +254,40 @@ token pulls only its own namespaces' images (a loopback registry serves reads
 to anyone on the node, token or not), and `relish images` lists only those.
 Unscoped tokens push and pull anything, as before.
 
+### Trusting the cluster CA
+
 The registry serves the node's certificate, which names the node rather than
-its address, so `NODE` has to be the node's name (`relish status` lists them)
-and your machine has to resolve it and trust the cluster's root CA. For the
-quickstart: add `127.0.0.1 NODE-1-NAME` to `/etc/hosts`, use port `15050`, and
-trust `~/.reliaburger/clusters/NAME/security/identity/root-ca.crt` (for docker,
-copy it to `/etc/docker/certs.d/NODE-1-NAME:15050/ca.crt`; on macOS, add it to
-the keychain for crane).
+its address, so `NODE` has to be the node's name (`relish status` lists them),
+your machine has to resolve it, and the client has to trust the cluster's root
+CA: `~/.reliaburger/clusters/NAME/security/identity/root-ca.crt`. Put it where
+your client looks, under the registry's `host:port`:
+
+| Client | Where the CA goes |
+|---|---|
+| docker on Linux | `/etc/docker/certs.d/NODE:5050/ca.crt` |
+| Docker Desktop (macOS, Windows) | `~/.docker/certs.d/NODE:5050/ca.crt`, then restart Docker Desktop |
+| podman on Linux | `/etc/containers/certs.d/NODE:5050/ca.crt`, or `~/.config/containers/certs.d/NODE:5050/ca.crt` for rootless podman |
+| podman machine (macOS, Windows) | inside the VM: `podman machine ssh`, then the Linux path |
+| skopeo | any directory holding `ca.crt`, passed as `--cert-dir` (`--src-cert-dir` and `--dest-cert-dir` on a `copy`) |
+| crane | `SSL_CERT_FILE=root-ca.crt` on Linux; the system keychain on macOS, where Go ignores `SSL_CERT_FILE` |
+
+Only the Linux rows are tested. Docker Desktop and podman machine run their
+engine in a VM, so `NODE` must also resolve inside that VM, and to an address
+the VM can reach.
+
+Don't point `NODE` at `127.0.0.1` for docker on Linux. docker treats any
+registry on `127.0.0.0/8` as insecure: it skips the certificate check and
+falls back to plaintext, which Pickle refuses for a token. Use an address of
+the machine instead. For the quickstart, add `<this machine's LAN address>
+NODE-1-NAME` to `/etc/hosts` and use port `15050`.
 
 Pickle only takes these credentials over TLS. A plaintext registry, which is
 what a node without an identity serves, refuses them even with a good token,
 because the password is your API token. There, use `relish build`, or push
 anonymously to a standalone node's loopback registry before its first API
-token exists. Pickle has no Docker token service, and it doesn't support
-deleting images through the registry API.
+token exists. Pickle has no Docker token service. It removes images by tag
+(see [Deleting a tag](#deleting-a-tag)); it doesn't mount layers across
+repositories, so a client offering a mount gets an ordinary upload instead.
 
 ## Multi-platform images
 

@@ -204,6 +204,11 @@ pub enum RelishError {
     #[error("council recover failed: {0}")]
     Recovery(String),
 
+    /// A chaos scenario was invalid, or one of its steps was refused or
+    /// failed, so the command exits non-zero.
+    #[error("scenario: {0}")]
+    Scenario(String),
+
     /// `relish uninstall` refused or could not remove something.
     #[error("{0}")]
     Uninstall(#[from] uninstall::UninstallError),
