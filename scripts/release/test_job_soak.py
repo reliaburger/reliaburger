@@ -41,6 +41,9 @@ class Counters(unittest.TestCase):
         node={"node":"node-a","slots":2,"counters":{"running":2,"active_commands":3}}
         with self.assertRaises(jobs.InvalidEvidence):
             jobs.validate_summary(summary(4,nodes=[node],active_commands=3), concurrency=2)
+        # The node's own counters name where and by how much.
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"cap on node-a: 3 verified, 2 callers, cap 2"):
+            jobs.validate_summary(summary(4,nodes=[node]), concurrency=2)
 
 
 class FakeAPI:
@@ -261,8 +264,62 @@ class UnexpectedFailure(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             c=jobs.Campaign(folder,API(),[],"token")
             intent=c.prepare("process","short","work",100); intent.update(id=7,name="fixture")
-            self.assertFalse(c.step(101,stop=True))
+            # The run drains, so the campaign can stop, but the failure stays
+            # in the evidence and fails the final gate.
+            self.assertTrue(c.step(101,stop=True))
             self.assertTrue(any("unexpected terminal failure" in error for error in c.state["errors"]))
+            c.state["stopped"]=True; c.publish(102)
+            final=json.loads(Path(folder,"snapshot.json").read_text())
+            self.assertTrue(any("unexpected terminal failure" in problem for problem in jobs.coverage_failures(final)))
+
+    def test_a_failed_run_is_reported_once_with_its_cause_and_still_drains(self):
+        # V02 candidate 3: run 26 failed one task at about 05:01 and every
+        # later poll raised again, so the run never left the campaign, the
+        # final drain ran out of time and the controller's heartbeat went stale.
+        class API(FakeAPI):
+            cancelled=set()
+            def request(self,method,path,body=None,raw=False):
+                if path=="/v1/jobs/runs": return super().request(method,path,body)
+                identity=int(path.split("/")[3])
+                if path.endswith("/cancel"): self.cancelled.add(identity); return {}
+                if identity!=7:
+                    # The campaign's other runs: clean, and drained once cancelled.
+                    request=next(v for v in self.posts if self.runs[(v["name"],v["request_id"])]==identity)
+                    template=request["definition"]["template"]; total=request["definition"]["tasks"]["count"]
+                    drained=dict(done=True,queued=0,not_run=total) if identity in self.cancelled else {}
+                    return summary(identity,total=total,name=request["name"],**drained,
+                                   runtime=template["runtime"],cpu_request_millicores=25,memory_request_bytes=int(template["memory"][:-2])<<20)
+                if "/results" in path:
+                    self.results=path
+                    return dict(batch_id=7,rows=[dict(index=5,attempts=1,succeeded=False,run_ms=3)],truncated=False,unreachable=[])
+                if path.endswith("/tasks/5/logs"):
+                    assert raw; return "cannot pull image: registry leader refused proposal\nsecond line\n"
+                failed=dict(failed=1,queued=6,succeeded=1)
+                if 7 in self.cancelled: failed=dict(failed=1,not_run=6,succeeded=1,queued=0,done=True)
+                return summary(7,**failed,name="fixture",runtime="runc",cpu_request_millicores=25,memory_request_bytes=32<<20)
+        with tempfile.TemporaryDirectory() as folder:
+            api=API(); c=jobs.Campaign(folder,api,[],"token")
+            intent=c.prepare("runc","short","work",100); intent.update(id=7,name="fixture")
+            c.step(101); c.step(102)
+            self.assertEqual(api.results,"/v1/batch/7/results?failed=true&limit=1")
+            self.assertEqual(c.state["errors"],["runc short work (7): unexpected terminal failure in ordinary campaign work: "
+                                                "task 5 after 1 attempt(s), no exit code: cannot pull image: registry leader refused proposal"])
+            self.assertEqual(c.state["active"]["runc:short"]["previous"]["failed"],1)
+            self.assertTrue(c.step(103,stop=True))
+            self.assertNotIn("runc:short",c.state["active"])
+            self.assertEqual(len(c.state["errors"]),1)
+            self.assertFalse(c.state["coverage"]["runc"].get("reuse"))
+
+    def test_a_failure_whose_cause_cannot_be_read_is_still_reported(self):
+        class API(FakeAPI):
+            def request(self,method,path,body=None,raw=False):
+                if "/results" in path: raise jobs.Unavailable("no node answered")
+                return summary(7,failed=1,queued=7,name="fixture",runtime="runc",cpu_request_millicores=25,memory_request_bytes=32<<20)
+        with tempfile.TemporaryDirectory() as folder:
+            c=jobs.Campaign(folder,API(),[],"token")
+            intent=c.prepare("runc","short","work",100); intent.update(id=7,name="fixture")
+            c.step(101)
+            self.assertEqual(c.state["errors"],["runc short work (7): unexpected terminal failure in ordinary campaign work"])
 
 
 class TargetLoad(unittest.TestCase):

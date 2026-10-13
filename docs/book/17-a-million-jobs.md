@@ -2277,6 +2277,25 @@ job evidence, stale heartbeats, orphaned owners or incomplete drain fail the
 release verdict. Drain begins inside the last two minutes, with no new settle
 allowance.
 
+The first soak to get past setup with all of this switched on (0.2.0
+candidate 3) failed every heavy check, and the cluster had nothing to do with
+it. The harness stamps a snapshot's `meta.json` and only then asks the three
+guests for their inventories, so a proof stamped four seconds later looked
+like one from the future, and "stale" really meant "too fresh". Every
+recovery waits for a clean check, so most faults then "didn't settle" either.
+The snapshot now records when its collection ended, and a proof counts if it
+was taken between 90 seconds before the snapshot started and that moment, plus
+two seconds for two clocks rounding to whole seconds (#887).
+
+The same run found a second trap. One task failing in ordinary work raised
+the same error on every poll, so its run never left the controller. The final
+drain ran out of time and the controller's heartbeat went stale for the rest of
+the run, failing every check after it. Now the failure is reported once, with
+the failed task's attempts, exit code and first line of output, and the run
+stays in the campaign only until it drains (#888). That detail matters: a
+run's results expire after an hour, and by the time anyone looked, the cause
+of that one failure was gone (#889).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work
