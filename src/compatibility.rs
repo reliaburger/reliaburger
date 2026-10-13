@@ -100,6 +100,7 @@ pub struct Compatibility {
 /// `RolloutFailed` and `RolloutReleased` requests, `StateReport::rollouts`,
 /// `NodeAssignment::held`, `/v1/rollouts/failed` and the
 /// `ApplyEvent::RolloutAborted` stream event, #692).
+/// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

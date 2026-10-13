@@ -448,6 +448,7 @@ mod tests {
             under_replicated_layers: 1,
             lost_images: vec!["web:v1".into()],
             lost_image_count: 1,
+            needs_mtls: false,
         };
         evidence.set_registry(registry.clone()).await;
 

@@ -134,6 +134,11 @@ pub struct RegistryCapabilityEvidence {
     /// How many images are Lost, including any beyond the reported names.
     #[serde(default)]
     pub lost_image_count: usize,
+    /// Whether this node can't forward or replicate registry state because
+    /// the cluster runs plaintext transports: the leader's registry
+    /// endpoints accept only mTLS node certificates (#792).
+    #[serde(default)]
+    pub needs_mtls: bool,
 }
 
 /// Assemble a current capability snapshot from listener, membership and
@@ -175,6 +180,7 @@ pub fn registry_capability_evidence(
         under_replicated_layers,
         lost_images,
         lost_image_count,
+        needs_mtls: false,
     }
 }
 
