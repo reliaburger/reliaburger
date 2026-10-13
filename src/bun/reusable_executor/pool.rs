@@ -515,7 +515,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
-                return Err(ExecutorError::Configuration(
+                return Err(ExecutorError::Unavailable(
                     "old host executor has not retired",
                 ));
             }
@@ -697,7 +697,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
-                return Err(ExecutorError::Configuration(
+                return Err(ExecutorError::Unavailable(
                     "old executor ownership has not retired",
                 ));
             }
@@ -841,7 +841,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         let pid = peer
             .pid()
             .and_then(|pid| u32::try_from(pid).ok())
-            .ok_or(ExecutorError::Configuration("missing helper peer pid"))?;
+            .ok_or(ExecutorError::Unavailable("missing helper peer pid"))?;
         runtime.authenticate_executor(&context.id, pid).await?;
         let mut magic = [0; 8];
         connection.read_exact(&mut magic).await?;
@@ -872,16 +872,14 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     {
         let CommandReporting { sink, singletons } = reporting;
         // The command never ran, so the reason is the only output the task
-        // keeps: without it a failed task shows nothing at all (#786).
+        // keeps: without it a failed task shows nothing at all (#786). A
+        // refusal about the job fails the task; a runtime, host, registry or
+        // helper failure is a launch failure the task pool retries (#889).
         let failed = |error: ExecutorError| {
-            let reason = error.to_string();
-            let mut output = CapturedOutput::default();
-            output.push(reason.as_bytes());
-            output.push(b"\n");
-            Attempt {
-                outcome: AttemptOutcome::SpawnFailed { reason },
-                output,
-                ran: None,
+            if error.is_transient() {
+                Attempt::launch_failed(error.to_string())
+            } else {
+                Attempt::refused(error.to_string())
             }
         };
         let key = match ExecutorKey::new(&template) {
@@ -927,7 +925,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .is_some_and(|old| old.key != key || self.budget.has_waiters())
             && !checkout.retire_previous().await
         {
-            return failed(ExecutorError::Configuration(
+            return failed(ExecutorError::Unavailable(
                 "the slot's previous executor has not retired",
             ));
         }
@@ -990,7 +988,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     }),
                     pulled = pull => match pulled {
                         Ok(Ok(image)) => Ok(image),
-                        Ok(Err(error)) => Err(failed(ExecutorError::Protocol(error.to_string()))),
+                        Ok(Err(error)) => Err(failed(ExecutorError::Runtime(error.into()))),
                         Err(error) => Err(failed(ExecutorError::Protocol(error.to_string()))),
                     },
                 };
@@ -1094,7 +1092,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         drop(admission_timer.take());
         let Some(context) = checkout.context.as_mut() else {
             checkout.release().await;
-            return failed(ExecutorError::Configuration("missing executor context"));
+            return failed(ExecutorError::Unavailable("missing executor context"));
         };
         if let Some(refresh) = refresh {
             let refreshed = refresh().await.ok().filter(|template| {
@@ -1151,7 +1149,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             context
                 .sequence
                 .checked_add(1)
-                .ok_or(ExecutorError::Configuration("executor sequence exhausted"))
+                .ok_or(ExecutorError::Unavailable("executor sequence exhausted"))
         })
         .and_then(|sequence| protocol::command(sequence, &process).map(|bytes| (sequence, bytes)));
         let (sequence, mut bytes) = match preparation {
@@ -1170,7 +1168,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let socket = context
                 .connection
                 .as_mut()
-                .ok_or(ExecutorError::Configuration("executor connection missing"))?;
+                .ok_or(ExecutorError::Unavailable("executor connection missing"))?;
             #[cfg(feature = "ebpf")]
             if let Some(policy) = &self.policy {
                 policy
@@ -1247,12 +1245,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                             ));
                         }
                         wait_empty_task(&context.base.join("task")).await?;
-                        return Ok(AttemptOutcome::SpawnFailed {
-                            reason: format!(
-                                "atomic cgroup launch: {}",
-                                std::io::Error::from_raw_os_error(error as i32)
-                            ),
-                        });
+                        return Ok(super::helper_spawn_outcome(error));
                     }
                     _ => {
                         return Err(ExecutorError::Protocol(
@@ -2498,7 +2491,7 @@ mod tests {
                 },
             )
             .await;
-        let AttemptOutcome::SpawnFailed { reason } = &attempt.outcome else {
+        let AttemptOutcome::Refused { reason } = &attempt.outcome else {
             panic!("expected a spawn failure: {attempt:?}");
         };
         // The task's kept output is all an operator sees of a failed task.

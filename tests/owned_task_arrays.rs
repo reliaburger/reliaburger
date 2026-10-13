@@ -300,7 +300,8 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
     assert_eq!(ran.output.head, b"ran", "{ran:?}");
     assert_eq!(runtime.starts(), 2, "the failed start was not retried");
     // Every later start fails: a different profile replaces the warm
-    // executor, tries twice and gives up with the runtime's reason.
+    // executor, tries twice and gives up with the runtime's reason, as a
+    // launch failure the task pool may retry on a later attempt (#889).
     runtime.failures.store(usize::MAX, Ordering::SeqCst);
     let refused = runner
         .run(
@@ -310,10 +311,10 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
         )
         .await;
     match &refused.outcome {
-        AttemptOutcome::SpawnFailed { reason } => {
+        AttemptOutcome::LaunchFailed { reason } => {
             assert!(reason.contains("did not finish within 5s"), "{reason}")
         }
-        other => panic!("a start that keeps failing was not refused: {other:?}"),
+        other => panic!("a start that keeps failing was not a launch failure: {other:?}"),
     }
     assert_eq!(runtime.starts(), 4, "the retry was not bounded");
     // Nothing is held once the refused command returns.
@@ -1753,7 +1754,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .await
         .unwrap()
         .unwrap();
-    let AttemptOutcome::SpawnFailed { reason } = &result.outcome else {
+    let AttemptOutcome::Refused { reason } = &result.outcome else {
         panic!("queued command used a revoked decryption snapshot: {result:?}");
     };
     // The command never ran: its only output is the refusal (#786), never

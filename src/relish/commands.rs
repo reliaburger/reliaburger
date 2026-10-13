@@ -2792,6 +2792,7 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         ("signal", "signal"),
         ("timeout", "timeout"),
         ("unknown", "unknown outcome"),
+        ("launch", "launch failure"),
         ("unrecorded", "not recorded across a restart"),
     ]
     .into_iter()
@@ -4714,9 +4715,9 @@ mod task_array_tests {
         let summary = serde_json::json!({
             "kind": "array", "name": "render", "namespace": "default",
             "status": "Running", "total": 100000, "succeeded": 51200,
-            "failed": 5, "not_run": 0, "retried": 12, "queued": 40000,
+            "failed": 5, "not_run": 0, "retried": 15, "queued": 40000,
             "retry_causes": { "exit_code": 10, "signal": 2, "timeout": 0,
-                              "unknown": 0, "unrecorded": 0 },
+                              "unknown": 0, "launch": 3, "unrecorded": 0 },
             "held": 8800, "chunks": 98, "chunks_done": 50,
             "failed_indices": [[7, 7], [1000, 1002]],
             "nodes": [
@@ -4729,8 +4730,8 @@ mod task_array_tests {
         assert_eq!(
             format_array_summary(3, &summary),
             "task array 3 (render in default): Running\n\
-             \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 12 retries\n\
-             \x20 retry causes: 10 non-zero exit, 2 signal\n\
+             \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 15 retries\n\
+             \x20 retry causes: 10 non-zero exit, 2 signal, 3 launch failure\n\
              \x20 chunks: 50 of 98 done; 8800 tasks held by nodes, 40000 queued\n\
              \x20 failed indices: 7, 1000-1002 and 1 more (see relish batch results 3 --failed)\n\
              \x20 node-1: 8 slots, 8 running, 51200 succeeded, 5 failed\n\

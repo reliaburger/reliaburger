@@ -1,3 +1,7 @@
+/// Builds the image error an injected create failure returns. A function
+/// pointer, because `ImageError` can't be cloned for every call.
+pub type ImageErrorFactory = fn() -> super::image::ImageError;
+
 /// Shared mock Grill for tests.
 ///
 /// Records all calls to the `Grill` trait so tests can assert on
@@ -82,6 +86,8 @@ pub struct MockGrill {
     /// Make pid reads fail, as an owner that doesn't answer does.
     fail_pid: Arc<AtomicBool>,
     fail_create: Arc<AtomicBool>,
+    /// Make creation fail with this image error, as a pull does.
+    create_image_error: Arc<Mutex<Option<ImageErrorFactory>>>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
@@ -139,6 +145,7 @@ impl Default for MockGrill {
             instance_pid_delays: Arc::default(),
             fail_pid: Arc::default(),
             fail_create: Arc::default(),
+            create_image_error: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
@@ -208,6 +215,12 @@ impl MockGrill {
     /// Fail creation after recording the attempted runtime mutation.
     pub fn set_fail_create(&self, value: bool) {
         self.fail_create.store(value, Ordering::SeqCst);
+    }
+
+    /// Fail creation with the image error `error` builds, as a pull that
+    /// fails inside `create` does; `None` stops failing.
+    pub fn set_create_image_error(&self, error: Option<ImageErrorFactory>) {
+        *self.create_image_error.lock().unwrap() = error;
     }
 
     /// Fail start after recording the attempted runtime mutation.
@@ -592,6 +605,9 @@ impl super::Grill for MockGrill {
                 instance: instance.clone(),
                 reason: "injected create failure".into(),
             });
+        }
+        if let Some(error) = *self.create_image_error.lock().unwrap() {
+            return Err(GrillError::ImagePull(error()));
         }
         if let Some(path) = spec.linux.host_cgroup_path() {
             self.cgroup_paths
