@@ -1,8 +1,9 @@
 //! Volume management and size enforcement.
 //!
-//! On Linux, managed volumes with a `size` limit use a loop-mounted ext4
-//! filesystem that enforces ENOSPC at the kernel level. On macOS and other
-//! platforms, size limits are soft-enforced with periodic checks and warnings.
+//! On Linux, managed volumes with a `size` limit use a Btrfs quota or a
+//! loop-mounted ext4 filesystem that enforces ENOSPC at the kernel level. A
+//! node that can do neither (rootless, macOS) refuses a sized volume, and an
+//! existing volume's size can't change (#701).
 
 mod owned;
 
@@ -72,6 +73,26 @@ pub enum VolumeError {
     CreateFailed { path: String, reason: String },
     #[error("invalid size value: {0}")]
     InvalidSize(String),
+    /// The node can only make a plain directory, which can't hold a limit.
+    #[error(
+        "volume {path} asks for size {size}, but this node can't enforce a size limit \
+         (that needs {need}); remove `size` or run the volume on such a node"
+    )]
+    SizeUnenforceable {
+        path: String,
+        size: String,
+        need: &'static str,
+    },
+    /// The volume exists with another size; resizing isn't supported.
+    #[error(
+        "volume {path} already exists with size {existing}, so it can't take size {requested}; \
+         resizing an existing volume isn't supported"
+    )]
+    SizeChanged {
+        path: String,
+        existing: String,
+        requested: String,
+    },
     #[error("mount path {0:?} escapes the volumes directory")]
     PathTraversal(String),
     /// A snapshot restore of this volume was interrupted and hasn't been
@@ -162,25 +183,34 @@ impl VolumeManager {
             return Err(VolumeError::RestorePending(host_path.display().to_string()));
         }
 
-        if let Some(backend) = self.backend_of(&host_path) {
+        let size_bytes = size_limit
+            .map(|s| parse_byte_size(s).map_err(|e| VolumeError::InvalidSize(format!("{s}: {e}"))))
+            .transpose()?;
+
+        if let Some(sidecar) = read_sidecar(&host_path) {
+            let existing = recorded_size(&host_path, &sidecar);
+            if existing != size_bytes {
+                return Err(VolumeError::SizeChanged {
+                    path: mount_path.display().to_string(),
+                    existing: describe_size(existing),
+                    requested: size_limit.unwrap_or("none").to_string(),
+                });
+            }
             // A loop mount doesn't survive a reboot. Without this the app
             // would write into the bare mountpoint on the root filesystem,
             // unbounded, while its real data sat unmounted in the image.
-            if backend == super::btrfs::VolumeBackend::LoopMount {
+            if sidecar.backend == super::btrfs::VolumeBackend::LoopMount {
                 self.remount_loop(&host_path)?;
             }
             return Ok(host_path); // already provisioned
         }
-
-        let size_bytes = size_limit
-            .map(|s| parse_byte_size(s).map_err(|e| VolumeError::InvalidSize(format!("{s}: {e}"))))
-            .transpose()?;
 
         let backend = super::btrfs::select_backend(
             super::btrfs::is_btrfs(&self.volumes_dir),
             cfg!(target_os = "linux") && is_root(),
             size_bytes.is_some(),
         );
+        refuse_unenforced_size(backend, mount_path, size_limit)?;
 
         // Parents are always plain directories; only the leaf differs.
         if let Some(parent) = host_path.parent() {
@@ -205,25 +235,13 @@ impl VolumeManager {
             }
             super::btrfs::VolumeBackend::Plain => {
                 std::fs::create_dir_all(&host_path)?;
-                if let Some(size_str) = size_limit {
-                    let need = if cfg!(target_os = "linux") {
-                        "root"
-                    } else {
-                        "Linux"
-                    };
-                    eprintln!(
-                        "warning: volume size enforcement requires {need}; \
-                         size limit {size_str} not enforced for {}",
-                        host_path.display()
-                    );
-                }
             }
         }
 
         // Only a Btrfs qgroup lives on the subvolume itself; a restore swaps
         // in a new subvolume and must set the same limit again.
         let quota = size_bytes.filter(|_| backend == super::btrfs::VolumeBackend::BtrfsSubvolume);
-        self.write_backend(&host_path, backend, quota)?;
+        self.write_backend(&host_path, backend, quota, size_bytes)?;
         Ok(host_path)
     }
 
@@ -329,6 +347,7 @@ impl VolumeManager {
         host_path: &Path,
         backend: super::btrfs::VolumeBackend,
         quota_bytes: Option<u64>,
+        size_bytes: Option<u64>,
     ) -> Result<(), VolumeError> {
         write_sidecar(
             host_path,
@@ -337,6 +356,7 @@ impl VolumeManager {
                 backend,
                 owner: None,
                 quota_bytes,
+                size_bytes,
             },
         )
     }
@@ -505,6 +525,46 @@ struct VolumeSidecar {
     /// when the backend enforces size some other way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quota_bytes: Option<u64>,
+    /// The `size` the volume was created with, whatever enforces it; `None`
+    /// when unsized. A deploy asking for another size is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+}
+
+/// The size `host_path` was created with. A sidecar written before sizes
+/// were recorded still says it through its Btrfs quota or loop image.
+fn recorded_size(host_path: &Path, sidecar: &VolumeSidecar) -> Option<u64> {
+    sidecar.size_bytes.or(sidecar.quota_bytes).or_else(|| {
+        (sidecar.backend == super::btrfs::VolumeBackend::LoopMount)
+            .then(|| std::fs::metadata(loop_image_path(host_path)).ok())
+            .flatten()
+            .map(|metadata| metadata.len())
+    })
+}
+
+fn describe_size(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "none".to_string(), |bytes| format!("{bytes} bytes"))
+}
+
+/// Refuse a sized volume on a backend that can't enforce it: a plain
+/// directory has no limit, so the app would run unbounded (#701).
+pub(crate) fn refuse_unenforced_size(
+    backend: super::btrfs::VolumeBackend,
+    mount_path: &Path,
+    size: Option<&str>,
+) -> Result<(), VolumeError> {
+    match (backend, size) {
+        (super::btrfs::VolumeBackend::Plain, Some(size)) => Err(VolumeError::SizeUnenforceable {
+            path: mount_path.display().to_string(),
+            size: size.to_string(),
+            need: if cfg!(target_os = "linux") {
+                "root"
+            } else {
+                "Linux with root"
+            },
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn read_sidecar(host_path: &Path) -> Option<VolumeSidecar> {
@@ -978,7 +1038,10 @@ mod tests {
         let error = vm
             .create_managed_volume("default", "redis", Path::new("/data"), Some("10Gi"))
             .unwrap_err();
-        assert!(matches!(error, VolumeError::SizeChanged { .. }), "{error:?}");
+        assert!(
+            matches!(error, VolumeError::SizeChanged { .. }),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("/data"), "{error}");
 
         // The size it was created with is still accepted.

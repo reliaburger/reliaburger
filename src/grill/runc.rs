@@ -294,7 +294,10 @@ impl RuncGrill {
                 .map_err(GrillError::ImagePull)?;
             let lower = pulled.rootfs;
             self.apply_image_config(instance, &mut spec, &pulled.config, &lower)?;
-            if !self.rootless {
+            // An init container borrows the app's volumes: handing them to
+            // its user would take them from the app's (#701). Root in the
+            // container's user namespace can write them as they are.
+            if !self.rootless && !spec.initialiser {
                 prepare_volumes(instance, &spec).await?;
             }
 
@@ -826,6 +829,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "invalid.example/reliaburger/no-pull:latest".to_string(),
@@ -888,6 +892,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "./rootfs".into(),
@@ -953,6 +958,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 // Use a path (not an image ref) to skip the image pull step
@@ -1047,6 +1053,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1207,6 +1214,7 @@ mod tests {
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
                 reusable_executor: false,
                 host_process: false,
+                initialiser: false,
                 port_mapping: None,
                 root: crate::grill::oci::OciRoot {
                     path: ALPINE_IMAGE.to_string(),
@@ -1373,6 +1381,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1433,6 +1442,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1627,6 +1637,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),

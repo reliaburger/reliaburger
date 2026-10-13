@@ -208,6 +208,13 @@ fn verify_snapshot_checksum(
     Ok(())
 }
 
+/// `replicas` held inside an `[autoscale]` block's `[min, max]`. A `min`
+/// above `max` can't reach the log (validation refuses it), but the clamp
+/// mustn't panic on one.
+fn clamp_to_bounds(replicas: u32, autoscale: &crate::config::app::AutoscaleSpec) -> u32 {
+    replicas.max(autoscale.min).min(autoscale.max)
+}
+
 /// Whether `keypair` is the age key `relish init` sealed the root CA backup
 /// to: the cluster-wide key of generation 0. Nothing else seals to it, so
 /// finalising a rotation keeps it, read-only.
@@ -754,6 +761,20 @@ impl StateMachineInner {
                 replicas,
                 reason: _,
             } => {
+                // The autoscaler read a spec, decided, then wrote: a deploy
+                // that removed `[autoscale]` or narrowed it may have
+                // committed in between (#701).
+                let Some(autoscale) = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .and_then(|spec| spec.autoscale.as_ref())
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("app {app_id} doesn't autoscale"),
+                    });
+                };
+                let replicas = clamp_to_bounds(*replicas, autoscale);
                 let key = app_id.to_string();
                 if let Some((_, existing)) = self
                     .state
@@ -761,9 +782,9 @@ impl StateMachineInner {
                     .iter_mut()
                     .find(|(k, _)| k == &key)
                 {
-                    *existing = *replicas;
+                    *existing = replicas;
                 } else {
-                    self.state.autoscale_overrides.push((key, *replicas));
+                    self.state.autoscale_overrides.push((key, replicas));
                 }
             }
             RaftRequest::GitOpsCoordinatorElection(election) => {
@@ -2534,9 +2555,25 @@ impl StateMachineInner {
             .apps
             .get(app_id)
             .is_some_and(|old| old.replicas != spec.replicas);
+        let key = app_id.to_string();
         if baseline_changed {
-            let key = app_id.to_string();
             self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+        }
+        // An override lives inside the `[autoscale]` bounds. Removing the
+        // block leaves nothing that could ever move it again, so it goes;
+        // narrowing the bounds clamps it (#701).
+        match &spec.autoscale {
+            None => self.state.autoscale_overrides.retain(|(k, _)| k != &key),
+            Some(autoscale) => {
+                for (_, replicas) in self
+                    .state
+                    .autoscale_overrides
+                    .iter_mut()
+                    .filter(|(k, _)| k == &key)
+                {
+                    *replicas = clamp_to_bounds(*replicas, autoscale);
+                }
+            }
         }
         self.state.apps.insert(app_id.clone(), spec.clone());
         // A different spec is the operator's answer to a failed rollout

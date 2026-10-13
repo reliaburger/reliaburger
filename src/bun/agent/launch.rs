@@ -221,14 +221,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// its own registry, on this node, before the deploy began.
     pub(super) async fn enforce_image_signature(
         &self,
-        spec: &AppSpec,
-    ) -> Result<Option<String>, String> {
-        self.enforce_image_reference_signature(spec.image.as_deref())
-            .await
-    }
-
-    pub(super) async fn enforce_image_reference_signature(
-        &self,
         image: Option<&str>,
     ) -> Result<Option<String>, String> {
         self.enforce_upstream_rules(image).await?;
@@ -761,11 +753,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         for new_id in new_ids {
             let host_port = new_ports.get(new_id).copied().flatten();
-            let health_config = spec
-                .health
-                .as_ref()
-                .zip(spec.port)
-                .map(|(hs, port)| crate::bun::health::HealthCheckConfig::from_spec(hs, port));
+            let health_config = crate::bun::health::HealthCheckConfig::for_app(spec);
             if let Some(ref cfg) = health_config {
                 self.supervisor
                     .register_health(new_id.clone(), cfg.clone(), now);

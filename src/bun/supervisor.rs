@@ -423,31 +423,21 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a GPU-requesting workload the node can't back (D15): either
-    /// `gpu_enabled = false` or the detector found no GPU. Makes
-    /// `gpu_enabled` effective instead of a silent lie.
+    /// Refuse every GPU-requesting workload (D41). Nothing passes a device
+    /// into the container yet and nothing counts which card a workload holds,
+    /// so admitting one would start it without its GPU. `relish apply`
+    /// refuses the request first; this is the node's second line, whatever
+    /// its `gpu_enabled` setting or detected cards say.
     fn admit_gpu(&self, app_name: &str, requested: u32) -> Result<(), BunError> {
         if requested == 0 {
             return Ok(());
         }
-        if !self.capabilities.gpu_enabled {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: "workload requests a GPU but GPU support is disabled on this node \
-                         ([resources] gpu_enabled = false)"
-                    .to_string(),
-            });
-        }
-        if self.capabilities.gpu_count < requested {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "workload requests {requested} gpu(s) but this node has {} available",
-                    self.capabilities.gpu_count
-                ),
-            });
-        }
-        Ok(())
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!(
+                "workload requests {requested} gpu(s), but GPU workloads aren't supported yet (#359)"
+            ),
+        })
     }
 
     /// Refuse a limit-requiring workload the node can't enforce (M22).
@@ -650,22 +640,17 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 None
             };
 
-            let health_config = if let Some(ref health_spec) = spec.health {
-                let app_port = match spec.port {
-                    Some(port) => port,
-                    None => {
-                        for port in &allocated_ports {
-                            let _ = self.port_allocator.release(*port).await;
-                        }
-                        return Err(BunError::NoPortForHealthCheck {
-                            app_name: app_name.to_string(),
-                        });
-                    }
-                };
-                Some(HealthCheckConfig::from_spec(health_spec, app_port))
-            } else {
-                None
-            };
+            // `health.port` is enough; only a health check with no port at
+            // all (which validation refuses) can't be probed.
+            let health_config = HealthCheckConfig::for_app(spec);
+            if spec.health.is_some() && health_config.is_none() {
+                for port in &allocated_ports {
+                    let _ = self.port_allocator.release(*port).await;
+                }
+                return Err(BunError::NoPortForHealthCheck {
+                    app_name: app_name.to_string(),
+                });
+            }
 
             prepared.push(WorkloadInstance {
                 id: instance_id,

@@ -46,12 +46,7 @@ pub(super) async fn wait_instance_healthy<G: Grill>(
         Err(_) => return Err(format!("{} state unknown, rolling back", id.0)),
     }
 
-    let Some(config) = spec
-        .health
-        .as_ref()
-        .zip(spec.port)
-        .map(|(hs, port)| crate::bun::health::HealthCheckConfig::from_spec(hs, port))
-    else {
+    let Some(config) = crate::bun::health::HealthCheckConfig::for_app(spec) else {
         return Ok(());
     };
 

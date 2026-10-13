@@ -111,6 +111,11 @@ pub struct Compatibility {
 /// `ReportingMessage::AggregatedReport` variant is gone.
 /// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
 /// sources with bit 63 set name a job's run identity (#737).
+/// App config fields (#701): applying an `AppSpec` without `[autoscale]`
+/// clears its override and narrowed bounds clamp it, an `AutoscaleOverride`
+/// for an app that doesn't autoscale is refused, `OciSpec::initialiser` marks
+/// an init container's spec, managed-volume sidecars record `size_bytes`, and
+/// inline config files move to a per-instance directory.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

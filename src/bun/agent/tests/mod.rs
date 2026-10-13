@@ -3526,7 +3526,7 @@ async fn enforce_image_signature_fails_closed_without_council() {
     let spec: AppSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
     // No cluster/council → the gate can't obtain verification material, so
     // it must refuse rather than skip (IMG2 fail-closed).
-    let result = agent.enforce_image_signature(&spec).await;
+    let result = agent.enforce_image_signature(spec.image.as_deref()).await;
     assert!(result.is_err(), "expected refusal, got {result:?}");
     assert!(
         result.unwrap_err().contains("requires a signature"),
@@ -3541,7 +3541,12 @@ async fn enforce_image_signature_allows_a_process_workload_without_council() {
     // A process workload has no image — nothing to verify, so it passes
     // even with require_signatures on and no council.
     let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
-    assert!(agent.enforce_image_signature(&spec).await.is_ok());
+    assert!(
+        agent
+            .enforce_image_signature(spec.image.as_deref())
+            .await
+            .is_ok()
+    );
 }
 
 // --- relish sign, end to end (operator key → attach → deploy gate) ---
@@ -3691,13 +3696,19 @@ async fn relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key() 
     });
 
     // Signed with the trusted key: admitted, pinned to the signed digest.
-    let pinned = agent.enforce_image_signature(&app("myapp:v1")).await;
+    let pinned = agent
+        .enforce_image_signature(app("myapp:v1").image.as_deref())
+        .await;
     assert_eq!(pinned, Ok(Some(format!("myapp@sha256:{signed}"))));
     // Never signed: refused.
-    let unsigned = agent.enforce_image_signature(&app("unsigned:v1")).await;
+    let unsigned = agent
+        .enforce_image_signature(app("unsigned:v1").image.as_deref())
+        .await;
     assert!(unsigned.is_err(), "unsigned image admitted: {unsigned:?}");
     // Signed, but by a key the policy doesn't list: refused.
-    let untrusted = agent.enforce_image_signature(&app("stranger:v1")).await;
+    let untrusted = agent
+        .enforce_image_signature(app("stranger:v1").image.as_deref())
+        .await;
     assert!(
         untrusted
             .as_ref()
@@ -3730,7 +3741,9 @@ async fn moving_a_tag_after_signing_leaves_the_new_digest_unsigned() {
     // Someone re-pushes v1 with different bytes: the signature covered
     // the old digest, not the tag, so the new content is refused.
     push_manifest(&council, "myapp", "v1", &"4".repeat(64)).await;
-    let result = agent.enforce_image_signature(&app("myapp:v1")).await;
+    let result = agent
+        .enforce_image_signature(app("myapp:v1").image.as_deref())
+        .await;
     assert!(result.is_err(), "re-tagged content admitted: {result:?}");
 }
 
@@ -3785,7 +3798,7 @@ async fn pulling_agent(
 async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
     let (_council, agent) = pulling_agent(9310, official_images_only()).await;
     let refused = agent
-        .enforce_image_signature(&app("ghcr.io/evil/miner:1"))
+        .enforce_image_signature(app("ghcr.io/evil/miner:1").image.as_deref())
         .await;
     assert!(
         refused
@@ -3795,7 +3808,7 @@ async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
     );
     let digest = format!("sha256:{}", "a".repeat(64));
     let allowed = agent
-        .enforce_image_signature(&app(&format!("nginx:1.27@{digest}")))
+        .enforce_image_signature(app(&format!("nginx:1.27@{digest}")).image.as_deref())
         .await;
     assert_eq!(allowed, Ok(None));
 }
@@ -3806,7 +3819,7 @@ async fn a_deploy_leaves_pickle_images_to_require_signatures() {
     let (council, agent) = pulling_agent(9311, official_images_only()).await;
     push_manifest(&council, "team/web", "v1", &"5".repeat(64)).await;
     let result = agent
-        .enforce_image_signature(&app("localhost:5050/team/web:v1"))
+        .enforce_image_signature(app("localhost:5050/team/web:v1").image.as_deref())
         .await;
     assert_eq!(result, Ok(None));
 }
@@ -3819,7 +3832,7 @@ async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
     let mut agent = agent_with_council(council);
     agent.set_trust_policy(official_images_only());
     let result = agent
-        .enforce_image_signature(&app("proc-grill:image-ignored"))
+        .enforce_image_signature(app("proc-grill:image-ignored").image.as_deref())
         .await;
     assert_eq!(result, Ok(None));
 }
@@ -8345,7 +8358,9 @@ async fn init_container_runs_its_own_image_with_the_app_env_and_mounts() {
     agent_handle.await.unwrap();
     expect_complete(&events);
 
-    let own = grill.created_spec(&own).expect("the first init was created");
+    let own = grill
+        .created_spec(&own)
+        .expect("the first init was created");
     assert_eq!(own.root.path, "migrate:v2");
     assert_eq!(own.process.args, vec!["migrate".to_string()]);
     assert!(
@@ -8395,8 +8410,7 @@ async fn stop_removes_each_instances_inline_config_files() {
     .unwrap();
     expect_complete(&send_deploy(&tx, config).await);
     for instance in ["default__web-0", "default__web-1"] {
-        let dir =
-            crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        let dir = crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(files.len(), 1, "{instance} has its own copy");
     }
@@ -8414,8 +8428,7 @@ async fn stop_removes_each_instances_inline_config_files() {
     agent_handle.await.unwrap();
 
     for instance in ["default__web-0", "default__web-1"] {
-        let dir =
-            crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        let dir = crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
         assert!(!dir.exists(), "{} survived the stop", dir.display());
     }
 }
@@ -8694,6 +8707,7 @@ fn adoption_record(
         oci_spec: crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),

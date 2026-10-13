@@ -40,7 +40,7 @@ command = ["echo", "running migrations..."]
 # Managed volume for persistent data.
 [[app.myapp.volumes]]
 path = "/data"
-size = "5Gi"
+# No `size`: only a root node on Linux can enforce one.
 
 # HostPath volume for shared config. The node mounts it only if its
 # node.toml allows the prefix: [storage] allowed_host_paths = ["/etc/myapp"].

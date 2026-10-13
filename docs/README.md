@@ -1147,7 +1147,7 @@ command = ["echo", "migration complete"]
 
 ### Init containers
 
-Init containers run sequentially before the main app starts. If any init container fails, the app transitions to Failed.
+Init containers run sequentially before the main app starts. If any init container fails, the app transitions to Failed. Each runs its own `image` (the app's when it names none) with the app's env, secrets and volume and config-file mounts.
 
 ```toml
 [app.web]
@@ -1158,7 +1158,7 @@ command = ["sleep", "60"]
 command = ["echo", "initialising database"]
 ```
 
-For the full configuration reference (resource limits, replicas, environment variables, volumes, secrets, namespaces), see the book chapter [Hello, Container](book/01-hello-container.md).
+For the full configuration reference (resource limits, replicas, environment variables, volumes, secrets, namespaces), see the [App fields](manual/13_reference.md#app-fields) table and the book chapter [Hello, Container](book/01-hello-container.md).
 
 ## Runtime auto-detection
 

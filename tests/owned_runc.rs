@@ -572,9 +572,8 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
         root.path(),
         "/bin/busybox cat /proc/self/cgroup > /work/cgroup; exec /bin/busybox sleep 60",
     );
-    specification.linux.cgroups_path = Some(reliaburger::grill::oci::hierarchy_cgroup_path(
-        &host_path,
-    ));
+    specification.linux.cgroups_path =
+        Some(reliaburger::grill::oci::hierarchy_cgroup_path(&host_path));
     runtime.create(&id, &specification).await.unwrap();
     install_fixture(root.path(), &id);
     // Model Bun's pre-start policy: the cgroup must be the same kernel object

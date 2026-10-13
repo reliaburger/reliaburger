@@ -7863,7 +7863,7 @@
       ],
       "refused_paths": [
         "volumes, config_file, run_as_user and run_as_group on exec or script apps.",
-        "A health check with no port, a zero interval, timeout or threshold, or a timeout not below the interval.",
+        "A health check with no port, a zero interval, timeout or threshold, or a timeout longer than the interval.",
         "gpu above 0 and egress.allow_franchise.",
         "A volume size the node cannot enforce, or a changed size on an existing volume."
       ],
