@@ -29,8 +29,11 @@ release: ## Compile all crates (optimised release)
 test: warm-executables ## Run the portable suite with nextest (ignored suites are separate)
 	$(NEXTEST)
 
-warm-executables: ## Build the binaries and run each once, so macOS assesses them before any test is timed
-	$(CARGO) build --bins
+# `cargo test --no-run` builds the binaries exactly as the suite does. A plain
+# `cargo build --bins` leaves out the dev-dependencies' features, so nextest
+# then compiled the library and every binary again and replaced the warm ones.
+warm-executables: ## Build the suite and its binaries, then run each binary once, so macOS assesses them before any test is timed
+	$(CARGO) test --no-run
 	python3 scripts/ci/warm_executables.py
 
 test-cargo: ## Run the portable suite with Cargo's built-in runner
