@@ -82,6 +82,8 @@ pub struct MockGrill {
     /// Make pid reads fail, as an owner that doesn't answer does.
     fail_pid: Arc<AtomicBool>,
     fail_create: Arc<AtomicBool>,
+    /// When set, `create` refuses the launch as a missing binary would (#881).
+    refused_launch: Arc<Mutex<Option<super::LaunchProblem>>>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
@@ -149,6 +151,7 @@ impl Default for MockGrill {
             instance_pid_delays: Arc::default(),
             fail_pid: Arc::default(),
             fail_create: Arc::default(),
+            refused_launch: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
@@ -222,6 +225,11 @@ impl MockGrill {
     /// Fail creation after recording the attempted runtime mutation.
     pub fn set_fail_create(&self, value: bool) {
         self.fail_create.store(value, Ordering::SeqCst);
+    }
+
+    /// Refuse every later `create` with this launch problem, or stop refusing.
+    pub fn set_refused_launch(&self, problem: Option<super::LaunchProblem>) {
+        *self.refused_launch.lock().unwrap() = problem;
     }
 
     /// Fail start after recording the attempted runtime mutation.
@@ -679,6 +687,13 @@ impl super::Grill for MockGrill {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "injected create failure".into(),
+            });
+        }
+        let refused = self.refused_launch.lock().unwrap().clone();
+        if let Some(problem) = refused {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
             });
         }
         if let Some(path) = spec.linux.host_cgroup_path() {

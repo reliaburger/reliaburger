@@ -225,6 +225,20 @@ pub struct ReplicaObservation {
     /// holds the other nodes on the previous spec (#692).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_failed: Option<crate::meat::deploy_types::RolloutFailure>,
+    /// Instances the runtime refused to launch, with why (#881).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_failures: Vec<LaunchFailureObservation>,
+}
+
+/// One instance the runtime refused to launch, such as for a missing binary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchFailureObservation {
+    /// Node that reported the instance.
+    pub node: String,
+    /// Instance identifier.
+    pub instance: String,
+    /// The runtime's reason, such as `binary not found: /usr/local/bin/app`.
+    pub reason: String,
 }
 
 /// One active Smoker fault.

@@ -323,6 +323,80 @@ fn signal_child_group(
     }
 }
 
+/// The program a spec launches: its first argument, or the placeholder
+/// `sleep` both launch paths fall back to when it has none.
+fn launched_program(spec: &OciSpec) -> String {
+    spec.process
+        .args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "sleep".to_string())
+}
+
+/// Whether `program` names something this node can execute, resolving a bare
+/// name on the workload's `PATH` the way `execvp` does.
+///
+/// Only answers that can't change by retrying are refusals. A path that
+/// can't be inspected for another reason (a permission on a parent
+/// directory, say) is left for the launch itself to report.
+fn check_launchable(
+    program: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<(), super::LaunchProblem> {
+    use super::LaunchProblem;
+    if program.contains('/') {
+        let path = PathBuf::from(program);
+        return match executable(&path) {
+            Some(true) => Ok(()),
+            Some(false) => Err(LaunchProblem::BinaryNotExecutable(path)),
+            None if absent(&path) => Err(LaunchProblem::BinaryNotFound(path)),
+            None => Ok(()),
+        };
+    }
+    // Bun clears the workload's environment, so only its own PATH counts.
+    // Without one, `execvp` falls back to the default search path.
+    let search = environment
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or("/usr/local/bin:/bin:/usr/bin");
+    let mut found_unexecutable = None;
+    for directory in search.split(':') {
+        let directory = if directory.is_empty() { "." } else { directory };
+        let candidate = Path::new(directory).join(program);
+        match executable(&candidate) {
+            Some(true) => return Ok(()),
+            // Uncertain evidence never refuses a launch.
+            None if !absent(&candidate) => return Ok(()),
+            Some(false) if found_unexecutable.is_none() => found_unexecutable = Some(candidate),
+            _ => {}
+        }
+    }
+    Err(match found_unexecutable {
+        Some(path) => LaunchProblem::BinaryNotExecutable(path),
+        None => LaunchProblem::BinaryNotFound(PathBuf::from(program)),
+    })
+}
+
+/// `Some(true)` for an executable file, `Some(false)` for a directory or a
+/// file without any execute bit, `None` when the path can't be inspected.
+fn executable(path: &Path) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether the path certainly doesn't exist: it, or one of its parents, is
+/// missing or isn't a directory.
+fn absent(path: &Path) -> bool {
+    matches!(
+        std::fs::metadata(path),
+        Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    )
+}
+
 fn owner_error(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
     GrillError::StateUnavailable {
         instance: instance.clone(),
@@ -538,6 +612,24 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+        // A missing binary would only show once the owner's gate tried to
+        // exec it, after start had already succeeded (#881). Refuse it here,
+        // before any generation exists, so the caller can fail the instance.
+        let program = launched_program(spec);
+        let environment = host_environment(&spec.process.env);
+        let checked = program.clone();
+        let check = tokio::task::spawn_blocking(move || check_launchable(&checked, &environment))
+            .await
+            .map_err(|error| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("binary check for {program} did not finish: {error}"),
+            })?;
+        if let Err(problem) = check {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
         if let Some(control) = &self.control {
             return control.prepare(instance, spec).await.map_err(|error| {
                 GrillError::StartFailed {
@@ -2871,5 +2963,105 @@ mod tests {
     #[tokio::test]
     async fn resumed_file_follow_keeps_offsets_across_eof_before_actual_child_exit() {
         assert_file_follow_rescans_after_empty_read_then_child_exit(true).await;
+    }
+
+    /// #881: the error a create returns for a binary nobody can run.
+    fn refused_launch(error: GrillError) -> super::super::LaunchProblem {
+        match error {
+            GrillError::LaunchRefused { problem, .. } => problem,
+            other => panic!("expected a refused launch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_missing_binary_as_binary_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-installed");
+        let grill = ProcessGrill::new();
+        let id = InstanceId("missing-0".to_string());
+        let spec = spec_with_args(vec![missing.display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            format!("binary not found: {}", missing.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_binary_without_execute_permission() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("not-executable");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("not-executable-0".to_string());
+        let spec = spec_with_args(vec![script.display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            format!("binary not executable: {}", script.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_directory_as_a_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("directory-0".to_string());
+        let spec = spec_with_args(vec![root.path().display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            format!("binary not executable: {}", root.path().display())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_looks_a_bare_command_up_on_the_workloads_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("rb-path-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("path-0".to_string());
+        let mut spec = spec_with_args(vec!["rb-path-tool".to_string()]);
+        spec.process.env = vec![format!("PATH={}", root.path().display())];
+
+        grill.create(&id, &spec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_bare_command_missing_from_the_workloads_path() {
+        let root = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("path-missing-0".to_string());
+        let mut spec = spec_with_args(vec!["rb-no-such-tool".to_string()]);
+        spec.process.env = vec![format!("PATH={}", root.path().display())];
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(problem.to_string(), "binary not found: rb-no-such-tool");
+    }
+
+    #[tokio::test]
+    async fn owned_create_refuses_a_missing_binary_before_preparing_a_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let owners = root.path().join("owners");
+        let missing = root.path().join("not-installed");
+        let grill = ProcessGrill::with_owner(owners.clone(), "/bin/false".into());
+        let id = InstanceId("owned-missing-0".to_string());
+        let spec = spec_with_args(vec![missing.display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::BinaryNotFound(missing.clone())
+        );
+        assert!(
+            !owners.join(&id.0).exists(),
+            "a refused launch must not leave a prepared generation behind"
+        );
     }
 }

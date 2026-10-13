@@ -111,6 +111,7 @@ pub struct Compatibility {
 /// `ReportingMessage::AggregatedReport` variant is gone.
 /// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
 /// sources with bit 63 set name a job's run identity (#737).
+/// A refused launch's `reason` on `/v1/status` instance rows (#881).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

@@ -496,7 +496,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 &cgroup_path.to_string_lossy(),
                 None,
             );
-            self.grill.create(&init_id, &init_oci).await?;
+            if let Err(error) = self.grill.create(&init_id, &init_oci).await {
+                // A missing init binary fails its parent the way its own would.
+                if let Some(problem) = error.launch_problem() {
+                    self.ops
+                        .record_launch_failure(instance_id, problem.to_string())
+                        .await;
+                }
+                return Err(error.into());
+            }
             // The parent's retirement forgets this launch's journal by its
             // generation. One the runtime can't say is kept, for the next
             // start's adoption to forget.
@@ -556,6 +564,24 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         Ok(())
     }
 
+    /// Create `instance_id` in the runtime. A launch the runtime refuses
+    /// (#881) fails the instance with the reason before the error returns.
+    async fn create_or_fail(
+        &self,
+        instance_id: &InstanceId,
+        spec: &crate::grill::oci::OciSpec,
+    ) -> Result<(), BunError> {
+        let Err(error) = self.grill.create(instance_id, spec).await else {
+            return Ok(());
+        };
+        if let Some(problem) = error.launch_problem() {
+            self.ops
+                .record_launch_failure(instance_id, problem.to_string())
+                .await;
+        }
+        Err(error.into())
+    }
+
     /// Drive a fresh instance through create → egress → init → start →
     /// HealthWait. The blocking grill calls (create/init/start) run here on
     /// the task; the loop applies the state transitions and bookkeeping.
@@ -572,7 +598,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
 
         // The image pull happens here, off the loop.
-        self.grill.create(instance_id, &prepared.oci_spec).await?;
+        self.create_or_fail(instance_id, &prepared.oci_spec).await?;
         self.ops
             .store_oci_spec(instance_id, prepared.oci_spec)
             .await;

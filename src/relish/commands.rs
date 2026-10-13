@@ -1782,8 +1782,25 @@ fn render_status(
         .iter()
         .filter_map(|app| app.unschedulable.as_ref().map(|short| (app, short)))
         .collect();
-    if !blocked.is_empty() || !waiting.is_empty() || !failed.is_empty() || !short.is_empty() {
+    let refused: Vec<_> = statuses
+        .iter()
+        .filter_map(|row| row.instance.reason.as_ref().map(|reason| (row, reason)))
+        .collect();
+    if !blocked.is_empty()
+        || !waiting.is_empty()
+        || !failed.is_empty()
+        || !short.is_empty()
+        || !refused.is_empty()
+    {
         output.push('\n');
+    }
+    // #881: the runtime refused the launch, so waiting won't start it.
+    for (row, reason) in refused {
+        let _ = writeln!(
+            output,
+            "{} ({}, namespace {}) failed on {}: {reason}",
+            row.instance.id, row.instance.app_name, row.instance.namespace, row.node
+        );
     }
     for (app, reason) in blocked {
         let _ = writeln!(
@@ -3713,6 +3730,7 @@ mod tests {
                 pid,
                 runtime_unknown: false,
                 status_age_ms: None,
+                reason: None,
             },
             cpu_percent: cpu,
             memory_bytes: memory,
@@ -4435,6 +4453,36 @@ spec:
             "no workloads running\n\n\
              web (namespace prod) is unschedulable: placed 2 of 3 replicas: \
              no node that can run it has room\n"
+        );
+    }
+
+    /// #881: an instance the runtime refused to launch says why under the
+    /// table, so a missing binary isn't just a `failed` cell.
+    #[test]
+    fn status_names_an_instance_that_could_not_launch_and_why() {
+        let row = crate::bun::agent::ClusterInstanceStatus {
+            node: "node-1".to_string(),
+            instance: crate::bun::agent::InstanceStatus {
+                id: "default__ghost-0".to_string(),
+                app_name: "ghost".to_string(),
+                namespace: "default".to_string(),
+                state: "failed".to_string(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: None,
+                pid: None,
+                runtime_unknown: false,
+                status_age_ms: None,
+                reason: Some("binary not found: /opt/ghost/server".to_string()),
+            },
+        };
+        let output = render_status(&[row], &[]);
+        assert!(
+            output.ends_with(
+                "\ndefault__ghost-0 (ghost, namespace default) failed on node-1: \
+                 binary not found: /opt/ghost/server\n"
+            ),
+            "{output}"
         );
     }
 

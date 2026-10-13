@@ -1559,6 +1559,7 @@ mod tests {
             pid: None,
             runtime_unknown: false,
             status_age_ms: None,
+            reason: None,
         }
     }
 

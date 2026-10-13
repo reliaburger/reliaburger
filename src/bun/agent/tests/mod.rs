@@ -3372,6 +3372,7 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
             oci_spec: None,
             identity: None,
             identity_mount: None,
+            launch_failure: None,
         },
     );
     agent
@@ -3969,6 +3970,49 @@ async fn deploy_command_creates_instances() {
 
     shutdown.cancel();
     agent_handle.await.unwrap();
+}
+
+/// #881: a binary the node can't run fails the deploy at once with the
+/// reason, and the instance is `failed` with that reason in its status,
+/// instead of sitting in `starting` while something retries.
+#[tokio::test]
+async fn a_refused_launch_fails_the_deploy_and_the_instance_with_its_reason() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_refused_launch(Some(crate::grill::LaunchProblem::BinaryNotFound(
+        "/opt/ghost/server".into(),
+    )));
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    let Some(ApplyEvent::Error { message }) = events.last() else {
+        panic!("the deploy must fail: {events:?}");
+    };
+    assert!(
+        message.contains("binary not found: /opt/ghost/server"),
+        "{message}"
+    );
+
+    let (response, result) = oneshot::channel();
+    tx.send(AgentCommand::Status { response }).await.unwrap();
+    let instances = result.await.unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    let web = instances
+        .iter()
+        .find(|instance| instance.app_name == "web")
+        .expect("the failed instance stays listed");
+    assert_eq!(web.state, "failed");
+    assert_eq!(
+        web.reason.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+    assert!(
+        !grill.calls().iter().any(|(call, _)| call == "start"),
+        "a refused launch must never be started: {:?}",
+        grill.calls()
+    );
 }
 
 /// DEP4/codex-M3: a deploy that blocks on a slow image pull must not
@@ -12434,6 +12478,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         pid: Some(7),
         runtime_unknown: false,
         status_age_ms: None,
+        reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();
     assert!(plain.get("runtime_unknown").is_none(), "{plain}");

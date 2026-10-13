@@ -19,9 +19,9 @@ use super::{
     AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
     ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
     DiskObservation, Evidence, FaultObservation, GitOpsObservation, IsolationObservation,
-    LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
-    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
-    TokenObservation, WtfInputs,
+    LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable,
+    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+    ServiceObservation, TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -652,10 +652,26 @@ fn collect_replicas(
         .filter(|desired| app_scope.is_none_or(|app| desired.app == app))
         .map(|desired| {
             let mut running = BTreeMap::new();
+            let mut launch_failures = Vec::new();
             for node in collected {
                 let Ok(instances) = &node.instances else {
                     continue;
                 };
+                launch_failures.extend(
+                    instances
+                        .iter()
+                        .filter(|instance| {
+                            instance.app_name == desired.app
+                                && instance.namespace == desired.namespace
+                        })
+                        .filter_map(|instance| {
+                            Some(LaunchFailureObservation {
+                                node: node.node_id.clone(),
+                                instance: instance.id.clone(),
+                                reason: instance.reason.clone()?,
+                            })
+                        }),
+                );
                 let count = instances
                     .iter()
                     .filter(|instance| {
@@ -682,6 +698,7 @@ fn collect_replicas(
                 volume_home_away: desired.volume_home_away.clone(),
                 unschedulable: desired.unschedulable.as_ref().map(ToString::to_string),
                 rollout_failed: desired.rollout_failed.clone(),
+                launch_failures,
             }
         })
         .collect();

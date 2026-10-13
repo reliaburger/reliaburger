@@ -1258,6 +1258,53 @@ and wildcards with the largest accepted step. Configuration admission parses
 the expression too, so a malformed schedule fails before it reaches the
 agent's command loop.
 
+### A missing binary fails at once
+
+The owner and its gate bought us durability, and they cost us an error
+message. The gate is what finally calls `exec`. By then `start` has returned
+`Ok`, because start only waits for the owner to record the gate's PID. So when
+the binary wasn't there, the gate's `exec` failed, the owner retired the
+generation, and Bun learned about it sideways: it went to record the instance
+for adoption, found the PID already gone, and said `runtime process identity
+could not be observed`. The instance sat in `starting`, and in a cluster the
+placement reconciler tried the whole deploy again on its backoff (#881). The
+real reason, a missing file, appeared nowhere.
+
+The fix checks before launching anything. `ProcessGrill::create` resolves the
+program the way `execvp` would: a path with a `/` in it is looked at directly,
+and a bare name is searched for on the workload's own `PATH`, the one Bun hands
+the gate, not Bun's. It looks at the file's metadata on a blocking thread
+(`tokio::task::spawn_blocking`), since a stat on a hung network filesystem
+mustn't stall the runtime. Only two answers refuse the launch, and both are
+facts about the file that retrying can't change:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaunchProblem {
+    #[error("binary not found: {}", .0.display())]
+    BinaryNotFound(PathBuf),
+    #[error("binary not executable: {}", .0.display())]
+    BinaryNotExecutable(PathBuf),
+}
+```
+
+`.0` is the first field of a tuple variant, and `thiserror` lets the format
+string reach it. Anything less certain, say a permission error on a parent
+directory, doesn't refuse: the launch goes ahead and reports what it finds.
+
+The problem travels as its own `GrillError::LaunchRefused` variant, not as a
+string inside `StartFailed`. That's what lets the deploy worker tell it apart
+with `error.launch_problem()`, a method returning `Option<&LaunchProblem>`,
+instead of matching on message text. When it gets `Some`, it moves the instance
+to `Failed` and keeps the reason on it. `relish status` prints the reason under
+the table, `--output json` carries it as `reason`, and `relish wtf` turns it
+into a critical `launch-failed` finding.
+
+Checking first has a gap: someone can delete the binary between the check and
+the `exec`. That case still ends the old way. We accepted it, because closing
+it means passing the `exec` error back from the gate through the owner's
+durable record, and the race needs someone removing a binary during a deploy.
+
 ## Batch scheduling
 
 The allocator below explains the original finite-batch design. Public jobs now
