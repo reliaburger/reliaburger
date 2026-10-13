@@ -245,6 +245,7 @@ fn cluster_params_from_config(
         labels: config.node.labels.clone(),
         // Wired in by the caller (run) once the disk-pressure channel exists.
         self_disk_pressured_rx: None,
+        job_capabilities_rx: None,
         readiness: None,
         recovery_probe_window: config
             .cluster
@@ -1227,6 +1228,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // pressured voter. Created before the cluster block so the receiver can ride
     // into ClusterParams.
     let (disk_pressured_tx, disk_pressured_rx) = tokio::sync::watch::channel(false);
+    // The kinds of job this node runs (#788), published once the task
+    // executor exists further down and advertised over gossip, so the leader
+    // refuses a run no live node could take at submission.
+    let (job_capabilities_tx, job_capabilities_rx) = tokio::sync::watch::channel(None);
 
     // Why the council's Raft core stopped, when it stops on its own (#480).
     // Set once by the watchdog below; bun then shuts down and exits non-zero.
@@ -1260,6 +1265,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         registry_cluster_advertise = Some(params.gossip_addr.ip());
         params.mayo = Some(Arc::clone(&mayo_store));
         params.self_disk_pressured_rx = Some(disk_pressured_rx.clone());
+        params.job_capabilities_rx = Some(job_capabilities_rx.clone());
         params.readiness = Some(readiness.clone());
         // Advertised via the gossip directory (12b.2): peers reach this
         // node's API at the port it actually listens on, not a derived one.
@@ -1695,15 +1701,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         .borrow()
                         .iter()
                         .map(|m| api::RosterMember {
-                            info: api::NodeMembershipInfo {
-                                node_id: m.node_id.clone(),
-                                address: directory.api_address(
-                                    &m.node_id,
-                                    m.address,
-                                    gossip_to_api_offset,
-                                ),
-                                api_advertised: directory.endpoints.contains_key(&m.node_id),
-                            },
+                            info: api::NodeMembershipInfo::from_gossip(
+                                m,
+                                &directory,
+                                gossip_to_api_offset,
+                            ),
                             gossip_address: m.address,
                             state: m.state,
                             incarnation: m.incarnation,
@@ -2778,6 +2780,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .with_storage(&data_base)
         .await?,
     );
+    if let Some(node) = &task_arrays.node {
+        job_capabilities_tx.send_replace(Some(node.job_capabilities()));
+    }
     // A job lease's cleanup stops and forgets its jobs in these arrays.
     let local_lease_reaper = reliaburger::testkit::lease::spawn_local_lease_reaper(
         local_test_leases.clone(),

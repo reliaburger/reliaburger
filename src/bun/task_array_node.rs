@@ -15,7 +15,10 @@
 //! segment per chunk grant, see [`super::task_output`]). The node keeps it
 //! while the cluster still lists the array, so `relish batch results` and
 //! `relish batch logs` work after the array finishes, and deletes it once
-//! the leader stops listing the array. The leader stops listing a finished
+//! the leader stops listing the array. In between, once the array is
+//! terminal (listed but no longer running) and its ledger has closed, the
+//! node compacts the ledger and index into one small results file (see
+//! [`super::task_result_index::compact`]). The leader stops listing a finished
 //! array an hour after it finishes, on a timer, whether or not anyone
 //! submits more work.
 //!
@@ -50,11 +53,18 @@ pub const TASK_ARRAYS_DIR: &str = "task-arrays";
 /// Most result rows one request returns.
 pub const MAX_RESULT_ROWS: usize = 1000;
 
-/// Most disk bytes a worker holds per finished task while the cluster still
-/// lists its run: a 22-byte ledger record plus a 24-byte result-index slot,
-/// rounded up for block headers and filesystem blocks. Kept failure output
-/// comes on top, bounded per chunk. Everything goes once the run retires.
-pub const STORAGE_BYTES_PER_TASK: u64 = 50;
+/// Most disk bytes a worker holds per task of a finished run while the
+/// cluster still lists it: one 14-byte compact result slot
+/// ([`super::task_result_index::FINAL_SLOT_BYTES`]), with room for
+/// filesystem blocks. Kept failure output comes on top, bounded per chunk.
+/// Everything goes once the run retires.
+pub const STORAGE_BYTES_PER_TASK: u64 = 16;
+
+/// Most disk bytes a worker holds per finished task while the run is still
+/// active: a 22-byte ledger record plus a 24-byte live result-index slot,
+/// rounded up for block headers and filesystem blocks. Once the run is
+/// terminal the node compacts both into [`STORAGE_BYTES_PER_TASK`].
+pub const ACTIVE_STORAGE_BYTES_PER_TASK: u64 = 50;
 
 /// Tasks examined by a detail page, even when its failure filter returns no rows.
 pub const RESULT_PAGE_SPAN: u32 = 4096;
@@ -146,6 +156,89 @@ pub struct NodeArrayCounters {
     pub start_lag_ms_counts: [u64; 16],
 }
 
+/// Why a node advertising `capabilities` refuses `assignment` for good, or
+/// `None` if it might run it. `binary_allowed` says whether the node's
+/// `allowed_binaries` names the run's binary.
+///
+/// The node's own `admit` asks this of its own capabilities, and the leader
+/// asks it of each node's gossiped ones at admission (#788), so both quote
+/// the same reason. Checks run in a fixed order and the first refusal wins.
+pub fn capability_refusal(
+    capabilities: &crate::meat::job_capability::JobCapabilities,
+    assignment: &ArrayAssignment,
+    binary_allowed: bool,
+) -> Option<String> {
+    use crate::config::job::JobRuntime;
+    let template = assignment.template.as_deref();
+    if let Some(template) = template {
+        // An allowlist or allow_from this node can't hold would leave every
+        // attempt to fail at launch; refuse the array up front.
+        let wants_policy = !super::task_runtime::egress_allow(template).is_empty()
+            || super::task_runtime::allow_from(template).is_some_and(|sources| !sources.is_empty());
+        if wants_policy && (template.runtime == JobRuntime::Process || !capabilities.network_policy)
+        {
+            return Some(super::task_runtime::NETWORK_POLICY_UNENFORCEABLE.into());
+        }
+        if template.env.values().any(|value| value.is_encrypted()) && !capabilities.encrypted_env {
+            return Some("encrypted templates require the owned runtime and namespace keys".into());
+        }
+    }
+    if assignment.resources.cpu_millicores == 0
+        || assignment.resources.memory_bytes == 0
+        || assignment.resources.gpus != 0
+    {
+        return Some(
+            "tasks require positive CPU and memory requests; GPU task execution is unavailable"
+                .into(),
+        );
+    }
+    let limits = template.is_some_and(|t| t.cpu.is_some() || t.memory.is_some());
+    if let Some(template) = template {
+        if template.runtime == JobRuntime::SharedRunc {
+            return (!capabilities.containers)
+                .then(|| "shared-runc requires the rootful owned Linux runtime".into());
+        }
+        if template.image.is_some() {
+            let singleton = assignment.spec.count == 1
+                && if limits {
+                    capabilities.singleton_image_limits
+                } else {
+                    capabilities.singleton_images
+                };
+            return (!capabilities.containers && !singleton)
+                .then(|| "container tasks require the rootful owned Linux runtime".into());
+        }
+    }
+    if !capabilities.host {
+        return Some(
+            "host arrays require the owned process runtime; use image tasks on Linux container nodes"
+                .into(),
+        );
+    }
+    if limits && !capabilities.host_limits {
+        return Some(
+            "the host process runtime cannot enforce CPU or memory limits; use image tasks".into(),
+        );
+    }
+    if !binary_allowed {
+        return Some(format!(
+            "{} isn't in this node's [process_workloads] allowed_binaries",
+            assignment.program.display()
+        ));
+    }
+    if capabilities.mount_isolation {
+        // TODO(#714): run tasks inside the mount namespace the ordinary
+        // process workloads use.
+        return Some(
+            "host jobs don't run under [process_workloads] mount_isolation yet \
+             (on by default on Linux); set mount_isolation = false to run them \
+             unisolated on the host, or give the job an image"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// A node's answer about one array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArrayProgress {
@@ -218,6 +311,10 @@ pub enum TaskArrayNodeError {
     Join(#[from] tokio::task::JoinError),
     #[error("busy: an earlier sync's disk work has not finished, so this node's disk may be stuck")]
     SyncBusy,
+    #[error(
+        "task array {batch_id} already finished on this node and its results are compacted; it can't run again"
+    )]
+    AlreadyFinished { batch_id: u64 },
 }
 
 /// Runs task attempts: real processes on a node, a fake in tests.
@@ -326,6 +423,9 @@ impl TaskArrayNodeConfig {
 struct ArrayRun {
     pool: Arc<TaskPool<NodeRunner>>,
     ledger: LedgerHandle,
+    /// The ledger's group-commit writer. It returns once every handle,
+    /// this run's and its chunks', is dropped, after its last fsync.
+    writer: tokio::task::JoinHandle<Result<Ledger, LedgerError>>,
     cancel: CancellationToken,
     /// Chunks started, by chunk id: the attempt and its cancel token.
     chunks: HashMap<u32, (u64, CancellationToken)>,
@@ -378,6 +478,19 @@ impl SyncClaim {
     }
 }
 
+/// How long a finished run whose compaction failed waits before the next
+/// try: every try rereads the whole ledger.
+const COMPACTION_RETRY: Duration = Duration::from_secs(60);
+
+/// Finished runs on their way to compact results (#739).
+#[derive(Default)]
+struct Compaction {
+    /// Ledger writers still closing, by run.
+    closing: HashMap<u64, tokio::task::JoinHandle<Result<Ledger, LedgerError>>>,
+    /// When compacting a run last failed.
+    failed: HashMap<u64, tokio::time::Instant>,
+}
+
 enum ControlCheck {
     Accepted,
     Stale,
@@ -392,6 +505,7 @@ pub struct TaskArrayNode {
     slots: Arc<Semaphore>,
     budget: Arc<super::execution_budget::ExecutionBudget>,
     indexes: Mutex<HashMap<u64, Arc<super::task_result_index::TaskResultIndex>>>,
+    compaction: Mutex<Compaction>,
     telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
     output_syncs: Arc<std::sync::atomic::AtomicU64>,
     /// fsyncs the control fence has cost, for [`Self::control_syncs`].
@@ -423,6 +537,7 @@ impl TaskArrayNode {
             slots,
             budget,
             indexes: Mutex::new(HashMap::new()),
+            compaction: Mutex::new(Compaction::default()),
             telemetry: Default::default(),
             output_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             control_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -642,16 +757,18 @@ impl TaskArrayNode {
             .collect();
         for id in finished_ids {
             // Finished or forgotten: stop anything still going. The
-            // directory stays while the cluster lists the array.
-            if request.known.contains(&id) {
-                if let Some(run) = arrays.get(&id) {
-                    run.cancel.cancel();
-                }
-            } else if let Some(run) = arrays.remove(&id) {
+            // directory stays while the cluster lists the array; a finished
+            // run's ledger closes once its last chunk lets go of it.
+            if let Some(run) = arrays.remove(&id) {
                 run.cancel.cancel();
+                if request.known.contains(&id) {
+                    self.compaction.lock().await.closing.insert(id, run.writer);
+                }
             }
         }
         self.delete_unknown(&claim, &request.known).await;
+        self.compact_finished(&claim, &request.known, &running)
+            .await;
         self.telemetry.retain_runs(|id| running.contains(&id));
         let root = self.config.root.clone();
         let audit_dir = self.config.audit_dir.clone();
@@ -703,6 +820,54 @@ impl TaskArrayNode {
             .map_or(default, |cap| cap.min(default).max(1))
     }
 
+    /// The kinds of job this node runs, as it advertises them over gossip
+    /// (#788). [`capability_refusal`] turns them back into the verdict
+    /// `admit` reaches, so the leader can judge a run without asking.
+    pub fn job_capabilities(&self) -> crate::meat::job_capability::JobCapabilities {
+        use crate::meat::job_capability::JobCapabilities;
+        let mount_isolation = self.config.policy.mount_isolation;
+        let binaries = !self.config.policy.allowed_binaries.is_empty();
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => JobCapabilities {
+                host: runner.supports_host(),
+                host_limits: runner.supports_host_limits(),
+                containers: runner.supports_containers(),
+                singleton_images: runner.supports_singleton_images(false),
+                singleton_image_limits: runner.supports_singleton_images(true),
+                encrypted_env: true,
+                network_policy: runner.enforces_container_network_policy(),
+                mount_isolation,
+                binaries,
+            },
+            // The plain process runner takes host limits without enforcing
+            // them, as it always has; it never runs containers.
+            NodeRunner::Process(_) => JobCapabilities {
+                host: true,
+                host_limits: true,
+                containers: false,
+                singleton_images: false,
+                singleton_image_limits: false,
+                encrypted_env: false,
+                network_policy: false,
+                mount_isolation,
+                binaries,
+            },
+            // The fake runs anything except what needs the owned runtime's
+            // keys.
+            NodeRunner::Fake(_) => JobCapabilities {
+                host: true,
+                host_limits: true,
+                containers: true,
+                singleton_images: true,
+                singleton_image_limits: true,
+                encrypted_env: false,
+                network_policy: true,
+                mount_isolation,
+                binaries,
+            },
+        }
+    }
+
     /// Why this node can never run `assignment`, if it can't: the same
     /// check every sync makes, for the leader's admission of a run when
     /// this node is the only one that could take it.
@@ -746,106 +911,25 @@ impl TaskArrayNode {
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
         if let Some(template) = assignment.template.as_ref() {
             template.validate_runtime().map_err(str::to_owned)?;
-            // An allowlist or allow_from this node can't hold would leave
-            // every attempt to fail at launch; refuse the array up front.
-            let enforced = match self.runner.as_ref() {
-                NodeRunner::Owned(runner) => runner.enforces_network_policy(template),
-                NodeRunner::Fake(_) => true,
-                NodeRunner::Process(_) => {
-                    super::task_runtime::egress_allow(template).is_empty()
-                        && super::task_runtime::allow_from(template)
-                            .is_none_or(|sources| sources.is_empty())
-                }
-            };
-            if !enforced {
-                return Err(super::task_runtime::NETWORK_POLICY_UNENFORCEABLE.into());
+        }
+        // The same question the leader asks of this node's advertisement
+        // at admission (#788), so the two can't disagree.
+        let binary_allowed = self.config.policy.is_binary_allowed(&assignment.program);
+        if let Some(reason) =
+            capability_refusal(&self.job_capabilities(), assignment, binary_allowed)
+        {
+            return Err(reason);
+        }
+        // What's left checks the template against the executor profile it
+        // will run under, which every node judges the same way.
+        if let Some(template) = assignment.template.as_ref() {
+            let reusable = template.runtime == crate::config::job::JobRuntime::SharedRunc;
+            let host_executor = template.image.is_none()
+                && matches!(self.runner.as_ref(), NodeRunner::Owned(runner) if runner.supports_host_limits());
+            if reusable || host_executor {
+                super::reusable_executor::ExecutorProfile::new(template)
+                    .map_err(|error| error.to_string())?;
             }
-        }
-        if assignment
-            .template
-            .as_ref()
-            .is_some_and(|template| template.env.values().any(|value| value.is_encrypted()))
-            && !matches!(self.runner.as_ref(), NodeRunner::Owned(_))
-        {
-            return Err("encrypted templates require the owned runtime and namespace keys".into());
-        }
-        if assignment.resources.cpu_millicores == 0
-            || assignment.resources.memory_bytes == 0
-            || assignment.resources.gpus != 0
-        {
-            return Err(
-                "tasks require positive CPU and memory requests; GPU task execution is unavailable"
-                    .into(),
-            );
-        }
-        if let Some(template) = assignment.template.as_ref()
-            && template.runtime == crate::config::job::JobRuntime::SharedRunc
-        {
-            super::reusable_executor::ExecutorProfile::new(template)
-                .map_err(|error| error.to_string())?;
-            return match self.runner.as_ref() {
-                NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
-                NodeRunner::Fake(_) => Ok(()),
-                _ => Err("shared-runc requires the rootful owned Linux runtime".into()),
-            };
-        }
-        if assignment
-            .template
-            .as_ref()
-            .is_some_and(|t| t.image.is_some())
-        {
-            return match self.runner.as_ref() {
-                NodeRunner::Owned(runner)
-                    if runner.supports_containers()
-                        || (assignment.spec.count == 1
-                            && assignment.template.as_ref().is_some_and(|template| {
-                                runner.supports_singleton_image(template)
-                            })) =>
-                {
-                    Ok(())
-                }
-                NodeRunner::Fake(_) => Ok(()),
-                _ => Err("container tasks require the rootful owned Linux runtime".into()),
-            };
-        }
-        if let NodeRunner::Owned(runner) = self.runner.as_ref() {
-            if !runner.supports_host() {
-                return Err("host arrays require the owned process runtime; use image tasks on Linux container nodes".into());
-            }
-            if assignment
-                .template
-                .as_ref()
-                .is_some_and(|t| t.cpu.is_some() || t.memory.is_some())
-                && !runner.supports_host_limits()
-            {
-                return Err(
-                    "the host process runtime cannot enforce CPU or memory limits; use image tasks"
-                        .into(),
-                );
-            }
-        }
-        if let NodeRunner::Owned(runner) = self.runner.as_ref()
-            && runner.supports_host_limits()
-            && let Some(template) = assignment.template.as_ref()
-        {
-            super::reusable_executor::ExecutorProfile::new(template)
-                .map_err(|error| error.to_string())?;
-        }
-        if !self.config.policy.is_binary_allowed(&assignment.program) {
-            return Err(format!(
-                "{} isn't in this node's [process_workloads] allowed_binaries",
-                assignment.program.display()
-            ));
-        }
-        if self.config.policy.mount_isolation {
-            // TODO(#714): run tasks inside the mount namespace
-            // the ordinary process workloads use.
-            return Err(
-                "host jobs don't run under [process_workloads] mount_isolation yet \
-                 (on by default on Linux); set mount_isolation = false to run them \
-                 unisolated on the host, or give the job an image"
-                    .to_string(),
-            );
         }
         Ok(())
     }
@@ -856,11 +940,20 @@ impl TaskArrayNode {
         assignment: &ArrayAssignment,
     ) -> Result<ArrayRun, TaskArrayNodeError> {
         let directory = self.array_dir(assignment.batch_id);
+        let batch_id = assignment.batch_id;
         let spec = assignment.spec.clone();
         let held: std::collections::BTreeSet<_> =
             assignment.held.iter().map(|h| h.chunk.0).collect();
         let (ledger, resumed, highest) = claim
             .spawn_blocking(move || {
+                // Compaction deleted the ledger: a fresh one would run
+                // finished tasks again.
+                if directory
+                    .join(super::task_result_index::RESULTS_FILE)
+                    .try_exists()?
+                {
+                    return Err(TaskArrayNodeError::AlreadyFinished { batch_id });
+                }
                 std::fs::create_dir_all(directory.join("output"))?;
                 let parent = directory
                     .parent()
@@ -895,7 +988,7 @@ impl TaskArrayNode {
             .lock()
             .await
             .insert(assignment.batch_id, ledger.index());
-        let (handle, _writer) = task_ledger::spawn_writer(ledger, self.config.group_commit);
+        let (handle, writer) = task_ledger::spawn_writer(ledger, self.config.group_commit);
         let config = PoolConfig {
             concurrency: self.concurrency(&assignment.spec),
             backoff_base: self.config.backoff.0,
@@ -911,6 +1004,7 @@ impl TaskArrayNode {
                 .with_budget(Arc::clone(&self.budget), assignment.resources),
             ),
             ledger: handle,
+            writer,
             cancel: CancellationToken::new(),
             chunks: HashMap::new(),
             finished: Arc::new(Mutex::new(HashMap::new())),
@@ -1189,6 +1283,89 @@ impl TaskArrayNode {
         }
     }
 
+    /// Compact the results of every run the cluster still lists but no
+    /// longer runs, so a finished run keeps [`STORAGE_BYTES_PER_TASK`]
+    /// instead of its ledger and live index (#739). A run waits until its
+    /// ledger writer has closed, so nothing appends after the copy.
+    async fn compact_finished(&self, claim: &SyncClaim, known: &[u64], running: &[u64]) {
+        let mut compaction = self.compaction.lock().await;
+        compaction.closing.retain(|id, _| known.contains(id));
+        compaction.failed.retain(|id, _| known.contains(id));
+        let compacted: Vec<u64> = self
+            .indexes
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, index)| index.is_final())
+            .map(|(id, _)| *id)
+            .collect();
+        let mut due = Vec::new();
+        for &batch_id in known {
+            if running.contains(&batch_id) || compacted.contains(&batch_id) {
+                continue;
+            }
+            if compaction
+                .failed
+                .get(&batch_id)
+                .is_some_and(|at| at.elapsed() < COMPACTION_RETRY)
+            {
+                continue;
+            }
+            if let Some(writer) = compaction.closing.remove(&batch_id) {
+                if !writer.is_finished() {
+                    compaction.closing.insert(batch_id, writer);
+                    continue;
+                }
+                // A writer that stopped on an error left a ledger whose
+                // durable blocks are still good: compaction reads only those.
+                match writer.await {
+                    Ok(Ok(_closed)) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("bun: task array {batch_id}: ledger writer stopped: {error}")
+                    }
+                    Err(error) => {
+                        eprintln!("bun: task array {batch_id}: ledger writer failed: {error}")
+                    }
+                }
+            }
+            due.push((batch_id, self.array_dir(batch_id)));
+        }
+        if due.is_empty() {
+            return;
+        }
+        let results = claim
+            .spawn_blocking(move || {
+                due.into_iter()
+                    .map(|(batch_id, directory)| (batch_id, compact_run(&directory)))
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let results = match results {
+            Ok(results) => results,
+            Err(error) => {
+                eprintln!("bun: task arrays: compaction task failed: {error}");
+                return;
+            }
+        };
+        let mut indexes = self.indexes.lock().await;
+        for (batch_id, result) in results {
+            match result {
+                Ok(Some(index)) => {
+                    indexes.insert(batch_id, index);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "bun: task array {batch_id}: can't compact finished results: {error}"
+                    );
+                    compaction
+                        .failed
+                        .insert(batch_id, tokio::time::Instant::now());
+                }
+            }
+        }
+    }
+
     /// The durable outcome of every task this node ran for the array, in
     /// index order, at most `limit` rows; with `failed_only`, just the
     /// failures.
@@ -1215,27 +1392,18 @@ impl TaskArrayNode {
         let index = match indexes.entry(batch_id) {
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
-                let path = self.array_dir(batch_id).join("ledger");
-                if !path.exists() {
-                    return Err(TaskArrayNodeError::UnknownArray { batch_id });
-                }
-                let index_path = path.with_extension("index");
-                if !index_path.exists() {
-                    return Err(std::io::Error::other(
-                        "result index unavailable; recover the worker ledger before reading detail",
-                    )
-                    .into());
-                }
+                let directory = self.array_dir(batch_id);
+                // Accepted outcomes already required the live index's durable
+                // commit. Recovery rebuilds active writers; a read never
+                // scans the historical ledger merely to open a valid index.
                 let index = tokio::task::spawn_blocking(move || {
-                    let index = super::task_result_index::TaskResultIndex::open(
-                        &path.with_extension("index"),
-                    )?;
-                    // Accepted outcomes already required this index's durable
-                    // commit. Recovery rebuilds active writers; a read never
-                    // scans the historical ledger merely to open a valid index.
-                    Ok::<_, LedgerError>(index)
+                    super::task_result_index::open_for_reading(
+                        &directory.join("ledger"),
+                        &directory.join(super::task_result_index::RESULTS_FILE),
+                    )
                 })
-                .await??;
+                .await??
+                .ok_or(TaskArrayNodeError::UnknownArray { batch_id })?;
                 entry.insert(index).clone()
             }
         };
@@ -1309,6 +1477,30 @@ impl TaskArrayNode {
             Err(TaskArrayNodeError::NoOutput { index })
         }
     }
+}
+
+/// Compact one finished run's directory: results instead of the ledger and
+/// live index, and no launch fences, which only guard a run that can still
+/// start chunks. Failure output stays. `None` when this node never ran it.
+/// Blocking I/O.
+fn compact_run(
+    directory: &Path,
+) -> Result<Option<Arc<super::task_result_index::TaskResultIndex>>, TaskArrayNodeError> {
+    use super::task_result_index::{RESULTS_FILE, compact};
+    let Some(index) = compact(&directory.join("ledger"), &directory.join(RESULTS_FILE))? else {
+        return Ok(None);
+    };
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if matches!(name, "grants.json" | "grants.tmp") || name.starts_with("started-") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(Some(index))
 }
 
 fn persist_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
@@ -1598,6 +1790,115 @@ mod tests {
             allow_from: vec!["frontend/web".into()],
         });
         assert!(node.admit(&task).unwrap_err().contains("allow_from"));
+    }
+
+    /// Runs a node is asked about in the advertisement tests, each named.
+    fn judged_runs() -> Vec<(&'static str, ArrayAssignment)> {
+        let with = |count: u32, template: &str| {
+            let mut task = assignment(1, count, &[]);
+            let template: crate::config::job::JobSpec = toml::from_str(template).unwrap();
+            task.program = template.exec.clone().unwrap_or_default();
+            task.template = Some(Box::new(template));
+            task
+        };
+        vec![
+            ("bare host array", assignment(1, 20, &[])),
+            (
+                "host template",
+                with(
+                    20,
+                    "runtime='process'\nexec='/bin/sh'\ncommand=['-c','true']",
+                ),
+            ),
+            (
+                "host template with limits",
+                with(
+                    20,
+                    "runtime='process'\nexec='/bin/sh'\ncommand=['-c','true']\ncpu='100m'",
+                ),
+            ),
+            (
+                "host binary off the allowlist",
+                with(20, "runtime='process'\nexec='/usr/bin/true'"),
+            ),
+            ("image singleton", with(1, "image='fixture:v1'")),
+            (
+                "image singleton with limits",
+                with(1, "image='fixture:v1'\nmemory='64Mi'"),
+            ),
+            ("image array", with(100, "image='fixture:v1'")),
+            (
+                "shared-runc array",
+                with(100, "runtime='shared-runc'\nimage='fixture:v1'"),
+            ),
+            (
+                "image with egress",
+                with(1, "image='fixture:v1'\n[egress]\nallow=['192.0.2.1:443']"),
+            ),
+        ]
+    }
+
+    /// #788: the leader judges a run from what each node advertises, so the
+    /// advertisement must reach the node's own verdict, word for word.
+    /// Otherwise admission would refuse a run the node would take, or quote
+    /// a different reason from the one the leader's tick would.
+    #[tokio::test]
+    async fn what_a_node_advertises_reaches_its_own_verdict_on_every_run() {
+        let root = tempfile::tempdir().unwrap();
+        let policies: [(&[&str], bool); 4] = [
+            (&[BINARY], false),
+            (&[BINARY], true),
+            (&[], false),
+            (&["/usr/bin/true"], false),
+        ];
+        for (allowed, mount_isolation) in policies {
+            let owned = super::super::task_runtime::OwnedRunner::new(
+                crate::grill::AnyGrill::Process(crate::grill::ProcessGrill::new()),
+            );
+            let runners = [
+                ("owned", NodeRunner::Owned(Box::new(owned))),
+                ("fake", NodeRunner::Fake(FakeRunner::always_succeeds())),
+                ("process", NodeRunner::Process(ProcessRunner::default())),
+            ];
+            for (runner_name, runner) in runners {
+                let node = TaskArrayNode::new(
+                    config(root.path(), policy(allowed, mount_isolation)),
+                    runner,
+                );
+                let advertised = node.job_capabilities();
+                assert_eq!(advertised.mount_isolation, mount_isolation);
+                assert_eq!(advertised.binaries, !allowed.is_empty());
+                for (run, task) in judged_runs() {
+                    let binary_allowed = node.config.policy.is_binary_allowed(&task.program);
+                    assert_eq!(
+                        capability_refusal(&advertised, &task, binary_allowed),
+                        node.refusal(&task),
+                        "{run} on a {runner_name} node allowing {allowed:?}, \
+                         mount_isolation = {mount_isolation}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #788: an owned node without the rootful Linux runtime says so, so the
+    /// leader refuses container arrays nobody can run at admission.
+    #[tokio::test]
+    async fn an_owned_process_node_advertises_no_containers() {
+        let root = tempfile::tempdir().unwrap();
+        let owned = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
+            crate::grill::ProcessGrill::new(),
+        ));
+        let node = TaskArrayNode::new(
+            config(root.path(), policy(&[BINARY], false)),
+            NodeRunner::Owned(Box::new(owned)),
+        );
+        let advertised = node.job_capabilities();
+        assert!(advertised.host);
+        assert!(!advertised.containers);
+        assert!(!advertised.singleton_images);
+        assert!(advertised.encrypted_env);
+        assert!(!advertised.network_policy);
     }
 
     #[tokio::test]
@@ -2281,6 +2582,106 @@ mod tests {
             node.results(1, false, 100).await,
             Err(TaskArrayNodeError::UnknownArray { batch_id: 1 })
         ));
+    }
+
+    /// Sync with `batch_id` known but no longer running until its ledger is
+    /// gone, or fail.
+    async fn sync_until_compacted(node: &TaskArrayNode, batch_id: u64) {
+        let finished = NodeSyncRequest {
+            version: ControlVersion::default(),
+            known: vec![batch_id],
+            arrays: Vec::new(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while node.array_dir(batch_id).join("ledger").exists() {
+            node.sync(&finished).await.unwrap();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "array {batch_id} was never compacted"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_keeps_only_its_compact_results() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(
+            root.path(),
+            FakeRunner::new(Duration::ZERO, |task| AttemptOutcome::Exited {
+                code: i32::from(task.index == 3),
+            }),
+        );
+        let mut array = assignment(1, 20, &[(0, 1), (1, 1)]);
+        array.spec.max_attempts = 1;
+        sync_until_finished(&node, &request(vec![array]), 2).await;
+        let all = node.results(1, false, 100).await.unwrap();
+        let failed = node.results(1, true, 100).await.unwrap();
+        let output = node.task_output(1, 3).await;
+
+        sync_until_compacted(&node, 1).await;
+        let directory = node.array_dir(1);
+        let mut left: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["output", "results"], "only what readers need stays");
+        assert_eq!(node.results(1, false, 100).await.unwrap(), all);
+        assert_eq!(node.results(1, true, 100).await.unwrap(), failed);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].exit_code, Some(1));
+        assert_eq!(
+            format!("{:?}", node.task_output(1, 3).await),
+            format!("{output:?}"),
+            "failure output is still found by its grant"
+        );
+
+        // Pruned: everything goes, as before.
+        node.sync(&NodeSyncRequest::default()).await.unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[tokio::test]
+    async fn a_node_restarted_after_the_run_finished_compacts_it_and_still_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let sync = request(vec![assignment(1, 20, &[(0, 1)])]);
+        let all = {
+            let first = fake_node(root.path(), FakeRunner::always_succeeds());
+            sync_until_finished(&first, &sync, 1).await;
+            first.results(1, false, 100).await.unwrap()
+        };
+        let second = fake_node(root.path(), FakeRunner::always_succeeds());
+        // A reader before the first sync sees the live index...
+        assert_eq!(second.results(1, false, 100).await.unwrap(), all);
+        sync_until_compacted(&second, 1).await;
+        // ...and the compact results after it.
+        assert_eq!(second.results(1, false, 100).await.unwrap(), all);
+        let third = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert_eq!(third.results(1, false, 100).await.unwrap(), all);
+    }
+
+    #[tokio::test]
+    async fn a_compacted_run_is_never_opened_to_run_again() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let sync = request(vec![assignment(1, 20, &[(0, 1)])]);
+        sync_until_finished(&node, &sync, 1).await;
+        sync_until_compacted(&node, 1).await;
+        // A view that lists the finished run as running again can't make
+        // the node start a fresh ledger and run its tasks a second time.
+        let restarted = request(vec![assignment(1, 20, &[(1, 1)])]);
+        let progress = node.sync(&restarted).await.unwrap().arrays.remove(0);
+        assert_eq!(progress.slots, 0);
+        assert!(
+            progress
+                .refused
+                .as_deref()
+                .is_some_and(|r| r.contains("finished")),
+            "{progress:?}"
+        );
+        assert!(!node.array_dir(1).join("ledger").exists());
+        assert_eq!(node.results(1, false, 100).await.unwrap().len(), 10);
     }
 
     #[tokio::test]

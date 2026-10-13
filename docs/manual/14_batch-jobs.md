@@ -400,11 +400,15 @@ outcomes and their result index are durable. Standalone admission reserves spars
 accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
 
-A worker holds at most 50 bytes of disk per accepted task while the cluster
-lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
-million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
-about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
-tasks' head and tail per chunk. All of it goes when the run retires. Task data,
+While a run is active, a worker holds at most 50 bytes of disk per accepted
+task: a 22-byte ledger record and a 24-byte result-index slot. A million tasks
+measured about 47 bytes per task, about 45 MiB in all. Once the run finishes,
+the worker compacts it into one 14-byte result per task and deletes the ledger
+and index, so a finished run the cluster still lists holds at most 16 bytes per
+task: a million tasks measured about 14, about 13.5 MiB (`make
+bench-task-arrays` fails above either bound). `relish batch results` and
+`relish batch logs` answer the same before and after. Kept failure output adds
+at most 16 tasks' head and tail per chunk. All of it goes when the run retires. Task data,
 together with the node's audit log, counts toward disk pressure: past a quarter of the filesystem, or with less
 than 1 GiB free, a worker finishes the chunks it holds but advertises no
 free slots, so it takes no new grants until retention frees space.
@@ -451,14 +455,31 @@ mount_isolation = false
 
 Forget it and the cluster says so straight away. A standalone node refuses the
 submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
-and the reason. In a cluster the run is admitted, because some other node might
-take it, and the leader fails it within a sync or two once every node it can
-reach has refused it. `relish batch-status` and `relish jobs` then show
-`Failed`, every task not run, and a `refused:` line quoting the nodes' reason;
-the JSON summary carries it as `unrunnable_reason`. The same rule catches any
-refusal that comes from a node's own configuration, such as a binary missing
-from every node's `allowed_binaries`. A run that only some nodes refuse keeps
-going on the others.
+and the reason. So does a cluster: every node advertises over gossip what
+kinds of job it runs (host commands, containers, limits it can enforce,
+`mount_isolation`, whether its `allowed_binaries` names anything), and the
+leader refuses a run that every live node says it can't take, with HTTP 422
+and a reason such as:
+
+```text
+no node can run job default/hello: host jobs don't run under
+[process_workloads] mount_isolation yet (on by default on Linux); ...
+```
+
+The leader refuses only when it's sure. It checks the binary against each
+node's `allowed_binaries` from that node's capability report; until a node
+has reported, it only knows whether the allowlist names anything. If a node
+hasn't advertised yet, or might allow the binary, the run is admitted, and
+the leader fails it
+within a sync or two once every node it can reach has refused it. The same
+happens when a node leaves or changes its configuration after admission.
+`relish batch-status` and `relish jobs` then show `Failed`, every task not
+run, and a `refused:` line quoting the nodes' reason; the JSON summary
+carries it as `unrunnable_reason`. Either way the reason reads the same. The
+rule catches any refusal that comes from a node's own configuration, such as
+a container job on nodes without the rootful Linux runtime, or a binary
+missing from every node's `allowed_binaries`. A run that only some nodes
+refuse keeps going on the others.
 
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
 

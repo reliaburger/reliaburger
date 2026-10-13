@@ -1413,6 +1413,7 @@ mod capacity_contract {
                     node_id: reliaburger::meat::NodeId::new("node-1"),
                     address: "127.0.0.1:9001".parse().unwrap(),
                     api_advertised: true,
+                    jobs: None,
                 }]))),
                 None,
                 None,

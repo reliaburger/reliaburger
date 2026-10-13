@@ -165,14 +165,17 @@ impl<G: Grill + Clone> OwnedRunner<G> {
     pub fn enforces_network_policy(&self, template: &crate::config::job::JobSpec) -> bool {
         let wants_policy = !egress_allow(template).is_empty()
             || allow_from(template).is_some_and(|sources| !sources.is_empty());
-        if !wants_policy {
-            return true;
-        }
+        !wants_policy
+            || (template.runtime != crate::config::job::JobRuntime::Process
+                && self.enforces_container_network_policy())
+    }
+    /// Whether this runner enforces a container task's egress allowlist and
+    /// `allow_from` before it starts: eBPF namespace policy, and a runtime
+    /// that puts each container in its own cgroup.
+    pub fn enforces_container_network_policy(&self) -> bool {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         {
-            template.runtime != crate::config::job::JobRuntime::Process
-                && self.namespace_policy.is_some()
-                && self.runtime.honours_cgroup_path()
+            self.namespace_policy.is_some() && self.runtime.honours_cgroup_path()
         }
         #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
         false
@@ -563,20 +566,19 @@ impl OwnedRunner<AnyGrill> {
         self.runtime
             .supports_runtime(crate::grill::records::RuntimeKind::Process)
     }
-    /// A singleton preserves the configured runtime's existing workload contract.
-    pub fn supports_singleton_image(&self, template: &crate::config::job::JobSpec) -> bool {
+    /// Whether this runner runs a single container task, with CPU or memory
+    /// `limits` or without. A singleton preserves the configured runtime's
+    /// existing workload contract, so rootless runc runs one only without
+    /// limits it can't enforce.
+    pub fn supports_singleton_images(&self, limits: bool) -> bool {
         #[cfg(not(target_os = "linux"))]
-        let _ = template;
-        #[cfg(target_os = "linux")]
-        let limits = template.cpu.is_some() || template.memory.is_some();
+        let _ = limits;
         match &self.runtime {
             AnyGrill::Process(_) => false,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => !runtime.is_rootless() || !limits,
             #[cfg(target_os = "linux")]
-            AnyGrill::Mixed(runtime) => {
-                (!runtime.container().is_rootless() && template.image.is_some()) || !limits
-            }
+            AnyGrill::Mixed(runtime) => !runtime.container().is_rootless() || !limits,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => true,
         }
