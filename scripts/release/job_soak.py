@@ -116,7 +116,8 @@ def validate_summary(value, previous=None, concurrency=None):
         verified = node["counters"].get("active_commands")
         if verified is not None and (type(verified) is not int or verified < 0 or verified > callers
                                      or concurrency is not None and verified > concurrency):
-            raise InvalidEvidence("verified activity exceeds callers/profile cap")
+            raise InvalidEvidence(f'verified activity exceeds callers/profile cap on {node.get("node")}: '
+                                  f"{verified} verified, {callers} callers, cap {concurrency}")
     return counts
 
 
@@ -434,8 +435,14 @@ class Campaign:
                     raise InvalidEvidence("candidate changed the admitted runtime or resource profile")
                 if value["batch_id"] != intent["id"] or value.get("name") != intent["name"]:
                     raise InvalidEvidence("summary is for another admitted job")
-                if intent["purpose"] in ("work","audit","cancel") and value["failed"]:
-                    raise InvalidEvidence("unexpected terminal failure in ordinary campaign work")
+                if intent["purpose"] in ("work","audit","cancel") and value["failed"] and not intent.get("failed_at"):
+                    # Reported once, with the first failed task's cause, and
+                    # the run stays in the campaign until it drains: raising
+                    # on every poll kept it there forever, so the final drain
+                    # could never finish (V02 candidate 3, run 26).
+                    intent["failed_at"]=now
+                    self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): '
+                               "unexpected terminal failure in ordinary campaign work"+self.failure_cause(intent["id"]))
                 progress=self.state["progress"][intent["mode"]]
                 delta=value["succeeded"]-(old["succeeded"] if old else 0)
                 progress["succeeded"]+=delta
@@ -471,7 +478,7 @@ class Campaign:
                         if self.ledger_reader is None: raise InvalidEvidence("deadline start verifier unavailable")
                         audit_effects(1,self.ledger_reader(intent["name"]))
                         rows[0]["started_effect"]=True
-                if not stop:
+                if not stop and not intent.get("failed_at"):
                     judge_terminal(intent["purpose"],value,rows)
                     if intent["purpose"] == "audit":
                         if self.ledger_reader is None: raise InvalidEvidence("independent ledger unavailable")
@@ -489,6 +496,24 @@ class Campaign:
             except (InvalidEvidence,KeyError,TypeError) as error: self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): {error}')
         self.save(); self.publish(int(time.time()),fault)
         return not self.state["active"]
+    def failure_cause(self, identity):
+        """The first failed task's attempts, exit code and first output line,
+        as a suffix for the campaign error, or nothing when the candidate
+        can't say. The cause is gone once the run's details expire."""
+        try:
+            page=self.api.request("GET",f"/v1/batch/{identity}/results?failed=true&limit=1")
+            row=page["rows"][0]
+            index=int(row["index"])
+            exit_code=row.get("exit_code")
+            cause=f': task {index} after {int(row["attempts"])} attempt(s), '+("no exit code" if exit_code is None else f"exit {exit_code}")
+        except (Unavailable,InvalidEvidence,KeyError,IndexError,TypeError,ValueError):
+            return ""
+        try:
+            output=self.api.request("GET",f"/v1/batch/{identity}/tasks/{index}/logs",raw=True)
+        except (Unavailable,InvalidEvidence):
+            return cause
+        first=next((line.strip() for line in output.splitlines() if line.strip()),"")
+        return cause+(": "+first[:200] if first else "")
     def record_metrics(self, value):
         """Fold one drained run's M8 measurements into the bounded campaign record."""
         metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))

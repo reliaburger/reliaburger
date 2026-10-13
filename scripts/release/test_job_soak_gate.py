@@ -51,6 +51,76 @@ class Gate(unittest.TestCase):
             self.assertIn("# Sustained soak (V02): FAIL",(root/"report.md").read_text())
 
 
+
+def inventory_proof(ts, boot="b1"):
+    return dict(schema=1,complete=True,ts=ts,boot=boot,prefix="a"*32,owners=[],errors=[],
+                resources=dict(runc=[],netns=[],lease=[],veth=[],cgroup=[]),storage_kb={},available_kb=1<<20)
+
+
+class InventoryWindow(unittest.TestCase):
+    """The guests are asked after the snapshot starts, so their proof is newer
+    than meta.json's ts. It must still be judged fresh (V02 candidate 3,
+    snapshots/20261013T044520-heavy-3: meta 1791866720, inventory 1791866724)."""
+
+    def test_inventory_taken_while_the_snapshot_was_collected_is_fresh(self):
+        for ts in (1000,1004,1010,1010+inventory.CLOCK_SKEW):
+            with self.subTest(ts=ts):
+                self.assertEqual(inventory.validate(inventory_proof(ts),1000,"b1",collected=1010)["ts"],ts)
+
+    def test_inventory_from_before_the_window_or_after_collection_is_refused(self):
+        for ts in (909,1011+inventory.CLOCK_SKEW,5000):
+            with self.subTest(ts=ts), self.assertRaisesRegex(inventory.InvalidInventory,"stale"):
+                inventory.validate(inventory_proof(ts),1000,"b1",collected=1010)
+
+    def test_without_a_collection_end_the_window_closes_at_the_snapshot_start(self):
+        inventory.validate(inventory_proof(1000),1000,"b1")
+        with self.assertRaises(inventory.InvalidInventory):
+            inventory.validate(inventory_proof(1004+inventory.CLOCK_SKEW),1000,"b1")
+
+    def evidence(self, directory, meta, proof_ts):
+        root=Path(directory); snap=root/"snap"; snap.mkdir()
+        (root/"metadata.json").write_text(json.dumps(dict(job_soak=True,job_stop_at=10**10)))
+        checker.save_state(root,{"nodes":["n"]})
+        (snap/"meta.json").write_text(json.dumps(meta))
+        (snap/"inventory-n.txt").write_text("boot b1\nnrestarts 0\nbun_pid 100\nbun_fd 300\nbun_rss_kb 300000\n")
+        (snap/"jobs-n.txt").write_text(json.dumps(inventory_proof(proof_ts)))
+        return root,snap
+
+    def inventory_findings(self, root, snap):
+        import contextlib,io
+        with contextlib.redirect_stdout(io.StringIO()): checker.evaluate(root,snap)
+        verdict=json.loads((snap/"verdict.json").read_text())
+        return [item["detail"] for item in verdict["findings"] if item["check"]=="job-inventory"]
+
+    def test_checker_accepts_a_proof_taken_after_the_snapshot_started(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root,snap=self.evidence(directory,dict(ts=1000,kind="heavy",collected=1030),1004)
+            self.assertEqual(self.inventory_findings(root,snap),[])
+
+    def test_checker_refuses_a_proof_from_after_the_collection_ended(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root,snap=self.evidence(directory,dict(ts=1000,kind="heavy",collected=1030),1100)
+            self.assertEqual(self.inventory_findings(root,snap),["job inventory stale or from another boot"])
+
+    def test_checker_replays_older_evidence_by_when_its_files_were_written(self):
+        # Snapshots from before meta.json recorded the collection end.
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            root,snap=self.evidence(directory,dict(ts=1000,kind="heavy"),1004)
+            for name in ("meta.json","inventory-n.txt","jobs-n.txt"): os.utime(snap/name,(1000,1000))
+            self.assertEqual(len(self.inventory_findings(root,snap)),1)
+            os.utime(snap/"jobs-n.txt",(1006,1006))
+            self.assertEqual(self.inventory_findings(root,snap),[])
+
+    def test_the_harness_records_when_a_snapshot_finished_collecting(self):
+        source=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        observe=source[source.index("\nobserve() {"):]
+        observe=observe[:observe.index("\n}\n")]
+        self.assertLess(observe.index("collect "),observe.index("finish_snapshot"))
+        self.assertLess(observe.index("finish_snapshot"),observe.index("check evaluate"))
+        self.assertIn('"collected"',source)
+
+
 class JobQualification(unittest.TestCase):
     """#686: the job tiers, node faults and the D18-C record."""
     release=Path(__file__).parent

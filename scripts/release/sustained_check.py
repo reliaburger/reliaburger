@@ -517,6 +517,18 @@ def job_findings(evidence, snapshot, now, fault_window):
     return [finding("jobs", "fail", item) for item in problems]
 
 
+def collection_end(snapshot, meta, now):
+    """When the harness finished collecting `snapshot`: meta.json's
+    `collected`, or for a snapshot from before it was recorded, when its last
+    collected file was written. The guests are asked after meta.json's `ts`,
+    so their evidence is stamped between the two."""
+    if type(meta.get("collected")) is int:
+        return meta["collected"]
+    written = [path.stat().st_mtime for path in Path(snapshot).iterdir()
+               if path.name not in ("meta.json", "verdict.json", "findings.txt")]
+    return max(now, int(max(written))) if written else now
+
+
 def evaluate(evidence, snapshot):
     state = load_state(evidence)
     meta = read_json(snapshot, "meta.json") or {}
@@ -636,7 +648,8 @@ def evaluate(evidence, snapshot):
             if jobs_enabled:
                 text=read(snapshot,f"jobs-{node}.txt")
                 try:
-                    owned=job_soak_inventory.validate(json.loads(text) if text else None,now,(inventory.get("boot") or [None])[0])
+                    owned=job_soak_inventory.validate(json.loads(text) if text else None,now,(inventory.get("boot") or [None])[0],
+                                                      collection_end(snapshot,meta,now))
                     # Refuse a forged proof even when there are no app instances.
                     job_soak_inventory.exemptions(owned)
                     usage=state.setdefault("job_resources",{}).setdefault(node,{})
