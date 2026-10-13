@@ -1478,6 +1478,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_a_learner_does_not_wait_for_a_slow_learner_to_catch_up() {
+        // #779: on a slow disk, catching a new learner up takes as long as
+        // its log gap needs, and the reconciler's bounded operation dropped
+        // the wait. Adding the learner is one commit by the existing voters;
+        // the catch-up carries on afterwards, and promotion waits for it.
+        // No snapshot: the learner must replay the whole log gap. openraft's
+        // blocking add waits until the learner trails by at most its
+        // `replication_lag_threshold` (5,000 entries), so a gap of 8,000 on
+        // a disk that takes half a millisecond per entry holds it for 1.5 s.
+        let config = CouncilConfig {
+            snapshot_threshold: 10_000,
+            ..fast_config()
+        };
+        let router = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        for id in 1..=2 {
+            let log_store = MemLogStore::new();
+            if id == 2 {
+                log_store.slow_entry_writes(Duration::from_micros(500));
+            }
+            let node = CouncilNode::new(
+                id,
+                config.clone(),
+                InMemoryRaftNetworkFactory::new(id, router.clone()),
+                log_store,
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        init_cluster(&nodes[..1]).await;
+        wait_for_leader(&nodes[..1], Duration::from_secs(5))
+            .await
+            .unwrap();
+        for _ in 0..8_000 {
+            nodes[0].write(RaftRequest::Noop).await.unwrap();
+        }
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            nodes[0].add_learner(2, node_info(2)),
+        )
+        .await
+        .expect("adding the learner waited for its catch-up")
+        .unwrap();
+        let membership = nodes[0].metrics().borrow().membership_config.clone();
+        assert!(membership.membership().get_node(&2).is_some());
+        assert!(!membership.membership().voter_ids().any(|id| id == 2));
+
+        // Replication carries on in the background until the learner holds
+        // the leader's log.
+        let mut metrics = nodes[0].metrics();
+        let last = nodes[0].metrics().borrow().last_log_index;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            metrics.wait_for(|m| {
+                m.replication
+                    .as_ref()
+                    .and_then(|r| r.get(&2).copied().flatten())
+                    .map(|log_id| log_id.index)
+                    >= last
+            }),
+        )
+        .await
+        .expect("the learner never caught up")
+        .unwrap();
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn write_on_follower_returns_forward_error() {
         let (nodes, _router) = create_cluster(3).await;
         init_cluster(&nodes).await;
