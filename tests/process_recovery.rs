@@ -1506,3 +1506,113 @@ async fn restart_adoption_keeps_a_live_instances_journal_and_forgets_a_dead_ones
     assert!(live_journal, "the adopted instance lost its journal");
     assert_eq!(live_state.unwrap(), ContainerState::Running);
 }
+
+/// An executable script that exits at once, for a test to remove or make
+/// unexecutable between `create` and `start` (#905).
+fn installed_tool(directory: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tool = directory.join("vanishing-tool");
+    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tool
+}
+
+/// Why the runtime refused a launch, or a panic naming what it did instead.
+fn refused(error: reliaburger::grill::GrillError) -> reliaburger::grill::LaunchProblem {
+    match error.launch_problem() {
+        Some(problem) => problem.clone(),
+        None => panic!("expected a refused launch, got {error:?}"),
+    }
+}
+
+/// #905: the binary passes `create`'s check, then disappears before the
+/// owner gate's `exec`. The gate's ENOENT comes back through the owner's
+/// record, so `start` reports "binary not found" and the generation retires.
+#[tokio::test]
+async fn an_owned_start_refuses_a_binary_deleted_before_exec_as_binary_not_found() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = installed_tool(directory.path());
+    let id = InstanceId("default__vanishing-0".into());
+    let grill = runtime(directory.path());
+    let mut launch = spec("unused");
+    launch.process.args = vec![tool.display().to_string()];
+    grill.create(&id, &launch).await.unwrap();
+    std::fs::remove_file(&tool).unwrap();
+
+    let problem = refused(grill.start(&id).await.unwrap_err());
+    assert_eq!(
+        problem.to_string(),
+        format!("binary not found: {}", tool.display())
+    );
+    stopped(&grill, &id).await;
+}
+
+/// #905: a binary that loses its execute bit before the gate's `exec` is
+/// refused as "binary not executable".
+#[tokio::test]
+async fn an_owned_start_refuses_a_binary_made_unexecutable_before_exec() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let tool = installed_tool(directory.path());
+    let id = InstanceId("default__unexecutable-0".into());
+    let grill = runtime(directory.path());
+    let mut launch = spec("unused");
+    launch.process.args = vec![tool.display().to_string()];
+    grill.create(&id, &launch).await.unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let problem = refused(grill.start(&id).await.unwrap_err());
+    assert_eq!(
+        problem.to_string(),
+        format!("binary not executable: {}", tool.display())
+    );
+    stopped(&grill, &id).await;
+}
+
+/// #905: a running app whose binary is deleted, and which then exits, fails
+/// its restart at once with "binary not found" instead of spending its
+/// restart budget and ending `Failed` without a reason.
+#[tokio::test]
+async fn a_restart_after_the_binary_vanished_ends_failed_with_binary_not_found() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let tool = directory.path().join("self-deleting-tool");
+    // It runs long enough for the deploy to see it start, then removes
+    // its own file and exits, so the restart finds no binary.
+    std::fs::write(&tool, "#!/bin/sh\nsleep 1\nrm -f \"$0\"\nexit 1\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path());
+    deploy(
+        &sender,
+        &format!(
+            "[app.ghost]\nimage = 'proc-grill:image-ignored'\ncommand = [{:?}]\n",
+            tool.display().to_string()
+        ),
+    )
+    .await;
+
+    let reason = format!("binary not found: {}", tool.display());
+    let failed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .send(reliaburger::bun::agent::AgentCommand::Status { response })
+                .await
+                .unwrap();
+            let instances = result.await.unwrap();
+            if let Some(ghost) = instances
+                .into_iter()
+                .find(|instance| instance.app_name == "ghost" && instance.state == "failed")
+            {
+                break ghost;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the restart never failed");
+    shutdown.cancel();
+    task.await.unwrap();
+    assert_eq!(failed.reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(failed.restart_count, 1, "one attempt, not the whole budget");
+}

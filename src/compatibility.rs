@@ -127,6 +127,8 @@ pub struct Compatibility {
 /// fences share one slot format: magic, generation, payload length, payload
 /// and CRC32, two slots of a power-of-two stride of at least 512 bytes (#902).
 /// A refused launch's `reason` on `/v1/status` instance rows (#881).
+/// The process owner record's `gate`, what the execution gate reported
+/// about its `exec`, and the gate's stdin is now a socket pair (#905).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

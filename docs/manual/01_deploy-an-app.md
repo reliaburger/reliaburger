@@ -245,10 +245,14 @@ default__ghost-0 (ghost, namespace default) failed on node-1: binary not found: 
 A bare name like `bun` is looked up on the app's `PATH`, the way a shell would.
 A directory, or a file without an execute bit, fails with `binary not
 executable` instead. `relish wtf` raises a critical `launch-failed` finding
-with the same reason. Waiting won't fix this one, so nothing waits: install
-the binary, or fix the spec and apply it again. In a cluster, the node's
-placement reconciler tries the deploy again on its usual backoff (five seconds,
-doubling to five minutes), so installing the binary is enough on its own.
+with the same reason. The same goes for a binary deleted while the deploy is
+starting it, and for a running app whose binary is deleted: the app keeps
+running, but when it exits, its restart fails at once with the reason instead
+of using up its restart attempts. Waiting won't fix this one, so nothing
+waits: install the binary, or fix the spec and apply it again. In a cluster,
+the node's placement reconciler tries the deploy again on its usual backoff
+(five seconds, doubling to five minutes), so installing the binary is enough
+on its own.
 
 ## When a node stops reporting
 
