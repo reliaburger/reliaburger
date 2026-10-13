@@ -1588,6 +1588,20 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **Recovery:** Automatic for a warm pin. For a cold one, the task fails after the client's retries and the task pool retries the attempt as usual. Configure `[images] mirrors` to keep a public registry's rate limit out of the path.
 
+### 7.12 A Consumer-Sync Turn Over the Turn Budget
+
+**What happens:** A leader answer that changes a node's consumer view runs through the agent loop as a sequence of steps, one a turn (#505, #603): `candidate` reads the runtime's launch inventory and builds the view, `journal` records the answer and journals its first change, then `withdraw`, `prove_receipts` and `publish` after a recovery, then `activate` and `compact`. Each step takes at most one fsync'd discovery-journal write or one inventory read. The two steps that install a view (`journal` for a node that's already active, and `publish`) also write every service's kernel entry under the shared eBPF handle's lock, rebuild the routing table and reconcile the namespace firewall, whose runtime cgroup reads stop at the turn's 500 ms deadline. In the 0.2.0 fast soak two nodes took one such turn of about 1.9 s each in the same second (#890).
+
+**Detection:** The turn histogram `bun_agent_loop_turn_seconds{branch="follow_up"}`, which the V02 soak checks against the 1 s budget, and the slow-turn log line. The line names the step, and from 0.2.1 it also lists what the turn's timed parts took: the journal write, the inventory read, the wait for the eBPF lock (job tasks, fault injection and traces hold it too), the view install and the firewall sync. Parts can nest, so the lock wait also counts inside the install or the sync:
+
+```
+bun: agent loop turn took 1902 ms in follow_up (consumer_sync/journal): journal write 1400 ms, kernel lock wait 3 ms, view install 6 ms, firewall sync 480 ms
+```
+
+**Impact:** Every caller waits for the turn in progress, so status, commands and deploy steps on that node wait up to the turn's length. The view itself stays correct: the steps keep their order, and the journal lists every view that may be exposed before the kernel sees it.
+
+**Recovery:** Automatic; the next turn runs normally. The view's size isn't the cost: a thousand services, first published and then with every backend moved, take each turn well within the budget less its journal write (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`), and the soak runs a handful. Which await held the soak's turns is still open in #890. The next soak's log line will say.
+
 ---
 
 ## 8. Security Considerations

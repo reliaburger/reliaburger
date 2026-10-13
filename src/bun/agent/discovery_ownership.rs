@@ -491,10 +491,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         else {
             return Err(failure("discovery ownership changed during update".into()));
         };
+        let started = std::time::Instant::now();
         #[cfg(test)]
         self.loop_stalls.hold(super::LoopStall::Persist).await;
         // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
-        match journal.persist(next).await {
+        let persisted = journal.persist(next).await;
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::JournalWrite,
+            started.elapsed(),
+        );
+        match persisted {
             Ok(journal) => {
                 self.discovery_ownership = if recovered {
                     DiscoveryOwnership::Recovered(journal)
