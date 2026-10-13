@@ -109,9 +109,9 @@
   },
   {
     "source": "src/grill/snapshot.rs",
-    "function": "interrupted_snapshot_is_cleaned_up_on_restart",
+    "function": "btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
     "binary": "reliaburger",
-    "test": "grill::snapshot::tests::interrupted_snapshot_is_cleaned_up_on_restart"
+    "test": "grill::snapshot::tests::btrfs_interrupted_snapshot_is_cleaned_up_on_restart"
   },
   {
     "source": "src/grill/snapshot.rs",

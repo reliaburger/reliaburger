@@ -2378,7 +2378,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1; run with make test-linux"]
-    fn interrupted_snapshot_is_cleaned_up_on_restart() {
+    fn btrfs_interrupted_snapshot_is_cleaned_up_on_restart() {
         let fs = ScratchBtrfs::new();
         let volumes = crate::grill::volume::VolumeManager::new(&fs.mount);
         let live = volumes
