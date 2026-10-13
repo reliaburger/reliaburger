@@ -21,6 +21,10 @@ use crate::file_lock::{FileLock, FileLockError};
 
 mod prune;
 
+/// How many times `prepare` starts again after a concurrent forget removed
+/// the identity it was replacing.
+const PREPARE_ATTEMPTS: usize = 3;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessControl {
     root: PathBuf,
@@ -169,7 +173,22 @@ impl ProcessControl {
         .await
     }
 
+    /// Publish a new prepared generation of `id`, replacing a retired one.
     pub(crate) async fn prepare(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
+        // Forgetting the retired generation (#738, #850) can remove the
+        // identity while this waits for its locks, as when an app is deleted
+        // and applied again at once. Nothing owns it then, so prepare again
+        // from nothing, exactly as on a new node.
+        for _ in 1..PREPARE_ATTEMPTS {
+            match self.prepare_once(id, spec).await {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                result => return result,
+            }
+        }
+        self.prepare_once(id, spec).await
+    }
+
+    async fn prepare_once(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
         let previous_nonce = self
             .run(id, |this, id| {
                 match std::fs::symlink_metadata(this.directory(&id)?) {
@@ -206,7 +225,8 @@ impl ProcessControl {
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     if previous_nonce.is_some() {
-                        return Err(io::Error::other(
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
                             "process generation disappeared before preparation",
                         ));
                     }
