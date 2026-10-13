@@ -1280,7 +1280,7 @@ Deleting by digest answers `405 UNSUPPORTED`. The OCI spec allows a registry to 
 
 ### A plaintext cluster has no registry
 
-While building all this we kept seeing one line in the upgrade fixture's logs, once a second, forever: `pickle: registry cleanup pending: replication failed: registry leader refused proposal: 403 Forbidden`. A missing token? No. The fixture runs a cluster with a master key but no node certificates, like every `relish dev` cluster. A node sends its registry proposals and queries to the leader's `/v1/registry/propose` and `/v1/registry/query`, and the leader works out *which node is asking* from the TLS client certificate. No certificate, no answer. The lease reaper asks every second, so it got refused every second.
+While building all this we kept seeing one line in the upgrade fixture's logs, once a second, forever: `pickle: registry cleanup pending: replication failed: registry leader refused proposal: 403 Forbidden`. A missing token? No. The fixture runs a cluster with a master key but no node certificates, like every `relish dev` cluster did back then. A node sends its registry proposals and queries to the leader's `/v1/registry/propose` and `/v1/registry/query`, and the leader works out *which node is asking* from the TLS client certificate. No certificate, no answer. The lease reaper asks every second, so it got refused every second.
 
 We had three ways out. Accept the service token alone on plaintext clusters, and any holder of the token could claim to be any node and report copies it doesn't have. Have the leader answer its own queries locally, and the followers stay broken. Or keep the endpoints mTLS-only and say so clearly. We took the last one. A plaintext cluster is a development convenience, and a registry that trusts whoever claims to be node 3 isn't something we want to grow a second code path for.
 
@@ -1322,6 +1322,10 @@ pub fn record(&mut self, result: &Result<(), PickleError>) -> Option<String> {
 ```
 
 `Option::take` moves the value out and leaves `None` behind, in one step. It's how you empty an `Option` you only borrow mutably: the borrow checker won't let you move out of `&mut self` and leave a hole, so `take` swaps in a valid value as it goes. `as_ref` turns `&Option<String>` into `Option<&String>`, so the comparison borrows instead of cloning. A new problem prints, a repeat prints nothing, and the first success afterwards prints once. `plaintext_cluster_registry_cleanup_is_refused_once_with_the_mtls_answer` serves the real Bun API without TLS, counts the requests it receives, runs six reaper ticks and checks for exactly one line and zero requests. Over mTLS, `worker_and_follower_pushes_commit_through_the_advertised_leader` runs the same tick and watches the retirement apply.
+
+That left one awkward consequence. Pickle is also the pull-through cache for Docker Hub, and the image store asks it first for every short name such as `nginx:1.27`. On a plaintext cluster that question fails with "the registry needs mTLS", and nothing falls back to Docker Hub directly. So a plaintext cluster with a container runtime couldn't run short-name images at all, and `relish dev` clusters were plaintext.
+
+We could have added the fallback on plaintext clusters only. We didn't (#870). The no-fallback rule exists so a cluster never quietly bypasses its own cache and image policy, and a rule with an "except when security is off" clause is a strange rule. We fixed the cause instead: clusters are mTLS by default now (chapter 4 has the details), `relish dev create` enrols every VM, and plaintext survives only as the explicit `relish init --development-plaintext`. On such a cluster you name the registry host in full (`ghcr.io/...`), or you don't use short names.
 
 ## Tests
 

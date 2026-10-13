@@ -683,6 +683,13 @@ without the required master key/service token cannot renew automatically. An
 identity that expired while offline needs authorised re-enrolment. Leaf renewal
 does not rotate the cluster CAs; CA rotation remains separately tracked.
 
+`require_mtls` defaults to `true`, so a node config with no `[security]`
+section fails closed: `bun --cluster` with no identity on disk refuses to start
+and tells you to run `relish init` (or `relish join` on a joiner). Single-node
+`bun`, without `--cluster`, doesn't read the setting and needs no identity.
+`relish dev create` and `relish setup --quickstart` both build an mTLS cluster
+for you.
+
 If you specifically need plaintext transports for an isolated local test,
 make that exception explicit:
 
@@ -692,8 +699,11 @@ cargo run --bin relish -- init cluster --development-plaintext
 
 That command writes `require_mtls = false`, embeds a warning in the generated
 file and prints a warning. Bun repeats the warning whenever that config starts
-in cluster mode. `relish dev create` does the same for its deliberately local
-Lima-VM configuration. Do not reuse either config on a shared network.
+in cluster mode. Do not reuse that config on a shared network. A plaintext
+cluster has no cluster registry, because the registry needs mTLS, so it can't
+pull Docker Hub short names such as `nginx:1.27`: Reliaburger never bypasses
+the cluster registry with a direct Docker Hub pull. Name the registry host in
+full (`ghcr.io/...`), or use an mTLS cluster.
 
 ### CLI (relish)
 
@@ -776,14 +786,15 @@ a release that trusts both old and new keys, then dropping the old one.
 
 ```sh
 relish dev create mycluster --nodes 3
-limactl shell reliaburger-1 relish nodes     # all three nodes
-limactl shell reliaburger-1 relish council   # every node's council view + leader
+limactl shell reliaburger-mycluster-1 relish nodes     # all three nodes
+limactl shell reliaburger-mycluster-1 relish council   # every node's council view + leader
 relish dev destroy mycluster
 ```
 
 Notes:
 
-- **Lima required** (`brew install lima`). VMs use Lima's `user-v2` network so they can reach each other with no `socket_vmnet`/sudo setup; each node advertises its inter-VM IP. That network isn't routable from the host, so run `relish nodes`/`council` *inside* a node (`limactl shell reliaburger-1 …`), where the CLI reaches the local agent on `127.0.0.1:9117`.
+- **mTLS, like any other cluster.** `dev create` generates the cluster's CA, master key and an administrator token on the host (kept in `~/.reliaburger/dev/clusters/<name>.security/` until `dev destroy`), gives the first node its identity, then enrols every other node with a join token and `relish join`. Each VM's `relish` gets a context file holding the administrator token and the root CA, so it reaches its local agent over HTTPS with no flags.
+- **Lima required** (`brew install lima`). VMs use Lima's `user-v2` network so they can reach each other with no `socket_vmnet`/sudo setup; each node advertises its inter-VM IP. That network isn't routable from the host, so run `relish nodes`/`council` *inside* a node (`limactl shell reliaburger-mycluster-1 …`), where the CLI reaches the local agent on `127.0.0.1:9117`.
 - **Binaries are built from your current tree, not downloaded.** `dev create` builds `bun`/`relish` for Linux inside the persistent build VM (the same one `relish dev test` uses), so the **first `create` is slow** (a full build); later runs are incremental.
 - `--bun <path>` / `--relish <path>` install a pre-built Linux binary instead, skipping the build.
 

@@ -1010,7 +1010,7 @@ async fn plaintext_cluster_registry_cleanup_is_refused_once_with_the_mtls_answer
     let hierarchy = ca::generate_ca_hierarchy("registry-plaintext", &IKM).unwrap();
     let leader = council(&hierarchy, true).await;
     let follower = council(&hierarchy, false).await;
-    // The real Bun API, served without TLS the way a `relish dev` or
+    // The real Bun API, served without TLS the way a development-plaintext or
     // upgrade-fixture leader serves it.
     let requests = Arc::new(AtomicUsize::new(0));
     let counted = requests.clone();
