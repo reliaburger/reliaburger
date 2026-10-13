@@ -29,9 +29,15 @@ owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
-`make test` first runs `make warm-executables`: it builds the `[[bin]]`
-targets (`bun`, `relish`, `testapp`) and, on macOS, runs each once with
-`--help` ([`warm_executables.py`](../scripts/ci/warm_executables.py)). macOS
+`make test` first runs `make warm-executables`: it builds the suite with
+`cargo test --no-run`, which builds the `[[bin]]` targets (`bun`, `relish`,
+`testapp`) as the tests use them, and, on macOS, runs each binary once with
+`--help` ([`warm_executables.py`](../scripts/ci/warm_executables.py)). It
+used to run `cargo build --bins`, which resolves features without the
+dev-dependencies (`proc-macro2`'s `span-locations` is one), so nextest's own
+build then compiled the library and the binaries a second time and replaced
+the files the step had just warmed
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). macOS
 assesses the first exec of every new executable before it runs, one file at a
 time across the host, and outside a terminal with the Developer Tools
 permission (a CI runner, a launchd service, a sandboxed agent) that costs
@@ -242,7 +248,14 @@ a failure in shard 2 reproduces locally with
 `cargo nextest run --partition hash:2/3`. Each shard compiles the suite
 itself, and compiling is most of a macOS job: on the first sharded run each
 shard spent about 38 minutes compiling and under 3 testing (7 unsharded), so
-a shard takes 42–44 minutes, level with acceptance. Building once and sharing
+a shard took 42–44 minutes. That included a second build of the library and
+binaries, 8–10 minutes of it, until `warm-executables` switched to
+`cargo test --no-run`
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). Across nine
+runs before that change, shard jobs took 23.6–46.1 minutes, with the slowest
+shard in a run at a median of about 41.6. On the first full run after it,
+shards took 31.0–35.8 minutes, the "Portable tests" step 29.1–34.7 of that,
+still a few minutes longer than acceptance (26.5–32.6). Building once and sharing
 a nextest archive would take the compile off two of the three runners, but not
 off the critical path. One shard runs `make lint-macos` and another the
 doctests. A shard re-run on its own keeps its own attempt; the evidence gate
