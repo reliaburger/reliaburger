@@ -3099,6 +3099,7 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
 
     let shutdown = CancellationToken::new();
     let mut nodes = Vec::new();
+    let mut services = Vec::new();
     for index in 0..3usize {
         let data = root.join(format!("node-{index}"));
         std::fs::create_dir_all(&data).unwrap();
@@ -3118,6 +3119,12 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
             },
             NodeRunner::Owned(Box::new(runner)),
         );
+        let service = Arc::new(TaskArrayService::with_timings(
+            Some(Arc::new(executor)),
+            Duration::from_millis(200),
+            Duration::from_secs(3),
+        ));
+        services.push(Arc::downgrade(&service));
         nodes.push(
             cluster_support::start_wired_node(cluster_support::WiredNodeOptions {
                 name: format!("loss{index}"),
@@ -3140,11 +3147,7 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
                 fault_injection: false,
                 labels: Default::default(),
                 keep_data_dir: false,
-                task_arrays: Some(Arc::new(TaskArrayService::with_timings(
-                    Some(Arc::new(executor)),
-                    Duration::from_millis(200),
-                    Duration::from_secs(3),
-                ))),
+                task_arrays: Some(service),
                 task_arrays_on_agent_budget: None,
             })
             .await,
@@ -3346,32 +3349,59 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         template["runtime"],
         held_at_loss.len()
     );
-    shutdown.cancel();
-    // Idle executors retire on their own; leave no runtime owner behind.
+    // Every executor must retire and be forgotten while its node still
+    // runs. Cancelling the nodes first left their pools retiring executors
+    // the runtime already reported stopped: one pool's forget recreated
+    // its route claim under `root` while the teardown removed it (#924).
+    // The lost leader's pool went with its control plane, so its idle
+    // executors stop without being forgotten. A restarted Bun's startup
+    // sweep forgets them (#678); run that sweep here.
+    let lost_runner =
+        OwnedRunner::for_data_dir(runtime.clone(), &root.join(format!("node-{leader}"))).unwrap();
+    let routes = root.join("instances/runtime-routes");
     let until = deadline(120);
     loop {
-        let mut running = 0;
-        for launch in runtime
+        lost_runner.forget_retired_executors().await;
+        let launches: Vec<_> = runtime
             .launch_inventory()
             .await
             .unwrap()
             .unwrap_or_default()
-        {
-            if runtime.state(&launch.instance_id).await.ok() == Some(ContainerState::Running) {
-                running += 1;
-            }
-        }
-        if running == 0 {
+            .into_iter()
+            .map(|launch| launch.instance_id.0)
+            .collect();
+        let claims: Vec<_> = std::fs::read_dir(&routes)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        if launches.is_empty() && claims.is_empty() {
             break;
         }
         assert!(
             tokio::time::Instant::now() < until,
-            "{running} executors still running"
+            "executors not retired and forgotten: {launches:?}, route files {claims:?}"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    drop(lost_runner);
     // Retirement tears each executor's network down with it (#786).
     assert_eq!(residue.namespaces(), Vec::<String>::new());
+    shutdown.cancel();
+    // Dropping the nodes joins their agent, API and Raft tasks. Each node's
+    // leader loop stops by itself once its agent has, after finishing any
+    // tick in progress, and that tick may still sync a node's ledger. The
+    // last reference to a node's task-array service goes with the loop.
+    drop(nodes);
+    let until = deadline(30);
+    while services.iter().any(|service| service.strong_count() > 0) {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "a node's task-array service outlived its node"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(residue);
     std::fs::remove_dir_all(root).unwrap();
 }

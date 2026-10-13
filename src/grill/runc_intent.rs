@@ -265,9 +265,12 @@ impl IntentJournal {
                     // No caller may allocate resources until atomic publication.
                     continue;
                 }
-                inventory.push(journal.load(&InstanceId(name))?.ok_or_else(|| {
-                    io::Error::other("runtime intent disappeared during inventory")
-                })?);
+                // `IntentClaim::forget` unpublishes a record with one rename,
+                // so a record listed here and gone now was forgotten in
+                // between: it has left the inventory (#924).
+                if let Some(intent) = journal.load(&InstanceId(name))? {
+                    inventory.push(intent);
+                }
             }
             inventory.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
             Ok(inventory)
@@ -305,11 +308,22 @@ impl IntentJournal {
         if !existing_directory(&directory)? {
             return Ok(None);
         }
-        let record: RuntimeIntent = read_json(
+        let record: RuntimeIntent = match read_json(
             &directory.join("intent.json"),
             RECORD_LIMIT,
             Access::OwnerOnly,
-        )?;
+        ) {
+            Ok(record) => record,
+            // Publication is atomic, so a published directory always holds
+            // its record. One that vanished since the check above was
+            // forgotten in between (#924).
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && !existing_directory(&directory)? =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if record.version != 5
             || record
                 .boot_id
@@ -619,11 +633,9 @@ fn validate_instance(instance: &InstanceId) -> io::Result<()> {
 }
 
 fn existing_directory(path: &Path) -> io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            validate_directory(path)?;
-            Ok(true)
-        }
+    match std::fs::symlink_metadata(path).and_then(|_| validate_directory(path)) {
+        Ok(()) => Ok(true),
+        // Gone before or while it was validated: a forget renamed it away.
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }

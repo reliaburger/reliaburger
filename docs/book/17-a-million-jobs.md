@@ -1271,6 +1271,90 @@ were looking". `read_bounded` now opens the path again in that case, a bounded
 number of times, and the test reproduces the exact interleaving: open, rename,
 validate.
 
+Forgetting has races of its own. An executor pool forgets each executor
+as it goes idle (#678): the host backend renames the executor's directory into
+a private `forgotten-process-owners` directory and deletes it there, then the
+mixed adapter removes the route and its lock. A three-node leader-loss test
+failed its very last line, `remove_dir_all` on the fixture, with "Directory not
+empty" (#924). Listing the fixture at that moment named the writer: a route
+lock, `runtime-routes/<executor>.lock`, created four milliseconds earlier. The
+test had waited until no executor was `Running`, cancelled the nodes, and
+deleted the tree. But a pool goes on retiring an executor after the runtime
+reports it stopped. It still removes the executor's files and forgets its
+identity, and taking the route's lock recreated the directory the test had
+just removed. Nothing was lying about being retired. The test was asking the
+wrong question.
+
+Looping the test in the VM turned up real bugs on the way. Forgets of
+different executors run at once and share the garbage directory, and each one
+starts by sweeping what earlier forgets left there. So one forget could delete
+another's directory mid-deletion, and the loser failed with "No such file or
+directory". Its executor was already out of the inventory, but the adapter
+gave up before removing the route, and the pool logged `metadata kept` about
+once a run. The deletion now treats a tree that someone else finished as
+deleted:
+
+```rust
+fn remove_forgotten(path: &Path) -> io::Result<()> {
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Err(absent) if absent.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(other) => return Err(other),
+                    Ok(_) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+```
+
+A match arm can carry a guard, `if error.kind() == ...`, and only matches when
+the guard holds. Any other error still fails the forget. The loop can't spin
+for ever: every pass removes what's left of a tree that only shrinks.
+
+The second bug was in inventory, three times over. Every layer builds its
+snapshot the same way: list a directory, then read each entry. The host
+backend lists its owner directories and loads each record; the runc intent
+journal lists its records and loads each one; the mixed adapter lists both
+backends and then reads each launch's route. A forget that finishes between
+the list and the read leaves the reader holding a name with nothing behind
+it, and all three failed the whole snapshot: "No such file or directory",
+"runtime intent disappeared during inventory", "mixed-runtime route is
+absent". That's the error an agent turn gets when it needs a complete
+inventory, so a busy job node could refuse turns while its pools tidied up.
+It also broke the forgets themselves, because a forget reads the inventory
+to prove the executor has gone, and gave up with the route still on disk.
+The runc variant of the leader-loss test, once it checked that every executor
+was really forgotten, failed four runs in twenty-nine on exactly that.
+
+Each fix leans on the same fact: a forget unpublishes with one `rename`, and
+publication is atomic too, so a published entry is never half there. A name
+that was listed and is now absent has left, and the snapshot leaves it out.
+The mixed adapter needs one more step, because its two halves live in
+different places. A forget removes the backend's launch before the route, so
+a missing route means the backend no longer lists the launch, which has just
+left, or still lists it, which is a real inconsistency the snapshot still
+refuses. The mock runtime can now answer one inventory read from before a
+change, which makes that test exact: it failed with the error from the VM
+before the fix. The host and runc tests race many forgets against a reader
+and failed every run or most runs before.
+
+The test now waits for the real end state while the nodes still run: no
+launch in the inventory and no route files left. The lost leader's pool went
+with its control plane, so its idle executors stop without being forgotten;
+the test runs the startup sweep a restarted Bun would run for them. Only then
+does it cancel the nodes. Each node's task-array leader loop is detached and
+ends after its current tick, which may still write a ledger, so the test keeps
+a `Weak` reference to every node's task-array service and waits for those
+references to die. `Arc::downgrade` makes a `Weak` from an `Arc`: it points at
+the same value but doesn't keep it alive, and `strong_count` says how many
+`Arc`s still do. When that reaches zero the service is gone, and nothing it
+owned can write any more.
+
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
 secrets catalogue skipped all its container tests. Now the classifier sees the

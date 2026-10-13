@@ -134,7 +134,21 @@ impl ProcessControl {
                             continue;
                         }
                         let instance_id = InstanceId(name);
-                        let record = this.load(&instance_id)?;
+                        let record = match this.load(&instance_id) {
+                            Ok(record) => record,
+                            // `forget_retired` unpublishes a generation with
+                            // one rename, so one listed above and gone now
+                            // was forgotten in between: it has left (#924).
+                            Err(error)
+                                if error.kind() == io::ErrorKind::NotFound
+                                    && std::fs::symlink_metadata(entry.path()).is_err_and(
+                                        |absent| absent.kind() == io::ErrorKind::NotFound,
+                                    ) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         let launch = record.launch;
                         launches.push(super::RuntimeLaunch {
                             generation: super::RuntimeGeneration::process(&record.nonce),
