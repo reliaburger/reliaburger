@@ -10,6 +10,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::oci;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
@@ -132,18 +133,21 @@ pub fn cases() -> Vec<TestCase> {
             name: "push_and_pull_image_roundtrip",
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry],
+            lease: LeaseScope::Applications,
             run: testkit_case!(push_and_pull_image_roundtrip),
         },
         TestCase {
             name: "manifest_catalog_lists_pushed_image",
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry],
+            lease: LeaseScope::Applications,
             run: testkit_case!(manifest_catalog_lists_pushed_image),
         },
         TestCase {
             name: "deploy_from_cluster_registry",
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry, Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(deploy_from_cluster_registry),
         },
     ]

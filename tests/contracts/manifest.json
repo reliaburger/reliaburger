@@ -13,6 +13,7 @@
       "required_in": [
         "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -42,6 +43,7 @@
       "required_in": [
         "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -55,6 +57,7 @@
         "test-rootless-runc"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -68,6 +71,7 @@
         "test-linux"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -80,6 +84,7 @@
         "scripts/release/qualify-oci-interruptions.sh"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -93,6 +98,7 @@
         "test-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -106,6 +112,7 @@
         "test-slow"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -119,6 +126,7 @@
         "test-upgrade-node"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -132,6 +140,7 @@
         "test-upgrade-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -145,6 +154,7 @@
         "test-standard-clients"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     }
@@ -6334,33 +6344,6 @@
       ]
     },
     {
-      "id": "issue-555-original-standard-clients",
-      "issue": 555,
-      "promise": "Complete all uncovered original ignored cases through their declared owner.",
-      "supported_paths": [
-        "Original finite source/test identity retains its owner binding."
-      ],
-      "refused_paths": [
-        "Missing, skipped, unfinished or wrong-owner success cannot qualify."
-      ],
-      "boundaries": [
-        "Inherited host/feature selection must be checked by actual discovery; source tables have no CI authority."
-      ],
-      "cases": [
-        {
-          "id": "legacy-ci-reliaburger-suite-registry_standard_clients-crane_logs_in_pushes_and_pulls_over_tls",
-          "binary": "reliaburger::suite",
-          "test": "registry_standard_clients::crane_logs_in_pushes_and_pulls_over_tls",
-          "requires": [
-            "standard-clients"
-          ],
-          "sources": [
-            "tests/suite/registry_standard_clients.rs"
-          ]
-        }
-      ]
-    },
-    {
       "id": "issue-588-a_task_array_survives_losing_a_node_mid_run",
       "issue": 588,
       "promise": "Delegated arrays retain unique accepted outcomes after worker loss.",
@@ -7503,6 +7486,88 @@
           ],
           "sources": [
             "tests/registry_durability.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-698-standard-clients",
+      "issue": 698,
+      "promise": "docker, podman, skopeo and crane log in to Pickle with an API token, verify the cluster CA, push an image and pull its layers back.",
+      "supported_paths": [
+        "A Pickle TLS listener on a non-loopback address under a name its node certificate carries, with the cluster root CA in /etc/docker/certs.d, /etc/containers/certs.d, skopeo --cert-dir or crane's SSL_CERT_FILE."
+      ],
+      "refused_paths": [
+        "A wrong token, a registry certificate from another CA, and a namespace-scoped token pushing outside its namespace are each refused by the client."
+      ],
+      "boundaries": [
+        "Linux only, on a host prepared by scripts/standard-clients-host.sh; client versions are whatever the runner image ships and are logged by the gate. oras is not exercised."
+      ],
+      "cases": [
+        {
+          "id": "standard-clients-docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_refuses_a_registry_signed_by_another_ca",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_refuses_a_registry_signed_by_another_ca",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-skopeo_copies_between_repositories_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::skopeo_copies_between_repositories_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-crane_pulls_layers_back_with_ca_verification",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
           ]
         }
       ]
