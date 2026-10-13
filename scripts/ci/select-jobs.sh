@@ -15,9 +15,12 @@
 #     portable Linux, the demo app and the optimized contract boundaries
 #     answer in about 15 minutes; macOS, the heavy suites and the benchmarks
 #     wait for the merge queue and the push to the train, which run
-#     everything on the merged result. A `full-ci` label, or a head that is
-#     itself a train, still gets everything.
+#     everything on the merged result. A `full-ci` label adds the heavy suites
+#     and the benchmarks but still not macOS: three macOS runners per PR
+#     queued for over an hour. A head that is itself a train gets everything.
 #   - into main, or from a train: everything the change touches.
+#   The evidence gate names the full-ci train selection `train-full`
+#   (scripts/ci/workflow_assembly.py) and accepts it on pull requests only.
 #   - other stacked PRs: macOS but not the heavy suites, unless labelled
 #     full-ci; they run in full once the PR targets main.
 #
@@ -100,6 +103,11 @@ fi
 
 if [ "$into_a_train" = true ] && [ "$from_a_train" = false ] && [ "${FULL_CI}" != true ]; then
     emit true false false false false
+    exit 0
+fi
+
+if [ "$into_a_train" = true ] && [ "$from_a_train" = false ]; then
+    emit true "$gossip" true "$task_arrays" false
     exit 0
 fi
 

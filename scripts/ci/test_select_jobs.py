@@ -176,11 +176,29 @@ class SelectJobsTests(unittest.TestCase):
         self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base),
                          {"code": True, "gossip": False, "heavy": False, "task_arrays": False, "macos": False})
 
-    def test_the_full_ci_label_runs_everything_on_a_release_train_pull_request(self):
+    def test_the_full_ci_label_on_a_release_train_pull_request_runs_the_heavy_suites_but_not_macos(self):
+        # Most train PRs need full-ci for privileged Linux, cluster and
+        # acceptance; three macOS runners each time queued for over an hour.
+        # The merge queue and the push to the train still run macOS.
         base = self.stacked_base()
         self.pull_request("src/lib.rs", "src/mustard/gossip.rs")
         self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base, full_ci=True),
-                         {"code": True, "gossip": True, "heavy": True, "task_arrays": False, "macos": True})
+                         {"code": True, "gossip": True, "heavy": True, "task_arrays": False, "macos": False})
+
+    def test_the_full_ci_label_still_runs_macos_outside_a_release_train(self):
+        base = self.stacked_base()
+        self.pull_request("src/lib.rs")
+        for base_ref, base_sha in [("main", self.main), ("fix/base", base)]:
+            with self.subTest(base=base_ref):
+                self.assertEqual(self.repo.select(base_ref=base_ref, base_sha=base_sha, full_ci=True),
+                                 {"code": True, "gossip": False, "heavy": True, "task_arrays": False,
+                                  "macos": True})
+
+    def test_a_train_heading_into_another_train_runs_macos_even_with_full_ci(self):
+        base = self.stacked_base()
+        self.pull_request("src/lib.rs")
+        self.assertTrue(self.repo.select(base_ref="release-1-1-5", base_sha=base, head_ref="release-1-1-4",
+                                         full_ci=True)["macos"])
 
     def test_a_release_train_heading_anywhere_runs_everything(self):
         # The gate PR (release-* into main) and any PR whose head is a train.
