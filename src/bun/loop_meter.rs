@@ -91,6 +91,87 @@ impl LoopBranch {
     }
 }
 
+/// A slow await inside a turn that the meter times, so a slow turn's log
+/// line can say where its time went (#890). Parts may nest: the kernel
+/// lock wait inside a view install counts towards both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnPart {
+    /// An fsync'd discovery journal write.
+    JournalWrite,
+    /// A read of the runtime's launch inventory.
+    RuntimeInventory,
+    /// Waiting for the eBPF handle's lock, which job tasks, faults and
+    /// traces share with the loop.
+    KernelLock,
+    /// Installing a consumer view: kernel entries, routing table and DNS.
+    ViewInstall,
+    /// Reconciling the namespace-firewall maps, runtime cgroup reads included.
+    FirewallSync,
+}
+
+impl TurnPart {
+    /// Every part, in the order a slow turn's line lists them.
+    const ALL: [TurnPart; 5] = [
+        TurnPart::JournalWrite,
+        TurnPart::RuntimeInventory,
+        TurnPart::KernelLock,
+        TurnPart::ViewInstall,
+        TurnPart::FirewallSync,
+    ];
+
+    /// How the slow-turn line names it.
+    fn label(self) -> &'static str {
+        match self {
+            TurnPart::JournalWrite => "journal write",
+            TurnPart::RuntimeInventory => "runtime inventory",
+            TurnPart::KernelLock => "kernel lock wait",
+            TurnPart::ViewInstall => "view install",
+            TurnPart::FirewallSync => "firewall sync",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What each part of the turn in progress has taken so far, and how often
+/// the turn reached it.
+struct PartTimes {
+    nanos: [AtomicU64; TurnPart::ALL.len()],
+    reached: [AtomicU64; TurnPart::ALL.len()],
+}
+
+impl PartTimes {
+    const fn new() -> Self {
+        Self {
+            nanos: [const { AtomicU64::new(0) }; TurnPart::ALL.len()],
+            reached: [const { AtomicU64::new(0) }; TurnPart::ALL.len()],
+        }
+    }
+
+    fn clear(&self) {
+        for part in TurnPart::ALL {
+            self.nanos[part.index()].store(0, Ordering::Relaxed);
+            self.reached[part.index()].store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn add(&self, part: TurnPart, took: Duration) {
+        let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        self.nanos[part.index()].fetch_add(nanos, Ordering::Relaxed);
+        self.reached[part.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Each part's total, or `None` for a part the turn never reached.
+    fn snapshot(&self) -> [Option<Duration>; TurnPart::ALL.len()] {
+        TurnPart::ALL.map(|part| {
+            (self.reached[part.index()].load(Ordering::Relaxed) > 0)
+                .then(|| Duration::from_nanos(self.nanos[part.index()].load(Ordering::Relaxed)))
+        })
+    }
+}
+
 /// One turn in progress: which branch, what it handled, when it began.
 #[derive(Debug, Clone, Copy)]
 pub struct Turn {
@@ -116,6 +197,15 @@ pub struct TurnRecord {
     pub branch: LoopBranch,
     pub detail: Option<&'static str>,
     pub took: Duration,
+    parts: [Option<Duration>; TurnPart::ALL.len()],
+}
+
+#[cfg(test)]
+impl TurnRecord {
+    /// What `part` took in this turn, or `None` if the turn never reached it.
+    pub fn part(&self, part: TurnPart) -> Option<Duration> {
+        self.parts[part.index()]
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +251,9 @@ impl BranchHistogram {
 /// metrics collector holds another and reads it every interval.
 pub struct LoopTurnMeter {
     branches: [BranchHistogram; LoopBranch::ALL.len()],
+    /// The timed parts of the turn in progress. The loop runs one turn at a
+    /// time, so one set serves every turn, and `begin` clears it.
+    parts: PartTimes,
     /// Test-only: the longest finished turn and the turn in progress. A
     /// `std` mutex is fine here: it guards a copy and is never held across
     /// an `await`.
@@ -168,6 +261,9 @@ pub struct LoopTurnMeter {
     worst: std::sync::Mutex<Option<TurnRecord>>,
     #[cfg(test)]
     in_flight: std::sync::Mutex<Option<Turn>>,
+    /// Test-only: the turn that finished last.
+    #[cfg(test)]
+    last: std::sync::Mutex<Option<TurnRecord>>,
 }
 
 impl Default for LoopTurnMeter {
@@ -181,16 +277,20 @@ impl LoopTurnMeter {
     pub fn new() -> Self {
         Self {
             branches: [const { BranchHistogram::new() }; LoopBranch::ALL.len()],
+            parts: PartTimes::new(),
             #[cfg(test)]
             worst: std::sync::Mutex::new(None),
             #[cfg(test)]
             in_flight: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            last: std::sync::Mutex::new(None),
         }
     }
 
     /// Start timing a turn of `branch`. `detail` names the command or deploy
     /// op it handles, for the slow-turn log.
     pub fn begin(&self, branch: LoopBranch, detail: Option<&'static str>) -> Turn {
+        self.parts.clear();
         let turn = Turn {
             branch,
             detail,
@@ -203,32 +303,58 @@ impl LoopTurnMeter {
         turn
     }
 
+    /// Add `took` to what `part` has cost the turn in progress.
+    pub fn add_part(&self, part: TurnPart, took: Duration) {
+        self.parts.add(part, took);
+    }
+
     /// Record a finished turn, and log it when it ran long.
     pub fn finish(&self, turn: Turn) {
         let took = turn.started.elapsed();
         self.branches[turn.branch.index()].observe(took);
         if took >= SLOW_TURN_LOG_THRESHOLD {
-            eprintln!(
-                "bun: agent loop turn took {} ms in {}",
-                took.as_millis(),
-                turn.describe()
-            );
+            eprintln!("{}", self.slow_turn_line(&turn, took));
         }
         #[cfg(test)]
         {
+            let record = TurnRecord {
+                branch: turn.branch,
+                detail: turn.detail,
+                took,
+                parts: self.parts.snapshot(),
+            };
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 *in_flight = None;
             }
             if let Ok(mut worst) = self.worst.lock()
-                && worst.is_none_or(|record| record.took < took)
+                && worst.is_none_or(|worst| worst.took < took)
             {
-                *worst = Some(TurnRecord {
-                    branch: turn.branch,
-                    detail: turn.detail,
-                    took,
-                });
+                *worst = Some(record);
+            }
+            if let Ok(mut last) = self.last.lock() {
+                *last = Some(record);
             }
         }
+    }
+
+    /// The log line for a turn that took `took`: its branch and what it
+    /// handled, then every part it timed.
+    fn slow_turn_line(&self, turn: &Turn, took: Duration) -> String {
+        let mut line = format!(
+            "bun: agent loop turn took {} ms in {}",
+            took.as_millis(),
+            turn.describe()
+        );
+        let parts: Vec<String> = TurnPart::ALL
+            .into_iter()
+            .zip(self.parts.snapshot())
+            .filter_map(|(part, took)| Some(format!("{} {} ms", part.label(), took?.as_millis())))
+            .collect();
+        if !parts.is_empty() {
+            line.push_str(": ");
+            line.push_str(&parts.join(", "));
+        }
+        line
     }
 
     /// The histogram as Mayo samples: cumulative `_bucket{branch,le}`, plus
@@ -293,12 +419,19 @@ impl LoopTurnMeter {
                 branch: turn.branch,
                 detail: turn.detail,
                 took: turn.started.elapsed(),
+                parts: self.parts.snapshot(),
             });
         match (finished, running) {
             (Some(finished), Some(running)) if running.took > finished.took => Some(running),
             (Some(finished), _) => Some(finished),
             (None, running) => running,
         }
+    }
+
+    /// The turn that finished last.
+    #[cfg(test)]
+    pub fn last_turn(&self) -> Option<TurnRecord> {
+        self.last.lock().ok().and_then(|last| *last)
     }
 
     /// Forget the worst turn, so a scenario measures only what it provokes.
