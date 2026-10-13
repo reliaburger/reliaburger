@@ -132,7 +132,7 @@ class SelectJobsTests(unittest.TestCase):
     def test_a_task_array_change_runs_the_task_array_benchmarks(self):
         for path in ["src/bun/task_array_leader.rs", "src/bun/task_executor.rs",
                      "src/meat/task_array_state.rs", "src/meat/index_set.rs",
-                     "benches/task_arrays.rs"]:
+                     "benches/task_arrays.rs", "scripts/ci/bench_baseline.py"]:
             with self.subTest(path=path):
                 repo = Repository(tempfile.mkdtemp(dir=self.tmp.name))
                 main = repo.git("rev-parse", "HEAD")

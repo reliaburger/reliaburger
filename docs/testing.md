@@ -150,13 +150,24 @@ bench` and `make bench-large`, and the `task-array benchmarks` job runs `make
 bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
 request runs the first when it touches the gossip protocol or its benchmarks,
 and the second when it touches what `benches/task_arrays.rs` measures: the
-task-array leader and node pool, the executor, range sets or the benchmark
-itself ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). The gossip numbers
+task-array leader and node pool, the executor, range sets, the benchmark
+itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). The gossip numbers
 gate nothing. The task-array job compares each benchmark's mean with the
-baseline the last `main` run saved, and fails only when one is more than twice
-as slow ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)): hosted
-runners differ by tens of per cent from run to run, so a tighter bound would
-be a flake source. Its Criterion output and baseline are kept as the
+baseline the last `main` run saved
+([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
+differ by tens of per cent from run to run, and on 12 October 2026 one was
+uniformly 1.4–2.1× slower (#857), so the job allows for the runner it got. It
+divides each benchmark's ratio by the median ratio of the other benchmarks in
+the same run (counted as at least 1, so a fast runner never tightens the
+bound), and fails when a benchmark is more than twice as slow as the rest of
+its run. It also fails when the run's median ratio is above 2, since a slow
+runner and a regression across most of the suite look the same from inside
+one run. The job summary shows each benchmark's ratio, its ratio against the
+rest and the runner factor (the median). The means of the 12 October runs are
+a fixture in
+[`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
+`make test-ci-scripts` checks that they pass and that a benchmark pushed to
+2.1× the rest of any of them fails. Its Criterion output and baseline are kept as the
 `criterion-task-arrays` artefact for 90 days, the cost trend #668 reads.
 `test_every_benchmark_target_is_run_by_a_workflow` fails if a `bench` target
 in the `Makefile` isn't run by any workflow.
