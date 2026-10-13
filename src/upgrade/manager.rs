@@ -15,6 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
+use super::candidate::Candidate;
+use super::compatibility::Probe;
 use super::error::UpgradeError;
 use super::marker::{
     InstanceInventory, MarkerPhase, StartupDecision, UpgradeMarker, decide_startup,
@@ -283,24 +285,27 @@ impl UpgradeManager {
     /// Nothing is staged and no marker is written. The fetch is tried
     /// once, so a registry outage comes back as a transient error at once.
     pub async fn check_candidate(&self, directive: &UpgradeDirective) -> Result<(), UpgradeError> {
-        self.fetch_verified(directive, Fetch::Once)
-            .await
-            .map(|_| ())
+        let (probe, _) = self.fetch_verified(directive, Fetch::Once).await?;
+        super::compatibility::discard_probe(probe).await;
+        Ok(())
     }
 
     /// Fetch a directive's binary, verify its signatures, and only then
-    /// run it once to check its formats. Returns the bytes and the
-    /// envelope they were verified against.
+    /// run it once to check its formats. Returns the probe, which is the
+    /// verified binary on disk, and the envelope it was verified against.
+    ///
+    /// The binary is never in memory: it arrives in a private file (a
+    /// [`Candidate`]) and every check reads that file (#892).
     async fn fetch_verified(
         &self,
         directive: &UpgradeDirective,
         fetch: Fetch,
-    ) -> Result<(Vec<u8>, SignatureEnvelope), UpgradeError> {
+    ) -> Result<(Probe, SignatureEnvelope), UpgradeError> {
         #[cfg(test)]
         let fixture_phase_started = std::time::Instant::now();
         #[cfg(test)]
         eprintln!("upgrade-fixture phase=fetch-begin");
-        let bytes = self.fetch_binary(directive, fetch).await?;
+        let candidate = self.fetch_binary(directive, fetch).await?;
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=fetch-end elapsed={:?}",
@@ -319,45 +324,33 @@ impl UpgradeManager {
         // Hashing and checking two signatures over a release-sized binary is
         // seconds of CPU. Done in place it starved this worker's other tasks,
         // the council's Raft core among them, and a node being upgraded
-        // called an election that deposed a healthy leader (#783). Writing
-        // the compatibility probe's private copy is the same size of work, so
-        // it runs here too, from the bytes just verified, instead of from a
-        // clone made on the worker (#794).
+        // called an election that deposed a healthy leader (#783). So it runs
+        // on the blocking pool, and the checked file becomes the probe there.
         let release_keys = self.release_keys.clone();
         let external_key = self.external_key;
         let checked = envelope.clone();
-        let probe_directory = self
-            .store
-            .symlink_path()
-            .parent()
-            .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))?
-            .to_path_buf();
-        let (bytes, probe) = tokio::task::spawn_blocking(move || {
-            let probe = signing::verify_binary(
-                &bytes,
-                &checked,
-                &release_keys,
-                external_key.as_ref(),
-                is_network,
-            )
-            .and_then(|()| super::compatibility::write_probe(&bytes, &probe_directory));
-            (bytes, probe)
+        let probe = tokio::task::spawn_blocking(move || {
+            candidate.verify(&checked, &release_keys, external_key.as_ref(), is_network)?;
+            candidate.into_probe()
         })
         .await
-        .map_err(std::io::Error::other)?;
+        .map_err(std::io::Error::other)??;
 
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=signature-verified-probe-begin elapsed={:?}",
             fixture_phase_started.elapsed()
         );
-        super::compatibility::query_probe(probe?).await?;
+        if let Err(error) = super::compatibility::query_probe(&probe).await {
+            super::compatibility::discard_probe(probe).await;
+            return Err(error);
+        }
         #[cfg(test)]
         eprintln!(
             "upgrade-fixture phase=compatibility-probe-end elapsed={:?}",
             fixture_phase_started.elapsed()
         );
-        Ok((bytes, envelope))
+        Ok((probe, envelope))
     }
 
     /// Is an upgrade currently in flight on this node? (Cheap: one stat.)
@@ -426,7 +419,7 @@ impl UpgradeManager {
 
         self.check_directive_target(directive).await?;
 
-        let (bytes, envelope) = self.fetch_verified(directive, Fetch::Retrying).await?;
+        let (probe, envelope) = self.fetch_verified(directive, Fetch::Retrying).await?;
 
         let stem = self
             .store
@@ -451,10 +444,12 @@ impl UpgradeManager {
         let fixture_stage_started = std::time::Instant::now();
         #[cfg(test)]
         eprintln!("upgrade-fixture phase=stage-begin");
-        // Staging reads, hashes, writes and syncs the whole binary: blocking
+        // Staging syncs the whole binary and renames it into place: blocking
         // work, kept off the runtime for the same reason as the signature
         // check (#783). The marker goes with it: its two syncs waited behind
         // the binary's own on a busy disk, for up to half a second (#794).
+        // The probe that passed is the file staged, so the bytes that run
+        // are the bytes that were checked.
         let store = self.store.clone();
         let running_version = self.running_version.clone();
         let marker_path = self.marker_path.clone();
@@ -462,7 +457,7 @@ impl UpgradeManager {
             // First upgrade from an un-versioned install: adopt the running
             // binary into the store so rollback has something to return to.
             adopt_running_binary_if_missing(&store, &running_version)?;
-            store.stage(&marker.target_version, &bytes, &envelope)?;
+            store.stage_file(&marker.target_version, probe.into_temp_path(), &envelope)?;
             marker.store(&marker_path)?;
             Ok(marker)
         })
@@ -610,35 +605,34 @@ impl UpgradeManager {
         // of already being on disk / executing, so there is nothing to check.
         // An envelope with an external signature is verified as a network
         // artefact (both signatures required); otherwise just the embedded one.
-        // Hashing a whole Bun binary is too slow for an async task, and one
-        // read serves both the signature check and the compatibility probe's
-        // private copy, written on the same blocking thread (#794).
+        // Hashing a whole Bun binary is too slow for an async task. The
+        // stored binary is copied to a private candidate first and the copy
+        // is what is checked and run, a piece at a time and never in memory
+        // (#892), on the same blocking thread (#794).
         let binary = self.store.binary_path(&target);
         let envelope_path = self.store.envelope_path(&target);
-        let probe_directory = binary
-            .parent()
-            .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))?
-            .to_path_buf();
+        let candidate_directory = self.candidate_directory()?;
         let release_keys = self.release_keys.clone();
         let external_key = self.external_key;
         let probe = tokio::task::spawn_blocking(move || {
-            let bytes = std::fs::read(&binary)?;
+            let candidate = Candidate::copy_from(&binary, &candidate_directory)?;
             if let Ok(envelope) = SignatureEnvelope::load(&envelope_path)
                 && !envelope.embedded.is_empty()
             {
-                signing::verify_binary(
-                    &bytes,
+                candidate.verify(
                     &envelope,
                     &release_keys,
                     external_key.as_ref(),
                     envelope.external.is_some(),
                 )?;
             }
-            super::compatibility::write_probe(&bytes, &probe_directory)
+            candidate.into_probe()
         })
         .await
         .map_err(|error| UpgradeError::IncompatibleBinary(error.to_string()))??;
-        super::compatibility::query_probe(probe).await?;
+        let answer = super::compatibility::query_probe(&probe).await;
+        super::compatibility::discard_probe(probe).await;
+        answer?;
 
         let stem = self
             .store
@@ -681,6 +675,13 @@ impl UpgradeManager {
     ///
     /// Call once, immediately after config load, before subsystems start.
     pub fn startup_action(&self) -> Result<StartupAction, UpgradeError> {
+        // Nothing is fetching yet, so any candidate file is a killed
+        // process's leftover, as big as a release (#892).
+        match self.store.remove_stale_candidates() {
+            Ok(0) => {}
+            Ok(removed) => eprintln!("bun: removed {removed} unfinished upgrade candidate file(s)"),
+            Err(e) => eprintln!("bun: warning: cannot remove unfinished upgrade candidates: {e}"),
+        }
         let marker = match UpgradeMarker::load(&self.marker_path) {
             Ok(marker) => marker,
             Err(e) => {
@@ -835,13 +836,29 @@ impl UpgradeManager {
         }
     }
 
+    /// Where a candidate binary is written: the binary directory, so
+    /// staging it is a rename on the same filesystem.
+    fn candidate_directory(&self) -> Result<PathBuf, UpgradeError> {
+        self.store
+            .symlink_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))
+    }
+
     async fn fetch_binary(
         &self,
         directive: &UpgradeDirective,
         fetch: Fetch,
-    ) -> Result<Vec<u8>, UpgradeError> {
+    ) -> Result<Candidate, UpgradeError> {
         match &directive.source {
-            BinarySource::LocalFile { path } => Ok(tokio::fs::read(path).await?),
+            BinarySource::LocalFile { path } => {
+                let source = path.clone();
+                let directory = self.candidate_directory()?;
+                tokio::task::spawn_blocking(move || Candidate::copy_from(&source, &directory))
+                    .await
+                    .map_err(std::io::Error::other)?
+            }
             BinarySource::Pickle { registry_address } => {
                 // Pickle stores the binary as a content-addressed blob under
                 // a single-segment repository name (axum {name} routes).
@@ -864,14 +881,14 @@ impl UpgradeManager {
     /// Fetch `url`, riding out a source that is briefly unavailable (a
     /// registry restarting with its node) for up to the retry budget.
     /// A permanent failure returns at once; nothing runs past the ceiling.
-    async fn fetch_with_retry(&self, url: &str) -> Result<Vec<u8>, UpgradeError> {
+    async fn fetch_with_retry(&self, url: &str) -> Result<Candidate, UpgradeError> {
         let started = tokio::time::Instant::now();
         let mut backoff = self.fetch_retry.initial_backoff;
         loop {
             let remaining = self.fetch_retry.ceiling.saturating_sub(started.elapsed());
             let attempt_timeout = self.fetch_retry.attempt_timeout.min(remaining);
             let error = match tokio::time::timeout(attempt_timeout, self.fetch_once(url)).await {
-                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Ok(candidate)) => return Ok(candidate),
                 Ok(Err(error)) => error,
                 Err(_) => UpgradeError::FetchUnavailable {
                     url: url.to_string(),
@@ -893,10 +910,12 @@ impl UpgradeManager {
         }
     }
 
-    /// One GET of the binary, classified: connection trouble, a cut-off
-    /// body and 5xx/408/429 are [`UpgradeError::FetchUnavailable`]; any
-    /// other non-success status is [`UpgradeError::FetchFailed`].
-    async fn fetch_once(&self, url: &str) -> Result<Vec<u8>, UpgradeError> {
+    /// One GET of the binary, written to a new [`Candidate`] as it arrives,
+    /// classified: connection trouble, a cut-off body and 5xx/408/429 are
+    /// [`UpgradeError::FetchUnavailable`]; any other non-success status is
+    /// [`UpgradeError::FetchFailed`]. A failed attempt deletes its file.
+    async fn fetch_once(&self, url: &str) -> Result<Candidate, UpgradeError> {
+        use tokio::io::AsyncWriteExt as _;
         let unavailable = |reason: String| UpgradeError::FetchUnavailable {
             url: url.to_string(),
             reason,
@@ -904,7 +923,7 @@ impl UpgradeManager {
         // `get` carries the internal service token as a bearer: on a
         // routable cluster the registry sets `require_read_auth`, so a
         // bearer-less binary fetch 401s (B2).
-        let response = tokio::time::timeout(
+        let mut response = tokio::time::timeout(
             self.fetch_retry.response_timeout,
             self.cluster_http.get(url).send(),
         )
@@ -926,11 +945,22 @@ impl UpgradeManager {
                 reason: format!("status {status}"),
             });
         }
-        let bytes = response
-            .bytes()
+        // Each piece goes to disk as it arrives, so the fetch holds one
+        // piece, never the binary (#892). reqwest reports a body cut off
+        // short of its content-length as an error here.
+        let (candidate, mut file) = Candidate::create(&self.candidate_directory()?).await?;
+        while let Some(piece) = response
+            .chunk()
             .await
-            .map_err(|e| unavailable(e.to_string()))?;
-        Ok(bytes.to_vec())
+            .map_err(|e| unavailable(e.to_string()))?
+        {
+            file.write_all(&piece).await?;
+        }
+        // A Tokio file finishes its last write in the background; wait for
+        // it, then close the handle so the candidate can be run.
+        file.flush().await?;
+        drop(file);
+        Ok(candidate)
     }
 
     fn append_history(&self, entry: &UpgradeHistoryEntry) -> Result<(), UpgradeError> {
@@ -982,30 +1012,10 @@ async fn hash_once(cell: &tokio::sync::OnceCell<String>, stored: PathBuf) -> Opt
     .cloned()
 }
 
-/// How much of the binary [`hash_running_binary`] reads at a time.
-const HASH_CHUNK_BYTES: usize = 1024 * 1024;
-
 fn hash_running_binary(stored: &Path) -> Option<String> {
-    let file = match std::fs::File::open(stored) {
-        Ok(file) => file,
-        Err(_) => std::fs::File::open(running_executable()?).ok()?,
-    };
-    hash_file(file).ok()
-}
-
-/// SHA-256 of a whole file, read in fixed chunks so hashing a 500 MB debug
-/// binary doesn't first allocate 500 MB.
-fn hash_file(mut file: std::fs::File) -> std::io::Result<String> {
-    use sha2::Digest;
-    use std::io::Read;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(hex::encode(hasher.finalize()));
-        }
-        hasher.update(&buffer[..read]);
+    match signing::sha256_file(stored) {
+        Ok(digest) => Some(digest),
+        Err(_) => signing::sha256_file(&running_executable()?).ok(),
     }
 }
 
@@ -1039,16 +1049,21 @@ fn adopt_running_binary_if_missing(
         return Ok(());
     }
     let current = std::fs::canonicalize(std::env::current_exe()?)?;
-    let bytes = std::fs::read(&current)?;
+    // Copied and hashed a piece at a time: the running binary is as big as
+    // any candidate (#892).
+    let directory = path
+        .parent()
+        .ok_or_else(|| UpgradeError::IncompatibleBinary("binary directory is missing".into()))?;
+    let copy = Candidate::copy_from(&current, directory)?;
     // No signature envelope for a pre-existing binary; store a stub so
     // the file pair stays consistent. It is never re-verified locally.
     let envelope = SignatureEnvelope {
         schema: 1,
-        sha256: signing::sha256_hex(&bytes),
+        sha256: copy.sha256()?,
         embedded: String::new(),
         external: None,
     };
-    store.stage(running_version, &bytes, &envelope)?;
+    store.stage_file(running_version, copy.into_temp_path(), &envelope)?;
     Ok(())
 }
 
@@ -1342,7 +1357,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bun");
         // Not a multiple of the chunk size, so the last read is partial.
-        let bytes: Vec<u8> = (0..HASH_CHUNK_BYTES * 2 + 12_345)
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 12_345)
             .map(|i| (i % 251) as u8)
             .collect();
         std::fs::write(&path, &bytes).unwrap();
@@ -2084,6 +2099,8 @@ mod tests {
         Silent,
         /// Send the headers and half the blob, then stall.
         StallMidBody,
+        /// Send the headers and half the blob, then close the connection.
+        CutMidBody,
     }
 
     /// A registry that gives `script`'s answers in order, then serves the
@@ -2133,6 +2150,15 @@ mod tests {
                             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
                             drop(socket);
                         });
+                    }
+                    RegistryAnswer::CutMidBody => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            blob.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&blob[..blob.len() / 2]).await;
+                        drop(socket);
                     }
                     RegistryAnswer::Blob => {
                         let head = format!(
@@ -2297,6 +2323,102 @@ mod tests {
             .unwrap_err();
 
         assert!(!error.is_transient(), "{error}");
+    }
+
+    /// What's in the binary directory besides the store's own files: a
+    /// candidate left behind by a failed fetch would show up here.
+    fn stray_files(fixture: &Fixture) -> Vec<String> {
+        std::fs::read_dir(&fixture.binary_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect()
+    }
+
+    /// #892: the binary now streams to a file as it arrives. A body cut off
+    /// short of its length is a transient failure, and the partial file is
+    /// gone: nothing staged, nothing left behind.
+    #[tokio::test]
+    async fn a_binary_cut_off_mid_body_is_refused_and_leaves_no_file() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"cut off halfway");
+        let (registry, _) = flaky_registry(vec![RegistryAnswer::CutMidBody], binary.clone()).await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        let error = fixture
+            .manager
+            .check_candidate(&directive)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UpgradeError::FetchUnavailable { .. }),
+            "{error}"
+        );
+        assert!(!fixture.binary_dir.join("bun-v0.2.0").exists());
+        assert_eq!(stray_files(&fixture), Vec::<String>::new());
+    }
+
+    /// A cut-off attempt is retried, and the retry's whole binary is the
+    /// one staged, not the first attempt's half appended to it.
+    #[tokio::test]
+    async fn a_retry_after_a_cut_off_body_stages_the_whole_binary() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"whole on the second try");
+        let (registry, requests) =
+            flaky_registry(vec![RegistryAnswer::CutMidBody], binary.clone()).await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        let prepared = fixture.manager.prepare(&directive, vec![]).await.unwrap();
+
+        assert!(prepared.is_some());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(fixture.binary_dir.join("bun-v0.2.0")).unwrap(),
+            binary
+        );
+        assert_eq!(stray_files(&fixture), Vec::<String>::new());
+    }
+
+    /// Tampered bytes are refused from the file as they were from memory,
+    /// and the refused candidate is deleted.
+    #[tokio::test]
+    async fn a_tampered_binary_is_refused_and_leaves_no_file() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"the signed one");
+        let mut tampered = binary.clone();
+        let last = tampered.len() - 2;
+        tampered[last] ^= 1;
+        let (registry, _) = flaky_registry(Vec::new(), tampered).await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        let error = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UpgradeError::HashMismatch { .. }),
+            "{error}"
+        );
+        assert!(!fixture.binary_dir.join("bun-v0.2.0").exists());
+        assert_eq!(stray_files(&fixture), Vec::<String>::new());
+    }
+
+    /// The leader's check runs the candidate and then deletes it; only a
+    /// node preparing the directive keeps the file, as its staged binary.
+    #[tokio::test]
+    async fn a_passed_candidate_check_leaves_no_file() {
+        let fixture = fixture();
+        let binary = compatible_binary(b"checked, not staged");
+        let (registry, _) = flaky_registry(Vec::new(), binary.clone()).await;
+        let directive = pickle_directive(&fixture, &binary, &registry);
+
+        fixture.manager.check_candidate(&directive).await.unwrap();
+
+        assert!(!fixture.binary_dir.join("bun-v0.2.0").exists());
+        assert_eq!(stray_files(&fixture), Vec::<String>::new());
     }
 
     #[test]

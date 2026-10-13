@@ -41,6 +41,28 @@ fn load_ebpf() -> OnionEbpf {
     OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).expect("failed to load eBPF program")
 }
 
+/// Bind a TCP listener on `ip` whose port is not `avoid`.
+///
+/// Port 0 lets the kernel choose, and it chooses per address: a listener on
+/// 127.0.0.6 (or `[::1]`) can be handed the very port another listener holds
+/// on 127.0.0.5 (or 127.0.0.1), roughly once in every 14,000 binds. A policy
+/// test whose "unlisted" destination differs only by port must rule that out,
+/// or the allowed port's rule lets the connection through (#913).
+fn listener_avoiding_port(ip: std::net::IpAddr, avoid: u16) -> (std::net::TcpListener, u16) {
+    let bind = || {
+        let listener = std::net::TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    };
+    let first = bind();
+    if first.1 != avoid {
+        return first;
+    }
+    // `first` still holds `avoid` on this address, so the kernel can't hand
+    // it out again.
+    bind()
+}
+
 /// Find the directory containing compiled .bpf.o files.
 ///
 /// build.rs puts them in OUT_DIR, which is under the target directory.
@@ -2051,8 +2073,9 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     // A v4 listener we allow, and a v6 listener we do not.
     let v4_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let v4_port = v4_listener.local_addr().unwrap().port();
-    let v6_listener = std::net::TcpListener::bind("[::1]:0").unwrap();
-    let v6_port = v6_listener.local_addr().unwrap().port();
+    // The v6 port doubles as the unlisted v4-mapped port below, so it must
+    // not be the allowed v4 port: [::1] and 127.0.0.1 can share one (#913).
+    let (_v6_listener, v6_port) = listener_avoiding_port(Ipv6Addr::LOCALHOST.into(), v4_port);
 
     let cgroup_id =
         egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
@@ -2128,11 +2151,12 @@ async fn cidr_egress_allowed_via_lpm_trie() {
     let mut ebpf = load_ebpf();
 
     // Two loopback listeners; 127.0.0.0/8 covers both addresses, but only
-    // one port is allowed.
+    // one port is allowed. The kernel picks port 0 per address, so the
+    // second listener must be kept off the allowed port explicitly (#913).
     let allowed = std::net::TcpListener::bind("127.0.0.5:0").unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
-    let denied = std::net::TcpListener::bind("127.0.0.6:0").unwrap();
-    let denied_port = denied.local_addr().unwrap().port();
+    let (_denied, denied_port) =
+        listener_avoiding_port(Ipv4Addr::new(127, 0, 0, 6).into(), allowed_port);
 
     let cgroup_id =
         egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
@@ -2168,7 +2192,8 @@ async fn cidr_egress_allowed_via_lpm_trie() {
             wrong_port.as_ref().map_err(|e| e.kind()),
             Err(std::io::ErrorKind::PermissionDenied)
         ),
-        "same CIDR on an unlisted port should be denied, got {wrong_port:?}"
+        "same CIDR on an unlisted port {denied_port} (allowed {allowed_port}) should be denied, \
+         got {wrong_port:?}"
     );
 }
 
