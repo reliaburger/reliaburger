@@ -422,6 +422,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 oci_spec: Some(record.oci_spec.clone()),
                 identity,
                 identity_mount,
+                launch_failure: None,
             };
             self.supervisor
                 .instances

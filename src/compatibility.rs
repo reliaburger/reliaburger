@@ -123,6 +123,7 @@ pub struct Compatibility {
 /// inline config files move to a per-instance directory.
 /// A task-array node's control fence is `control.fence`, two checksummed
 /// slots rewritten in place, not `control.json` (#745).
+/// A refused launch's `reason` on `/v1/status` instance rows (#881).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

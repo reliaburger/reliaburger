@@ -61,6 +61,9 @@ pub struct WorkloadInstance {
     /// Path to the host directory where identity files are written.
     /// Bind-mounted into the container at `/run/reliaburger/identity/`.
     pub identity_mount: Option<std::path::PathBuf>,
+    /// Why the runtime refused to launch this instance (#881), shown by
+    /// `relish status` and `relish wtf`. Set only on a `Failed` instance.
+    pub launch_failure: Option<String>,
 }
 
 impl WorkloadInstance {
@@ -670,6 +673,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
+                launch_failure: None,
             });
         }
 

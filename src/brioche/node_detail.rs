@@ -103,6 +103,7 @@ mod tests {
                     pid: Some(1234),
                     runtime_unknown: false,
                     status_age_ms: None,
+                    reason: None,
                 },
                 InstanceStatus {
                     exit_code: None,
@@ -115,6 +116,7 @@ mod tests {
                     pid: Some(5678),
                     runtime_unknown: false,
                     status_age_ms: None,
+                    reason: None,
                 },
             ],
             warning: None,

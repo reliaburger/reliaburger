@@ -480,6 +480,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
+    /// The runtime refused to launch `instance_id` because its binary can't
+    /// run here (#881). Launching it again fails the same way, so the
+    /// instance is `Failed` at once, keeping the reason for `relish status`
+    /// and `relish wtf`, instead of waiting in `Starting`.
+    pub(super) async fn record_launch_failure(&mut self, instance_id: &InstanceId, reason: String) {
+        let Some(instance) = self.supervisor.get_instance_mut(instance_id) else {
+            return;
+        };
+        if let Ok(failed) = instance.state.transition_to(ContainerState::Failed) {
+            instance.state = failed;
+        }
+        instance.retry_pending = false;
+        instance.launch_failure = Some(reason.clone());
+        let app = instance.app_name.clone();
+        let namespace = instance.namespace.clone();
+        self.record_event(
+            crate::bun::events::EventKind::Deploy,
+            crate::bun::events::EventSeverity::Warning,
+            Some(app),
+            Some(namespace),
+            format!("instance {instance_id} cannot launch: {reason}"),
+        )
+        .await;
+    }
+
     /// Post-start bookkeeping for a fresh instance (the loop side of the tail
     /// of `drive_instance_startup`): record the container IP, transition to
     /// HealthWait (→Running if no health checks), register its service-map
@@ -593,6 +618,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
+                launch_failure: None,
             },
         );
         self.supervisor
@@ -783,6 +809,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     oci_spec: new_specs.remove(new_id),
                     identity,
                     identity_mount,
+                    launch_failure: None,
                 },
             );
         }

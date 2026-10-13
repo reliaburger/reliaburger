@@ -223,6 +223,33 @@ An `exec` or `script` app only goes to nodes that would run it: the node's
 a script), and `mount_isolation` must be off. A node whose allowlist stops
 covering the binary loses the replica to one that still does.
 
+## When the binary isn't there
+
+The allowlist says a node may run a binary. It doesn't say the binary is
+installed. Bun checks just before it launches a process app: if the `exec`
+path, or the first word of `command`, doesn't exist or isn't executable, the
+deploy fails at once with the reason, and the instance goes to `failed`:
+
+```text
+$ relish apply ghost.toml
+  deploying app ghost (replicas: 1)
+  creating instance default__ghost-0
+error: API error (status 500): instance default__ghost-0 cannot launch: binary not found: /usr/local/bin/ghost-server
+
+$ relish status
+...
+
+default__ghost-0 (ghost, namespace default) failed on node-1: binary not found: /usr/local/bin/ghost-server
+```
+
+A bare name like `bun` is looked up on the app's `PATH`, the way a shell would.
+A directory, or a file without an execute bit, fails with `binary not
+executable` instead. `relish wtf` raises a critical `launch-failed` finding
+with the same reason. Waiting won't fix this one, so nothing waits: install
+the binary, or fix the spec and apply it again. In a cluster, the node's
+placement reconciler tries the deploy again on its usual backoff (five seconds,
+doubling to five minutes), so installing the binary is enough on its own.
+
 ## When a node stops reporting
 
 A node can stay alive in gossip while its reports stop, say because its
