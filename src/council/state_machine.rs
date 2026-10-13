@@ -6184,7 +6184,6 @@ mod tests {
             api_tokens: vec![crate::sesame::types::ApiToken {
                 name: "admin".to_string(),
                 token_hash: vec![1],
-                token_salt: vec![2],
                 role: crate::sesame::types::ApiRole::Admin,
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
@@ -7228,7 +7227,6 @@ mod tests {
         let token = crate::sesame::types::ApiToken {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: crate::sesame::types::ApiRole::Deployer,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
@@ -7246,7 +7244,6 @@ mod tests {
         let token = crate::sesame::types::ApiToken {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: crate::sesame::types::ApiRole::Deployer,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
@@ -7270,7 +7267,6 @@ mod tests {
         crate::sesame::types::ApiToken {
             name: name.to_string(),
             token_hash: name.as_bytes().to_vec(),
-            token_salt: vec![4, 5, 6],
             role,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: expires_unix_ms
@@ -7410,7 +7406,6 @@ mod tests {
         let api_token = |name: &str, role: ApiRole| ApiToken {
             name: name.to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role,
             scope: TokenScope::default(),
             expires_at: None,
@@ -7481,7 +7476,6 @@ mod tests {
         crate::sesame::types::TokenRotation {
             name: name.to_string(),
             token_hash: vec![hash; 3],
-            token_salt: vec![hash; 3],
             rotated_at: now,
             expires_at: None,
             previous_valid_until: Some(now + std::time::Duration::from_secs(3_600)),
@@ -7499,7 +7493,6 @@ mod tests {
         inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: ApiRole::Deployer,
             scope: scope.clone(),
             expires_at: None,
@@ -7528,7 +7521,6 @@ mod tests {
         inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
             name: "root".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: ApiRole::Admin,
             scope: TokenScope::default(),
             expires_at: None,
@@ -8561,7 +8553,6 @@ mod tests {
         crate::sesame::types::ApiToken {
             name: "rbtest-run1-scope".into(),
             token_hash: vec![1; 32],
-            token_salt: vec![2; 16],
             role: crate::sesame::types::ApiRole::Deployer,
             scope: crate::sesame::types::TokenScope {
                 apps: None,

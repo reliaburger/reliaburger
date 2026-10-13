@@ -1389,6 +1389,8 @@ Pickle now uses the same asynchronous verifier as the API and browser login. It 
 
 The regression holds every verification permit and sends real registry reads and uploads, with both Bearer and TLS Basic credentials. Each request waits until admission opens, while malformed credentials return 401 immediately. Role and repository scope checks still happen after authentication. A different HTTP port doesn't buy a second CPU budget.
 
+In 0.2.1 the budget itself went away: API tokens are stored as SHA-256 digests rather than Argon2id hashes (Chapter 4 says why), so a verification takes microseconds and runs inline. What's left of this section is the part that mattered most. The registry still calls the same `sesame::auth::authenticate` as the API, so malformed credentials are refused before any hashing, and `registry_reads_and_writes_authenticate_bearer_and_basic_credentials` checks that Bearer and Basic both work on reads and uploads.
+
 ### A shared digest needs repository authority
 
 A content-addressed store shares identical bytes across repositories. That saves

@@ -63,7 +63,6 @@ time = "0.3"
 ring = "0.17"
 x509-parser = { version = "0.16", features = ["verify"] }
 pem = "3"
-argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
 datafusion = "55"
@@ -149,21 +148,6 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.block-buffer]
-opt-level = 3
-
-# API tokens are verified with Argon2id on every request. Unoptimised, one
-# verification costs most of a second, so the authorisation tests spent
-# their time hashing rather than testing. Same trade as the hash crates.
-[profile.dev.package.argon2]
-opt-level = 3
-
-[profile.dev.package.blake2]
-opt-level = 3
-
-[profile.test.package.argon2]
-opt-level = 3
-
-[profile.test.package.blake2]
 opt-level = 3
 
 # Every Raft RPC opens a fresh mTLS connection, and openraft gives each

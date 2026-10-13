@@ -3206,7 +3206,7 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
 
 /// Create a new API token through the agent.
 ///
-/// The agent mints the token, stores its Argon2id hash in Raft, and
+/// The agent mints the token, stores its SHA-256 digest in Raft, and
 /// returns the plaintext once; this prints it to stdout and never stores
 /// it. Needs a reachable agent and an admin credential.
 pub async fn token_create(request: &super::client::TokenRequest) -> Result<(), RelishError> {

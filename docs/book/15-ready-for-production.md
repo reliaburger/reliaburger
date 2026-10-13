@@ -213,7 +213,8 @@ Not everything in the slow list was a timeout. Most of the API authorisation tes
 their time in Argon2id, which is slow by design and much slower again without optimisation. Cargo lets one
 crate be optimised inside an otherwise debug build, and we already did that for SHA-256, so
 `argon2` and `blake2` joined it. The slowest of those tests fell from nearly nine seconds to
-a third of a second. One test unpacked 65,537 empty files to prove the entry cap; the cap
+a third of a second. (In 0.2.1 tokens moved to SHA-256 and the `argon2` crate left the
+build altogether, override and all: see Chapter 4.) One test unpacked 65,537 empty files to prove the entry cap; the cap
 counts entries, not files, so the same directory repeated 65,537 times proves the same limit
 without half a minute of file creation.
 

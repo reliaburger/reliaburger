@@ -669,11 +669,15 @@ Tokens have three roles:
 - **Deployer** — deploy and stop apps, view status
 - **ReadOnly** — view status, logs, and service resolution
 
-Tokens are hashed with Argon2id before storage. Argon2id is deliberately slow — it's designed to resist GPU-based brute force attacks. The Rust `argon2` crate handles the hashing:
+Only a hash of each token goes into Raft, never the token itself. Since 0.2.1 that hash is plain SHA-256 of the whole token string, and "Token validation" below explains why it isn't the password hash we started with:
 
 ```rust
-let argon2 = Argon2::default();
-let hash = argon2.hash_password(token.as_bytes(), &salt)?;
+pub(crate) fn hash_secret(plaintext: &str) -> Result<Vec<u8>, TokenError> {
+    if !looks_like_token(plaintext) {
+        return Err(TokenError::WeakSecret);
+    }
+    Ok(digest(plaintext).to_vec())
+}
 ```
 
 The middleware skips authentication for `/v1/health` (so liveness probes still work) and when no user tokens exist yet. That second case is a bootstrap window, not permission to publish an open control plane: Bun only permits it on an IP-literal loopback listener. Wildcard, routable and hostname listeners are refused until the cluster has a real user token.
@@ -892,36 +896,45 @@ Second, `seal_in_place_append_tag` modifies the buffer in place — the plaintex
 
 Third, `LessSafeKey` can't be cloned, serialised, or sent across threads. You create it, use it, and it disappears when the function returns. The type system prevents you from accidentally persisting the encryption key alongside the ciphertext.
 
-### Token validation: cheap checks first
+### Token validation: the wrong hash for the job
 
-The token validation function shows a pattern worth remembering — order your checks from cheapest to most expensive:
+Phase 4 stored tokens the way you'd store passwords: Argon2id with a random salt per token. It felt like the responsible choice. Argon2id is slow and memory-hungry on purpose, so an attacker who steals the hashes can't try billions of guesses a second on a GPU.
+
+Now think about what those guesses are. A password hash protects *short, human-chosen* secrets. `hunter2` and `Summer2026!` are in every cracking dictionary, so making each guess cost 20 ms really does stop an attacker. Our tokens aren't chosen by humans. Each one is `rbrg_` plus 32 bytes from the operating system's random number generator: 256 bits. Even at a trillion guesses a second, you'd expect to need around 10^57 years to find one. Making each guess slower doesn't change "never" into anything. The salt is pointless for the same reason: it defends against precomputed tables of likely passwords, and there are no likely 256-bit secrets.
+
+So the slowness bought nothing, but every request paid for it. Bun checks the bearer on every API call, against every stored token in turn, and nothing cached the answer. With ten tokens in the store one request cost 177 ms of hashing, and each Argon2 verification briefly allocated about 19 MiB. Chapter 10 had to bound that work with a semaphore and push it onto a blocking thread pool. Then in the 0.2.0 soak the API node, answering thousands of job-controller requests an hour, ran out of memory during an upgrade (#892): glibc's allocator keeps part of the freed memory resident, and 19 MiB at a time adds up.
+
+In 0.2.1 we switched to SHA-256 (#912). Validation hashes the bearer once and compares the digest with each stored one:
 
 ```rust
-pub fn validate_token(plaintext: &str, stored: &ApiToken) -> Result<(), TokenError> {
-    // Check expiry first (cheap: compare two timestamps)
-    if let Some(expires_at) = stored.expires_at
-        && SystemTime::now() > expires_at
-    {
-        return Err(TokenError::Expired);
-    }
+pub fn validate_token_at(
+    plaintext: &str,
+    stored: &ApiToken,
+    now: SystemTime,
+) -> Result<MatchedSecret, TokenError> {
+    validate_digest_at(&digest(plaintext), stored, now)
+}
 
-    // Verify Argon2id hash (expensive: deliberately slow)
-    let hash_str = String::from_utf8(stored.token_hash.clone())
-        .map_err(|_| TokenError::ValidationFailed)?;
-    let parsed_hash = PasswordHash::new(&hash_str)
-        .map_err(|_| TokenError::ValidationFailed)?;
-
-    Argon2::default()
-        .verify_password(plaintext.as_bytes(), &parsed_hash)
-        .map_err(|_| TokenError::ValidationFailed)?;
-
-    Ok(())
+fn digests_equal(candidate: &[u8; 32], stored: &[u8]) -> bool {
+    super::ca::constant_time_eq(candidate, stored)
 }
 ```
 
-Expiry is a nanosecond comparison. Argon2id verification is deliberately slow (tens of milliseconds). By checking expiry first, we reject expired tokens instantly without burning CPU on the hash. This matters under load — an attacker spamming expired tokens costs you almost nothing.
+`digest` returns `[u8; 32]`, a fixed-size array whose length is part of its type, so the compiler knows every candidate is exactly 32 bytes. The stored side is a `&[u8]` slice, because it comes out of Raft as a `Vec<u8>`. `constant_time_eq` is the comparison join tokens already used: it XORs every byte pair into one accumulator instead of stopping at the first difference, so the time it takes doesn't reveal how much of the digest a guess got right. Strictly, learning the digest wouldn't help an attacker (SHA-256 can't be run backwards), but the constant-time compare costs nothing, so we keep the defence. The same measurement as before now takes under 7 µs, and a burst of verifications on four threads no longer moves peak memory at all.
 
-The `if let Some(x) && condition` syntax is relatively new in Rust (stabilised in 1.64). It combines pattern matching with a boolean guard in a single `if` clause. Without it, you'd need a nested `if let` inside an `if`, which is both uglier and harder to read.
+The fast hash is safe only while every secret behind it is long and random, so the code says so twice. `hash_secret` refuses anything that isn't `rbrg_` plus 64 hex characters, and the byte count is pinned at compile time:
+
+```rust
+pub const TOKEN_SECRET_BYTES: usize = 32;
+
+const _: () = assert!(TOKEN_SECRET_BYTES >= 32);
+```
+
+`const _: () = ...` declares an unnamed constant, and evaluating a constant happens at compile time, so a failing `assert!` here is a build error, not a runtime panic. Someone who "simplifies" tokens to 8 bytes gets told off by the compiler before a single weak token exists.
+
+The stored format changed, so 0.2.1 starts a fresh cluster and everyone reissues their tokens. Before 1.0 we don't migrate (see `src/compatibility.rs`).
+
+What would we do differently? Ask what kind of secret we're protecting before picking the hash. "Hash passwords with Argon2" is good advice, and these weren't passwords.
 
 ### The CA hierarchy generation
 
@@ -1120,7 +1133,7 @@ The roster maps directly onto the primitives in this chapter:
 - **AES-256-GCM** — encrypt/decrypt round-trips, and the one that matters most: flip a byte of ciphertext and decryption returns an error, never plaintext.
 - **Key wrapping** — wrap an intermediate CA key, unwrap it, get the original back; unwrap with the wrong purpose string and it fails.
 - **`age` secrets** — encrypt/decrypt, plus namespace isolation (team B's key can't read team A's secret).
-- **Argon2id** — hashing and verification, and that the three roles (`Admin`/`Deployer`/`ReadOnly`) gate the right operations.
+- **Token hashing** — the stored hash is the SHA-256 of the full token; a correct, wrong, revoked or wrong-length token does what you'd expect; a secret without 256 random bits is refused at issue time; a property test changes one character of a real token at every position and checks it never validates; and the three roles (`Admin`/`Deployer`/`ReadOnly`) gate the right operations.
 - **Gossip HMAC**, **mTLS config building**, **Raft log entry encryption**, **eBPF firewall rule resolution** — each gets its own test.
 
 A nice property of testing crypto this way: the tamper-detection and namespace-isolation tests are *negative* tests. They assert that the wrong key fails. Those are the tests that actually tell you the security property holds, not just that the happy path works.

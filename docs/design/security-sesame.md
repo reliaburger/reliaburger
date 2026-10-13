@@ -387,11 +387,9 @@ pub struct ApiToken {
     /// Human-readable name for the token (e.g., "ci-deploy").
     pub name: String,
 
-    /// Argon2id hash of the token secret.
+    /// SHA-256 digest of the full token secret (`rbrg_` + 64 hex
+    /// characters). No salt: see "Why SHA-256, not Argon2id" in §5.4.
     pub token_hash: Vec<u8>,
-
-    /// Salt used for hashing.
-    pub token_salt: Vec<u8>,
 
     /// The role granted to this token.
     pub role: ApiRole,
@@ -903,11 +901,47 @@ $ relish token create --name ci-deploy --role deployer \
     --apps "web,api" --namespaces "production" --ttl-days 30
 ```
 
-1. Generate a 256-bit cryptographically random token secret.
-2. Hash the secret with Argon2id (salt generated per-token).
-3. Store the hash, salt, role, scope, and expiry in Raft.
+1. Generate a 256-bit cryptographically random token secret
+   (`sesame::token::TOKEN_SECRET_BYTES`, asserted at compile time to be at
+   least 32 bytes).
+2. Hash the whole plaintext, `rbrg_` prefix included, with SHA-256
+   (`sesame::token::hash_secret`). The function refuses any secret that
+   isn't `rbrg_` plus 64 hex characters, so nothing short or human-chosen
+   can end up behind the fast hash.
+3. Store the digest, role, scope, and expiry in Raft.
 4. Return the plaintext token to the user, with its expiry. It is never stored
    in plaintext.
+
+**Verification.** `sesame::auth::authenticate` turns away a bearer that
+doesn't have the token shape with a string check. Otherwise it hashes the
+bearer once and compares the digest with every stored secret (each token's
+current one, and its previous one during a rotation's grace period) using a
+constant-time comparison (`sesame::ca::constant_time_eq`, the one join
+tokens use). The whole check takes a few microseconds, so it runs inline on
+the request's async task: no semaphore, no blocking thread and no
+verified-token cache.
+
+**Why SHA-256, not Argon2id (0.2.1, #912).** Until 0.2.1 the stored hash was
+Argon2id with a per-token salt. Argon2id is a *password* hash. It's slow and
+memory-hungry on purpose, so that an attacker who steals the hashes can't
+try billions of guesses at short, human-chosen passwords. Our secrets aren't
+passwords: they're 256 random bits, and nobody can enumerate 2^256 guesses
+however fast each one is. The slowness bought nothing, and every request
+paid for it. One verification used about 19 MiB and tens of milliseconds
+per stored token, so up to four ran at a time behind a process-wide
+semaphore. In the V02 soak the API node served thousands of job-controller
+requests an hour, and glibc kept part of that freed memory resident (#892).
+Measured on the same machine, verifying a bearer against a ten-token store
+went from 177 ms to under 7 µs, and a burst of 40 verifications on four
+threads stopped adding 57 MiB to peak RSS. A salt is pointless for the same
+reason: it defends against precomputed tables of likely passwords, and there
+are no likely 256-bit secrets. The trade only holds while every stored
+secret is long and random, which is why issuing refuses anything else. A
+stolen digest still doesn't reveal the token, because SHA-256 can't be run
+backwards.
+
+The change alters the stored format, so 0.2.1 starts a fresh cluster (state
+`69`, see `src/compatibility.rs`) and tokens must be reissued.
 
 **Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
 ReadOnly token expires after the answering node's `[security.tokens]
@@ -1011,7 +1045,7 @@ $ relish token rotate ci-deploy [--grace-hours 24]
 1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
    new secret and hash, and reads the clock once.
 2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
-   hash and salt, `rotated_at`, the new expiry (the token's previous lifetime
+   SHA-256 digest, `rotated_at`, the new expiry (the token's previous lifetime
    length from now, or none) and `previous_valid_until` (now plus the grace,
    24 hours by default, capped at the old expiry; `None` for a zero grace).
 3. The state machine (`sesame::token::apply_rotation`) moves the old hash into
@@ -1871,11 +1905,10 @@ Reliaburger's age-based secret encryption is much simpler than Vault but covers 
 |-------|---------|-------|
 | **rustls** | TLS implementation for all inter-node mTLS and API TLS. | Pure Rust, no OpenSSL dependency. Supports certificate verification callbacks for CRL checking. |
 | **rcgen** | X.509 certificate generation and CSR creation. | Used by `relish init` for CA generation and by Bun for creating workload CSRs. |
-| **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing. | The core crypto library. No unsafe code, constant-time operations. |
+| **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing (including API and join token digests). | The core crypto library. No unsafe code, constant-time operations. |
 | **age** | Asymmetric encryption for secrets (`ENC[AGE:...]` values). | Rust implementation of the age encryption format. Used for secret encryption/decryption and root CA key sealing. |
 | **x509-parser** | Parsing and validating X.509 certificates and CRLs. | Used for certificate chain validation, CRL parsing, and `relish ca status` output. |
 | **pem** | PEM encoding/decoding for certificates and keys. | Used for writing certificate files to workload identity mounts. |
-| **argon2** | Password hashing for API token storage. | Argon2id variant. Used for hashing API token secrets before Raft storage. |
 
 ---
 
