@@ -101,6 +101,10 @@ pub struct Compatibility {
 /// `NodeAssignment::held`, `/v1/rollouts/failed` and the
 /// `ApplyEvent::RolloutAborted` stream event, #692).
 /// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
+/// Gossip robustness (#696): `GossipMessage::sequence` for replay
+/// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
+/// its own name) in place of `relayed`, and the reporting
+/// `ReportingMessage::AggregatedReport` variant is gone.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

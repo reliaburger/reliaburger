@@ -259,6 +259,12 @@
   },
   {
     "source": "tests/cluster_gossip.rs",
+    "function": "nodes_with_maximal_labels_stay_alive_during_churn",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "nodes_with_maximal_labels_stay_alive_during_churn"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
     "function": "three_node_council_elects_leader_and_grows",
     "binary": "reliaburger::cluster_gossip",
     "test": "three_node_council_elects_leader_and_grows"

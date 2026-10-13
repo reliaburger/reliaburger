@@ -172,18 +172,6 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                                 self.publish();
                             }
                         }
-                        Some((_, _peer, ReportingMessage::AggregatedReport { reports })) => {
-                            // Merge reports from another council member (leader
-                            // aggregation). This bundles many nodes' reports, so
-                            // it isn't bound to a single node id. Under mTLS the
-                            // reporting acceptor requires a client cert, so an
-                            // unauthenticated peer never reaches here; a
-                            // legitimate council member is trusted to forward.
-                            for (_, report) in reports {
-                                self.store_report(report);
-                            }
-                            self.publish();
-                        }
                         Some((_, _, ReportingMessage::Ack { .. })) => {
                             // Workers don't send Acks to the aggregator
                         }
@@ -560,15 +548,61 @@ mod tests {
         let honest = net.register_as(addr(3), Some(NodeId::new("honest"))).await;
         let council_transport = net.register(addr(2)).await;
         let shutdown = CancellationToken::new();
+        let rollup_dir = tempfile::tempdir().unwrap();
+        let rollups = Arc::new(RwLock::new(crate::mayo::rollup_store::RollupStore::new(
+            rollup_dir.path().to_path_buf(),
+        )));
 
         let (mut aggregator, mut watch_rx) = ReportAggregator::new(
             council_transport,
             test_config(),
             shutdown.clone(),
-            None,
+            Some(Arc::clone(&rollups)),
             None,
             None,
         );
+
+        // #696: every message type that carries node state is bound to the
+        // peer's identity. (`AggregatedReport`, which bundled many nodes'
+        // reports with no binding at all, is gone.) Rollups and capability
+        // reports go first, so they're processed by the time the reports
+        // below are visible.
+        let rollup = |name: &str| crate::mayo::rollup::NodeRollup {
+            node_id: NodeId::new(name),
+            timestamp: 60,
+            entries: vec![crate::mayo::rollup::RollupEntry {
+                metric_name: "node_cpu_usage_percent".to_string(),
+                labels: std::collections::BTreeMap::new(),
+                aggregate: crate::mayo::rollup::RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        };
+        attacker
+            .send(addr(2), &ReportingMessage::MetricsRollup(rollup("victim")))
+            .await
+            .unwrap();
+        attacker
+            .send(
+                addr(2),
+                &ReportingMessage::CapabilityReport(capability("victim")),
+            )
+            .await
+            .unwrap();
+        honest
+            .send(addr(2), &ReportingMessage::MetricsRollup(rollup("honest")))
+            .await
+            .unwrap();
+        honest
+            .send(
+                addr(2),
+                &ReportingMessage::CapabilityReport(capability("honest")),
+            )
+            .await
+            .unwrap();
 
         // The attacker tries to overwrite "victim"'s entry, and to report as
         // itself; the honest node reports as itself.
@@ -630,6 +664,17 @@ mod tests {
         assert!(
             !state.readiness.contains_key(&NodeId::new("victim")),
             "readiness evidence must have the same mTLS identity binding"
+        );
+        assert!(state.capabilities.contains_key(&NodeId::new("honest")));
+        assert!(
+            !state.capabilities.contains_key(&NodeId::new("victim")),
+            "capability reports must have the same mTLS identity binding"
+        );
+        drop(state);
+        assert_eq!(
+            rollups.read().await.buffer_len(),
+            1,
+            "only the honest node's rollup may be ingested"
         );
 
         shutdown.cancel();

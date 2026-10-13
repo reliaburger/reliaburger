@@ -3,7 +3,6 @@
 /// A `StateReport` is sent by each worker node to its assigned council
 /// member at the configured reporting interval. It contains all runtime
 /// state: running apps, resource usage, and recent events.
-use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -248,10 +247,6 @@ pub enum ReportingMessage {
     Report(StateReport),
     /// Acknowledgement from the council member.
     Ack { node_id: NodeId },
-    /// Aggregated reports forwarded from council member to leader.
-    AggregatedReport {
-        reports: HashMap<NodeId, StateReport>,
-    },
     /// Pre-aggregated metrics rollup from worker to council aggregator.
     MetricsRollup(NodeRollup),
     /// Live scheduling capabilities and per-workload security evidence.

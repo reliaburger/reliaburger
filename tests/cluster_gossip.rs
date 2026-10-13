@@ -163,6 +163,27 @@ async fn start_node_with_mayo(
     shutdown: &CancellationToken,
     mayo: Option<std::sync::Arc<tokio::sync::RwLock<reliaburger::mayo::store::MayoStore>>>,
 ) -> (ClusterHandle, ClusterRuntime) {
+    start_node_with(
+        cluster,
+        index,
+        name,
+        shutdown,
+        mayo,
+        std::collections::BTreeMap::new(),
+    )
+    .await
+}
+
+/// Start node `index` of `cluster` like `start_node_with_mayo`, advertising
+/// `labels`.
+async fn start_node_with(
+    cluster: &TestCluster,
+    index: u16,
+    name: &str,
+    shutdown: &CancellationToken,
+    mayo: Option<std::sync::Arc<tokio::sync::RwLock<reliaburger::mayo::store::MayoStore>>>,
+    labels: std::collections::BTreeMap<String, String>,
+) -> (ClusterHandle, ClusterRuntime) {
     let gossip_port = cluster.gossip_port(index);
     let (mut handle, runtime) = runtime::start(
         ClusterParams {
@@ -185,7 +206,7 @@ async fn start_node_with_mayo(
             rollup_interval: Duration::from_millis(300),
             identity: None,
             backup: Default::default(),
-            labels: std::collections::BTreeMap::new(),
+            labels,
             self_disk_pressured_rx: None,
             readiness: None,
             recovery_probe_window: None,
@@ -400,6 +421,83 @@ async fn three_nodes_join_by_address_and_converge() {
     }
 
     shutdown.cancel();
+}
+
+/// #696: a node with 63-byte names, a full label set and a busy dissemination
+/// queue used to build probes over the 1,400-byte cap. The transport refused
+/// them, the error was discarded, and its peers declared it dead during the
+/// very churn that filled the queue. Every probe is now sized to fit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow multi-node gossip acceptance; run with make test-cluster"]
+async fn nodes_with_maximal_labels_stay_alive_during_churn() {
+    const NODES: u16 = 5;
+    let cluster = TestCluster::lease(NODES);
+    // The longest DNS-label names, so every update and header is maximal.
+    let name = |index: u16| {
+        let tag = format!("-{index}");
+        format!("{}{tag}", "m".repeat(63 - tag.len()))
+    };
+    // Sixteen labels that use the whole 512-byte label budget.
+    let labels: std::collections::BTreeMap<String, String> = (0..16)
+        .map(|i| (format!("label-key-{i:0>6}"), format!("value-{i:0>10}")))
+        .collect();
+
+    let tokens: Vec<CancellationToken> = (0..NODES).map(|_| CancellationToken::new()).collect();
+    let _cancel: Vec<CancelOnDrop> = tokens.iter().cloned().map(CancelOnDrop).collect();
+    let mut handles = Vec::new();
+    for index in 0..NODES - 1 {
+        handles.push(
+            start_node_with(
+                &cluster,
+                index,
+                &name(index),
+                &tokens[usize::from(index)],
+                None,
+                labels.clone(),
+            )
+            .await,
+        );
+    }
+
+    let first_four: Vec<String> = (0..NODES - 1).map(name).collect();
+    let converged = wait_until(Duration::from_secs(30), || {
+        handles
+            .iter()
+            .all(|(h, _)| alive_names(&h.membership_rx.borrow()) == first_four)
+    })
+    .await;
+    assert!(converged, "the maximally labelled nodes never converged");
+
+    // Churn: node 3 leaves and node 4 joins, so every queue fills with
+    // updates while the labelled extensions keep the datagrams full.
+    tokens[3].cancel();
+    handles.push(start_node_with(&cluster, 4, &name(4), &tokens[4], None, labels.clone()).await);
+
+    // For the next 20 seconds, nodes 0, 1 and 2 must never stop seeing each
+    // other as alive.
+    let stable: Vec<String> = (0..3).map(name).collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        for (index, (handle, _)) in handles.iter().take(3).enumerate() {
+            let alive = alive_names(&handle.membership_rx.borrow());
+            for peer in &stable {
+                assert!(
+                    alive.contains(peer),
+                    "node {index} lost sight of {peer} during churn: {alive:?}"
+                );
+            }
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    let after: Vec<String> = [0, 1, 2, 4].into_iter().map(name).collect();
+    let rejoined = wait_until(Duration::from_secs(30), || {
+        [0, 1, 2, 4]
+            .iter()
+            .all(|&i| alive_names(&handles[i].0.membership_rx.borrow()) == after)
+    })
+    .await;
+    assert!(rejoined, "the joining labelled node never converged");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -515,7 +515,7 @@ Reliaburger uses two distinct protocols for cluster coordination:
 
 **Layer 2: Raft, small dynamic council.** A council of typically 3-7 nodes runs Raft consensus for leader election and desired-state replication. The cluster picks council members automatically: a candidate must have been alive in gossip for a few seconds, and among those it prefers a zone the council doesn't cover yet, then the oldest node. Resource-aware selection is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)).
 
-Variable-size runtime state (what's running where, health, resource usage) travels separately from gossip, so gossip messages stay constant-size. Today every node sends its state reports straight to the leader. The design calls for a **hierarchical reporting tree**, where each node reports to an assigned council member and council members aggregate for the leader. That tree is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)), and it comes before any 10,000-node claim: a leader taking a report from every node directly won't get there.
+Variable-size runtime state (what's running where, health, resource usage) travels separately from gossip, so every gossip message fits one 1,400-byte datagram: a probe carries as many membership updates as its header and the sender's endpoints and labels leave room for. Today every node sends its state reports straight to the leader. The design calls for a **hierarchical reporting tree**, where each node reports to an assigned council member and council members aggregate for the leader. That tree is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)), and it comes before any 10,000-node claim: a leader taking a report from every node directly won't get there.
 
 ### 8.2 Reconstructable State
 
@@ -1110,7 +1110,7 @@ Nobody has run 10,000 nodes yet, so this is the design and what exists of it. Ea
 
 ### Q3: Isn't gossip carrying too much data at scale?
 
-Not the gossip itself: Mustard carries only lightweight, fixed-size state (membership, failure detection and leader identity), which is what keeps SWIM's O(1) per-node overhead. Per-node resource summaries on gossip are planned but not sent ([#364](https://github.com/reliaburger/reliaburger/issues/364)). Variable-size runtime state (what's running where, image availability, job completions) goes outside gossip, and that's the part that doesn't scale yet: every node reports straight to the leader. The hierarchical reporting tree, where nodes report to an assigned council member and council members aggregate for the leader, is planned under the same issue and has to land before any 10,000-node claim.
+Not the gossip itself: Mustard carries only lightweight, bounded state (membership, failure detection and leader identity), which is what keeps SWIM's O(1) per-node overhead. Per-node resource summaries on gossip are planned but not sent ([#364](https://github.com/reliaburger/reliaburger/issues/364)). Variable-size runtime state (what's running where, image availability, job completions) goes outside gossip, and that's the part that doesn't scale yet: every node reports straight to the leader. The hierarchical reporting tree, where nodes report to an assigned council member and council members aggregate for the leader, is planned under the same issue and has to land before any 10,000-node claim.
 
 ### Q4: With encrypted-in-git secrets, how do developers encrypt without cluster access?
 
