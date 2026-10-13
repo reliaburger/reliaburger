@@ -141,6 +141,7 @@ impl Fixture {
             data_dir_prefix: "rb-failover",
             data_root: Some(self.data.path().to_path_buf()),
             stale_report_timeout_secs: 10,
+            stale_node_grace: None,
             metrics_rollup: None,
             scheduler: schedule.then_some(reliaburger::config::node::ReconstructionSection {
                 report_threshold_percent: 80,

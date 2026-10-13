@@ -1621,9 +1621,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 Arc::clone(council),
                 membership_rx.clone(),
                 aggregated_rx,
-                config.dns.enabled,
-                config.reconstruction.clone(),
+                reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+                    dns_required: config.dns.enabled,
+                    reconstruction: config.reconstruction.clone(),
+                    stale_node_grace: std::time::Duration::from_secs(
+                        config.reporting_tree.stale_node_grace_secs,
+                    ),
+                },
                 Some(readiness.clone()),
+                Some(Arc::clone(&event_store)),
                 shutdown.clone(),
             ));
             // L3: leader-only autoscale loop, feeding on the same rollup

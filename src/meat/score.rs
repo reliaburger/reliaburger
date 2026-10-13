@@ -167,6 +167,52 @@ mod tests {
         assert!(scored[0].1 > scored[1].1);
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A node with `cpu_used` of 1000m and `memory_used` of 8 GiB taken.
+    fn loaded(name: &str, cpu_used: u64, memory_used: u64) -> SchedulerNodeState {
+        let mut node = node_state(name, 1000, cpu_used, BTreeMap::new());
+        node.allocatable.memory_bytes = 8 * GIB;
+        node.allocated.memory_bytes = memory_used;
+        node
+    }
+
+    /// D30: a cache asks for little CPU and a lot of memory. CPU alone
+    /// can't tell the two nodes apart, so the memory-full one must win on
+    /// memory, not lose the tiebreak to the emptier one.
+    #[test]
+    fn memory_heavy_app_packs_onto_the_memory_full_node() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(loaded("a-empty", 300, GIB));
+        cluster.set_node(loaded("b-full", 300, 6 * GIB));
+
+        let candidates = vec![NodeId::new("a-empty"), NodeId::new("b-full")];
+        let app = AppId::new("cache", "prod");
+        let res = Resources::new(100, GIB, 0);
+
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
+
+        assert_eq!(scored[0].0, NodeId::new("b-full"), "{scored:?}");
+    }
+
+    /// D30: both nodes end up 60% used on average, but one would be 90% CPU
+    /// and 30% memory, stranding memory nobody can use without CPU. The
+    /// imbalance penalty prefers the balanced node.
+    #[test]
+    fn imbalance_penalty_prefers_balanced_nodes() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(loaded("a-skewed", 800, GIB * 16 / 10));
+        cluster.set_node(loaded("b-balanced", 500, 4 * GIB));
+
+        let candidates = vec![NodeId::new("a-skewed"), NodeId::new("b-balanced")];
+        let app = AppId::new("api", "prod");
+        let res = Resources::new(100, GIB * 8 / 10, 0);
+
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
+
+        assert_eq!(scored[0].0, NodeId::new("b-balanced"), "{scored:?}");
+    }
+
     #[test]
     fn preferred_labels_boost_score() {
         let mut cluster = ClusterStateCache::new();

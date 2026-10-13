@@ -680,6 +680,7 @@ fn collect_replicas(
                 unanswered: unanswered.clone(),
                 blocked: desired.blocked.as_ref().map(ToString::to_string),
                 volume_home_away: desired.volume_home_away.clone(),
+                unschedulable: desired.unschedulable.as_ref().map(ToString::to_string),
                 rollout_failed: desired.rollout_failed.clone(),
             }
         })
@@ -1241,6 +1242,7 @@ mod tests {
                 service_port: Some(8080),
                 blocked: None,
                 volume_home_away: None,
+                unschedulable: None,
                 volume_homes: Vec::new(),
                 rollout_failed: None,
             }]),

@@ -196,6 +196,11 @@ pub struct DesiredAppEvidence {
     /// start it elsewhere on an empty volume (#423). `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_home_away: Option<String>,
+    /// The scheduler placed only some of the app's replicas: how many, out
+    /// of how many, and why the rest have no node (#702). `None` when every
+    /// replica is placed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unschedulable: Option<crate::meat::types::Unschedulable>,
     /// The nodes that hold this app's managed volumes, live or not: where
     /// its replicas are placed, or with none (a stopped app), where they
     /// last ran. Snapshot requests go there, whichever node receives them

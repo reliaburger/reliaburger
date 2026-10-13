@@ -99,8 +99,12 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         council.clone(),
         membership_rx,
         reports_rx,
-        false,
-        Default::default(),
+        reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+            dns_required: false,
+            reconstruction: Default::default(),
+            stale_node_grace: Duration::from_secs(300),
+        },
+        None,
         None,
         shutdown.clone(),
     );
@@ -268,8 +272,12 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
         council.clone(),
         membership_rx,
         reports_rx,
-        false,
-        Default::default(),
+        reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+            dns_required: false,
+            reconstruction: Default::default(),
+            stale_node_grace: Duration::from_secs(300),
+        },
+        None,
         None,
         shutdown.clone(),
     );

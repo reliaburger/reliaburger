@@ -50,6 +50,12 @@ pub struct AggregatedState {
     /// Nodes whose last report was *received* longer ago than
     /// `stale_report_timeout` (receive time, not sender wall clock).
     pub stale_nodes: Vec<NodeId>,
+    /// When each node in `stale_nodes` went stale: the last time this
+    /// leadership epoch heard from it, or for a node it never heard from,
+    /// when it started listening, plus `stale_report_timeout`. The leader
+    /// holds a stale node's placements for a grace period counted from here
+    /// (#702).
+    pub stale_since: HashMap<NodeId, Instant>,
     /// Latest capability evidence from each node. Absence means no
     /// schedulable security capabilities, never an optimistic guess.
     pub capabilities: HashMap<NodeId, NodeCapabilityReport>,
@@ -417,6 +423,19 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             }
         }
 
+        let stale_since = stale_nodes
+            .iter()
+            .filter_map(|node| {
+                let heard = self
+                    .report_freshness
+                    .get(node)
+                    .or_else(|| self.entries.get(node).map(|entry| &entry.received_at))?;
+                heard
+                    .checked_add(stale_timeout)
+                    .map(|since| (node.clone(), since))
+            })
+            .collect();
+
         let capabilities: HashMap<NodeId, NodeCapabilityReport> = self
             .capability_entries
             .iter()
@@ -449,6 +468,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                 .collect(),
             reports,
             stale_nodes,
+            stale_since,
             capabilities,
             readiness,
         }
@@ -508,6 +528,7 @@ mod tests {
                     pre_start: true,
                 },
                 dns: Default::default(),
+                process: Default::default(),
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,
@@ -531,6 +552,7 @@ mod tests {
             report_interval_secs: 1,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 
@@ -1045,5 +1067,42 @@ mod tests {
         assert!(aggregator.build_aggregated_state().stale_nodes.is_empty());
         tokio::time::advance(Duration::from_secs(31)).await;
         assert_eq!(aggregator.build_aggregated_state().stale_nodes.len(), 2);
+    }
+
+    /// #702: the leader counts a stale node's grace from when it went
+    /// stale: its last report plus the stale timeout, or for a member this
+    /// epoch never heard from, when the epoch started listening.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_node_says_when_it_went_stale() {
+        let net = InMemoryReportingNetwork::new();
+        let (_members, membership) = watch::channel(vec![member("reported"), member("silent")]);
+        let (_epoch, epoch_rx) = watch::channel(1);
+        let (mut aggregator, _view) = ReportAggregator::new(
+            net.register(addr(2)).await,
+            test_config(),
+            CancellationToken::new(),
+            None,
+            Some(epoch_rx),
+            Some(membership),
+        );
+        let listening = Instant::now();
+        aggregator.publish();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let reported = Instant::now();
+        aggregator.store_report(report("reported"));
+        assert!(aggregator.build_aggregated_state().stale_since.is_empty());
+
+        tokio::time::advance(Duration::from_secs(45)).await;
+        let state = aggregator.build_aggregated_state();
+
+        let timeout = Duration::from_secs(30);
+        assert_eq!(
+            state.stale_since.get(&NodeId::new("reported")),
+            Some(&(reported + timeout))
+        );
+        assert_eq!(
+            state.stale_since.get(&NodeId::new("silent")),
+            Some(&(listening + timeout))
+        );
     }
 }

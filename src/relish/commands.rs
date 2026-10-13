@@ -4247,6 +4247,7 @@ spec:
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             rollout_failed: None,
             volume_homes: Vec::new(),
         }
@@ -4311,6 +4312,27 @@ spec:
             "no workloads running\n\n\
              db (namespace prod) waits for node-2, which holds its volume and is out of the \
              cluster\n"
+        );
+    }
+
+    /// #702: an app placed only in part says how many replicas found a
+    /// node and why the rest didn't.
+    #[test]
+    fn status_says_how_much_of_a_short_app_is_placed_and_why() {
+        let short = crate::bun::diagnostics::DesiredAppEvidence {
+            unschedulable: Some(crate::meat::types::Unschedulable {
+                placed: 2,
+                wanted: 3,
+                reason: crate::meat::types::UnplacedReason::NoRoom,
+            }),
+            ..evidence("web", 3)
+        };
+        let output = render_status(&[], &[evidence("fine", 1), short]);
+        assert_eq!(
+            output,
+            "no workloads running\n\n\
+             web (namespace prod) is unschedulable: placed 2 of 3 replicas: \
+             no node that can run it has room\n"
         );
     }
 

@@ -112,8 +112,9 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 	fi
 	$(CARGO) audit
 
-bench: ## Run reproducible transport and 5-250 node gossip benchmarks
+bench: ## Run reproducible transport and 5-250 node gossip benchmarks, and the 1k and 10k node scheduling pass
 	$(CARGO) bench --bench gossip
+	$(CARGO) bench --bench scheduler
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large

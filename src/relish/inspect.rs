@@ -350,6 +350,7 @@ mod tests {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
             volume_homes: Vec::new(),
             rollout_failed: None,
         }

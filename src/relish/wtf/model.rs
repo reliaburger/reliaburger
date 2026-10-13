@@ -217,6 +217,10 @@ pub struct ReplicaObservation {
     /// the cluster and the app waits for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_home_away: Option<String>,
+    /// The scheduler placed only some replicas, and why the rest have no
+    /// node (#702).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unschedulable: Option<String>,
     /// The app's current spec failed to roll out on a node, so the leader
     /// holds the other nodes on the previous spec (#692).
     #[serde(default, skip_serializing_if = "Option::is_none")]

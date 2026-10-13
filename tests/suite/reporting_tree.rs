@@ -29,6 +29,7 @@ fn fast_config() -> ReportingTreeSection {
         report_interval_secs: 1,
         max_events_per_report: 100,
         stale_report_timeout_secs: 30,
+        stale_node_grace_secs: 300,
     }
 }
 
