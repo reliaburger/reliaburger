@@ -242,6 +242,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
     }
 
+    /// Whether this node's runtime runs containers, which an image app
+    /// needs (#914). The leader places image apps only where it does.
+    pub fn runs_containers(&self) -> bool {
+        false
+    }
+
     /// Replace the process-workloads policy (host-exec/script allowlist,
     /// mount isolation, script dir). The binary feeds the parsed
     /// `[process_workloads]` config here so the deny-by-default allowlist
@@ -1996,5 +2002,30 @@ mod tests {
         host.exec = None;
         host.image = Some("fixture:v1".into());
         sup.admit_app("image", &host).unwrap();
+    }
+
+    /// #914: the leader places image apps only on nodes that say they run
+    /// containers. A process runtime doesn't; runc, Apple Container and the
+    /// mixed runtime do.
+    #[test]
+    fn a_node_runs_containers_only_when_its_runtime_does() {
+        let root = tempfile::tempdir().unwrap();
+        let process = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        assert!(!process.runs_containers());
+
+        let runc = MockGrill::new();
+        runc.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runc = WorkloadSupervisor::new(runc, PortAllocator::new(30000, 31000));
+        assert!(runc.runs_containers());
+
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let mixed = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mixed = WorkloadSupervisor::new(mixed, PortAllocator::new(30000, 31000));
+        assert!(mixed.runs_containers());
     }
 }

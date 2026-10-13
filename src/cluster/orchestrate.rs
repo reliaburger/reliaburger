@@ -5017,6 +5017,7 @@ image = "busybox:latest"
                 },
                 dns: Default::default(),
                 process: Default::default(),
+                containers: true,
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,
@@ -8677,5 +8678,67 @@ mod scheduler_policy {
         );
 
         assert_eq!(nodes_of(&plan.decisions[0]), ["n2"]);
+    }
+
+    /// #914: an image app needs a container runtime. With a process-only
+    /// node and a runc node, it lands on the runc node; with only the
+    /// process node, it's unschedulable and says why, rather than placed
+    /// where the node would refuse it.
+    #[test]
+    fn an_image_app_is_never_placed_on_a_process_only_node() {
+        let app = AppId::new("web", "default");
+        let spec = requesting(100, Replicas::Fixed(1));
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), spec);
+        let runc = |name: &str| {
+            let mut node = node(name, 4000);
+            node.capabilities.containers = true;
+            node
+        };
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(node("process", 4000));
+        cache.set_node(runc("runc"));
+        let members = PassMembers {
+            alive: names(&["process", "runc"]),
+            ..Default::default()
+        };
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+        assert_eq!(nodes_of(&plan.decisions[0]), ["runc"]);
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(node("process", 4000));
+        let members = PassMembers {
+            alive: names(&["process"]),
+            ..Default::default()
+        };
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+        assert!(
+            plan.decisions
+                .iter()
+                .all(|decision| decision.placements.is_empty()),
+            "{:?}",
+            plan.decisions
+        );
+        assert_eq!(
+            plan.unschedulable.get(&app),
+            Some(&Unschedulable {
+                placed: 0,
+                wanted: 1,
+                reason: UnplacedReason::NoContainerRuntime,
+            })
+        );
     }
 }

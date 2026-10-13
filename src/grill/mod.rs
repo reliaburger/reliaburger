@@ -270,6 +270,35 @@ pub enum LaunchProblem {
     /// The path names a directory, or a file without execute permission.
     #[error("binary not executable: {}", .0.display())]
     BinaryNotExecutable(PathBuf),
+    /// The workload is a container, and this node's runtime runs only host
+    /// processes (`--runtime process`, #914). An image needs a container
+    /// runtime: the process runtime never pulls one, and running the app's
+    /// `command` on the host instead would only pretend to run it.
+    #[error("needs a container runtime to run {0}, and this node's runtime is process")]
+    NeedsContainerRuntime(ContainerWorkload),
+    /// The spec names nothing to execute.
+    #[error("no command to run")]
+    NoCommand,
+}
+
+/// What a [`LaunchProblem::NeedsContainerRuntime`] refusal couldn't run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerWorkload {
+    /// An app's image (or, for an app with only a `command`, the root
+    /// filesystem it would run in).
+    Image(String),
+    /// An init container, which runs before its app in the app's image or
+    /// its own.
+    InitContainer,
+}
+
+impl fmt::Display for ContainerWorkload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContainerWorkload::Image(image) => write!(f, "image {image}"),
+            ContainerWorkload::InitContainer => f.write_str("an init container"),
+        }
+    }
 }
 
 impl GrillError {

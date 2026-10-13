@@ -29,6 +29,10 @@ pub struct WorkloadRequirements {
     pub requires_dns: bool,
     /// The host binary an `exec` or `script` app runs (see [`host_binary`]).
     pub host_binary: Option<PathBuf>,
+    /// The app runs a container: it names an image, or has only a
+    /// `command`, or declares an init container. Only a node whose runtime
+    /// runs containers may take it (#914).
+    pub requires_containers: bool,
 }
 
 impl WorkloadRequirements {
@@ -45,6 +49,7 @@ impl WorkloadRequirements {
             requires_egress: spec.requires_network_policy(),
             requires_dns,
             host_binary: host_binary(spec).map(Path::to_path_buf),
+            requires_containers: false,
         }
     }
 }
@@ -197,6 +202,7 @@ mod tests {
                 requires_egress: false,
                 requires_dns: false,
                 host_binary: None,
+                requires_containers: false,
             },
             &cluster,
         );
@@ -231,6 +237,7 @@ mod tests {
                 requires_egress: false,
                 requires_dns: false,
                 host_binary: None,
+                requires_containers: false,
             },
             &cluster,
         );
@@ -252,6 +259,7 @@ mod tests {
                 requires_egress: false,
                 requires_dns: false,
                 host_binary: None,
+                requires_containers: false,
             },
             &cluster,
         );
@@ -280,6 +288,7 @@ mod tests {
                 requires_egress: false,
                 requires_dns: false,
                 host_binary: None,
+                requires_containers: false,
             },
             &cluster,
         );
@@ -316,6 +325,7 @@ mod tests {
                 requires_egress: false,
                 requires_dns: true,
                 host_binary: None,
+                requires_containers: false,
             },
             &cluster,
         );
@@ -367,6 +377,7 @@ mod tests {
                 requires_egress: false,
                 requires_dns: false,
                 host_binary: None,
+                requires_containers: false,
             },
             &cluster,
         );
@@ -447,5 +458,53 @@ mod tests {
         needs.host_binary = None;
         assert_eq!(unplaced_reason(&needs, &cluster), UnplacedReason::NoRoom);
         assert!(filter_nodes(&needs, &cluster).is_empty());
+    }
+
+    fn with_containers(mut node: SchedulerNodeState) -> SchedulerNodeState {
+        node.capabilities.containers = true;
+        node
+    }
+
+    /// #914: an app that names an image needs a container runtime, and a
+    /// node on `--runtime process` refuses it. Placement keeps it off such a
+    /// node, so it lands where it can run instead of failing after placement.
+    #[test]
+    fn image_app_skips_a_node_without_a_container_runtime() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(with_containers(running("runc", true, &["/bin/sh"])));
+        cluster.set_node(running("process", true, &["/bin/sh"]));
+
+        let image: AppSpec = toml::from_str(r#"image = "web:1""#).unwrap();
+        let result = filter_nodes(&WorkloadRequirements::for_app(&image, false), &cluster);
+        assert_eq!(result, vec![NodeId::new("runc")]);
+
+        // An init container is a container too, even before an exec app.
+        let init: AppSpec = toml::from_str(
+            "exec = \"/bin/sh\"\n[[init]]\ncommand = [\"echo\", \"migrating\"]",
+        )
+        .unwrap();
+        let result = filter_nodes(&WorkloadRequirements::for_app(&init, false), &cluster);
+        assert_eq!(result, vec![NodeId::new("runc")]);
+
+        // A host workload runs on either.
+        let script: AppSpec = toml::from_str(r#"script = "echo hi""#).unwrap();
+        let mut result = filter_nodes(&WorkloadRequirements::for_app(&script, false), &cluster);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(result, vec![NodeId::new("process"), NodeId::new("runc")]);
+    }
+
+    #[test]
+    fn an_image_app_with_only_process_nodes_is_unplaced_for_want_of_a_container_runtime() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(running("process", true, &["/bin/sh"]));
+        let image: AppSpec = toml::from_str(r#"image = "web:1""#).unwrap();
+
+        let reason = unplaced_reason(&WorkloadRequirements::for_app(&image, false), &cluster);
+
+        assert_eq!(reason, UnplacedReason::NoContainerRuntime);
+        assert_eq!(
+            reason.to_string(),
+            "no ready node has a container runtime to run its image"
+        );
     }
 }

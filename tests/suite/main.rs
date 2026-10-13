@@ -34,6 +34,7 @@ mod bun_startup_exit;
 mod ca_trust_rotation;
 mod cluster_fixtures;
 mod compatibility;
+mod container_runtime_required;
 mod council_persistence;
 mod council_snapshot_install;
 mod council_tcp;

@@ -3129,4 +3129,139 @@ mod tests {
             "a refused launch must not leave a prepared generation behind"
         );
     }
+
+    /// The OCI spec Bun builds for `app`, as a fresh deploy does.
+    fn app_spec(name: &str, app: &str) -> OciSpec {
+        let app: crate::config::app::AppSpec = toml::from_str(app).unwrap();
+        crate::grill::oci::generate_oci_spec(
+            name,
+            "default",
+            &app,
+            &format!("default__{name}-0"),
+            None,
+            &format!("/reliaburger/default/{name}/0"),
+            None,
+            None,
+        )
+    }
+
+    /// #914: an app that names an image needs a container runtime. The
+    /// process runtime refuses it, instead of running its `command` on the
+    /// host as though the image were a placeholder.
+    #[tokio::test]
+    async fn create_refuses_an_image_app_as_needing_a_container_runtime() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__web-0".to_string());
+        let spec = app_spec(
+            "web",
+            "image = \"nginx:1.27\"\ncommand = [\"sleep\", \"60\"]",
+        );
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::NeedsContainerRuntime(
+                super::super::ContainerWorkload::Image("nginx:1.27".to_string())
+            )
+        );
+        assert_eq!(
+            problem.to_string(),
+            "needs a container runtime to run image nginx:1.27, and this node's runtime is process"
+        );
+        assert!(
+            matches!(
+                grill.start(&id).await,
+                Err(GrillError::NotFound { .. })
+            ),
+            "a refused image app must leave nothing to start"
+        );
+    }
+
+    /// #914: an image app without a command used to run `sleep 86400` as a
+    /// stand-in, and looked healthy while doing nothing.
+    #[tokio::test]
+    async fn create_refuses_an_image_app_without_a_command_instead_of_sleeping() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__idle-0".to_string());
+        let spec = app_spec("idle", "image = \"busybox:1.36\"");
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::NeedsContainerRuntime(
+                super::super::ContainerWorkload::Image("busybox:1.36".to_string())
+            )
+        );
+    }
+
+    /// #914: an init container is a container, so an exec app that declares
+    /// one fails on the process runtime with that reason.
+    #[tokio::test]
+    async fn create_refuses_an_init_container_as_needing_a_container_runtime() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__tool-0-init-0".to_string());
+        let app = app_spec("tool", "exec = \"/bin/sleep\"\ncommand = [\"60\"]");
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("command = [\"echo\", \"migrating\"]").unwrap();
+        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            "needs a container runtime to run an init container, and this node's runtime is process"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_create_refuses_an_image_app_before_preparing_a_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let owners = root.path().join("owners");
+        let grill = ProcessGrill::with_owner(owners.clone(), "/bin/false".into());
+        let id = InstanceId("default__web-0".to_string());
+        let spec = app_spec("web", "image = \"nginx:1.27\"\ncommand = [\"sleep\", \"60\"]");
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert!(
+            matches!(problem, super::super::LaunchProblem::NeedsContainerRuntime(_)),
+            "{problem:?}"
+        );
+        assert!(
+            !owners.join(&id.0).exists(),
+            "a refused launch must not leave a prepared generation behind"
+        );
+    }
+
+    /// #914: host workloads are what the process runtime is for. An `exec`
+    /// app and a `script` app still run.
+    #[tokio::test]
+    async fn host_exec_and_script_apps_still_run_under_the_process_runtime() {
+        let grill = ProcessGrill::new();
+        for (name, app) in [
+            ("tool", "exec = \"/bin/sleep\"\ncommand = [\"60\"]"),
+            ("job", "script = \"sleep 60\""),
+        ] {
+            let id = InstanceId(format!("default__{name}-0"));
+            let spec = app_spec(name, app);
+            assert!(spec.host_process, "{name} must be a host workload");
+
+            grill.create(&id, &spec).await.unwrap();
+            grill.start(&id).await.unwrap();
+            assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+            grill.kill(&id).await.unwrap();
+        }
+    }
+
+    /// #914: the `sleep 86400` stand-in is gone. A host spec with nothing to
+    /// run is refused, not kept alive doing nothing.
+    #[tokio::test]
+    async fn create_refuses_a_host_spec_with_no_command() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("empty-0".to_string());
+        let mut spec = spec_with_args(Vec::new());
+        spec.host_process = true;
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(problem, super::super::LaunchProblem::NoCommand);
+        assert_eq!(problem.to_string(), "no command to run");
+    }
 }

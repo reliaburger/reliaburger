@@ -21,6 +21,11 @@ pub struct NodeCapabilities {
     /// The host process workloads (`exec` and `script` apps) the node runs.
     #[serde(default)]
     pub process: ProcessWorkloadCapability,
+    /// The node's runtime runs containers: runc, Apple Container or the
+    /// mixed runtime. A node on `--runtime process` runs only `exec` and
+    /// `script` apps, so the scheduler keeps image apps off it (#914).
+    #[serde(default)]
+    pub containers: bool,
 }
 
 /// Which host process workloads a node runs: the `[process_workloads]`

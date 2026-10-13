@@ -219,6 +219,9 @@ pub enum UnplacedReason {
     NoReadyNode,
     /// No ready node carries every `required` placement label.
     NoLabelMatch,
+    /// The app names an image or an init container, and no ready node with
+    /// the labels runs containers: they all run `--runtime process` (#914).
+    NoContainerRuntime,
     /// No ready node with the labels can enforce what the app needs: an
     /// egress allowlist, internal DNS, or its host binary in
     /// `[process_workloads] allowed_binaries`.
@@ -232,6 +235,9 @@ impl fmt::Display for UnplacedReason {
         f.write_str(match self {
             UnplacedReason::NoReadyNode => "no node is ready",
             UnplacedReason::NoLabelMatch => "no ready node has its required labels",
+            UnplacedReason::NoContainerRuntime => {
+                "no ready node has a container runtime to run its image"
+            }
             UnplacedReason::NoCapableNode => {
                 "no ready node can enforce its egress or DNS needs or run its host binary"
             }
