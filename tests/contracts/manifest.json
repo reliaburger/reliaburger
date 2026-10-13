@@ -7366,6 +7366,48 @@
       ]
     },
     {
+      "id": "issue-852-capacity-harness-volumes",
+      "issue": 852,
+      "promise": "The owned-runc capacity harness keeps its volumes directory until it stops, then unmounts and removes it, whether the test passed or panicked.",
+      "supported_paths": [
+        "Rootful agents that leave workload identity tmpfs mounted beneath the harness's volumes directory"
+      ],
+      "cases": [
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        },
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A volumes directory that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
       "id": "issue-734-rootless-test-cleanup",
       "issue": 734,
       "promise": "A failed rootless OCI test leaves none of its network helpers running.",
