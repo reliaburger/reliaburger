@@ -1098,17 +1098,31 @@ pub fn plan_pass(
             .with_daemon_credit(committed_footprints(desired, app_id));
         let Placed { decision, unplaced } = scheduler.place_app(app_id, &effective_spec);
         *cache = scheduler.cluster;
-        let placements = number_placements(previous, kept, decision.placements);
+        let mut kept = kept;
         if let Some(unplaced) = unplaced {
             unschedulable.insert(
                 app_id.clone(),
                 crate::meat::types::Unschedulable {
-                    placed: u32::try_from(placements.len()).unwrap_or(u32::MAX),
+                    placed: u32::try_from(kept.len() + decision.placements.len())
+                        .unwrap_or(u32::MAX),
                     wanted: u32::try_from(want).unwrap_or(u32::MAX),
                     reason: unplaced.reason,
                 },
             );
+            // A replica that no longer holds but has nowhere else to go
+            // stays committed where it was: dropping it would retire a
+            // workload that may still run, and replace it with nothing. It
+            // moves once a node can take it.
+            let mut stranded: Vec<_> = previous
+                .iter()
+                .filter(|p| !kept.iter().any(|k| k.ordinal == p.ordinal))
+                .cloned()
+                .collect();
+            stranded.sort_by_key(|p| p.ordinal);
+            stranded.truncate(unplaced.missing as usize);
+            kept.extend(stranded);
         }
+        let placements = number_placements(previous, kept, decision.placements);
         // A short app plans the same placements tick after tick; committing
         // them again would only grow the Raft log.
         if !same_placements(previous, &placements) {
@@ -8578,6 +8592,49 @@ mod scheduler_policy {
             ),
             [],
             "a deleted app isn't placed again, it's gone"
+        );
+    }
+
+    /// D29 places what fits, but a replica that no longer holds and has
+    /// nowhere else to go stays committed where it was: dropping it would
+    /// retire a workload that may still be running, for no replacement. The
+    /// self-upgrade revert test caught this: a lone node that briefly
+    /// reported not ready while restarting lost its only workload.
+    #[test]
+    fn a_replica_with_nowhere_to_go_stays_where_it_was() {
+        let app = AppId::new("rejoin", "default");
+        let spec = requesting(100, Replicas::Fixed(2));
+        let mut desired = DesiredState::default();
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&spec, &["n1", "n2"]));
+        desired.apps.insert(app.clone(), spec);
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(node("n1", 150));
+        let mut booting = node("n2", 4000);
+        booting.ready = false;
+        cache.set_node(booting);
+        let members = PassMembers {
+            alive: names(&["n1", "n2"]),
+            ..Default::default()
+        };
+
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+
+        assert!(plan.decisions.is_empty(), "{:?}", plan.decisions);
+        assert_eq!(
+            plan.unschedulable.get(&app),
+            Some(&Unschedulable {
+                placed: 1,
+                wanted: 2,
+                reason: UnplacedReason::NoRoom,
+            })
         );
     }
 
