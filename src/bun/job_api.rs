@@ -112,7 +112,11 @@ pub(crate) async fn admit_definition(
         }
     }
     super::task_array_api::admit_template_image(state, binder, &mut definition.template).await?;
-    if let Some(reason) = sole_node_refusal(state, name, namespace, definition) {
+    let refusal = match sole_node_refusal(state, name, namespace, definition) {
+        Some(reason) => Some(reason),
+        None => cluster_refusal(state, name, namespace, definition).await,
+    };
+    if let Some(reason) = refusal {
         return Err(error(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("no node can run job {namespace}/{name}: {reason}"),
@@ -125,8 +129,8 @@ pub(crate) async fn admit_definition(
 /// only node that could run them (standalone: no council, no gossip peers).
 /// Admitting host work nobody can run (most often under `mount_isolation`,
 /// #714) would only fail a second later; refusing it names the reason at
-/// once. Container work and clusters are left to the leader, which fails a
-/// run once every node has refused it.
+/// once. Container work is left to the tick, which fails a run once every
+/// node has refused it.
 fn sole_node_refusal(
     state: &ApiState,
     name: &str,
@@ -137,7 +141,46 @@ fn sole_node_refusal(
         return None;
     }
     let node = state.task_arrays.node.as_ref()?;
-    let record = crate::meat::task_array_store::TaskArrayRecord {
+    let record = definition_record(name, namespace, definition)?;
+    let self_node = crate::meat::NodeId::new(state.node_name.as_deref().unwrap_or("local"));
+    node.refusal(&super::task_array_leader::assignment_for(
+        0, &record, &self_node,
+    ))
+}
+
+/// Why no live member of a cluster can run the definition, judged by the
+/// leader from the job capabilities every member advertises over gossip
+/// (#788). `None` standalone, while any member might run it, or before
+/// gossip names any member. The leader's tick stays the backstop for runs
+/// this lets through and for nodes that change after admission.
+async fn cluster_refusal(
+    state: &ApiState,
+    name: &str,
+    namespace: &str,
+    definition: &JobDefinition,
+) -> Option<String> {
+    state.council.as_ref()?;
+    let record = definition_record(name, namespace, definition)?;
+    let members = state.membership.as_ref()?.read().await;
+    let nodes: Vec<_> = members
+        .iter()
+        .map(|member| super::task_array_leader::AdvertisedNode {
+            node: member.node_id.clone(),
+            jobs: member.jobs,
+            allowed_binaries: None,
+        })
+        .collect();
+    super::task_array_leader::admission_refusal(&record, &nodes)
+}
+
+/// The record a run of `definition` would have, for asking whether any
+/// node could take it before anything is written.
+fn definition_record(
+    name: &str,
+    namespace: &str,
+    definition: &JobDefinition,
+) -> Option<crate::meat::task_array_store::TaskArrayRecord> {
+    Some(crate::meat::task_array_store::TaskArrayRecord {
         name: name.to_string(),
         namespace: namespace.to_string(),
         template: definition.template.clone(),
@@ -146,11 +189,7 @@ fn sole_node_refusal(
         terminal_at_epoch_secs: None,
         quota_blocked: None,
         unrunnable: None,
-    };
-    let self_node = crate::meat::NodeId::new(state.node_name.as_deref().unwrap_or("local"));
-    node.refusal(&super::task_array_leader::assignment_for(
-        0, &record, &self_node,
-    ))
+    })
 }
 
 /// `POST /v1/jobs/runs`: manual singleton/array run or durable cron registration.

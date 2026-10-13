@@ -107,6 +107,8 @@ pub struct Compatibility {
 /// `ReportingMessage::AggregatedReport` variant is gone.
 /// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
 /// sources with bit 63 set name a job's run identity (#737).
+/// The gossip directory extension's `jobs`, each node's job capability
+/// summary, which the leader's job admission reads (#788).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

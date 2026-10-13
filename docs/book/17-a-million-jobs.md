@@ -1191,9 +1191,88 @@ common admission path, `admit_definition`, asks the node's executor the same
 `admit` question about host work before writing anything, and a refusal comes
 back as HTTP 422 with the reason. We kept it to host work, the case #777 is
 about; a container run on a node without a container runtime still goes
-through the tick, a second later. A council could do the same if every node
-advertised what it can run, but that's another piece of gossiped state to keep honest.
-A second of delay in a cluster is a fair price for not having it.
+through the tick, a second later.
+
+A cluster had no such shortcut at first. The leader admitted the run, wrote
+it to Raft, and failed it on the next tick. You got a `202 Accepted` and, a
+second later, a `Failed`. That's honest, but it's a strange way to say no.
+The fix (#788) was the piece of gossiped state we'd been putting off: every
+node now tells the others what kinds of job it runs.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCapabilities {
+    pub host: bool,
+    pub host_limits: bool,
+    pub containers: bool,
+    pub singleton_images: bool,
+    pub singleton_image_limits: bool,
+    pub encrypted_env: bool,
+    pub network_policy: bool,
+    pub mount_isolation: bool,
+    pub binaries: bool,
+}
+```
+
+Nine flags, one for each question `admit` asks of the node's runtime and
+`[process_workloads]` policy. `Copy` is new here: it tells the compiler that a
+`JobCapabilities` is plain bits, so assigning one copies it and the original
+stays usable, the way an `int` or a C struct of `bool`s behaves. Without it,
+`let b = a;` would *move* `a`, and touching `a` afterwards wouldn't compile.
+Rust only lets you derive `Copy` when every field is `Copy` too, so a struct
+holding a `String` can't have it.
+
+The summary rides the gossip directory extension, beside the node's labels
+and endpoints, on every probe. Since #696 a probe fills a fixed byte budget,
+and whatever the extension costs is room a membership update can't use. So
+the summary is small on purpose: bincode writes a `bool` as one byte, which
+makes the whole thing ten bytes with its `Option` tag. A test stamps the
+biggest extension a node can send (63-byte names, IPv6 endpoints, sixteen
+labels using the whole label budget, a leader hint, a recovery claim and
+every job flag) and checks the probe still carries a membership update.
+
+What the summary can't carry is the allowlist itself. Paths are long, and a
+node can name dozens. So `binaries` only says whether the allowlist names
+anything at all, since an empty one refuses every host job.
+
+The harder problem was keeping the summary honest. If the leader decided from
+the flags with its own logic, the two would drift, and admission would refuse
+runs the nodes would take, or quote a different reason from the tick. So
+there's only one copy of the logic. `capability_refusal` takes the flags, the
+assignment and whether the binary is allowed, and returns the first refusal.
+The node's `admit` now calls it with its *own* flags:
+
+```rust
+let binary_allowed = self.config.policy.is_binary_allowed(&assignment.program);
+if let Some(reason) = capability_refusal(&self.job_capabilities(), assignment, binary_allowed)
+{
+    return Err(reason);
+}
+```
+
+The leader calls the same function with each live member's gossiped flags. A
+test runs a matrix of runs (host arrays, limits, singleton images, image
+arrays, `shared-runc`, egress) against owned, process and fake runners under
+four policies, and checks the advertised verdict matches `admit` word for
+word.
+
+The leader refuses only when it's sure. Every live member has to have
+advertised a summary, and every one of them has to refuse. A member it hasn't
+heard from yet might take the run, so the run is admitted and left to the
+nodes. For the binary, the leader assumes a non-empty allowlist might allow
+it. In each of those cases the tick from #777 stays the backstop, as it does
+for the races: a node that leaves, or changes its configuration, after
+admission. When admission does refuse, it quotes the reasons through the same
+`quote_reasons` helper the tick uses, so `relish run` prints `no node can run
+job default/render: host jobs don't run under [process_workloads]
+mount_isolation yet …` whether the leader caught it at the door or a tick
+later.
+
+The node publishes its summary through a `tokio::sync::watch` channel, because
+gossip starts long before the task executor exists. Gossip reads the latest
+value whenever it builds a probe, and lists the node in its own directory too:
+the leader is a member like any other, and its own extension never comes back
+to it over the wire.
 
 One more thing was quietly wrong. A node's capability report said it ran
 process workloads whenever its allowlist wasn't empty, even with

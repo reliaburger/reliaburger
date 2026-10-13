@@ -794,12 +794,18 @@ mod tests {
     #[test]
     fn a_worst_case_extension_with_job_capabilities_still_carries_an_update() {
         assert!(worst_case_extension().jobs.is_some());
-        let mut message =
-            GossipMessage::new(longest_name(1), u64::MAX, GossipPayload::Ping { updates: vec![] });
+        let mut message = GossipMessage::new(
+            longest_name(1),
+            u64::MAX,
+            GossipPayload::Ping { updates: vec![] },
+        );
         message.sequence = u64::MAX;
         message.attach_extension(worst_case_extension());
         assert_eq!(
-            message.extension.as_ref().and_then(|extension| extension.jobs),
+            message
+                .extension
+                .as_ref()
+                .and_then(|extension| extension.jobs),
             Some(every_job_capability())
         );
         assert!(fill_worst_case(GossipPayload::Ping { updates: vec![] }) >= 1);

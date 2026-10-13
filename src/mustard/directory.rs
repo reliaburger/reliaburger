@@ -91,6 +91,12 @@ impl NodeDirectory {
             self.disk_pressured.remove(&extension.node_id);
             changed = true;
         }
+        // A node that stops advertising its job summary is unknown again,
+        // never still capable of what it last said.
+        changed |= match extension.jobs {
+            Some(jobs) => self.jobs.insert(extension.node_id.clone(), jobs) != Some(jobs),
+            None => self.jobs.remove(&extension.node_id).is_some(),
+        };
         let claim = extension.recovery_epoch.map(|epoch| RecoveryClaim {
             epoch,
             id: extension.recovery_id,
@@ -158,6 +164,7 @@ impl NodeDirectory {
             self.labels.remove(node_id);
             self.disk_pressured.remove(node_id);
             self.recovery_claims.remove(node_id);
+            self.jobs.remove(node_id);
         }
         self.endpoints.len() != before
     }

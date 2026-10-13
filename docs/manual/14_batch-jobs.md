@@ -451,14 +451,29 @@ mount_isolation = false
 
 Forget it and the cluster says so straight away. A standalone node refuses the
 submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
-and the reason. In a cluster the run is admitted, because some other node might
-take it, and the leader fails it within a sync or two once every node it can
-reach has refused it. `relish batch-status` and `relish jobs` then show
-`Failed`, every task not run, and a `refused:` line quoting the nodes' reason;
-the JSON summary carries it as `unrunnable_reason`. The same rule catches any
-refusal that comes from a node's own configuration, such as a binary missing
-from every node's `allowed_binaries`. A run that only some nodes refuse keeps
-going on the others.
+and the reason. So does a cluster: every node advertises over gossip what
+kinds of job it runs (host commands, containers, limits it can enforce,
+`mount_isolation`, whether its `allowed_binaries` names anything), and the
+leader refuses a run that every live node says it can't take, with HTTP 422
+and a reason such as:
+
+```text
+no node can run job default/hello: host jobs don't run under
+[process_workloads] mount_isolation yet (on by default on Linux); ...
+```
+
+The leader refuses only when it's sure. If a node hasn't advertised yet, or
+might allow the binary (gossip says whether a node's allowlist names
+anything, not which paths), the run is admitted, and the leader fails it
+within a sync or two once every node it can reach has refused it. The same
+happens when a node leaves or changes its configuration after admission.
+`relish batch-status` and `relish jobs` then show `Failed`, every task not
+run, and a `refused:` line quoting the nodes' reason; the JSON summary
+carries it as `unrunnable_reason`. Either way the reason reads the same. The
+rule catches any refusal that comes from a node's own configuration, such as
+a container job on nodes without the rootful Linux runtime, or a binary
+missing from every node's `allowed_binaries`. A run that only some nodes
+refuse keeps going on the others.
 
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
 

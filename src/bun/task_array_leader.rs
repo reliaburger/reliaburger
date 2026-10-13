@@ -897,6 +897,12 @@ pub fn unrunnable_reason(
         }
         reasons.insert(progress.refused.as_deref()?);
     }
+    Some(format!("no node can run it: {}", quote_reasons(&reasons)))
+}
+
+/// The distinct reasons nodes gave for refusing a run, joined for a user:
+/// at most [`MAX_UNRUNNABLE_REASONS`] of them, each cut to 256 bytes.
+fn quote_reasons(reasons: &BTreeSet<&str>) -> String {
     let mut quoted: Vec<String> = reasons
         .iter()
         .take(MAX_UNRUNNABLE_REASONS)
@@ -915,7 +921,7 @@ pub fn unrunnable_reason(
             reasons.len() - MAX_UNRUNNABLE_REASONS
         ));
     }
-    Some(format!("no node can run it: {}", quoted.join("; ")))
+    quoted.join("; ")
 }
 
 /// A live node as the leader sees it when it admits a job run (#788).
@@ -933,9 +939,32 @@ pub struct AdvertisedNode<'a> {
 /// Why no live node can run `record`, from what the nodes advertise: each
 /// distinct reason, quoted as [`unrunnable_reason`] quotes them. `None`
 /// while any node might take it (#788).
+///
+/// Admission only refuses when it is sure: every node must have advertised
+/// a summary, and a node with a non-empty allowlist the leader can't see
+/// counts as allowing the binary. The tick ([`unrunnable_reason`]) stays
+/// the backstop for whatever this lets through, and for races such as a
+/// node leaving or changing its configuration after admission.
 pub fn admission_refusal(record: &TaskArrayRecord, nodes: &[AdvertisedNode<'_>]) -> Option<String> {
-    let _ = (record, nodes);
-    None
+    let [first, ..] = nodes else {
+        return None;
+    };
+    // The assignment a node would be sent, so the checks see what it sees.
+    let assignment = assignment_for(0, record, &first.node);
+    let mut refusals = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let jobs = node.jobs?;
+        let binary_allowed = node.allowed_binaries.map_or(jobs.binaries, |allowed| {
+            allowed.contains(&assignment.program)
+        });
+        refusals.push(super::task_array_node::capability_refusal(
+            &jobs,
+            &assignment,
+            binary_allowed,
+        )?);
+    }
+    let reasons: BTreeSet<&str> = refusals.iter().map(String::as_str).collect();
+    Some(quote_reasons(&reasons))
 }
 
 /// One node's answer to a sync call, with the `known` list it was sent.
@@ -2203,7 +2232,11 @@ mod tests {
             advertised("c", Some(no_host)),
         ];
         let reason = admission_refusal(&record, &nodes).expect("no node can take it");
-        assert_eq!(reason.matches("mount_isolation").count(), 1, "{reason}");
+        assert_eq!(
+            reason.matches("host jobs don't run under").count(),
+            1,
+            "{reason}"
+        );
         assert!(reason.contains("host arrays require"), "{reason}");
     }
 
@@ -2301,7 +2334,9 @@ mod tests {
         };
         let reason = admission_refusal(&record, &[reported]).unwrap();
         assert!(
-            reason.contains("/usr/bin/render isn't in this node's [process_workloads] allowed_binaries"),
+            reason.contains(
+                "/usr/bin/render isn't in this node's [process_workloads] allowed_binaries"
+            ),
             "{reason}"
         );
         assert_eq!(

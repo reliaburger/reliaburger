@@ -374,6 +374,7 @@ impl<T: MustardTransport> MustardNode<T> {
         rx: watch::Receiver<Option<crate::meat::job_capability::JobCapabilities>>,
     ) {
         self.job_capabilities_rx = Some(rx);
+        self.refresh_own_job_capabilities();
     }
 
     /// Wire this node's recovery fence (#424): every outgoing extension then
@@ -447,9 +448,30 @@ impl<T: MustardTransport> MustardNode<T> {
             disk_pressured,
             recovery_epoch: recovery_claim.map(|claim| claim.epoch),
             recovery_id: recovery_claim.and_then(|claim| claim.id),
-            jobs: None,
+            jobs: self.own_job_capabilities(),
             hmac: [0u8; 32],
         })
+    }
+
+    /// The kinds of job this node runs, as its runtime last published them.
+    fn own_job_capabilities(&self) -> Option<crate::meat::job_capability::JobCapabilities> {
+        self.job_capabilities_rx
+            .as_ref()
+            .and_then(|rx| *rx.borrow())
+    }
+
+    /// List this node's own job summary in its directory, publishing on a
+    /// change. Its own extension never comes back over the wire, and the
+    /// leader counts itself among the nodes that might run a job (#788).
+    fn refresh_own_job_capabilities(&mut self) {
+        let own = self.own_job_capabilities();
+        let changed = match own {
+            Some(jobs) => self.directory.jobs.insert(self.node_id.clone(), jobs) != Some(jobs),
+            None => self.directory.jobs.remove(&self.node_id).is_some(),
+        };
+        if changed {
+            self.publish_directory();
+        }
     }
 
     /// Build an outgoing probe (Ping, PingReq or Ack) from this node:
@@ -731,6 +753,7 @@ impl<T: MustardTransport> MustardNode<T> {
         if self.node_gate.is_quiesced() {
             return;
         }
+        self.refresh_own_job_capabilities();
         // An explicit departure retires a contact; a failure does not. Inspect
         // Left before reaping, while that distinction still exists.
         self.rejoin_contacts.retain(|(node, _)| {

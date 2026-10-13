@@ -19,12 +19,12 @@ use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNode
 use reliaburger::bun::task_executor::{AttemptOutcome, FakeRunner, ProcessRunner};
 use reliaburger::bun::task_ledger::GroupCommit;
 use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
-use reliaburger::meat::job_capability::JobCapabilities;
 use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
 use reliaburger::council::node::CouncilNode;
 use reliaburger::council::state_machine::CouncilStateMachine;
 use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
+use reliaburger::meat::job_capability::JobCapabilities;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -735,7 +735,9 @@ async fn a_cluster_refuses_a_run_no_live_node_can_take_at_submission() {
     let isolated = harness.job_capabilities;
     assert!(isolated.mount_isolation);
     let gossip = GossipPair::start(isolated, isolated).await;
-    gossip.publish_once_peer_advertises(isolated, &members).await;
+    gossip
+        .publish_once_peer_advertises(isolated, &members)
+        .await;
 
     let started = tokio::time::Instant::now();
     let (status, answer) = harness.submit(shell_array(20, 10, "exit 0")).await;
