@@ -1268,6 +1268,28 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
             affected_resource: "registry".to_string(),
         });
     }
+    // A plaintext cluster is plaintext on every node, so name the fix once
+    // and list the nodes it holds back (#792).
+    let plaintext: Vec<String> = registries
+        .iter()
+        .filter(|registry| registry.needs_mtls)
+        .map(|registry| registry.node_id.clone())
+        .collect();
+    if !plaintext.is_empty() {
+        found = true;
+        report.warnings.push(WtfFinding {
+            id: "registry-needs-mtls".to_string(),
+            title: "the registry needs mTLS: on this plaintext cluster it can't replicate \
+                    or reach its leader, so pushes and image reads fail"
+                .to_string(),
+            details: plaintext,
+            suggestion: "start the cluster with TLS (`relish init`, then `relish join` on each \
+                         node); plaintext clusters such as `relish dev` have no cluster registry"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "registry".to_string(),
+        });
+    }
     for registry in registries.iter().filter(|registry| {
         !registry.ready
             || (registry.clustered && !registry.peer_reachable)
@@ -1488,6 +1510,7 @@ mod tests {
                     under_replicated_layers: 0,
                     lost_images: Vec::new(),
                     lost_image_count: 0,
+                    needs_mtls: false,
                 }]),
                 tokens: available(vec![
                     token("admin", "admin", NOW - 10 * DAY, None),
@@ -2218,6 +2241,7 @@ mod tests {
             under_replicated_layers: 2,
             lost_images: Vec::new(),
             lost_image_count: 0,
+            needs_mtls: false,
         }]);
 
         let report = diagnose(&inputs);
@@ -2232,6 +2256,45 @@ mod tests {
         ] {
             assert!(report.warnings.iter().any(|item| item.id == id), "{id}");
         }
+    }
+
+    /// #792: a plaintext cluster's registry can't forward or replicate.
+    /// Every node says so, but the operator reads it once, with the fix.
+    #[test]
+    fn a_plaintext_cluster_registry_is_one_warning_naming_the_mtls_fix() {
+        let mut inputs = healthy_inputs();
+        let node = |node_id: &str| RegistryObservation {
+            node_id: node_id.to_string(),
+            clustered: true,
+            ready: true,
+            peer_reachable: true,
+            redundancy_possible: true,
+            under_replicated_layers: 0,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
+            needs_mtls: true,
+        };
+        inputs.cluster.registry = available(vec![node("node-1"), node("node-2")]);
+
+        let report = diagnose(&inputs);
+
+        let findings: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|item| item.id == "registry-needs-mtls")
+            .collect();
+        assert_eq!(findings.len(), 1, "{:?}", report.warnings);
+        assert!(findings[0].title.contains("mTLS"), "{}", findings[0].title);
+        assert!(
+            findings[0].suggestion.contains("relish init"),
+            "{}",
+            findings[0].suggestion
+        );
+        assert_eq!(
+            findings[0].details,
+            vec!["node-1".to_string(), "node-2".to_string()]
+        );
+        assert!(!report.ok.iter().any(|item| item.id == "registry"));
     }
 
     #[test]
@@ -2283,6 +2346,7 @@ mod tests {
             under_replicated_layers: 0,
             lost_images: vec!["web:v1".to_string(), "api:v2".to_string()],
             lost_image_count: 2,
+            needs_mtls: false,
         };
         inputs.cluster.registry = available(vec![lost("node-1"), lost("node-2")]);
 
@@ -2315,6 +2379,7 @@ mod tests {
             under_replicated_layers: 0,
             lost_images: Vec::new(),
             lost_image_count: 0,
+            needs_mtls: false,
         }]);
 
         let report = diagnose(&inputs);

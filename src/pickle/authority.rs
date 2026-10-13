@@ -267,6 +267,9 @@ pub struct RegistryForwarder {
     directory: watch::Receiver<NodeDirectory>,
     /// Whole-exchange deadline for one proposal or query.
     timeout: Duration,
+    /// A unit test's plaintext stand-in leader takes no certificate.
+    #[cfg(test)]
+    plaintext_stand_in: bool,
 }
 
 impl RegistryForwarder {
@@ -276,6 +279,8 @@ impl RegistryForwarder {
             http,
             directory,
             timeout: PROPOSAL_TIMEOUT,
+            #[cfg(test)]
+            plaintext_stand_in: false,
         }
     }
 
@@ -285,6 +290,26 @@ impl RegistryForwarder {
     fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Let a unit test drive the forwarding exchange against a plaintext
+    /// stand-in leader, which, unlike the real one, takes no certificate.
+    #[cfg(test)]
+    pub(crate) fn against_plaintext_stand_in(mut self) -> Self {
+        self.plaintext_stand_in = true;
+        self
+    }
+
+    /// Whether this node can't forward at all, because its cluster
+    /// transport is plaintext. The leader's propose and query endpoints
+    /// accept only mTLS node certificates (#792), so a plaintext request
+    /// could only ever be refused.
+    pub fn requires_mtls(&self) -> bool {
+        #[cfg(test)]
+        if self.plaintext_stand_in {
+            return false;
+        }
+        self.http.scheme() != "https"
     }
 
     /// Commit locally when possible, otherwise send directly to the leader.
@@ -350,6 +375,9 @@ impl RegistryForwarder {
         path: &str,
         request: &T,
     ) -> Result<R, PickleError> {
+        if self.requires_mtls() {
+            return Err(PickleError::RegistryNeedsMtls);
+        }
         let address = {
             let directory = self.directory.borrow();
             if let Some(council) = council {
@@ -487,7 +515,8 @@ mod tests {
         let forwarder = RegistryForwarder::new(
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
-        );
+        )
+        .against_plaintext_stand_in();
         assert!(forwarder.write(None, report()).await.is_err());
         tx.send(directory(address)).unwrap();
         assert_eq!(
@@ -536,7 +565,8 @@ mod tests {
                 crate::cluster::ClusterHttp::plaintext_with_client(client)
                     .with_bearer(Some("internal".into())),
                 rx,
-            );
+            )
+            .against_plaintext_stand_in();
             assert!(forwarder.write(None, report()).await.is_err());
             assert!(!followed.load(std::sync::atomic::Ordering::SeqCst));
             task.abort();
@@ -590,6 +620,7 @@ mod tests {
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
         )
+        .against_plaintext_stand_in()
         .with_timeout(Duration::from_secs(2));
         assert!(
             forwarder
@@ -709,5 +740,73 @@ mod tests {
             ]),
         }));
         assert!(mutation.request_for_node("writer", 1).is_err());
+    }
+
+    /// #792: the leader's registry endpoints accept only callers with a
+    /// cluster certificate. A plaintext forwarder knows that up front, so it
+    /// answers with the fix instead of sending a request the leader refuses.
+    #[tokio::test]
+    async fn plaintext_forwarding_answers_that_the_registry_needs_mtls_without_sending() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        let server = tokio::spawn(async move {
+            let count = move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::FORBIDDEN
+                }
+            };
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(REGISTRY_PROPOSAL_PATH, post(count.clone()))
+                    .route(REGISTRY_QUERY_PATH, post(count)),
+            )
+            .await
+            .unwrap();
+        });
+        let (_tx, rx) = watch::channel(directory(address));
+        let forwarder = RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+            rx,
+        );
+
+        assert!(forwarder.requires_mtls());
+        assert!(matches!(
+            forwarder.write(None, report()).await,
+            Err(PickleError::RegistryNeedsMtls)
+        ));
+        assert!(matches!(
+            forwarder.query(None, 1, RegistryQuery::Retirements).await,
+            Err(PickleError::RegistryNeedsMtls)
+        ));
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a plaintext node must not send registry control traffic"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn an_mtls_forwarder_sends_registry_traffic() {
+        let (_tx, rx) = watch::channel(NodeDirectory::default());
+        let forwarder = RegistryForwarder::new(
+            crate::cluster::ClusterHttp::secure(reqwest::Client::new()),
+            rx,
+        );
+        assert!(!forwarder.requires_mtls());
+    }
+
+    #[test]
+    fn the_mtls_refusal_tells_the_operator_how_to_fix_it() {
+        let message = PickleError::RegistryNeedsMtls.to_string();
+        assert!(message.starts_with("the registry needs mTLS"), "{message}");
+        assert!(message.contains("relish init"), "{message}");
+        assert!(message.contains("relish join"), "{message}");
     }
 }

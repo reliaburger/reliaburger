@@ -156,6 +156,33 @@ can't rebuild it. `relish status` prints a line naming each lost image,
 `image … is lost: … re-push it`. Push it again, or bring the node that held it
 back.
 
+### The cluster registry needs mTLS
+
+Everything above, from pushes and heal to expiry and cleanup, goes through the
+council leader. Nodes send their registry proposals and queries to the leader,
+and the leader takes them only from a node that shows its cluster certificate.
+That's how it knows which node is asking, so one node can't claim another's
+copies. There's no token-only way in.
+
+A plaintext cluster (`[security] require_mtls = false`, which is what
+`relish dev` sets up) has no certificates, so it has no cluster registry.
+Pushes, `relish build`, `relish images`, and pulls of images Pickle would
+resolve (Docker Hub names such as `web:v1` or `nginx:1.27`) fail with:
+
+```text
+the registry needs mTLS: its leader accepts replication and forwarded queries
+only from nodes with a cluster certificate, and this cluster runs plaintext
+transports; start the cluster with TLS (`relish init`, then `relish join` on
+each node)
+```
+
+Each node logs it once at start-up and once from its cleanup loop, not every
+second. `relish status` prints `registry: needs mTLS`, and `relish wtf` warns
+`registry-needs-mtls`, naming the nodes. An image with an explicit registry
+host (`ghcr.io/org/app:v1`) still pulls straight from that registry. To use
+Pickle, start the cluster with TLS. A standalone node (no `--cluster`) keeps its own loopback registry
+and needs none of this.
+
 ## Building images
 
 `relish build` builds images from your config straight into Pickle:
@@ -278,7 +305,9 @@ Pickle only takes these credentials over TLS. A plaintext registry, which is
 what a node without an identity serves, refuses them even with a good token,
 because the password is your API token. There, use `relish build`, or push
 anonymously to a standalone node's loopback registry before its first API
-token exists. Pickle has no Docker token service. It removes images by tag
+token exists. On a plaintext cluster neither works (see
+[The cluster registry needs mTLS](#the-cluster-registry-needs-mtls)). Pickle
+has no Docker token service. It removes images by tag
 (see [Deleting a tag](#deleting-a-tag)); it doesn't mount layers across
 repositories, so a client offering a mount gets an ordinary upload instead.
 

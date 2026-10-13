@@ -1121,6 +1121,15 @@ pub enum PickleError {
     DigestMismatch { expected: Digest, actual: Digest },
     #[error("replication failed: {0}")]
     ReplicationFailed(String),
+    /// The cluster runs plaintext transports, and the registry leader's
+    /// propose and query endpoints accept only mTLS node certificates
+    /// (#792), so this node can't forward or replicate registry state.
+    #[error(
+        "the registry needs mTLS: its leader accepts replication and forwarded queries only \
+         from nodes with a cluster certificate, and this cluster runs plaintext transports; \
+         start the cluster with TLS (`relish init`, then `relish join` on each node)"
+    )]
+    RegistryNeedsMtls,
     /// No live node holds some blob the image needs (design §7.3): only a
     /// fresh push brings it back.
     #[error(
