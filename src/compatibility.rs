@@ -121,6 +121,8 @@ pub struct Compatibility {
 /// for an app that doesn't autoscale is refused, `OciSpec::initialiser` marks
 /// an init container's spec, managed-volume sidecars record `size_bytes`, and
 /// inline config files move to a per-instance directory.
+/// A task-array node's control fence is `control.fence`, two checksummed
+/// slots rewritten in place, not `control.json` (#745).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,
