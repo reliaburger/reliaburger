@@ -436,7 +436,8 @@ gossip benchmarks when it touches `src/mustard/` or the gossip benches, and the
 task-array benchmarks when it touches the task-array leader, node pool,
 executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
 nothing; the task-array job fails only on a benchmark more than twice as slow
-as main's last baseline, and keeps its Criterion output for 90 days
+against main's last baseline as the rest of its run, or on a run whose median
+benchmark is, and keeps its Criterion output for 90 days
 ([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.

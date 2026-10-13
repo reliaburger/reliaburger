@@ -697,7 +697,8 @@ the real `curl … | sh` install against it on every host we advertise.
 
    Also link the candidate commit's `task-array benchmarks` run from the gate
    issue. It runs nightly on `main` and fails only on a regression of more
-   than 2x against main's last baseline; its `criterion-task-arrays` artefact
+   than 2x against main's last baseline, allowing for the runner's own speed
+   ([how](testing.md#benchmarks-in-ci)); its `criterion-task-arrays` artefact
    is the cost evidence for bounded-cost claims such as 0.2.0's (#668).
 
 6. **Record it.** Copy each host's record into

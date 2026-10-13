@@ -616,10 +616,40 @@ branch skips the acceptance suites unless someone labels it `full-ci`; it gets t
 targets `main`, or a release's merge-train branch: from 0.1.4 on, each release collects its
 pull requests on one `release-*` branch, and those are the release's changes, so they get the
 whole of CI. Benchmarks run on `main`, nightly, and on changes to the code they measure.
-The gossip numbers gate nothing. The task-array benchmarks gate on one thing: a benchmark
-more than twice as slow as the baseline the last `main` run saved. Why twice, and not
-Criterion's own few per cent? Because a hosted runner is a different machine every night, and
-a gate that trips on the runner's mood is just another flake.
+The gossip numbers gate nothing. The task-array benchmarks gate on a regression, measured
+against the baseline the last `main` run saved. Why not Criterion's own few per cent? Because
+a hosted runner is a different machine every night, and a gate that trips on the runner's mood
+is just another flake.
+
+At first the gate was absolute: fail when any benchmark is more than twice as slow as the
+baseline. That held until the night of 12 October 2026, when five runs in a row failed it,
+on `main` and on the 0.2.1 train alike, and then blocked the 0.2.0 candidate build three
+times. Every benchmark was 1.4 to 2.1 times slower, including `index_set/insert_sequential_1m`,
+at 2.07 in each run, and nobody had touched that code. The runner was slow, not our code, and
+a gate that fails every run blocks every merge and every release on a cloud provider's bad
+night.
+
+So now each run measures its own runner. `bench_baseline.py` takes each benchmark's ratio to
+the baseline, then divides it by the median ratio of the *other* benchmarks in the same run. A
+uniformly slower machine cancels out, and a benchmark fails only when it's more than twice as
+slow as the rest of its run. We kept the real numbers from those five runs as a test fixture:
+the worst of them, a 0.1 ms JSON encode at 2.93 times the baseline, comes out at 1.86 against
+the rest, and passes.
+
+Two details came from the same data. First, a fast runner never tightens the bound: the median
+counts as at least 1. Two earlier runs that day had fast CPUs and a slow disk, with the median
+benchmark at 0.82 and the storage one at 1.66. Divided by the median, storage would have been
+2.05 and failed a run that was fine. Second, a slow runner and a change that slows down most of
+the suite look exactly the same from inside one run, and the median would quietly absorb that
+second one. So the run also fails when its median ratio is above two. That's the old absolute
+gate, asked of the median rather than of every benchmark, so the new gate passes everything the
+old one did.
+
+Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
+alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
+slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
+which kind of loop we picked, and on that one loop's own noise. A new workload would also have
+no history to test against, and no entry in `main`'s baseline until the change landed.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
