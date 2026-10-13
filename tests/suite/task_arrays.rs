@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::bun::api;
-use reliaburger::bun::task_array_leader::TaskArrayService;
+use reliaburger::bun::task_array_leader::{CronClock, TaskArrayService};
 use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
 use reliaburger::bun::task_executor::{AttemptOutcome, FakeRunner, ProcessRunner};
 use reliaburger::bun::task_ledger::GroupCommit;
@@ -131,6 +131,20 @@ impl Harness {
         tokens: Option<reliaburger::sesame::auth::TokenStore>,
         data: tempfile::TempDir,
     ) -> Self {
+        Self::start_in_with_cron_clock(options, tokens, data, CronClock::System).await
+    }
+
+    /// A harness whose leader fires cron schedules at `clock`'s time.
+    async fn start_with_cron_clock(options: Options, clock: CronClock) -> Self {
+        Self::start_in_with_cron_clock(options, None, tempfile::tempdir().unwrap(), clock).await
+    }
+
+    async fn start_in_with_cron_clock(
+        options: Options,
+        tokens: Option<reliaburger::sesame::auth::TokenStore>,
+        data: tempfile::TempDir,
+        cron_clock: CronClock,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         // No agent: task arrays don't go through it. Holding the receiver
@@ -175,6 +189,7 @@ impl Harness {
                 Duration::from_secs(30),
             )
             .with_retention(options.retention)
+            .with_cron_clock(cron_clock)
             .with_storage(data.path())
             .await
             .unwrap(),
@@ -851,7 +866,10 @@ async fn manual_singletons_use_common_runs_and_repeat_requests_keep_the_same_ide
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cron_registration_is_durable_without_launching_a_manual_run() {
-    let harness = Harness::start(Options::processes(true)).await;
+    // Cron time held at the start, so the every-minute schedule can't come
+    // due if the test crosses a minute boundary (#868).
+    let clock = CronClock::manual(reliaburger::meat::batch_ids::epoch_now_secs());
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock).await;
     let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     let response = harness
         .http
@@ -879,6 +897,81 @@ async fn cron_registration_is_durable_without_launching_a_manual_run() {
             .is_some()
     );
     assert!(arrays.ids().is_empty());
+}
+
+/// The leader reads cron time from the service's cron clock, so a test can
+/// hold time still and move it on exactly when it wants an occurrence.
+/// Nothing fires while the clock stands before the scheduled minute, however
+/// many leader ticks pass, and the occurrence fires once it gets there (#748).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cron_occurrence_fires_only_when_the_cron_clock_reaches_its_minute() {
+    let start = reliaburger::meat::batch_ids::epoch_now_secs() / 60 * 60;
+    let clock = CronClock::manual(start);
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock.clone()).await;
+    // Well past the minute registration lands in, which a schedule never fires in.
+    let occurrence = start + 30 * 60;
+    let at = time::OffsetDateTime::from_unix_timestamp(occurrence as i64).unwrap();
+    let expression = format!(
+        "{} {} {} {} *",
+        at.minute(),
+        at.hour(),
+        at.day(),
+        u8::from(at.month())
+    );
+    let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":expression}}});
+    let response = harness
+        .http
+        .post(format!("{}/v1/jobs/runs", harness.base_url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let council = harness.council.as_ref().unwrap();
+    let fired = async || {
+        council
+            .desired_state()
+            .await
+            .task_arrays
+            .jobs()
+            .runs()
+            .any(|(_, run)| run.name == "nightly")
+    };
+
+    // Twenty leader ticks with the clock held still.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!fired().await, "the occurrence fired before its minute");
+
+    clock.set(occurrence);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !fired().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the occurrence never fired"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let arrays = council.desired_state().await.task_arrays;
+    let run = arrays
+        .jobs()
+        .runs()
+        .find(|(_, run)| run.name == "nightly")
+        .unwrap()
+        .1;
+    assert_eq!(
+        run.trigger,
+        reliaburger::meat::job::RunTrigger::Cron {
+            minute: (occurrence / 60) as i64
+        }
+    );
+    assert_eq!(
+        arrays
+            .jobs()
+            .definition("default", "nightly")
+            .unwrap()
+            .skipped,
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -968,7 +1061,10 @@ async fn finite_batches_are_common_singletons_and_repeated_submissions_keep_the_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jobs_inventory_and_stop_use_durable_schedule_definitions() {
-    let harness = Harness::start(Options::processes(true)).await;
+    // Cron time held at the start, so the every-minute schedule can't come
+    // due if the test crosses a minute boundary (#868).
+    let clock = CronClock::manual(reliaburger::meat::batch_ids::epoch_now_secs());
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock).await;
     let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     assert_eq!(
         harness
