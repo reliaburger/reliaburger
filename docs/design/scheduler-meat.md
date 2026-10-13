@@ -1351,8 +1351,8 @@ This fits comfortably within a typical server's memory. The 312 MB total Bun age
 
 Meat's scheduling loop is designed to consume < 15% of a single core at sustained throughput. At the 1,150 jobs/sec target:
 
-- Each scheduling decision involves: one Filter pass (~50us), one Score pass (~20us), one Select (~1us), one Raft commit (~200us for the leader's local append; replication is async for scheduling decisions that are not App deploys).
-- Total: ~270us per decision. At 1,150 decisions/sec = ~310ms of CPU per second = 31% of one core.
+- App placement is measured by `benches/scheduler.rs` (`make bench`). One leader pass placing 150 replicas (50 apps of 3) took about 29 ms on 1,000 nodes, about 190 µs per placement, and about 330 ms on 10,000 nodes, about 2.2 ms per placement, on the development laptop (an Apple silicon MacBook, October 2026). Filter and Score each walk every node for every replica, so the cost grows with the cluster. A converged pass, the one the leader runs every tick once everything is placed, took about 0.2 ms on 1,000 nodes and 1.7 ms on 10,000. The Raft commit comes on top, once per pass rather than per decision.
+- An earlier version of this section estimated ~270 µs per decision with nothing to measure it against. The measurement above is close at 1,000 nodes and an order of magnitude off at 10,000; App placement rates are far below the job rates below, so it fits the budget, but per-node work in Filter and Score is the place to look if large clusters need faster placement.
 - With core pinning at > 1,000 nodes, this would be isolated from other Bun tasks (core pinning is planned, not yet implemented — see Section 1).
 
 In practice, the batch model means most scheduling decisions are batch allocations (one per node per batch, not one per instance), so the actual decision rate for 100M jobs/day is closer to 50-200 allocation decisions per second, well within budget.
