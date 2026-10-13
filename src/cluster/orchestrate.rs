@@ -742,17 +742,37 @@ impl std::fmt::Display for ShortfallChange {
     }
 }
 
-/// What changed between the recorded short apps and this pass's, in app
-/// order. The leader logs each change once, and raises an event when an app
-/// starts or stops being short, instead of logging every tick. An app that
-/// left desired state isn't "cleared": it's gone.
+/// What changed between the recorded short apps and this pass's: apps that
+/// became short or changed, then apps that cleared, each in app order. The
+/// leader logs each change once, and raises an event when an app starts or
+/// stops being short, instead of logging every tick. An app that left
+/// desired state isn't "cleared": it's gone.
 fn shortfall_changes(
     recorded: &HashMap<crate::meat::types::AppId, crate::meat::types::Unschedulable>,
     planned: &BTreeMap<crate::meat::types::AppId, crate::meat::types::Unschedulable>,
     desired: &crate::council::types::DesiredState,
 ) -> Vec<ShortfallChange> {
-    let _ = (recorded, planned, desired);
-    Vec::new()
+    let mut changes: Vec<ShortfallChange> = planned
+        .iter()
+        .filter_map(|(app_id, short)| match recorded.get(app_id) {
+            None => Some(ShortfallChange::Started(app_id.clone(), *short)),
+            Some(before) if before != short => {
+                Some(ShortfallChange::Changed(app_id.clone(), *short))
+            }
+            Some(_) => None,
+        })
+        .collect();
+    let mut cleared: Vec<&crate::meat::types::AppId> = recorded
+        .keys()
+        .filter(|app_id| !planned.contains_key(*app_id) && desired.apps.contains_key(*app_id))
+        .collect();
+    cleared.sort();
+    changes.extend(
+        cleared
+            .into_iter()
+            .map(|app_id| ShortfallChange::Cleared(app_id.clone())),
+    );
+    changes
 }
 
 /// Log each change in which apps are short, and record an event when one
@@ -802,8 +822,20 @@ fn lapsed_nodes(
     reports: &AggregatedState,
     grace: Duration,
 ) -> HashSet<NodeId> {
-    let _ = (alive, reports, grace);
-    HashSet::new()
+    let now = tokio::time::Instant::now();
+    alive
+        .iter()
+        .filter(|node| reports.stale_nodes.contains(*node))
+        .filter(|node| {
+            // A stale node with no recorded time holds: no evidence of how
+            // long, so no move.
+            reports
+                .stale_since
+                .get(*node)
+                .is_some_and(|since| now.saturating_duration_since(*since) >= grace)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Plan a pass with the cluster's configured DNS requirement.
@@ -829,14 +861,14 @@ pub fn plan_pass(
     quotas: &mut crate::meat::quota::QuotaLedger,
     dns_required: bool,
 ) -> PassPlan {
+    use crate::meat::scheduler::{Placed, Scheduler};
+
     let PassMembers {
         alive,
         suspect,
         unheard,
         lapsed,
     } = members;
-    let _ = lapsed;
-    use crate::meat::scheduler::Scheduler;
 
     crate::meat::admission::reserve_commitments(cache, desired);
 
@@ -863,11 +895,13 @@ pub fn plan_pass(
         alive,
         suspect,
         unheard,
+        lapsed,
         retired: &retired,
         dns_required,
     };
     let mut decisions = Vec::new();
     let mut quota_blocked = BTreeMap::new();
+    let mut unschedulable = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
     let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
     app_ids.sort_by_key(|a| a.to_string());
@@ -876,13 +910,7 @@ pub fn plan_pass(
     // converged, up front. A placement is only OK if it targets a node still
     // alive, ready and capable of enforcing the spec — capability loss is a
     // state change that forces the same re-plan as node loss or a cordon.
-    let mut planned: Vec<(
-        &crate::meat::types::AppId,
-        &AppSpec,
-        Option<u32>,
-        usize,
-        bool,
-    )> = Vec::with_capacity(app_ids.len());
+    let mut planned: Vec<AppPass<'_>> = Vec::with_capacity(app_ids.len());
     for app_id in &app_ids {
         let Some(spec) = desired.apps.get(app_id) else {
             continue;
@@ -898,15 +926,30 @@ pub fn plan_pass(
                 .map(|(_, n)| *n)
         };
         // A daemon set targets every *eligible* node, so its convergence count
-        // is the eligible-node count, not every alive node (M25).
+        // is the eligible-node count, not every alive node (M25), plus the
+        // copies it keeps on nodes that can't be judged right now: a stale
+        // node within its grace, a suspect or an unheard one (D28).
+        let mut held_daemons = Vec::new();
         let want = if override_replicas.is_none() && matches!(spec.replicas, Replicas::DaemonSet) {
-            daemon_eligible_count(
+            let eligible: HashSet<NodeId> = crate::meat::scheduler::daemon_candidates(
                 cache,
                 app_id,
-                spec,
-                dns_required,
                 &committed_footprints(desired, app_id),
+                &crate::meat::filter::WorkloadRequirements::for_app(spec, dns_required),
             )
+            .into_iter()
+            .collect();
+            held_daemons = desired
+                .scheduling
+                .get(app_id)
+                .into_iter()
+                .flatten()
+                .filter(|p| {
+                    !eligible.contains(&p.node_id) && liveness.keeps(app_id, p, spec, cache)
+                })
+                .cloned()
+                .collect();
+            eligible.len() + held_daemons.len()
         } else {
             effective_replicas(spec, override_replicas, alive.len())
         };
@@ -921,7 +964,14 @@ pub fn plan_pass(
                         .all(|p| p.resources == requested && liveness.keeps(app_id, p, spec, cache))
             })
             .unwrap_or(false);
-        planned.push((app_id, spec, override_replicas, want, converged));
+        planned.push(AppPass {
+            app_id,
+            spec,
+            override_replicas,
+            want,
+            converged,
+            held_daemons,
+        });
     }
 
     // Seed the quota ledger with every already-converged app's footprint
@@ -930,18 +980,24 @@ pub fn plan_pass(
     // namespace's usage, so a later new app is admitted against a clean slate
     // and the budget is silently busted once the earlier apps converge.
     if !quotas.is_empty() {
-        for (app_id, spec, _, want, converged) in &planned {
-            if *converged {
-                quotas.charge_committed(
-                    &app_id.namespace,
-                    &scheduler_resources(spec),
-                    *want as u32,
-                );
-            }
+        for app in planned.iter().filter(|app| app.converged) {
+            quotas.charge_committed(
+                &app.app_id.namespace,
+                &scheduler_resources(app.spec),
+                app.want as u32,
+            );
         }
     }
 
-    for (app_id, spec, override_replicas, want, converged) in planned {
+    for AppPass {
+        app_id,
+        spec,
+        override_replicas,
+        want,
+        converged,
+        held_daemons,
+    } in planned
+    {
         if converged {
             continue;
         }
@@ -975,7 +1031,8 @@ pub fn plan_pass(
         // places the rest. Losing one node of three must not move the
         // replicas on the other two: they're serving, and replacing them
         // would restart them for nothing. A scale-down keeps the lowest
-        // ordinals, so it retires the highest.
+        // ordinals, so it retires the highest. A daemon set keeps its
+        // copies on nodes it can't judge yet, and is re-placed on the rest.
         let previous = desired
             .scheduling
             .get(app_id)
@@ -992,7 +1049,7 @@ pub fn plan_pass(
                 holding.truncate(want);
                 holding
             }
-            Replicas::DaemonSet => Vec::new(),
+            Replicas::DaemonSet => held_daemons,
         };
         // A kept replica whose request changed is resized where it runs:
         // its node trades the footprint it was committed with for the new
@@ -1004,75 +1061,94 @@ pub fn plan_pass(
                 placement.resources = per_replica;
             }
         }
-        // An app with no placement left (it was stopped, or is starting
-        // again) goes back to the nodes that hold its managed volumes.
-        if kept.is_empty() && matches!(effective_spec.replicas, Replicas::Fixed(_)) {
-            let home = VolumeHome {
-                cache,
-                alive,
-                suspect,
-                unheard,
-                retired: &retired,
-                dns_required,
-            };
-            match home.reserve(app_id, spec, desired.last_placed_nodes.get(app_id), want) {
-                HomeOutcome::Placed(placements) => kept = placements,
-                HomeOutcome::Wait { node, reason } => {
-                    eprintln!(
-                        "scheduler: {app_id} waits for {node}, which holds its volumes: {reason}"
-                    );
-                    continue;
+        if let Replicas::Fixed(_) = effective_spec.replicas {
+            // An app with no placement left (it was stopped, or is starting
+            // again) goes back to the nodes that hold its managed volumes.
+            if kept.is_empty() {
+                let home = VolumeHome {
+                    cache,
+                    alive,
+                    suspect,
+                    unheard,
+                    retired: &retired,
+                    dns_required,
+                };
+                match home.reserve(app_id, spec, desired.last_placed_nodes.get(app_id), want) {
+                    HomeOutcome::Placed(placements) => kept = placements,
+                    HomeOutcome::Wait { node, reason } => {
+                        eprintln!(
+                            "scheduler: {app_id} waits for {node}, which holds its volumes: {reason}"
+                        );
+                        continue;
+                    }
                 }
             }
-        }
-        if !kept.is_empty() {
-            let missing = want - kept.len();
-            if missing == 0 {
-                decisions.push(crate::meat::types::SchedulingDecision {
-                    app_id: app_id.clone(),
-                    placements: number_placements(previous, kept, Vec::new()),
-                });
-                continue;
-            }
-            effective_spec.replicas = Replicas::Fixed(missing as u32);
-        }
-        // Spread the rest against what's kept, not against what the nodes
-        // last reported: a report can lag a new leader, or still list a
-        // replica on its way out.
-        if matches!(effective_spec.replicas, Replicas::Fixed(_)) {
+            effective_spec.replicas = Replicas::Fixed((want - kept.len()) as u32);
+            // Spread the rest against what's kept, not against what the
+            // nodes last reported: a report can lag a new leader, or still
+            // list a replica on its way out.
             count_kept_replicas(cache, app_id, &kept);
         }
         // The scheduler owns its cache, so hand it the shared one and take
         // it back afterwards (Rust move semantics — no shared &mut alias).
-        // Snapshot first: a partially-placed fixed-replica app reserves some
-        // nodes and then errors (M25), and writing the scheduler's mutated
-        // cache back unconditionally would leak those phantom reservations
-        // into the shared pass, wrongly starving later apps. On error we
-        // restore the pre-call cache; only a successful placement's
-        // reservations are kept.
-        let snapshot = (*cache).clone();
+        // Every replica it placed stays reserved, even when some found no
+        // node: those run, and later apps in the pass must see them (D29).
         let mut scheduler = Scheduler::new(std::mem::take(cache))
             .with_dns_required(dns_required)
             .with_daemon_credit(committed_footprints(desired, app_id));
-        let result = scheduler.schedule_app(app_id, &effective_spec);
-        match result {
-            Ok(mut decision) => {
-                *cache = scheduler.cluster;
-                let added = std::mem::take(&mut decision.placements);
-                decision.placements = number_placements(previous, kept, added);
-                decisions.push(decision);
-            }
-            Err(e) => {
-                *cache = snapshot;
-                eprintln!("scheduler: cannot place {app_id}: {e}");
-            }
+        let Placed { decision, unplaced } = scheduler.place_app(app_id, &effective_spec);
+        *cache = scheduler.cluster;
+        let placements = number_placements(previous, kept, decision.placements);
+        if let Some(unplaced) = unplaced {
+            unschedulable.insert(
+                app_id.clone(),
+                crate::meat::types::Unschedulable {
+                    placed: u32::try_from(placements.len()).unwrap_or(u32::MAX),
+                    wanted: u32::try_from(want).unwrap_or(u32::MAX),
+                    reason: unplaced.reason,
+                },
+            );
+        }
+        // A short app plans the same placements tick after tick; committing
+        // them again would only grow the Raft log.
+        if !same_placements(previous, &placements) {
+            decisions.push(crate::meat::types::SchedulingDecision {
+                app_id: app_id.clone(),
+                placements,
+            });
         }
     }
     PassPlan {
         decisions,
         quota_blocked,
-        unschedulable: BTreeMap::new(),
+        unschedulable,
     }
+}
+
+/// One app's place in a pass: what it wants, and whether it already has it.
+struct AppPass<'a> {
+    app_id: &'a crate::meat::types::AppId,
+    spec: &'a AppSpec,
+    /// A stop or the autoscaler's replica count, over the spec's.
+    override_replicas: Option<u32>,
+    /// Replicas the app should have.
+    want: usize,
+    /// Every committed placement still holds and there are `want` of them.
+    converged: bool,
+    /// A daemon set's committed copies on nodes that aren't eligible now but
+    /// still hold, such as a stale node within its grace (D28).
+    held_daemons: Vec<crate::meat::types::Placement>,
+}
+
+/// Whether `planned` (in ordinal order) is exactly what `committed` already
+/// says, in whatever order it was committed.
+fn same_placements(
+    committed: &[crate::meat::types::Placement],
+    planned: &[crate::meat::types::Placement],
+) -> bool {
+    let mut committed = committed.to_vec();
+    committed.sort_by_key(|p| p.ordinal);
+    committed == planned
 }
 
 /// Give an app's placements their cluster-wide ordinals, distinct within the
@@ -1257,33 +1333,33 @@ impl VolumeHome<'_> {
 /// over several seconds, one report at a time, and a node whose report went
 /// to a council member that just died can take longer still; "not heard from
 /// yet" is not evidence of trouble, and moving its replicas would restart
-/// healthy workloads. A node that reported and went stale, or reported not
-/// ready or not capable, does lose them. (A managed-volume app's placement
-/// never gets this far: [`Liveness::keeps`] keeps it.)
+/// healthy workloads. A node whose reports went stale keeps them too, but
+/// only for the stale-node grace (D28): once it is in `lapsed`, they move. A
+/// node that reported not ready or not capable loses them at once. (A
+/// managed-volume app's placement never gets this far: [`Liveness::keeps`]
+/// keeps it.)
 fn placement_holds(
     placement: &crate::meat::types::Placement,
     spec: &AppSpec,
     cache: &ClusterStateCache,
-    alive: &HashSet<NodeId>,
-    suspect: &HashSet<NodeId>,
-    unheard: &HashSet<NodeId>,
-    dns_required: bool,
+    liveness: &Liveness<'_>,
 ) -> bool {
+    let node_id = &placement.node_id;
     // Suspicion is gossip's "missed a probe", not "gone": SWIM gives the
     // node its suspicion timeout to refute it. Moving its replicas now would
     // stop healthy ones for a late ack (#346).
-    if suspect.contains(&placement.node_id) {
+    if liveness.suspect.contains(node_id) {
         return true;
     }
-    if !alive.contains(&placement.node_id) {
+    if !liveness.alive.contains(node_id) || liveness.lapsed.contains(node_id) {
         return false;
     }
-    if unheard.contains(&placement.node_id) {
+    if liveness.unheard.contains(node_id) {
         return true;
     }
     cache
-        .get_node(&placement.node_id)
-        .is_none_or(|node| node_can_run(node, spec, dns_required))
+        .get_node(node_id)
+        .is_none_or(|node| node_can_run(node, spec, liveness.dns_required))
 }
 
 /// What a pass knows about the cluster's members, for deciding which
@@ -1292,6 +1368,8 @@ struct Liveness<'a> {
     alive: &'a HashSet<NodeId>,
     suspect: &'a HashSet<NodeId>,
     unheard: &'a HashSet<NodeId>,
+    /// Alive nodes whose reports have been stale for longer than the grace.
+    lapsed: &'a HashSet<NodeId>,
     /// Decommissioned nodes, whose volumes the operator has written off.
     retired: &'a HashSet<NodeId>,
     dns_required: bool,
@@ -1331,15 +1409,7 @@ impl Liveness<'_> {
         if cache.capacity_refused(&placement.node_id, app_id) {
             return false;
         }
-        placement_holds(
-            placement,
-            spec,
-            cache,
-            self.alive,
-            self.suspect,
-            self.unheard,
-            self.dns_required,
-        ) && admits_in_place(placement, spec, cache)
+        placement_holds(placement, spec, cache, self) && admits_in_place(placement, spec, cache)
     }
 }
 
@@ -1502,28 +1572,6 @@ fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<
         })
         .cloned()
         .collect()
-}
-
-/// The number of nodes a daemon set of `spec` can currently be placed on
-/// (M25). A daemon set targets every *eligible* node, not every alive node, so
-/// its convergence must be judged against this — otherwise, whenever any alive
-/// node is ineligible (not ready, lacks a required capability, doesn't fit),
-/// `placements.len()` never equals `alive.len()` and the leader re-commits an
-/// identical `SchedulingDecision` to Raft every tick.
-fn daemon_eligible_count(
-    cache: &ClusterStateCache,
-    app_id: &crate::meat::AppId,
-    spec: &AppSpec,
-    dns_required: bool,
-    credit: &HashMap<NodeId, Resources>,
-) -> usize {
-    crate::meat::scheduler::daemon_candidates(
-        cache,
-        app_id,
-        credit,
-        &crate::meat::filter::WorkloadRequirements::for_app(spec, dns_required),
-    )
-    .len()
 }
 
 /// The per-replica resources an app requests, for quota accounting. Mirrors
@@ -6692,33 +6740,41 @@ image = "busybox:latest"
         assert!(!aggregate_is_for_app("not json", &web_prod));
     }
 
-    /// M25a: a partially-placed fixed-replica app that then fails must not leak
-    /// its phantom reservations into the shared pass cache and starve a later
-    /// app that would otherwise fit.
+    /// M25a, revised by D29 (#702): a partially placed app used to be thrown
+    /// away whole, so its reservations had to be undone before they starved
+    /// later apps. Now the replica that fits is committed and its
+    /// reservation is real: a later app that needs the same room is short,
+    /// and the pass says so for both.
     #[test]
-    fn failed_placement_does_not_leak_reservations_to_later_apps() {
+    fn a_partly_placed_app_keeps_its_replica_and_later_apps_see_it() {
         // One node with room for exactly one 600m replica.
         let mut cache = ClusterStateCache::new();
         cache.set_node(sched_node("solo", 1000, BTreeMap::new()));
-        let alive = HashSet::from([NodeId::new("solo")]);
+        let members = PassMembers {
+            alive: HashSet::from([NodeId::new("solo")]),
+            ..Default::default()
+        };
 
         let mut desired = DesiredState::default();
-        // App "a" wants 2 replicas of 600m — only one fits, so it fails after
-        // reserving one node. It sorts before "b".
+        // App "a" wants 2 replicas of 600m and sorts before "b".
         let a = AppId::new("a", "prod");
         let b = AppId::new("b", "prod");
-        desired.apps.insert(a, app_spec(600, 2));
+        desired.apps.insert(a.clone(), app_spec(600, 2));
         desired.apps.insert(b.clone(), app_spec(600, 1));
 
-        let decisions =
-            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
-
-        // "a" fails (only 1 of 2 fits). Its phantom reservation must be
-        // discarded so "b" (a single 600m replica) still places on the node.
-        assert!(
-            decisions.iter().any(|d| d.app_id == b),
-            "the later app must still place after a failed app's reservations are discarded: {decisions:?}"
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
         );
+
+        assert_eq!(plan.decisions.len(), 1, "{:?}", plan.decisions);
+        assert_eq!(plan.decisions[0].app_id, a);
+        assert_eq!(plan.decisions[0].placements.len(), 1);
+        assert_eq!(plan.unschedulable[&a].placed, 1);
+        assert_eq!(plan.unschedulable[&b].placed, 0);
     }
 
     /// C12: a namespace quota must count already-converged apps, so a new app

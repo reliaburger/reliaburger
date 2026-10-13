@@ -72,6 +72,10 @@ pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequiremen
     node.ready
         && (!requirements.requires_egress || node.capabilities.egress.can_enforce_allowlist())
         && (!requirements.requires_dns || node.capabilities.dns.can_resolve_internal())
+        && requirements
+            .host_binary
+            .as_deref()
+            .is_none_or(|binary| node.capabilities.process.runs(binary))
 }
 
 /// Filter the cluster to nodes eligible for placing this workload.

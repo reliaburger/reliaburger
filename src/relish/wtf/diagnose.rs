@@ -717,6 +717,25 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
                 .push(volume_home_away_finding(app, home, running));
             continue;
         }
+        // #702: the scheduler placed what fits and recorded why the rest
+        // has no node. That's the finding, with the reason it gave.
+        if let Some(reason) = &app.unschedulable {
+            report.warnings.push(WtfFinding {
+                id: "unschedulable".to_string(),
+                title: format!(
+                    "app {}/{} is unschedulable: {running} of {} replicas running",
+                    app.app, app.namespace, app.desired_replicas
+                ),
+                details: vec![reason.clone()],
+                suggestion: "add nodes or free room on the ones there, relax the app's \
+                             required labels, or allow its binary in [process_workloads]; \
+                             the scheduler places the rest as soon as a node can take them"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
+            continue;
+        }
         let replicas = |count: u32| {
             if count == 1 {
                 "1 replica".to_string()

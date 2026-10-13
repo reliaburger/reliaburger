@@ -123,6 +123,47 @@ A `[namespace]` block can also give the namespace its own secret key with
 `secret_key = true`, so its encrypted values don't decrypt anywhere else. See
 "A key per namespace" in the security chapter.
 
+## When some replicas don't fit
+
+The scheduler places every replica it can find a node for. Ask for three when
+the cluster only has room for two, and you get two, plus a reason that stays
+until the third finds a home:
+
+```text
+$ relish status
+...
+
+web (namespace default) is unschedulable: placed 2 of 3 replicas: no node that can run it has room
+
+$ relish inspect web
+App: web (namespace default)
+  Replicas:  3 desired, 2 running
+  Placed:    node-1 1, node-2 1
+  Unplaced:  placed 2 of 3 replicas: no node that can run it has room
+```
+
+The reason is the first rule no node passes, in the order the scheduler checks
+them: no node is ready, no ready node has the app's `required` labels, none can
+enforce its egress or DNS needs or run its host binary, or none has room.
+`relish wtf` raises an `unschedulable` warning with the same reason, and the
+leader logs it and records a `placement` event once when it starts and once
+when it clears. Add a node, free some room, or relax the constraint, and the
+next scheduling pass places the rest.
+
+An `exec` or `script` app only goes to nodes that would run it: the node's
+`[process_workloads] allowed_binaries` must name the `exec` path (`/bin/sh` for
+a script), and `mount_isolation` must be off. A node whose allowlist stops
+covering the binary loses the replica to one that still does.
+
+## When a node stops reporting
+
+A node can stay alive in gossip while its reports stop, say because its
+report worker wedged. Its replicas may still be serving, so the leader leaves
+them for `[reporting_tree] stale_node_grace_secs` (five minutes by default)
+after the reports go stale, then places them elsewhere. Daemon sets get the
+same grace. An app with a managed volume never moves off its node this way;
+see `images-and-volumes`.
+
 ## The everyday loop
 
 ```sh

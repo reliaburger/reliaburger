@@ -3,7 +3,8 @@
 /// Ranks candidate nodes. Spread comes first: a node running fewer replicas
 /// of the app always outranks one running more. Among nodes that run the
 /// same number, a weighted score on a 0–90 scale decides (higher is better):
-/// - Bin-packing (50): prefer fuller nodes to maximise density
+/// - Bin-packing (50): prefer nodes fuller in CPU and memory, evenly, to
+///   maximise density
 /// - Preferred labels (20): prefer nodes matching soft constraints
 /// - Image locality (15): prefer nodes with cached images
 /// - Stability (5): prefer longer-running nodes
@@ -66,16 +67,7 @@ fn compute_score(
         None => return 0,
     };
 
-    // Bin-packing: prefer nodes that will be more utilised after placement.
-    // Score = utilisation_after / allocatable * 100
-    // Nodes with zero allocatable CPU get a neutral score of 50.
-    let bin_pack = {
-        let allocated_after = node.allocated.cpu_millicores + resources.cpu_millicores;
-        (allocated_after * 100)
-            .checked_div(node.allocatable.cpu_millicores)
-            .map(|v| v.min(100) as u32)
-            .unwrap_or(50u32)
-    };
+    let bin_pack = bin_packing_score(node, resources);
 
     // Preferred labels: proportion of preferred labels that match.
     let preferred = if preferred_labels.is_empty() {
@@ -109,6 +101,54 @@ fn compute_score(
         + stability * WEIGHT_STABILITY;
 
     total / 100
+}
+
+/// Bin-packing (D30): prefer the node that is fuller in both CPU and memory
+/// after placement, 0-100.
+///
+/// The score is the average of the two utilisations, less a tenth of the gap
+/// between them. Filling one dimension and leaving the other empty strands
+/// the empty one, since nothing can use memory without CPU to run on, so a
+/// lopsided node scores lower than a balanced one at the same average. A
+/// node that reports none of a resource is scored on the other alone, and
+/// one that reports neither gets a neutral 50.
+///
+/// Integer percentages keep the score deterministic on every platform: a
+/// float could round differently and break ties another way.
+fn bin_packing_score(
+    node: &super::cluster_state::SchedulerNodeState,
+    resources: &Resources,
+) -> u32 {
+    let cpu = utilisation_after(
+        node.allocated.cpu_millicores,
+        resources.cpu_millicores,
+        node.allocatable.cpu_millicores,
+    );
+    let memory = utilisation_after(
+        node.allocated.memory_bytes,
+        resources.memory_bytes,
+        node.allocatable.memory_bytes,
+    );
+    let score = match (cpu, memory) {
+        (Some(cpu), Some(memory)) => {
+            let average = (cpu + memory) / 2;
+            average.saturating_sub(cpu.abs_diff(memory) / 10)
+        }
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => 50,
+    };
+    // At most 100, so the conversion can't fail.
+    u32::try_from(score).unwrap_or(100)
+}
+
+/// How full a resource is once `request` joins `allocated`, as a percentage
+/// of `allocatable` capped at 100. `None` when the node has none of it.
+fn utilisation_after(allocated: u64, request: u64, allocatable: u64) -> Option<u64> {
+    allocated
+        .saturating_add(request)
+        .saturating_mul(100)
+        .checked_div(allocatable)
+        .map(|percent| percent.min(100))
 }
 
 // ---------------------------------------------------------------------------
