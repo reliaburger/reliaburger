@@ -532,7 +532,11 @@ pub struct CrlEntry {
 > and `allow_from` names `app` or `namespace/app` sources from other
 > namespaces. Apps and jobs both take `[firewall] allow_from`; a job's
 > destination identity is `0x8000_0000 | hash(namespace/name)`, a service's
-> its VIP. Isolation covers real destinations as well as VIPs through
+> its VIP. A job can also be the source `allow_from` names (#737): each task
+> cgroup is bound in `cgroup_source_map` to its run identity
+> (`hash(namespace/job)`), and the grant keys `firewall_map` on
+> `1 << 63 | identity` instead of a cgroup, so it holds before the job's
+> first task starts. Isolation covers real destinations as well as VIPs through
 > `destination_map` (see the Onion design, §4), and the
 > `reliaburger_isolation` nftables table repeats the check on the forward
 > path between local containers, for traffic that never meets a socket hook.

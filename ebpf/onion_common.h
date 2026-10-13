@@ -76,6 +76,12 @@ struct firewall_value {
     __u32 action;  /* FIREWALL_DENY or FIREWALL_ALLOW */
 };
 
+/* A firewall_key source with this bit set names a run identity from
+ * cgroup_source_map (namespace plus job), not one cgroup. Kernel cgroup ids
+ * never reach bit 63. Must match SOURCE_IDENTITY_TAG in
+ * src/sesame/firewall.rs. */
+#define SOURCE_IDENTITY_TAG  (1ULL << 63)
+
 /* ---------- destination_map --------------------------------------------- */
 
 /* Who owns a real destination: a backend's container address and port, a

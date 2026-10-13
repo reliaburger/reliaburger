@@ -105,6 +105,8 @@ pub struct Compatibility {
 /// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
 /// its own name) in place of `relayed`, and the reporting
 /// `ReportingMessage::AggregatedReport` variant is gone.
+/// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
+/// sources with bit 63 set name a job's run identity (#737).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

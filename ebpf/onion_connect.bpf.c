@@ -48,6 +48,18 @@ struct {
     RELIABURGER_MAP_PINNING
 } cgroup_namespace_map SEC(".maps");
 
+/* A delegated task's cgroup -> its run identity (namespace plus job). Grants
+ * that name a job key firewall_map on SOURCE_IDENTITY_TAG | identity, so
+ * they exist before any of the job's tasks does. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u32);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
+} cgroup_source_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 131072);
@@ -139,7 +151,9 @@ static __always_inline struct cgroup_ns_value *source_namespace(__u64 cg)
 
 /* Does namespace isolation refuse this caller a destination owned by
  * (namespace_id, app_id)? Same namespace passes; another namespace needs an
- * explicit firewall_map grant from allow_from. */
+ * explicit firewall_map grant from allow_from: one for the caller's own
+ * cgroup (an app), or else one for the run identity its cgroup is bound to
+ * (a delegated task, whose job allow_from names). */
 static __always_inline int isolation_denies(__u64 cg, __u32 namespace_id, __u32 app_id)
 {
     struct cgroup_ns_value *src = source_namespace(cg);
@@ -151,6 +165,13 @@ static __always_inline int isolation_denies(__u64 cg, __u32 namespace_id, __u32 
         ._pad          = 0,
     };
     struct firewall_value *fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
+    if (!fw) {
+        __u32 *identity = bpf_map_lookup_elem(&cgroup_source_map, &cg);
+        if (identity) {
+            fw_key.src_cgroup_id = SOURCE_IDENTITY_TAG | (__u64)*identity;
+            fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
+        }
+    }
     return !fw || fw->action == FIREWALL_DENY;
 }
 
