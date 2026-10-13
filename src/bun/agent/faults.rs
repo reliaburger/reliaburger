@@ -6,6 +6,11 @@ use super::*;
 /// The principal a fault's automatic expiry is recorded under.
 pub const FAULT_EXPIRY_PRINCIPAL: &str = "system";
 
+/// How long adoption waits for the runtime to name an instance's main pid,
+/// to thaw it if a pause fault froze it. Adoption already waits up to ten
+/// seconds for the runtime per instance.
+const ADOPTION_PID_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What fencing a node fault left for a task to finish.
 pub(super) enum NodeFaultFence {
     /// Nothing: the grant is fenced and its slot free.
@@ -338,9 +343,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .count() as u32;
 
-        let target_service_faulted_replicas =
-            self.fault_registry
-                .count_by_service(&request.target_service) as u32;
+        let target_service_faulted_replicas = self
+            .fault_registry
+            .count_paused(request.namespace.as_deref(), &request.target_service)
+            as u32;
 
         // Cluster-derived fields, or zeros when this node has no council. A
         // zero `council_size`/`total_nodes` makes the quorum, leader, and
@@ -691,7 +697,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .filter_map(|instance| {
                 Some((
                     instance.id.clone(),
-                    instance.oci_spec.as_ref()?.linux.host_cgroup_path()?,
+                    self.workload_cgroup_dir(instance.oci_spec.as_ref()?)?,
                 ))
             })
             .collect()
@@ -958,6 +964,52 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// The host cgroup directory a workload's specification places it in.
+    pub(super) fn workload_cgroup_dir(
+        &self,
+        spec: &crate::grill::oci::OciSpec,
+    ) -> Option<std::path::PathBuf> {
+        spec.linux.cgroup_path_under(&self.cgroup_mount)
+    }
+
+    /// Undo whatever a fault from an earlier Bun left on an instance this
+    /// one adopts.
+    ///
+    /// A fault's saved values and paused pids live only in the registry of
+    /// the Bun that applied it, so a Bun that crashes or upgrades mid-fault
+    /// takes them with it, and nothing could lift a CPU cap or thaw a paused
+    /// process afterwards. The adopted instance's recorded specification
+    /// says what its limits should be, so they're written back, and every
+    /// process it runs gets a SIGCONT, which a running process ignores.
+    /// Best-effort: a failure is logged, and adoption goes on.
+    pub(super) async fn release_leftover_faults(
+        &self,
+        id: &InstanceId,
+        spec: &crate::grill::oci::OciSpec,
+    ) {
+        if let Some(cgroup) = self.workload_cgroup_dir(spec)
+            && cgroup.is_dir()
+        {
+            if let Err(error) = crate::smoker::resource::restore_recorded_limits(
+                &cgroup,
+                spec.linux.resources.as_ref(),
+            ) {
+                eprintln!("smoker: restoring {id}'s recorded limits failed: {error}");
+            }
+            if let Err(error) = crate::smoker::process::resume_cgroup_processes(&cgroup) {
+                eprintln!("smoker: resuming {id}'s processes failed: {error}");
+            }
+        }
+        // A runtime that keeps no cgroup of its own (the process runtime)
+        // still names the main process.
+        let pid =
+            tokio::time::timeout(ADOPTION_PID_PATIENCE, self.supervisor.grill().pid(id)).await;
+        if let Ok(Ok(Some(pid))) = pid {
+            // A process that has gone has nothing to resume.
+            let _ = crate::smoker::process::resume_process(pid as i32);
+        }
+    }
+
     /// Pair each saved `(instance id, value)` with the instance's cgroup path.
     ///
     /// The cgroup path comes from the current instance's original OCI specification so
@@ -977,7 +1029,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 {
                     return None;
                 }
-                let path = instance.oci_spec.as_ref()?.linux.host_cgroup_path()?;
+                let path = self.workload_cgroup_dir(instance.oci_spec.as_ref()?)?;
                 // A specific instance target still restores only its own cgroup.
                 if rule.target_instance.as_ref().is_some_and(|t| t != id) {
                     return None;

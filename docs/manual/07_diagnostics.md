@@ -93,6 +93,13 @@ namespace quota keeps unplaced gets a `Blocked:` line with the quota it would
 break (see `deploy-an-app`), and `wtf` reports it as a `quota-blocked` warning
 rather than a generic under-replication.
 
+An app whose current spec failed to roll out on a node is marked
+`RolloutFailed`: the leader holds its other nodes on the previous version and
+won't try the failed spec again. `wtf` reports it as a `rollout-failed`
+warning naming the node and the reason, and `relish status` prints the same
+line. Applying a different spec, or `relish rollback`, clears it; applying the
+same spec again doesn't (see `deploy-an-app`).
+
 ## `relish path`: can A reach B?
 
 `path` walks the network path between two apps hop by hop. It finds a running
@@ -165,10 +172,11 @@ workload identity, ingress, volumes, process workloads, jobs, the image
 registry and cluster coordination. Each case runs in its own leased `rbtest-*`
 namespace and cleans up after itself. While the council changes leader, the
 server refuses new leases with a 503 "retry shortly"; the runner asks again
-for up to 30 seconds before it gives up on the case. Job cases hold a job
-lease: their jobs run through the cluster's common job lifecycle like any
-other job, and releasing the lease cancels their runs and forgets their
-definitions. With a council the lease itself lives in Raft, so any node can
+for up to 30 seconds before it gives up on the case. Every case that runs a
+job holds a job lease, in the `jobs` group and the `process-workloads` group
+alike, because an application lease refuses jobs. Its jobs run through the
+cluster's common job lifecycle like any other job, and releasing the lease
+cancels their runs and forgets their definitions. With a council the lease itself lives in Raft, so any node can
 check it.
 
 ```sh

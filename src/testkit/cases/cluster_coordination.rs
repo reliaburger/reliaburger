@@ -5,6 +5,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -69,6 +70,7 @@ pub fn cases() -> Vec<TestCase> {
             name: "all_nodes_report_alive",
             group: TestGroup::ClusterCoordination,
             requires: &[Capability::Cluster, Capability::MultiNode],
+            lease: LeaseScope::Applications,
             run: testkit_case!(all_nodes_report_alive),
         },
         TestCase {
@@ -79,12 +81,14 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Council,
                 Capability::MultiNode,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(council_has_leader_and_quorum),
         },
         TestCase {
             name: "every_node_answers_health",
             group: TestGroup::ClusterCoordination,
             requires: &[Capability::Cluster, Capability::MultiNode],
+            lease: LeaseScope::Applications,
             run: testkit_case!(every_node_answers_health),
         },
     ]

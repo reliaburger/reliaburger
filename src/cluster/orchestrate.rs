@@ -164,6 +164,12 @@ pub struct NodeAssignment {
     /// lowest first. Their count is the node's share of the app.
     pub ordinals: Vec<u32>,
     pub spec: AppSpec,
+    /// The app's rollout hasn't reached this node yet (#692), and `spec` is
+    /// the last version that rolled out everywhere. The node keeps running
+    /// whatever version it runs: it starts `spec` only for a first
+    /// placement, and follows a scale change only of the version it runs.
+    #[serde(default)]
+    pub held: bool,
 }
 
 /// An ingress route distributed to every node, including nodes without replicas.
@@ -383,6 +389,24 @@ pub fn spawn_leader_scheduler(
                         eprintln!("scheduler: endpoint catalogue was not applied: {response:?}");
                     }
                     Err(e) => eprintln!("scheduler: failed to publish endpoint catalogue: {e}"),
+                }
+            }
+
+            // An app whose current spec now runs healthy on every node it's
+            // placed on has finished rolling out: it becomes the newest
+            // rollback target, and the spec the next rollout holds nodes on
+            // (#692).
+            for (app_id, spec) in super::rollout::newly_released(&desired, &reports) {
+                let released = RaftRequest::RolloutReleased {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec),
+                };
+                match council.write(released).await {
+                    Ok(CouncilResponse::Refused { reason }) => {
+                        eprintln!("scheduler: rollout of {app_id} not recorded: {reason}");
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("scheduler: failed to record rollout of {app_id}: {e}"),
                 }
             }
 
@@ -2138,6 +2162,9 @@ fn spawn_placement_reconciler_with_io_timeout(
                 {
                     continue; // already converged; don't redeploy
                 }
+                if assignment.held && !held_assignment_applies(applied.get(&key), &spec) {
+                    continue; // the rollout hasn't reached this node yet
+                }
                 // The leader commits a placement and its service allocation in
                 // separate writes, so an answer can place an app whose
                 // allocation hasn't committed yet (#309). The agent would refuse
@@ -2181,9 +2208,14 @@ fn spawn_placement_reconciler_with_io_timeout(
                     continue;
                 }
 
+                let terminal_timeout = deploy_terminal_timeout(&spec);
+                let version = crate::meat::deploy_types::rollout_fingerprint(&spec);
                 let mut config = Config::default();
                 config.app.insert(assignment.name.clone(), spec);
 
+                // What this node had converged on before: a rollout that
+                // rolls back to it is converged on it again.
+                let converged_before = applied.get(&key).cloned();
                 // The durable intent survives a crash after the agent accepts
                 // work but before we can observe its terminal outcome.
                 let mut next = applied.clone();
@@ -2208,7 +2240,7 @@ fn spawn_placement_reconciler_with_io_timeout(
                 // The deploy's events drain on their own task, so retiring
                 // below can't stall the stream: the agent closes a stream its
                 // reader leaves full, and the deploy would then look failed.
-                let mut terminal = tokio::spawn(deploy_outcome(event_rx, DEPLOY_TERMINAL_TIMEOUT));
+                let mut terminal = tokio::spawn(deploy_outcome(event_rx, terminal_timeout));
                 let outcome = loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => {
@@ -2242,6 +2274,43 @@ fn spawn_placement_reconciler_with_io_timeout(
                         }
                     }
                 };
+                if let Err(DeployWaitError::RolloutAborted {
+                    rolled_back,
+                    reason,
+                }) = &outcome
+                {
+                    // Every instance runs the version it ran before, so this
+                    // node is converged on that again, and reports it.
+                    if *rolled_back
+                        && let Some(before @ AssignmentState::Applied { .. }) = &converged_before
+                    {
+                        let mut next = applied.clone();
+                        next.insert(key.clone(), before.clone());
+                        match persist_placements(checkpoint_path.as_deref(), &next).await {
+                            Ok(()) => applied = next,
+                            Err(error) => {
+                                eprintln!("orchestrator: cannot record the rollback: {error}")
+                            }
+                        }
+                    }
+                    let report = crate::cluster::rollout::RolloutFailureReport {
+                        app_name: key.0.clone(),
+                        namespace: key.1.clone(),
+                        node: node_name.clone(),
+                        fingerprint: version.clone(),
+                        reason: reason.clone(),
+                    };
+                    report_rollout_failure(
+                        &client,
+                        &service_token,
+                        &leader_url,
+                        &report,
+                        io_timeout,
+                        &shutdown,
+                    )
+                    .await;
+                }
+                publish_converged(&cmd_tx, &applied);
                 if let Err(error) = outcome {
                     let deferral =
                         backoff.record_failure(&key, &fingerprint, std::time::Instant::now());
@@ -2261,12 +2330,100 @@ fn spawn_placement_reconciler_with_io_timeout(
                     Ok(()) => applied = next,
                     Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
                 }
+                // The leader releases the next node once it hears this.
+                publish_converged(&cmd_tx, &applied);
             }
 
             backoff.retain(|key| seen.contains(key));
             awaiting.retain(|key| seen.contains(key));
+            publish_converged(&cmd_tx, &applied);
         }
     })
+}
+
+/// Whether a held assignment (#692) may deploy here: when this node runs
+/// nothing of the app yet, or runs the very version the leader holds it on
+/// and only the replica count or ordinals changed. Anything else (a deploy
+/// in flight or halted, a newer version) stays as it is until the rollout
+/// reaches this node.
+fn held_assignment_applies(state: Option<&AssignmentState>, held: &AppSpec) -> bool {
+    match state {
+        None => true,
+        Some(AssignmentState::Pending) => false,
+        Some(AssignmentState::Applied { fingerprint }) => {
+            serde_json::from_str::<AppSpec>(fingerprint).is_ok_and(|ran| {
+                crate::meat::deploy_types::rollout_fingerprint(&ran)
+                    == crate::meat::deploy_types::rollout_fingerprint(held)
+            })
+        }
+    }
+}
+
+/// The app versions `applied` says this node finished deploying, for the
+/// state report the leader reads rollout progress from (#692).
+fn converged_rollouts(applied: &AppliedMap) -> Vec<crate::reporting::types::RolloutReport> {
+    applied
+        .iter()
+        .filter_map(|((name, namespace), state)| {
+            let AssignmentState::Applied { fingerprint } = state else {
+                return None;
+            };
+            let spec = serde_json::from_str::<AppSpec>(fingerprint).ok()?;
+            Some(crate::reporting::types::RolloutReport {
+                app_name: name.clone(),
+                namespace: namespace.clone(),
+                fingerprint: crate::meat::deploy_types::rollout_fingerprint(&spec),
+            })
+        })
+        .collect()
+}
+
+/// Tell the agent which versions this node has converged on. A full
+/// command queue only delays it to the next tick.
+fn publish_converged(cmd_tx: &mpsc::Sender<AgentCommand>, applied: &AppliedMap) {
+    let _ = cmd_tx.try_send(AgentCommand::RecordConvergedRollouts {
+        rollouts: converged_rollouts(applied),
+    });
+}
+
+/// Tell the leader this node's rollout of an app failed, so it marks the
+/// spec `RolloutFailed` and stops releasing it (#692, D11-B). A lost report
+/// costs only time: the reconciler backs off and the next failure reports
+/// again.
+async fn report_rollout_failure(
+    client: &reqwest::Client,
+    service_token: &Option<String>,
+    leader_url: &str,
+    report: &crate::cluster::rollout::RolloutFailureReport,
+    io_timeout: Duration,
+    shutdown: &CancellationToken,
+) {
+    let mut request = client
+        .post(format!("{leader_url}/v1/rollouts/failed"))
+        .json(report);
+    if let Some(token) = service_token {
+        request = request.bearer_auth(token);
+    }
+    let sent = tokio::select! {
+        _ = shutdown.cancelled() => return,
+        result = tokio::time::timeout(io_timeout, request.send()) => result,
+    };
+    match sent {
+        Ok(Ok(response)) if response.status().is_success() => eprintln!(
+            "orchestrator: rollout of {}/{} failed here; the leader holds the app on its previous spec",
+            report.namespace, report.app_name
+        ),
+        Ok(Ok(response)) => eprintln!(
+            "orchestrator: the leader refused the rollout failure of {}/{}: {}",
+            report.namespace,
+            report.app_name,
+            response.status()
+        ),
+        _ => eprintln!(
+            "orchestrator: could not report the rollout failure of {}/{} to the leader",
+            report.namespace, report.app_name
+        ),
+    }
 }
 
 /// Whether `assignment` declares a port that `catalog` doesn't allocate yet,
@@ -2481,13 +2638,26 @@ async fn forget_convergence(
     }
 }
 
-/// How long the reconciler waits for a deploy's terminal event before giving
+/// The least the reconciler waits for a deploy's terminal event before giving
 /// up on this tick (M14). Without a bound, a deploy that stalls (a stuck image
 /// pull, a hung runtime holding the event sender) would block the reconcile
 /// tick forever: the node would stop polling the leader, never converge other
 /// apps, and silently drop out of reconciliation while still alive. On timeout
 /// the placement is treated as not-yet-applied and retried next tick.
 const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long the reconciler waits for a deploy of `spec` (this node's share)
+/// to finish: [`DEPLOY_TERMINAL_TIMEOUT`] for image pulls and the like, plus
+/// a health wait and a drain for every replica, twice over, since an aborted
+/// rollout restores the previous spec at the same pace (#692). A fixed five
+/// minutes gave up on a ten-replica share with a one-minute health timeout
+/// while it was still rolling.
+fn deploy_terminal_timeout(spec: &AppSpec) -> Duration {
+    let config = crate::meat::deploy_types::DeployConfig::for_app(spec);
+    let share = spec.replica_ordinals().len() as u32;
+    let per_replica = config.health_timeout.saturating_add(config.drain_timeout);
+    DEPLOY_TERMINAL_TIMEOUT.saturating_add(per_replica.saturating_mul(share.saturating_mul(2)))
+}
 
 /// Why a deploy the reconciler handed to the agent did not converge.
 #[derive(Debug, thiserror::Error)]
@@ -2504,29 +2674,49 @@ enum DeployWaitError {
     /// The task reading the event stream ended without an outcome.
     #[error("the deploy's event reader ended without an outcome: {0}")]
     WatcherLost(String),
+    /// A rollout over running instances failed and was cleaned up:
+    /// `rolled_back` when every instance runs the previous version again.
+    #[error("{reason}")]
+    RolloutAborted { rolled_back: bool, reason: String },
 }
 
 /// Drain a deploy's event stream until it reaches `Complete` within `timeout`.
 ///
 /// Every error leaves the placement unapplied, so the caller retries it next
 /// tick. `Failed` carries the agent's own message, so the caller can say why.
+///
+/// After an error the stream is read to its end: a rollout reports its
+/// abort (and whether it rolled back) after the error that caused it.
 async fn deploy_outcome(
     mut events: mpsc::Receiver<ApplyEvent>,
     timeout: Duration,
 ) -> Result<(), DeployWaitError> {
-    let drain = async {
-        while let Some(event) = events.recv().await {
-            match event {
-                ApplyEvent::Complete { .. } => return Ok(()),
-                ApplyEvent::Error { message } => return Err(DeployWaitError::Failed(message)),
-                _ => {}
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut failure: Option<DeployWaitError> = None;
+    loop {
+        let event = match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => return Err(failure.unwrap_or(DeployWaitError::Closed)),
+            Err(_) => return Err(failure.unwrap_or(DeployWaitError::TimedOut(timeout))),
+        };
+        match event {
+            ApplyEvent::Complete { .. } if failure.is_none() => return Ok(()),
+            ApplyEvent::RolloutAborted {
+                rolled_back,
+                reason,
+                ..
+            } => {
+                failure = Some(DeployWaitError::RolloutAborted {
+                    rolled_back,
+                    reason,
+                });
             }
+            ApplyEvent::Error { message } if failure.is_none() => {
+                failure = Some(DeployWaitError::Failed(message));
+            }
+            _ => {}
         }
-        Err(DeployWaitError::Closed)
-    };
-    tokio::time::timeout(timeout, drain)
-        .await
-        .unwrap_or(Err(DeployWaitError::TimedOut(timeout)))
+    }
 }
 
 #[cfg(test)]
@@ -2824,12 +3014,14 @@ mod tests {
                 }));
                 None
             }
+            AgentCommand::RecordConvergedRollouts { .. } => None,
             other => Some(other),
         }
     }
 
     fn assigned(name: &str, namespace: &str, toml: &str) -> NodeAssignment {
         NodeAssignment {
+            held: false,
             name: name.into(),
             namespace: namespace.into(),
             ordinals: vec![0],
@@ -3300,6 +3492,7 @@ mod tests {
             "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
         );
         let assignment = NodeAssignment {
+            held: false,
             name: "web".into(),
             namespace: "default".into(),
             ordinals: vec![0],
@@ -3400,6 +3593,7 @@ mod tests {
         let assignments = NodeAssignments {
             endpoint_generation: 7,
             apps: vec![NodeAssignment {
+                held: false,
                 name: "web".into(),
                 namespace: "default".into(),
                 ordinals: vec![0],
@@ -3511,6 +3705,7 @@ mod tests {
         let assignments = NodeAssignments {
             endpoint_generation: 7,
             apps: vec![NodeAssignment {
+                held: false,
                 name: "web".into(),
                 namespace: "default".into(),
                 ordinals: vec![0],
@@ -3561,6 +3756,7 @@ mod tests {
                     AgentCommand::AdoptedPlacementMatches { response, .. } => {
                         let _ = response.send(false);
                     }
+                    AgentCommand::RecordConvergedRollouts { .. } => {}
                     _ => panic!("unexpected command"),
                 }
             }
@@ -3677,6 +3873,7 @@ mod tests {
                                 _ => panic!("retirement did not complete after repair"),
                             }
                         }
+                        AgentCommand::RecordConvergedRollouts { .. } => {}
                         _ => panic!("unexpected mutation during retirement"),
                     }
                 }
@@ -3816,6 +4013,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let assignments = NodeAssignments {
             apps: vec![NodeAssignment {
+                held: false,
                 name: "broken".into(),
                 namespace: "default".into(),
                 ordinals: vec![0],
@@ -3911,6 +4109,7 @@ command = ["false"]
         let address = listener.local_addr().unwrap();
         let assignments = NodeAssignments {
             apps: vec![NodeAssignment {
+                held: false,
                 name: "writer".into(),
                 namespace: "default".into(),
                 ordinals: vec![0],
@@ -4034,6 +4233,7 @@ image = "busybox:latest"
         let journal = checkpoint.clone();
         let assignments = NodeAssignments {
             apps: vec![NodeAssignment {
+                held: false,
                 name: "interrupted".into(),
                 namespace: "rbtest-interrupted".into(),
                 ordinals: vec![0],
@@ -4354,6 +4554,9 @@ image = "busybox:latest"
         })
         .await
         .unwrap();
+        // The agent closes the stream once the deploy has finished; the
+        // reader waits for that, since a rollout reports its abort last.
+        drop(tx);
         let error = deploy_outcome(rx, Duration::from_secs(5))
             .await
             .expect_err("an Error event must fail the deploy");
@@ -4366,6 +4569,81 @@ image = "busybox:latest"
                 .to_string()
                 .contains("container's cgroup is not empty")
         );
+    }
+
+    /// #692: a rollout's abort follows the error that caused it, and it's
+    /// what the reconciler reports to the leader.
+    #[tokio::test]
+    async fn deploy_outcome_reports_a_rollout_abort_that_follows_the_error() {
+        let (tx, rx) = mpsc::channel(4);
+        for event in [
+            ApplyEvent::Error {
+                message: "default__web-g1-0 failed its health check".into(),
+            },
+            ApplyEvent::RolloutAborted {
+                app: "web".into(),
+                rolled_back: true,
+                reason: "rolled back — old instances preserved".into(),
+            },
+            ApplyEvent::Error {
+                message: "rolled back — old instances preserved".into(),
+            },
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        assert!(matches!(
+            deploy_outcome(rx, Duration::from_secs(5)).await,
+            Err(DeployWaitError::RolloutAborted { rolled_back: true, ref reason })
+                if reason == "rolled back — old instances preserved"
+        ));
+    }
+
+    /// The reconciler waits long enough for a large share to roll and, if
+    /// it aborts, to roll back.
+    #[test]
+    fn deploy_terminal_timeout_grows_with_the_share() {
+        let spec = |replicas: u32| -> AppSpec {
+            toml::from_str(&format!(
+                "image = \"web:v1\"\nreplicas = {replicas}\n[deploy]\n\
+                 health_timeout = \"60s\"\ndrain_timeout = \"30s\"\n"
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            deploy_terminal_timeout(&spec(1)),
+            DEPLOY_TERMINAL_TIMEOUT + Duration::from_secs(180)
+        );
+        assert_eq!(
+            deploy_terminal_timeout(&spec(10)),
+            DEPLOY_TERMINAL_TIMEOUT + Duration::from_secs(1800)
+        );
+    }
+
+    /// A held assignment (#692) only starts a first placement, or follows a
+    /// scale change of the version this node already runs.
+    #[test]
+    fn a_held_assignment_never_replaces_another_version() {
+        let spec = |image: &str, replicas: u32| -> AppSpec {
+            toml::from_str(&format!("image = {image:?}\nreplicas = {replicas}\n")).unwrap()
+        };
+        let applied = |spec: &AppSpec| AssignmentState::Applied {
+            fingerprint: serde_json::to_string(spec).unwrap(),
+        };
+        let held = spec("web:v1", 2);
+        assert!(held_assignment_applies(None, &held));
+        assert!(held_assignment_applies(
+            Some(&applied(&spec("web:v1", 1))),
+            &held
+        ));
+        assert!(!held_assignment_applies(
+            Some(&applied(&spec("web:v2", 2))),
+            &held
+        ));
+        assert!(!held_assignment_applies(
+            Some(&AssignmentState::Pending),
+            &held
+        ));
     }
 
     #[tokio::test]
@@ -4419,6 +4697,7 @@ image = "busybox:latest"
             timestamp: SystemTime::now(),
             running_apps: vec![],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: ResourceUsage {
                 cpu_used_millicores: cpu_used,
                 memory_used_mb: 256,
@@ -6810,6 +7089,7 @@ mod audit_stale_endpoints {
                 node_id: id,
                 timestamp: SystemTime::now(),
                 cached_specs: vec![],
+                rollouts: Vec::new(),
                 resource_usage: ResourceUsage::default(),
                 event_log: vec![],
                 running_apps: vec![RunningApp {
@@ -6892,6 +7172,7 @@ mod audit_stale_endpoints {
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
                 running_apps: vec![],
                 cached_specs: vec![],
+                rollouts: Vec::new(),
                 resource_usage: crate::reporting::types::ResourceUsage {
                     cpu_total_millicores: 1000,
                     ..Default::default()
@@ -7424,6 +7705,7 @@ mod revalidation_in_place {
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
                 has_buildah: false,
                 cached_specs: Vec::new(),
+                rollouts: Vec::new(),
                 event_log: Vec::new(),
                 resource_usage: crate::reporting::types::ResourceUsage {
                     cpu_total_millicores: 1000,

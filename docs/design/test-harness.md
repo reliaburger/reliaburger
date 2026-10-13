@@ -61,7 +61,7 @@ be visible until we remove its race.
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-standard-clients` | `crane` against Pickle's TLS listener | Linux, with a pinned `crane`; PRs into `main`, `main` and nightly |
+| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make test-gpu`, `make test-s3` | Real NVIDIA hardware; a real S3 bucket | Manual |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
@@ -84,7 +84,8 @@ cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once 
 PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
 Pull requests into a release's merge-train branch (`release-*`) run the light set:
 lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
-contract boundaries. The merge queue on the train, the push to it and the gate PR
+contract boundaries. Labelled `full-ci`, they run every heavy owner but not the
+macOS shards (the `train-full` selection). The merge queue on the train, the push to it and the gate PR
 into `main` run everything, including the three macOS shards
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
@@ -302,8 +303,8 @@ own script declaration. No prefix matching or generic alias can widen the bridge
 The seventeen original manual/subprocess classifications remain outside CI
 inventory, with the original policy visible in the generated matrix.
 
-`workflow_assembly.py` defines eleven literal owners and derives light, portable
-or full selection from trusted current workflow inputs; only a pull request may
+`workflow_assembly.py` defines eleven literal owners and derives light, portable,
+train-full or full selection from trusted current workflow inputs; only a pull request may
 qualify with less than full. The macOS owner runs as three hash-partition
 shards, and aggregation proves their lists cover every test exactly once. `workflow_adapter.py` preserves
 those commands and their complete selections. Ordinary nextest producers retain
@@ -433,6 +434,15 @@ failed rootless run leaked its `slirp4netns` helper: the helper names only its g
 inherited, including the lock the shared Linux test VM queues its users on, and it held
 that lock for an hour. `RootCleanup` now reads each node's runtime intents for those
 directories and kills whatever names them too.
+
+Cleanup also removes the root, mounts and all. A rootful Bun mounts a `reliaburger-identity`
+tmpfs for each workload beneath its volumes directory, and the mounts outlive Bun. Until
+#780 `RootCleanup` never removed the root, so every rootful run left its identity tmpfs
+mounted under `/tmp`. It now finishes with `clear_fixture_dir` from
+[`tests/support/fixture_dir.rs`](../../tests/support/fixture_dir.rs), the helper the
+cluster fixtures use, which unmounts everything beneath the root deepest first and then
+removes it. A root it can't remove fails a passing test; while a failed test unwinds, the
+error goes to stderr, because a second panic would abort the test binary.
 
 Cleanup must also stop at what the test owns. The scan reads every process on the host, and
 on a CI runner that includes the runner. Until #800 it killed the whole process group of any
