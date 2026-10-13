@@ -7280,6 +7280,44 @@
       ]
     },
     {
+      "id": "issue-780-root-cleanup-mounts",
+      "issue": 780,
+      "promise": "An OCI test's root is unmounted and removed when the test ends, whether it passed or panicked.",
+      "supported_paths": [
+        "Rootful runs that leave workload identity tmpfs mounted beneath the root"
+      ],
+      "cases": [
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        },
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A root that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
       "id": "issue-734-rootless-test-cleanup",
       "issue": 734,
       "promise": "A failed rootless OCI test leaves none of its network helpers running.",
@@ -7368,6 +7406,78 @@
       ],
       "boundaries": [
         "Running host tasks under mount isolation is #714; until then host jobs need mount_isolation = false."
+      ]
+    },
+    {
+      "id": "issue-699-faults-revert-after-bun-restart",
+      "issue": 699,
+      "promise": "A chaos fault never outlives the Bun that injected it: CPU and memory caps, paused processes and pinned eBPF fault entries are undone when the next Bun adopts its workloads, and CPU and memory faults restore the workload's own cgroup values when they expire.",
+      "supported_paths": [
+        "Rootful Linux with cgroup v2, through the agent's adoption of recorded instances",
+        "The owned eBPF loader with maps pinned in bpffs"
+      ],
+      "cases": [
+        {
+          "id": "issue-699-cpu_fault_round_trip_restores_cpu_max",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_round_trip_restores_cpu_max",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-memory_fault_round_trip_restores_memory_high",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::memory_fault_round_trip_restores_memory_high",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-cpu_fault_is_reverted_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_is_reverted_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-paused_instance_resumes_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::paused_instance_resumes_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-owned_loader_clears_stale_fault_connect_entries",
+          "binary": "reliaburger::ebpf",
+          "test": "owned_loader_clears_stale_fault_connect_entries",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "The pinned egress policy is not cleared along with the fault entries."
+      ],
+      "boundaries": [
+        "Dropping an in-process agent stands in for a SIGKILL of Bun; the cgroup and the workload process are real."
       ]
     },
     {

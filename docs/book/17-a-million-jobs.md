@@ -950,6 +950,69 @@ opening and closing the write end until opening without blocking fails with
 from 6,000 tasks to 4,000. Twenty milliseconds a task on 48 slots still takes at
 least 27 seconds, three times longer than the hung window needs work running.
 
+Those two stuck threads were a bug in their own right (issue #770). Dropping the
+handler releases the worker's lock on its arrays, so the next sync walks
+straight in and starts another read on the same stuck disk. The leader retries
+every few seconds, so a disk that hangs for an hour leaks about a thousand
+threads. Tokio's blocking pool stops at 512, and once it's full every
+`spawn_blocking` in Bun queues behind threads that will never come back,
+including work that has nothing to do with task arrays. Timing out the read
+itself isn't an option: a `read` blocked on a hung device can't be interrupted,
+not even by a signal, so the thread is gone until the disk answers.
+
+What we can bound is how many threads go in after it. A worker now allows one
+sync on its disk at a time, and the permit for it has to outlive a dropped
+handler. Chapter 3 tied a proxy's connection slots to `OwnedSemaphorePermit`
+values; this is the same trick with one more twist:
+
+```rust
+#[derive(Clone)]
+struct SyncClaim {
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+fn spawn_blocking<T, F>(&self, work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let claim = self.clone();
+    tokio::task::spawn_blocking(move || {
+        let _claim = claim;
+        work()
+    })
+}
+```
+
+A semaphore with one permit makes the gate. `sync` takes the permit with
+`try_acquire_owned`, which fails at once rather than queueing, and wraps it in
+an `Arc`. Every blocking call the sync makes goes through
+`SyncClaim::spawn_blocking`, and the `move` closure takes its own clone of that
+`Arc` onto the blocking thread. The permit goes back only when the last clone
+drops: when the sync returns normally, or, if the leader gave up on it, when
+the stuck read finally does. The leading underscore in `_permit` tells the
+compiler we keep the field for its `Drop`, not to read it. A sync that finds
+the permit taken returns `TaskArrayNodeError::SyncBusy`, which the API answers
+with `503 Service Unavailable`.
+
+The leader has to see that as a failure, not as an answer. A busy worker that
+counted as "heard from" would never reach the 30-second silence timeout, so its
+chunks would never move to a healthy node, however long the disk stayed stuck.
+So the busy reply lands where the timeout used to: the node is marked failing,
+and silence takes its course. The change only costs the worker one thread
+instead of one per retry.
+
+`syncs_the_leader_gives_up_on_a_stuck_disk_hold_one_blocking_thread` needs no
+FIFO. The node has a test-only `fence_probe`, a closure the fence check calls
+first, and the test's closure counts its callers and then waits on a
+`Condvar` latch, like a read from a dead disk. The test drops the first sync
+after 20 ms, as the leader's deadline would, and then sends 50 more. Each is
+refused as busy within 20 ms, and the probe still counts exactly one blocked
+thread. Then it opens the latch, the stuck read returns, the claim frees itself,
+and the next sync runs normally. A small `Drop` guard opens the latch if an
+assertion fails first, so a failing run can't hang the runtime at shutdown the
+way the FIFO test did.
+
 The third cost was copying. `desired_state()` clones the whole replicated
 state, apps and all, and the leader called it four times a tick. The tick now
 reads through `read_control`, which runs a closure against the state under its

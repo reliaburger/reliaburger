@@ -11,6 +11,8 @@ use reliaburger::relish::client::BunClient;
 
 #[path = "support/bun_process.rs"]
 mod bun_process;
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
 #[path = "support/root_processes.rs"]
 mod root_processes;
 use bun_process::PortBlockReservation;
@@ -136,8 +138,12 @@ impl Node {
 /// keeps its veth pair and /32 host route, and the next test's first
 /// container gets the same address and fails with "File exists". Drop can't
 /// await or return errors, so the teardown is synchronous and best-effort:
-/// nothing in it may panic, since a second panic during unwinding aborts the
+/// nothing in it may panic while unwinding, since a second panic aborts the
 /// test binary and hides the first.
+///
+/// Last of all it unmounts everything beneath the root and removes it. A
+/// root that can't be removed fails a passing test; during unwinding it's
+/// reported on stderr instead.
 struct RootCleanup(PathBuf);
 
 impl Drop for RootCleanup {
@@ -164,11 +170,21 @@ impl Drop for RootCleanup {
             retire_leaked_kernel(&node);
         }
         let suffix = root_suffix(&self.0);
-        if suffix.is_empty() {
-            return;
+        if !suffix.is_empty() {
+            remove_leaked_cgroups(&suffix);
+            remove_leaked_networks(&suffix);
         }
-        remove_leaked_cgroups(&suffix);
-        remove_leaked_networks(&suffix);
+        // Last, once nothing runs from the root: a rootful Bun's identity
+        // tmpfs stay mounted beneath it after the process dies, and while
+        // they do the root can't be removed (#780).
+        if let Err(error) = fixture_dir::clear_fixture_dir(&self.0) {
+            let message = format!("test cleanup: cannot remove {}: {error}", self.0.display());
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
     }
 }
 
@@ -575,6 +591,55 @@ fn root_suffix(root: &Path) -> String {
         .unwrap_or_default()
         .trim_start_matches('.')
         .to_ascii_lowercase()
+}
+
+/// Mount workload identity tmpfs beneath `root` the way a rootful Bun does
+/// for its containers, one nested inside the other, and leave them there as
+/// a killed Bun or a failed assertion would (#780).
+fn leave_identity_mounts(root: &Path) {
+    let outer = reliaburger::sesame::identity::instance_identity_dir(&root.join("volumes"), "a");
+    let inner = outer.join("nested");
+    for dir in [&outer, &inner] {
+        reliaburger::sesame::identity::prepare_identity_dir(dir).unwrap();
+    }
+    let mounted = mounts_under(root);
+    assert!(
+        mounted.contains(&outer) && mounted.contains(&inner),
+        "identity tmpfs not mounted: {mounted:?}"
+    );
+}
+
+/// The mount points `/proc/self/mountinfo` lists at or beneath `root`.
+fn mounts_under(root: &Path) -> Vec<PathBuf> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    fixture_dir::mounts_beneath(&mountinfo, root)
+}
+
+#[test]
+#[ignore = "requires Linux root to mount tmpfs; run through scripts/release/qualify-oci-interruptions.sh"]
+fn root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root() {
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap().keep();
+    let cleanup = RootCleanup(root.clone());
+    leave_identity_mounts(&root);
+    drop(cleanup);
+    assert_eq!(mounts_under(&root), Vec::<PathBuf>::new());
+    assert!(!root.exists(), "{} survived cleanup", root.display());
+}
+
+#[test]
+#[ignore = "requires Linux root to mount tmpfs; run through scripts/release/qualify-oci-interruptions.sh"]
+fn root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds() {
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap().keep();
+    let failed = std::panic::catch_unwind(|| {
+        let _cleanup = RootCleanup(root.clone());
+        leave_identity_mounts(&root);
+        panic!("a failed assertion with identity tmpfs still mounted");
+    });
+    assert!(failed.is_err());
+    assert_eq!(mounts_under(&root), Vec::<PathBuf>::new());
+    assert!(!root.exists(), "{} survived cleanup", root.display());
 }
 
 #[tokio::test]

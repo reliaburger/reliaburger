@@ -2,6 +2,7 @@
 from pathlib import Path
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -82,6 +83,13 @@ class WarmExecutablesTests(unittest.TestCase):
     def test_a_binary_that_hangs_is_stopped_and_the_next_still_runs(self):
         self.binary("bun", body="exec sleep 30")
         relish = self.binary("relish")
+        # The short timeout applies to every binary. A brand-new file's first
+        # exec waits for macOS to assess it, which took 0.13 s idle and over
+        # 0.5 s with sibling builds exec'ing new files (#849), so the healthy
+        # binary would be stopped too. Assess it now, as the script itself
+        # would, so the timeout only has to cover its run.
+        subprocess.run([str(relish), "--help"], env=dict(os.environ, CALLS=os.devnull),
+                       check=True, timeout=120)
         status, output = self.run_warm(timeout=0.5)
         self.assertEqual(status, 0)
         self.assertIn("bun did not exit", output)

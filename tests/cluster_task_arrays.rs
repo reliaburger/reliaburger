@@ -1179,9 +1179,10 @@ async fn hang_sync(control: &std::path::Path) {
     panic!("the worker kept replacing its fence file");
 }
 
-/// Release every hung sync. The leader gives up on a sync after its 3 s
-/// timeout and sends another, so by now two or more of the worker's syncs
-/// can be blocked on the FIFO, each holding a blocking thread.
+/// Release the hung sync. The leader gives up on a sync after its 3 s
+/// timeout and sends another, but the worker refuses it as busy while the
+/// first one's read is still blocked (#770), so one blocking thread waits
+/// on the FIFO. Before that fix each retry added another.
 ///
 /// First move the FIFO aside, so the next sync finds no fence file and
 /// carries on. Then open and close its write end until no reader holds it.
