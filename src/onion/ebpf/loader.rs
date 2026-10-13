@@ -128,8 +128,10 @@ impl OnionEbpf {
     #[cfg(feature = "ebpf")]
     pub fn load_embedded(cgroup_path: &Path) -> Result<Self, OnionError> {
         check_prerequisites()?;
-        let bpf = aya::Ebpf::load(Self::embedded_object()).map_err(|error| OnionError::EbpfLoadFailed {
-            reason: format!("failed to load embedded eBPF program: {error}"),
+        let bpf = aya::Ebpf::load(Self::embedded_object()).map_err(|error| {
+            OnionError::EbpfLoadFailed {
+                reason: format!("failed to load embedded eBPF program: {error}"),
+            }
         })?;
         Self::attach(bpf, cgroup_path)
     }
