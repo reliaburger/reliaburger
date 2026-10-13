@@ -50,6 +50,14 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 /// Upper bound on a single reconciler membership operation. A peer whose Raft
 /// port is unreachable must not block the reconciler forever — on timeout we
 /// log and retry on the next tick.
+///
+/// An operation is a fixed number of commits: the guard no-op, then one
+/// membership entry (adding or removing a learner) or two (the joint and
+/// uniform steps of a voter change). With a log store that takes 20 ms per
+/// entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion
+/// 147 ms, so five seconds leaves room for a busy leader's apply queue. A new learner's catch-up, which grows with its log gap, is not part
+/// of any operation: it runs between ticks, and the planner promotes the
+/// learner only once it's caught up (#779).
 const RECONCILE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns resources that must outlive `start()` for the cluster to keep
@@ -1120,9 +1128,10 @@ pub struct CouncilReconcilerConfig {
     pub selection: CouncilSelectionConfig,
     /// How often to reconcile the council against gossip membership.
     pub tick_interval: Duration,
-    /// Upper bound on a single membership operation. A peer whose Raft port
-    /// is unreachable must not block the reconciler forever — on timeout we
-    /// log and retry on the next tick.
+    /// Upper bound on a single membership operation: the guard no-op plus
+    /// one or two membership commits, never a learner's catch-up. A peer
+    /// whose Raft port is unreachable must not block the reconciler forever —
+    /// on timeout we log and retry on the next tick.
     pub op_timeout: Duration,
 }
 
@@ -1712,6 +1721,120 @@ mod tests {
             .get_joint_config()
             .clone();
         assert_eq!(configs, vec![BTreeSet::from([1, 2])]);
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciler_grows_onto_slow_learners_without_timing_out() {
+        // #779: on a slow disk, a new learner's catch-up takes as long as its
+        // log gap needs. The reconciler waited for it inside its bounded
+        // operation, so every add timed out. Each operation is now a few
+        // commits; the catch-up runs between ticks, and promotion waits for it.
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+
+        let router = InMemoryRaftRouter::new();
+        let names = ["node-1", "node-2", "node-3"];
+        let mut nodes = Vec::new();
+        for name in names {
+            let id = raft_id_from_name(name);
+            let log_store = MemLogStore::new();
+            if name != "node-1" {
+                // 8,000 entries at half a millisecond each: four seconds to
+                // catch up, 1.5 s of it before the learner is within
+                // openraft's 5,000-entry `replication_lag_threshold`.
+                log_store.slow_entry_writes(Duration::from_micros(500));
+            }
+            let node = CouncilNode::new(
+                id,
+                CouncilConfig {
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 200,
+                    election_timeout_max_ms: 400,
+                    ..CouncilConfig::default()
+                },
+                InMemoryRaftNetworkFactory::new(id, router.clone()),
+                log_store,
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        let self_id = raft_id_from_name("node-1");
+        let self_info = info("node-1", 9444);
+        nodes[0]
+            .initialize(BTreeMap::from([(self_id, self_info.clone())]))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !nodes[0].is_leader().await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..8_000 {
+            nodes[0]
+                .write(crate::council::RaftRequest::Noop)
+                .await
+                .unwrap();
+        }
+
+        let now = Instant::now();
+        let mut peer_a = snap("node-2", 9445, now);
+        peer_a.first_seen = now - Duration::from_secs(600);
+        let mut peer_b = snap("node-3", 9447, now);
+        peer_b.first_seen = now - Duration::from_secs(600);
+        let (_membership_tx, membership_rx) = watch::channel(vec![peer_a, peer_b]);
+
+        let mut config = fast_reconciler_config();
+        config.op_timeout = Duration::from_secs(1);
+        config.selection.max_promotion_lag = 8;
+        let mut tracker = HealthTracker::default();
+        let mut deposition_throttle = DepositionThrottle::default();
+        let no_pressure = BTreeSet::new();
+        let expected: BTreeSet<u64> = names.iter().map(|n| raft_id_from_name(n)).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let started = tokio::time::Instant::now();
+            reconcile_council_once(
+                &nodes[0],
+                &membership_rx,
+                1,
+                self_id,
+                &self_info,
+                &config,
+                &mut tracker,
+                &mut deposition_throttle,
+                &no_pressure,
+            )
+            .await;
+            assert!(
+                started.elapsed() < config.op_timeout,
+                "a reconciler operation ran into its bound"
+            );
+
+            let voters: BTreeSet<u64> = nodes[0]
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .collect();
+            if voters == expected {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "council did not grow to 3 voters; got {voters:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         for node in &nodes {
             node.shutdown().await.unwrap();
         }

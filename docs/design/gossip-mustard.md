@@ -990,6 +990,8 @@ Remove member flow:
 
 In the implementation, promotion and eviction go through openraft's joint consensus (`change_membership`): a joint configuration commits first, then the uniform one. The caller's future proposes the second step, so a caller that times out or a leader that fails over between the steps leaves a committed joint configuration behind. The council reconciler finishes it before planning anything else (`CouncilNode::finish_membership_change`), proposing the joint configuration's target voter set; otherwise its change-in-flight gate would hold every later membership change (#673).
 
+Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). Step 5's catch-up is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
+
 ---
 
 ## 6. Configuration
