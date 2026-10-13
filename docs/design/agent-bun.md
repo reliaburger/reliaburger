@@ -205,7 +205,12 @@ linear backoff; only when all of them exit before serving the API does
 `state()` return "exited before readiness" with the last attempt's stderr.
 Connection-level API failures (missing or refused socket, reset, EOF) are
 retried within the 5 s readiness window; API refusals and conflicting
-forwarding inventories fail immediately. Rootless cgroup limits remain an admission-time refusal: Bun
+forwarding inventories fail immediately. A Bun that execs mid-replacement can
+leave the new helper bound but never started; the next supervision pass
+cancels it under the generation claim and starts another, and gives a helper
+whose owner is starting it up to 5 s. Replacement likewise waits up to 5 s for
+an earlier helper to retire, then refuses: a helper still running after that
+is a live owner, never replaced alongside. Rootless cgroup limits remain an admission-time refusal: Bun
 doesn't create a delegated user scope, so the OCI rewrite removes the rootful
 cgroup path rather than fabricating a path runc cannot write.
 
