@@ -64,6 +64,18 @@ even after worker restart or disappearance. A timed-out attempt counts as
 uncertain too: Bun stops the command, but the work may have half happened, so
 a job without `replay_unknown` waits for `relish batch replay` rather than
 retrying. With `replay_unknown = true`, a timeout is an ordinary failed attempt.
+
+An attempt can also fail before its command runs. If the spec is invalid or
+unsupported on the node (an image reference that doesn't parse, a missing
+binary, a runtime the node doesn't have), the task fails at once, without
+retries. If the runtime, the host or a registry failed instead (an image pull,
+a registry that answers 503, a runc call, network or capture setup), the
+attempt is a launch failure: it retries with the usual backoff and counts
+against `max_attempts`, like any other failed attempt. When Bun can't tell
+which it is, it retries, because the command never ran. Either way the reason
+is the failed task's output, so `relish batch logs ID --index N` shows it, and Bun
+logs it on stderr with the batch ID, task index and attempt (at most 20 lines a
+minute per run; the next line says how many it left out).
 A successful launch isn't evidence of successful work. Explicit bulk
 submissions retain at-least-once replay, including a one-element array. This is
 a retry policy on the common engine.
@@ -214,7 +226,7 @@ alternate between zero and a burst. Use a sustained interval for capacity planni
 Duration histograms merge across workers; watch displays p50, p95 and p99 bucket
 upper bounds for final attempts. They exclude queueing and earlier retries.
 Retries come with their causes: non-zero exit, a signal (including the memory
-limit's kill), a timeout, an unknown outcome, or "not recorded across a
+limit's kill), a timeout, an unknown outcome, a launch failure, or "not recorded across a
 restart" when a worker read an attempt count back from its ledger, which
 keeps counts but not reasons. The causes always add up to the retry count,
 and they're a handful of counters per run, never a log per task.

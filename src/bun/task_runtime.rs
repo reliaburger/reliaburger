@@ -631,24 +631,12 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         cancel: &CancellationToken,
     ) -> Attempt {
         let Some(template) = task.template.as_ref() else {
-            return Attempt {
-                outcome: AttemptOutcome::SpawnFailed {
-                    reason: "owned tasks require a runtime template".into(),
-                },
-                output: CapturedOutput::default(),
-                ran: None,
-            };
+            return Attempt::refused("owned tasks require a runtime template");
         };
         let resolved = match self.resolve_template(template).await {
             Ok(resolved) => resolved,
             Err(_) => {
-                return Attempt {
-                    outcome: AttemptOutcome::SpawnFailed {
-                        reason: "cannot decrypt this job's namespace secrets".into(),
-                    },
-                    output: CapturedOutput::default(),
-                    ran: None,
-                };
+                return Attempt::refused("cannot decrypt this job's namespace secrets");
             }
         };
         let backend = match resolved.runtime {
@@ -658,31 +646,13 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             }
         };
         if let Err(reason) = resolved.validate_runtime() {
-            return Attempt {
-                outcome: AttemptOutcome::SpawnFailed {
-                    reason: reason.into(),
-                },
-                output: CapturedOutput::default(),
-                ran: None,
-            };
+            return Attempt::refused(reason);
         }
         if !self.runtime.supports_runtime(backend) {
-            return Attempt {
-                outcome: AttemptOutcome::SpawnFailed {
-                    reason: "selected job runtime is unavailable on this node".into(),
-                },
-                output: CapturedOutput::default(),
-                ran: None,
-            };
+            return Attempt::refused("selected job runtime is unavailable on this node");
         }
         if !self.enforces_network_policy(&resolved) {
-            return Attempt {
-                outcome: AttemptOutcome::SpawnFailed {
-                    reason: NETWORK_POLICY_UNENFORCEABLE.into(),
-                },
-                output: CapturedOutput::default(),
-                ran: None,
-            };
+            return Attempt::refused(NETWORK_POLICY_UNENFORCEABLE);
         }
         if resolved.runtime == crate::config::job::JobRuntime::SharedRunc
             || (resolved.runtime == crate::config::job::JobRuntime::Process
@@ -753,15 +723,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 }
                 return result;
             }
-            return Attempt {
-                outcome: AttemptOutcome::SpawnFailed {
-                    reason:
-                        "shared-runc requires the owned rootful Linux runtime on Linux 5.8 or later"
-                            .into(),
-                },
-                output: CapturedOutput::default(),
-                ran: None,
-            };
+            return Attempt::refused(
+                "shared-runc requires the owned rootful Linux runtime on Linux 5.8 or later",
+            );
         }
         let Some(slot) = self.slot(cancel).await else {
             return Attempt {
@@ -820,13 +784,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         .filter(|cgroup| cgroup.to_str().is_some());
         let Some(cgroup) = cgroup else {
             self.return_slot(slot);
-            return Attempt {
-                outcome: AttemptOutcome::SpawnFailed {
-                    reason: format!("executor {id} has no valid UTF-8 cgroup path"),
-                },
-                output: CapturedOutput::default(),
-                ran: None,
-            };
+            return Attempt::refused(format!("executor {id} has no valid UTF-8 cgroup path"));
         };
         let _listing = task.run.as_ref().map(|run| {
             AttemptListing::new(&self.attempts, run.batch_id, id.clone(), cgroup.clone())
@@ -915,7 +873,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 if interrupted.is_cancelled()
                     || deadline.is_some_and(|at| tokio::time::Instant::now() >= at)
                 {
-                    return Ok::<_, crate::grill::GrillError>(false);
+                    return Ok::<_, LaunchError>(false);
                 }
                 #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 if namespace_enforced && let Some(policy) = &self.namespace_policy {
@@ -928,10 +886,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 }
                 if template.env.values().any(|value| value.is_encrypted()) {
                     self.resolve_template(template).await.map_err(|_| {
-                        crate::grill::GrillError::StartFailed {
-                            instance: id.clone(),
-                            reason: "namespace credentials no longer authorise this command".into(),
-                        }
+                        LaunchError::Refused(
+                            "namespace credentials no longer authorise this command",
+                        )
                     })?;
                 }
                 execution_authorised.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -963,9 +920,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 result = &mut launch => match result {
                     Ok(true) => None,
                     Ok(false) => Some(AttemptOutcome::Cancelled),
-                    Err(error) => Some(if execution_authorised.load(std::sync::atomic::Ordering::Relaxed) {
-                        AttemptOutcome::Unknown { reason: error.to_string() }
-                    } else { AttemptOutcome::SpawnFailed { reason: error.to_string() } }),
+                    Err(error) => Some(error.outcome(
+                        execution_authorised.load(std::sync::atomic::Ordering::Relaxed),
+                    )),
                 },
             }
         };
@@ -1065,8 +1022,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let mut output = CapturedOutput::default();
-        if let AttemptOutcome::SpawnFailed { reason } | AttemptOutcome::Unknown { reason } =
-            &outcome
+        if let AttemptOutcome::Refused { reason }
+        | AttemptOutcome::LaunchFailed { reason }
+        | AttemptOutcome::Unknown { reason } = &outcome
         {
             output.push(reason.as_bytes());
             output.push(b"\n");
@@ -1130,6 +1088,35 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             outcome,
             output,
             ran: None,
+        }
+    }
+}
+
+/// Why a fresh launch stopped early.
+#[derive(Debug, thiserror::Error)]
+enum LaunchError {
+    /// The runtime failed: creating, preparing or starting the container.
+    #[error(transparent)]
+    Runtime(#[from] crate::grill::GrillError),
+    /// The job can't run as specified, whatever the runtime does.
+    #[error("{0}")]
+    Refused(&'static str),
+}
+
+impl LaunchError {
+    /// How this error ends the attempt. Once the command was authorised to
+    /// start it may have run, so the outcome is unknown. Before that it
+    /// never ran: a spec the runtime can't accept refuses the task, and
+    /// anything else (an image pull, runc, disk, network or capture setup)
+    /// is a launch failure the task pool retries within `max_attempts`
+    /// (#889).
+    fn outcome(self, authorised: bool) -> AttemptOutcome {
+        let reason = self.to_string();
+        match self {
+            _ if authorised => AttemptOutcome::Unknown { reason },
+            Self::Refused(_) => AttemptOutcome::Refused { reason },
+            Self::Runtime(error) if error.refuses_spec() => AttemptOutcome::Refused { reason },
+            Self::Runtime(_) => AttemptOutcome::LaunchFailed { reason },
         }
     }
 }
@@ -1467,11 +1454,81 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await;
-        let AttemptOutcome::SpawnFailed { reason } = result.outcome else {
-            panic!("expected runtime refusal");
+        // A runtime failure before the command ran is transient (#889).
+        let AttemptOutcome::LaunchFailed { reason } = result.outcome else {
+            panic!("expected a launch failure: {result:?}");
         };
         assert!(String::from_utf8_lossy(&result.output.head).contains(&reason));
         assert_eq!(runner.slots.lock().unwrap().len(), 256);
+    }
+
+    async fn launch_with_image_error(error: fn() -> crate::grill::image::ImageError) -> Attempt {
+        let runtime = crate::grill::mock::MockGrill::new();
+        runtime.set_create_image_error(Some(error));
+        let runner = OwnedRunner::new(runtime);
+        let result = runner
+            .run(
+                &invocation(),
+                Duration::from_secs(1),
+                &CancellationToken::new(),
+            )
+            .await;
+        // Either way the slot came back, so a retry can take it.
+        assert_eq!(runner.slots.lock().unwrap().len(), 256);
+        result
+    }
+
+    #[tokio::test]
+    async fn a_registry_failure_during_launch_is_a_retryable_launch_failure() {
+        let result = launch_with_image_error(|| crate::grill::image::ImageError::ManifestPull {
+            image: "public.ecr.aws/docker/library/busybox".into(),
+            reason: "registry leader refused proposal: 503 Service Unavailable".into(),
+        })
+        .await;
+        let AttemptOutcome::LaunchFailed { reason } = &result.outcome else {
+            panic!("a registry failure was not transient: {result:?}");
+        };
+        assert!(reason.contains("503 Service Unavailable"), "{reason}");
+        assert!(result.outcome.is_retryable());
+        assert_eq!(
+            String::from_utf8_lossy(&result.output.head),
+            format!("{reason}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_image_reference_refuses_the_task() {
+        let result = launch_with_image_error(|| {
+            crate::grill::image::ImageError::InvalidReference("empty image reference".into())
+        })
+        .await;
+        let AttemptOutcome::Refused { reason } = &result.outcome else {
+            panic!("an invalid image was retried: {result:?}");
+        };
+        assert!(reason.contains("empty image reference"), "{reason}");
+        assert!(!result.outcome.is_retryable());
+        assert_eq!(
+            String::from_utf8_lossy(&result.output.head),
+            format!("{reason}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_without_a_template_is_refused_with_the_reason_as_output() {
+        let runtime = crate::grill::mock::MockGrill::new();
+        let runner = OwnedRunner::new(runtime);
+        let mut task = invocation();
+        task.template = None;
+        let result = runner
+            .run(&task, Duration::from_secs(1), &CancellationToken::new())
+            .await;
+        let AttemptOutcome::Refused { reason } = &result.outcome else {
+            panic!("a task without a template was not refused: {result:?}");
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&result.output.head),
+            format!("{reason}\n")
+        );
     }
 
     #[tokio::test]

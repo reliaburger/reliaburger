@@ -380,6 +380,50 @@ async fn failures_are_counted_and_their_output_kept() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once() {
+    // #889: index 3's first launch fails as an image pull would during
+    // registry churn, index 5's spec is refused, the rest just run.
+    let harness = Harness::start(Options {
+        council: true,
+        runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |task| {
+            match (task.index, task.attempt) {
+                (3, 1) => AttemptOutcome::LaunchFailed {
+                    reason: "registry leader refused proposal: 503".into(),
+                },
+                (5, _) => AttemptOutcome::Refused {
+                    reason: "invalid image reference".into(),
+                },
+                _ => AttemptOutcome::Exited { code: 0 },
+            }
+        })),
+        allowed: vec![SHELL],
+        slots: 4,
+        retention: RETENTION,
+        mount_isolation: false,
+    })
+    .await;
+    let mut array = shell_array(10, 5, "true");
+    array["spec"]["max_attempts"] = json!(3);
+    let batch_id = harness.submit_ok(array).await;
+    let summary = harness.wait_done(batch_id, 60).await;
+    assert_eq!(summary["status"], "CompletedWithFailures", "{summary}");
+    assert_eq!(summary["succeeded"], 9);
+    assert_eq!(summary["failed"], 1);
+    assert_eq!(summary["failed_indices"], json!([[5, 5]]));
+    // The leader accepted the chunk because the causes add up to the retries.
+    assert_eq!(summary["retried"], 1);
+    assert_eq!(summary["retry_causes"]["launch"], 1, "{summary}");
+
+    let (status, body) = harness
+        .get(&format!("/v1/batch/{batch_id}/results?failed=true"))
+        .await;
+    assert_eq!(status, 200);
+    let results: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(results["rows"][0]["index"], 5);
+    assert_eq!(results["rows"][0]["attempts"], 1, "a refusal was retried");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
     let harness = Harness::start(Options {
         council: true,
