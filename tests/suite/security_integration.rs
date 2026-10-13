@@ -335,10 +335,17 @@ async fn spawn_issuer(
     };
     let app = Router::new()
         .route(
-            "/v1/version",
+            "/v1/cluster/ca",
             axum::routing::get(|| async {
                 Json(serde_json::json!({"compatibility": reliaburger::compatibility::CURRENT}))
             }),
+        )
+        // A freshly started Bun answers `/v1/version` only once it has
+        // hashed its own binary, which on a saturated host takes longer
+        // than a joiner waits (#884). The join must not depend on it.
+        .route(
+            "/v1/version",
+            axum::routing::get(|| std::future::pending::<Json<serde_json::Value>>()),
         )
         .route("/v1/cluster/join", post(issue))
         .with_state(issuer);
@@ -374,6 +381,24 @@ async fn joiner_persists_the_identity_returned_by_a_remote_member() {
         &loaded.root_ca_der,
     )
     .unwrap();
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn joiner_checks_compatibility_while_the_members_binary_hash_is_still_running() {
+    let (state, token, ikm) = bootstrap_security_state();
+    let (url, server) = spawn_issuer(state, ikm).await;
+
+    let client = reqwest::Client::new();
+    let identity = tokio::time::timeout(
+        Duration::from_secs(5),
+        join::request_join(&client, &url, &token, "node-02", None),
+    )
+    .await
+    .expect("the join waited on the member's /v1/version")
+    .expect("join should succeed");
+    assert_eq!(identity.node_id, "node-02");
 
     server.abort();
 }
@@ -434,12 +459,20 @@ async fn incompatible_member_never_receives_the_join_token() {
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
+        // `/v1/version` claims the current formats, so only a check of
+        // what the pinned member's CA endpoint reports refuses the join.
         let app = Router::new()
             .route(
-                "/v1/version",
+                "/v1/cluster/ca",
                 get(move || {
                     let version = version.clone();
                     async move { Json(version) }
+                }),
+            )
+            .route(
+                "/v1/version",
+                get(|| async {
+                    Json(serde_json::json!({"compatibility": reliaburger::compatibility::CURRENT}))
                 }),
             )
             .route(
