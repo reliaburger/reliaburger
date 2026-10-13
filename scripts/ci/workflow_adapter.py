@@ -322,7 +322,8 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
     """Waited job results and trusted output hashes authorize artifact consumption.
 
     `event` is the workflow's own event name. Only a pull request may qualify
-    with fewer than every owner; the command line always passes it.
+    with fewer than every owner (`light`, `portable` or `train-full`); the
+    command line always passes it.
     """
     root, incoming = Path(root), Path(incoming)
     manifest = c.inventory(c.read_json(manifest_path), root)
@@ -381,7 +382,7 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
     for (gate, host), parts in shards.items():
         verified[(gate, host)] = shards_complete(manifest, gate, [directory for directory, _ in parts],
                                                  [cases for _, cases in parts])
-    if selection['mode'] == 'full':
+    if selection['mode'] in ('full', 'train-full'):
         c.require(bindings_path is not None, 'complete legacy ignored-owner bindings required')
         import ignored_owners
         owned = {}

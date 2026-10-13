@@ -26,6 +26,13 @@ fn secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup() {
     qualify_process_catalogue("jobs");
 }
 
+/// #742: the process-workloads group's job cases ran under Applications
+/// leases, which refuse jobs, so they failed at apply.
+#[test]
+fn secure_catalogue_process_job_cases_run_under_job_leases() {
+    qualify_process_catalogue("process-workloads");
+}
+
 /// A secure single-node Bun on the process runtime, with an admin token.
 struct SecureNode {
     bun: bun_process::BunProcess,
@@ -147,7 +154,12 @@ fn qualify_process_catalogue(group: &str) {
         "--filter",
         group,
         "--timeout",
-        if group == "jobs" { "90s" } else { "15s" },
+        match group {
+            "jobs" => "90s",
+            // The job cases take about 5 s; the app case runs out this budget.
+            "process-workloads" => "20s",
+            _ => "15s",
+        },
     ]);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
@@ -180,6 +192,25 @@ fn qualify_process_catalogue(group: &str) {
         let leases =
             std::fs::read_to_string(node_data.join("node-test-leases.json")).unwrap_or_default();
         assert!(!leases.contains("node-jobs-"), "{leases}");
+        return;
+    }
+    if group == "process-workloads" {
+        // The app case runs `bun testapp` from where `relish dev` installs
+        // it, which this fixture doesn't have, so it never gets past
+        // starting. Only the job cases are qualified here.
+        for name in [
+            "process_job_with_exit_zero_succeeds",
+            "failing_job_retries_then_fails",
+        ] {
+            let case = report["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from {report}"));
+            assert_eq!(case["outcome"]["status"], "pass", "{case}");
+            assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
+        }
         return;
     }
     let case = report["results"]

@@ -60,12 +60,20 @@ class WorkflowAssembly(unittest.TestCase):
         self.assertEqual(set(plan['jobs']), {'changes', 'portable', 'contract-boundaries'})
         self.assertEqual(set(plan['gates']), {'portable-linux', 'optimized-cron'})
 
-    def test_heavy_work_without_macos_or_an_unknown_macos_value_is_refused(self):
-        with self.assertRaises(c.Invalid):
-            self.w.selected_workflow(self.expected, code='true', heavy='true', macos='false')
-        for value in [None, True, '', 'yes']:
-            with self.subTest(macos=value), self.assertRaises(c.Invalid):
-                self.w.selected_workflow(self.expected, code='true', heavy='false', macos=value)
+    def test_train_full_plan_waits_for_every_heavy_owner_but_not_macos(self):
+        # A full-ci pull request into a merge train: everything except the
+        # three portable macOS shards, which the queue and the train push run.
+        plan = self.w.selected_workflow(self.expected, code='true', heavy='true', macos='false')
+        self.assertEqual(plan['mode'], 'train-full')
+        self.assertEqual(set(plan['jobs']), {'changes', 'portable', 'contract-boundaries', 'linux',
+                                             'build-tests', 'cluster', 'acceptance'})
+        self.assertEqual(set(plan['gates']), set(self.w.OWNERS) - {'portable-darwin'})
+
+    def test_an_unknown_macos_value_is_refused(self):
+        for heavy in ['true', 'false']:
+            for value in [None, True, '', 'yes']:
+                with self.subTest(heavy=heavy, macos=value), self.assertRaises(c.Invalid):
+                    self.w.selected_workflow(self.expected, code='true', heavy=heavy, macos=value)
 
     def test_the_portable_macos_owner_is_split_into_three_hash_partitions(self):
         self.assertEqual(self.w.SHARDS, {'portable-darwin': 3})
