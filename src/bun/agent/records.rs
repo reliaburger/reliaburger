@@ -353,6 +353,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 return Err(error);
             }
 
+            // No fault survives its Bun: lift any cap or pause the previous
+            // process left on this instance before publishing it (#699).
+            self.release_leftover_faults(&runtime_id, &record.oci_spec)
+                .await;
+
             // The surviving instance still holds its port.
             if let Some(port) = record.host_port {
                 self.supervisor.port_allocator.reserve(port).await?;
