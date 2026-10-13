@@ -332,6 +332,166 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
     }
 }
 
+/// A loopback stand-in for a registry that counts every connection. It
+/// forwards to `upstream` until `throttled` is set, then answers each one
+/// `429 Too Many Requests`, as an anonymous registry does under a burst.
+async fn counting_registry_proxy(
+    upstream: String,
+    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    throttled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            connections.fetch_add(1, Ordering::SeqCst);
+            let upstream = upstream.clone();
+            let throttled = throttled.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                if throttled {
+                    let mut request = [0u8; 4096];
+                    let _ = client.read(&mut request).await;
+                    let body =
+                        r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"rate limited"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = client.write_all(response.as_bytes()).await;
+                    return;
+                }
+                if let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    address
+}
+
+/// Cold shared-runc executors for a digest-pinned image that is already
+/// unpacked read nothing from the registry: not in the pool's pull, not in
+/// runc's create. So a burst of them can't trip a rate limit (#790).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
+    use reliaburger::bun::execution_budget::ExecutionBudget;
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
+    use reliaburger::bun::task_runtime::OwnedRunner;
+    use reliaburger::grill::ImageMirrors;
+    use reliaburger::grill::image::ImageReference;
+    use reliaburger::meat::Resources;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+    const BURST: usize = 4;
+    assert!(nix::unistd::geteuid().is_root());
+    let mirror_env = reliaburger::testkit::pinned_images::TEST_IMAGE_MIRROR_ENV;
+    let mirror = std::env::var(mirror_env).unwrap_or_else(|_| {
+        panic!("{mirror_env} is unset: run with make test-linux, which serves the pinned images")
+    });
+    let connections = Arc::new(AtomicUsize::new(0));
+    let throttled = Arc::new(AtomicBool::new(false));
+    let proxy =
+        counting_registry_proxy(mirror, Arc::clone(&connections), Arc::clone(&throttled)).await;
+    let root = tempfile::Builder::new()
+        .prefix("rb-790-warm-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    // Declared before the runtime, so it drops after it: a failed assertion
+    // still releases the executors' namespaces for the next runc test.
+    let _residue = ExecutorResidue { root: root.clone() };
+    let node = root.join("node-0");
+    std::fs::create_dir_all(&node).unwrap();
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let registry = ImageReference::parse(image).unwrap().registry;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(ImageMirrors::new([(registry, proxy)].into()).unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    assert!(
+        connections.load(Ordering::SeqCst) > 0,
+        "the warm-up pull bypassed the counting registry"
+    );
+    // From here the registry refuses everything, and every request counts.
+    throttled.store(true, Ordering::SeqCst);
+    connections.store(0, Ordering::SeqCst);
+    let runtime = RuncGrill::new(
+        root.join("bundles"),
+        images,
+        false,
+        root.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let budget = ExecutionBudget::new(Resources::new(1000, 512 << 20, 0));
+    // A data directory, so the residue guard can name this runner's executors.
+    let runner = OwnedRunner::for_data_dir(runtime.clone(), &node)
+        .unwrap()
+        .with_budget(budget.clone());
+    let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+        "image='{image}'\nnamespace='rbtest-warm-pin'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+    ))
+    .unwrap();
+    let tasks: Vec<TaskInvocation> = (0..BURST as u32)
+        .map(|index| TaskInvocation {
+            template: Some(Box::new(template.clone())),
+            index,
+            attempt: 1,
+            program: "/unused".into(),
+            // Overlapping commands keep every slot busy, so each one
+            // cold-starts its own executor.
+            args: vec!["/bin/sh".into(), "-c".into(), "sleep 1; printf ran".into()],
+            env: vec![],
+            run: None,
+        })
+        .collect();
+    let cancel = CancellationToken::new();
+    let attempts = futures_util::future::join_all(
+        tasks
+            .iter()
+            .map(|task| runner.run(task, Duration::from_secs(60), &cancel)),
+    )
+    .await;
+    for attempt in &attempts {
+        assert_eq!(
+            attempt.outcome,
+            AttemptOutcome::Exited { code: 0 },
+            "{attempt:?}"
+        );
+        assert_eq!(attempt.output.head, b"ran", "{attempt:?}");
+    }
+    let executors = runtime
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .filter(|launch| launch.instance_id.0.contains("__executor-"))
+        .map(|launch| launch.instance_id)
+        .collect::<Vec<_>>();
+    assert_eq!(executors.len(), BURST, "every slot cold-started");
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "warm pinned cold starts asked the registry"
+    );
+    // Idle executors retire and hand back everything they held.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while budget.available() != budget.capacity() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("idle executors never retired");
+    for id in &executors {
+        assert_retired(&runtime, id).await;
+    }
+}
+
 /// Delegated sources inherit their tenant before their first connect; losing
 /// that live binding retires the process tree instead of running unguarded.
 #[cfg(feature = "ebpf")]
@@ -3052,9 +3212,9 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
     use tokio_util::sync::CancellationToken;
     assert!(nix::unistd::geteuid().is_root());
     if template["runtime"] != "process" {
-        // Every cold executor reads the image's manifest. Straight from the
-        // public registry, dozens of them trip its anonymous rate limit and
-        // fail tasks that leader loss never touched (#786).
+        // Cold executors of the warmed pin read nothing from the registry
+        // (#790), but the warm-up pull does, and the public registry's
+        // anonymous rate limit must not decide whether this test runs (#786).
         let mirror = reliaburger::testkit::pinned_images::TEST_IMAGE_MIRROR_ENV;
         assert!(
             std::env::var_os(mirror).is_some(),

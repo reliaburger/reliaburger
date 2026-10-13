@@ -1668,6 +1668,60 @@ the fresh-launch path always did. The unit test
 `a_command_that_never_starts_says_why_in_its_output` asks the pool for more
 than its node can hold and checks that the refusal is the task's output.
 
+The mirror only hid the rate limit, though. At a million jobs the same burst
+happens in production, against whatever registry a customer's images live in,
+and no mirror stands in front of it. So in 0.2.1 we fixed the pull itself
+(#790). Think about what the two manifest reads were for. A digest names exact
+bytes. If the node already holds bytes that hash to that digest, and has
+already unpacked the layers they name, what could the registry possibly tell
+it? Nothing. It can only be slow, or say no.
+
+Now a pull that verifies a digest-pinned image also keeps the raw bytes it
+verified, each under the digest that names it, in `metadata/sha256/` beside
+the layer blobs: the index the pin names (if it names one), the platform
+manifest and the config. The next pull of that pin starts with
+`pinned_image_from_local`. It reads the pinned root and hashes it, picks the
+platform entry exactly as a registry pull does, reads that manifest and
+checks its hash and size, then does the same for the config. If the rootfs
+generation those layer digests name has its `.complete` marker, that's the
+image: no request leaves the node. Any miss (a file that's absent, a byte
+that's changed, a generation that never finished unpacking) returns `None`,
+and the pull goes to the registry as before and rewrites the files it
+verified. The pool's pull and runc's create both call `pull_and_unpack`, so
+both get it for free. A cold executor for a warm pin costs zero registry
+requests instead of two.
+
+We kept two rules from the registry path. First, local bytes are trusted only
+because their hash matches the digest the job asked for, never because of a
+file name or a tag. `metadata_path` refuses anything but a well-formed sha256
+digest, so a hostile descriptor can't steer it outside the directory either.
+Second, a tag reference never takes this path. `nginx:1.29` today may be a
+different image from `nginx:1.29` yesterday, and only the registry knows
+which. This is one more reason the job API insists on digest pins.
+
+`Option` makes the fallback easy to read. Every step of the local lookup can
+miss, so it returns `Option<PulledImage>` and uses `?` on each one. In a
+function that returns `Option`, `?` on a `None` returns `None` straight away,
+and `.ok()?` turns a `Result` into an `Option` first, dropping its error. It's
+the same early return that `?` does for errors, without inventing an error
+type for "not here, ask the registry".
+
+The tests use the image store's counting fake registry, which now counts
+every request. `a_warm_digest_pinned_pull_makes_no_registry_requests` pulls a
+pin once, then pulls it again through a second store over the same directory
+(what runc's create sees after the pool's pull) and expects zero requests,
+for a pinned manifest and a pinned index.
+`warm_pinned_cold_starts_survive_a_registry_that_rate_limits_every_request`
+switches the registry to `429` for everything after the warm-up and runs 32
+pulls at once: all succeed, with no request. Before the fix they waited out
+the client's retries and failed. Two more tests pin down the security side:
+tampered local metadata is ignored, refetched and verified, and a tag always
+asks the registry. On Linux,
+`runc_warm_pinned_executor_cold_starts_make_no_registry_requests` puts a
+counting proxy in front of the test mirror, warms the image, makes the proxy
+answer `429` to everything and cold-starts four shared-runc executors at
+once. Every task runs, and the proxy sees no connection at all.
+
 The failed run also left executor network namespaces behind. A test that
 panics drops its nodes without retiring their executors, and the next runc
 test in the VM failed with `RTNETLINK answers: File exists`. Rust runs `Drop`
