@@ -5405,16 +5405,17 @@ async fn explicit_stop_cancels_pending_restart_before_creation() {
     assert_eq!(grill.calls().len(), calls);
 }
 
+/// A real process crashing during backoff stays eligible for a later tick.
+/// Once its executable is gone, the restart fails at once with the reason
+/// instead of retrying until the binary returns (#905). Transient restart
+/// failures still retry: see `failed_restart_recovers`.
 #[tokio::test]
-async fn real_process_restart_recovers_when_executable_returns() {
+async fn real_process_restart_stays_eligible_and_fails_at_once_without_its_executable() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let program = directory.path().join("worker");
-    let install = || {
-        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    };
-    install();
+    std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_tx, rx) = mpsc::channel(32);
     let grill = crate::grill::process::ProcessGrill::new();
     let mut agent = BunAgent::new(
@@ -5433,24 +5434,10 @@ async fn real_process_restart_recovers_when_executable_returns() {
     agent.deploy(config, &events).await;
     let id = agent.supervisor.list_instances()[0].id.clone();
     grill.kill(&id).await.unwrap();
-    std::fs::remove_file(&program).unwrap();
     agent.check_apps().await;
     agent.drive_pending_restarts_to_completion().await;
-    assert_eq!(
-        agent.supervisor.get_instance(&id).unwrap().state,
-        ContainerState::Stopping
-    );
-    agent.drive_pending_restarts_to_completion().await;
-    assert_eq!(
-        agent.supervisor.get_instance(&id).unwrap().state,
-        ContainerState::Stopped
-    );
-    install();
-    agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
-        Some(Instant::now() - std::time::Duration::from_secs(600));
-    agent.drive_pending_restarts_to_completion().await;
     assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
-    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
     // A second crash during backoff must stay eligible for a later tick.
     grill.kill(&id).await.unwrap();
     agent.check_apps().await;
@@ -5462,7 +5449,22 @@ async fn real_process_restart_recovers_when_executable_returns() {
         Some(Instant::now() - std::time::Duration::from_secs(600));
     agent.drive_pending_restarts_to_completion().await;
     assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
-    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 3);
+    assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+
+    // Now the executable goes, and the process with it.
+    std::fs::remove_file(&program).unwrap();
+    grill.kill(&id).await.unwrap();
+    agent.check_apps().await;
+    agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+        Some(Instant::now() - std::time::Duration::from_secs(600));
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert_eq!(
+        instance.launch_failure,
+        Some(format!("binary not found: {}", program.display()))
+    );
+    assert_eq!(instance.restart_count, 3);
     agent.stop_app("retry", "default").await.unwrap();
 }
 

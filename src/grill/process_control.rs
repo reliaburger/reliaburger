@@ -221,6 +221,7 @@ impl ProcessControl {
                     instance_id: id.clone(),
                     spec,
                 },
+                gate: None,
             };
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -270,7 +271,10 @@ impl ProcessControl {
         .await
     }
 
-    pub(crate) async fn start(&self, id: &InstanceId) -> io::Result<()> {
+    /// Launch the prepared generation's owner. Returns its record once the
+    /// execution gate has reported about `exec` (#905), or once the owner
+    /// has retired, which it may do without recording a report.
+    pub(crate) async fn start(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
         // Cancellation can leave a blocking mutation queued behind another
         // operation. Bind its authority before queueing that mutation, so it
         // cannot activate a successor prepared by the intervening lock holder.
@@ -331,12 +335,18 @@ impl ProcessControl {
                     return Err(io::Error::other("process launch generation changed"));
                 }
                 match current.phase {
-                    OwnerPhase::Running { .. }
-                    | OwnerPhase::Retiring { .. }
-                    | OwnerPhase::Retired { .. }
+                    // The gate reports moments after activation. Waiting
+                    // for it means a binary that vanished after `create`'s
+                    // check fails this start, with the reason (#905).
+                    OwnerPhase::Running { .. } if launch_status.is_some() => {
+                        if current.gate.is_some() {
+                            return Ok(current);
+                        }
+                    }
+                    OwnerPhase::Retiring { .. } | OwnerPhase::Retired { .. }
                         if launch_status.is_some() =>
                     {
-                        return Ok(());
+                        return Ok(current);
                     }
                     OwnerPhase::Cancelled => {
                         return Err(io::Error::other("process launch was cancelled"));

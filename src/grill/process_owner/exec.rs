@@ -89,6 +89,7 @@ impl Execution {
             environment: parent_record.environment.clone(),
             phase: OwnerPhase::Prepared,
             launch,
+            gate: None,
         };
         persist(temporary.path(), &record)?;
         File::open(parent)?.sync_all()?;

@@ -124,6 +124,8 @@ pub struct Compatibility {
 /// A task-array node's control fence is `control.fence`, two checksummed
 /// slots rewritten in place, not `control.json` (#745).
 /// A refused launch's `reason` on `/v1/status` instance rows (#881).
+/// The process owner record's `gate`, what the execution gate reported
+/// about its `exec`, and the gate's stdin is now a socket pair (#905).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

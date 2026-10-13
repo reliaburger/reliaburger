@@ -189,7 +189,8 @@ impl OwnedCommands {
 
     /// Activate the prepared generation through its independent owner.
     pub async fn start(&self, id: &CommandId) -> Result<(), CommandError> {
-        Ok(self.control.start(&id.0).await?)
+        self.control.start(&id.0).await?;
+        Ok(())
     }
 
     /// Cancel an attempt that was prepared but whose owner never started,

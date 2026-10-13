@@ -233,6 +233,17 @@ pub enum BunError {
     UpgradesUnavailable,
 }
 
+impl BunError {
+    /// Why the runtime refused to launch, if a refused launch is what failed
+    /// (#881, #905).
+    pub fn launch_problem(&self) -> Option<&crate::grill::LaunchProblem> {
+        match self {
+            BunError::Grill(error) => error.launch_problem(),
+            _ => None,
+        }
+    }
+}
+
 pub mod job_api;
 /// Common deployment admission and durable hook settlement.
 pub mod job_apply;

@@ -534,7 +534,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .record_initialiser_generation(instance_id, &init_id, generation)
                     .await;
             }
-            self.grill.start(&init_id).await?;
+            self.start_or_fail(&init_id, instance_id).await?;
 
             // Bounded wait: a hung init can't wedge the deploy forever (and
             // no longer wedges the loop at all — this poll is off it).
@@ -603,6 +603,26 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         Err(error.into())
     }
 
+    /// Start `launched` in the runtime. A launch the runtime refuses at
+    /// `exec`, because the binary vanished after `create`'s check (#905),
+    /// fails `instance_id` with the reason before the error returns. The two
+    /// differ for an init container, whose refusal fails its parent.
+    async fn start_or_fail(
+        &self,
+        launched: &InstanceId,
+        instance_id: &InstanceId,
+    ) -> Result<(), BunError> {
+        let Err(error) = self.grill.start(launched).await else {
+            return Ok(());
+        };
+        if let Some(problem) = error.launch_problem() {
+            self.ops
+                .record_launch_failure(instance_id, problem.to_string())
+                .await;
+        }
+        Err(error.into())
+    }
+
     /// Drive a fresh instance through create → egress → init → start →
     /// HealthWait. The blocking grill calls (create/init/start) run here on
     /// the task; the loop applies the state transitions and bookkeeping.
@@ -643,7 +663,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         self.ops
             .transition_state(instance_id, ContainerState::Starting)
             .await?;
-        self.grill.start(instance_id).await?;
+        self.start_or_fail(instance_id, instance_id).await?;
 
         let evidence = launch_evidence::LaunchEvidence::read(&self.grill, instance_id).await;
         self.ops
