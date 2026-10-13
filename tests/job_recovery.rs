@@ -363,7 +363,15 @@ registry_port = 0
     let stopped = recovered.client.stop("init-crash", "default").await;
     recovered.crash().await;
     assert!(original_process.is_some());
-    assert_eq!(retired.unwrap(), ContainerState::Stopped);
+    // Recovery retires the unadopted initialiser and then forgets its
+    // journal (#738), which the runtime does only for a retired generation.
+    assert!(
+        matches!(
+            retired,
+            Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })
+        ),
+        "{retired:?}"
+    );
     assert!(
         original_gone,
         "the interrupted initialiser survived recovery"
