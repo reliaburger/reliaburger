@@ -49,6 +49,14 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 /// Upper bound on a single reconciler membership operation. A peer whose Raft
 /// port is unreachable must not block the reconciler forever — on timeout we
 /// log and retry on the next tick.
+///
+/// An operation is a fixed number of commits: the guard no-op, then one
+/// membership entry (adding or removing a learner) or two (the joint and
+/// uniform steps of a voter change). With a log store that takes 20 ms per
+/// entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion
+/// 147 ms, so five seconds leaves room for a busy leader's apply queue. A new learner's catch-up, which grows with its log gap, is not part
+/// of any operation: it runs between ticks, and the planner promotes the
+/// learner only once it's caught up (#779).
 const RECONCILE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns resources that must outlive `start()` for the cluster to keep
@@ -1119,9 +1127,10 @@ pub struct CouncilReconcilerConfig {
     pub selection: CouncilSelectionConfig,
     /// How often to reconcile the council against gossip membership.
     pub tick_interval: Duration,
-    /// Upper bound on a single membership operation. A peer whose Raft port
-    /// is unreachable must not block the reconciler forever — on timeout we
-    /// log and retry on the next tick.
+    /// Upper bound on a single membership operation: the guard no-op plus
+    /// one or two membership commits, never a learner's catch-up. A peer
+    /// whose Raft port is unreachable must not block the reconciler forever —
+    /// on timeout we log and retry on the next tick.
     pub op_timeout: Duration,
 }
 

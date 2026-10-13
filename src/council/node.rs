@@ -317,8 +317,13 @@ impl CouncilNode {
 
     /// Add a learner node to the cluster.
     ///
-    /// The learner receives log replication but does not vote.
-    /// Use `change_membership()` to promote learners to voters.
+    /// The learner receives log replication but does not vote. This returns
+    /// once the membership entry that adds it has committed, which takes the
+    /// existing voters a commit or two. It does not wait for the learner to
+    /// catch up: on a slow disk that takes as long as the learner's log gap
+    /// needs (#779). Replication carries on in the background; promote the
+    /// learner with `change_membership()` once its replication metrics show
+    /// it close behind the leader, as the council planner does.
     pub async fn add_learner(&self, id: u64, info: CouncilNodeInfo) -> Result<(), CouncilError> {
         let _guard = self.guard_membership_change().await?;
         if self
@@ -331,7 +336,7 @@ impl CouncilNode {
             return Err(CouncilError::WriteFailed("node identity is retired".into()));
         }
         self.raft
-            .add_learner(id, info, true)
+            .add_learner(id, info, false)
             .await
             .map_err(|e| CouncilError::WriteFailed(e.to_string()))?;
         Ok(())
