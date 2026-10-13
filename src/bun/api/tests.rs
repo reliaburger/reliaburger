@@ -2533,6 +2533,21 @@ async fn unparseable_peer_identity_is_refused_before_any_route() {
     council.shutdown().await.unwrap();
 }
 
+/// Wait until `council`'s applied log index has stopped moving for 200 ms,
+/// so a test can count the writes its own requests make.
+async fn wait_for_quiet_log(council: &crate::council::CouncilNode) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last = council.desired_state().await.last_applied_log;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let now = council.desired_state().await.last_applied_log;
+        if now == last || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        last = now;
+    }
+}
+
 #[tokio::test]
 async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
     let council = seeded_council("endpoint-consumer").await;
@@ -2547,6 +2562,10 @@ async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
         Some(council.clone()),
     )
     .await;
+    // The router's leader loops write to Raft once as they start. Token
+    // checks used to take long enough (Argon2) to hide that; now they don't,
+    // so wait for the log to settle before counting writes.
+    wait_for_quiet_log(&council).await;
     let path = "/v1/placements/worker";
     assert_eq!(
         get_authenticated(app.clone(), path, &user_key).await.0,
