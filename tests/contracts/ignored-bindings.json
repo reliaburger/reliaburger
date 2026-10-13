@@ -1488,12 +1488,6 @@
     "test": "a_registry_outage_at_directive_time_does_not_pause_the_upgrade"
   },
   {
-    "source": "tests/suite/registry_standard_clients.rs",
-    "function": "crane_logs_in_pushes_and_pulls_over_tls",
-    "binary": "reliaburger::suite",
-    "test": "registry_standard_clients::crane_logs_in_pushes_and_pulls_over_tls"
-  },
-  {
     "source": "tests/test_storage.rs",
     "function": "lease_loop_storage_keeps_busy_mount_then_retries_cleanup",
     "binary": "reliaburger::test_storage",
@@ -1714,5 +1708,41 @@
     "function": "image_survives_loss_of_the_pushing_node",
     "binary": "reliaburger::registry_durability",
     "test": "image_survives_loss_of_the_pushing_node"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::docker_logs_in_pushes_and_pulls_layers_over_verified_tls"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "docker_refuses_a_registry_signed_by_another_ca",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::docker_refuses_a_registry_signed_by_another_ca"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::docker_push_with_a_scoped_token_outside_its_namespace_is_denied"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::podman_logs_in_pushes_and_pulls_layers_over_verified_tls"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "skopeo_copies_between_repositories_over_verified_tls",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::skopeo_copies_between_repositories_over_verified_tls"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "crane_pulls_layers_back_with_ca_verification",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification"
   }
 ]

@@ -47,8 +47,9 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
   portable Linux with the coverage floor, the demo app and the optimised
-  contract boundaries, in 15–20 minutes. A `full-ci` label still forces
-  everything on the PR.
+  contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
+  except the three macOS shards: privileged Linux, cluster, acceptance,
+  upgrades and benchmarks. macOS runs in the queue and on the push.
 - **The merge queue** on `release-*` runs every job, macOS shards and heavy
   suites included, on the batch merged onto the train, before any of it
   lands. The queue requires the single check `ignored-test evidence`, which
