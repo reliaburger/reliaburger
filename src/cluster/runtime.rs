@@ -132,6 +132,13 @@ pub struct ClusterParams {
     /// over gossip so the leader's reconciler resigns and replaces this voter.
     /// `None` (single-node / no disk-pressure loop) advertises "healthy".
     pub self_disk_pressured_rx: Option<watch::Receiver<bool>>,
+    /// The kinds of job this node runs (#788), published by Bun once its
+    /// task executor exists and advertised over gossip so the leader can
+    /// refuse a run no live node could take at submission. `None`
+    /// advertises nothing, and the leader leaves this node's runs to its
+    /// tick.
+    pub job_capabilities_rx:
+        Option<watch::Receiver<Option<crate::meat::job_capability::JobCapabilities>>>,
     /// Process-wide critical-subsystem evidence owned by Bun.
     pub readiness: Option<crate::bun::readiness::ReadinessTracker>,
     /// How long a restarted voter listens for its peers' recovery epochs
@@ -292,6 +299,9 @@ pub async fn start(
     // constant "healthy", the pre-theme behaviour.
     if let Some(rx) = params.self_disk_pressured_rx.clone() {
         node.set_disk_pressured_watch(rx);
+    }
+    if let Some(rx) = params.job_capabilities_rx.clone() {
+        node.set_job_capabilities_watch(rx);
     }
     let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
     node.set_directory_watch(directory_tx);

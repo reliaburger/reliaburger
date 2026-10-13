@@ -665,6 +665,7 @@ impl FenceNode {
                 backup: Default::default(),
                 labels: Default::default(),
                 self_disk_pressured_rx: None,
+                job_capabilities_rx: None,
                 readiness: None,
                 recovery_probe_window: None,
             };

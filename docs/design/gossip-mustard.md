@@ -113,7 +113,7 @@ Each PING/ACK message piggybacks a bounded number of membership updates (new joi
 
 **A relay never blocks.** When C receives A's PING-REQ for B, it sends B a PING, records "forward B's ACK to A" with a deadline of one `probe_timeout`, and returns. B's ACK arrives through the ordinary message handler, which forwards it to A as an ACK that C sends in its own name with `relayed_for: Some(B)`. Every message a node receives while it waits for its own probe's ACK goes through the same handler, so a node in the middle of a probe still answers PINGs, merges syncs and serves relays. (The first version waited inline for B and dropped everything else that arrived meanwhile, so a busy relay stopped acknowledging its own probers and got itself suspected.)
 
-**Byte budget.** A datagram is at most 1,400 bytes (`MAX_DATAGRAM_BYTES`). A probe is built header first, then the sender's directory extension (§4.1), then piggybacked updates in priority order until the next one doesn't fit; the rest stay queued with their broadcast counts untouched. `MAX_PIGGYBACK_UPDATES` (8) caps the count, but the byte budget is what bounds the size, so a node with 63-byte names, IPv6 addresses and a full label set sends fewer updates per probe instead of oversized datagrams the transport refuses. The budget is measured from the encoded message, not computed from constants, so a field added to the header or extension later is accounted for automatically. In the worst case (16 labels using the whole 512-byte label budget) a PING still carries one update; a PING-REQ or relayed ACK may carry none, and anti-entropy, which sends no extension, makes up the difference. If an extension alone would not fit, the probe goes without it. A failed send is counted and logged at most every ten seconds, never discarded.
+**Byte budget.** A datagram is at most 1,400 bytes (`MAX_DATAGRAM_BYTES`). A probe is built header first, then the sender's directory extension (§4.1), then piggybacked updates in priority order until the next one doesn't fit; the rest stay queued with their broadcast counts untouched. `MAX_PIGGYBACK_UPDATES` (8) caps the count, but the byte budget is what bounds the size, so a node with 63-byte names, IPv6 addresses and a full label set sends fewer updates per probe instead of oversized datagrams the transport refuses. The budget is measured from the encoded message, not computed from constants, so a field added to the header or extension later is accounted for automatically. In the worst case (16 labels using the whole 512-byte label budget, plus the ten-byte job capability summary) a PING still carries one update; a PING-REQ or relayed ACK may carry none, and anti-entropy, which sends no extension, makes up the difference. If an extension alone would not fit, the probe goes without it. A failed send is counted and logged at most every ten seconds, never discarded.
 
 **Refutation first.** The dissemination queue sends this node's own refutation (Alive about itself at a raised incarnation) ahead of everything else, then Dead/Left, Suspect and Alive about others. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
 
@@ -272,8 +272,11 @@ struct GossipMessage {
     /// The message payload.
     payload: GossipPayload,
     /// Directory extension (endpoints, leader hint, labels, disk pressure,
-    /// recovery claim), encoded after the body with its own HMAC.
-    /// Not serialised inside the body.
+    /// recovery claim, job capabilities), encoded after the body with its
+    /// own HMAC. Not serialised inside the body. The job capabilities
+    /// (#788) are nine flags saying which kinds of job the node runs; the
+    /// leader refuses a job run at submission when every live member's
+    /// flags refuse it.
     extension: Option<DirectoryExtension>,
 }
 

@@ -30,14 +30,12 @@ async fn job_runs_to_completion_and_reports_exit(ctx: TestContext) -> Result<(),
 async fn scheduled_job_fires_on_its_schedule(ctx: TestContext) -> Result<(), String> {
     let job = "cron";
     // Every minute (the finest cron granularity). The default per-case timeout
-    // gives it two windows to fire.
+    // gives it two windows to fire. A host job, like the case's requirement
+    // says: an image job needs a container runtime, and a cluster with none
+    // refuses it at admission (#788).
     let spec = format!(
-        "[job.{job}]\n\
-         image = \"proc-grill:image-ignored\"\n\
-         command = [\"/bin/sh\", \"-c\", \"echo tick\"]\n\
-         schedule = \"* * * * *\"\n\
-         namespace = \"{ns}\"\n",
-        ns = ctx.namespace,
+        "{}schedule = \"* * * * *\"\n",
+        ctx.process_job_spec(job, &["/bin/sh", "-c", "echo tick"])
     );
     ctx.apply(&spec).await?;
     // A fired schedule leaves at least one run behind.

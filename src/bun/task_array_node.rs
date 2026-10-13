@@ -156,6 +156,89 @@ pub struct NodeArrayCounters {
     pub start_lag_ms_counts: [u64; 16],
 }
 
+/// Why a node advertising `capabilities` refuses `assignment` for good, or
+/// `None` if it might run it. `binary_allowed` says whether the node's
+/// `allowed_binaries` names the run's binary.
+///
+/// The node's own `admit` asks this of its own capabilities, and the leader
+/// asks it of each node's gossiped ones at admission (#788), so both quote
+/// the same reason. Checks run in a fixed order and the first refusal wins.
+pub fn capability_refusal(
+    capabilities: &crate::meat::job_capability::JobCapabilities,
+    assignment: &ArrayAssignment,
+    binary_allowed: bool,
+) -> Option<String> {
+    use crate::config::job::JobRuntime;
+    let template = assignment.template.as_deref();
+    if let Some(template) = template {
+        // An allowlist or allow_from this node can't hold would leave every
+        // attempt to fail at launch; refuse the array up front.
+        let wants_policy = !super::task_runtime::egress_allow(template).is_empty()
+            || super::task_runtime::allow_from(template).is_some_and(|sources| !sources.is_empty());
+        if wants_policy && (template.runtime == JobRuntime::Process || !capabilities.network_policy)
+        {
+            return Some(super::task_runtime::NETWORK_POLICY_UNENFORCEABLE.into());
+        }
+        if template.env.values().any(|value| value.is_encrypted()) && !capabilities.encrypted_env {
+            return Some("encrypted templates require the owned runtime and namespace keys".into());
+        }
+    }
+    if assignment.resources.cpu_millicores == 0
+        || assignment.resources.memory_bytes == 0
+        || assignment.resources.gpus != 0
+    {
+        return Some(
+            "tasks require positive CPU and memory requests; GPU task execution is unavailable"
+                .into(),
+        );
+    }
+    let limits = template.is_some_and(|t| t.cpu.is_some() || t.memory.is_some());
+    if let Some(template) = template {
+        if template.runtime == JobRuntime::SharedRunc {
+            return (!capabilities.containers)
+                .then(|| "shared-runc requires the rootful owned Linux runtime".into());
+        }
+        if template.image.is_some() {
+            let singleton = assignment.spec.count == 1
+                && if limits {
+                    capabilities.singleton_image_limits
+                } else {
+                    capabilities.singleton_images
+                };
+            return (!capabilities.containers && !singleton)
+                .then(|| "container tasks require the rootful owned Linux runtime".into());
+        }
+    }
+    if !capabilities.host {
+        return Some(
+            "host arrays require the owned process runtime; use image tasks on Linux container nodes"
+                .into(),
+        );
+    }
+    if limits && !capabilities.host_limits {
+        return Some(
+            "the host process runtime cannot enforce CPU or memory limits; use image tasks".into(),
+        );
+    }
+    if !binary_allowed {
+        return Some(format!(
+            "{} isn't in this node's [process_workloads] allowed_binaries",
+            assignment.program.display()
+        ));
+    }
+    if capabilities.mount_isolation {
+        // TODO(#714): run tasks inside the mount namespace the ordinary
+        // process workloads use.
+        return Some(
+            "host jobs don't run under [process_workloads] mount_isolation yet \
+             (on by default on Linux); set mount_isolation = false to run them \
+             unisolated on the host, or give the job an image"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// A node's answer about one array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArrayProgress {
@@ -733,6 +816,54 @@ impl TaskArrayNode {
             .map_or(default, |cap| cap.min(default).max(1))
     }
 
+    /// The kinds of job this node runs, as it advertises them over gossip
+    /// (#788). [`capability_refusal`] turns them back into the verdict
+    /// `admit` reaches, so the leader can judge a run without asking.
+    pub fn job_capabilities(&self) -> crate::meat::job_capability::JobCapabilities {
+        use crate::meat::job_capability::JobCapabilities;
+        let mount_isolation = self.config.policy.mount_isolation;
+        let binaries = !self.config.policy.allowed_binaries.is_empty();
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => JobCapabilities {
+                host: runner.supports_host(),
+                host_limits: runner.supports_host_limits(),
+                containers: runner.supports_containers(),
+                singleton_images: runner.supports_singleton_images(false),
+                singleton_image_limits: runner.supports_singleton_images(true),
+                encrypted_env: true,
+                network_policy: runner.enforces_container_network_policy(),
+                mount_isolation,
+                binaries,
+            },
+            // The plain process runner takes host limits without enforcing
+            // them, as it always has; it never runs containers.
+            NodeRunner::Process(_) => JobCapabilities {
+                host: true,
+                host_limits: true,
+                containers: false,
+                singleton_images: false,
+                singleton_image_limits: false,
+                encrypted_env: false,
+                network_policy: false,
+                mount_isolation,
+                binaries,
+            },
+            // The fake runs anything except what needs the owned runtime's
+            // keys.
+            NodeRunner::Fake(_) => JobCapabilities {
+                host: true,
+                host_limits: true,
+                containers: true,
+                singleton_images: true,
+                singleton_image_limits: true,
+                encrypted_env: false,
+                network_policy: true,
+                mount_isolation,
+                binaries,
+            },
+        }
+    }
+
     /// Why this node can never run `assignment`, if it can't: the same
     /// check every sync makes, for the leader's admission of a run when
     /// this node is the only one that could take it.
@@ -776,106 +907,25 @@ impl TaskArrayNode {
     fn admit(&self, assignment: &ArrayAssignment) -> Result<(), String> {
         if let Some(template) = assignment.template.as_ref() {
             template.validate_runtime().map_err(str::to_owned)?;
-            // An allowlist or allow_from this node can't hold would leave
-            // every attempt to fail at launch; refuse the array up front.
-            let enforced = match self.runner.as_ref() {
-                NodeRunner::Owned(runner) => runner.enforces_network_policy(template),
-                NodeRunner::Fake(_) => true,
-                NodeRunner::Process(_) => {
-                    super::task_runtime::egress_allow(template).is_empty()
-                        && super::task_runtime::allow_from(template)
-                            .is_none_or(|sources| sources.is_empty())
-                }
-            };
-            if !enforced {
-                return Err(super::task_runtime::NETWORK_POLICY_UNENFORCEABLE.into());
+        }
+        // The same question the leader asks of this node's advertisement
+        // at admission (#788), so the two can't disagree.
+        let binary_allowed = self.config.policy.is_binary_allowed(&assignment.program);
+        if let Some(reason) =
+            capability_refusal(&self.job_capabilities(), assignment, binary_allowed)
+        {
+            return Err(reason);
+        }
+        // What's left checks the template against the executor profile it
+        // will run under, which every node judges the same way.
+        if let Some(template) = assignment.template.as_ref() {
+            let reusable = template.runtime == crate::config::job::JobRuntime::SharedRunc;
+            let host_executor = template.image.is_none()
+                && matches!(self.runner.as_ref(), NodeRunner::Owned(runner) if runner.supports_host_limits());
+            if reusable || host_executor {
+                super::reusable_executor::ExecutorProfile::new(template)
+                    .map_err(|error| error.to_string())?;
             }
-        }
-        if assignment
-            .template
-            .as_ref()
-            .is_some_and(|template| template.env.values().any(|value| value.is_encrypted()))
-            && !matches!(self.runner.as_ref(), NodeRunner::Owned(_))
-        {
-            return Err("encrypted templates require the owned runtime and namespace keys".into());
-        }
-        if assignment.resources.cpu_millicores == 0
-            || assignment.resources.memory_bytes == 0
-            || assignment.resources.gpus != 0
-        {
-            return Err(
-                "tasks require positive CPU and memory requests; GPU task execution is unavailable"
-                    .into(),
-            );
-        }
-        if let Some(template) = assignment.template.as_ref()
-            && template.runtime == crate::config::job::JobRuntime::SharedRunc
-        {
-            super::reusable_executor::ExecutorProfile::new(template)
-                .map_err(|error| error.to_string())?;
-            return match self.runner.as_ref() {
-                NodeRunner::Owned(runner) if runner.supports_containers() => Ok(()),
-                NodeRunner::Fake(_) => Ok(()),
-                _ => Err("shared-runc requires the rootful owned Linux runtime".into()),
-            };
-        }
-        if assignment
-            .template
-            .as_ref()
-            .is_some_and(|t| t.image.is_some())
-        {
-            return match self.runner.as_ref() {
-                NodeRunner::Owned(runner)
-                    if runner.supports_containers()
-                        || (assignment.spec.count == 1
-                            && assignment.template.as_ref().is_some_and(|template| {
-                                runner.supports_singleton_image(template)
-                            })) =>
-                {
-                    Ok(())
-                }
-                NodeRunner::Fake(_) => Ok(()),
-                _ => Err("container tasks require the rootful owned Linux runtime".into()),
-            };
-        }
-        if let NodeRunner::Owned(runner) = self.runner.as_ref() {
-            if !runner.supports_host() {
-                return Err("host arrays require the owned process runtime; use image tasks on Linux container nodes".into());
-            }
-            if assignment
-                .template
-                .as_ref()
-                .is_some_and(|t| t.cpu.is_some() || t.memory.is_some())
-                && !runner.supports_host_limits()
-            {
-                return Err(
-                    "the host process runtime cannot enforce CPU or memory limits; use image tasks"
-                        .into(),
-                );
-            }
-        }
-        if let NodeRunner::Owned(runner) = self.runner.as_ref()
-            && runner.supports_host_limits()
-            && let Some(template) = assignment.template.as_ref()
-        {
-            super::reusable_executor::ExecutorProfile::new(template)
-                .map_err(|error| error.to_string())?;
-        }
-        if !self.config.policy.is_binary_allowed(&assignment.program) {
-            return Err(format!(
-                "{} isn't in this node's [process_workloads] allowed_binaries",
-                assignment.program.display()
-            ));
-        }
-        if self.config.policy.mount_isolation {
-            // TODO(#714): run tasks inside the mount namespace
-            // the ordinary process workloads use.
-            return Err(
-                "host jobs don't run under [process_workloads] mount_isolation yet \
-                 (on by default on Linux); set mount_isolation = false to run them \
-                 unisolated on the host, or give the job an image"
-                    .to_string(),
-            );
         }
         Ok(())
     }
@@ -1736,6 +1786,115 @@ mod tests {
             allow_from: vec!["frontend/web".into()],
         });
         assert!(node.admit(&task).unwrap_err().contains("allow_from"));
+    }
+
+    /// Runs a node is asked about in the advertisement tests, each named.
+    fn judged_runs() -> Vec<(&'static str, ArrayAssignment)> {
+        let with = |count: u32, template: &str| {
+            let mut task = assignment(1, count, &[]);
+            let template: crate::config::job::JobSpec = toml::from_str(template).unwrap();
+            task.program = template.exec.clone().unwrap_or_default();
+            task.template = Some(Box::new(template));
+            task
+        };
+        vec![
+            ("bare host array", assignment(1, 20, &[])),
+            (
+                "host template",
+                with(
+                    20,
+                    "runtime='process'\nexec='/bin/sh'\ncommand=['-c','true']",
+                ),
+            ),
+            (
+                "host template with limits",
+                with(
+                    20,
+                    "runtime='process'\nexec='/bin/sh'\ncommand=['-c','true']\ncpu='100m'",
+                ),
+            ),
+            (
+                "host binary off the allowlist",
+                with(20, "runtime='process'\nexec='/usr/bin/true'"),
+            ),
+            ("image singleton", with(1, "image='fixture:v1'")),
+            (
+                "image singleton with limits",
+                with(1, "image='fixture:v1'\nmemory='64Mi'"),
+            ),
+            ("image array", with(100, "image='fixture:v1'")),
+            (
+                "shared-runc array",
+                with(100, "runtime='shared-runc'\nimage='fixture:v1'"),
+            ),
+            (
+                "image with egress",
+                with(1, "image='fixture:v1'\n[egress]\nallow=['192.0.2.1:443']"),
+            ),
+        ]
+    }
+
+    /// #788: the leader judges a run from what each node advertises, so the
+    /// advertisement must reach the node's own verdict, word for word.
+    /// Otherwise admission would refuse a run the node would take, or quote
+    /// a different reason from the one the leader's tick would.
+    #[tokio::test]
+    async fn what_a_node_advertises_reaches_its_own_verdict_on_every_run() {
+        let root = tempfile::tempdir().unwrap();
+        let policies: [(&[&str], bool); 4] = [
+            (&[BINARY], false),
+            (&[BINARY], true),
+            (&[], false),
+            (&["/usr/bin/true"], false),
+        ];
+        for (allowed, mount_isolation) in policies {
+            let owned = super::super::task_runtime::OwnedRunner::new(
+                crate::grill::AnyGrill::Process(crate::grill::ProcessGrill::new()),
+            );
+            let runners = [
+                ("owned", NodeRunner::Owned(Box::new(owned))),
+                ("fake", NodeRunner::Fake(FakeRunner::always_succeeds())),
+                ("process", NodeRunner::Process(ProcessRunner::default())),
+            ];
+            for (runner_name, runner) in runners {
+                let node = TaskArrayNode::new(
+                    config(root.path(), policy(allowed, mount_isolation)),
+                    runner,
+                );
+                let advertised = node.job_capabilities();
+                assert_eq!(advertised.mount_isolation, mount_isolation);
+                assert_eq!(advertised.binaries, !allowed.is_empty());
+                for (run, task) in judged_runs() {
+                    let binary_allowed = node.config.policy.is_binary_allowed(&task.program);
+                    assert_eq!(
+                        capability_refusal(&advertised, &task, binary_allowed),
+                        node.refusal(&task),
+                        "{run} on a {runner_name} node allowing {allowed:?}, \
+                         mount_isolation = {mount_isolation}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #788: an owned node without the rootful Linux runtime says so, so the
+    /// leader refuses container arrays nobody can run at admission.
+    #[tokio::test]
+    async fn an_owned_process_node_advertises_no_containers() {
+        let root = tempfile::tempdir().unwrap();
+        let owned = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
+            crate::grill::ProcessGrill::new(),
+        ));
+        let node = TaskArrayNode::new(
+            config(root.path(), policy(&[BINARY], false)),
+            NodeRunner::Owned(Box::new(owned)),
+        );
+        let advertised = node.job_capabilities();
+        assert!(advertised.host);
+        assert!(!advertised.containers);
+        assert!(!advertised.singleton_images);
+        assert!(advertised.encrypted_env);
+        assert!(!advertised.network_policy);
     }
 
     #[tokio::test]

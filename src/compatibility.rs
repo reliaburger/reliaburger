@@ -114,6 +114,8 @@ pub struct Compatibility {
 /// Compacted task results (#739): a worker rewrites a finished run's ledger
 /// and live index into `task-arrays/<id>/results`, 14-byte slots, and
 /// deletes both, so a finished run no longer has a ledger to replay.
+/// The gossip directory extension's `jobs`, each node's job capability
+/// summary, which the leader's job admission reads (#788).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,
