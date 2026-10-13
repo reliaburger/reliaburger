@@ -166,6 +166,16 @@ opt-level = 3
 [profile.test.package.blake2]
 opt-level = 3
 
+# Every Raft RPC opens a fresh mTLS connection, and openraft gives each
+# is-leader heartbeat only `heartbeat_interval` (150 ms). Unoptimised, ring's
+# handshake crypto pushed that over the limit between `relish dev` VMs, which
+# run debug builds, so every linearizable read on the leader failed (#870).
+[profile.dev.package.ring]
+opt-level = 3
+
+[profile.test.package.ring]
+opt-level = 3
+
 [[bench]]
 name = "gossip"
 harness = false
