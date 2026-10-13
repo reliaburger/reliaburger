@@ -5,9 +5,15 @@
 //! address, gossip converges, a Raft leader is elected, and the council grows
 //! from gossip membership. This is the proof that the cluster runtime forms a
 //! real cluster, not just in a harness.
+//!
+//! Each test leases its nodes' ports with `reserve_port_block_lease` and
+//! keeps every node's data under its own temporary directory, so these tests
+//! can run beside each other, beside the other cluster suites and beside
+//! another worktree's run of this binary (#840).
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -27,15 +33,55 @@ use reliaburger::sesame::identity_store::NodeIdentity;
 use reliaburger::sesame::mtls::CrlHandle;
 use reliaburger::sesame::types::SerialNumber;
 
-#[path = "support/cluster.rs"]
-mod cluster_support;
-use cluster_support::local;
 #[path = "support/bun_process.rs"]
 mod bun_process;
-use bun_process::reserve_port_block_lease;
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use bun_process::{PortBlockReservation, reserve_port_block_lease};
+use cluster_support::local;
 
 /// Ports per node: gossip, +1 Raft, +2 reporting, +3 API.
 const PORTS_PER_NODE: u16 = 4;
+
+/// What one test's cluster holds until the test ends: a leased port block
+/// for every node and a temporary directory for every node's data. No other
+/// fixture on the host (a test beside it, another suite, another worktree's
+/// run) binds these ports or shares these directories (#840).
+struct TestCluster {
+    ports: PortBlockReservation,
+    data: tempfile::TempDir,
+}
+
+impl TestCluster {
+    /// Lease one block for `nodes` nodes; node `n` starts at `base + 4n`.
+    fn lease(nodes: u16) -> Self {
+        Self {
+            ports: reserve_port_block_lease(nodes * PORTS_PER_NODE),
+            data: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    /// Node `index`'s gossip port; its Raft, reporting and API ports follow.
+    fn gossip_port(&self, index: u16) -> u16 {
+        self.ports.base + index * PORTS_PER_NODE
+    }
+
+    /// Node `index`'s seeds: none for the bootstrap node 0, which every
+    /// other node joins by address.
+    fn seeds(&self, index: u16) -> Vec<SocketAddr> {
+        if index == 0 {
+            vec![]
+        } else {
+            vec![local(self.gossip_port(0))]
+        }
+    }
+
+    /// Node `name`'s data directory. It starts empty, so the durable Raft
+    /// store does too (stale state would suppress the bootstrap).
+    fn data_dir(&self, name: &str) -> PathBuf {
+        self.data.path().join(name)
+    }
+}
 
 struct CancelOnDrop(CancellationToken);
 
@@ -99,29 +145,28 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
     });
 }
 
-/// Start a node. Gossip/raft/reporting ports are adjacent (gossip, +1, +2),
-/// so each node on the shared loopback IP gets distinct raft/reporting
-/// addresses.
+/// Start node `index` of `cluster` on its leased ports (gossip, then Raft,
+/// reporting and API at +1, +2 and +3) with its own data directory.
 async fn start_node(
+    cluster: &TestCluster,
+    index: u16,
     name: &str,
-    gossip_port: u16,
-    seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
 ) -> (ClusterHandle, ClusterRuntime) {
-    start_node_with_mayo(name, gossip_port, seeds, shutdown, None).await
+    start_node_with_mayo(cluster, index, name, shutdown, None).await
 }
 
 async fn start_node_with_mayo(
+    cluster: &TestCluster,
+    index: u16,
     name: &str,
-    gossip_port: u16,
-    seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
     mayo: Option<std::sync::Arc<tokio::sync::RwLock<reliaburger::mayo::store::MayoStore>>>,
 ) -> (ClusterHandle, ClusterRuntime) {
     start_node_with(
+        cluster,
+        index,
         name,
-        gossip_port,
-        seeds,
         shutdown,
         mayo,
         std::collections::BTreeMap::new(),
@@ -129,19 +174,17 @@ async fn start_node_with_mayo(
     .await
 }
 
+/// Start node `index` of `cluster` like `start_node_with_mayo`, advertising
+/// `labels`.
 async fn start_node_with(
+    cluster: &TestCluster,
+    index: u16,
     name: &str,
-    gossip_port: u16,
-    seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
     mayo: Option<std::sync::Arc<tokio::sync::RwLock<reliaburger::mayo::store::MayoStore>>>,
     labels: std::collections::BTreeMap<String, String>,
 ) -> (ClusterHandle, ClusterRuntime) {
-    // A fresh, unique data dir per node so the durable Raft store starts empty
-    // (stale state from a prior run would suppress the bootstrap).
-    let data_dir = std::env::temp_dir().join(format!("rb-cluster-test-{name}-{gossip_port}"));
-    let _ = std::fs::remove_dir_all(&data_dir);
-
+    let gossip_port = cluster.gossip_port(index);
     let (mut handle, runtime) = runtime::start(
         ClusterParams {
             node_name: name.into(),
@@ -154,10 +197,10 @@ async fn start_node_with(
                 max_events_per_report: 100,
                 stale_report_timeout_secs: 30,
             },
-            seeds,
+            seeds: cluster.seeds(index),
             wrapping_ikm: None,
             bootstrap_security_state: None,
-            data_dir,
+            data_dir: cluster.data_dir(name),
             mayo,
             // Fast rollups so tests observe delivery quickly.
             rollup_interval: Duration::from_millis(300),
@@ -209,9 +252,9 @@ fn issued_node_identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> 
 }
 
 async fn start_mtls_node(
+    cluster: &TestCluster,
+    index: u16,
     name: &str,
-    gossip_port: u16,
-    seeds: Vec<SocketAddr>,
     identity: NodeIdentity,
     shutdown: &CancellationToken,
 ) -> (
@@ -219,8 +262,8 @@ async fn start_mtls_node(
     ClusterRuntime,
     reliaburger::sesame::credentials::LiveNodeIdentity,
 ) {
-    let data_dir = std::env::temp_dir().join(format!("rb-cluster-mtls-{name}-{gossip_port}"));
-    let _ = std::fs::remove_dir_all(&data_dir);
+    let gossip_port = cluster.gossip_port(index);
+    let data_dir = cluster.data_dir(name);
     let identity_dir = data_dir.join("identity");
     reliaburger::sesame::identity_store::save(&identity_dir, &identity).unwrap();
     let identity = reliaburger::sesame::credentials::LiveNodeIdentity::load(&identity_dir).unwrap();
@@ -237,7 +280,7 @@ async fn start_mtls_node(
                 max_events_per_report: 100,
                 stale_report_timeout_secs: 30,
             },
-            seeds,
+            seeds: cluster.seeds(index),
             wrapping_ikm: Some([42; 32]),
             bootstrap_security_state: None,
             data_dir,
@@ -352,9 +395,10 @@ async fn three_nodes_join_by_address_and_converge() {
     let shutdown = CancellationToken::new();
 
     // node-1 is the bootstrap node (no seeds); node-2/3 join by its address.
-    let h1 = start_node("node-1", 17441, vec![], &shutdown).await;
-    let h2 = start_node("node-2", 17443, vec![local(17441)], &shutdown).await;
-    let h3 = start_node("node-3", 17445, vec![local(17441)], &shutdown).await;
+    let cluster = TestCluster::lease(3);
+    let h1 = start_node(&cluster, 0, "node-1", &shutdown).await;
+    let h2 = start_node(&cluster, 1, "node-2", &shutdown).await;
+    let h3 = start_node(&cluster, 2, "node-3", &shutdown).await;
     let handles = [&h1.0, &h2.0, &h3.0];
 
     let expected = vec!["node-1".to_string(), "node-2".into(), "node-3".into()];
@@ -387,8 +431,7 @@ async fn three_nodes_join_by_address_and_converge() {
 #[ignore = "slow multi-node gossip acceptance; run with make test-cluster"]
 async fn nodes_with_maximal_labels_stay_alive_during_churn() {
     const NODES: u16 = 5;
-    let ports = reserve_port_block_lease(NODES * PORTS_PER_NODE);
-    let port = |index: u16| ports.base + index * PORTS_PER_NODE;
+    let cluster = TestCluster::lease(NODES);
     // The longest DNS-label names, so every update and header is maximal.
     let name = |index: u16| {
         let tag = format!("-{index}");
@@ -403,16 +446,11 @@ async fn nodes_with_maximal_labels_stay_alive_during_churn() {
     let _cancel: Vec<CancelOnDrop> = tokens.iter().cloned().map(CancelOnDrop).collect();
     let mut handles = Vec::new();
     for index in 0..NODES - 1 {
-        let seeds = if index == 0 {
-            vec![]
-        } else {
-            vec![local(port(0))]
-        };
         handles.push(
             start_node_with(
+                &cluster,
+                index,
                 &name(index),
-                port(index),
-                seeds,
                 &tokens[usize::from(index)],
                 None,
                 labels.clone(),
@@ -433,17 +471,7 @@ async fn nodes_with_maximal_labels_stay_alive_during_churn() {
     // Churn: node 3 leaves and node 4 joins, so every queue fills with
     // updates while the labelled extensions keep the datagrams full.
     tokens[3].cancel();
-    handles.push(
-        start_node_with(
-            &name(4),
-            port(4),
-            vec![local(port(0))],
-            &tokens[4],
-            None,
-            labels.clone(),
-        )
-        .await,
-    );
+    handles.push(start_node_with(&cluster, 4, &name(4), &tokens[4], None, labels.clone()).await);
 
     // For the next 20 seconds, nodes 0, 1 and 2 must never stop seeing each
     // other as alive.
@@ -477,9 +505,10 @@ async fn nodes_with_maximal_labels_stay_alive_during_churn() {
 async fn three_node_council_elects_leader_and_grows() {
     let shutdown = CancellationToken::new();
 
-    let h1 = start_node("c1", 17541, vec![], &shutdown).await;
-    let h2 = start_node("c2", 17543, vec![local(17541)], &shutdown).await;
-    let h3 = start_node("c3", 17545, vec![local(17541)], &shutdown).await;
+    let cluster = TestCluster::lease(3);
+    let h1 = start_node(&cluster, 0, "c1", &shutdown).await;
+    let h2 = start_node(&cluster, 1, "c2", &shutdown).await;
+    let h3 = start_node(&cluster, 2, "c3", &shutdown).await;
     let handles = [&h1.0, &h2.0, &h3.0];
 
     let expected: BTreeSet<u64> = ["c1", "c2", "c3"]
@@ -554,16 +583,10 @@ async fn generated_security_model_protects_all_live_cluster_transports() {
     let identity_2 = issued_node_identity(&hierarchy, "tls-2", 11);
     let identity_3 = issued_node_identity(&hierarchy, "tls-3", 12);
 
-    let node_1 = start_mtls_node("tls-1", 17841, vec![], identity_1.clone(), &shutdown).await;
-    let node_2 = start_mtls_node(
-        "tls-2",
-        17843,
-        vec![local(17841)],
-        identity_2.clone(),
-        &shutdown,
-    )
-    .await;
-    let node_3 = start_mtls_node("tls-3", 17845, vec![local(17841)], identity_3, &shutdown).await;
+    let cluster = TestCluster::lease(3);
+    let node_1 = start_mtls_node(&cluster, 0, "tls-1", identity_1.clone(), &shutdown).await;
+    let node_2 = start_mtls_node(&cluster, 1, "tls-2", identity_2.clone(), &shutdown).await;
+    let node_3 = start_mtls_node(&cluster, 2, "tls-3", identity_3, &shutdown).await;
     let nodes = [&node_1, &node_2, &node_3];
 
     let expected_voters: BTreeSet<u64> = ["tls-1", "tls-2", "tls-3"]
@@ -715,12 +738,12 @@ async fn generated_security_model_protects_all_live_cluster_transports() {
 
 /// A MayoStore holding one flushed sample, so rollups have data.
 async fn seeded_mayo_store(
+    cluster: &TestCluster,
     name: &str,
 ) -> std::sync::Arc<tokio::sync::RwLock<reliaburger::mayo::store::MayoStore>> {
     use reliaburger::mayo::types::{MetricKey, Sample};
 
-    let dir = std::env::temp_dir().join(format!("rb-w4-mayo-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = cluster.data_dir(name).join("mayo");
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut store = reliaburger::mayo::store::MayoStore::new(dir);
@@ -758,12 +781,13 @@ async fn seeded_mayo_store(
 async fn rollup_worker_delivers_node_rollups_to_the_leader() {
     let shutdown = CancellationToken::new();
 
-    let m1 = seeded_mayo_store("r1").await;
-    let m2 = seeded_mayo_store("r2").await;
-    let m3 = seeded_mayo_store("r3").await;
-    let h1 = start_node_with_mayo("r1", 17641, vec![], &shutdown, Some(m1)).await;
-    let h2 = start_node_with_mayo("r2", 17643, vec![local(17641)], &shutdown, Some(m2)).await;
-    let h3 = start_node_with_mayo("r3", 17645, vec![local(17641)], &shutdown, Some(m3)).await;
+    let cluster = TestCluster::lease(3);
+    let m1 = seeded_mayo_store(&cluster, "r1").await;
+    let m2 = seeded_mayo_store(&cluster, "r2").await;
+    let m3 = seeded_mayo_store(&cluster, "r3").await;
+    let h1 = start_node_with_mayo(&cluster, 0, "r1", &shutdown, Some(m1)).await;
+    let h2 = start_node_with_mayo(&cluster, 1, "r2", &shutdown, Some(m2)).await;
+    let h3 = start_node_with_mayo(&cluster, 2, "r3", &shutdown, Some(m3)).await;
     let nodes = [&h1, &h2, &h3];
 
     // Wait for a leader.
@@ -860,8 +884,9 @@ async fn rollup_worker_delivers_node_rollups_to_the_leader() {
 async fn state_reports_carry_nonzero_capacity_and_usage() {
     let shutdown = CancellationToken::new();
 
-    let h1 = start_node("cap1", 17741, vec![], &shutdown).await;
-    let h2 = start_node("cap2", 17743, vec![local(17741)], &shutdown).await;
+    let cluster = TestCluster::lease(2);
+    let h1 = start_node(&cluster, 0, "cap1", &shutdown).await;
+    let h2 = start_node(&cluster, 1, "cap2", &shutdown).await;
     let nodes = [&h1, &h2];
 
     let elected = wait_until(Duration::from_secs(25), || {
@@ -982,19 +1007,15 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
     let _cancel_on_drop = CancelOnDrop(shutdown.clone());
     let hierarchy = ca::generate_ca_hierarchy("renewal-cluster", &[42; 32]).unwrap();
     let names = ["renew-1", "renew-2", "renew-3"];
-    let ports = [17881, 17883, 17885];
+    let cluster = TestCluster::lease(3);
     let mut nodes = Vec::new();
-    for index in 0..3 {
+    for (index, name) in (0..).zip(names) {
         nodes.push(
             start_mtls_node(
-                names[index],
-                ports[index],
-                if index == 0 {
-                    vec![]
-                } else {
-                    vec![local(ports[0])]
-                },
-                issued_node_identity(&hierarchy, names[index], 10 + index as u64),
+                &cluster,
+                index,
+                name,
+                issued_node_identity(&hierarchy, name, 10 + u64::from(index)),
                 &shutdown,
             )
             .await,
@@ -1133,12 +1154,7 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
     assert!(calls[old_leader].load(Ordering::SeqCst) > 0);
     assert!(calls[new_leader].load(Ordering::SeqCst) > 0);
     let installed = nodes[worker_index].2.snapshot();
-    let identity_dir = std::env::temp_dir()
-        .join(format!(
-            "rb-cluster-mtls-{}-{}",
-            names[worker_index], ports[worker_index]
-        ))
-        .join("identity");
+    let identity_dir = cluster.data_dir(names[worker_index]).join("identity");
     let restarted =
         reliaburger::sesame::credentials::LiveNodeIdentity::load(&identity_dir).unwrap();
     assert_eq!(
@@ -1164,19 +1180,15 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
     let _cancel_on_drop = CancelOnDrop(shutdown.clone());
     let hierarchy = ca::generate_ca_hierarchy("leased-token-cluster", &[42; 32]).unwrap();
     let names = ["token-1", "token-2", "token-3"];
-    let ports = [17941, 17943, 17945];
+    let cluster = TestCluster::lease(3);
     let mut nodes = Vec::new();
-    for index in 0..3 {
+    for (index, name) in (0..).zip(names) {
         nodes.push(
             start_mtls_node(
-                names[index],
-                ports[index],
-                if index == 0 {
-                    vec![]
-                } else {
-                    vec![local(ports[0])]
-                },
-                issued_node_identity(&hierarchy, names[index], 10 + index as u64),
+                &cluster,
+                index,
+                name,
+                issued_node_identity(&hierarchy, name, 10 + u64::from(index)),
                 &shutdown,
             )
             .await,
@@ -1390,19 +1402,15 @@ async fn rotating_the_node_ca_moves_every_node_while_mtls_traffic_keeps_flowing(
     let _cancel_on_drop = CancelOnDrop(shutdown.clone());
     let hierarchy = ca::generate_ca_hierarchy("rotation-cluster", &[42; 32]).unwrap();
     let names = ["rotate-1", "rotate-2", "rotate-3"];
-    let ports = [17981, 17983, 17985];
+    let cluster = TestCluster::lease(3);
     let mut nodes = Vec::new();
-    for index in 0..3 {
+    for (index, name) in (0..).zip(names) {
         nodes.push(
             start_mtls_node(
-                names[index],
-                ports[index],
-                if index == 0 {
-                    vec![]
-                } else {
-                    vec![local(ports[0])]
-                },
-                issued_node_identity(&hierarchy, names[index], 10 + index as u64),
+                &cluster,
+                index,
+                name,
+                issued_node_identity(&hierarchy, name, 10 + u64::from(index)),
                 &shutdown,
             )
             .await,
