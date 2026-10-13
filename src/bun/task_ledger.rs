@@ -173,15 +173,30 @@ impl Ledger {
     }
 }
 
-pub(crate) fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
-    let outcome: u8 = match record.outcome {
+/// The byte an outcome is stored as. Never zero, so an all-zero result
+/// slot can mean "no outcome".
+pub(crate) fn outcome_byte(outcome: TaskFinal) -> u8 {
+    match outcome {
         TaskFinal::Succeeded => 1,
         TaskFinal::Failed => 2,
         TaskFinal::NotRun => 3,
-    };
+    }
+}
+
+/// The outcome stored as `byte`, if it is one.
+pub(crate) fn outcome_from_byte(byte: u8) -> Option<TaskFinal> {
+    match byte {
+        1 => Some(TaskFinal::Succeeded),
+        2 => Some(TaskFinal::Failed),
+        3 => Some(TaskFinal::NotRun),
+        _ => None,
+    }
+}
+
+pub(crate) fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
     out.extend_from_slice(&record.index.to_le_bytes());
     out.push(record.attempts);
-    out.push(outcome);
+    out.push(outcome_byte(record.outcome));
     out.extend_from_slice(&record.exit_code.unwrap_or(NO_EXIT_CODE).to_le_bytes());
     out.extend_from_slice(&record.run_ms.to_le_bytes());
     out.extend_from_slice(&record.grant_attempt.to_le_bytes());
@@ -190,17 +205,10 @@ pub(crate) fn encode(record: &TaskRecord, out: &mut Vec<u8>) {
 pub(crate) fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskRecord, LedgerError> {
     let u32_at =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-    let outcome = match bytes[5] {
-        1 => TaskFinal::Succeeded,
-        2 => TaskFinal::Failed,
-        3 => TaskFinal::NotRun,
-        other => {
-            return Err(LedgerError::BadRecord {
-                offset,
-                outcome: other,
-            });
-        }
-    };
+    let outcome = outcome_from_byte(bytes[5]).ok_or(LedgerError::BadRecord {
+        offset,
+        outcome: bytes[5],
+    })?;
     let exit_code = u32_at(6) as i32;
     Ok(TaskRecord {
         grant_attempt: u64::from_le_bytes(bytes[14..22].try_into().expect("record width")),

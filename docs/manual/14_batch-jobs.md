@@ -400,11 +400,15 @@ outcomes and their result index are durable. Standalone admission reserves spars
 accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
 
-A worker holds at most 50 bytes of disk per accepted task while the cluster
-lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
-million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
-about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
-tasks' head and tail per chunk. All of it goes when the run retires. Task data,
+While a run is active, a worker holds at most 50 bytes of disk per accepted
+task: a 22-byte ledger record and a 24-byte result-index slot. A million tasks
+measured about 47 bytes per task, about 45 MiB in all. Once the run finishes,
+the worker compacts it into one 14-byte result per task and deletes the ledger
+and index, so a finished run the cluster still lists holds at most 16 bytes per
+task: a million tasks measured about 14, about 13.5 MiB (`make
+bench-task-arrays` fails above either bound). `relish batch results` and
+`relish batch logs` answer the same before and after. Kept failure output adds
+at most 16 tasks' head and tail per chunk. All of it goes when the run retires. Task data,
 together with the node's audit log, counts toward disk pressure: past a quarter of the filesystem, or with less
 than 1 GiB free, a worker finishes the chunks it holds but advertises no
 free slots, so it takes no new grants until retention frees space.

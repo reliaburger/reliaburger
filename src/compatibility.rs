@@ -101,6 +101,9 @@ pub struct Compatibility {
 /// `NodeAssignment::held`, `/v1/rollouts/failed` and the
 /// `ApplyEvent::RolloutAborted` stream event, #692).
 /// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
+/// Compacted task results (#739): a worker rewrites a finished run's ledger
+/// and live index into `task-arrays/<id>/results`, 14-byte slots, and
+/// deletes both, so a finished run no longer has a ledger to replay.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,
