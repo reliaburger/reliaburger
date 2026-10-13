@@ -397,7 +397,8 @@
             <p>Hacking on Reliaburger itself? Start with a local process. No container
               runtime required.</p>
             <p>You’ll need Rust and the build tools for your platform. This example runs
-              <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
+              <code>hello</code> as a host process under the built-in process runtime, which
+              runs the binaries the node config allows and no images; it doesn’t create
               an isolated container or a multi-node cluster.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
               quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.1.6.</p>
@@ -409,7 +410,8 @@
 git clone https://github.com/reliaburger/reliaburger
 cd reliaburger
 cargo build --bins
-target/debug/bun --runtime process
+target/debug/bun --runtime process \
+  --config examples/node/process-runtime.toml
 
 <span class="comment"># Terminal 2 · from the same checkout</span>
 target/debug/relish apply \

@@ -491,7 +491,7 @@ async fn assert_batch_refuses_declarative_job_field(field: &str) {
     })
     .await;
     let mut spec = serde_json::json!({
-        "image": "proc-grill:image-ignored", "namespace": "default",
+        "image": "app:v1", "namespace": "default",
         "command": ["sh", "-c", format!("printf 'launch\\n' >> '{}'", launches.display())]
     });
     spec[field] = match field {
@@ -1367,8 +1367,8 @@ async fn invalid_cluster_prerequisites_are_refused_before_any_app_commit() {
     let http = reqwest::Client::new();
     for body in [
         "[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['app.absent']\n",
-        "[app.web]\nimage='proc-grill:image-ignored'\nnamespace='production'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nnamespace='other'\nrun_before=['app.web']\n",
-        "[app.web]\nimage='proc-grill:image-ignored'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['job.web']\n",
+        "[app.web]\nimage='app:v1'\nnamespace='production'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nnamespace='other'\nrun_before=['app.web']\n",
+        "[app.web]\nimage='app:v1'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['job.web']\n",
     ] {
         let response = http
             .post(format!("{}/v1/apply", harness.base_url))

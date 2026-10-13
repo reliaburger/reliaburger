@@ -14,6 +14,10 @@ use crate::config::job::JobSpec;
 use crate::config::types::{EnvValue, ResourceRange};
 use crate::grill::cgroup;
 
+/// The root a host workload (`exec` or `script`) runs in: the node's own
+/// filesystem, not an image. An init container of a host app inherits it.
+pub const HOST_ROOT: &str = "proc-grill:host";
+
 /// A simplified OCI runtime specification.
 ///
 /// Contains the fields Reliaburger actually uses. Additional fields
@@ -360,7 +364,7 @@ pub fn generate_oci_spec_with_decryptor(
             // Container workloads use the image reference (Apple Container)
             // or resolved rootfs path (runc).
             path: if spec.exec.is_some() || spec.script.is_some() {
-                "proc-grill:host".to_string()
+                HOST_ROOT.to_string()
             } else {
                 spec.image.clone().unwrap_or_else(|| {
                     format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
@@ -443,8 +447,8 @@ pub fn build_env_with_decryptor(
 /// Build the process arguments from an app spec.
 ///
 /// Returns the app's `command` followed by its `args`. When both are
-/// empty, ProcessGrill falls back to `sleep 86400`; runc resolves the
-/// image's `Entrypoint` and `Cmd` from [`OciProcess::overrides`] instead.
+/// empty, runc resolves the image's `Entrypoint` and `Cmd` from
+/// [`OciProcess::overrides`]. ProcessGrill runs no images (#914).
 fn build_args(app_name: &str, spec: &AppSpec) -> Vec<String> {
     let _ = app_name;
 
@@ -780,7 +784,7 @@ pub fn generate_job_oci_spec(
         initialiser: false,
         root: OciRoot {
             path: if spec.is_host() {
-                "proc-grill:host".to_string()
+                HOST_ROOT.to_string()
             } else {
                 spec.image.clone().unwrap_or_else(|| {
                     format!("/var/lib/reliaburger/images/{namespace}/{job_name}/rootfs")

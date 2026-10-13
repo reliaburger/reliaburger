@@ -253,6 +253,21 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
             node.clone(),
             tokio::time::Instant::now() + Duration::from_secs(300),
         );
+        // Both nodes run containers, so the image app may go to either
+        // (#914).
+        reports.capabilities.insert(
+            node.clone(),
+            reliaburger::reporting::types::NodeCapabilityReport {
+                node_id: node.clone(),
+                capabilities: reliaburger::meat::cluster_state::NodeCapabilities {
+                    containers: true,
+                    ..Default::default()
+                },
+                egress_enforcement: Vec::new(),
+                egress_degraded: false,
+                egress_affected_workloads: Vec::new(),
+            },
+        );
         reports.readiness.insert(
             node.clone(),
             reliaburger::reporting::types::NodeReadinessReport {

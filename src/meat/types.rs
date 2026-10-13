@@ -219,8 +219,9 @@ pub enum UnplacedReason {
     NoReadyNode,
     /// No ready node carries every `required` placement label.
     NoLabelMatch,
-    /// The app names an image or an init container, and no ready node with
-    /// the labels runs containers: they all run `--runtime process` (#914).
+    /// The app runs an image (its own or an init container's), and no ready
+    /// node with the labels runs containers: they all run `--runtime
+    /// process` (#914).
     NoContainerRuntime,
     /// No ready node with the labels can enforce what the app needs: an
     /// egress allowlist, internal DNS, or its host binary in

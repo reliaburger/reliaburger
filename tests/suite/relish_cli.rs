@@ -43,8 +43,7 @@ fn apply_dry_run_succeeds_without_an_agent() {
         &config,
         r#"
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["true"]
+script = "exec true"
 "#,
     )
     .unwrap();

@@ -9,7 +9,8 @@
 //!   `InMemoryRaftRouter`, three voters and two spares) and the leader waits
 //!   that go with it;
 //! - [`start_wired_node`], the same subsystems `bun --cluster` starts
-//!   (gossip, Raft, reporting, a real `BunAgent` on `ProcessGrill`, the HTTP
+//!   (gossip, Raft, reporting, a real `BunAgent` on `ProcessGrill` posing as
+//!   a container runtime ([`host_containers::HostContainers`]), the HTTP
 //!   API, the leader scheduler and the placement reconciler), on one host
 //!   with per-node port blocks.
 //!
@@ -45,7 +46,6 @@ use reliaburger::council::selection::CouncilSelectionConfig;
 use reliaburger::council::state_machine::CouncilStateMachine;
 use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
 use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::process::ProcessGrill;
 use reliaburger::mayo::rollup_store::RollupStore;
 use reliaburger::meat::NodeId;
 use reliaburger::mustard::directory::NodeDirectory;
@@ -55,6 +55,8 @@ use reliaburger::reporting::aggregator::AggregatedState;
 use reliaburger::sesame::auth::TokenStore;
 use reliaburger::sesame::types::ApiToken;
 
+#[path = "host_containers.rs"]
+pub(crate) mod host_containers;
 #[path = "task_harness.rs"]
 pub(crate) mod task_harness;
 use task_harness::TestTasks;
@@ -306,6 +308,10 @@ pub struct WiredNodeOptions {
     /// Task arrays built on the agent's own execution budget. Takes
     /// precedence over `task_arrays`.
     pub task_arrays_on_agent_budget: Option<TaskArraysOnBudget>,
+    /// Run plain `ProcessGrill`, as a node on `--runtime process` does: it
+    /// refuses image apps and reports no container runtime (#914). `false`
+    /// runs [`host_containers::HostContainers`], which runs them.
+    pub process_only: bool,
 }
 
 /// A running wired node and everything a test observes it through.
@@ -361,6 +367,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         keep_data_dir,
         task_arrays,
         task_arrays_on_agent_budget,
+        process_only,
     } = options;
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -431,16 +438,21 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     let rollup_store = Arc::clone(&cluster_runtime.rollup_store);
     let directory_rx = cluster_runtime.directory_rx.clone();
 
-    // Real agent with a ProcessGrill, built with the cluster handle so it
-    // answers reporting snapshots with real capacity. `ClusterHandle` isn't
-    // `Clone` (it owns `snapshot_rx`), so the agent takes it and the node
-    // keeps clones of the watch receivers above.
+    // Real agent with a ProcessGrill that also runs image apps as host
+    // processes, so tests can place volume apps (#914). It's built with the
+    // cluster handle so it answers reporting snapshots with real capacity.
+    // `ClusterHandle` isn't `Clone` (it owns `snapshot_rx`), so the agent
+    // takes it and the node keeps clones of the watch receivers above.
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
     // The agent stops with the node, or on its own to wedge its reports
     // while gossip carries on.
     let agent_shutdown = shutdown.child_token();
     let mut agent = BunAgent::with_cluster(
-        ProcessGrill::new(),
+        if process_only {
+            host_containers::HostContainers::process_only()
+        } else {
+            host_containers::HostContainers::new()
+        },
         PortAllocator::new(gossip_port + 100, gossip_port + 400),
         cmd_rx,
         agent_shutdown.clone(),
@@ -448,6 +460,24 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         "default".to_string(),
     );
     agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
+    // The process runtime runs only host workloads (#914), so fixture apps
+    // are `script` apps through `/bin/sh` or `exec` apps of these binaries.
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: [
+                "/bin/sh",
+                "/bin/sleep",
+                "/bin/echo",
+                "/bin/false",
+                "/usr/bin/true",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
     agent.set_node_capacity(8000, 16384);
     agent.set_readiness_tracker(readiness.clone());
     // Several agents share this host; don't spawn nft against the real

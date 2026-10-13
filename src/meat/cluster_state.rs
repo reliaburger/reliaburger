@@ -28,6 +28,18 @@ pub struct NodeCapabilities {
     pub containers: bool,
 }
 
+#[cfg(test)]
+impl NodeCapabilities {
+    /// A node whose runtime runs containers, and nothing more: what most
+    /// scheduling tests assume of a node.
+    pub fn container_runtime() -> Self {
+        Self {
+            containers: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Which host process workloads a node runs: the `[process_workloads]`
 /// policy it enforces, reported so the scheduler places an `exec` or
 /// `script` app only where the node will start it (#702).
@@ -263,7 +275,7 @@ mod tests {
             allocated: Resources::default(),
             labels: BTreeMap::new(),
             ready: true,
-            capabilities: NodeCapabilities::default(),
+            capabilities: NodeCapabilities::container_runtime(),
             app_replicas: HashMap::new(),
             uptime_secs: 3600,
             cached_images: HashSet::new(),

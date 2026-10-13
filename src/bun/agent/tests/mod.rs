@@ -3825,15 +3825,15 @@ async fn a_deploy_leaves_pickle_images_to_require_signatures() {
     assert_eq!(result, Ok(None));
 }
 
-/// Under ProcessGrill an image is a placeholder nobody pulls, so there's
-/// nothing for the upstream rules to judge (decision 5).
+/// A process runtime never pulls an image: it refuses image apps (#914). So
+/// there's nothing for the upstream rules to judge (decision 5).
 #[tokio::test]
 async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
     let council = catalogue_council(9312).await;
     let mut agent = agent_with_council(council);
     agent.set_trust_policy(official_images_only());
     let result = agent
-        .enforce_image_signature(app("proc-grill:image-ignored").image.as_deref())
+        .enforce_image_signature(app("registry.example.com/web:1").image.as_deref())
         .await;
     assert_eq!(result, Ok(None));
 }
@@ -5080,6 +5080,24 @@ fn probe_host_prefers_container_ip() {
     );
 }
 
+/// Let `agent` run host workloads: `script` apps through `/bin/sh`, and
+/// `exec` apps for each of `binaries`, unisolated. The process runtime runs
+/// nothing else (#914), so every real-process test here needs it.
+fn allow_host_workloads<G: Grill + Clone + 'static>(
+    agent: &mut BunAgent<G>,
+    binaries: &[&std::path::Path],
+) {
+    let mut allowed_binaries = vec![std::path::PathBuf::from("/bin/sh")];
+    allowed_binaries.extend(binaries.iter().map(|binary| binary.to_path_buf()));
+    agent
+        .supervisor
+        .set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries,
+            mount_isolation: false,
+            ..Default::default()
+        });
+}
+
 #[tokio::test]
 async fn container_logs_forwarded_to_log_sink() {
     // Use a real ProcessGrill so follow_logs actually streams output.
@@ -5088,15 +5106,13 @@ async fn container_logs_forwarded_to_log_sink() {
     let grill = crate::grill::process::ProcessGrill::new();
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+    allow_host_workloads(&mut agent, &[]);
 
     let (log_tx, mut log_rx) = mpsc::channel(64);
     agent.set_log_sink(log_tx, Default::default());
     let handle = tokio::spawn(async move { agent.run().await });
 
-    let config = Config::parse(
-        "[app.printer]\nimage = \"proc-grill:ignored\"\ncommand = [\"echo\", \"hello-logs\"]\n",
-    )
-    .unwrap();
+    let config = Config::parse("[app.printer]\nscript = \"echo hello-logs\"\n").unwrap();
     let _ = send_deploy(&tx, config).await;
 
     // The per-instance forwarder should stream the echoed line into the sink.
@@ -5118,13 +5134,12 @@ async fn crashed_app_without_health_check_is_restarted() {
     let grill = crate::grill::process::ProcessGrill::new();
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+    allow_host_workloads(&mut agent, &[]);
     let handle = tokio::spawn(async move { agent.run().await });
 
     // An app with no health check whose process exits immediately. Nothing
     // probes it, so only crash detection can notice and restart it.
-    let config =
-        Config::parse("[app.crasher]\nimage = \"proc-grill:ignored\"\ncommand = [\"true\"]\n")
-            .unwrap();
+    let config = Config::parse("[app.crasher]\nscript = \"true\"\n").unwrap();
     let _ = send_deploy(&tx, config).await;
 
     let crasher = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -5168,9 +5183,10 @@ async fn redeploy_registers_backends_health_and_port() {
     let volumes = tempfile::tempdir().unwrap();
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
     agent.set_volumes_dir(volumes.path().to_path_buf());
+    allow_host_workloads(&mut agent, &[]);
 
     let config = Config::parse(&format!(
-            "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
+            "[app.web]\nscript = \"exec sleep 60\"\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
         ))
         .unwrap();
     let (ev_tx, mut ev_rx) = mpsc::channel(256);
@@ -5425,8 +5441,9 @@ async fn real_process_restart_stays_eligible_and_fails_at_once_without_its_execu
         CancellationToken::new(),
     );
     agent.set_volumes_dir(directory.path().join("volumes"));
+    allow_host_workloads(&mut agent, &[&program]);
     let config = Config::parse(&format!(
-        "[app.retry]\nimage = 'proc-grill:ignored'\ncommand = [{:?}]\n",
+        "[app.retry]\nexec = {:?}\n",
         program.to_str().unwrap()
     ))
     .unwrap();
@@ -5477,10 +5494,9 @@ async fn redeployed_instance_restarts_after_a_crash() {
     let volumes = tempfile::tempdir().unwrap();
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
     agent.set_volumes_dir(volumes.path().to_path_buf());
+    allow_host_workloads(&mut agent, &[]);
 
-    let config =
-        Config::parse("[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n")
-            .unwrap();
+    let config = Config::parse("[app.web]\nscript = \"exec sleep 60\"\n").unwrap();
     let (ev_tx, mut ev_rx) = mpsc::channel(256);
 
     // Fresh deploy, then redeploy (existing instances → rolling path).
@@ -6126,14 +6142,12 @@ async fn follow_logs_does_not_block_the_event_loop() {
     let grill = crate::grill::process::ProcessGrill::new();
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+    allow_host_workloads(&mut agent, &[]);
     let handle = tokio::spawn(async move { agent.run().await });
 
     // A long-running process whose follow would block the loop for 60s if
     // handled inline.
-    let config = Config::parse(
-        "[app.sleeper]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
-    )
-    .unwrap();
+    let config = Config::parse("[app.sleeper]\nscript = \"exec sleep 60\"\n").unwrap();
     let _ = send_deploy(&tx, config).await;
 
     // Start following logs; never drain them.
@@ -6178,7 +6192,7 @@ const STUBBORN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 fn stubborn_app(name: &str, dir: &std::path::Path) -> String {
     let trapped = dir.join(format!("{name}.trapped"));
     format!(
-        "[app.{name}]\nimage = \"proc-grill:ignored\"\ncommand = [\"sh\", \"-c\", \"trap '' TERM; touch '{}'; sleep 60\"]\n",
+        "[app.{name}]\nscript = \"trap '' TERM; touch '{}'; sleep 60\"\n",
         trapped.display()
     )
 }
@@ -6217,6 +6231,7 @@ fn stubborn_agent() -> (
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
     let volumes = tempfile::tempdir().unwrap();
     agent.set_volumes_dir(volumes.path().to_path_buf());
+    allow_host_workloads(&mut agent, &[]);
     agent.set_stop_grace(STUBBORN_GRACE);
     agent.set_shutdown_grace(std::time::Duration::from_millis(200));
     let handle = tokio::spawn(async move { agent.run().await });

@@ -8377,7 +8377,7 @@ mod tests {
             allocated: crate::meat::Resources::default(),
             labels: Default::default(),
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 0,
             cached_images: Default::default(),

@@ -291,12 +291,12 @@ impl TestContext {
     /// namespace.
     ///
     /// The workload is the `testapp` server embedded in `bun` itself, launched
-    /// as a process workload — every node already has `bun` at
-    /// [`BUN_BINARY_PATH`], so no container image is needed. Cases built on
-    /// this must therefore require
-    /// [`Capability::ProcessRuntime`](crate::bun::capabilities::Capability::ProcessRuntime);
-    /// on a runc/apple cluster the spec would be handed to the container
-    /// runtime and fail.
+    /// as an `exec` app — every node already has `bun` at [`BUN_BINARY_PATH`],
+    /// so no container image is needed. Cases built on this must therefore
+    /// require
+    /// [`Capability::ProcessRuntime`](crate::bun::capabilities::Capability::ProcessRuntime),
+    /// and the node's `[process_workloads] allowed_binaries` must name
+    /// [`BUN_BINARY_PATH`].
     ///
     /// `mode` is a `testapp` mode string (`"healthy"`, `"unhealthy-after"`,
     /// `"hang"`, `"exit-after"`, `"slow"`, `"alloc"`). The port is derived
@@ -320,7 +320,6 @@ impl TestContext {
     ) -> String {
         let port = testapp_port(app);
         let mut argv: Vec<String> = vec![
-            BUN_BINARY_PATH.to_string(),
             "testapp".to_string(),
             "--mode".to_string(),
             mode.to_string(),
@@ -335,7 +334,7 @@ impl TestContext {
             .join(", ");
         format!(
             "[app.{app}]\n\
-             image = \"proc-grill:image-ignored\"\n\
+             exec = \"{BUN_BINARY_PATH}\"\n\
              command = [{command}]\n\
              port = {port}\n\
              replicas = {replicas}\n\
@@ -1429,12 +1428,14 @@ mod tests {
         let app = config.app.get("web").expect("app named web");
         assert_eq!(app.namespace.as_deref(), Some("rbtest-abc-00"));
         assert_eq!(app.replicas, crate::config::types::Replicas::Fixed(1));
-        // The workload is launched from the node's installed bun, as a process.
+        // The workload is launched from the node's installed bun, as a host
+        // `exec` app: the process runtime runs no images (#914).
         assert_eq!(
-            app.command.first().map(String::as_str),
-            Some(BUN_BINARY_PATH)
+            app.exec.as_deref(),
+            Some(std::path::Path::new(BUN_BINARY_PATH))
         );
-        assert_eq!(app.command.get(1).map(String::as_str), Some("testapp"));
+        assert!(app.image.is_none());
+        assert_eq!(app.command.first().map(String::as_str), Some("testapp"));
         assert!(
             app.command.iter().any(|arg| arg == "healthy"),
             "mode should appear in argv: {:?}",

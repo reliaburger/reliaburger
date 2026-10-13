@@ -226,8 +226,7 @@ retain_versions = 3
         let config = format!(
             r#"
 [app.{app}]
-image = "proc-grill:image-ignored"
-command = ["{testapp}", "--mode", "healthy", "--port", "{port}"]
+script = "exec {testapp} --mode healthy --port {port}"
 "#,
             testapp = env!("CARGO_BIN_EXE_testapp"),
         );

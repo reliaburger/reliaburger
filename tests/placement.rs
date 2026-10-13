@@ -190,6 +190,8 @@ struct NodeSetup {
     /// How long the leader holds a stale node's placements; `None` uses
     /// the node default.
     stale_node_grace: Option<Duration>,
+    /// Run the process runtime, which runs no containers (#914).
+    process_only: bool,
 }
 
 impl Default for NodeSetup {
@@ -199,6 +201,7 @@ impl Default for NodeSetup {
             keep_data_dir: false,
             stale_report_timeout_secs: 30,
             stale_node_grace: None,
+            process_only: false,
         }
     }
 }
@@ -216,6 +219,7 @@ async fn start_node_with(
         keep_data_dir,
         stale_report_timeout_secs,
         stale_node_grace,
+        process_only,
     } = setup;
     let wired = start_wired_node(WiredNodeOptions {
         name: name.to_string(),
@@ -245,6 +249,7 @@ async fn start_node_with(
         keep_data_dir,
         task_arrays: None,
         task_arrays_on_agent_budget: None,
+        process_only,
     })
     .await;
 
@@ -332,8 +337,7 @@ async fn apply_on_any_node_places_across_the_cluster() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 3
     "#,
     )
@@ -450,8 +454,7 @@ async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
     "#,
     )
@@ -621,6 +624,111 @@ async fn stop_until_gone(node: &Node, nodes: &[&Node], app: &str) {
     panic!("{app} was not torn down after stop");
 }
 
+/// #914: an app that names an image needs a container runtime, and a node
+/// on `--runtime process` refuses one. With one such node and two that run
+/// containers, the image app never lands on the process node. Pinned to the
+/// process node's zone, it's unschedulable, with that reason, instead of
+/// placed where it would be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn an_image_app_is_never_placed_on_a_process_only_node() {
+    let shutdown = CancellationToken::new();
+
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let process_setup = NodeSetup {
+        labels: [("zone".to_string(), "a".to_string())].into(),
+        process_only: true,
+        ..NodeSetup::default()
+    };
+    let n1 = start_node_with("p1", base, vec![], &shutdown, None, process_setup).await;
+    let n2 = start_labelled_node(
+        "c2",
+        base + 4,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
+    let n3 = start_labelled_node(
+        "c3",
+        base + 8,
+        vec![local(base)],
+        &shutdown,
+        &[("zone", "b")],
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let image = r#"
+        [app.web]
+        image = "app:v1"
+        command = ["sleep", "600"]
+        replicas = 2
+    "#;
+    apply_until_live(&n1, &nodes, image, "web").await;
+    let placed = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let mut live = nodes_with_live(&nodes, "web").await;
+            live.sort();
+            if live.len() == 2 {
+                return live;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("web never ran two replicas");
+    assert_eq!(placed, ["c2", "c3"]);
+    let on_process_node = n1.client.status().await.unwrap();
+    assert!(
+        on_process_node.iter().all(|row| row.app_name != "web"),
+        "the process node was handed an image app: {on_process_node:?}"
+    );
+
+    let pinned = reliaburger::config::Config::parse(
+        r#"
+        [app.pinned]
+        image = "app:v1"
+        command = ["sleep", "600"]
+
+        [app.pinned.placement]
+        required = ["zone=a"]
+    "#,
+    )
+    .unwrap();
+    let app = reliaburger::meat::AppId::new("pinned", "default");
+    let reason = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let _ = tokio::time::timeout(Duration::from_secs(15), n2.client.apply(&pinned)).await;
+            for node in nodes {
+                let Some(council) = node.handle.council.as_ref() else {
+                    continue;
+                };
+                if let Some(short) = council.desired_state().await.unschedulable.get(&app) {
+                    return short.reason;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("the pinned image app was never reported unschedulable");
+    assert_eq!(
+        reason,
+        reliaburger::meat::types::UnplacedReason::NoContainerRuntime
+    );
+    assert!(nodes_with_live(&nodes, "pinned").await.is_empty());
+
+    shutdown.cancel();
+}
+
 /// V02 soak on 9e6a6b6: `relish stop` then `apply` brought a volume app back
 /// on another node, with an empty volume. It must go back to the node that
 /// holds its data, even when the scheduler would now rather go elsewhere.
@@ -659,7 +767,7 @@ async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
     // Pinned to zone b, db lands on v2, which then holds its volume.
     let pinned = r#"
         [app.db]
-        image = "proc-grill:image-ignored"
+        image = "app:v1"
         command = ["sleep", "600"]
 
         [app.db.placement]
@@ -676,7 +784,7 @@ async fn a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume() {
     stop_until_gone(&n1, &nodes, "db").await;
     let unpinned = r#"
         [app.db]
-        image = "proc-grill:image-ignored"
+        image = "app:v1"
         command = ["sleep", "600"]
 
         [[app.db.volumes]]
@@ -741,7 +849,7 @@ async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
     // a wrong move would take it.
     let manifest = r#"
         [app.db]
-        image = "proc-grill:image-ignored"
+        image = "app:v1"
         command = ["sleep", "600"]
 
         [app.db.placement]
@@ -943,8 +1051,7 @@ async fn autoscaler_scales_up_on_high_metric() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.scaler]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
 
         [app.scaler.autoscale]
@@ -1023,8 +1130,7 @@ async fn autoscaler_scales_up_from_real_collector_cpu() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.scaler]
-        image = "proc-grill:image-ignored"
-        command = ["sh", "-c", "while :; do :; done"]
+        script = "while :; do :; done"
         replicas = 1
 
         [app.scaler.autoscale]
@@ -1638,8 +1744,7 @@ async fn start_spread_web_cluster(
         let config = reliaburger::config::Config::parse(
             r#"
             [app.web]
-            image = "proc-grill:image-ignored"
-            command = ["sh", "-c", "while true; do echo tick from $$; sleep 0.3; done"]
+            script = "while true; do echo tick from $$; sleep 0.3; done"
             port = 8080
             replicas = 3
         "#,
@@ -2506,8 +2611,7 @@ async fn ingress_reaches_nodes_without_local_replicas() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
         port = 8080
         [app.web.ingress]
@@ -3151,7 +3255,7 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
         .await
         .unwrap();
     let mut config = reliaburger::config::Config::parse(&format!(
-        "[app.capacity]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"300\"]\ncpu = \"100000m\"\nmemory = \"1Mi\"\nnamespace = \"{}\"\n", lease.namespace
+        "[app.capacity]\nscript = \"exec sleep 300\"\ncpu = \"100000m\"\nmemory = \"1Mi\"\nnamespace = \"{}\"\n", lease.namespace
     )).unwrap();
     let app_id = reliaburger::meat::AppId::new("capacity", &lease.namespace);
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -3303,7 +3407,7 @@ async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion(
         .create_test_lease(120, Some("rbtest-storage-contract"))
         .await
         .unwrap();
-    let mut config = reliaburger::config::Config::parse(&format!("[app.web]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '120']\nreplicas = 3\nnamespace = '{}'\n[[app.web.volumes]]\npath = '/data'\n", lease.namespace)).unwrap();
+    let mut config = reliaburger::config::Config::parse(&format!("[app.web]\nimage = 'app:v1'\ncommand = ['sleep', '120']\nreplicas = 3\nnamespace = '{}'\n[[app.web.volumes]]\npath = '/data'\n", lease.namespace)).unwrap();
     leader
         .client
         .apply_with_lease(&config, &lease.lease_id)
@@ -3477,25 +3581,33 @@ async fn desired_web(node: &Node) -> Option<reliaburger::config::app::AppSpec> {
         .cloned()
 }
 
-/// Apply `web` at `tag` with two replicas until the council holds it and two
-/// replicas run.
+/// The `VERSION` a `web` spec rolled out by [`roll_web_out`] carries. A host
+/// app has no image tag to tell its versions apart (#914).
+fn web_version(spec: &reliaburger::config::app::AppSpec) -> Option<&str> {
+    match spec.env.get("VERSION")? {
+        reliaburger::config::types::EnvValue::Plain(version) => Some(version),
+        _ => None,
+    }
+}
+
+/// Apply `web` at version `tag` with two replicas until the council holds it
+/// and two replicas run.
 async fn roll_web_out(nodes: &[&Node], tag: &str) {
     let config = reliaburger::config::Config::parse(&format!(
         r#"
         [app.web]
-        image = "proc-grill:{tag}"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 2
+        [app.web.env]
+        VERSION = "{tag}"
     "#
     ))
     .unwrap();
-    let image = format!("proc-grill:{tag}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut last_apply: Option<tokio::time::Instant> = None;
     loop {
         let spec = desired_web(nodes[0]).await;
-        if spec.as_ref().and_then(|s| s.image.as_deref()) == Some(image.as_str())
-            && live_web_instances(nodes).await == 2
+        if spec.as_ref().and_then(web_version) == Some(tag) && live_web_instances(nodes).await == 2
         {
             return;
         }
@@ -3576,7 +3688,7 @@ async fn rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let spec = desired_web(&n1).await.expect("web is still desired");
-        if spec.image.as_deref() == Some("proc-grill:v1") {
+        if web_version(&spec) == Some("v1") {
             assert_eq!(
                 spec.replicas,
                 reliaburger::config::Replicas::Fixed(2),
@@ -3685,8 +3797,7 @@ async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy(
         nodes[0],
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sh", "-c", "while true; do echo tock from $$; sleep 0.3; done"]
+        script = "while true; do echo tock from $$; sleep 0.3; done"
         port = 8080
         replicas = 3
 
@@ -3748,8 +3859,7 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
         nodes[0],
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         port = 8080
         replicas = 3
 
@@ -3815,7 +3925,7 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
 
     // Re-applying the same spec, as a GitOps re-sync would, keeps the mark.
     let same = reliaburger::config::Config::parse(
-        "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"600\"]\n\
+        "[app.web]\nscript = \"exec sleep 600\"\n\
          port = 8080\nreplicas = 3\n[app.web.health]\npath = \"/healthz\"\n\
          [app.web.deploy]\nhealth_timeout = \"5s\"\n",
     )
@@ -3837,8 +3947,7 @@ async fn bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying() {
         nodes[0],
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sh", "-c", "while true; do echo fixed from $$; sleep 0.3; done"]
+        script = "while true; do echo fixed from $$; sleep 0.3; done"
         port = 8080
         replicas = 3
     "#,
@@ -3945,7 +4054,7 @@ async fn rollback_works_after_every_node_restarts() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let spec = desired_web(live[0]).await.expect("web is still desired");
-        if spec.image.as_deref() == Some("proc-grill:v1") {
+        if web_version(&spec) == Some("v1") {
             assert_eq!(spec.replicas, reliaburger::config::Replicas::Fixed(2));
             break;
         }
@@ -4027,8 +4136,7 @@ async fn replicas_move_off_a_node_whose_reports_stopped_after_the_grace() {
     let config = reliaburger::config::Config::parse(
         r#"
         [app.web]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 3
     "#,
     )

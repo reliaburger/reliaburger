@@ -420,13 +420,15 @@ detail in GitHub milestones and issues.
 You'll need Rust 1.97 or later. On Linux the build also compiles two small
 static C helpers, so it needs a C compiler and a static libc (`build-essential`
 on Debian and Ubuntu, `gcc glibc-static` on Fedora). This runs a process
-workload with no container runtime, on macOS or Linux:
+workload with no container runtime, on macOS or Linux. The process runtime
+runs host binaries the node allows, not images, so start Bun with the example
+node config that allows the `testapp` workload:
 
 ```sh
 git clone https://github.com/reliaburger/reliaburger
 cd reliaburger
 cargo build --locked --bins
-target/debug/bun --runtime process
+target/debug/bun --runtime process --config examples/node/process-runtime.toml
 
 # In another terminal
 target/debug/relish apply examples/phase-1/proc-first-run.toml

@@ -245,7 +245,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// Whether this node's runtime runs containers, which an image app
     /// needs (#914). The leader places image apps only where it does.
     pub fn runs_containers(&self) -> bool {
-        false
+        self.grill.runs_containers()
     }
 
     /// Replace the process-workloads policy (host-exec/script allowlist,

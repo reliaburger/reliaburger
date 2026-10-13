@@ -323,14 +323,22 @@ fn signal_child_group(
     }
 }
 
-/// The program a spec launches: its first argument, or the placeholder
-/// `sleep` both launch paths fall back to when it has none.
-fn launched_program(spec: &OciSpec) -> String {
+/// Why the process runtime can never launch `spec`, judged from the spec
+/// alone: it runs an image, or it names nothing to run.
+///
+/// The process runtime runs host workloads (`exec` and `script` apps, and
+/// the init containers of such an app that name no image of their own) and
+/// nothing else (#914). It used to run an image app's `command` on the host,
+/// or `sleep 86400` when it had none, so the app looked as though it ran.
+fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
+    use super::LaunchProblem;
+    if !spec.host_process && spec.root.path != super::oci::HOST_ROOT {
+        return Some(LaunchProblem::NeedsContainerRuntime(spec.root.path.clone()));
+    }
     spec.process
         .args
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "sleep".to_string())
+        .is_empty()
+        .then_some(LaunchProblem::NoCommand)
 }
 
 /// Whether `program` names something this node can execute, resolving a bare
@@ -635,10 +643,20 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+        // A launch that can never work fails here, before any generation
+        // exists, so the caller can fail the instance with the reason.
+        let refused = |problem| GrillError::LaunchRefused {
+            instance: instance.clone(),
+            problem,
+        };
+        if let Some(problem) = spec_problem(spec) {
+            return Err(refused(problem));
+        }
         // A missing binary would only show once the owner's gate tried to
-        // exec it, after start had already succeeded (#881). Refuse it here,
-        // before any generation exists, so the caller can fail the instance.
-        let program = launched_program(spec);
+        // exec it, after start had already succeeded (#881).
+        let Some(program) = spec.process.args.first().cloned() else {
+            return Err(refused(super::LaunchProblem::NoCommand));
+        };
         let environment = host_environment(&spec.process.env);
         let checked = program.clone();
         let check = tokio::task::spawn_blocking(move || check_launchable(&checked, &environment))
@@ -648,10 +666,7 @@ impl super::Grill for ProcessGrill {
                 reason: format!("binary check for {program} did not finish: {error}"),
             })?;
         if let Err(problem) = check {
-            return Err(GrillError::LaunchRefused {
-                instance: instance.clone(),
-                problem,
-            });
+            return Err(refused(problem));
         }
         if let Some(control) = &self.control {
             return control.prepare(instance, spec).await.map_err(|error| {
@@ -715,18 +730,14 @@ impl super::Grill for ProcessGrill {
             });
         }
 
-        let args = &entry.spec.process.args;
-
-        // If no command specified, use a long sleep as a placeholder.
-        // Real containers get their entrypoint from the image; ProcessGrill
-        // doesn't have images, so we fall back to keeping the process alive.
-        let default_args;
-        let effective_args = if args.is_empty() {
-            default_args = vec!["sleep".to_string(), "86400".to_string()];
-            &default_args
-        } else {
-            args
-        };
+        // `create` refused a spec with nothing to run.
+        let effective_args = &entry.spec.process.args;
+        if effective_args.is_empty() {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem: super::LaunchProblem::NoCommand,
+            });
+        }
 
         let mut cmd = Command::new(&effective_args[0]);
         cmd.kill_on_drop(entry.cleanup_on_drop);
@@ -1422,10 +1433,11 @@ mod tests {
     use crate::grill::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
     use crate::grill::records::{self, InstanceRecord, RuntimeKind};
 
+    /// A host workload's spec: the only kind the process runtime runs.
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
             reusable_executor: false,
-            host_process: false,
+            host_process: true,
             initialiser: false,
             port_mapping: None,
             root: OciRoot {
@@ -3160,19 +3172,14 @@ mod tests {
         let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
         assert_eq!(
             problem,
-            super::super::LaunchProblem::NeedsContainerRuntime(
-                super::super::ContainerWorkload::Image("nginx:1.27".to_string())
-            )
+            super::super::LaunchProblem::NeedsContainerRuntime("nginx:1.27".to_string())
         );
         assert_eq!(
             problem.to_string(),
             "needs a container runtime to run image nginx:1.27, and this node's runtime is process"
         );
         assert!(
-            matches!(
-                grill.start(&id).await,
-                Err(GrillError::NotFound { .. })
-            ),
+            matches!(grill.start(&id).await, Err(GrillError::NotFound { .. })),
             "a refused image app must leave nothing to start"
         );
     }
@@ -3188,28 +3195,33 @@ mod tests {
         let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
         assert_eq!(
             problem,
-            super::super::LaunchProblem::NeedsContainerRuntime(
-                super::super::ContainerWorkload::Image("busybox:1.36".to_string())
-            )
+            super::super::LaunchProblem::NeedsContainerRuntime("busybox:1.36".to_string())
         );
     }
 
-    /// #914: an init container is a container, so an exec app that declares
-    /// one fails on the process runtime with that reason.
+    /// #914: an init container that names its own image needs a container
+    /// runtime too, even before an exec app. One that names none runs on the
+    /// host, like its app.
     #[tokio::test]
-    async fn create_refuses_an_init_container_as_needing_a_container_runtime() {
+    async fn create_refuses_an_init_container_image_but_runs_a_host_apps_init() {
         let grill = ProcessGrill::new();
-        let id = InstanceId("default__tool-0-init-0".to_string());
         let app = app_spec("tool", "exec = \"/bin/sleep\"\ncommand = [\"60\"]");
-        let init: crate::config::app::InitContainerSpec =
-            toml::from_str("command = [\"echo\", \"migrating\"]").unwrap();
-        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
 
+        let id = InstanceId("default__tool-0-init-0".to_string());
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("image = \"migrate:2\"\ncommand = [\"migrate\"]").unwrap();
+        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
         let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
         assert_eq!(
             problem.to_string(),
-            "needs a container runtime to run an init container, and this node's runtime is process"
+            "needs a container runtime to run image migrate:2, and this node's runtime is process"
         );
+
+        let id = InstanceId("default__tool-0-init-1".to_string());
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("command = [\"echo\", \"migrating\"]").unwrap();
+        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
+        grill.create(&id, &spec).await.unwrap();
     }
 
     #[tokio::test]
@@ -3218,11 +3230,17 @@ mod tests {
         let owners = root.path().join("owners");
         let grill = ProcessGrill::with_owner(owners.clone(), "/bin/false".into());
         let id = InstanceId("default__web-0".to_string());
-        let spec = app_spec("web", "image = \"nginx:1.27\"\ncommand = [\"sleep\", \"60\"]");
+        let spec = app_spec(
+            "web",
+            "image = \"nginx:1.27\"\ncommand = [\"sleep\", \"60\"]",
+        );
 
         let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
         assert!(
-            matches!(problem, super::super::LaunchProblem::NeedsContainerRuntime(_)),
+            matches!(
+                problem,
+                super::super::LaunchProblem::NeedsContainerRuntime(_)
+            ),
             "{problem:?}"
         );
         assert!(
