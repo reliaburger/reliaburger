@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 use super::oci::OciSpec;
 use super::process_control::ProcessControl;
-use super::process_owner::OwnerPhase;
+use super::process_owner::{GateReport, OwnerPhase, OwnerRecord};
 use super::records::{self, InstanceRecord};
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
@@ -397,6 +397,29 @@ fn absent(path: &Path) -> bool {
     )
 }
 
+/// What a started generation's execution gate reported, as a start result.
+///
+/// A binary that vanished after `create`'s check is a refused launch, as one
+/// missing at `create` is (#905). Another gate failure fails the start with
+/// the gate's reason. Silence, or no report at all, means the command runs.
+fn gate_result(instance: &InstanceId, record: &OwnerRecord) -> Result<(), GrillError> {
+    let Some(report @ GateReport::Failed { reason, .. }) = &record.gate else {
+        return Ok(());
+    };
+    // Loading the record proved its command non-empty.
+    let program = record.command.first().map(String::as_str).unwrap_or("");
+    match report.launch_problem(program) {
+        Some(problem) => Err(GrillError::LaunchRefused {
+            instance: instance.clone(),
+            problem,
+        }),
+        None => Err(GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("execution gate failed: {reason}"),
+        }),
+    }
+}
+
 fn owner_error(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
     GrillError::StateUnavailable {
         instance: instance.clone(),
@@ -668,13 +691,15 @@ impl super::Grill for ProcessGrill {
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
         if let Some(control) = &self.control {
-            return control
-                .start(instance)
-                .await
-                .map_err(|error| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: error.to_string(),
-                });
+            let record =
+                control
+                    .start(instance)
+                    .await
+                    .map_err(|error| GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: error.to_string(),
+                    })?;
+            return gate_result(instance, &record);
         }
         let mut procs = self.processes.lock().await;
         let entry = procs
@@ -748,9 +773,26 @@ impl super::Grill for ProcessGrill {
             cmd.stderr(std::process::Stdio::piped());
         }
 
-        let mut child = cmd.spawn().map_err(|e| GrillError::StartFailed {
-            instance: instance.clone(),
-            reason: e.to_string(),
+        let mut child = cmd.spawn().map_err(|error| {
+            // The binary can vanish after `create`'s check (#905).
+            let program = PathBuf::from(&effective_args[0]);
+            let problem = match error.kind() {
+                std::io::ErrorKind::NotFound => Some(super::LaunchProblem::BinaryNotFound(program)),
+                std::io::ErrorKind::PermissionDenied => {
+                    Some(super::LaunchProblem::BinaryNotExecutable(program))
+                }
+                _ => None,
+            };
+            match problem {
+                Some(problem) => GrillError::LaunchRefused {
+                    instance: instance.clone(),
+                    problem,
+                },
+                None => GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                },
+            }
         })?;
 
         let capture = if self.log_dir.is_none() {
@@ -3044,6 +3086,28 @@ mod tests {
 
         let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
         assert_eq!(problem.to_string(), "binary not found: rb-no-such-tool");
+    }
+
+    /// #905: a binary deleted after the pre-launch check fails the start
+    /// as "binary not found", not as a generic spawn error.
+    #[tokio::test]
+    async fn start_refuses_a_binary_deleted_after_create_as_binary_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("vanishing-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("vanishing-0".to_string());
+        let spec = spec_with_args(vec![tool.display().to_string()]);
+        grill.create(&id, &spec).await.unwrap();
+        std::fs::remove_file(&tool).unwrap();
+
+        let problem = refused_launch(grill.start(&id).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::BinaryNotFound(tool.clone())
+        );
     }
 
     #[tokio::test]

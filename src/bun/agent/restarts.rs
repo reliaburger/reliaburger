@@ -363,7 +363,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.restart_after_start(&id, &launch, &evidence).await;
             }
             (RestartStep::Create | RestartStep::Start, StepResult::Failed(error), _) => {
-                self.record_failed_restart(&id, &error.to_string()).await;
+                // A binary that's gone fails every attempt the same way, so
+                // spending the restart budget on it only hides why (#905).
+                match error.launch_problem() {
+                    Some(problem) => {
+                        self.record_launch_failure(&id, problem.to_string()).await;
+                    }
+                    None => self.record_failed_restart(&id, &error.to_string()).await,
+                }
             }
             (RestartStep::Refuse, StepResult::Done, _) => {
                 if let Some(instance) = self.supervisor.get_instance_mut(&id)

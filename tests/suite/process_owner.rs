@@ -108,7 +108,10 @@ impl Owner {
                 &std::fs::read(self.directory.path().join("owner.json")).unwrap(),
             )
             .unwrap();
-            if record["phase"]["state"] == expected {
+            // A running owner writes its record once more, when the gate
+            // reports on its `exec` (#905); only then is the record settled.
+            let settled = expected != "running" || !record["gate"].is_null();
+            if record["phase"]["state"] == expected && settled {
                 return record;
             }
             if self.child.try_wait().unwrap().is_some() {

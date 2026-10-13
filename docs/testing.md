@@ -52,6 +52,24 @@ disclaims responsibility (`posix_spawn` with
 `responsibility_spawnattrs_setdisclaim`); the measurements are in the book's
 [Chapter 14](book/14-changing-the-tyres.md#the-deadline-was-timing-macos-not-the-candidate).
 
+The same rule holds for every target that builds before its tests. `make
+test-linux` needs `target/debug/bun` with the `ebpf` feature
+(`RELIABURGER_BUN_BINARY` names it), so it first runs `cargo test --no-run
+--features ebpf`, the build nextest's `--features ebpf` will ask for. It used
+to run `cargo build --features ebpf --bin bun`, so on a fresh target nextest
+compiled the library, every proc macro and `bun` a second time, and replaced
+the `bun` the step had built. On a Mac the two builds took 710 s; now they take 327 s
+([#904](https://github.com/reliaburger/reliaburger/issues/904)).
+A pre-build is `cargo test --no-run` with exactly the build flags of the test
+run that follows it (`--features`, `--release` and the like); selection flags
+such as `-E` don't matter, since nextest builds every test target anyway.
+[`test_make_prebuilds.py`](../scripts/ci/test_make_prebuilds.py) reads each
+recipe, with its prerequisites, and fails on a `cargo build` before a test
+run or on a pre-build whose features differ. The other gated targets build
+nothing before nextest: in CI the cluster and acceptance suites run from the
+`build tests` job's nextest archive, and the `qualify-*.sh` scripts already
+build with `cargo test --no-run`.
+
 ## The agent loop's turn budget
 
 Each node's agent runs one loop that owns all of the node's state, one turn at

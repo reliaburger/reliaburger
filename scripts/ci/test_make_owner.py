@@ -17,7 +17,7 @@ import workflow_assembly as w
 MAKEFILE = '''test:
 \t$(NEXTEST)
 test-linux:
-\t$(CARGO) build --features ebpf --bin bun
+\t$(CARGO) test --no-run --features ebpf
 \tRELIABURGER_RUNC_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(test_storage) $(LINUX_EXCLUDE)'
 '''
 

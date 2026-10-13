@@ -48,8 +48,10 @@ test-slow: ## Run required wall-clock acceptance tests
 test-images: ## Fetch the pinned test images (with retries) into the local mirror cache
 	python3 scripts/test-images/mirror.py warm --cache "$(TEST_IMAGE_CACHE)"
 
+# Build bun, which RELIABURGER_BUN_BINARY names, the way nextest builds it, so
+# nextest compiles nothing again and leaves that file alone (#904).
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
-	$(CARGO) build --features ebpf --bin bun
+	$(CARGO) test --no-run --features ebpf
 	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/^grill::(volume|image)::tests::/) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
 
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user

@@ -123,7 +123,12 @@ pub struct Compatibility {
 /// inline config files move to a per-instance directory.
 /// A task-array node's control fence is `control.fence`, two checksummed
 /// slots rewritten in place, not `control.json` (#745).
+/// Each array's grant fence is `grants.fence`, not `grants.json`, and both
+/// fences share one slot format: magic, generation, payload length, payload
+/// and CRC32, two slots of a power-of-two stride of at least 512 bytes (#902).
 /// A refused launch's `reason` on `/v1/status` instance rows (#881).
+/// The process owner record's `gate`, what the execution gate reported
+/// about its `exec`, and the gate's stdin is now a socket pair (#905).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

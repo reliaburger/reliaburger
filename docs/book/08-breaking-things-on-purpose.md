@@ -1301,9 +1301,53 @@ the table, `--output json` carries it as `reason`, and `relish wtf` turns it
 into a critical `launch-failed` finding.
 
 Checking first has a gap: someone can delete the binary between the check and
-the `exec`. That case still ends the old way. We accepted it, because closing
-it means passing the `exec` error back from the gate through the owner's
-durable record, and the race needs someone removing a binary during a deploy.
+the `exec`. We shipped #881 with that race open, and closed it in #905 by
+letting the gate talk back.
+
+The owner used to activate the gate through a pipe on its stdin: write
+`activate`, close, done. Now the gate's stdin is one end of a socket pair, so
+the same channel carries an answer. The gate's first act is to copy it:
+
+```rust
+let report = io::stdin()
+    .as_fd()
+    .try_clone_to_owned()
+    .map(UnixStream::from)
+    .ok();
+```
+
+`as_fd()` borrows the file descriptor as a `BorrowedFd`, a handle the borrow
+checker won't let outlive stdin, and `try_clone_to_owned()` duplicates it into
+an `OwnedFd` that closes itself when dropped. Rust opens every descriptor
+close-on-exec, and this duplicate is no exception. That's the trick, and it's
+an old one from the C world. If `exec` works, the kernel closes the copy as it
+replaces the gate with the workload, and the owner reads end-of-file: silence
+means success. If `exec` fails, the gate is still there to write a
+`GateReport::Failed` with the `errno` before it exits. The owner waits for one
+or the other, at most five seconds, and writes the answer into its durable
+record as `gate`. `ProcessControl::start` waits for that field before it
+returns, and ENOENT becomes the same `LaunchRefused` that `create` would have
+returned (EACCES becomes "binary not executable").
+
+So `start` now waits a few milliseconds longer, for the `exec` itself rather
+than just the gate's PID. In return, a deploy never records a workload that
+was never there.
+
+The same `LaunchRefused` also changes restarts. A running app whose binary is
+deleted keeps running, since the kernel still has the file open. It's when the
+app exits that things go wrong: each restart's `create` finds nothing. Those
+restarts used to go through the restart budget, failing and backing off until
+it ran out, and then the instance ended `Failed` with no reason at all. Now the
+restart's step result goes through the same `launch_problem()` test, and a
+refusal moves the instance straight to `Failed` with the reason, as a fresh
+deploy does. Failures that might pass on a retry still take the budget path.
+
+What we didn't change is the cluster's placement reconciler. It still retries a
+refused deploy on its backoff, 5 s doubling to 5 min, so installing the binary
+is picked up without a re-apply. Each retry fails at once with the real
+reason, so it costs little. Stopping it until the spec changes would need a
+typed signal from the node rather than a match on message text, and we'll add
+that only if the retries turn out to be a nuisance.
 
 ## Batch scheduling
 
