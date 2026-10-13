@@ -137,6 +137,24 @@ took a cache read (a couple of redis commands over the pool's open
 connections) from about 43 ms to about 945 ms, and `relish fault clear redis`
 brought it straight back.
 
+### When Bun restarts during a fault
+
+Faults live in the memory of the Bun that injected them, so a fault never
+outlives its Bun. If Bun crashes, is killed or upgrades while a fault is
+active, the fault is gone and so is its effect. `relish fault list` is empty
+afterwards, and there's nothing left to clear. The new Bun undoes what the old
+one left in the kernel before it takes the workloads back:
+
+- `cpu`, `memory` and `disk-io` faults: each adopted instance's `cpu.max` and
+  `memory.high` are rewritten from its recorded specification, and any
+  `io.max` throttle is lifted.
+- `pause`: every process in each adopted instance's cgroup gets SIGCONT.
+- `drop` and `partition`: the eBPF fault map is emptied, including on the
+  rootful runc path where the maps are pinned and outlive Bun.
+- `delay`: Bun removes the netem qdiscs it finds on its containers.
+
+If you still want the fault, inject it again.
+
 ## Recovery catalogue
 
 `relish test --chaos` runs five destructive recovery checks, one at a time:
@@ -201,6 +219,34 @@ relish fault scenario examples/phase-8/chaos-scenario.toml --dry-run
 relish fault scenario examples/phase-8/chaos-scenario.toml --acknowledge
 relish fault scenario examples/phase-8/chaos-scenario.toml --speed 2.0 --acknowledge
 ```
+
+A step's `fault` is any workload fault: `delay`, `drop`, `dns`, `partition`,
+`cpu`, `memory`, `disk-io`, `kill` or `pause`. `kill` and `pause` take no
+`value`. A step can also carry what the matching `relish fault` flags do:
+
+| Field | Flag | Steps |
+|-------|------|-------|
+| `namespace` | `--namespace` | all (default: `default`) |
+| `from` | `--from` | `delay`, `partition` |
+| `count` | `--count` | `kill` (default: 1) |
+| `instance` | `--instance` | all but `dns` |
+
+```toml
+[[step]]
+description = "Cut checkout off from the cache"
+fault = "partition"
+target = "redis"
+namespace = "shop"
+from = "checkout"
+start_after = "5m"
+duration = "1m"
+```
+
+Relish checks every step before it injects the first, so a typo in step three
+fails the whole scenario with nothing injected. So does a field the step's
+fault can't use, or one it doesn't know. If the server refuses a step, or it
+fails, the later steps still run on time, but the command exits non-zero and
+names the steps that failed, so a script or CI job can tell.
 
 Start small: one fault, one app, a hypothesis about what should happen. If
 the system surprises you, that's the experiment working.

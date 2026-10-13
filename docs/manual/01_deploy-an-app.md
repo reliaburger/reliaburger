@@ -202,6 +202,16 @@ Apply a changed app and Bun replaces its instances one at a time, waiting for
 each new one to pass its health check. `relish deploy app.toml` makes the
 same request and reports it as a deploy.
 
+In a cluster the change reaches one node at a time. The leader hands the new
+spec to the first node (by node id) that doesn't run it yet and keeps the other
+nodes on the previous version until that node's replicas are all running and
+healthy on the new one; then the next node goes. Each node rolls its own share
+of the replicas with the app's `[deploy]` table, so `max_surge` and
+`max_unavailable` count that node's instances, not the whole app's. An app
+with one replica per node therefore keeps every other replica serving while
+one node rolls. A brand-new app, a node getting its first replica and a change
+to `replicas` alone don't wait.
+
 ```toml
 [app.web.deploy]
 strategy = "rolling"      # or "blue-green"
@@ -234,19 +244,49 @@ relish cancel-deploy <OPERATION_ID>
 get one row per node per deploy, with a NODE column. A node that doesn't answer
 prints `warning: history incomplete: …` on stderr.
 
-`relish rollback` reads the same cluster-wide history, from whichever node you
-ask. The previous version is the newest one that differs from what the app
-runs now, so the copies of the current deploy that every node recorded don't
-count. A rollback changes the version and keeps the scale: an app running
-three replicas still runs three, and a deploy that only changed `replicas`
-isn't a version to roll back to.
+Each node keeps its last 50 deploys per app.
+
+In a cluster, `relish rollback` takes its target from the council, which keeps
+the last ten versions of each app that rolled out healthy on every node, so it
+works from whichever node you ask and after every node has restarted. The
+previous version is the newest one there that differs from what the app runs
+now. Without one (a single node, or an app that never finished a rollout) it
+falls back to the cluster-wide history. A rollback changes the version and
+keeps the scale: an app running three replicas still runs three, and a deploy
+that only changed `replicas` isn't a version to roll back to.
 
 A new instance that doesn't turn healthy within `health_timeout` fails the
-deploy, and with `auto_rollback` (the default) Bun restores the previous
-version. With `auto_rollback = false` the deploy stops where it failed.
+deploy. With `auto_rollback` (the default) the node puts the previous version
+back without ever running fewer replicas than it started with: if old
+instances had already retired, it restarts them on the previous spec first and
+only then stops the new ones. If even the previous spec won't start, it keeps
+the healthy new instances serving and reports the rollout halted. With
+`auto_rollback = false` the deploy stops where it failed, both versions
+running.
+
+In a cluster a failed rollout also marks the app `RolloutFailed`. The leader
+keeps the desired spec as you applied it but stops handing it to nodes: the
+nodes that already run it keep it, the rest stay on the previous version, and
+nothing retries it. `relish status` prints the node and the reason:
+
+```text
+web (namespace default) RolloutFailed on node-2: default__web-g3-0 failed its health check; apply a different spec or roll back
+```
+
+`relish wtf` reports it as a warning. Applying the same spec again (a GitOps
+re-sync, say) doesn't clear it, since it would only fail the same way. Apply a
+fixed spec, or `relish rollback web`, and the mark goes.
+
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
-in-flight step to finish. `examples/phase-1/proc-restarts.toml` shows the
-health checker restarting an app that goes unhealthy.
+in-flight step to finish. It works on a single node only: a cluster `apply`
+returns once the council has recorded the spec, and prints no operation id,
+because each node runs its own deploy later. `examples/phase-1/proc-restarts.toml`
+shows the health checker restarting an app that goes unhealthy.
+
+`relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
+`strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
+`health_timeout` that isn't a whole number of seconds, minutes or hours
+(`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`).
 
 ## Jobs and cron
 

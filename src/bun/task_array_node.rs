@@ -216,6 +216,8 @@ pub enum TaskArrayNodeError {
     Io(#[from] std::io::Error),
     #[error("blocking task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("busy: an earlier sync's disk work has not finished, so this node's disk may be stuck")]
+    SyncBusy,
 }
 
 /// Runs task attempts: real processes on a node, a fake in tests.
@@ -336,6 +338,46 @@ struct ArrayRun {
     failure: Arc<Mutex<Option<String>>>,
 }
 
+/// The one sync allowed on this node's disk at a time (#770).
+///
+/// A sync holds it while it runs, and so does every blocking disk call the
+/// sync starts. When the leader gives up on a sync and drops it, a call
+/// stuck on the disk keeps running on its blocking thread, still holding
+/// the claim, and later syncs are refused as busy instead of each starting
+/// another thread that would hang on the same disk. The claim frees itself
+/// when that call finally returns.
+#[derive(Clone)]
+struct SyncClaim {
+    // Never read: the permit goes back to the gate when the last clone drops.
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl SyncClaim {
+    /// Take the claim, or fail at once if a sync or its disk work holds it.
+    fn take(gate: &Arc<Semaphore>) -> Result<Self, TaskArrayNodeError> {
+        let permit = Arc::clone(gate)
+            .try_acquire_owned()
+            .map_err(|_| TaskArrayNodeError::SyncBusy)?;
+        Ok(Self {
+            _permit: Arc::new(permit),
+        })
+    }
+
+    /// Run blocking disk work on the blocking pool, holding the claim until
+    /// the work returns, even if the sync awaiting it is dropped first.
+    fn spawn_blocking<T, F>(&self, work: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let claim = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _claim = claim;
+            work()
+        })
+    }
+}
+
 enum ControlCheck {
     Accepted,
     Stale,
@@ -356,6 +398,12 @@ pub struct TaskArrayNode {
     control_syncs: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this process has made `root`'s directory entry durable.
     root_durable: Arc<std::sync::atomic::AtomicBool>,
+    /// One permit, for [`SyncClaim`].
+    sync_gate: Arc<Semaphore>,
+    /// Runs at the start of the control-fence check, so a test can make
+    /// the disk hang there.
+    #[cfg(test)]
+    fence_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl TaskArrayNode {
@@ -379,8 +427,11 @@ impl TaskArrayNode {
             output_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             control_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sync_gate: Arc::new(Semaphore::new(1)),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fence_probe: None,
         }
     }
 
@@ -469,81 +520,96 @@ impl TaskArrayNode {
         self.config.root.join(batch_id.to_string())
     }
 
-    /// Apply the leader's view and report progress. Never fails as a
-    /// whole: an array this node can't run is answered with zero slots
-    /// and the reason.
-    pub async fn sync(&self, request: &NodeSyncRequest) -> NodeSyncResponse {
+    /// Apply the leader's view and report progress. An array this node
+    /// can't run is answered with zero slots and the reason.
+    ///
+    /// Fails as a whole only with [`TaskArrayNodeError::SyncBusy`], at
+    /// once, while an earlier sync or the disk work it started is still
+    /// running: a stuck disk then costs one blocking thread, not one per
+    /// sync the leader gives up on.
+    pub async fn sync(
+        &self,
+        request: &NodeSyncRequest,
+    ) -> Result<NodeSyncResponse, TaskArrayNodeError> {
+        let claim = SyncClaim::take(&self.sync_gate)?;
         let mut arrays = self.arrays.lock().await;
         let root = self.config.root.clone();
         let path = root.join("control.json");
         let version = request.version;
         let syncs = Arc::clone(&self.control_syncs);
         let root_durable = Arc::clone(&self.root_durable);
-        let checked = tokio::task::spawn_blocking(move || {
-            let directory = root.as_path();
-            let existed = directory.is_dir();
-            std::fs::create_dir_all(directory)?;
-            // The directory entry itself must survive before a fence can.
-            // Once per process (a previous one may have crashed before its
-            // flush) and whenever the directory had to be created: the
-            // leader calls this every tick, and on macOS each fsync is a
-            // whole-device flush (#809).
-            if !existed || !root_durable.load(Ordering::Acquire) {
-                let parent = directory
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."));
-                std::fs::File::open(parent)?.sync_all()?;
-                syncs.fetch_add(1, Ordering::Relaxed);
-                root_durable.store(true, Ordering::Release);
-            }
-            let previous: ControlVersion = match std::fs::read(&path) {
-                Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    ControlVersion::default()
+        #[cfg(test)]
+        let probe = self.fence_probe.clone();
+        let checked = claim
+            .spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe();
                 }
-                Err(error) => return Err(error),
-            };
-            if version.epoch < previous.epoch
-                || (version.epoch == previous.epoch
-                    && (version.term < previous.term || version.index < previous.index))
-            {
-                return Ok(ControlCheck::Stale);
-            }
-            let recovery = directory.join("recovery-required.json");
-            match std::fs::read(&recovery) {
-                Ok(_) => return Ok(ControlCheck::RecoveryRequired),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            if version.epoch > previous.epoch {
-                let has_old_arrays =
-                    std::fs::read_dir(directory)?.try_fold(false, |found, entry| {
-                        let entry = entry?;
-                        Ok::<_, std::io::Error>(
-                            found
-                                || (entry.file_type()?.is_dir()
-                                    && entry
-                                        .file_name()
-                                        .to_str()
-                                        .is_some_and(|name| name.parse::<u64>().is_ok())),
-                        )
-                    })?;
-                if has_old_arrays {
-                    // Persist the refusal before cancellation. A restart or a later
-                    // snapshot forgetting these arrays must never clear their fences.
-                    persist_json(&recovery, &(previous, version))?;
-                    return Ok(ControlCheck::RecoveryRequired);
+                let directory = root.as_path();
+                let existed = directory.is_dir();
+                std::fs::create_dir_all(directory)?;
+                // The directory entry itself must survive before a fence can.
+                // Once per process (a previous one may have crashed before its
+                // flush) and whenever the directory had to be created: the
+                // leader calls this every tick, and on macOS each fsync is a
+                // whole-device flush (#809).
+                if !existed || !root_durable.load(Ordering::Acquire) {
+                    let parent = directory
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."));
+                    std::fs::File::open(parent)?.sync_all()?;
+                    syncs.fetch_add(1, Ordering::Relaxed);
+                    root_durable.store(true, Ordering::Release);
                 }
-            }
-            if version > previous {
-                persist_json(&path, &version)?;
-                // The fence file and its directory.
-                syncs.fetch_add(2, Ordering::Relaxed);
-            }
-            Ok::<_, std::io::Error>(ControlCheck::Accepted)
-        })
-        .await;
+                let previous: ControlVersion = match std::fs::read(&path) {
+                    Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ControlVersion::default()
+                    }
+                    Err(error) => return Err(error),
+                };
+                if version.epoch < previous.epoch
+                    || (version.epoch == previous.epoch
+                        && (version.term < previous.term || version.index < previous.index))
+                {
+                    return Ok(ControlCheck::Stale);
+                }
+                let recovery = directory.join("recovery-required.json");
+                match std::fs::read(&recovery) {
+                    Ok(_) => return Ok(ControlCheck::RecoveryRequired),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                if version.epoch > previous.epoch {
+                    let has_old_arrays =
+                        std::fs::read_dir(directory)?.try_fold(false, |found, entry| {
+                            let entry = entry?;
+                            Ok::<_, std::io::Error>(
+                                found
+                                    || (entry.file_type()?.is_dir()
+                                        && entry
+                                            .file_name()
+                                            .to_str()
+                                            .is_some_and(|name| name.parse::<u64>().is_ok())),
+                            )
+                        })?;
+                    if has_old_arrays {
+                        // Persist the refusal before cancellation. A restart or a later
+                        // snapshot forgetting these arrays must never clear their fences.
+                        persist_json(&recovery, &(previous, version))?;
+                        return Ok(ControlCheck::RecoveryRequired);
+                    }
+                }
+                if version > previous {
+                    persist_json(&path, &version)?;
+                    // The fence file and its directory.
+                    syncs.fetch_add(2, Ordering::Relaxed);
+                }
+                Ok::<_, std::io::Error>(ControlCheck::Accepted)
+            })
+            .await;
         if !matches!(checked, Ok(Ok(ControlCheck::Accepted))) {
             let recovery_required = matches!(checked, Ok(Ok(ControlCheck::RecoveryRequired)));
             if recovery_required {
@@ -556,13 +622,13 @@ impl TaskArrayNode {
             } else {
                 "stale control version or unavailable persistent fence"
             };
-            return NodeSyncResponse {
+            return Ok(NodeSyncResponse {
                 arrays: request
                     .arrays
                     .iter()
                     .map(|a| refused(a.batch_id, reason.into()))
                     .collect(),
-            };
+            });
         }
         let running: Vec<u64> = request.arrays.iter().map(|a| a.batch_id).collect();
         let finished_ids: Vec<u64> = arrays
@@ -581,15 +647,14 @@ impl TaskArrayNode {
                 run.cancel.cancel();
             }
         }
-        self.delete_unknown(&request.known).await;
+        self.delete_unknown(&claim, &request.known).await;
         self.telemetry.retain_runs(|id| running.contains(&id));
         let root = self.config.root.clone();
         let audit_dir = self.config.audit_dir.clone();
-        let pressured = tokio::task::spawn_blocking(move || {
-            Self::task_data_pressured(&root, audit_dir.as_deref())
-        })
-        .await
-        .unwrap_or(true);
+        let pressured = claim
+            .spawn_blocking(move || Self::task_data_pressured(&root, audit_dir.as_deref()))
+            .await
+            .unwrap_or(true);
 
         let mut response = NodeSyncResponse::default();
         for assignment in &request.arrays {
@@ -608,7 +673,7 @@ impl TaskArrayNode {
             }
             let run = match arrays.entry(assignment.batch_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => match self.open(assignment).await {
+                Entry::Vacant(entry) => match self.open(&claim, assignment).await {
                     Ok(run) => entry.insert(run),
                     Err(error) => {
                         let reason = format!("can't open the task ledger: {error}");
@@ -617,7 +682,7 @@ impl TaskArrayNode {
                     }
                 },
             };
-            let mut progress = self.reconcile(run, assignment).await;
+            let mut progress = self.reconcile(&claim, run, assignment).await;
             if pressured {
                 // Chunks already granted still run and report; the leader
                 // just sees no room for more until retention frees space.
@@ -625,7 +690,7 @@ impl TaskArrayNode {
             }
             response.arrays.push(progress);
         }
-        response
+        Ok(response)
     }
 
     fn concurrency(&self, spec: &TaskArraySpec) -> u32 {
@@ -781,42 +846,47 @@ impl TaskArrayNode {
         Ok(())
     }
 
-    async fn open(&self, assignment: &ArrayAssignment) -> Result<ArrayRun, TaskArrayNodeError> {
+    async fn open(
+        &self,
+        claim: &SyncClaim,
+        assignment: &ArrayAssignment,
+    ) -> Result<ArrayRun, TaskArrayNodeError> {
         let directory = self.array_dir(assignment.batch_id);
         let spec = assignment.spec.clone();
         let held: std::collections::BTreeSet<_> =
             assignment.held.iter().map(|h| h.chunk.0).collect();
-        let (ledger, resumed, highest) = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(directory.join("output"))?;
-            let parent = directory
-                .parent()
-                .ok_or_else(|| std::io::Error::other("array directory has no parent"))?;
-            std::fs::File::open(parent)?.sync_all()?;
-            let path = directory.join("ledger");
-            let resumed = if path.exists() {
-                let mut records = Vec::new();
-                task_ledger::scan(&path, |record| {
-                    if spec
-                        .chunk_of(record.index)
-                        .is_some_and(|c| held.contains(&c.0))
-                    {
-                        records.push(record);
-                    }
-                    Ok(())
-                })?;
-                group_by_chunk(&spec, records)
-            } else {
-                HashMap::new()
-            };
-            let fence = directory.join("grants.json");
-            let highest = match std::fs::read(&fence) {
-                Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-                Err(error) => return Err(error.into()),
-            };
-            Ok::<_, TaskArrayNodeError>((Ledger::open(&path)?, resumed, highest))
-        })
-        .await??;
+        let (ledger, resumed, highest) = claim
+            .spawn_blocking(move || {
+                std::fs::create_dir_all(directory.join("output"))?;
+                let parent = directory
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("array directory has no parent"))?;
+                std::fs::File::open(parent)?.sync_all()?;
+                let path = directory.join("ledger");
+                let resumed = if path.exists() {
+                    let mut records = Vec::new();
+                    task_ledger::scan(&path, |record| {
+                        if spec
+                            .chunk_of(record.index)
+                            .is_some_and(|c| held.contains(&c.0))
+                        {
+                            records.push(record);
+                        }
+                        Ok(())
+                    })?;
+                    group_by_chunk(&spec, records)
+                } else {
+                    HashMap::new()
+                };
+                let fence = directory.join("grants.json");
+                let highest = match std::fs::read(&fence) {
+                    Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+                    Err(error) => return Err(error.into()),
+                };
+                Ok::<_, TaskArrayNodeError>((Ledger::open(&path)?, resumed, highest))
+            })
+            .await??;
         self.indexes
             .lock()
             .await
@@ -847,7 +917,12 @@ impl TaskArrayNode {
     }
 
     /// Bring one array in line with the leader's view of it.
-    async fn reconcile(&self, run: &mut ArrayRun, assignment: &ArrayAssignment) -> ArrayProgress {
+    async fn reconcile(
+        &self,
+        claim: &SyncClaim,
+        run: &mut ArrayRun,
+        assignment: &ArrayAssignment,
+    ) -> ArrayProgress {
         if let Some(reason) = run.failure.lock().await.clone() {
             return refused(assignment.batch_id, reason);
         }
@@ -873,8 +948,9 @@ impl TaskArrayNode {
             run.pool.counters().unknown.store(false, Ordering::Relaxed);
             let path = self.array_dir(assignment.batch_id).join("grants.json");
             let highest = run.highest.clone();
-            let persisted =
-                tokio::task::spawn_blocking(move || persist_json(&path, &highest)).await;
+            let persisted = claim
+                .spawn_blocking(move || persist_json(&path, &highest))
+                .await;
             if !matches!(persisted, Ok(Ok(()))) {
                 let reason = "cannot persist the grant fence".to_string();
                 *run.failure.lock().await = Some(reason.clone());
@@ -924,8 +1000,8 @@ impl TaskArrayNode {
                 let marker = self
                     .array_dir(assignment.batch_id)
                     .join(format!("started-{chunk}-{attempt}"));
-                let authorised =
-                    tokio::task::spawn_blocking(move || match std::fs::metadata(&marker) {
+                let authorised = claim
+                    .spawn_blocking(move || match std::fs::metadata(&marker) {
                         Ok(_) => Ok(complete),
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                             crate::sesame::identity::atomic_write_mode(
@@ -1070,32 +1146,33 @@ impl TaskArrayNode {
     }
 
     /// Delete the directories of arrays the cluster no longer lists.
-    async fn delete_unknown(&self, known: &[u64]) {
+    async fn delete_unknown(&self, claim: &SyncClaim, known: &[u64]) {
         self.indexes.lock().await.retain(|id, _| known.contains(id));
         let root = self.config.root.clone();
         let known = known.to_vec();
-        let result = tokio::task::spawn_blocking(move || {
-            let entries = match std::fs::read_dir(&root) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            for entry in entries {
-                let entry = entry?;
-                let Some(id) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse::<u64>().ok())
-                else {
-                    continue;
+        let result = claim
+            .spawn_blocking(move || {
+                let entries = match std::fs::read_dir(&root) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
                 };
-                if !known.contains(&id) {
-                    std::fs::remove_dir_all(entry.path())?;
+                for entry in entries {
+                    let entry = entry?;
+                    let Some(id) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    if !known.contains(&id) {
+                        std::fs::remove_dir_all(entry.path())?;
+                    }
                 }
-            }
-            Ok(())
-        })
-        .await;
+                Ok(())
+            })
+            .await;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => eprintln!("bun: task arrays: cleanup failed: {error}"),
@@ -1561,7 +1638,7 @@ mod tests {
     ) -> ArrayProgress {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let progress = node.sync(request).await.arrays.remove(0);
+            let progress = node.sync(request).await.unwrap().arrays.remove(0);
             if progress.finished.len() >= chunks {
                 return progress;
             }
@@ -1581,7 +1658,7 @@ mod tests {
         let mut a = assignment(1, 10, &[]);
         a.replay_unknown = false;
         let req = request(vec![a.clone()]);
-        assert!(node.sync(&req).await.arrays[0].refused.is_none());
+        assert!(node.sync(&req).await.unwrap().arrays[0].refused.is_none());
         std::fs::write(node.array_dir(1).join("started-0-1"), b"started").unwrap();
         a.held = vec![HeldChunk {
             chunk: ChunkId(0),
@@ -1589,7 +1666,7 @@ mod tests {
         }];
         let req = request(vec![a.clone()]);
         assert!(
-            node.sync(&req).await.arrays[0]
+            node.sync(&req).await.unwrap().arrays[0]
                 .refused
                 .as_deref()
                 .unwrap()
@@ -1622,25 +1699,135 @@ mod tests {
             term: 1,
             index: 1,
         };
-        node.sync(&sync).await;
+        node.sync(&sync).await.unwrap();
         // The new directory's entry, the fence file and its directory.
         assert_eq!(node.control_syncs(), 3);
-        node.sync(&sync).await;
-        node.sync(&sync).await;
+        node.sync(&sync).await.unwrap();
+        node.sync(&sync).await.unwrap();
         assert_eq!(
             node.control_syncs(),
             3,
             "an unchanged fence flushed the disk"
         );
         sync.version.index = 2;
-        node.sync(&sync).await;
+        node.sync(&sync).await.unwrap();
         // A new fence rewrites its file; the directory entry is durable.
         assert_eq!(node.control_syncs(), 5);
         // A directory removed underneath the node is made durable again.
         std::fs::remove_dir_all(&root).unwrap();
-        node.sync(&sync).await;
+        node.sync(&sync).await.unwrap();
         assert_eq!(node.control_syncs(), 8);
         assert!(root.join("control.json").exists());
+    }
+
+    /// A disk that hangs every read until it is released, counting the
+    /// blocking threads that have entered it.
+    #[derive(Default)]
+    struct StuckDisk {
+        entered: std::sync::atomic::AtomicUsize,
+        released: std::sync::Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    impl StuckDisk {
+        fn read(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.wake.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+
+        fn entered(&self) -> usize {
+            self.entered.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Releases the disk when a test ends, even by failing, so the
+    /// runtime's shutdown doesn't wait forever on a hung blocking thread.
+    struct Unstick(Arc<StuckDisk>);
+
+    impl Drop for Unstick {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    fn on_stuck_disk(root: &Path) -> (TaskArrayNode, Arc<StuckDisk>) {
+        let mut node = fake_node(root, FakeRunner::always_succeeds());
+        let disk = Arc::new(StuckDisk::default());
+        let hung = Arc::clone(&disk);
+        node.fence_probe = Some(Arc::new(move || hung.read()));
+        (node, disk)
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "never {what}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn syncs_the_leader_gives_up_on_a_stuck_disk_hold_one_blocking_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let (node, disk) = on_stuck_disk(root.path());
+        let _unstick = Unstick(Arc::clone(&disk));
+        let sync = request(vec![assignment(1, 10, &[])]);
+        // The leader's deadline drops the call mid-read, as a timed-out
+        // HTTP request drops the handler.
+        let first = tokio::time::timeout(Duration::from_millis(20), node.sync(&sync)).await;
+        assert!(first.is_err(), "a sync finished on a stuck disk");
+        wait_until("entered the stuck read", || disk.entered() == 1).await;
+        for _ in 0..50 {
+            let retry = tokio::time::timeout(Duration::from_millis(20), node.sync(&sync)).await;
+            assert!(
+                matches!(retry, Ok(Err(TaskArrayNodeError::SyncBusy))),
+                "a retry was not refused as busy: {retry:?}"
+            );
+        }
+        assert_eq!(disk.entered(), 1, "retries started more stuck reads");
+        disk.release();
+        // The stuck read finishes on its own, and the next sync runs.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let answer = loop {
+            match node.sync(&sync).await {
+                Err(TaskArrayNodeError::SyncBusy) => {}
+                answer => break answer.unwrap(),
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never recovered");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        assert_eq!(answer.arrays[0].refused, None);
+        assert_eq!(disk.entered(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_sync_still_running_its_disk_work_refuses_a_concurrent_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (node, disk) = on_stuck_disk(root.path());
+        let _unstick = Unstick(Arc::clone(&disk));
+        let node = Arc::new(node);
+        let sync = request(Vec::new());
+        let running = {
+            let (node, sync) = (Arc::clone(&node), sync.clone());
+            tokio::spawn(async move { node.sync(&sync).await })
+        };
+        wait_until("entered the stuck read", || disk.entered() == 1).await;
+        let concurrent = tokio::time::timeout(Duration::from_millis(20), node.sync(&sync)).await;
+        assert!(
+            matches!(concurrent, Ok(Err(TaskArrayNodeError::SyncBusy))),
+            "a concurrent sync was not refused as busy: {concurrent:?}"
+        );
+        disk.release();
+        assert!(running.await.unwrap().is_ok());
+        assert!(node.sync(&sync).await.is_ok());
     }
 
     #[tokio::test]
@@ -1672,7 +1859,7 @@ mod tests {
             term: 1,
             index: 1,
         };
-        let response = node.sync(&restored).await.arrays.remove(0);
+        let response = node.sync(&restored).await.unwrap().arrays.remove(0);
         assert!(response.refused.unwrap().contains("recovery epoch"));
         assert!(response.finished.is_empty());
         drop(node);
@@ -1683,9 +1870,10 @@ mod tests {
                 version: restored.version,
                 ..Default::default()
             })
-            .await;
+            .await
+            .unwrap();
         assert!(
-            restarted.sync(&restored).await.arrays[0]
+            restarted.sync(&restored).await.unwrap().arrays[0]
                 .refused
                 .as_ref()
                 .unwrap()
@@ -1714,14 +1902,16 @@ mod tests {
     async fn failed_grant_fence_keeps_refusing_after_the_disk_is_repaired() {
         let root = tempfile::tempdir().unwrap();
         let node = fake_node(root.path(), FakeRunner::always_succeeds());
-        node.sync(&request(vec![assignment(1, 10, &[])])).await;
+        node.sync(&request(vec![assignment(1, 10, &[])]))
+            .await
+            .unwrap();
         let fence = node.array_dir(1).join("grants.json");
         std::fs::create_dir(&fence).unwrap();
         let grant = request(vec![assignment(1, 10, &[(0, 1)])]);
-        let first = node.sync(&grant).await.arrays.remove(0);
+        let first = node.sync(&grant).await.unwrap().arrays.remove(0);
         assert!(first.refused.unwrap().contains("grant fence"));
         std::fs::remove_dir(&fence).unwrap();
-        let later = node.sync(&grant).await.arrays.remove(0);
+        let later = node.sync(&grant).await.unwrap().arrays.remove(0);
         assert!(later.refused.unwrap().contains("grant fence"));
         assert!(later.finished.is_empty());
         assert_eq!(later.counters.attempts_started, 0);
@@ -1734,7 +1924,7 @@ mod tests {
         let sync = request(vec![assignment(1, 25, &[(0, 1), (2, 3)])]);
         sync_until_finished(&node, &sync, 2).await;
         // The counters in the response lag the finished chunks by one sync.
-        node.sync(&sync).await;
+        node.sync(&sync).await.unwrap();
         let samples = node.telemetry().samples("node-a");
         let value = |name: &str| {
             samples
@@ -1749,7 +1939,7 @@ mod tests {
         assert_eq!(labels.get("node").map(String::as_str), Some("node-a"));
 
         // Once the leader stops listing the run, nothing of it is running.
-        node.sync(&request(Vec::new())).await;
+        node.sync(&request(Vec::new())).await.unwrap();
         assert!(node.telemetry().usage_targets().is_empty());
     }
 
@@ -1777,10 +1967,14 @@ mod tests {
         let sync = request(vec![assignment(1, 20, &[(0, 1)])]);
         sync_until_finished(&node, &sync, 1).await;
         // Still held: reported again, in case the leader missed it.
-        assert_eq!(node.sync(&sync).await.arrays[0].finished.len(), 1);
+        assert_eq!(node.sync(&sync).await.unwrap().arrays[0].finished.len(), 1);
         // Retired: the leader stops listing it, and the node forgets it.
         let retired = request(vec![assignment(1, 20, &[])]);
-        assert!(node.sync(&retired).await.arrays[0].finished.is_empty());
+        assert!(
+            node.sync(&retired).await.unwrap().arrays[0]
+                .finished
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1801,7 +1995,12 @@ mod tests {
         let node = fake_node(root.path(), FakeRunner::always_succeeds());
         let mut greedy = assignment(1, 20, &[]);
         greedy.resources.cpu_millicores = u64::MAX;
-        let progress = node.sync(&request(vec![greedy])).await.arrays.remove(0);
+        let progress = node
+            .sync(&request(vec![greedy]))
+            .await
+            .unwrap()
+            .arrays
+            .remove(0);
         assert_eq!(progress.slots, 0);
         assert!(
             !progress.unrunnable,
@@ -1820,6 +2019,7 @@ mod tests {
         let progress = node
             .sync(&request(vec![assignment(1, 20, &[(0, 1)])]))
             .await
+            .unwrap()
             .arrays
             .remove(0);
         assert_eq!(progress.slots, 0);
@@ -1838,6 +2038,7 @@ mod tests {
         let progress = node
             .sync(&request(vec![assignment(1, 20, &[])]))
             .await
+            .unwrap()
             .arrays
             .remove(0);
         assert_eq!(progress.slots, 0);
@@ -1854,7 +2055,12 @@ mod tests {
         let node = fake_node(root.path(), FakeRunner::always_succeeds());
         let mut capped = assignment(1, 20, &[]);
         capped.spec.per_node_concurrency = Some(3);
-        let progress = node.sync(&request(vec![capped])).await.arrays.remove(0);
+        let progress = node
+            .sync(&request(vec![capped]))
+            .await
+            .unwrap()
+            .arrays
+            .remove(0);
         assert_eq!(progress.slots, 3);
     }
 
@@ -1887,7 +2093,12 @@ mod tests {
             array.template = Some(Box::new(toml::from_str(
                 "image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
             ).unwrap()));
-            let progress = node.sync(&request(vec![array])).await.arrays.remove(0);
+            let progress = node
+                .sync(&request(vec![array]))
+                .await
+                .unwrap()
+                .arrays
+                .remove(0);
             assert_eq!(progress.refused, None);
             assert_eq!(
                 progress.slots, expected,
@@ -1906,7 +2117,7 @@ mod tests {
             }),
         );
         let mut array = assignment(1, 20, &[(0, 1), (1, 1)]);
-        node.sync(&request(vec![array.clone()])).await;
+        node.sync(&request(vec![array.clone()])).await.unwrap();
         array.stopping = true;
         let progress = sync_until_finished(&node, &request(vec![array]), 2).await;
         let not_run: u32 = progress.finished.iter().map(|r| r.not_run).sum();
@@ -1944,7 +2155,8 @@ mod tests {
             known: vec![1],
             arrays: Vec::new(),
         })
-        .await;
+        .await
+        .unwrap();
         let failed = node.results(1, true, 100).await.unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].index, 3);
@@ -1953,7 +2165,7 @@ mod tests {
         assert_eq!(node.results(1, false, 4).await.unwrap().len(), 4);
 
         // Pruned: the directory goes.
-        node.sync(&NodeSyncRequest::default()).await;
+        node.sync(&NodeSyncRequest::default()).await.unwrap();
         assert!(!node.array_dir(1).exists());
         assert!(matches!(
             node.results(1, false, 100).await,
@@ -2094,7 +2306,7 @@ mod tests {
             known: arrays.ids(),
             arrays: Vec::new(),
         };
-        node.sync(&known(&arrays)).await;
+        node.sync(&known(&arrays)).await.unwrap();
         assert!(
             node.array_dir(1).exists(),
             "kept while the cluster lists it"
@@ -2112,7 +2324,7 @@ mod tests {
                 || 0,
             )
             .unwrap();
-        node.sync(&known(&arrays)).await;
+        node.sync(&known(&arrays)).await.unwrap();
         assert!(!node.array_dir(1).exists());
     }
 }

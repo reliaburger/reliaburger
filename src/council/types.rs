@@ -481,6 +481,18 @@ pub enum RaftRequest {
     /// it is still untagged since the same moment and that no app or job
     /// pins it, and answers `Refused` otherwise.
     ExpireManifest(crate::pickle::types::ExpireManifest),
+    /// A node aborted its rollout of an app's current spec (#692, D11-B).
+    /// The leader stops handing that spec to nodes until a different one is
+    /// applied. Refused when the fingerprint isn't the app's current spec:
+    /// the operator has moved on since.
+    RolloutFailed {
+        app_id: AppId,
+        failure: crate::meat::deploy_types::RolloutFailure,
+    },
+    /// Every node an app is placed on runs its current spec healthy (#692):
+    /// record it as the newest rollback target. Refused unless `spec` is
+    /// still the app's current spec.
+    RolloutReleased { app_id: AppId, spec: Box<AppSpec> },
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +603,15 @@ pub struct DesiredState {
         deserialize_with = "map_as_vec::deserialize"
     )]
     pub quota_blocked: HashMap<AppId, crate::meat::quota::QuotaError>,
+    /// Each app's rollout record (#692): the fully rolled-out specs that
+    /// `relish rollback` and the leader's node-by-node release fall back on,
+    /// and the spec whose rollout failed. Survives every node restarting.
+    #[serde(
+        default,
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub rollouts: HashMap<AppId, crate::meat::deploy_types::AppRollouts>,
     /// GitOps sync state.
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
@@ -658,13 +679,15 @@ pub struct DesiredState {
 
 impl DesiredState {
     /// Every image digest an app or job in desired state pins
-    /// (`web:v1@sha256:…`): app and init-container images, job definitions
-    /// and task-array templates. Registry expiry never removes these.
-    ///
-    // TODO(#692): also read the persisted deploy history once it lands, so
-    // a rollback target stays pullable.
+    /// (`web:v1@sha256:…`): app and init-container images, the rollback
+    /// targets in each app's rollout record (#692), job definitions and
+    /// task-array templates. Registry expiry never removes these.
     pub fn pinned_image_digests(&self) -> std::collections::HashSet<String> {
-        let apps = self.apps.values().flat_map(|spec| {
+        let rollback_targets = self
+            .rollouts
+            .values()
+            .flat_map(|rollouts| rollouts.released.iter());
+        let apps = self.apps.values().chain(rollback_targets).flat_map(|spec| {
             spec.image
                 .iter()
                 .chain(spec.init.iter().filter_map(|init| init.image.as_ref()))

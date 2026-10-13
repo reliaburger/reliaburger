@@ -26,11 +26,12 @@ pub(super) enum DeployOp {
         reply: oneshot::Sender<Result<Option<String>, String>>,
     },
     /// Admit the app kind before recording the deployed spec for the Brioche UI.
+    /// Answers the spec the app's instances ran before, if the node knows it.
     StoreDeployedSpec {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<Result<(), BunError>>,
+        reply: oneshot::Sender<Result<Option<AppSpec>, BunError>>,
     },
     /// Every owned instance id, including terminal instances awaiting cleanup.
     ListExistingOwned {
@@ -308,6 +309,36 @@ pub(super) struct RollingInstance {
     pub(super) launch: launch_evidence::LaunchEvidence,
 }
 
+/// How many deploy history entries a node keeps per app.
+pub(crate) const DEPLOY_HISTORY_PER_APP: usize = 50;
+
+/// Append a deploy history entry, dropping the app's oldest entries beyond
+/// [`DEPLOY_HISTORY_PER_APP`].
+///
+/// Every deploy, retry and abort records one, each with a full spec, so an
+/// app the reconciler retried for a week used to hold thousands of specs in
+/// memory. Fifty is plenty to read a story from; `relish rollback` in a
+/// cluster reads the council's rollback targets, not this.
+pub(crate) fn record_deploy_history(
+    history: &mut Vec<crate::meat::deploy_types::DeployHistoryEntry>,
+    entry: crate::meat::deploy_types::DeployHistoryEntry,
+) {
+    let app_id = entry.app_id.clone();
+    history.push(entry);
+    let kept = history
+        .iter()
+        .filter(|entry| entry.app_id == app_id)
+        .count();
+    let mut excess = kept.saturating_sub(DEPLOY_HISTORY_PER_APP);
+    history.retain(|entry| {
+        if excess > 0 && entry.app_id == app_id {
+            excess -= 1;
+            return false;
+        }
+        true
+    });
+}
+
 /// The fast pre-create outputs the loop hands back for a fresh instance.
 pub(super) struct PreparedInstance {
     pub(super) oci_spec: crate::grill::oci::OciSpec,
@@ -454,7 +485,7 @@ impl DeployOps {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-    ) -> Result<(), BunError> {
+    ) -> Result<Option<AppSpec>, BunError> {
         self.call(
             |reply| DeployOp::StoreDeployedSpec {
                 app_name: app_name.to_string(),
@@ -1056,9 +1087,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 spec,
                 reply,
             } => {
+                let adopted = self.adopted_spec(&app_name, &namespace);
                 self.forget_adopted_app(&app_name, &namespace);
-                self.deployed_specs.insert((app_name, namespace), *spec);
-                let _ = reply.send(Ok(()));
+                let previous = self
+                    .deployed_specs
+                    .insert((app_name, namespace), *spec)
+                    .or(adopted);
+                let _ = reply.send(Ok(previous));
             }
             DeployOp::ListExistingOwned {
                 app_name,
@@ -1474,7 +1509,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(());
             }
             DeployOp::PushDeployHistory { entry, reply } => {
-                self.deploy_history.write().await.push(*entry);
+                record_deploy_history(&mut *self.deploy_history.write().await, *entry);
                 let _ = reply.send(());
             }
             DeployOp::RebuildRoutingTable { reply } => {
@@ -1503,5 +1538,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::{DEPLOY_HISTORY_PER_APP, record_deploy_history};
+    use crate::meat::deploy_types::{DeployHistoryEntry, DeployId, DeployResult};
+
+    fn entry(app: &str, id: u64) -> DeployHistoryEntry {
+        DeployHistoryEntry {
+            id: DeployId(id),
+            app_id: crate::meat::types::AppId::new(app, "default"),
+            image: format!("{app}:{id}"),
+            result: DeployResult::Completed,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+            steps_completed: 1,
+            steps_total: 1,
+            spec: None,
+        }
+    }
+
+    #[test]
+    fn deploy_history_keeps_the_newest_fifty_entries_per_app() {
+        let mut history = Vec::new();
+        record_deploy_history(&mut history, entry("api", 0));
+        for id in 0..120 {
+            record_deploy_history(&mut history, entry("web", id));
+        }
+        let web: Vec<u64> = history
+            .iter()
+            .filter(|entry| entry.app_id.name == "web")
+            .map(|entry| entry.id.0)
+            .collect();
+        assert_eq!(web.len(), DEPLOY_HISTORY_PER_APP);
+        assert_eq!(web.first(), Some(&70), "the oldest entries go first");
+        assert_eq!(web.last(), Some(&119));
+        assert!(
+            history.iter().any(|entry| entry.app_id.name == "api"),
+            "one app's deploys never push out another app's history"
+        );
     }
 }

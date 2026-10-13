@@ -7,6 +7,8 @@ use super::trace::{MAX_CONCURRENT_TRACES, trace_dns_command, trace_dns_step, tra
 use super::*;
 use crate::grill::mock::MockGrill;
 
+#[cfg(target_os = "linux")]
+mod cgroup_faults;
 mod fault_coverage;
 mod loop_harness;
 mod loop_rule;
@@ -7539,6 +7541,208 @@ async fn rolling_redeploy_rolls_back_when_the_probe_fails() {
     agent_handle.await.unwrap();
 }
 
+/// Run `first`, then `second` with the given replacements failing their
+/// health wait, on a running agent. Returns the agent once it has shut
+/// down, every event of the second deploy, and its deploy history.
+async fn deploy_over_failing_replacements(
+    first: &str,
+    second: &str,
+    failing: &[InstanceId],
+) -> (
+    TestAgent,
+    Vec<ApplyEvent>,
+    Vec<crate::meat::deploy_types::DeployHistoryEntry>,
+) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    let history = agent.deploy_history_handle();
+    let task = tokio::spawn(async move {
+        agent.run().await;
+        agent
+    });
+    expect_complete(&send_deploy(&tx, Config::parse(first).unwrap()).await);
+    for id in failing {
+        grill.set_state(id, ContainerState::Failed);
+    }
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        send_deploy(&tx, Config::parse(second).unwrap()),
+    )
+    .await
+    .expect("the aborted rollout must finish");
+    let history = history.read().await.clone();
+    shutdown.cancel();
+    (task.await.unwrap(), events, history)
+}
+
+/// The live instances of `web`, sorted, with the image each runs.
+fn web_instances(agent: &BunAgent<MockGrill>) -> Vec<(String, String)> {
+    let mut instances: Vec<(String, String)> = agent
+        .supervisor
+        .list_instances()
+        .iter()
+        .filter(|instance| instance.app_name == "web")
+        .filter(|instance| {
+            !matches!(
+                instance.state,
+                ContainerState::Stopped | ContainerState::Failed
+            )
+        })
+        .map(|instance| (instance.id.0.clone(), instance.image.clone()))
+        .collect();
+    instances.sort();
+    instances
+}
+
+/// #692 scenario A: three replicas on one node, defaults. The first
+/// replacement goes healthy and an old instance retires for it, then the
+/// second replacement fails. Auto-rollback used to kill the healthy
+/// replacement and never restart the retired old instance, leaving two of
+/// three. It must end with three replicas, all on the old spec.
+#[tokio::test]
+async fn auto_rollback_after_a_retirement_restores_old_capacity() {
+    let canary = |generation, ordinal| {
+        crate::grill::InstanceIdentity::canary("default", "web", generation, ordinal).instance_id()
+    };
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\n",
+        "[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[canary(1, 1)],
+    )
+    .await;
+
+    let message = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the failed rollout must report an error");
+    assert!(message.contains("rolled back"), "{message}");
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances.len(),
+        3,
+        "the abort must end with the capacity it started from: {instances:?}"
+    );
+    assert!(
+        instances.iter().all(|(_, image)| image == "web:v1"),
+        "every replica must run the old spec again: {instances:?}"
+    );
+    assert!(
+        instances.iter().all(|(id, _)| !id.contains("-g1-")),
+        "no replacement of the failed spec may survive a rollback: {instances:?}"
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|(id, _)| id.contains("-g2-"))
+            .count(),
+        1,
+        "the retired old instance comes back as one old-spec replacement: {instances:?}"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::RolledBack)
+    );
+    assert_eq!(
+        agent
+            .deployed_specs
+            .get(&("web".to_string(), "default".to_string()))
+            .and_then(|spec| spec.image.clone())
+            .as_deref(),
+        Some("web:v1"),
+        "a rolled-back app's deployed spec is the old one again"
+    );
+}
+
+/// #692 scenario B: a managed volume forces stop-first, so the only old
+/// instance retires before its replacement starts. When the replacement
+/// fails, the old spec must run again rather than leave nothing.
+#[tokio::test]
+async fn auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance() {
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\n[[app.web.volumes]]\npath = '/data'\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\n",
+        "[app.web]\nimage = 'web:v2'\n[[app.web.volumes]]\npath = '/data'\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id()],
+    )
+    .await;
+
+    assert!(
+        matches!(events.last(), Some(ApplyEvent::Error { .. })),
+        "{events:?}"
+    );
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances,
+        vec![(
+            crate::grill::InstanceIdentity::canary("default", "web", 2, 0)
+                .instance_id()
+                .0,
+            "web:v1".to_string()
+        )],
+        "the volume app must run its old spec again, not nothing"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::RolledBack)
+    );
+}
+
+/// When the old spec can't come back either, the abort keeps the healthy
+/// replacement serving and says so, rather than killing it.
+#[tokio::test]
+async fn abort_keeps_healthy_new_instances_when_old_capacity_cannot_return() {
+    let canary = |generation, ordinal| {
+        crate::grill::InstanceIdentity::canary("default", "web", generation, ordinal).instance_id()
+    };
+    let (agent, events, history) = deploy_over_failing_replacements(
+        "[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        "[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 3\n\
+         [app.web.deploy]\ndrain_timeout = '0s'\nhealth_timeout = '1s'\n",
+        &[canary(1, 1), canary(2, 0), canary(2, 1), canary(2, 2)],
+    )
+    .await;
+
+    let message = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the failed rollout must report an error");
+    assert!(message.contains("halted"), "{message}");
+    let instances = web_instances(&agent);
+    assert_eq!(
+        instances.len(),
+        3,
+        "healthy new + remaining old must survive the abort: {instances:?}"
+    );
+    assert!(
+        instances.contains(&(canary(1, 0).0, "web:v2".to_string())),
+        "the healthy replacement must keep serving: {instances:?}"
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|(_, image)| image == "web:v1")
+            .count(),
+        2,
+        "{instances:?}"
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.result),
+        Some(crate::meat::deploy_types::DeployResult::Halted)
+    );
+}
+
 /// The gate must not break healthy deploys: with the responder answering
 /// 200, the rolling redeploy completes through the real probe path and
 /// the replacement takes over.
@@ -8679,6 +8883,126 @@ async fn started_rootless_instance_persists_network_recreation_state() {
     assert_eq!(persisted[0].schema, crate::grill::records::RECORD_SCHEMA);
     assert_eq!(persisted[0].boot_id, crate::grill::records::current_boot());
     assert_eq!(persisted[0].rootless_network, Some(rootless_network));
+}
+
+/// An adoption record whose workload has a cgroup and resource limits, as
+/// a runc instance's has.
+pub(super) fn limited_adoption_record(
+    instance: &str,
+    app: &str,
+) -> crate::grill::records::InstanceRecord {
+    let mut record = adoption_record(instance, app, false);
+    record.oci_spec.linux.cgroups_path = Some(format!("/reliaburger/default/{app}/0"));
+    record.oci_spec.linux.resources = Some(crate::grill::oci::OciResources {
+        cpu: Some(crate::grill::oci::OciCpuResources {
+            quota: 50_000,
+            period: 100_000,
+        }),
+        memory: Some(crate::grill::oci::OciMemoryResources {
+            limit: 128 * 1024 * 1024,
+        }),
+        unified: std::collections::BTreeMap::from([(
+            "memory.high".to_string(),
+            "33554432".to_string(),
+        )]),
+    });
+    record
+}
+
+/// Whether `ps` reports `pid` as stopped (state `T`).
+pub(super) fn process_is_stopped(pid: u32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim_start()
+        .starts_with('T')
+}
+
+/// Wait up to five seconds for `pid` to be stopped, or running.
+pub(super) async fn wait_for_stopped(pid: u32, stopped: bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_is_stopped(pid) != stopped {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pid {pid} never became stopped={stopped}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Bun keeps a CPU fault's saved `cpu.max` only in memory. A Bun that was
+/// killed mid-fault left the cap behind, and the next one adopted the
+/// instance without lifting it (#699): the recorded specification says
+/// what the limits should be, so adoption writes them back.
+#[tokio::test]
+async fn adopting_an_instance_restores_its_recorded_cpu_max() {
+    let records = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_cgroup_mount(mount.path().to_path_buf());
+    let record = limited_adoption_record("default__web-0", "web");
+    let cgroup = mount.path().join("reliaburger/default/web/0");
+    std::fs::create_dir_all(&cgroup).unwrap();
+    // What a 99% CPU fault, a memory fault and a disk-I/O fault left.
+    std::fs::write(cgroup.join("cpu.max"), "1000 100000").unwrap();
+    std::fs::write(cgroup.join("memory.high"), "1024").unwrap();
+    std::fs::write(
+        cgroup.join("io.max"),
+        "8:0 rbps=1048576 wbps=1048576 riops=max wiops=max\n",
+    )
+    .unwrap();
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let read = |name: &str| std::fs::read_to_string(cgroup.join(name)).unwrap();
+    assert_eq!(read("cpu.max"), "50000 100000");
+    assert_eq!(read("memory.high"), "33554432");
+    assert_eq!(read("io.max"), "8:0 rbps=max wbps=max riops=max wiops=max");
+}
+
+/// A pause fault's frozen pids lived only in the old Bun's registry, so an
+/// instance paused when Bun died stayed frozen for good (#699).
+#[tokio::test]
+async fn adopting_an_instance_sends_sigcont_to_its_pids() {
+    let records = tempfile::tempdir().unwrap();
+    let mount = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    agent.set_cgroup_mount(mount.path().to_path_buf());
+    let mut main = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut worker = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    for child in [&main, &worker] {
+        crate::smoker::process::pause_process(child.id() as i32).unwrap();
+        wait_for_stopped(child.id(), true).await;
+    }
+    // The runtime names the main process; the cgroup lists the rest.
+    grill.set_pid(main.id());
+    let record = limited_adoption_record("default__web-0", "web");
+    let cgroup = mount.path().join("reliaburger/default/web/0");
+    std::fs::create_dir_all(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), format!("{}\n", worker.id())).unwrap();
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+    grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    wait_for_stopped(main.id(), false).await;
+    wait_for_stopped(worker.id(), false).await;
+    for child in [&mut main, &mut worker] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 #[tokio::test]

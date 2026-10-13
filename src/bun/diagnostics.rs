@@ -202,6 +202,11 @@ pub struct DesiredAppEvidence {
     /// (#482). Empty for an app without a managed volume.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volume_homes: Vec<String>,
+    /// The app's current spec failed to roll out on a node (#692): the
+    /// leader holds every other node on the previous spec until a different
+    /// spec is applied. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_failed: Option<crate::meat::deploy_types::RolloutFailure>,
 }
 
 /// Current diagnostics wire schema.

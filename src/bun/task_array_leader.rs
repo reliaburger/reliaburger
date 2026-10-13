@@ -1487,7 +1487,7 @@ async fn sync_node(
 ) -> Result<NodeSyncResponse, String> {
     let Some(url) = url else {
         return match &state.task_arrays.node {
-            Some(node) => Ok(node.sync(request).await),
+            Some(node) => node.sync(request).await.map_err(|error| error.to_string()),
             None => Err("this node has no task executor".to_string()),
         };
     };

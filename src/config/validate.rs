@@ -404,9 +404,10 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
 
     // Deploy block: `max_surge = 0` with `max_unavailable = 0` leaves a rolling
     // deploy no legal move in either direction, so reject it here rather than
-    // let the rollout wedge (M7).
+    // let the rollout wedge (M7). A timeout that doesn't parse is refused
+    // too, rather than replaced by the default (#692).
     if let Some(deploy) = &app.deploy
-        && let Err(reason) = crate::meat::deploy_types::DeployConfig::from_spec(deploy).validate()
+        && let Err(reason) = crate::meat::deploy_types::DeployConfig::parse(deploy)
     {
         return Err(ConfigError::Validation {
             field: "deploy".to_string(),
@@ -1135,6 +1136,55 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. } if field == "args/working_dir"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn unknown_deploy_strategy_is_rejected() {
+        // "bluegreen" used to mean "rolling", silently.
+        let error = toml::from_str::<AppSpec>(
+            r#"
+            image = "web:v1"
+            [deploy]
+            strategy = "bluegreen"
+        "#,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "an unknown strategy must fail to parse: {error}"
+        );
+        for strategy in ["rolling", "blue-green"] {
+            let app: AppSpec = toml::from_str(&format!(
+                "image = \"web:v1\"\n[deploy]\nstrategy = \"{strategy}\"\n"
+            ))
+            .unwrap();
+            config_with_app("web", app).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn unparseable_drain_timeout_is_rejected() {
+        for (field, value) in [
+            ("drain_timeout", "1m30s"),
+            ("drain_timeout", "500ms"),
+            ("health_timeout", "a minute"),
+        ] {
+            let app: AppSpec = toml::from_str(&format!(
+                "image = \"web:v1\"\n[deploy]\n{field} = \"{value}\"\n"
+            ))
+            .unwrap();
+            let err = config_with_app("web", app).validate().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Validation { field: ref f, ref reason, .. }
+                    if f == "deploy" && reason.contains(field) && reason.contains(value)),
+                "{field} = {value:?} must be refused, not replaced by the default: {err:?}"
+            );
+        }
+        let app: AppSpec = toml::from_str(
+            "image = \"web:v1\"\n[deploy]\ndrain_timeout = \"90s\"\nhealth_timeout = \"2m\"\n",
+        )
+        .unwrap();
+        config_with_app("web", app).validate().unwrap();
     }
 
     #[test]

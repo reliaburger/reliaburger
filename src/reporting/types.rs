@@ -26,6 +26,11 @@ pub struct StateReport {
     pub running_apps: Vec<RunningApp>,
     /// Cached desired-state specs this node was last assigned.
     pub cached_specs: Vec<CachedSpec>,
+    /// The version of each app this node's placement reconciler last
+    /// finished deploying. The leader reads rollout progress from these
+    /// (#692), so a new leader carries on where the old one stopped.
+    #[serde(default)]
+    pub rollouts: Vec<RolloutReport>,
     /// Current resource usage.
     pub resource_usage: ResourceUsage,
     /// Capacity task attempts and reusable executors hold in this node's
@@ -142,6 +147,18 @@ pub enum ReportHealthStatus {
     Starting,
     /// Health status is not known.
     Unknown,
+}
+
+/// One app version a node has finished deploying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutReport {
+    /// Name of the app.
+    pub app_name: String,
+    /// Namespace the app belongs to.
+    pub namespace: String,
+    /// [`crate::meat::deploy_types::rollout_fingerprint`] of the spec the
+    /// node's share converged on.
+    pub fingerprint: String,
 }
 
 /// Cached desired-state spec on a worker node.
@@ -272,6 +289,7 @@ mod tests {
                 },
             }],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: ResourceUsage {
                 cpu_used_millicores: 500,
                 memory_used_mb: 1024,

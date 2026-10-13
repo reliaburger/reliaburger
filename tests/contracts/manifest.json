@@ -6334,33 +6334,6 @@
       ]
     },
     {
-      "id": "issue-555-original-standard-clients",
-      "issue": 555,
-      "promise": "Complete all uncovered original ignored cases through their declared owner.",
-      "supported_paths": [
-        "Original finite source/test identity retains its owner binding."
-      ],
-      "refused_paths": [
-        "Missing, skipped, unfinished or wrong-owner success cannot qualify."
-      ],
-      "boundaries": [
-        "Inherited host/feature selection must be checked by actual discovery; source tables have no CI authority."
-      ],
-      "cases": [
-        {
-          "id": "legacy-ci-reliaburger-suite-registry_standard_clients-crane_logs_in_pushes_and_pulls_over_tls",
-          "binary": "reliaburger::suite",
-          "test": "registry_standard_clients::crane_logs_in_pushes_and_pulls_over_tls",
-          "requires": [
-            "standard-clients"
-          ],
-          "sources": [
-            "tests/suite/registry_standard_clients.rs"
-          ]
-        }
-      ]
-    },
-    {
       "id": "issue-588-a_task_array_survives_losing_a_node_mid_run",
       "issue": 588,
       "promise": "Delegated arrays retain unique accepted outcomes after worker loss.",
@@ -7280,6 +7253,44 @@
       ]
     },
     {
+      "id": "issue-780-root-cleanup-mounts",
+      "issue": 780,
+      "promise": "An OCI test's root is unmounted and removed when the test ends, whether it passed or panicked.",
+      "supported_paths": [
+        "Rootful runs that leave workload identity tmpfs mounted beneath the root"
+      ],
+      "cases": [
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        },
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A root that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
       "id": "issue-734-rootless-test-cleanup",
       "issue": 734,
       "promise": "A failed rootless OCI test leaves none of its network helpers running.",
@@ -7371,6 +7382,78 @@
       ]
     },
     {
+      "id": "issue-699-faults-revert-after-bun-restart",
+      "issue": 699,
+      "promise": "A chaos fault never outlives the Bun that injected it: CPU and memory caps, paused processes and pinned eBPF fault entries are undone when the next Bun adopts its workloads, and CPU and memory faults restore the workload's own cgroup values when they expire.",
+      "supported_paths": [
+        "Rootful Linux with cgroup v2, through the agent's adoption of recorded instances",
+        "The owned eBPF loader with maps pinned in bpffs"
+      ],
+      "cases": [
+        {
+          "id": "issue-699-cpu_fault_round_trip_restores_cpu_max",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_round_trip_restores_cpu_max",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-memory_fault_round_trip_restores_memory_high",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::memory_fault_round_trip_restores_memory_high",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-cpu_fault_is_reverted_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_is_reverted_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-paused_instance_resumes_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::paused_instance_resumes_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-owned_loader_clears_stale_fault_connect_entries",
+          "binary": "reliaburger::ebpf",
+          "test": "owned_loader_clears_stale_fault_connect_entries",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "The pinned egress policy is not cleared along with the fault entries."
+      ],
+      "boundaries": [
+        "Dropping an in-process agent stands in for a SIGKILL of Bun; the cgroup and the workload process are real."
+      ]
+    },
+    {
       "id": "issue-697-image_survives_loss_of_the_pushing_node",
       "issue": 697,
       "promise": "A pushed image survives losing the node it was pushed to: heal counts only live copies and re-replicates from a survivor.",
@@ -7393,6 +7476,88 @@
           ],
           "sources": [
             "tests/registry_durability.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-698-standard-clients",
+      "issue": 698,
+      "promise": "docker, podman, skopeo and crane log in to Pickle with an API token, verify the cluster CA, push an image and pull its layers back.",
+      "supported_paths": [
+        "A Pickle TLS listener on a non-loopback address under a name its node certificate carries, with the cluster root CA in /etc/docker/certs.d, /etc/containers/certs.d, skopeo --cert-dir or crane's SSL_CERT_FILE."
+      ],
+      "refused_paths": [
+        "A wrong token, a registry certificate from another CA, and a namespace-scoped token pushing outside its namespace are each refused by the client."
+      ],
+      "boundaries": [
+        "Linux only, on a host prepared by scripts/standard-clients-host.sh; client versions are whatever the runner image ships and are logged by the gate. oras is not exercised."
+      ],
+      "cases": [
+        {
+          "id": "standard-clients-docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_refuses_a_registry_signed_by_another_ca",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_refuses_a_registry_signed_by_another_ca",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-skopeo_copies_between_repositories_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::skopeo_copies_between_repositories_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-crane_pulls_layers_back_with_ca_verification",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
           ]
         }
       ]
@@ -7422,6 +7587,58 @@
       ],
       "boundaries": [
         "Run through the real Linux gate; the portable mixed-runtime tests cover the routing rules with mock backends."
+      ]
+    },
+    {
+      "id": "issue-692-rollout-safety",
+      "issue": 692,
+      "promise": "A cluster spec change reaches one node at a time, a failed rollout is marked RolloutFailed and never retried until the spec changes, and rollback targets survive every node restarting.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs"
+      ],
+      "cases": [
+        {
+          "id": "rollout-safety-three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "binary": "reliaburger::placement",
+          "test": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "binary": "reliaburger::placement",
+          "test": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-rollback_works_after_every_node_restarts",
+          "binary": "reliaburger::placement",
+          "test": "rollback_works_after_every_node_restarts",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Re-applying the identical failed spec keeps RolloutFailed; only a different spec clears it."
+      ],
+      "boundaries": [
+        "Rollout progress comes from node reports; full leader-coordinated rollouts with a cluster-wide budget are not claimed."
       ]
     }
   ]

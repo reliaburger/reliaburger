@@ -3128,6 +3128,58 @@ fn egress_owner_process_fixture() {
     }
 }
 
+/// The pinned maps outlive a crashed Bun, and its faults must not: the next
+/// Bun's registry is empty, so a drop or partition entry left in
+/// `fault_connect_map` would keep firing with nothing in `fault list` to
+/// clear it (#699). The egress policy in the same pins stays.
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+fn owned_loader_clears_stale_fault_connect_entries() {
+    use reliaburger::smoker::bpf_maps::{read_connect_fault, write_connect_fault};
+    use reliaburger::smoker::bpf_types::{
+        BpfConnectFaultValue, FAULT_ACTION_PARTITION, partition_fault_key,
+    };
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    let leaf = reliaburger::sesame::egress::cgroup_id_of_path(&owned.cgroup.join("probe")).unwrap();
+    let key = partition_fault_key(
+        u32::from(Ipv4Addr::new(127, 128, 0, 9)).to_be(),
+        6379u16.to_be(),
+        leaf,
+    );
+    let mut crashed = owned.load().unwrap();
+    write_connect_fault(
+        &mut crashed.bpf,
+        key,
+        BpfConnectFaultValue {
+            action: FAULT_ACTION_PARTITION,
+            probability: 100,
+            _pad: [0; 6],
+            delay_ns: 0,
+            jitter_ns: 0,
+            expires_ns: u64::MAX,
+        },
+    )
+    .unwrap();
+    reliaburger::sesame::egress::set_egress_enforced(&mut crashed.bpf, leaf).unwrap();
+    // Dropping the handle is what a SIGKILL leaves: pins and links stay.
+    drop(crashed);
+
+    let mut recovered = owned.load().unwrap();
+
+    assert!(
+        read_connect_fault(&mut recovered.bpf, &key)
+            .unwrap()
+            .is_none(),
+        "a fault from the previous Bun survived its recovery"
+    );
+    assert!(
+        reliaburger::sesame::egress::egress_enforced(&mut recovered.bpf, leaf).unwrap(),
+        "recovery cleared egress policy along with the faults"
+    );
+    recovered.retire_owned().unwrap();
+}
+
 #[test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 fn persistent_policy_refuses_conflicting_owners_and_retired_state() {
