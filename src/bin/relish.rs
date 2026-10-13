@@ -692,7 +692,7 @@ enum Command {
     },
     /// Run the built-in integration test suite against the cluster.
     Test {
-        /// Comma-separated groups, or exact scenario names with --chaos. Omit for all.
+        /// Comma-separated groups or exact case names (scenario names with --chaos). Omit for all.
         #[arg(long)]
         filter: Option<String>,
         /// Maximum concurrently running tests.

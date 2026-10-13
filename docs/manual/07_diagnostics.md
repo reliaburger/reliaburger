@@ -189,6 +189,7 @@ check it.
 ```sh
 relish test                                  # every group, four at a time
 relish test --filter scheduling,firewall     # just these groups
+relish test --filter process_job_with_exit_zero_succeeds   # just this case
 relish test --profile full-runc              # stricter acceptance profile
 relish --output json test                    # report for CI
 ```
@@ -196,7 +197,9 @@ relish --output json test                    # report for CI
 Group names are `scheduling`, `service-discovery`, `deployments`,
 `health-checks`, `secrets-config`, `firewall`, `workload-identity`, `ingress`,
 `volumes`, `process-workloads`, `jobs`, `image-registry` and
-`cluster-coordination`. The default `development` profile accepts a skip with
+`cluster-coordination`. A `--filter` entry can also be an exact case name,
+as the report prints it, to run one case on its own; groups and case names
+mix. The default `development` profile accepts a skip with
 a known reason, such as a capability this node lacks. A node with
 `[process_workloads] mount_isolation` on, the Linux default, doesn't advertise
 host workloads, because it refuses them until #714 lands; its host

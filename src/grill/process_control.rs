@@ -21,6 +21,10 @@ use crate::file_lock::{FileLock, FileLockError};
 
 mod prune;
 
+/// How many times `prepare` starts again after a concurrent forget removed
+/// the identity it was replacing.
+const PREPARE_ATTEMPTS: usize = 3;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessControl {
     root: PathBuf,
@@ -152,7 +156,39 @@ impl ProcessControl {
             .await
     }
 
+    /// The generation of `id`'s current launch, or `None` when it has none.
+    pub(crate) async fn generation(
+        &self,
+        id: &InstanceId,
+    ) -> io::Result<Option<super::RuntimeGeneration>> {
+        self.run(id, |this, id| {
+            match std::fs::symlink_metadata(this.directory(&id)?) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+                Ok(_) => this
+                    .load(&id)
+                    .map(|record| Some(super::RuntimeGeneration::process(&record.nonce))),
+            }
+        })
+        .await
+    }
+
+    /// Publish a new prepared generation of `id`, replacing a retired one.
     pub(crate) async fn prepare(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
+        // Forgetting the retired generation (#738, #850) can remove the
+        // identity while this waits for its locks, as when an app is deleted
+        // and applied again at once. Nothing owns it then, so prepare again
+        // from nothing, exactly as on a new node.
+        for _ in 1..PREPARE_ATTEMPTS {
+            match self.prepare_once(id, spec).await {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                result => return result,
+            }
+        }
+        self.prepare_once(id, spec).await
+    }
+
+    async fn prepare_once(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
         let previous_nonce = self
             .run(id, |this, id| {
                 match std::fs::symlink_metadata(this.directory(&id)?) {
@@ -189,7 +225,8 @@ impl ProcessControl {
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     if previous_nonce.is_some() {
-                        return Err(io::Error::other(
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
                             "process generation disappeared before preparation",
                         ));
                     }
@@ -1055,6 +1092,35 @@ mod tests {
             control.load(&running).unwrap().phase,
             OwnerPhase::Running { .. }
         ));
+    }
+
+    /// A forget for a retired generation that arrives after the identity
+    /// launched again must leave the successor alone (#850).
+    #[tokio::test]
+    async fn forgetting_a_stale_generation_keeps_the_successors_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__web-0__init-0".into());
+        assert_eq!(control.generation(&id).await.unwrap(), None);
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        let retired = control.generation(&id).await.unwrap().unwrap();
+
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        let successor = control.generation(&id).await.unwrap().unwrap();
+        assert_ne!(retired, successor);
+
+        assert!(
+            control.forget_retired(&id, Some(&retired)).await.is_err(),
+            "a stale generation forgot its successor"
+        );
+        assert_eq!(
+            control.generation(&id).await.unwrap(),
+            Some(successor.clone())
+        );
+        control.forget_retired(&id, Some(&successor)).await.unwrap();
+        assert_eq!(control.generation(&id).await.unwrap(), None);
     }
 
     #[tokio::test]

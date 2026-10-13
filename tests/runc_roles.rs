@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use reliaburger::grill::command::{CommandState, OwnedCommands};
+use reliaburger::grill::command::{CommandId, CommandState, OwnedCommands};
 use reliaburger::grill::runc_intent::{
     IntentCommands, IntentConfiguration, IntentJournal, IntentPhase, RuntimeRole,
 };
@@ -683,6 +683,166 @@ async fn helper_history_refuses_duplicate_missing_or_unretired_bindings() {
     std::fs::write(path, original).unwrap();
     recover(root.path())
         .await
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+/// Bind a prepared helper as the current one, moving the old binding into
+/// the history, as `start_role` does just before it starts the helper.
+fn bind_prepared_helper(root: &Path, prepared: &CommandId) {
+    let path = record_path(root);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let previous = record["roles"]["rootless_network"].clone();
+    record["roles"]["retired_rootless_network"]
+        .as_array_mut()
+        .unwrap()
+        .push(previous);
+    record["roles"]["rootless_network"] = serde_json::to_value(prepared).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+}
+
+/// Bun execs while it replaces a dead network helper: the new helper is bound,
+/// but the process that would have started it is gone. The next process must
+/// cancel that helper and start another, not refuse adoption (#778).
+#[tokio::test]
+async fn the_next_process_replaces_a_helper_its_predecessor_bound_but_never_started() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        "exit 0",
+    )
+    .await;
+    terminal(&commands, RuntimeRole::RootlessNetwork).await;
+    drop(commands);
+    let collection = role_collection(root.path(), "rootless-network");
+    let abandoned = collection
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    bind_prepared_helper(root.path(), &abandoned);
+    let commands = recover(root.path()).await;
+    assert_eq!(
+        commands
+            .role_state(RuntimeRole::RootlessNetwork)
+            .await
+            .unwrap(),
+        Some(CommandState::Prepared)
+    );
+    assert_eq!(
+        commands.settle_network_helper().await.unwrap(),
+        Some(CommandState::Cancelled)
+    );
+    assert!(collection.start(&abandoned).await.is_err());
+    let commands = shell(commands, RuntimeRole::RootlessNetwork, "exec sleep 60").await;
+    assert!(matches!(
+        commands.settle_network_helper().await.unwrap(),
+        Some(CommandState::Running { .. })
+    ));
+    assert_eq!(collection.inventory().await.unwrap().len(), 3);
+    commands
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+/// A helper that is still exiting when the next process replaces it gets a
+/// bounded wait, like an earlier short command does (#778).
+#[tokio::test]
+async fn helper_replacement_waits_for_a_predecessor_helper_that_is_still_exiting() {
+    let root = tempfile::tempdir().unwrap();
+    let release = root.path().join("release");
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        &format!(
+            "while [ ! -f '{}' ]; do sleep 0.02; done",
+            release.display()
+        ),
+    )
+    .await;
+    drop(commands);
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(release, "exit").unwrap();
+    });
+    let commands = recover(root.path())
+        .await
+        .start_role(
+            RuntimeRole::RootlessNetwork,
+            Path::new("/bin/sh"),
+            &["-c".into(), "exec sleep 60".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("a helper that was still exiting refused its replacement");
+    releaser.await.unwrap();
+    commands
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+/// The wait is bounded: a helper that keeps running still refuses its
+/// replacement, and keeps running.
+#[tokio::test]
+async fn helper_replacement_still_refuses_a_helper_that_keeps_running() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        "exec sleep 60",
+    )
+    .await;
+    drop(commands);
+    let started = std::time::Instant::now();
+    let error = recover(root.path())
+        .await
+        .start_role(
+            RuntimeRole::RootlessNetwork,
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("still running"),
+        "unexpected refusal: {error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let commands = recover(root.path()).await;
+    assert!(matches!(
+        commands
+            .role_state(RuntimeRole::RootlessNetwork)
+            .await
+            .unwrap(),
+        Some(CommandState::Running { .. })
+    ));
+    assert_eq!(
+        role_collection(root.path(), "rootless-network")
+            .inventory()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    commands
         .seal(Duration::from_secs(15))
         .await
         .unwrap()

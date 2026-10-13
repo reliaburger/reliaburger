@@ -121,6 +121,14 @@ pub(super) enum DeployOp {
         index: usize,
         reply: oneshot::Sender<Result<InstanceId, BunError>>,
     },
+    /// Remember the runtime generation an initialiser launched, for its
+    /// parent's retirement to forget (#850).
+    RecordInitialiserGeneration {
+        instance_id: InstanceId,
+        initialiser: InstanceId,
+        generation: crate::grill::RuntimeGeneration,
+        reply: oneshot::Sender<()>,
+    },
     /// Release an initialiser only after confirmed runtime retirement.
     ForgetInitialiser {
         instance_id: InstanceId,
@@ -277,6 +285,7 @@ impl DeployOp {
             DeployOp::PrepareFreshInstance { .. } => "prepare_fresh_instance",
             DeployOp::StoreOciSpec { .. } => "store_oci_spec",
             DeployOp::RegisterInitialiser { .. } => "register_initialiser",
+            DeployOp::RecordInitialiserGeneration { .. } => "record_initialiser_generation",
             DeployOp::ForgetInitialiser { .. } => "forget_initialiser",
             DeployOp::ApplyNetworkPreStart { .. } => "apply_network_pre_start",
             DeployOp::TransitionState { .. } => "transition_state",
@@ -724,6 +733,24 @@ impl DeployOps {
             Err(BunError::InstanceNotFound {
                 instance_id: instance_id.clone(),
             }),
+        )
+        .await
+    }
+
+    pub(super) async fn record_initialiser_generation(
+        &self,
+        instance_id: &InstanceId,
+        initialiser: &InstanceId,
+        generation: crate::grill::RuntimeGeneration,
+    ) {
+        self.call(
+            |reply| DeployOp::RecordInitialiserGeneration {
+                instance_id: instance_id.clone(),
+                initialiser: initialiser.clone(),
+                generation,
+                reply,
+            },
+            (),
         )
         .await
     }
@@ -1298,6 +1325,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     _ => Err(BunError::InstanceNotFound { instance_id }),
                 };
                 let _ = reply.send(result);
+            }
+            DeployOp::RecordInitialiserGeneration {
+                instance_id,
+                initialiser,
+                generation,
+                reply,
+            } => {
+                // Only the parent that still owns the initialiser records it.
+                if self
+                    .initialisers
+                    .get(&instance_id)
+                    .is_some_and(|children| children.contains(&initialiser))
+                {
+                    self.initialiser_generations
+                        .entry(instance_id)
+                        .or_default()
+                        .insert(initialiser, generation);
+                }
+                let _ = reply.send(());
             }
             DeployOp::ForgetInitialiser {
                 instance_id,

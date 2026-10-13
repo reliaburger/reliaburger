@@ -1405,6 +1405,58 @@ async fn deleting_an_app_removes_the_ownership_journal_of_every_instance() {
 }
 
 #[tokio::test]
+async fn deleting_an_app_removes_its_init_containers_journals_and_a_redeploy_runs_its_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path());
+    let app =
+        format!("[app.web]\n{SLEEPER}[[app.web.init]]\ncommand = ['/bin/sh', '-c', 'exit 0']\n");
+    deploy(&sender, &app).await;
+    let init = "default__web-0__init-0";
+    assert!(owner_directory(directory.path(), init).is_dir());
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    // The redeploy reuses the initialiser's identity straight away and
+    // must still read its own exit code (#850).
+    deploy(&sender, &app).await;
+    assert!(
+        owner_directory(directory.path(), init).is_dir(),
+        "the redeploy's initialiser lost its journal"
+    );
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    owners_forgotten(directory.path(), &["default__web-0", init]).await;
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
     let directory = tempfile::tempdir().unwrap();
     let (sender, shutdown, task) = running_agent(directory.path());
