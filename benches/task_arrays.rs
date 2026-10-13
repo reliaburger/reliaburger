@@ -4,7 +4,8 @@
 /// predict the headline before any VM exists:
 /// - range-set operations the leader does per chunk;
 /// - the leader's whole control-plane cost for a 1M-task array (no
-///   processes), with 3 and 200 nodes, and the JSON snapshot of it;
+///   processes), with 3 and 200 nodes, and the JSON snapshot of it,
+///   encoded 64 times an iteration;
 /// - one leader tick (plan every array's writes, batch them, apply the
 ///   entry) with 64 concurrent arrays on 3 nodes, and with one array of
 ///   one-task chunks on 10 nodes, the shape that splits state the most;
@@ -129,10 +130,21 @@ fn bench_leader(c: &mut Criterion) {
             |b, &nodes| b.iter(|| simulate_leader(nodes)),
         );
     }
+    // One encode of the finished state takes about 0.1 ms, close enough to
+    // timer and scheduling noise that it was the noisiest benchmark in the
+    // gate (#872). So each iteration encodes it `JSON_ENCODES` times, and the
+    // throughput still reports encodes per second. The name carries the
+    // count: a different workload must not be compared with main's baseline
+    // for the old one.
+    const JSON_ENCODES: usize = 64;
     let finished = simulate_leader(3);
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("json_encode_1m", |b| {
-        b.iter(|| serde_json::to_vec(&finished).map(|bytes| bytes.len()))
+    group.throughput(Throughput::Elements(JSON_ENCODES as u64));
+    group.bench_function("json_encode_1m_x64", |b| {
+        b.iter(|| {
+            (0..JSON_ENCODES)
+                .map(|_| serde_json::to_vec(&finished).map_or(0, |bytes| bytes.len()))
+                .sum::<usize>()
+        })
     });
     group.finish();
 }
