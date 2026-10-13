@@ -5455,14 +5455,6 @@ async fn cluster_consumer_advances_identical_generations_and_does_not_consume_re
         .unwrap()
         .backends[0]
         .host_port = 30002;
-    let mut invalid = ingress.clone();
-    invalid[0].config.rate_limit_rps = Some(0);
-    assert!(
-        agent
-            .publish_cluster_catalogue(6, changed.clone(), invalid)
-            .await
-            .is_err()
-    );
     agent
         .publish_cluster_catalogue(5, changed.clone(), ingress.clone())
         .await
@@ -5483,6 +5475,90 @@ async fn cluster_consumer_advances_identical_generations_and_does_not_consume_re
         .publish_cluster_catalogue(5, changed, ingress)
         .await
         .unwrap();
+}
+
+/// `base` plus a second remote service: `remote` keeps its valid ingress
+/// route and `broken` gets one naming a TLS mode no node supports.
+fn with_one_bad_route(
+    base: &crate::onion::catalog::EndpointCatalog,
+) -> (
+    crate::onion::catalog::EndpointCatalog,
+    Vec<crate::cluster::orchestrate::IngressAssignment>,
+) {
+    let (_, mut ingress) = cluster_publication_fixture();
+    let remote = base.services["default__remote"].clone();
+    let catalog = base
+        .reconcile([
+            (
+                crate::onion::service_id::ServiceId::new("default", "remote"),
+                remote.port,
+                remote.backends,
+            ),
+            (
+                crate::onion::service_id::ServiceId::new("default", "broken"),
+                9090,
+                vec![crate::onion::catalog::CatalogBackend {
+                    execution: None,
+                    node_id: "other-node".into(),
+                    node_ip: "192.168.1.3".parse().unwrap(),
+                    host_port: 30010,
+                    healthy: true,
+                }],
+            ),
+        ])
+        .unwrap();
+    ingress.push(crate::cluster::orchestrate::IngressAssignment {
+        namespace: "default".into(),
+        name: "broken".into(),
+        config: toml::from_str("host = \"broken.local\"\ntls = \"acme\"").unwrap(),
+    });
+    (catalog, ingress)
+}
+
+/// Assert that both services resolve, `remote.local` routes, and the bad
+/// route was skipped rather than installed.
+async fn assert_only_the_bad_route_is_skipped(agent: &BunAgent<MockGrill>) {
+    let view = agent.service_map_tx.borrow().clone();
+    for name in ["remote", "broken"] {
+        assert!(
+            view.resolve(&crate::onion::service_id::ServiceId::new("default", name))
+                .is_some(),
+            "{name} must still resolve"
+        );
+    }
+    let table = agent.routing_table.read().await;
+    assert!(table.lookup("remote.local", "/").is_some());
+    assert!(table.lookup("broken.local", "/").is_none());
+}
+
+/// #700: one app's invalid ingress route made every node refuse every new
+/// catalogue, freezing discovery and ingress for the whole cluster. The bad
+/// route is skipped and logged; everything else publishes.
+#[tokio::test]
+async fn one_invalid_cluster_route_does_not_block_the_catalogue() {
+    let (mut agent, _, _) = test_agent();
+    let (catalog, ingress) = with_one_bad_route(&cluster_publication_fixture().0);
+    agent
+        .publish_cluster_catalogue(1, catalog.clone(), ingress)
+        .await
+        .unwrap();
+    assert_eq!(agent.cluster_catalog, catalog);
+    assert_eq!(agent.cluster_catalog_generation, Some(1));
+    assert_only_the_bad_route_is_skipped(&agent).await;
+}
+
+/// #700, the discovery-owning consumer path: the same bad route must not
+/// refuse the publication either.
+#[tokio::test]
+async fn one_invalid_consumer_route_does_not_block_the_view() {
+    let (mut agent, _root, base) = clustered_allocation_fixture().await;
+    let (committed, ingress) = with_one_bad_route(&base);
+    agent
+        .synchronise_consumer(2, committed, ingress, vec![])
+        .await
+        .unwrap();
+    assert_eq!(agent.cluster_catalog_generation, Some(2));
+    assert_only_the_bad_route_is_skipped(&agent).await;
 }
 
 #[tokio::test]
@@ -5549,21 +5625,21 @@ async fn cluster_publication_refusal_preserves_the_confirmed_catalogue_dns_and_i
         .unwrap()
         .backends[0]
         .host_port = 30002;
-    let mut invalid = ingress.clone();
-    invalid[0].config.rate_limit_rps = Some(0);
+    // A rewritten generation 1 conflicts with the confirmed one. (An invalid
+    // route no longer refuses a generation; it's skipped, #700.)
     let (response, reply) = oneshot::channel();
     agent
         .handle_command(AgentCommand::SyncClusterCatalog {
-            generation: 2,
+            generation: 1,
             response,
             catalog: Box::new(changed.clone()),
-            ingress: invalid,
+            ingress: ingress.clone(),
         })
         .await;
     assert!(reply.await.unwrap().is_err());
     assert_eq!(
         agent.cluster_catalog, original,
-        "a refused route changed the installed catalogue"
+        "a refused publication changed the installed catalogue"
     );
     assert_eq!(
         agent

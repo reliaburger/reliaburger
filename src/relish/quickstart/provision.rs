@@ -169,7 +169,7 @@ pub fn describe_test_policy(policy: &crate::testkit::safety::ClusterTestPolicy) 
 }
 
 /// Guest service supervised and restarted by systemd; logs go to its journal.
-pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=always\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
+pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=always\nRestartSec=2\nOOMScoreAdjust=-900\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(test)]
 mod tests {
@@ -181,6 +181,14 @@ mod tests {
         // SIGKILL them on every restart and leave their records unowned.
         assert!(SERVICE.contains("\nKillMode=process\n"), "{SERVICE}");
         assert!(!SERVICE.contains("KillMode=mixed"));
+    }
+
+    #[test]
+    fn service_unit_sets_oom_score_adjust() {
+        // Under memory pressure the kernel must pick a container before Bun,
+        // or discovery map updates stall for every workload (#700).
+        assert!(SERVICE.contains("\nOOMScoreAdjust=-900\n"), "{SERVICE}");
+        assert!(SERVICE.contains("\nRestartSec=2\n"), "{SERVICE}");
     }
 
     #[test]

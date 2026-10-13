@@ -229,6 +229,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+    "binary": "reliaburger::cluster_failover",
+    "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "lease_retirement_waits_for_paused_worker_across_leader_change",
     "binary": "reliaburger::cluster_failover",
     "test": "lease_retirement_waits_for_paused_worker_across_leader_change"
