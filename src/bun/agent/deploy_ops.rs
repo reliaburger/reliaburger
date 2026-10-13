@@ -154,6 +154,13 @@ pub(super) enum DeployOp {
         to: ContainerState,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// The runtime refused to launch an instance (#881): fail it, keeping
+    /// the reason for status.
+    RecordLaunchFailure {
+        instance_id: InstanceId,
+        reason: String,
+        reply: oneshot::Sender<()>,
+    },
     /// Post-start bookkeeping for a fresh instance: log forwarder, on-disk
     /// record, container IP, HealthWait(→Running), service-map backend and
     /// kernel networking.
@@ -289,6 +296,7 @@ impl DeployOp {
             DeployOp::ForgetInitialiser { .. } => "forget_initialiser",
             DeployOp::ApplyNetworkPreStart { .. } => "apply_network_pre_start",
             DeployOp::TransitionState { .. } => "transition_state",
+            DeployOp::RecordLaunchFailure { .. } => "record_launch_failure",
             DeployOp::FinishFreshInstance { .. } => "finish_fresh_instance",
             DeployOp::ProvisionIdentity { .. } => "provision_identity",
             DeployOp::ReserveRollingInstance { .. } => "reserve_rolling_instance",
@@ -811,6 +819,19 @@ impl DeployOps {
                 reply,
             },
             Ok(()),
+        )
+        .await
+    }
+
+    /// Fail an instance the runtime refused to launch, with the reason.
+    pub(super) async fn record_launch_failure(&self, instance_id: &InstanceId, reason: String) {
+        self.call(
+            |reply| DeployOp::RecordLaunchFailure {
+                instance_id: instance_id.clone(),
+                reason,
+                reply,
+            },
+            (),
         )
         .await
     }
@@ -1408,6 +1429,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 let result = self.transition_deploy_state(&instance_id, to).await;
                 let _ = reply.send(result);
+            }
+            DeployOp::RecordLaunchFailure {
+                instance_id,
+                reason,
+                reply,
+            } => {
+                self.record_launch_failure(&instance_id, reason).await;
+                let _ = reply.send(());
             }
             DeployOp::FinishFreshInstance {
                 instance_id,

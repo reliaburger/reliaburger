@@ -107,6 +107,12 @@ warning naming the node and the reason, and `relish status` prints the same
 line. Applying a different spec, or `relish rollback`, clears it; applying the
 same spec again doesn't (see `deploy-an-app`).
 
+An instance whose binary isn't on its node, or isn't executable, is `failed`
+with the reason, such as `binary not found: /usr/local/bin/ghost-server`.
+`relish status` prints it under the table, and `wtf` reports a critical
+`launch-failed` finding naming each instance, its node and the reason, in place
+of a generic under-replication (see `deploy-an-app`).
+
 ## `relish path`: can A reach B?
 
 `path` walks the network path between two apps hop by hop. It finds a running

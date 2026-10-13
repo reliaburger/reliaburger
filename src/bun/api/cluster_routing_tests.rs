@@ -78,6 +78,7 @@ fn instance(id: &str, app: &str, state: &str) -> InstanceStatus {
         pid: Some(4242),
         runtime_unknown: false,
         status_age_ms: None,
+        reason: None,
     }
 }
 

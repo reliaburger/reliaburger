@@ -161,6 +161,7 @@ pub fn add_job_rows(
                 pid: None,
                 runtime_unknown: false,
                 status_age_ms: None,
+                reason: None,
             },
             cpu_percent: sample.cpu_percent,
             memory_bytes: sample.memory_bytes,
@@ -189,6 +190,7 @@ mod tests {
             pid,
             runtime_unknown: false,
             status_age_ms: None,
+            reason: None,
         }
     }
 

@@ -47,6 +47,7 @@ pub mod userns;
 pub mod volume;
 
 use std::fmt;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
@@ -242,11 +243,43 @@ pub enum GrillError {
         reason: String,
     },
 
+    /// The workload's executable can't run on this node (#881). Launching it
+    /// again fails the same way until someone installs the binary or fixes
+    /// the spec, so callers fail the instance instead of retrying.
+    #[error("instance {instance} cannot launch: {problem}")]
+    LaunchRefused {
+        instance: InstanceId,
+        problem: LaunchProblem,
+    },
+
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
 
     #[error("image pull failed: {0}")]
     ImagePull(#[from] image::ImageError),
+}
+
+/// Why a workload's executable can't run, found before launching it.
+///
+/// Its message is the reason `relish status` and `relish wtf` show.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaunchProblem {
+    /// No file at the path, or no match on the workload's `PATH`.
+    #[error("binary not found: {}", .0.display())]
+    BinaryNotFound(PathBuf),
+    /// The path names a directory, or a file without execute permission.
+    #[error("binary not executable: {}", .0.display())]
+    BinaryNotExecutable(PathBuf),
+}
+
+impl GrillError {
+    /// Why this launch can never succeed as it stands, if that's what failed.
+    pub fn launch_problem(&self) -> Option<&LaunchProblem> {
+        match self {
+            GrillError::LaunchRefused { problem, .. } => Some(problem),
+            _ => None,
+        }
+    }
 }
 
 /// Non-secret identity of one original runtime execution generation.
