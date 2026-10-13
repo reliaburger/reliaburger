@@ -598,6 +598,32 @@ The rest of the fix follows one idea: build once, then fan out.
   it. Code that only the no-features pass compiles depends on a feature alone and builds the
   same on Linux. Dropping the second pass on macOS saves about three minutes.
 
+Building once left another repeated cost. Acceptance ran four Make owners, and
+each owner asked nextest to discover its tests before running them. Both commands
+passed `--archive-file`, so both unpacked the whole archive. On one October run,
+those eight extractions took six minutes and 43 seconds. Only one was needed.
+
+The job now prepares the archive before the owners start. Nextest's
+`list --list-type binaries-only` extracts the archive and reads its metadata
+without starting a test binary. Later discovery and execution use
+`--cargo-metadata` and `--binaries-metadata`, with the target and workspace paths
+remapped to the checkout. The Make recipes still choose the tests and own their
+prerequisites. We've changed how they obtain their executables.
+
+Reusing files needs a check that overwriting them used to give us for free. The
+preparation step verifies the builder's archive, records the extracted files'
+hashes, and publishes the receipt's hash as a workflow output. Each owner checks
+those bytes before discovery, again before execution, and afterwards. That
+includes helper programmes, libraries and build-script outputs, not just the
+test executables. Each owner's evidence carries the receipt so aggregation
+doesn't need the old runner's filesystem. A changed or missing file fails the
+gate. It doesn't trigger a quiet rebuild or repair.
+
+This removes seven acceptance extractions, but doesn't promise six minutes off
+the whole run. In that sample, macOS finished only two minutes before acceptance.
+It becomes the next bottleneck. We need both numbers: work removed from the
+runners and time removed from the developer's wait.
+
 The last piece is choosing what a run needs. A small script diffs a pull request against its
 base and sets three outputs, and every expensive job asks one of them:
 
