@@ -152,6 +152,23 @@ impl ProcessControl {
             .await
     }
 
+    /// The generation of `id`'s current launch, or `None` when it has none.
+    pub(crate) async fn generation(
+        &self,
+        id: &InstanceId,
+    ) -> io::Result<Option<super::RuntimeGeneration>> {
+        self.run(id, |this, id| {
+            match std::fs::symlink_metadata(this.directory(&id)?) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+                Ok(_) => this
+                    .load(&id)
+                    .map(|record| Some(super::RuntimeGeneration::process(&record.nonce))),
+            }
+        })
+        .await
+    }
+
     pub(crate) async fn prepare(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
         let previous_nonce = self
             .run(id, |this, id| {
@@ -1054,6 +1071,35 @@ mod tests {
             control.load(&running).unwrap().phase,
             OwnerPhase::Running { .. }
         ));
+    }
+
+    /// A forget for a retired generation that arrives after the identity
+    /// launched again must leave the successor alone (#850).
+    #[tokio::test]
+    async fn forgetting_a_stale_generation_keeps_the_successors_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__web-0__init-0".into());
+        assert_eq!(control.generation(&id).await.unwrap(), None);
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        let retired = control.generation(&id).await.unwrap().unwrap();
+
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        let successor = control.generation(&id).await.unwrap().unwrap();
+        assert_ne!(retired, successor);
+
+        assert!(
+            control.forget_retired(&id, Some(&retired)).await.is_err(),
+            "a stale generation forgot its successor"
+        );
+        assert_eq!(
+            control.generation(&id).await.unwrap(),
+            Some(successor.clone())
+        );
+        control.forget_retired(&id, Some(&successor)).await.unwrap();
+        assert_eq!(control.generation(&id).await.unwrap(), None);
     }
 
     #[tokio::test]
