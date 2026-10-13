@@ -89,18 +89,23 @@ pub(super) async fn query_probe(probe: Probe) -> Result<(), UpgradeError> {
 
 /// Ask the executable at `executable` which formats it uses.
 async fn query(executable: &Path) -> Result<(), UpgradeError> {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("--compatibility")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    query_with(command).await
+}
+
+/// Run a prepared compatibility query and check the answer.
+async fn query_with(mut command: tokio::process::Command) -> Result<(), UpgradeError> {
     let started = tokio::time::Instant::now();
     let deadline = started + QUERY_DEADLINE;
     let mut progress = QueryProgress::default();
     let mut child = loop {
-        match tokio::process::Command::new(executable)
-            .arg("--compatibility")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-        {
+        match command.spawn() {
             Ok(child) => break child,
             // Another concurrent fork can briefly inherit the writable file
             // before its exec closes CLOEXEC descriptors. Retain the same
@@ -193,5 +198,78 @@ async fn query(executable: &Path) -> Result<(), UpgradeError> {
             found: formats,
             expected: crate::compatibility::CURRENT,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_slow_probe_launch_leaves_the_runtime_free() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        let directory = tempfile::tempdir().unwrap();
+        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
+        let script = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n");
+        let probe = write_probe(script.as_bytes(), directory.path()).unwrap();
+        let mut command = tokio::process::Command::new(&probe.0);
+        command
+            .arg("--compatibility")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        // Stand in for macOS's first-launch assessment (#793), which holds
+        // the parent's spawn until the kernel has finished with the new
+        // file. A sleep between fork and exec holds it the same way, on any
+        // host. (A slow script can't: `spawn` returns once exec succeeds,
+        // before the script's first line runs.)
+        // SAFETY: the closure runs in the forked child before exec, where
+        // only async-signal-safe calls are allowed. `thread::sleep` is a
+        // loop around nanosleep, which is one, and it neither allocates nor
+        // takes a lock.
+        unsafe {
+            command.pre_exec(|| {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(())
+            });
+        }
+
+        let stop = CancellationToken::new();
+        let ticker = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let mut longest = Duration::ZERO;
+                let mut last = std::time::Instant::now();
+                while !stop.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    longest = longest.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                longest
+            }
+        });
+        // Let the ticker take its first reading: on this one-thread runtime
+        // it doesn't run until the test yields, and a launch that blocks
+        // before its first `.await` would otherwise go unseen.
+        tokio::task::yield_now().await;
+        let started = std::time::Instant::now();
+        let answered = query_with(command).await;
+        let took = started.elapsed();
+        stop.cancel();
+        let longest = ticker.await.unwrap();
+
+        answered.unwrap();
+        assert!(
+            took >= Duration::from_secs(1),
+            "the launch took only {took:?}"
+        );
+        // The same bound as `preparing_a_large_binary_leaves_the_runtime_free`:
+        // a quarter of Raft's shortest election timeout.
+        assert!(
+            longest < Duration::from_millis(250),
+            "the probe launch held the runtime for {longest:?} of its {took:?}"
+        );
     }
 }
