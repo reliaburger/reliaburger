@@ -3,6 +3,7 @@
 use crate::bun::capabilities::Capability;
 use crate::relish::client::LogOptions;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -85,18 +86,21 @@ pub fn cases() -> Vec<TestCase> {
             name: "job_runs_to_completion_and_reports_exit",
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(job_runs_to_completion_and_reports_exit),
         },
         TestCase {
             name: "scheduled_job_fires_on_its_schedule",
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(scheduled_job_fires_on_its_schedule),
         },
         TestCase {
             name: "job_logs_are_retrievable_after_completion",
             group: TestGroup::Jobs,
             requires: &[Capability::Logs, Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(job_logs_are_retrievable_after_completion),
         },
     ]

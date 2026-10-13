@@ -1184,7 +1184,21 @@ duration = "2m"
 
 ```
 
-Scenario execution:
+A step's `fault` is any workload fault except `bandwidth` (refused until
+#366) and `resume`; `kill` and `pause` take no `value`. Steps carry the scope
+the CLI flags do: `namespace` (the API's `default` when absent), `from` (a
+`delay` or `partition` from one source app), `count` (a `kill`, 1 when absent:
+`count = 0` means every replica, which the replica rail always refuses) and
+`instance` (any step but `dns`). Unknown keys, and a field the step's fault
+can't use, are refused.
+
+Every step is parsed and validated into its `FaultRequest` before the first
+is injected (`smoker::scenario::build_timeline`), so a typo in step three
+fails the scenario with nothing injected. A step the server refuses or that
+fails doesn't stop the timeline, but `relish fault scenario` then exits
+non-zero naming the failed steps, so CI can rely on its status (#699).
+
+Scenario execution, in outline:
 
 ```rust
 /// Execute a scripted chaos scenario.
@@ -1195,8 +1209,9 @@ fn execute_scenario(
 ) -> Result<ScenarioResult> {
     let scenario_start = Instant::now();
 
-    // Parse all steps and compute absolute activation times
-    let mut timeline: Vec<(Duration, &ScenarioStep)> = Vec::new();
+    // Parse and validate every step, and compute activation times, before
+    // anything is injected
+    let mut timeline: Vec<(Duration, &ScenarioStep, FaultRequest)> = Vec::new();
     for step in &scenario.steps {
         let start_after = match &step.start_after {
             Some(s) => parse_duration(s)?,
@@ -1206,16 +1221,18 @@ fn execute_scenario(
         let adjusted = Duration::from_secs_f64(
             start_after.as_secs_f64() / speed_multiplier
         );
-        timeline.push((adjusted, step));
+        let request = step_to_fault_request(step, speed_multiplier)?;
+        timeline.push((adjusted, step, request));
     }
 
     // Sort by activation time
-    timeline.sort_by_key(|(t, _)| *t);
+    timeline.sort_by_key(|(t, _, _)| *t);
+    let mut failed = Vec::new();
 
     if dry_run {
         println!("Scenario: {}", scenario.name);
         println!("Steps ({}):", timeline.len());
-        for (time, step) in &timeline {
+        for (time, step, _) in &timeline {
             let duration = step.duration.as_deref().unwrap_or("until scenario ends");
             println!("  T+{:>6}: {} {} {} ({}s) -- {}",
                 format_duration(*time),
@@ -1227,7 +1244,7 @@ fn execute_scenario(
 
     println!("Executing scenario: {}", scenario.name);
 
-    for (activation_time, step) in &timeline {
+    for (activation_time, step, request) in &timeline {
         // Wait until it is time to activate this step
         let elapsed = scenario_start.elapsed();
         if *activation_time > elapsed {
@@ -1240,13 +1257,14 @@ fn execute_scenario(
             format_duration(scenario_start.elapsed()),
             step.description, step.fault, step.target, step.value);
 
-        // Convert step to FaultRule and submit via the normal API path
-        // (which enforces permissions and safety rails)
-        let fault_rule = step_to_fault_rule(step, speed_multiplier)?;
-        submit_fault(fault_rule)?;
+        // Submit via the normal API path (which enforces permissions and
+        // safety rails)
+        if submit_fault(request).is_err() {
+            failed.push(step);   // later steps still run on time
+        }
     }
 
-    Ok(ScenarioResult::Completed)
+    if failed.is_empty() { Ok(ScenarioResult::Completed) } else { Err(failed) }
 }
 ```
 
@@ -1378,8 +1396,10 @@ Some safety rails can be explicitly overridden with flags:
 | Last-replica kill | Cannot be overridden | Always enforced |
 
 Overrides are logged with additional prominence in the audit log (#685).
-Every `fault.injected` record carries `include_leader` and `override_safety`
-in its details, `true` or `false`, so a query can find the overridden ones,
+Every `fault.injected` record carries the fault's namespace (the normalised
+one, `default` when the request named none) and `include_leader` and
+`override_safety` in its details, `true` or `false`, so a query can find the
+overridden ones,
 and an injection with either set is recorded at `critical` severity instead
 of `warning`, with "with safety overrides" in its message:
 
@@ -1421,15 +1441,21 @@ if (val->probability > 100 || val->action > FAULT_ACTION_MAX) {
 
 1. **eBPF expiry.** Active faults continue to have effect but will stop at their expiry timestamp (checked in-kernel on every lookup).
 
-2. **Startup cleanup.** When Bun restarts, it iterates all fault BPF maps and deletes every entry. This is safe because fault state is never persisted to disk -- a Bun restart should always produce a clean state.
+2. **Startup cleanup.** A Bun restart, crash or upgrade always produces a clean state, because the new Bun undoes everything its predecessor's faults left in the kernel before it takes the workloads back (#699):
+   - Both eBPF loaders empty every fault map. The rootful runc path loads through `ownership::load` with maps pinned in bpffs, which survive Bun; it clears the fault maps after validating the pins and keeps the policy maps.
+   - Adopting an instance rewrites its `cpu.max` and `memory.high` from its recorded OCI specification and lifts every `io.max` throttle. A fault's saved values live only in the lost registry, but the recorded specification says what the limits should be, so no fault journal is needed.
+   - Adopting an instance sends SIGCONT to every process in its cgroup and to the main pid the runtime names, so a paused workload doesn't stay frozen.
+   - The first network reconcile removes any `fa01:` netem delay tree from the node's runc containers.
+
+   The new registry is empty, so `relish fault list` matches what's in force: nothing.
 
 3. **Manual override.** `relish fault clear` sends a command directly to the Bun agent via a Unix socket (bypassing the cluster API). Even if the cluster leader is unreachable, an operator with host access can clear faults locally.
 
-### 7.4 Resource Fault Helper Process Orphan
+### 7.4 Resource Fault Left in a Workload's Cgroup
 
-**Scenario:** Bun crashes while a CPU burn loop or memory pressure process is running inside a container's cgroup.
+**Scenario:** Bun crashes or upgrades while a CPU, memory or disk-I/O fault is active on a container.
 
-**Mitigation:** The helper process is spawned as a direct child of the Bun process. When Bun dies, the helper process receives SIGHUP. The burn loop and memory pressure processes install a SIGHUP handler that immediately exits. Additionally, cgroup limits (CPU, memory) will cause the orphaned helper to be killed if Bun's cgroup is cleaned up by the init system (systemd unit restart).
+**Mitigation:** Workload resource faults run no helper process. A CPU fault caps the target's own `cpu.max`, a memory fault lowers its `memory.high` and a disk fault writes its `io.max` (§5.2). Burning cycles in a helper starved Bun rather than the workload, so that design was dropped. What's left behind is a cgroup value, and adoption rewrites it from the instance's recorded specification (§7.3). Node pressure (`fault node-pressure`) does run a helper, in its own `reliaburger-chaos` cgroup, which the node-pressure controller removes on start.
 
 ### 7.5 Node-Kill Fault Recovery Failure
 
@@ -1512,7 +1538,7 @@ or a client-supplied JSON field.
 Smoker prevents faults that would make the cluster unrecoverable:
 
 - **Quorum protection.** Cannot partition more than `(council_size - 1) / 2` council nodes. This is the hard limit that preserves Raft quorum. It cannot be overridden.
-- **Replica minimum.** Cannot kill more replicas of an app than `replicas - 1`. At least one instance must survive. A pause counts as one replica with `--instance`, otherwise as all of them. Cannot be overridden.
+- **Replica minimum.** Cannot kill more replicas of an app than `replicas - 1`. At least one instance must survive. A pause counts as one replica with `--instance`, otherwise as all of them. The replicas already out of service are the active pauses on the same app in the same namespace; a network or resource fault leaves its replica serving and isn't counted. Cannot be overridden.
 - **Leader protection.** Cannot target the cluster leader without the explicit `--include-leader` flag.
 - **Node percentage limit.** Cannot inject faults on more than 50% of nodes simultaneously without `--override-safety`.
 
@@ -1520,7 +1546,7 @@ Smoker prevents faults that would make the cluster unrecoverable:
 
 Fault rules exist only in BPF maps (kernel memory) and Bun's in-process state. They are never written to disk. This means:
 
-- A Bun restart on any node clears all faults on that node.
+- A Bun restart on any node clears all faults on that node, and the new Bun undoes their kernel effects: fault maps, cgroup limits, paused processes and netem delays (§7.3).
 - A full cluster restart clears everything.
 - There is no way for a fault to "survive" a restart and silently affect production.
 - Forensic analysis of a node's disk cannot reveal what faults were injected (only the audit log, which is separate, records this).

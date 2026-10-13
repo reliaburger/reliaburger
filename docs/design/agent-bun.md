@@ -1561,6 +1561,16 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
 
+### 7.10 Task-Array Sync on a Stuck Disk
+
+**What happens:** A worker's disk stops answering (a hung device, a dead network filesystem) while the leader's once-a-second task-array sync is reading or writing the worker's control fence, grant fences, ledgers or launch markers. Each of those calls runs on a tokio blocking thread, and a blocked `read` can't be interrupted, not even by a signal.
+
+**Detection:** The leader's per-tick deadline and its 3-second `NODE_SYNC_TIMEOUT`. It drops the call and marks the node failing.
+
+**Impact:** One blocking thread, not one per retry (#770). Dropping the HTTP request drops the worker's handler, but the stuck call keeps running and holds the worker's single sync claim (`SyncClaim` in `task_array_node.rs`, one `OwnedSemaphorePermit` shared by the sync and every blocking call it starts). While the claim is held, later syncs fail at once with `SyncBusy`, answered as `503 Service Unavailable`, without touching the disk. Before this, each sync the leader gave up on left one more thread blocked on the disk, until the blocking pool filled and stalled unrelated work in Bun. The leader counts a busy answer as a failed sync, exactly like a timeout, so the node stops counting towards a run's eligible nodes and its held chunks move elsewhere after the 30-second silence timeout. Chunks already running on the worker carry on as long as their own disk writes do.
+
+**Recovery:** Automatic. When the stuck call returns, the claim frees itself and the next sync runs normally.
+
 ---
 
 ## 8. Security Considerations

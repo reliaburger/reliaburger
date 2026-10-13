@@ -11,7 +11,8 @@ on:
     # (scripts/ci/select-jobs.sh), and the merge queue and the push to the
     # train run everything.
     branches: [main, "codex/**", "fix/**", "release-*"]
-    # labeled lets a `full-ci` label start the whole of CI on any PR.
+    # labeled lets a `full-ci` label start the heavy suites on any PR (on a
+    # PR into a train, everything but the macOS shards).
     types: [opened, synchronize, reopened, labeled]
   merge_group:
     # The merge queue on release-* tests each batch, merged onto the train,
@@ -437,7 +438,8 @@ jobs:
       upgrade_cluster_sha256: ${{ steps.upgrade_cluster.outputs.upgrade_cluster_sha256 }}
       standard_clients_sha256: ${{ steps.standard_clients.outputs.standard_clients_sha256 }}
     # Wall-clock, single-node upgrade and cluster upgrade suites, plus the
-    # crane interoperability test: each used to pay for its own test build.
+    # standard registry client tests (docker, podman, skopeo, crane): each
+    # used to pay for its own test build.
     name: acceptance
     needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
@@ -510,6 +512,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/crane"
           tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane" crane
           echo "$RUNNER_TEMP/crane" >> "$GITHUB_PATH"
+      - name: Prepare the host for docker, podman and skopeo
+        # docker, podman and skopeo come with the runner image. The gate's
+        # host check fails if one is missing and logs the versions it ran.
+        # This step names the registry host and lets the tests install their
+        # CA under certs.d.
+        if: ${{ !cancelled() }}
+        run: sudo scripts/standard-clients-host.sh --provision
       - name: Standard registry clients
         id: standard_clients
         if: ${{ !cancelled() }}

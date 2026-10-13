@@ -686,7 +686,11 @@ max_unavailable = 0       # instances allowed down (default 0)
 auto_rollback = true      # default true
 ```
 
-Rollouts are node-local today. The leader commits the new spec to Raft, and every node reconciles its own share at the same time, so an app with one replica per node is briefly down everywhere on each redeploy. `auto_rollback` is node-local too: a node whose new instance fails its health check restores the previous version on that node, but the desired spec in Raft still names the new version, so the reconciler keeps retrying it. A second deploy that reaches a node while its rollout of the app is still running is refused there rather than superseding it. Leader-released, node-by-node rollouts and a `RolloutFailed` state that stops the retries and shows in `relish status` and `relish wtf` are planned for 0.2.1 ([#692](https://github.com/reliaburger/reliaburger/issues/692)).
+The leader releases a spec change one node at a time. It commits the new spec to Raft, hands it to the first node (in node-id order) that doesn't run it yet, and keeps every later node on the last spec that rolled out everywhere until that node reports its share running healthy on the new one. Each node rolls its own share with the app's `[deploy]` table, so `max_surge` and `max_unavailable` bound one node's share, not the whole app. The leader reads progress from the nodes' reports, not from state of its own, so a new leader carries on where the old one stopped. A first placement and a scale change aren't gated: neither costs running capacity.
+
+`auto_rollback` (on by default) never ends below the capacity a node started from. A node whose new instance fails its health check stops the rollout; if old instances had already retired, it restarts them on the previous spec before it retires the healthy new ones, and if the previous spec can't come back either it keeps the new ones serving and reports the rollout halted. Either way it tells the leader, which marks the app `RolloutFailed` in Raft. The leader doesn't revert the desired spec (GitOps would only apply it again); it stops handing the failed spec to nodes, and `relish status` and `relish wtf` say where and why it failed. Applying the same spec again doesn't clear the mark. A different spec does, whether it comes from `relish apply`, `relish rollback` or a git commit. The council also keeps the last ten specs that rolled out everywhere for each app, so `relish rollback` still works after every node restarts.
+
+There's no superseding: a second deploy that reaches a node while that node's rollout of the app is still running waits for it. Fully leader-coordinated rollouts, with one surge and unavailable budget for the whole cluster held in Raft, are planned.
 
 **Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start. The target app must be in the same apply and namespace. Cluster apply records ownership before execution and publishes dependent app revisions only after positive zero exit and durable confirmation; uncertainty or leader replacement retains the fence. A hook gets one attempt and a 600-second deadline unless it sets `max_attempts` or `task_timeout_secs`. Recurring schedules work on clusters and standalone nodes alike: once the apps publish, the leader registers each `schedule` as a durable definition and claims each matching UTC minute in Raft. An unknown outcome is never replayed or overtaken automatically: cron skips that job's occurrences until an operator acknowledges the exact grant with `relish batch replay`, and `--rerun-jobs` doesn't clear it.
 
@@ -848,19 +852,23 @@ relish fault delay redis 200ms --acknowledge       # tc netem on each caller's i
 relish fault drop api 10% --acknowledge            # fail 10% of connections
 relish fault dns redis nxdomain --acknowledge      # DNS failure
 relish fault cpu inference 50% --acknowledge       # CPU stress in cgroup
-relish fault kill web-3 --acknowledge              # kill an instance
-relish fault run chaos/scenario.toml --acknowledge # scripted multi-step scenario
+relish fault kill web --count 1 --acknowledge      # kill one replica
+relish fault scenario chaos/scenario.toml --acknowledge # scripted multi-step scenario
 ```
 
-`relish fault bandwidth` parses but Bun refuses it until it's implemented.
+`relish fault delay` has shipped; `relish fault bandwidth` parses but Bun
+refuses it until it's implemented
+([#366](https://github.com/reliaburger/reliaburger/issues/366)).
 Safety rails require an authenticated role, the matching server-owned
 `[testing].allowed_operations` grant and explicit acknowledgement. They also
 enforce duration limits (default 10 min) and blast-radius protection
-(quorum, replica and leader guards). A fault isn't re-applied after Bun
-restarts, but it isn't always cleanly undone either: CPU, memory and disk-I/O
-caps, paused processes and eBPF drop or partition entries can outlive a Bun
-crash or upgrade, and then don't show in `relish fault list`. Reverting them on
-restart is [#699](https://github.com/reliaburger/reliaburger/issues/699). Admin doesn't
+(quorum, replica and leader guards). A fault never outlives the Bun that
+injected it: after a crash, kill or upgrade, the new Bun empties the eBPF
+fault maps (pinned ones included), rewrites each adopted instance's CPU,
+memory and disk-I/O limits from its recorded specification, resumes paused
+processes and removes netem delays, so `relish fault list` and the kernel
+agree there's nothing active. A scripted scenario validates every step before
+it injects any and exits non-zero if a step is refused. Admin doesn't
 override a disabled operation, and Bun attributes audit events to the
 authenticated credential rather than a client-supplied name.
 

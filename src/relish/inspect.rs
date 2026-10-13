@@ -351,6 +351,7 @@ mod tests {
             blocked: None,
             volume_home_away: None,
             volume_homes: Vec::new(),
+            rollout_failed: None,
         }
     }
 

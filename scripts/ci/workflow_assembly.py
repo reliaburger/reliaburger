@@ -64,7 +64,9 @@ def selected_workflow(expected, *, code, heavy, macos):
 
     `full` runs every owner, `portable` both portable hosts and the optimized
     boundaries, and `light` (pull requests into a merge train) only portable
-    Linux and the optimized boundaries.
+    Linux and the optimized boundaries. `train-full` (a merge-train pull
+    request labelled full-ci) runs every owner except the macOS shards, which
+    the merge queue and the push to the train still run.
     """
     c.fields(expected, ('commit', 'run_id', 'attempt'))
     c.require(re.fullmatch('[0-9a-f]{40}', expected['commit']) is not None,
@@ -77,7 +79,11 @@ def selected_workflow(expected, *, code, heavy, macos):
     c.require(code == 'true' or heavy == 'false', 'heavy work requires code selection')
     if code == 'false':
         return None
-    c.require(heavy == 'false' or macos == 'true', 'heavy work requires the macOS owner')
+    if heavy == 'true' and macos == 'false':
+        return dict(schema_version=1, **expected, mode='train-full',
+                    jobs=['changes', 'portable', 'contract-boundaries', 'linux', 'build-tests', 'cluster',
+                          'acceptance'],
+                    gates=LIGHT_GATES + HEAVY_GATES)
     if macos == 'false':
         return dict(schema_version=1, **expected, mode='light',
                     jobs=['changes', 'portable', 'contract-boundaries'], gates=LIGHT_GATES[:])

@@ -492,6 +492,9 @@ pub struct BunAgent<G: Grill> {
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
+    /// Where the cgroup v2 hierarchy is mounted: `/sys/fs/cgroup`, except in
+    /// tests that stand a directory in for it.
+    cgroup_mount: PathBuf,
     /// Which apps' volumes a snapshot operation owns right now.
     volume_maintenance: crate::bun::volume_maintenance::VolumeMaintenance,
     /// Test hook: an accepted restore waits here before touching the disk.
@@ -669,6 +672,10 @@ pub struct BunAgent<G: Grill> {
     /// namespace), with when that happened. State reports carry recent ones
     /// so the leader places the replicas elsewhere instead of holding them.
     capacity_refusals: std::collections::HashMap<(String, String), tokio::time::Instant>,
+    /// The app versions this node's placement reconciler last finished
+    /// deploying, as it last told the agent. State reports carry them so the
+    /// leader can release a rollout node by node (#692).
+    converged_rollouts: Vec<crate::reporting::types::RolloutReport>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; reservations advance beyond both this counter and all restored owners.
@@ -818,6 +825,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -899,6 +907,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
             capture_offsets: Arc::default(),
@@ -964,6 +973,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -1056,6 +1066,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
             capture_offsets: Arc::default(),
@@ -1267,6 +1278,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The constructors default it; the binary overrides from config.
     pub fn set_volumes_dir(&mut self, dir: std::path::PathBuf) {
         self.volumes_dir = dir;
+    }
+
+    /// Stand a directory in for the cgroup v2 mount.
+    #[cfg(test)]
+    pub(crate) fn set_cgroup_mount(&mut self, mount: std::path::PathBuf) {
+        self.cgroup_mount = mount;
     }
 
     /// Configure the actual protected listener ports, explicit enrolment peers

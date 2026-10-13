@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -103,6 +104,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::MultiNode,
                 Capability::ProcessRuntime,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(resolve_returns_vip_and_healthy_backends),
         },
         TestCase {
@@ -113,12 +115,14 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::MultiNode,
                 Capability::ProcessRuntime,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(resolve_reflects_scale_up),
         },
         TestCase {
             name: "stopped_instance_leaves_the_backend_list",
             group: TestGroup::ServiceDiscovery,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(stopped_instance_leaves_the_backend_list),
         },
     ]
