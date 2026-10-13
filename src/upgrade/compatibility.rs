@@ -99,13 +99,42 @@ async fn query(executable: &Path) -> Result<(), UpgradeError> {
     query_with(command).await
 }
 
+/// What [`launch`] hands back: the command, for a retry, and its result.
+type Launched = (
+    tokio::process::Command,
+    std::io::Result<tokio::process::Child>,
+);
+
+/// Start `command` on the blocking pool and hand it back with the result.
+///
+/// Launching blocks until the new program has been exec'd, and on macOS
+/// the first exec of a new file waits for the host to assess it: seconds,
+/// for a release-sized binary on a busy host. That wait would stop every
+/// task on the caller's worker, the node's Raft core among them (#793).
+/// The command comes back so an `ETXTBSY` retry can launch it again.
+async fn launch(mut command: tokio::process::Command) -> Result<Launched, UpgradeError> {
+    // Blocking-pool threads carry the runtime's context, so the child is
+    // registered with the runtime that will wait for it. If the caller is
+    // cancelled first, the child is dropped when the launch finishes, and
+    // `kill_on_drop` stops it.
+    let launched = tokio::task::spawn_blocking(move || {
+        let launched = command.spawn();
+        (command, launched)
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    Ok(launched)
+}
+
 /// Run a prepared compatibility query and check the answer.
 async fn query_with(mut command: tokio::process::Command) -> Result<(), UpgradeError> {
     let started = tokio::time::Instant::now();
     let deadline = started + QUERY_DEADLINE;
     let mut progress = QueryProgress::default();
     let mut child = loop {
-        match command.spawn() {
+        let (returned, launched) = launch(command).await?;
+        command = returned;
+        match launched {
             Ok(child) => break child,
             // Another concurrent fork can briefly inherit the writable file
             // before its exec closes CLOEXEC descriptors. Retain the same
