@@ -1351,6 +1351,73 @@ mod tests {
         );
     }
 
+    /// Write `contents` as a resolver file in a fresh temp directory.
+    fn resolv_conf(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn dns_upstream_defaults_to_host_resolvers() {
+        // #700: the default was 8.8.8.8, which fails on networks that block
+        // outbound port 53 and leaks every lookup to Google.
+        let nc = NodeConfig::parse("[dns]\nenabled = true\n").unwrap();
+        assert_eq!(nc.dns.upstream, None);
+        let (_dir, path) = resolv_conf(
+            "# managed by the host\nsearch corp.example\nnameserver 10.0.0.2\n\
+             nameserver 10.0.0.3 # backup\noptions edns0\nnameserver fd00::53\n",
+        );
+        let config = nc.dns.to_dns_config_from(&path, 53).unwrap();
+        assert_eq!(
+            config.upstreams,
+            vec![
+                "10.0.0.2:53".parse::<std::net::SocketAddr>().unwrap(),
+                "10.0.0.3:53".parse().unwrap(),
+                "[fd00::53]:53".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_dns_upstream_overrides_host_resolvers() {
+        let nc = NodeConfig::parse("[dns]\nenabled = true\nupstream = \"192.0.2.53:5353\"\n")
+            .unwrap();
+        let (_dir, path) = resolv_conf("nameserver 10.0.0.2\n");
+        let config = nc.dns.to_dns_config_from(&path, 53).unwrap();
+        assert_eq!(config.upstreams, vec!["192.0.2.53:5353".parse().unwrap()]);
+    }
+
+    #[test]
+    fn resolv_conf_parser_skips_own_listen_address() {
+        let own: std::net::SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let found = resolv_conf_nameservers(
+            "nameserver 10.0.0.1\nnameserver not-an-address\nnameserver fe80::1%eth0\n\
+             ;nameserver 10.0.0.9\nnameserver 10.0.0.2\n",
+            53,
+            own,
+        );
+        assert_eq!(found, vec!["10.0.0.2:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn dns_without_usable_upstream_refuses_to_start() {
+        let nc = NodeConfig::parse("[dns]\nenabled = true\nlisten = \"10.0.0.1:53\"\n").unwrap();
+        for contents in [None, Some(""), Some("search example\n"), Some("nameserver 10.0.0.1\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resolv.conf");
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            }
+            let error = nc.dns.to_dns_config_from(&path, 53).unwrap_err();
+            assert!(
+                error.to_string().contains("[dns] upstream"),
+                "{contents:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn dns_rejects_node_default_namespace_override() {
         let error = NodeConfig::parse("[dns]\ndefault_namespace = \"payments\"\n").unwrap_err();
@@ -1367,7 +1434,7 @@ mod tests {
             nc.network.port_range,
             PortRange {
                 start: 10000,
-                end: 60000
+                end: 32767
             }
         );
         assert!(nc.cluster.join.is_empty());

@@ -136,6 +136,33 @@ impl PortAllocator {
 mod tests {
     use super::*;
 
+    /// Linux hands out ephemeral source ports from 32768 by default
+    /// (`net.ipv4.ip_local_port_range`), so a published port at or above it
+    /// can collide with an outgoing connection (#700).
+    #[test]
+    fn default_range_stays_below_the_ephemeral_range() {
+        let allocator = PortAllocator::from_config(&crate::config::node::PortRange::default());
+        let (start, end) = allocator.range();
+        assert_eq!(start, 10000);
+        assert!(end <= 32768, "default range reaches {end}");
+    }
+
+    #[tokio::test]
+    async fn allocator_skips_a_port_bound_on_the_host() {
+        // A host daemon listening on a port must never be shadowed by a
+        // DNAT'd published port (#700).
+        let host = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let taken = host.local_addr().unwrap().port();
+        let allocator = PortAllocator::new(taken, taken + 1);
+        assert!(matches!(
+            allocator.allocate().await,
+            Err(PortError::Exhausted { .. })
+        ));
+        assert!(!allocator.is_allocated(taken).await);
+        drop(host);
+        assert_eq!(allocator.allocate().await.unwrap(), taken);
+    }
+
     #[tokio::test]
     async fn last_free_port_is_found_even_in_a_nearly_full_pool() {
         let allocator = PortAllocator::new(1000, 65000);

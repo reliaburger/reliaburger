@@ -1525,7 +1525,7 @@ mod tests {
         });
         let bound = BoundDnsResponder::bind(DnsConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
-            upstream: address,
+            upstreams: vec![address],
             ..test_config()
         })
         .await
@@ -1561,7 +1561,7 @@ mod tests {
         map.register_app("redis", "default", 6379, None).unwrap();
         let bound = BoundDnsResponder::bind(DnsConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
-            upstream: upstream_address,
+            upstreams: vec![upstream_address],
             upstream_timeout: Duration::from_millis(30),
             ..test_config()
         })

@@ -184,6 +184,14 @@ mod tests {
     }
 
     #[test]
+    fn service_unit_sets_oom_score_adjust() {
+        // Under memory pressure the kernel must pick a container before Bun,
+        // or discovery map updates stall for every workload (#700).
+        assert!(SERVICE.contains("\nOOMScoreAdjust=-900\n"), "{SERVICE}");
+        assert!(SERVICE.contains("\nRestartSec=2\n"), "{SERVICE}");
+    }
+
+    #[test]
     fn service_restarts_bun_even_after_a_clean_exit() {
         // A release that exits 0 while its upgrade is being verified (or a
         // stray SIGTERM) would leave the node down under `on-failure`, and

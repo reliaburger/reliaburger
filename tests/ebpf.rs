@@ -1842,7 +1842,7 @@ async fn dns_responder_resolves_internal_name() {
     // Use a high port to avoid needing root for port 53
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
-        upstream: "8.8.8.8:53".parse().unwrap(),
+        upstreams: vec!["192.0.2.1:53".parse().unwrap()],
         upstream_timeout: Duration::from_secs(2),
         source_namespaces: tokio::sync::watch::channel(
             reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
@@ -1906,7 +1906,7 @@ async fn dns_responder_non_internal_times_out() {
     let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
-        upstream: upstream.local_addr().unwrap(),
+        upstreams: vec![upstream.local_addr().unwrap()],
         upstream_timeout: Duration::from_millis(500),
         source_namespaces: tokio::sync::watch::channel(
             reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(

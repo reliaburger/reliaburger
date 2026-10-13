@@ -1028,7 +1028,7 @@ mod tests {
         let responder =
             crate::onion::dns::BoundDnsResponder::bind_freebind(crate::onion::dns::DnsConfig {
                 listen_addr: std::net::SocketAddr::new(nameserver.into(), 53),
-                upstream: "192.0.2.1:53".parse().unwrap(),
+                upstreams: vec!["192.0.2.1:53".parse().unwrap()],
                 source_namespaces: grill.dns_source_namespaces(),
                 ..Default::default()
             })

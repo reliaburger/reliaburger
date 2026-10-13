@@ -7585,6 +7585,33 @@
       "boundaries": [
         "Rollout progress comes from node reports; full leader-coordinated rollouts with a cluster-wide budget are not claimed."
       ]
+    },
+    {
+      "id": "issue-700-one-bad-ingress-route",
+      "issue": 700,
+      "promise": "One app whose ingress route no node can install never stops the cluster catalogue: every node skips that route, logs it, and keeps publishing discovery and ingress for every other app.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime, with the invalid spec written straight to the council"
+      ],
+      "cases": [
+        {
+          "id": "issue-700-invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+          "binary": "reliaburger::cluster_failover",
+          "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "relish apply and relish lint refuse an ingress with an unsupported TLS mode, a zero rate or burst, or a rate whose default burst overflows."
+      ],
+      "boundaries": [
+        "The skipped route stays uninstalled until its app is reapplied with a valid ingress."
+      ]
     }
   ]
 }
