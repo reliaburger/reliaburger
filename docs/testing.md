@@ -239,7 +239,14 @@ a failure in shard 2 reproduces locally with
 `cargo nextest run --partition hash:2/3`. Each shard compiles the suite
 itself, and compiling is most of a macOS job: on the first sharded run each
 shard spent about 38 minutes compiling and under 3 testing (7 unsharded), so
-a shard takes 42–44 minutes, level with acceptance. Building once and sharing
+a shard took 42–44 minutes. That included a second build of the library and
+binaries, 8–10 minutes of it, until `warm-executables` switched to
+`cargo test --no-run`
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). Across nine
+runs before that change, shard jobs took 23.6–46.1 minutes, with the slowest
+shard in a run at a median of about 41.6. On the first full run after it,
+shards took 31.0–35.8 minutes, the "Portable tests" step 29.1–34.7 of that,
+still a few minutes longer than acceptance (26.5–32.6). Building once and sharing
 a nextest archive would take the compile off two of the three runners, but not
 off the critical path. One shard runs `make lint-macos` and another the
 doctests. A shard re-run on its own keeps its own attempt; the evidence gate

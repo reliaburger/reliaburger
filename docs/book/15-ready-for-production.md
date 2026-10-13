@@ -720,6 +720,22 @@ The real win is the light set. A pull request into a train no longer touches mac
 and hears back in 15 to 20 minutes instead of about 50. Making macOS itself faster means
 compiling once, not testing in parallel.
 
+It turned out each shard wasn't even compiling once. It compiled twice. `make test` first runs
+`make warm-executables` (the #722 step in chapter 14), and that ran `cargo build --bins`. A
+plain build resolves features without the dev-dependencies, and one of them turns on
+`proc-macro2`'s `span-locations`. So when nextest's `cargo test --no-run` came next, it saw
+different features and rebuilt `proc-macro2`, `syn`, every proc macro, the library and all
+three binaries. That's 8 to 10 minutes on a 3-vCPU `macos-15` runner, and the rebuild also
+replaced the binaries the step had just warmed. The fix is one line: the warm step now runs
+`cargo test --no-run` itself, and nextest finds everything fresh
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). Across nine full runs before
+the fix, shard jobs took 23.6 to 46.1 minutes, and the slowest shard in a run had a median of
+about 41.6. On the first full run with the fix, the shards took 31.0, 34.3 and 35.8 minutes,
+and the step that builds and runs the tests took 29 to 35. That's one run, not a median, but
+the slowest shard came in about six minutes under the old median. macOS is still the longest
+job in the set, a few minutes longer than acceptance's 26.5 to 32.6, and what's left is the
+compile itself.
+
 The `full-ci` label turned out to be the leak. Most train pull requests touch privileged
 Linux, the cluster or acceptance, so most of them wore it, and each one then asked for three
 macOS runners that queued for over an hour. So on a pull request into a train, `full-ci` now
