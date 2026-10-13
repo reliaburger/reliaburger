@@ -19,7 +19,7 @@
 
 use super::commands::AgentCommand;
 use super::*;
-use crate::bun::loop_meter::{LoopTurnMeter, TURN_BUDGET};
+use crate::bun::loop_meter::{LoopBranch, LoopTurnMeter, TURN_BUDGET, TurnPart};
 use crate::grill::mock::MockCall;
 
 /// Long enough past the budget that a pass or a failure is unambiguous.
@@ -1137,6 +1137,141 @@ async fn the_first_consumer_sync_after_a_restart_takes_one_slow_await_a_turn() {
         "a turn took more than one slow await; (writes, inventory reads) per turn: \
          {per_turn:?}"
     );
+}
+
+/// Take a leader answer through the loop's consumer-sync turns, one step a
+/// turn as `run_loop` does, and return each turn as the meter saw it.
+async fn consumer_sync_turns(
+    agent: &mut BunAgent<MockGrill>,
+    generation: u64,
+    catalog: crate::onion::catalog::EndpointCatalog,
+    ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+) -> Vec<crate::bun::loop_meter::TurnRecord> {
+    let (response, reply) = oneshot::channel();
+    agent
+        .handle_command(AgentCommand::SyncClusterConsumer {
+            generation,
+            catalog: Box::new(catalog),
+            ingress,
+            withdrawals: vec![],
+            requested_at_ns: crate::onion::lease::boot_clock_ns(),
+            response,
+        })
+        .await;
+    let mut turns = Vec::new();
+    while !agent.consumer_syncs.is_idle() {
+        let turn = agent.begin_consumer_sync_turn();
+        agent.continue_consumer_sync().await;
+        agent.consumer_syncs.end_turn();
+        agent.turn_deadline = None;
+        agent.loop_meter.finish(turn);
+        turns.push(agent.loop_meter.last_turn().unwrap());
+    }
+    let update = reply.await.unwrap().unwrap();
+    assert!(update.published, "generation {generation} was not published");
+    turns
+}
+
+/// The 0.2.0 candidate's fast soak (#890): two nodes each took a
+/// `consumer_sync` turn of about 1.9 s in the same second, and the log said
+/// only `follow_up (consumer_sync)`. Seven steps share that name, and the
+/// one that installs a view takes a journal write, the kernel's lock for
+/// every service, and a firewall sync with runtime reads. Each turn now
+/// names its step, and the meter keeps what its slow awaits took, so the
+/// next slow turn's log line says where the time went.
+#[tokio::test]
+async fn each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits() {
+    let (mut agent, _root, catalog, ingress) = recovered_consumer().await;
+    let write = std::time::Duration::from_millis(50);
+    agent.loop_stalls.set(LoopStall::Persist, write);
+    agent
+        .supervisor
+        .grill()
+        .set_inventory_delay(Some(std::time::Duration::from_millis(50)));
+    let turns = consumer_sync_turns(&mut agent, 1, catalog, ingress).await;
+    let steps: Vec<_> = turns.iter().map(|turn| turn.detail).collect();
+    assert_eq!(
+        steps,
+        [
+            "consumer_sync/candidate",
+            "consumer_sync/journal",
+            "consumer_sync/withdraw",
+            "consumer_sync/prove_receipts",
+            "consumer_sync/publish",
+            "consumer_sync/activate",
+            "consumer_sync/compact",
+        ]
+        .map(Some),
+        "turns: {turns:?}"
+    );
+    for turn in &turns {
+        assert_eq!(turn.branch, LoopBranch::FollowUp);
+        let writes = turn.detail != Some("consumer_sync/candidate")
+            && turn.detail != Some("consumer_sync/compact");
+        assert_eq!(
+            turn.part(TurnPart::JournalWrite).is_some_and(|took| took >= write),
+            writes,
+            "{turn}'s journal write: {:?}",
+            turn.part(TurnPart::JournalWrite)
+        );
+    }
+    let candidate = &turns[0];
+    assert!(
+        candidate
+            .part(TurnPart::RuntimeInventory)
+            .is_some_and(|took| took >= std::time::Duration::from_millis(50)),
+        "{candidate}'s inventory read: {:?}",
+        candidate.part(TurnPart::RuntimeInventory)
+    );
+    let publish = &turns[4];
+    assert!(publish.part(TurnPart::ViewInstall).is_some(), "{publish}");
+    assert!(publish.part(TurnPart::FirewallSync).is_some(), "{publish}");
+}
+
+/// A catalogue of `services` services, three remote backends each, on
+/// host ports from `port_base`.
+fn large_catalogue(services: usize, port_base: u16) -> crate::onion::catalog::EndpointCatalog {
+    crate::onion::catalog::EndpointCatalog::rebuild((0..services).map(|index| {
+        (
+            crate::onion::service_id::ServiceId::new("default", format!("svc{index}")),
+            8080,
+            (0..3u8)
+                .map(|replica| crate::onion::catalog::CatalogBackend {
+                    execution: None,
+                    node_id: format!("node-{replica}"),
+                    node_ip: std::net::Ipv4Addr::new(192, 168, 1, 2 + replica),
+                    host_port: port_base + (index % 1000) as u16,
+                    healthy: true,
+                })
+                .collect::<Vec<_>>(),
+        )
+    }))
+    .unwrap()
+}
+
+/// One lead for #890: a node's services rejoining change the view every
+/// node consumes at once. Building, journalling and installing a view does
+/// scale with its size, so a thousand services (the soak runs a handful),
+/// first published after a recovery and then with every backend moved,
+/// must leave each turn well inside the budget once the disk's share is
+/// taken out. The disk's share is the slow-disk scenarios' business; this
+/// one measures what the view's size costs the loop.
+#[tokio::test]
+async fn a_large_consumer_view_change_takes_each_turn_well_within_the_budget() {
+    let (mut agent, _root, _catalog, _ingress) = recovered_consumer().await;
+    for (generation, catalog) in [
+        (1, large_catalogue(1000, 30000)),
+        (2, large_catalogue(1000, 31000)),
+    ] {
+        for turn in consumer_sync_turns(&mut agent, generation, catalog, vec![]).await {
+            let disk = turn.part(TurnPart::JournalWrite).unwrap_or_default();
+            let view = turn.took.saturating_sub(disk);
+            assert!(
+                view < TURN_BUDGET / 2,
+                "generation {generation}: {turn} spent {view:?} beside its journal write"
+            );
+        }
+    }
 }
 
 /// Between a recovery's withdrawal and its publication the journal says
