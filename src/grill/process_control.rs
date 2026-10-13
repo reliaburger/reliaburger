@@ -342,6 +342,12 @@ impl ProcessControl {
                         if current.gate.is_some() {
                             return Ok(current);
                         }
+                        // An owner that died before recording the report
+                        // never will. Its lock is free then, and start
+                        // reports what it always did: the owner ran.
+                        if process_owner::lock_owner(&directory).is_ok() {
+                            return Ok(current);
+                        }
                     }
                     OwnerPhase::Retiring { .. } | OwnerPhase::Retired { .. }
                         if launch_status.is_some() =>
