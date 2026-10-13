@@ -47,6 +47,13 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+Once a node has pulled and unpacked a digest-pinned image, it doesn't ask any
+registry about it again. Bun keeps the index, manifest and config it verified
+and checks each against its digest before reusing it, so a burst of
+containers or job executors from that image can't trip a registry's rate
+limit. A tag reference, or a pin whose local copy is missing or no longer
+matches its digest, goes to the registry as usual.
+
 ## Tags bind to digests at apply
 
 A tag moves. `nginx:1.27` today needn't be `nginx:1.27` next week, so the

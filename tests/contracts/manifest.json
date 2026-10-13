@@ -7121,6 +7121,33 @@
       ]
     },
     {
+      "id": "issue-790-warm-pinned-cold-starts-read-no-registry",
+      "issue": 790,
+      "promise": "Cold shared-runc executors for a digest-pinned image this node has already verified and unpacked send no registry request, so a burst of them survives a registry that rate-limits every request.",
+      "supported_paths": [
+        "Rootful Linux shared-runc executors"
+      ],
+      "cases": [
+        {
+          "id": "warm-pin-runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Local metadata that no longer hashes to its digest is ignored and refetched, and a tag reference always asks the registry."
+      ],
+      "boundaries": [
+        "The first pull of an image on a node still reads the registry, and a cold pin fails as before once the registry's retries run out."
+      ]
+    },
+    {
       "id": "issue-678-runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
       "issue": 678,
       "promise": "Retired shared-runc executors across namespaces leave no runtime journals, identities or route files behind.",

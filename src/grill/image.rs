@@ -309,6 +309,8 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
 ///   blobs/sha256/{digest}/data               — raw layer blobs
 ///   rootfs/{registry}/{repo}/{tag}/          — unpacked filesystem
 ///   manifests/{registry}/{repo}/{tag}.json   — cached manifests
+///   metadata/sha256/{digest}                 — verified raw indexes,
+///                                              manifests and configs
 /// ```
 #[derive(Clone)]
 pub struct ImageStore {
@@ -502,6 +504,14 @@ impl ImageStore {
 
         let rootfs = self.rootfs_path(&image_ref);
 
+        // A digest names exact bytes. When this node already holds them,
+        // verified, and has unpacked the image, no registry or peer has
+        // anything to add: asking anyway is how a burst of cold executors
+        // trips an anonymous registry's rate limit (#790).
+        if let Some(pulled) = self.pinned_image_from_local(&image_ref, &rootfs).await {
+            return Ok(pulled);
+        }
+
         // Cluster-first: if the Pickle catalog knows this image, its
         // layers arrive from peers and unpack from the pickle blob
         // store. This isn't only a bandwidth win — the external client
@@ -607,8 +617,11 @@ impl ImageStore {
             reason: e.to_string(),
         })?;
 
+        let config = parse_config(&verified.config_bytes, &verified.manifest.config.digest)?;
+        if image_ref.tag.starts_with("sha256:") {
+            self.remember_pin(&image_ref.tag, &verified).await?;
+        }
         let manifest = verified.manifest;
-        let config = parse_config(&verified.config_bytes, &manifest.config.digest)?;
 
         // Save the manifest for cache validation
         let manifest_path = self.manifest_path(image_ref);
@@ -712,6 +725,133 @@ impl ImageStore {
                 })?;
         }
         Ok((manifest.layers, config))
+    }
+
+    /// Where verified registry metadata (an index, a manifest or a config)
+    /// named by `digest` lives. `None` for anything but a well-formed sha256
+    /// digest, so a descriptor's digest can never steer the path.
+    fn metadata_path(&self, digest: &str) -> Option<PathBuf> {
+        let hex = digest.strip_prefix("sha256:")?;
+        let well_formed = hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        well_formed.then(|| self.store_root.join("metadata").join("sha256").join(hex))
+    }
+
+    /// The metadata stored under `digest`, only if its bytes still hash to
+    /// it (and have the descriptor's size, when there is one). Anything else
+    /// is a miss, and the pull asks the registry as before.
+    async fn read_metadata(&self, digest: &str, size: Option<i64>) -> Option<Vec<u8>> {
+        let path = self.metadata_path(digest)?;
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        match super::oci_pull::verify(&bytes, digest, size) {
+            Ok(()) => Some(bytes),
+            Err(error) => {
+                eprintln!(
+                    "warning: ignoring local image metadata {}: {error}",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    /// Keep `bytes` under the digest that names them, after checking that
+    /// it does. The write is atomic, so a crash leaves a miss, never a torn
+    /// file that a later read would have to reject.
+    async fn store_metadata(&self, digest: &str, bytes: Vec<u8>) -> Result<(), ImageError> {
+        let Some(path) = self.metadata_path(digest) else {
+            return Ok(());
+        };
+        super::oci_pull::verify(&bytes, digest, None).map_err(|error| {
+            ImageError::ManifestPull {
+                image: digest.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            crate::sesame::identity::atomic_write(&path, &bytes)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(())
+    }
+
+    /// Keep the raw bytes a pinned pull verified: the root the pin names
+    /// (an index or a manifest), the platform manifest an index led to, and
+    /// the config. Together they let the next pull resolve the pin locally.
+    async fn remember_pin(
+        &self,
+        pin: &str,
+        verified: &super::oci_pull::VerifiedImageManifest,
+    ) -> Result<(), ImageError> {
+        if let Some(index) = &verified.index_bytes {
+            self.store_metadata(pin, index.clone()).await?;
+        }
+        self.store_metadata(&verified.digest, verified.manifest_bytes.clone())
+            .await?;
+        self.store_metadata(
+            &verified.manifest.config.digest,
+            verified.config_bytes.clone(),
+        )
+        .await
+    }
+
+    /// Resolve a digest-pinned image entirely from local storage: the pinned
+    /// root, the platform manifest and the config, each re-verified against
+    /// the digest that names it, and a rootfs generation that finished
+    /// unpacking. `None` sends the pull to the registry as before. A tag is
+    /// never resolved here: only a digest says which bytes are right.
+    async fn pinned_image_from_local(
+        &self,
+        image_ref: &ImageReference,
+        rootfs: &Path,
+    ) -> Option<PulledImage> {
+        use oci_distribution::manifest::OciManifest;
+        if !image_ref.tag.starts_with("sha256:") {
+            return None;
+        }
+        let root = self.read_metadata(&image_ref.tag, None).await?;
+        let manifest = match super::oci_pull::parse_manifest(&root).ok()? {
+            OciManifest::Image(manifest) => manifest,
+            OciManifest::ImageIndex(index) => {
+                let architecture =
+                    super::oci_pull::linux_architecture(std::env::consts::ARCH).ok()?;
+                let descriptor = super::oci_pull::platform_descriptor(&index, architecture).ok()?;
+                let bytes = self
+                    .read_metadata(&descriptor.digest, Some(descriptor.size))
+                    .await?;
+                match super::oci_pull::parse_manifest(&bytes).ok()? {
+                    OciManifest::Image(manifest) => manifest,
+                    OciManifest::ImageIndex(_) => return None,
+                }
+            }
+        };
+        super::oci_pull::check_layer_sizes(&manifest).ok()?;
+        let config_bytes = self
+            .read_metadata(&manifest.config.digest, Some(manifest.config.size))
+            .await?;
+        let config = parse_config(&config_bytes, &manifest.config.digest).ok()?;
+        let layer_paths: Vec<PathBuf> = manifest
+            .layers
+            .iter()
+            .map(|layer| self.blob_path(&layer.digest))
+            .collect();
+        // The generation is named by the verified layer digests, and its
+        // marker is written only after the unpacked tree is flushed: the
+        // same proof a registry pull relies on before reusing it.
+        let generation = self.rootfs_generation_path(rootfs, &layer_paths);
+        generation
+            .with_extension("complete")
+            .is_file()
+            .then_some(PulledImage {
+                rootfs: generation,
+                config,
+            })
     }
 
     /// Unpack blobs the cluster already holds, re-checking the config
@@ -1674,6 +1814,8 @@ mod tests {
         layer: Vec<u8>,
         layer_requests: Arc<AtomicUsize>,
         manifest_requests: Arc<AtomicUsize>,
+        /// Every request the registry answers, the version check included.
+        requests: Arc<AtomicUsize>,
         fault: Option<RegistryFault>,
     }
 
@@ -1681,6 +1823,9 @@ mod tests {
         reference: String,
         layer_requests: Arc<AtomicUsize>,
         manifest_requests: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+        /// The manifest fault's remaining count, when there is one.
+        fault_remaining: Option<Arc<AtomicUsize>>,
         shutdown: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1700,6 +1845,7 @@ mod tests {
         request: Request,
     ) -> Response<Body> {
         let path = request.uri().path();
+        state.requests.fetch_add(1, Ordering::SeqCst);
         if path == "/v2/" {
             return Response::builder()
                 .status(StatusCode::OK)
@@ -1876,6 +2022,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let layer_requests = Arc::new(AtomicUsize::new(0));
         let manifest_requests = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let fault_remaining = fault.as_ref().map(|fault| Arc::clone(&fault.remaining));
         let mut state = RegistryState {
             index: None,
             manifest_path: format!("/v2/fixture/manifests/{manifest_digest}"),
@@ -1886,6 +2034,7 @@ mod tests {
             layer,
             layer_requests: Arc::clone(&layer_requests),
             manifest_requests: Arc::clone(&manifest_requests),
+            requests: Arc::clone(&requests),
             fault,
         };
         let mut root_digest = manifest_digest.clone();
@@ -1954,6 +2103,8 @@ mod tests {
             reference: format!("{address}/fixture@{root_digest}"),
             layer_requests,
             manifest_requests,
+            requests,
+            fault_remaining,
             shutdown,
             task,
         }
@@ -2581,6 +2732,151 @@ mod tests {
         store.pull_and_unpack(&fixture.reference).await.unwrap();
 
         assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    // -- Warm digest pins (#790) ----------------------------------------------
+
+    /// Every file under the store's verified registry metadata, so a test can
+    /// tamper with what a warm pull would read.
+    fn stored_metadata(store_root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![store_root.join("metadata")];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files
+    }
+
+    #[tokio::test]
+    async fn a_warm_digest_pinned_pull_makes_no_registry_requests() {
+        for integrity in [None, Some(RegistryIntegrityCase::ValidIndex)] {
+            let fixture = start_registry_fixture_with_options(None, integrity).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            let cold = store.pull_and_unpack(&fixture.reference).await.unwrap();
+            fixture.requests.store(0, Ordering::SeqCst);
+
+            // A second store over the same directory: what runc's create sees
+            // after the executor pool pulled, and what a restarted node sees.
+            let reopened = ImageStore::new(tmp.path().to_path_buf());
+            let warm = reopened.pull_and_unpack(&fixture.reference).await.unwrap();
+
+            assert_eq!(
+                fixture.requests.load(Ordering::SeqCst),
+                0,
+                "a warm pin asked the registry ({integrity:?})"
+            );
+            assert_eq!(warm.rootfs, cold.rootfs);
+            assert_eq!(warm.config, cold.config);
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_pinned_cold_starts_survive_a_registry_that_rate_limits_every_request() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            0,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        store.pull_and_unpack(&fixture.reference).await.unwrap();
+        // From here on the registry refuses every manifest read, as an
+        // anonymous registry does under a burst of cold executors.
+        fixture
+            .fault_remaining
+            .as_ref()
+            .unwrap()
+            .store(usize::MAX, Ordering::SeqCst);
+        fixture.requests.store(0, Ordering::SeqCst);
+
+        let burst: Vec<_> = (0..32)
+            .map(|_| {
+                let store = store.clone();
+                let reference = fixture.reference.clone();
+                tokio::spawn(async move { store.pull_and_unpack(&reference).await })
+            })
+            .collect();
+        for pull in burst {
+            let pulled = tokio::time::timeout(std::time::Duration::from_secs(5), pull)
+                .await
+                .expect("a warm pull waited on the rate-limited registry")
+                .unwrap()
+                .unwrap();
+            assert!(pulled.rootfs.join("bin/sh").exists());
+        }
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn tampered_local_metadata_is_refetched_and_verified_against_the_pin() {
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::ValidIndex))
+                .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let cold = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        let stored = stored_metadata(tmp.path());
+        // The index, the platform manifest and the config.
+        assert_eq!(stored.len(), 3, "{stored:?}");
+        for file in &stored {
+            let mut bytes = std::fs::read(file).unwrap();
+            bytes.extend_from_slice(b" ");
+            std::fs::write(file, bytes).unwrap();
+        }
+        fixture.requests.store(0, Ordering::SeqCst);
+
+        let refetched = store.pull_and_unpack(&fixture.reference).await.unwrap();
+
+        assert!(fixture.manifest_requests.load(Ordering::SeqCst) > 1);
+        assert!(fixture.requests.load(Ordering::SeqCst) > 0);
+        assert_eq!(refetched.config, cold.config);
+        // The refetch replaced the tampered copies with verified ones.
+        fixture.requests.store(0, Ordering::SeqCst);
+        store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_tag_reference_always_asks_the_registry() {
+        let fixture = start_registry_fixture().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        store.pull_and_unpack(&fixture.reference).await.unwrap();
+        fixture.requests.store(0, Ordering::SeqCst);
+
+        // The fixture serves no tags, so only the registry can answer.
+        let (repository, _) = fixture.reference.split_once('@').unwrap();
+        let tagged = format!("{repository}:latest");
+        assert!(store.pull_and_unpack(&tagged).await.is_err());
+        assert!(fixture.requests.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn a_pin_whose_rootfs_never_finished_unpacking_is_pulled_again() {
+        let fixture = start_registry_fixture().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let cold = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        std::fs::remove_file(cold.rootfs.with_extension("complete")).unwrap();
+        fixture.requests.store(0, Ordering::SeqCst);
+
+        let pulled = store.pull_and_unpack(&fixture.reference).await.unwrap();
+
+        assert!(fixture.requests.load(Ordering::SeqCst) > 0);
+        assert!(pulled.rootfs.with_extension("complete").is_file());
     }
 
     #[tokio::test]

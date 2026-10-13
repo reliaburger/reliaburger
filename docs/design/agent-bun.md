@@ -1041,7 +1041,7 @@ before their Phase 15 cases can use this contract.
 
 1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler via the reporting tree).
 2. Transition state to `Pending`.
-3. **Prepare image:** Check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
+3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.10). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
 4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000-60000) and marks it as in-use.
 5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a request, the request-derived soft controls `cpu.weight` and `memory.high` in the `linux.resources.unified` map (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
@@ -1560,6 +1560,16 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 **Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second failure, or any refusal, fails the attempt with the runtime's reason as `SpawnFailed`.
 
 **Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
+
+### 7.10 Registry Rate-Limits a Burst of Cold Starts
+
+**What happens:** Dozens of reusable executors cold-start together, and each one prepares its image twice: once in the pool, to resolve the command against the image config, and once in runc's create, to build the bundle. An anonymous registry such as `public.ecr.aws` answers `TOOMANYREQUESTS`.
+
+**Detection:** The registry client retries four times with backoff, then the pull fails with `ImageError::ManifestPull` and the attempt with `SpawnFailed`, its reason in the task's output.
+
+**Impact:** None for a digest-pinned image this node has already pulled and unpacked (#790). `ImageStore::pull_and_unpack` first resolves a pin from local storage: the raw index, platform manifest and config it verified on the first pull, kept under `metadata/sha256/{digest}` and re-hashed against the digest that names them on every read, plus a rootfs generation with its `.complete` marker. Then neither pull sends a request. Only the first pull of an image on a node, a tag reference, or a pin whose local metadata or rootfs is missing or fails verification asks the registry.
+
+**Recovery:** Automatic for a warm pin. For a cold one, the task fails after the client's retries and the task pool retries the attempt as usual. Configure `[images] mirrors` to keep a public registry's rate limit out of the path.
 
 ---
 
