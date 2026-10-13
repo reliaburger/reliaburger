@@ -1014,6 +1014,18 @@
     "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds"
   },
   {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+    "binary": "reliaburger::owned_runc",
+    "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+    "binary": "reliaburger::owned_runc",
+    "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds"
+  },
+  {
     "source": "tests/owned_network.rs",
     "function": "owned_network_setup_and_forwarding_retire_through_the_generation",
     "binary": "reliaburger::owned_network",

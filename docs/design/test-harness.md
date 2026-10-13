@@ -409,8 +409,10 @@ of the binary at once (two worktrees, say) failed with "Address already in use" 
 second run's gossip bind. `cluster_gossip` was the last `make test-cluster` suite on fixed
 ports: two nextest processes running it at once lost 4 of their 16 tests that way. A new
 multi-node test leases its ports like these. The two leader-loss tests in
-`owned_task_arrays` (`make test-linux`) still start their clusters at fixed bases; a port
-that has to stay fixed keeps out of the leased 27000–30000 range.
+`owned_task_arrays` (`make test-linux`) were the last on fixed bases (24510 and 24610);
+they lease their three nodes' ports the same way and keep the nodes' data under their own
+fixture root (#852). A port that has to stay fixed keeps out of the leased 27000–30000
+range.
 
 The same rule covers any port a process gives up and binds again: a crash fixture's
 restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
@@ -443,6 +445,13 @@ mounted under `/tmp`. It now finishes with `clear_fixture_dir` from
 cluster fixtures use, which unmounts everything beneath the root deepest first and then
 removes it. A root it can't remove fails a passing test; while a failed test unwinds, the
 error goes to stderr, because a second panic would abort the test binary.
+
+The owned-runc capacity harness in `tests/owned_runc.rs` had the same leak in a quieter
+form (#852). It handed its agent a volumes `TempDir` and dropped it once the agent task
+ended, and dropping a `TempDir` ignores a failed removal, so a mounted identity tmpfs
+stayed behind without a word. The harness now owns the directory for its whole life; its
+`Drop` stops the agent and API first, then calls `clear_fixture_dir` with the same
+panic-or-print rule.
 
 Cleanup must also stop at what the test owns. The scan reads every process on the host, and
 on a CI runner that includes the runner. Until #800 it killed the whole process group of any
