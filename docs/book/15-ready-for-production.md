@@ -1317,8 +1317,11 @@ named, the `match` is exhaustive, and there's no magic integer floating around
 that a reader has to decode.
 
 Two smaller choices round out the command. Selection: `--filter
-scheduling,firewall` parses to a list of groups and picks those; no filter runs
-everything. And the human report renders as plain aligned text with word labels
+scheduling,firewall` picks those groups, and an entry that names an exact case,
+such as `process_job_with_exit_zero_succeeds`, picks just that case; no filter
+runs everything. Case names came later, when a qualification test had to run a
+group's two job cases without its app case, which needs a `bun` the fixture
+doesn't install and spent its whole budget waiting for it (#742). And the human report renders as plain aligned text with word labels
 rather than colour:
 
 ```
