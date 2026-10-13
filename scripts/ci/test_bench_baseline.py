@@ -154,6 +154,23 @@ class BenchBaselineTests(unittest.TestCase):
         self.assertFalse(result.failed)
         self.assertIn("index_set/insert_sequential_1m", [row[0] for row in result.rows])
 
+    def test_a_renamed_benchmark_with_a_larger_workload_starts_a_fresh_baseline(self):
+        # #872 grew the 0.1 ms JSON encode to 64 encodes an iteration. Under
+        # its old name, main's baseline would read that as a 64x regression;
+        # under a new name it has no baseline yet and the next main run
+        # records one.
+        run = RUNS[0]
+        grown = dict(run["current"])
+        mean = grown.pop("state/json_encode_1m") * 64
+        stale = dict(run["current"], **{"state/json_encode_1m": mean})
+        self.assertEqual(bench_baseline.compare(stale, run["baseline"], 2.0).regressions,
+                         ["state/json_encode_1m"])
+        grown["state/json_encode_1m_x64"] = mean
+        result = bench_baseline.compare(grown, run["baseline"], 2.0)
+        self.assertFalse(result.failed)
+        row = next(row for row in result.rows if row[0] == "state/json_encode_1m_x64")
+        self.assertEqual(row[1:], (None, mean, None, None))
+
     def test_nothing_to_compare_has_no_runner_factor(self):
         result = bench_baseline.compare(bench_baseline.read_means(self.criterion), {}, 2.0)
         self.assertIsNone(result.runner)

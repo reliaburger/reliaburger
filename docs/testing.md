@@ -170,7 +170,11 @@ rest and the runner factor (the median). The means of the 12 October runs are
 a fixture in
 [`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
 `make test-ci-scripts` checks that they pass and that a benchmark pushed to
-2.1× the rest of any of them fails. Its Criterion output and baseline are kept as the
+2.1× the rest of any of them fails. The gate matches benchmarks by name, so
+a benchmark whose workload changes gets a new name (as
+`state/json_encode_1m_x64` did, #872): under its old name it would be
+compared with `main`'s baseline for the old workload, and a new name starts
+fresh. The job's Criterion output and baseline are kept as the
 `criterion-task-arrays` artefact for 90 days, the cost trend #668 reads.
 `test_every_benchmark_target_is_run_by_a_workflow` fails if a `bench` target
 in the `Makefile` isn't run by any workflow.

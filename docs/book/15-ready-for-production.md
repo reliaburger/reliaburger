@@ -635,6 +635,39 @@ slow as the rest of its run. We kept the real numbers from those five runs as a 
 the worst of them, a 0.1 ms JSON encode at 2.93 times the baseline, comes out at 1.86 against
 the rest, and passes.
 
+It passes, but only just. At a tenth of a millisecond, timer resolution and one unlucky
+context switch move that benchmark more than any change to the encoder would, and 1.86 is
+uncomfortably close to two. So `state/json_encode_1m` became `state/json_encode_1m_x64`: each
+iteration encodes the same finished 1M-task state 64 times, which puts the mean at a few
+milliseconds. It still measures one thing, JSON encoding of task-array state, and the
+throughput still counts encodes, so its per-encode figure stays comparable by eye:
+
+```rust
+const JSON_ENCODES: usize = 64;
+group.throughput(Throughput::Elements(JSON_ENCODES as u64));
+group.bench_function("json_encode_1m_x64", |b| {
+    b.iter(|| {
+        (0..JSON_ENCODES)
+            .map(|_| serde_json::to_vec(&finished).map_or(0, |bytes| bytes.len()))
+            .sum::<usize>()
+    })
+});
+```
+
+The closure returns the total bytes rather than nothing, so the compiler can't decide the
+encodes are unused and optimise them away; Criterion's `iter` feeds the return value through
+`black_box` for exactly that reason. `map_or(0, ...)` turns each `Result` into a length, with
+0 for an error that never happens here, and `sum::<usize>()` uses the turbofish to say what
+type the sum is.
+
+Why rename it, rather than keep the name? Because the gate matches benchmarks by name. Under
+its old name, the first run after the change would have compared a 64-encode workload with
+`main`'s one-encode baseline, seen a ratio of about 64, and failed. A new name has no baseline,
+so `bench_baseline.py` reports it as "new" and gates nothing; the old name is simply absent,
+which isn't a regression either. The first `main` run after the merge records the new
+baseline, and every run after that is gated as usual. `make test-ci-scripts` pins both halves
+of that against the 12 October runs.
+
 Two details came from the same data. First, a fast runner never tightens the bound: the median
 counts as at least 1. Two earlier runs that day had fast CPUs and a slow disk, with the median
 benchmark at 0.82 and the storage one at 1.66. Divided by the median, storage would have been
