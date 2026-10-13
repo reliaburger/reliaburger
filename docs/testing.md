@@ -29,9 +29,15 @@ owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
-`make test` first runs `make warm-executables`: it builds the `[[bin]]`
-targets (`bun`, `relish`, `testapp`) and, on macOS, runs each once with
-`--help` ([`warm_executables.py`](../scripts/ci/warm_executables.py)). macOS
+`make test` first runs `make warm-executables`: it builds the suite with
+`cargo test --no-run`, which builds the `[[bin]]` targets (`bun`, `relish`,
+`testapp`) as the tests use them, and, on macOS, runs each binary once with
+`--help` ([`warm_executables.py`](../scripts/ci/warm_executables.py)). It
+used to run `cargo build --bins`, which resolves features without the
+dev-dependencies (`proc-macro2`'s `span-locations` is one), so nextest's own
+build then compiled the library and the binaries a second time and replaced
+the files the step had just warmed
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). macOS
 assesses the first exec of every new executable before it runs, one file at a
 time across the host, and outside a terminal with the Developer Tools
 permission (a CI runner, a launchd service, a sandboxed agent) that costs

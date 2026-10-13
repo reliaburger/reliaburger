@@ -261,8 +261,10 @@ shape for a new fixture whose caller can take an interpreter; use `install_scrip
 caller needs a single executable path.
 
 The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
-depends on `make warm-executables`, which runs each of them once before the suite
-([#722](https://github.com/reliaburger/reliaburger/issues/722)).
+depends on `make warm-executables`, which builds them with `cargo test --no-run`, as the
+suite will, and runs each of them once before the suite
+([#722](https://github.com/reliaburger/reliaburger/issues/722),
+[#846](https://github.com/reliaburger/reliaburger/issues/846)).
 
 ## Benchmarks and coverage
 
