@@ -56,9 +56,10 @@ The same rule holds for every target that builds before its tests. `make
 test-linux` needs `target/debug/bun` with the `ebpf` feature
 (`RELIABURGER_BUN_BINARY` names it), so it first runs `cargo test --no-run
 --features ebpf`, the build nextest's `--features ebpf` will ask for. It used
-to run `cargo build --features ebpf --bin bun`, so nextest compiled the
-library, every proc macro and `bun` a second time, and replaced the `bun` the
-step had built ([#904](https://github.com/reliaburger/reliaburger/issues/904)).
+to run `cargo build --features ebpf --bin bun`, so on a fresh target nextest
+compiled the library, every proc macro and `bun` a second time, and replaced
+the `bun` the step had built. On a Mac the two builds took 710 s; now they take 327 s
+([#904](https://github.com/reliaburger/reliaburger/issues/904)).
 A pre-build is `cargo test --no-run` with exactly the build flags of the test
 run that follows it (`--features`, `--release` and the like); selection flags
 such as `-E` don't matter, since nextest builds every test target anyway.
