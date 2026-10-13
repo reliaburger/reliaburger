@@ -672,7 +672,7 @@ relish exec <app> --namespace <ns> <cmd...>  # Scope to a namespace
 
 # Cluster lifecycle
 relish init [dir] --cluster-name <name> --node-id <id> # Generate config + PKI
-relish init [dir] --development-plaintext              # Local-only plaintext transports
+relish init [dir] --development-plaintext              # Local-only plaintext transports (explicit opt-in; no cluster registry)
 relish nodes                        # Gossip membership and node state
 relish council [status]             # Every node's council view: role, epoch, term, log, quorum
 relish council recover --data-dir <dir> [--from <url> [--backup <name>]] [--master-key <path>] [--api-port <port>] [--force]
@@ -1269,6 +1269,10 @@ state and the first node's identity. It prints the one-use join token and root
 CA fingerprint. It does **not** start Bun. The operator starts the first node
 explicitly with `bun --cluster --config <dir>/reliaburger.toml`; the generated
 config requires mTLS unless `--development-plaintext` was explicitly used.
+`require_mtls` also defaults to `true` when a config omits it, so a hand-written
+config without an identity makes `bun --cluster` refuse and name `relish init`.
+`--development-plaintext` is the only generator of a plaintext config; such a
+cluster has no cluster registry and can't pull Docker Hub short names.
 
 **`relish join --token <token> --node-id <id> <api-address>`**
 

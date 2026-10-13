@@ -5039,6 +5039,98 @@ answer, and no turn may journal more than one write. Run two sync steps in
 one turn and it fails straight away, with a worst turn of 840 ms that the
 stopwatch would have passed.
 
+#### Which step, which await
+
+One write a turn held through 0.1.6. Then the 0.2.0 candidate's fast soak
+failed one settle check on two nodes at once (#890):
+
+```
+12:48:16.783 node-1 bun: agent loop turn took 1902 ms in follow_up (consumer_sync)
+12:48:16.692 node-3 bun: agent loop turn took 1880 ms in follow_up (consumer_sync)
+```
+
+Both turns started within a tenth of a second of each other. Node 2's bun had
+been killed and restarted two and a half minutes earlier, so its services
+coming back into the catalogue probably changed the view every node consumes,
+and the leader's next answer took nodes 1 and 3 through the same steps
+together. That much fits. What doesn't follow from the log is where 1.9 s
+went, because `consumer_sync` names seven steps, and two of them do more than
+journal. A step that installs a view also writes each service's kernel entry
+under the eBPF handle's lock (which job tasks, fault injection and traces
+share), rebuilds the routing table and reconciles the namespace firewall.
+The firewall's runtime reads already stop at the turn's deadline. A fsync
+doesn't, and nor does a lock.
+
+The obvious suspect was the view's size, since the leader sends the whole
+catalogue. So we measured it first. Two thousand services with three
+backends each, published to a recovered consumer and then republished with
+every backend moved, took at most 240 ms a step in a debug build on a laptop,
+real fsyncs included. The soak runs a handful of services. That isn't it,
+and `a_large_consumer_view_change_takes_each_turn_well_within_the_budget`
+keeps it that way: every turn, less its journal write, must stay under half
+the budget.
+
+That leaves the disk, the lock and the host. The same second, node 2 logged
+a 489 ms snapshot turn and node 3 an executor that "did not retire within
+1s", on three VMs sharing one Mac's disk while the leader ran a job campaign.
+It smells like a host-wide stall, but a smell isn't a measurement, so this
+time we made the log line carry one. A turn is now named after its step, and
+the meter keeps what the turn's slow awaits took:
+
+```
+bun: agent loop turn took 1902 ms in follow_up (consumer_sync/journal): journal write 1400 ms, kernel lock wait 3 ms, view install 6 ms, firewall sync 480 ms
+```
+
+(Those numbers are illustrative. The real ones arrive with the next soak.)
+
+The parts are a small enum, `TurnPart`, and the meter keeps two arrays of
+atomics indexed by it: total nanoseconds and how often the turn reached each
+part. `begin` clears them, so each turn starts empty, and the slow-turn line
+lists only the parts the turn reached:
+
+```rust
+fn snapshot(&self) -> [Option<Duration>; TurnPart::ALL.len()] {
+    TurnPart::ALL.map(|part| {
+        (self.reached[part.index()].load(Ordering::Relaxed) > 0)
+            .then(|| Duration::from_nanos(self.nanos[part.index()].load(Ordering::Relaxed)))
+    })
+}
+```
+
+`[T; N]::map` turns one fixed-size array into another of the same length,
+and `bool::then` turns `true` into `Some(..)` and `false` into `None`, so a
+part the turn never reached reads as `None` rather than as zero. Why atomics,
+when only the loop writes them? Because the meter is shared through an `Arc`
+with the metrics collector, and anything reached through an `Arc` from
+several tasks must be safe to touch from several threads. An `AtomicU64` is,
+and costs no lock.
+
+The lock wait needed one more trick. Every kernel write took the lock inline
+with `handle.lock().await`, and timing it means wrapping that in a method:
+
+```rust
+pub(super) async fn lock_kernel<'a>(
+    &self,
+    handle: &'a tokio::sync::Mutex<OnionEbpf>,
+) -> tokio::sync::MutexGuard<'a, OnionEbpf> {
+```
+
+The `'a` is a lifetime parameter: it says the returned guard borrows from
+`handle`, and from nothing else. Leave it out and Rust's elision rules give
+the guard the lifetime of `&self` instead, which is wrong twice over. The
+guard really borrows `handle`, so the method wouldn't compile, and a guard
+that borrowed `self` would stop the firewall sync from writing to `self`'s
+fields while it holds the lock. Naming the lifetime tells the compiler
+exactly which borrow the guard keeps alive.
+
+`each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits` drives a
+recovery's first answer one step a turn, through the same
+`begin_consumer_sync_turn` the loop calls, and checks the names in order
+(`candidate`, `journal`, `withdraw`, `prove_receipts`, `publish`, `activate`,
+`compact`), that every step with a write timed one, that the candidate timed
+its inventory read, and that `publish` timed its install and firewall sync.
+Issue #890 stays open until a soak's log line says which part it was.
+
 #### A test that raced the clock
 
 One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`

@@ -88,9 +88,20 @@ fn wait_for_exit(command: &mut Command) -> Output {
     }
 }
 
+/// The same node config with plaintext cluster transports explicitly chosen,
+/// so a clustered start reaches the listener checks instead of stopping at
+/// the missing identity.
+fn write_plaintext_config(root: &Path) -> std::path::PathBuf {
+    let config = write_config(root);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[security]\nrequire_mtls = false\n");
+    std::fs::write(&config, text).unwrap();
+    config
+}
+
 fn assert_empty_token_listener_refused(listen: &str, clustered: bool) {
     let root = tempfile::tempdir().unwrap();
-    let config = write_config(root.path());
+    let config = write_plaintext_config(root.path());
     let output = wait_for_exit(&mut bun_command(&config, listen, clustered));
     assert!(
         !output.status.success(),
@@ -124,14 +135,52 @@ fn clustered_refuses_wildcard_listener_during_bootstrap() {
 }
 
 #[test]
-fn standalone_allows_ip_literal_loopback_during_bootstrap() {
+fn clustered_start_without_an_identity_refuses_by_default_and_names_relish_init() {
+    // The config has no [security] section: mTLS is required by default.
     let root = tempfile::tempdir().unwrap();
     let config = write_config(root.path());
+    let output = wait_for_exit(&mut bun_command(&config, "127.0.0.1:0", true));
+    assert!(
+        !output.status.success(),
+        "bun started a cluster in the clear"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("require_mtls is set") && stderr.contains("relish init"),
+        "unexpected startup error: {stderr}"
+    );
+}
+
+#[test]
+fn standalone_without_security_settings_starts_with_no_identity() {
+    // Single-node Bun ignores [security] require_mtls: the default config,
+    // with no identity anywhere on disk, still serves.
+    let root = tempfile::tempdir().unwrap();
+    let config = write_config(root.path());
+    assert!(
+        !std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("[security]")
+    );
+    assert_standalone_serves_loopback(root.path(), &config);
+    assert!(!root.path().join("data/identity").exists());
+}
+
+#[test]
+fn standalone_allows_ip_literal_loopback_during_bootstrap() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_plaintext_config(root.path());
+    assert_standalone_serves_loopback(root.path(), &config);
+}
+
+/// Start single-node Bun on an ephemeral loopback port and wait for a 200
+/// from its health endpoint.
+fn assert_standalone_serves_loopback(root: &Path, config: &Path) {
     // Let Bun own its ephemeral port from the first bind. Reserving and
     // releasing a candidate here races every other process on the CI host.
-    let stdout_path = root.path().join("bun.stdout");
+    let stdout_path = root.join("bun.stdout");
     let stdout = std::fs::File::create(&stdout_path).unwrap();
-    let mut child = bun_command(&config, "127.0.0.1:0", false)
+    let mut child = bun_command(config, "127.0.0.1:0", false)
         .stdout(stdout)
         .spawn()
         .unwrap();

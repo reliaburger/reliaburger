@@ -786,12 +786,24 @@ The master key and security-bootstrap files are both written with mode `0600`.
 Bun enforces that at load time, so a generated bootstrap never relies on a
 world-readable interval or asks the operator to repair permissions manually.
 
-This is the normal path. Explicit development generators are the exception:
-`relish init --development-plaintext` and `relish dev create` write
-`require_mtls = false`, embed a development-only warning in the file and print
-the same warning; Bun repeats it at every cluster start. The Lima dev cluster
-keeps this temporary limitation because its provisioning path doesn't enrol a
-separate node identity in each VM yet. Don't reuse those configs elsewhere.
+This is the normal path, and since 0.2.1 it's also the default: `[security]
+require_mtls` defaults to `true`, so a node config that omits it, or omits the
+whole section, fails closed. `bun --cluster` with no identity on disk refuses to
+start with the command that fixes it, `relish init` on a bootstrap node or
+`relish join` on a joiner. Single-node `bun` without `--cluster` doesn't read
+the setting. `relish dev create` builds an mTLS cluster the way
+`relish setup --quickstart` does, from the same bootstrap code: it generates the
+CA, master key and first identity on the host, then enrols every other Lima VM
+with a join token and `relish join`.
+
+Plaintext is an explicit opt-in, and there are only two: `relish init
+--development-plaintext`, and test fixtures that write `require_mtls = false`.
+The generated file embeds a development-only warning, the command prints it,
+and Bun repeats it at every cluster start. Don't reuse such a config elsewhere.
+A plaintext cluster has no cluster registry, because the registry needs mTLS
+(#792), so it can't pull Docker Hub short names such as `nginx:1.27`. That's
+deliberate: Pickle stays the only path to Docker Hub, and no node ever falls
+back to a direct pull that skips the cluster's cache and policy (#870).
 
 The transport contract has one deliberate split. Raft and reporting require a
 valid, unrevoked node certificate at the TLS handshake. The agent API also

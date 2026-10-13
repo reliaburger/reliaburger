@@ -48,7 +48,8 @@
 //!
 //! Every turn is timed by branch ([`super::loop_meter`]) and exported as
 //! `bun_agent_loop_turn_seconds`; any turn over 250 ms is logged with the
-//! command or deploy op it ran.
+//! command, deploy op or consumer-sync step it ran, and with what its timed
+//! slow awaits took ([`super::loop_meter::TurnPart`], #890).
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
@@ -1583,7 +1584,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
                     _ = std::future::ready(()), if self.consumer_syncs.step_first() => {
-                        let turn = self.begin_turn(LoopBranch::FollowUp, Some("consumer_sync"));
+                        let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
                     }
@@ -1598,7 +1599,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         turn
                     }
                     _ = std::future::ready(()), if !self.consumer_syncs.is_idle() => {
-                        let turn = self.begin_turn(LoopBranch::FollowUp, Some("consumer_sync"));
+                        let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
                     }
@@ -1636,6 +1637,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(test)]
         self.loop_stalls.begin_turn();
         self.loop_meter.begin(branch, detail)
+    }
+
+    /// Start a turn that takes the next consumer-sync step, named after
+    /// that step, so a slow one's log line says which it was (#890).
+    fn begin_consumer_sync_turn(&mut self) -> super::loop_meter::Turn {
+        let step = self.consumer_syncs.next_step_label();
+        self.begin_turn(LoopBranch::FollowUp, Some(step))
     }
 
     /// When the turn in progress must give up on a runtime read or other
