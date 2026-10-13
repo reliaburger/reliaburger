@@ -123,6 +123,9 @@ pub struct Compatibility {
 /// inline config files move to a per-instance directory.
 /// A task-array node's control fence is `control.fence`, two checksummed
 /// slots rewritten in place, not `control.json` (#745).
+/// Each array's grant fence is `grants.fence`, not `grants.json`, and both
+/// fences share one slot format: magic, generation, payload length, payload
+/// and CRC32, two slots of a power-of-two stride of at least 512 bytes (#902).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,
