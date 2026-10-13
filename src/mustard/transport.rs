@@ -528,6 +528,7 @@ mod tests {
             disk_pressured: false,
             recovery_epoch: None,
             recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         }
     }

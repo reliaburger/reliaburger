@@ -48,6 +48,7 @@ fn members(nodes: &[(&str, SocketAddr)]) -> Arc<RwLock<Vec<NodeMembershipInfo>>>
                 node_id: crate::meat::NodeId::new(*name),
                 address: *address,
                 api_advertised: true,
+                jobs: None,
             })
             .collect(),
     ))

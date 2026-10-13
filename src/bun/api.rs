@@ -158,6 +158,28 @@ pub struct NodeMembershipInfo {
     /// nodes listing) must wait for the real thing: nodes sharing a host
     /// pick their ports independently, so one node's offset is not another's.
     pub api_advertised: bool,
+    /// The kinds of job the node advertises over gossip, or `None` until it
+    /// has said (#788). The leader refuses a job run at submission when
+    /// every live member's summary refuses it.
+    pub jobs: Option<crate::meat::job_capability::JobCapabilities>,
+}
+
+impl NodeMembershipInfo {
+    /// A member as gossip describes it: its advertised API endpoint (or a
+    /// guess at `gossip_to_api_offset` from its gossip port until that
+    /// arrives) and the job capabilities it advertises.
+    pub fn from_gossip(
+        member: &crate::mustard::membership::MembershipSnapshot,
+        directory: &crate::mustard::directory::NodeDirectory,
+        gossip_to_api_offset: i32,
+    ) -> Self {
+        Self {
+            node_id: member.node_id.clone(),
+            address: directory.api_address(&member.node_id, member.address, gossip_to_api_offset),
+            api_advertised: directory.endpoints.contains_key(&member.node_id),
+            jobs: directory.jobs.get(&member.node_id).copied(),
+        }
+    }
 }
 
 /// Every member this node has seen through gossip, with its last API address:
