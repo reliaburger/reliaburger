@@ -33,56 +33,76 @@ fn ebpf_tests_enabled() -> bool {
 }
 
 /// Load and attach the Onion programs, refusing to run without the eBPF gate.
+///
+/// This loads the object embedded in the library under test, as production
+/// does. Searching the target directory instead could find another
+/// worktree's object when several share one `CARGO_TARGET_DIR` (#878).
 fn load_ebpf() -> OnionEbpf {
     assert!(
         ebpf_tests_enabled(),
         "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
     );
-    OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).expect("failed to load eBPF program")
-}
-
-/// Find the directory containing compiled .bpf.o files.
-///
-/// build.rs puts them in OUT_DIR, which is under the target directory.
-/// We search for them relative to the current cargo target dir.
-fn find_bpf_obj_dir() -> PathBuf {
-    // The OUT_DIR from build.rs is something like:
-    // target/debug/build/reliaburger-HASH/out/
-    // We search for onion_connect.bpf.o under the target dir.
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("target"));
-
-    // Walk the build directory to find the .bpf.o file
-    for entry in walkdir(&target_dir) {
-        if entry.ends_with("onion_connect.bpf.o") {
-            return entry.parent().unwrap().to_path_buf();
-        }
-    }
-
-    panic!(
-        "onion_connect.bpf.o not found under {}. Did you build with --features ebpf?",
-        target_dir.display()
-    );
-}
-
-/// Recursively walk a directory and return all file paths.
-fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                results.extend(walkdir(&path));
-            } else {
-                results.push(path);
-            }
-        }
-    }
-    results
+    OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).expect("failed to load eBPF program")
 }
 
 const CGROUP_PATH: &str = "/sys/fs/cgroup";
+
+/// The object this build's `build.rs` wrote, read from this build's own
+/// `OUT_DIR`. Cargo gives the library and its integration tests the same
+/// build-script output directory, so no other tree's object can answer.
+const THIS_BUILDS_OBJECT: &str = concat!(env!("OUT_DIR"), "/onion_connect.bpf.o");
+
+/// Map names this tree's `ebpf/onion_connect.bpf.c` declares, read from
+/// `} name SEC(".maps");` lines.
+fn maps_declared_by_this_trees_source() -> Vec<String> {
+    let source_path = concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/onion_connect.bpf.c");
+    let source = std::fs::read_to_string(source_path).unwrap();
+    source
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix("SEC(\".maps\");"))
+        .filter_map(|line| line.trim().strip_prefix('}'))
+        .map(|name| name.trim().to_string())
+        .collect()
+}
+
+/// Does the ELF object name this symbol? Symbol names sit NUL-terminated
+/// in the object's string tables.
+fn object_names_symbol(object: &[u8], name: &str) -> bool {
+    let needle = format!("\0{name}\0");
+    object
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Tier 0: Which object the tests load (no kernel needed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tests_load_the_object_this_build_compiled() {
+    let loaded = OnionEbpf::embedded_object();
+    let compiled = std::fs::read(THIS_BUILDS_OBJECT).unwrap();
+    assert!(
+        loaded == compiled.as_slice(),
+        "the object the tests load differs from {THIS_BUILDS_OBJECT}"
+    );
+
+    let declared = maps_declared_by_this_trees_source();
+    assert!(
+        declared.len() >= reliaburger::onion::ebpf::loader::REQUIRED_MAPS.len(),
+        "found only {declared:?} in ebpf/onion_connect.bpf.c"
+    );
+    for name in declared
+        .iter()
+        .map(String::as_str)
+        .chain(reliaburger::onion::ebpf::loader::REQUIRED_PROGRAMS)
+    {
+        assert!(
+            object_names_symbol(loaded, name),
+            "the loaded object has no {name}, so it was not built from this tree"
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tier 1: Load and map verification
@@ -109,6 +129,18 @@ async fn ebpf_load_and_attach() {
     assert!(ebpf.sendmsg4_attached());
     assert!(ebpf.sendmsg6_attached());
     ebpf.detach().unwrap();
+
+    // The `[ebpf] program_dir` override loads from a directory. Give it a
+    // private copy of this build's object, never a search of the target tree.
+    let program_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        THIS_BUILDS_OBJECT,
+        program_dir.path().join("onion_connect.bpf.o"),
+    )
+    .unwrap();
+    let mut overridden = OnionEbpf::load(program_dir.path(), CGROUP_PATH.as_ref()).unwrap();
+    assert!(overridden.is_attached());
+    overridden.detach().unwrap();
 }
 
 #[tokio::test]
