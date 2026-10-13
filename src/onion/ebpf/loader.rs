@@ -116,13 +116,19 @@ impl OnionEbpf {
         Self::attach(bpf, cgroup_path)
     }
 
+    /// The `onion_connect.bpf.o` bytes this build compiled and embedded.
+    /// [`OnionEbpf::load_embedded`] loads exactly these bytes.
+    #[cfg(feature = "ebpf")]
+    pub fn embedded_object() -> &'static [u8] {
+        aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o"))
+    }
+
     /// Load the version-matched object embedded in this executable.
     /// No build tree or installed `.bpf.o` files are needed at runtime.
     #[cfg(feature = "ebpf")]
     pub fn load_embedded(cgroup_path: &Path) -> Result<Self, OnionError> {
         check_prerequisites()?;
-        let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o"));
-        let bpf = aya::Ebpf::load(bytes).map_err(|error| OnionError::EbpfLoadFailed {
+        let bpf = aya::Ebpf::load(Self::embedded_object()).map_err(|error| OnionError::EbpfLoadFailed {
             reason: format!("failed to load embedded eBPF program: {error}"),
         })?;
         Self::attach(bpf, cgroup_path)

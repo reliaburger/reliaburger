@@ -88,6 +88,11 @@ ignored by default and run by their own targets and CI jobs
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
+The eBPF tests load the object embedded in the library under test, as Bun
+does, and never search the target directory. Worktrees can share one
+`CARGO_TARGET_DIR` without testing each other's programs.
+`tests_load_the_object_this_build_compiled` checks this without a kernel.
+
 ### Who runs an ignored test
 
 Every `#[ignore = "..."]` reason names its owner, and `make check-ignored`
