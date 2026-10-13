@@ -15,7 +15,7 @@ Bun's responsibilities on every node:
 
 - **Container management (Grill):** Start, stop, health-check, and monitor OCI containers via the Grill abstraction layer. Grill drives the runtimes directly (runc on Linux, Apple Container on macOS, and a `process` mode with no runtime at all); it does not shell through containerd.
 - **Process workload management:** Start, stop, and health-check non-container workloads (host binaries and inline scripts), gated by a deny-by-default binary allowlist. (The namespace/cgroup isolation stack for these host processes is planned; see §5.2.)
-- **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000-60000) and map them to container-internal ports.
+- **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000 up to, not including, 32767: below Linux's ephemeral range) and map them to container-internal ports. Ports a host daemon already listens on are skipped.
 - **eBPF service discovery (Onion):** Load and maintain the Onion eBPF programs and kernel maps for socket-level service discovery and firewall enforcement.
 - **Log collection (Ketchup):** Capture stdout/stderr from all workloads and feed them into the structured log pipeline.
 - **Metrics collection (Mayo):** Scrape per-workload metrics endpoints and feed them into the time-series store.
@@ -814,7 +814,7 @@ pub struct NetworkConfig {
     /// Default: auto-detected from the default route interface.
     pub advertise_address: Option<IpAddr>,
     /// Ephemeral port range for container port mapping.
-    pub port_range: PortRange,   // default: 10000-60000
+    pub port_range: PortRange,   // default: 10000..32767 (end exclusive)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1042,7 +1042,7 @@ before their Phase 15 cases can use this contract.
 1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler via the reporting tree).
 2. Transition state to `Pending`.
 3. **Prepare image:** Check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
-4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000-60000) and marks it as in-use.
+4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000..32767), skips any port a TCP bind on the host shows is already taken, and marks it as in-use.
 5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a request, the request-derived soft controls `cpu.weight` and `memory.high` in the `linux.resources.unified` map (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
@@ -1403,7 +1403,7 @@ join = ["10.0.1.5:9443"]
 | `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
 | `[resources]` | `gpu_enabled` | `true` | bool | Auto-detect NVIDIA GPUs (probe `/dev/nvidia0`, parse `nvidia-smi`) at startup. When false, GPU workloads are refused on this node. |
 | `[network]` | `advertise_address` | auto-detect | IP address | IP address this node advertises to the cluster. |
-| `[network]` | `port_range` | `"10000-60000"` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
+| `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
 | `[images]` | `max_storage` | `"50Gi"` | resource string (bytes) | Maximum disk space for Pickle image layers. |
 | `[images]` | `redundancy` | `2` | 1-10 | Number of peers to replicate pushed images to immediately. |
 | `[images]` | `gc_retain_tags` | `10` | 1-1000 | Keep this many most-recent tags per repository. |
@@ -1691,7 +1691,7 @@ The default seccomp profile blocks the following syscall families (identical for
 
 **10,000 nodes:** Bun itself is not affected by cluster size. The reporting tree ensures that each Bun instance communicates only with its parent (a council member), not with all other nodes. The Onion service map on each node contains entries for all workloads in the cluster (~5M at max density), which fits comfortably in kernel memory (~80 bytes per entry = ~400 MB, well within typical server memory).
 
-**Port allocation at density:** The default port range of 10000-60000 provides 50,000 ports. At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum = 2% utilisation. Port exhaustion is not a concern.
+**Port allocation at density:** The default port range of 10000..32767 provides about 22,700 ports, all below Linux's ephemeral range (32768-60999). At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum, about 4% utilisation. Port exhaustion is not a concern.
 
 ### 9.3 Memory Budget
 

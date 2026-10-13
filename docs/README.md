@@ -920,7 +920,7 @@ other combination before it adopts or creates a workload.
 [dns]
 enabled = true
 listen = "0.0.0.0:53"       # derive and bind this node's runc gateway
-upstream = "8.8.8.8:53"
+# upstream = "10.0.0.2:53"  # default: the host's /etc/resolv.conf nameservers
 restrict_sources = true
 
 [ebpf]
@@ -933,6 +933,10 @@ Linux `IP_FREEBIND` before the first workload creates the interface. This avoids
 host loopback, which a container namespace can't reach, and avoids claiming
 wildcard port 53 from `systemd-resolved`. `/etc/resolv.conf` has no port syntax,
 so other ports are rejected.
+
+Names outside `.internal` go to the host's own resolvers, in the order its
+`/etc/resolv.conf` lists them, so split-horizon and corporate DNS keep working.
+Set `upstream` to override that. With no usable resolver, Bun refuses to start.
 
 Short names such as `redis.internal` use the namespace of the isolated source
 workload, as published by the runtime. Unknown or ambiguous source addresses are

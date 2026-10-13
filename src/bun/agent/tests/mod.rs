@@ -5522,7 +5522,7 @@ async fn assert_only_the_bad_route_is_skipped(agent: &BunAgent<MockGrill>) {
         assert!(
             view.resolve(&crate::onion::service_id::ServiceId::new("default", name))
                 .is_some(),
-            "{name} must still resolve: {view:?}"
+            "{name} must still resolve"
         );
     }
     let table = agent.routing_table.read().await;
@@ -5624,21 +5624,21 @@ async fn cluster_publication_refusal_preserves_the_confirmed_catalogue_dns_and_i
         .unwrap()
         .backends[0]
         .host_port = 30002;
-    let mut invalid = ingress.clone();
-    invalid[0].config.rate_limit_rps = Some(0);
+    // A rewritten generation 1 conflicts with the confirmed one. (An invalid
+    // route no longer refuses a generation; it's skipped, #700.)
     let (response, reply) = oneshot::channel();
     agent
         .handle_command(AgentCommand::SyncClusterCatalog {
-            generation: 2,
+            generation: 1,
             response,
             catalog: Box::new(changed.clone()),
-            ingress: invalid,
+            ingress: ingress.clone(),
         })
         .await;
     assert!(reply.await.unwrap().is_err());
     assert_eq!(
         agent.cluster_catalog, original,
-        "a refused route changed the installed catalogue"
+        "a refused publication changed the installed catalogue"
     );
     assert_eq!(
         agent

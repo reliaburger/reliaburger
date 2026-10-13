@@ -295,7 +295,10 @@ async fn external_lookup_uses_the_configured_resolver_file() {
         listen: "127.0.0.1:0".into(),
         ..Default::default()
     };
-    assert_eq!(section.upstream, None, "the default must be the host's resolvers");
+    assert_eq!(
+        section.upstream, None,
+        "the default must be the host's resolvers"
+    );
     // resolv.conf names addresses only; the fake resolver can't bind port 53
     // unprivileged, so the test tells the reader which port they answer on.
     let config = section

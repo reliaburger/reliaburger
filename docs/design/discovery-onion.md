@@ -51,7 +51,7 @@ The hierarchical reporting tree is the source of truth for service map updates. 
 
 Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that feed it, plus a userspace DNS responder, all managed by the Bun agent process.
 
-> **Decision log — the `onion_dns` eBPF program below was never shipped.** The `onion_dns` program, its `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks, and the `dns_map` it reads are the *original* in-kernel DNS design. We built and abandoned it because those hooks can't read the DNS payload (see §1). The live implementation is a supervised userspace UDP/TCP responder (`src/onion/dns.rs`), with a per-instance resolver file mounted into rootful runc workloads. The kernel listings are preserved for teaching, not as a description of the running binary; `dns_map` survives in the source as a leftover but is off the resolution path. The later TC proof demonstrates that packet-hook synthesis is feasible, but it remains review evidence rather than production code.
+> **Decision log — the `onion_dns` eBPF program below was never shipped.** The `onion_dns` program, its `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks, and the `dns_map` it reads are the *original* in-kernel DNS design. We built and abandoned it because those hooks can't read the DNS payload (see §1). The live implementation is a supervised userspace UDP/TCP responder (`src/onion/dns.rs`), with a per-instance resolver file mounted into rootful runc workloads. The kernel listings are preserved for teaching, not as a description of the running binary. 0.2.1 deleted the leftovers (#700): `ebpf/onion_dns.bpf.c` is no longer compiled, and the `dns_map` key and value types are gone from `ebpf/onion_common.h` and `src/onion/types.rs`. The later TC proof demonstrates that packet-hook synthesis is feasible, but it remains review evidence rather than production code.
 
 ### eBPF Programs
 
@@ -703,6 +703,8 @@ Bun receives state changes from the reporting tree and translates them into BPF 
    c. Cleans up related firewall_map entries
 ```
 
+**Publication failure handling:** A node refuses a whole catalogue generation only when the catalogue itself can't be trusted: a stale or rewritten generation, a VIP allocation that fails validation, or a collision with this node's local services. One app's ingress route is not the catalogue. A route whose TLS mode doesn't parse, or whose rate limit is zero or can't derive a burst, is left out of the routing table, logged with its namespace and app, and the rest of the generation installs as normal: every service's VIP, backends, DNS answer and every other route. Before 0.2.1 both cluster paths (the plain catalogue publication and the discovery-owning consumer view) turned that one bad route into a refusal of the generation, which froze discovery and ingress for every app in the cluster at the last good catalogue (#700). Config validation now refuses such an ingress at `relish apply` and `relish lint`, so skipping is the fallback for a spec that predates the check.
+
 ### 5.4 Virtual IP Allocation Algorithm
 
 VIPs are deterministic: the same app name always produces the same VIP across every node in the cluster. This means there is no coordination required for VIP allocation -- every node independently computes the same mapping.
@@ -732,7 +734,7 @@ The health status of each backend is maintained by Bun based on the health check
 
 The eBPF programs are designed to be invisible for non-cluster traffic:
 
-- **DNS:** Only queries for names ending in `.internal` are intercepted. All other DNS queries (`api.stripe.com`, `s3.amazonaws.com`, etc.) pass through to the host's upstream DNS resolver configured in `/etc/resolv.conf`.
+- **DNS:** Only queries for names ending in `.internal` are answered locally. Bun's responder forwards all other DNS queries (`api.stripe.com`, `s3.amazonaws.com`, etc.) to the host's resolvers: the `nameserver` lines of `/etc/resolv.conf`, read at start, tried in order, skipping the responder's own address. `[dns] upstream` overrides them, and with no usable resolver Bun refuses to start.
 - **Connect:** Only connections to IPs in the `127.128.0.0/16` range are rewritten. Other `connect()` calls (to real IPs, to `127.0.0.1`, to external addresses) are never rewritten; a namespaced caller is refused one only when `destination_map` names another namespace's workload there, or its egress allowlist doesn't list it.
 
 Because Reliaburger does not use an overlay network, containers have direct outbound access to external services via the host network stack, subject to the same hooks' egress allowlists. An allowlist always permits the node's DNS responder on port 53.
@@ -775,8 +777,9 @@ The host port range Onion references for backend map entries is not an
 
 ```toml
 [network]
-# Dynamic host port allocation range (default: start = 10000, end = 60000).
-port_range = { start = 10000, end = 60000 }
+# Dynamic host port allocation range (default: start = 10000, end = 32767,
+# end exclusive), below Linux's ephemeral range. Host-bound ports are skipped.
+port_range = { start = 10000, end = 32767 }
 ```
 
 ### eBPF Program Files
@@ -784,12 +787,11 @@ port_range = { start = 10000, end = 60000 }
 Onion ships as pre-compiled eBPF object files (CO-RE, using BTF for portability):
 
 ```
-/var/lib/reliaburger/ebpf/
-    onion_dns.bpf.o          # DNS interception program
-    onion_connect.bpf.o      # connect() rewrite program
+onion_connect.bpf.o          # connect() rewrite and policy hooks
+onion_connect_owned.bpf.o    # the same program, built for pinned maps owned by Bun
 ```
 
-These are embedded in the `reliaburger` binary and extracted to disk at install time. Bun loads them via the BPF syscall at startup.
+`build.rs` compiles both from `ebpf/onion_connect.bpf.c` and the binary embeds them; Bun loads one via the BPF syscall at startup. There is no DNS program: the abandoned `onion_dns.bpf.o` is no longer built.
 
 ---
 

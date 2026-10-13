@@ -11,13 +11,17 @@ use tokio::sync::Mutex;
 
 /// Concurrent-safe ephemeral port allocator.
 ///
-/// Allocates ports from a configurable range (default 10000-60000).
-/// Uses random selection to avoid predictable port assignment.
+/// Allocates ports from a configurable range (default 10000 up to, not
+/// including, 32767). Uses random selection to avoid predictable port
+/// assignment, and skips any port something on the host already listens on.
 #[derive(Debug, Clone)]
 pub struct PortAllocator {
     range_start: u16,
     range_end: u16,
     allocated: Arc<Mutex<HashSet<u16>>>,
+    /// Skip ports a host process already listens on. Always on outside
+    /// test fixtures.
+    probe_host: bool,
 }
 
 /// Errors from port allocation operations.
@@ -40,7 +44,16 @@ impl PortAllocator {
             range_start,
             range_end,
             allocated: Arc::new(Mutex::new(HashSet::new())),
+            probe_host: true,
         }
+    }
+
+    /// Trust the bookkeeping alone, without probing the host. For test
+    /// fixtures whose stand-in workload is already listening on the one port
+    /// it expects Bun to allocate; a real node never wants this.
+    pub fn without_host_probe(mut self) -> Self {
+        self.probe_host = false;
+        self
     }
 
     /// Create from a node config PortRange.
@@ -79,7 +92,8 @@ impl PortAllocator {
         let first = rng.gen_range(0..self.total_ports());
         for offset in 0..self.total_ports() {
             let port = self.range_start + ((first + offset) % self.total_ports()) as u16;
-            if allocated.insert(port) {
+            if !allocated.contains(&port) && (!self.probe_host || host_port_is_free(port)) {
+                allocated.insert(port);
                 return Ok(port);
             }
         }
@@ -132,9 +146,35 @@ impl PortAllocator {
     }
 }
 
+/// Whether nothing on the host listens on TCP `port`.
+///
+/// The bookkeeping above only knows Bun's own allocations. A published port
+/// is DNAT'd, so one a host daemon already listens on would shadow that
+/// daemon for external clients. A test bind on the wildcard address fails
+/// when anything listens on the port on any IPv4 address. The bind is one
+/// non-blocking syscall, so it's fine on the runtime.
+fn host_port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A port nothing on the host listens on, for tests whose range is a
+    /// port or two wide. Fixed ports (5000 is AirPlay on macOS) may be taken.
+    fn unused_host_port() -> u16 {
+        loop {
+            let port = std::net::TcpListener::bind("0.0.0.0:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            if port < u16::MAX - 2 && host_port_is_free(port + 1) {
+                return port;
+            }
+        }
+    }
 
     /// Linux hands out ephemeral source ports from 32768 by default
     /// (`net.ipv4.ip_local_port_range`), so a published port at or above it
@@ -263,9 +303,10 @@ mod tests {
 
     #[tokio::test]
     async fn single_port_range() {
-        let alloc = PortAllocator::new(5000, 5001);
+        let free = unused_host_port();
+        let alloc = PortAllocator::new(free, free + 1);
         let port = alloc.allocate().await.unwrap();
-        assert_eq!(port, 5000);
+        assert_eq!(port, free);
         assert!(alloc.allocate().await.is_err());
     }
 
@@ -279,7 +320,8 @@ mod tests {
     /// count against the range's exhaustion cap.
     #[tokio::test]
     async fn out_of_range_reserve_does_not_exhaust_the_pool() {
-        let alloc = PortAllocator::new(5000, 5002); // two allocatable ports
+        let free = unused_host_port();
+        let alloc = PortAllocator::new(free, free + 2); // two allocatable ports
         // Reserve several out-of-range ports (as adoption does).
         for p in [80u16, 443, 8080] {
             alloc.reserve(p).await.unwrap();

@@ -5,7 +5,7 @@
 /// nameserver; on Linux, Bun uses `IP_FREEBIND` so it can bind that precise
 /// address before the first veth creates it.
 /// When a query arrives for `*.internal`, we answer from the service map;
-/// everything else is forwarded to the upstream resolver.
+/// everything else is forwarded to the upstream resolvers, in order.
 ///
 /// The responder is authoritative for `.internal`: names that don't
 /// resolve get NXDOMAIN locally and are never forwarded, so internal
@@ -171,9 +171,11 @@ impl DnsSourceNamespaces {
 pub struct DnsConfig {
     /// Address to listen on (e.g. `0.0.0.0:53` for runc workloads).
     pub listen_addr: SocketAddr,
-    /// Upstream DNS server for non-`.internal` queries.
-    pub upstream: SocketAddr,
-    /// How long to wait for an upstream reply before SERVFAIL.
+    /// Upstream DNS servers for non-`.internal` queries, tried in order
+    /// until one answers. Empty means external names always SERVFAIL.
+    pub upstreams: Vec<SocketAddr>,
+    /// How long to wait for each upstream's reply before trying the next,
+    /// then SERVFAIL.
     pub upstream_timeout: Duration,
     /// Runtime-owned source addresses and their workload namespaces.
     /// Short names are refused when the source is absent or ambiguous.
@@ -186,7 +188,7 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             listen_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53),
-            upstream: SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53),
+            upstreams: Vec::new(),
             upstream_timeout: Duration::from_secs(2),
             source_namespaces: watch::channel(DnsSourceNamespaces::default()).1,
             source_acl: SourceAcl::default(),
@@ -499,11 +501,10 @@ pub async fn serve(
                     continue;
                 };
                 let socket = Arc::clone(&socket);
-                let upstream = config.upstream;
-                let timeout = config.upstream_timeout;
+                let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let response = forward_upstream(&query, upstream, timeout)
+                    let response = forward_upstreams(&query, &config)
                         .await
                         .unwrap_or_else(|| build_status_response(&query, RCODE_SERVFAIL));
                     let _ = socket.send_to(&response, src).await;
@@ -590,7 +591,7 @@ async fn answer_tcp_query(
                 qtype,
                 peer.ip(),
             ),
-            None => forward_upstream_tcp(&query, config.upstream, config.upstream_timeout)
+            None => forward_upstreams_tcp(&query, &config)
                 .await
                 .unwrap_or_else(|| build_status_response(&query, RCODE_SERVFAIL)),
         }
@@ -695,7 +696,29 @@ fn service_id_for(stripped: &str, namespace: Option<&str>) -> Option<ServiceId> 
     }
 }
 
-/// Forward a query to the upstream resolver and return its reply.
+/// Forward a query over UDP to each upstream in turn and return the first
+/// reply. `None` means none answered in time.
+async fn forward_upstreams(query: &[u8], config: &DnsConfig) -> Option<Vec<u8>> {
+    for upstream in &config.upstreams {
+        if let Some(reply) = forward_upstream(query, *upstream, config.upstream_timeout).await {
+            return Some(reply);
+        }
+    }
+    None
+}
+
+/// Forward a query over TCP to each upstream in turn and return the first
+/// reply. `None` means none answered in time.
+async fn forward_upstreams_tcp(query: &[u8], config: &DnsConfig) -> Option<Vec<u8>> {
+    for upstream in &config.upstreams {
+        if let Some(reply) = forward_upstream_tcp(query, *upstream, config.upstream_timeout).await {
+            return Some(reply);
+        }
+    }
+    None
+}
+
+/// Forward a query to one upstream resolver and return its reply.
 ///
 /// Uses a fresh connected socket per query, so replies from any other
 /// address are rejected by the kernel, and validates that the reply's

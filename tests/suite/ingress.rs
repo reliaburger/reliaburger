@@ -56,7 +56,8 @@ impl IngressHarness {
         let shutdown = CancellationToken::new();
 
         let grill = ProcessGrill::new();
-        let port_allocator = PortAllocator::new(range_start, range_end);
+        // The test app already listens on the port the "container" gets.
+        let port_allocator = PortAllocator::new(range_start, range_end).without_host_probe();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());

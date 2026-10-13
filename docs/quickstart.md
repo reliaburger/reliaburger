@@ -164,6 +164,12 @@ normal CLI commands read it without requiring a VM shell. The node APIs use
 TLS and pinned cluster CAs. Explicit `--endpoint` settings don't inherit this
 context's credentials.
 
+Each VM runs Bun as `reliaburger.service`. systemd restarts it 2 seconds after
+it exits, and `OOMScoreAdjust=-900` makes the kernel kill containers before
+Bun when the guest runs out of memory. Containers resolve `.internal` names
+through Bun, and everything else through the guest's own resolvers from
+`/etc/resolv.conf`, not a public one.
+
 For guest diagnostics, use the VM name printed by `relish local status`:
 
 ```sh

@@ -805,7 +805,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .collect();
         let mut table = crate::wrapper::routing::RoutingTable::new();
-        table.rebuild(&map, &routes).map_err(failure)?;
+        // Skip, never refuse: one app's invalid route must not hold back the
+        // view every other app's discovery and ingress depend on (#700).
+        if let Err(error) = table.rebuild(&map, &routes) {
+            eprintln!("wrapper: consumer view skipped invalid routes: {error}");
+        }
         for entry in services {
             self.publish_backend_kernel(&ServiceId::new(&entry.namespace, &entry.app_name), &map)
                 .await?;

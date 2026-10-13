@@ -3879,6 +3879,15 @@ async fn prepare_dns_runtime(
     if config.listen_addr.ip().is_unspecified() {
         config.listen_addr.set_ip(nameserver.into());
     }
+    // Only now is the address workloads query known; forwarding to it would
+    // loop every external lookup back into this responder.
+    let own_listen = config.listen_addr;
+    config.upstreams.retain(|upstream| *upstream != own_listen);
+    if config.upstreams.is_empty() {
+        anyhow::bail!(
+            "dns: every upstream resolver is this node's own DNS address {own_listen}; set [dns] upstream"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     let bound = if freebind {

@@ -549,7 +549,7 @@ Recovery from the last two cases is deliberately operator-triggered rather than 
 
 ### 9.1 No Overlay Network
 
-Reliaburger doesn't use an overlay network, a CNI plugin, or any form of virtual networking. Each container runs in its own Linux network namespace with dynamic port mapping to the host. Each container gets host ports from a configurable range (default 10000-60000, providing 50,000 available ports per node). There's no virtual network, no tunnel encapsulation, and no cluster-wide IP space to manage.
+Reliaburger doesn't use an overlay network, a CNI plugin, or any form of virtual networking. Each container runs in its own Linux network namespace with dynamic port mapping to the host. Each container gets host ports from a configurable range (default 10000-32766, about 22,700 ports per node), kept below Linux's ephemeral range so a published port never collides with an outgoing connection's source port. Bun also skips any port a host daemon already listens on. There's no virtual network, no tunnel encapsulation, and no cluster-wide IP space to manage.
 
 This eliminates a large proportion of Kubernetes debugging pain: encapsulation overhead, MTU issues, IP exhaustion, opaque packet paths, and an entire plugin ecosystem to manage.
 
@@ -563,7 +563,7 @@ host = "myapp.com"
 tls = "cluster"     # clients must trust the cluster root CA
 ```
 
-There's no IngressClass, no annotations, no separate cert-manager installation. External traffic reaches the cluster via a standard TCP load balancer (or DNS round-robin) pointing to any set of nodes. Service VIPs and published host ports are TCP-only; UDP services aren't supported. Wrapper on each node can route traffic for any app, so you don't need application-aware routing at the load balancer layer.
+There's no IngressClass, no annotations, no separate cert-manager installation. External traffic reaches the cluster via a standard TCP load balancer (or DNS round-robin) pointing to any set of nodes. Service VIPs and published host ports are TCP-only; UDP services aren't supported. Rate limits are per node, per client IP: behind a balancer that spreads one client over N nodes, that client gets up to N times the configured rate. `relish apply` refuses an ingress whose TLS mode or rate limit no node could serve, and if one reaches the cluster anyway, each node skips that route and keeps publishing the rest of the catalogue. Wrapper on each node can route traffic for any app, so you don't need application-aware routing at the load balancer layer.
 
 > For routing, TLS modes, and connection draining details, see [design/ingress-wrapper.md](design/ingress-wrapper.md).
 
@@ -587,9 +587,9 @@ App calls connect(127.128.0.42, 6379)
 
 From an application's perspective, connecting to another service is identical to any network service: `http://web.internal:8080`, `redis://redis.payments.internal:6379`. Names are namespace-qualified (`<app>.<namespace>.internal`); a bare `<app>.internal` resolves within the caller's own namespace. Two apps of the same name in different namespaces are distinct services with distinct VIPs. The connect-rewrite layer is completely invisible.
 
-Virtual IPs are allocated per namespace-qualified service (not per instance) from 127.128.0.0/16, within the loopback range so packets are guaranteed to be intercepted locally and never leak onto the network (~65K unique services, expandable to /10 for ~4M). The connect hook runs in the kernel, so a Bun crash doesn't break existing connections. The service map becomes stale for new connections until Bun restarts. The systemd units we ship restart Bun two seconds after it exits, and on startup Bun re-populates the eBPF maps from the leader's service catalogue. Protecting Bun from the OOM killer (`OOMScoreAdjust`) is planned ([#700](https://github.com/reliaburger/reliaburger/issues/700)).
+Virtual IPs are allocated per namespace-qualified service (not per instance) from 127.128.0.0/16, within the loopback range so packets are guaranteed to be intercepted locally and never leak onto the network (~65K unique services, expandable to /10 for ~4M). The connect hook runs in the kernel, so a Bun crash doesn't break existing connections. The service map becomes stale for new connections until Bun restarts. The systemd units we ship restart Bun two seconds after it exits and set `OOMScoreAdjust=-900`, so under memory pressure the kernel kills containers before Bun. On startup Bun re-populates the eBPF maps from the leader's service catalogue.
 
-**External DNS:** The responder forwards non-`.internal` names to `[dns] upstream`, which defaults to `8.8.8.8:53` rather than the host's own resolvers; following the host's resolvers by default is planned ([#700](https://github.com/reliaburger/reliaburger/issues/700)). Egress allowlists implicitly permit DNS (UDP and TCP port 53) to the node's responder, so an allowlisted app can still resolve the names on its list. Without `[dns]` there is no responder, and an allowlist must name its resolver itself.
+**External DNS:** Non-`.internal` names use the host's configured resolvers: Bun reads the `nameserver` lines of `/etc/resolv.conf` at start and tries them in order, skipping its own listen address. `[dns] upstream` overrides that, and with no usable resolver Bun refuses to start. Egress allowlists implicitly permit DNS (UDP and TCP port 53) to the node's responder, so an allowlisted app can still resolve the names on its list. Without `[dns]` there is no responder, and an allowlist must name its resolver itself.
 
 > For BPF map layouts, eBPF program details, and the `firewall_map`, see [design/discovery-onion.md](design/discovery-onion.md).
 
@@ -1102,7 +1102,7 @@ This section addresses the hard questions about Reliaburger's architecture: fail
 
 ### Q1: Port mapping with 500 apps per node. Won't you run out of ports?
 
-The default ephemeral port range is 10000-60000, providing 50,000 available ports per node. At 500 apps per node, even with rolling deploys (where old and new versions briefly coexist), port exhaustion isn't a practical concern. Unlike proxy-based service discovery approaches, the Onion eBPF layer consumes zero OS ports. It operates entirely at the socket level in the kernel. The only ports consumed are those allocated to actual running containers.
+The default host port range is 10000-32766, about 22,700 ports per node, below Linux's own ephemeral range. At 500 apps per node, even with rolling deploys (where old and new versions briefly coexist), port exhaustion isn't a practical concern. Unlike proxy-based service discovery approaches, the Onion eBPF layer consumes zero OS ports. It operates entirely at the socket level in the kernel. The only ports consumed are those allocated to actual running containers.
 
 ### Q2: How do cluster-wide metrics queries work at 10,000 nodes?
 

@@ -1144,7 +1144,7 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 | `resources.reserved_cpu` | `"500m"` | CPU reserved for system and Bun overhead on each node. |
 | `resources.reserved_memory` | `"512Mi"` | Memory reserved for system and Bun overhead. |
 | `resources.reserved_disk` | `"10Gi"` | Disk reserved for system use. |
-| `network.port_range` | `"10000-60000"` | Ephemeral port range for host port allocation. |
+| `network.port_range` | `{ start = 10000, end = 32767 }` | Host port range for container port allocation, below Linux's ephemeral range. |
 
 ---
 
