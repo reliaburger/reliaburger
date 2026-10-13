@@ -84,6 +84,12 @@
     "test": "grill::runc::tests::runc_redis_persists_to_a_managed_volume_across_restarts"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_init_container_runs_its_own_image_with_app_env",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_init_container_runs_its_own_image_with_app_env"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",

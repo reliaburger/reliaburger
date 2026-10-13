@@ -208,6 +208,13 @@ fn verify_snapshot_checksum(
     Ok(())
 }
 
+/// `replicas` held inside an `[autoscale]` block's `[min, max]`. A `min`
+/// above `max` can't reach the log (validation refuses it), but the clamp
+/// mustn't panic on one.
+fn clamp_to_bounds(replicas: u32, autoscale: &crate::config::app::AutoscaleSpec) -> u32 {
+    replicas.max(autoscale.min).min(autoscale.max)
+}
+
 /// Whether `keypair` is the age key `relish init` sealed the root CA backup
 /// to: the cluster-wide key of generation 0. Nothing else seals to it, so
 /// finalising a rotation keeps it, read-only.
@@ -754,6 +761,20 @@ impl StateMachineInner {
                 replicas,
                 reason: _,
             } => {
+                // The autoscaler read a spec, decided, then wrote: a deploy
+                // that removed `[autoscale]` or narrowed it may have
+                // committed in between (#701).
+                let Some(autoscale) = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .and_then(|spec| spec.autoscale.as_ref())
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("app {app_id} doesn't autoscale"),
+                    });
+                };
+                let replicas = clamp_to_bounds(*replicas, autoscale);
                 let key = app_id.to_string();
                 if let Some((_, existing)) = self
                     .state
@@ -761,9 +782,9 @@ impl StateMachineInner {
                     .iter_mut()
                     .find(|(k, _)| k == &key)
                 {
-                    *existing = *replicas;
+                    *existing = replicas;
                 } else {
-                    self.state.autoscale_overrides.push((key, *replicas));
+                    self.state.autoscale_overrides.push((key, replicas));
                 }
             }
             RaftRequest::GitOpsCoordinatorElection(election) => {
@@ -2534,9 +2555,25 @@ impl StateMachineInner {
             .apps
             .get(app_id)
             .is_some_and(|old| old.replicas != spec.replicas);
+        let key = app_id.to_string();
         if baseline_changed {
-            let key = app_id.to_string();
             self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+        }
+        // An override lives inside the `[autoscale]` bounds. Removing the
+        // block leaves nothing that could ever move it again, so it goes;
+        // narrowing the bounds clamps it (#701).
+        match &spec.autoscale {
+            None => self.state.autoscale_overrides.retain(|(k, _)| k != &key),
+            Some(autoscale) => {
+                for (_, replicas) in self
+                    .state
+                    .autoscale_overrides
+                    .iter_mut()
+                    .filter(|(k, _)| k == &key)
+                {
+                    *replicas = clamp_to_bounds(*replicas, autoscale);
+                }
+            }
         }
         self.state.apps.insert(app_id.clone(), spec.clone());
         // A different spec is the operator's answer to a failed rollout
@@ -4190,7 +4227,7 @@ mod tests {
         let app_id = AppId::new("web", "prod");
         let spec = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         sm.apply_fixture(vec![
             normal_entry(
@@ -4234,11 +4271,11 @@ mod tests {
         let app_id = AppId::new("web", "prod");
         let spec2 = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         let spec4 = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(4),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         sm.apply_fixture(vec![
             normal_entry(
@@ -4288,12 +4325,12 @@ mod tests {
         let spec = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
             image: Some("web:v1".to_string()),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         let spec_new_image = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
             image: Some("web:v2".to_string()),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         sm.apply_fixture(vec![
             normal_entry(
@@ -4331,6 +4368,101 @@ mod tests {
             vec![("prod/web".to_string(), 5)],
             "an image-only redeploy must keep the override"
         );
+    }
+
+    /// An app with two fixed replicas that autoscales between `min` and `max`.
+    fn autoscaled_spec(min: u32, max: u32) -> AppSpec {
+        toml::from_str(&format!(
+            "image = \"test:v1\"\nreplicas = 2\n\
+             [autoscale]\nmetric = \"cpu\"\ntarget = \"70%\"\nmin = {min}\nmax = {max}\n"
+        ))
+        .unwrap()
+    }
+
+    /// Apply `spec`, then an override to `replicas`, then each of `then` in
+    /// turn, and return the override the app is left with.
+    async fn override_after(
+        spec: AppSpec,
+        replicas: u32,
+        then: Vec<AppSpec>,
+    ) -> (Vec<CouncilResponse>, Vec<(String, u32)>) {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let mut entries = vec![
+            normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec),
+                },
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::AutoscaleOverride {
+                    app_id: app_id.clone(),
+                    replicas,
+                    reason: "load".to_string(),
+                },
+            ),
+        ];
+        for (offset, next) in then.into_iter().enumerate() {
+            entries.push(normal_entry(
+                1,
+                3 + offset as u64,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(next),
+                },
+            ));
+        }
+        let responses = sm.apply_fixture(entries).await.unwrap();
+        (responses, sm.desired_state().await.autoscale_overrides)
+    }
+
+    #[tokio::test]
+    async fn removing_autoscale_clears_the_override() {
+        // #701: the autoscaler skips an app without `[autoscale]`, but the
+        // scheduler kept applying its last override, pinning it at 8.
+        let without = AppSpec {
+            replicas: crate::config::types::Replicas::Fixed(2),
+            ..default_spec()
+        };
+        let (_, overrides) = override_after(autoscaled_spec(1, 10), 8, vec![without]).await;
+        assert!(
+            overrides.is_empty(),
+            "removing [autoscale] must clear the override: {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn narrowing_autoscale_bounds_clamps_the_override() {
+        let (_, overrides) =
+            override_after(autoscaled_spec(1, 10), 8, vec![autoscaled_spec(1, 5)]).await;
+        assert_eq!(overrides, vec![("prod/web".to_string(), 5)]);
+
+        let (_, overrides) =
+            override_after(autoscaled_spec(1, 10), 2, vec![autoscaled_spec(4, 10)]).await;
+        assert_eq!(overrides, vec![("prod/web".to_string(), 4)]);
+    }
+
+    #[tokio::test]
+    async fn an_override_for_an_app_without_autoscale_is_refused() {
+        // The autoscaler read a spec with `[autoscale]`; a deploy removing
+        // it committed first. The late override must not pin the app.
+        let (responses, overrides) = override_after(default_spec(), 8, Vec::new()).await;
+        assert!(
+            matches!(responses[1], CouncilResponse::Refused { .. }),
+            "{responses:?}"
+        );
+        assert!(overrides.is_empty(), "{overrides:?}");
+    }
+
+    #[tokio::test]
+    async fn an_override_outside_the_bounds_is_clamped() {
+        let (_, overrides) = override_after(autoscaled_spec(1, 5), 9, Vec::new()).await;
+        assert_eq!(overrides, vec![("prod/web".to_string(), 5)]);
     }
 
     #[tokio::test]

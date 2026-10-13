@@ -116,6 +116,14 @@ pub struct Compatibility {
 /// deletes both, so a finished run no longer has a ledger to replay.
 /// The gossip directory extension's `jobs`, each node's job capability
 /// summary, which the leader's job admission reads (#788).
+/// App config fields (#701): applying an `AppSpec` without `[autoscale]`
+/// clears its override and narrowed bounds clamp it, an `AutoscaleOverride`
+/// for an app that doesn't autoscale is refused, `OciSpec::initialiser` marks
+/// an init container's spec, managed-volume sidecars record `size_bytes`, and
+/// inline config files move to a per-instance directory.
+/// A task-array node's control fence is `control.fence`, two checksummed
+/// slots rewritten in place, not `control.json` (#745).
+/// A refused launch's `reason` on `/v1/status` instance rows (#881).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

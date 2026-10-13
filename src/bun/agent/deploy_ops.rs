@@ -20,9 +20,10 @@ pub(super) enum DeployOp {
         created_at: Instant,
         status: Result<crate::bun::health::HealthStatus, crate::bun::probe::ProbeError>,
     },
-    /// Enforce the image trust policy; returns the digest-pinned image, if any.
+    /// Enforce the image trust policy on one image reference (an app's or an
+    /// init container's); returns the digest-pinned image, if any.
     EnforceImageSignature {
-        spec: Box<AppSpec>,
+        image: Option<String>,
         reply: oneshot::Sender<Result<Option<String>, String>>,
     },
     /// Admit the app kind before recording the deployed spec for the Brioche UI.
@@ -152,6 +153,13 @@ pub(super) enum DeployOp {
         instance_id: InstanceId,
         to: ContainerState,
         reply: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// The runtime refused to launch an instance (#881): fail it, keeping
+    /// the reason for status.
+    RecordLaunchFailure {
+        instance_id: InstanceId,
+        reason: String,
+        reply: oneshot::Sender<()>,
     },
     /// Post-start bookkeeping for a fresh instance: log forwarder, on-disk
     /// record, container IP, HealthWait(→Running), service-map backend and
@@ -288,6 +296,7 @@ impl DeployOp {
             DeployOp::ForgetInitialiser { .. } => "forget_initialiser",
             DeployOp::ApplyNetworkPreStart { .. } => "apply_network_pre_start",
             DeployOp::TransitionState { .. } => "transition_state",
+            DeployOp::RecordLaunchFailure { .. } => "record_launch_failure",
             DeployOp::FinishFreshInstance { .. } => "finish_fresh_instance",
             DeployOp::ProvisionIdentity { .. } => "provision_identity",
             DeployOp::ReserveRollingInstance { .. } => "reserve_rolling_instance",
@@ -477,11 +486,11 @@ impl DeployOps {
 
     pub(super) async fn enforce_image_signature(
         &self,
-        spec: &AppSpec,
+        image: Option<&str>,
     ) -> Result<Option<String>, String> {
         self.call(
             |reply| DeployOp::EnforceImageSignature {
-                spec: Box::new(spec.clone()),
+                image: image.map(String::from),
                 reply,
             },
             Err("agent shutting down".to_string()),
@@ -814,6 +823,19 @@ impl DeployOps {
         .await
     }
 
+    /// Fail an instance the runtime refused to launch, with the reason.
+    pub(super) async fn record_launch_failure(&self, instance_id: &InstanceId, reason: String) {
+        self.call(
+            |reply| DeployOp::RecordLaunchFailure {
+                instance_id: instance_id.clone(),
+                reason,
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
     pub(super) async fn finish_fresh_instance(
         &self,
         instance_id: &InstanceId,
@@ -1103,9 +1125,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.complete_health_probe(instance_id, created_at, status)
                     .await;
             }
-            DeployOp::EnforceImageSignature { spec, reply } => {
-                let verdict = self.enforce_image_signature(&spec).await;
-                let check = self.cosign_check(spec.image.as_deref()).await;
+            DeployOp::EnforceImageSignature { image, reply } => {
+                let verdict = self.enforce_image_signature(image.as_deref()).await;
+                let check = self.cosign_check(image.as_deref()).await;
                 answer_after_cosign(verdict, check, reply);
             }
             DeployOp::StoreDeployedSpec {
@@ -1408,6 +1430,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self.transition_deploy_state(&instance_id, to).await;
                 let _ = reply.send(result);
             }
+            DeployOp::RecordLaunchFailure {
+                instance_id,
+                reason,
+                reply,
+            } => {
+                self.record_launch_failure(&instance_id, reason).await;
+                let _ = reply.send(());
+            }
             DeployOp::FinishFreshInstance {
                 instance_id,
                 app_name,
@@ -1485,11 +1515,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         owner.retry_pending = false;
                         owner.oci_spec = Some(instance.oci_spec);
                         let health_config =
-                            instance.spec.health.as_ref().zip(instance.spec.port).map(
-                                |(health, port)| {
-                                    crate::bun::health::HealthCheckConfig::from_spec(health, port)
-                                },
-                            );
+                            crate::bun::health::HealthCheckConfig::for_app(&instance.spec);
                         owner.health_config = health_config.clone();
                         if let Some(config) = health_config {
                             self.supervisor

@@ -29,9 +29,15 @@ owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
-`make test` first runs `make warm-executables`: it builds the `[[bin]]`
-targets (`bun`, `relish`, `testapp`) and, on macOS, runs each once with
-`--help` ([`warm_executables.py`](../scripts/ci/warm_executables.py)). macOS
+`make test` first runs `make warm-executables`: it builds the suite with
+`cargo test --no-run`, which builds the `[[bin]]` targets (`bun`, `relish`,
+`testapp`) as the tests use them, and, on macOS, runs each binary once with
+`--help` ([`warm_executables.py`](../scripts/ci/warm_executables.py)). It
+used to run `cargo build --bins`, which resolves features without the
+dev-dependencies (`proc-macro2`'s `span-locations` is one), so nextest's own
+build then compiled the library and the binaries a second time and replaced
+the files the step had just warmed
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). macOS
 assesses the first exec of every new executable before it runs, one file at a
 time across the host, and outside a terminal with the Developer Tools
 permission (a CI runner, a launchd service, a sandboxed agent) that costs
@@ -87,6 +93,11 @@ ignored by default and run by their own targets and CI jobs
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
+
+The eBPF tests load the object embedded in the library under test, as Bun
+does, and never search the target directory. Worktrees can share one
+`CARGO_TARGET_DIR` without testing each other's programs.
+`tests_load_the_object_this_build_compiled` checks this without a kernel.
 
 ### Who runs an ignored test
 
@@ -170,7 +181,11 @@ rest and the runner factor (the median). The means of the 12 October runs are
 a fixture in
 [`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
 `make test-ci-scripts` checks that they pass and that a benchmark pushed to
-2.1× the rest of any of them fails. Its Criterion output and baseline are kept as the
+2.1× the rest of any of them fails. The gate matches benchmarks by name, so
+a benchmark whose workload changes gets a new name (as
+`state/json_encode_1m_x64` did, #872): under its old name it would be
+compared with `main`'s baseline for the old workload, and a new name starts
+fresh. The job's Criterion output and baseline are kept as the
 `criterion-task-arrays` artefact for 90 days, the cost trend #668 reads.
 `test_every_benchmark_target_is_run_by_a_workflow` fails if a `bench` target
 in the `Makefile` isn't run by any workflow.
@@ -233,7 +248,14 @@ a failure in shard 2 reproduces locally with
 `cargo nextest run --partition hash:2/3`. Each shard compiles the suite
 itself, and compiling is most of a macOS job: on the first sharded run each
 shard spent about 38 minutes compiling and under 3 testing (7 unsharded), so
-a shard takes 42–44 minutes, level with acceptance. Building once and sharing
+a shard took 42–44 minutes. That included a second build of the library and
+binaries, 8–10 minutes of it, until `warm-executables` switched to
+`cargo test --no-run`
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). Across nine
+runs before that change, shard jobs took 23.6–46.1 minutes, with the slowest
+shard in a run at a median of about 41.6. On the first full run after it,
+shards took 31.0–35.8 minutes, the "Portable tests" step 29.1–34.7 of that,
+still a few minutes longer than acceptance (26.5–32.6). Building once and sharing
 a nextest archive would take the compile off two of the three runners, but not
 off the critical path. One shard runs `make lint-macos` and another the
 doctests. A shard re-run on its own keeps its own attempt; the evidence gate

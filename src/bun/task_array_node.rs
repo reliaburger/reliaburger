@@ -649,7 +649,7 @@ impl TaskArrayNode {
         let claim = SyncClaim::take(&self.sync_gate)?;
         let mut arrays = self.arrays.lock().await;
         let root = self.config.root.clone();
-        let path = root.join("control.json");
+        let path = root.join(super::control_fence::FILE_NAME);
         let version = request.version;
         let syncs = Arc::clone(&self.control_syncs);
         let root_durable = Arc::clone(&self.root_durable);
@@ -678,13 +678,8 @@ impl TaskArrayNode {
                     syncs.fetch_add(1, Ordering::Relaxed);
                     root_durable.store(true, Ordering::Release);
                 }
-                let previous: ControlVersion = match std::fs::read(&path) {
-                    Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        ControlVersion::default()
-                    }
-                    Err(error) => return Err(error),
-                };
+                let fence = super::control_fence::read(&path)?;
+                let previous = fence.map_or(ControlVersion::default(), |fence| fence.version);
                 if version.epoch < previous.epoch
                     || (version.epoch == previous.epoch
                         && (version.term < previous.term || version.index < previous.index))
@@ -717,10 +712,19 @@ impl TaskArrayNode {
                         return Ok(ControlCheck::RecoveryRequired);
                     }
                 }
-                if version > previous {
-                    persist_json(&path, &version)?;
-                    // The fence file and its directory.
-                    syncs.fetch_add(2, Ordering::Relaxed);
+                // Durable before the node acts on it: a restarted node must
+                // still refuse anything older.
+                match fence {
+                    Some(fence) if version > previous => {
+                        super::control_fence::advance(&path, &fence, version)?;
+                        syncs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(_) => {}
+                    None => {
+                        super::control_fence::create(&path, version)?;
+                        // The fence file and its directory.
+                        syncs.fetch_add(2, Ordering::Relaxed);
+                    }
                 }
                 Ok::<_, std::io::Error>(ControlCheck::Accepted)
             })
@@ -2017,13 +2021,114 @@ mod tests {
         );
         sync.version.index = 2;
         node.sync(&sync).await.unwrap();
-        // A new fence rewrites its file; the directory entry is durable.
-        assert_eq!(node.control_syncs(), 5);
+        // A new fence rewrites one slot of its file in place: one flush,
+        // and the file's directory entry is already durable.
+        assert_eq!(node.control_syncs(), 4);
         // A directory removed underneath the node is made durable again.
         std::fs::remove_dir_all(&root).unwrap();
         node.sync(&sync).await.unwrap();
-        assert_eq!(node.control_syncs(), 8);
-        assert!(root.join("control.json").exists());
+        assert_eq!(node.control_syncs(), 7);
+        assert!(root.join("control.fence").exists());
+    }
+
+    /// Damage one slot of the control fence, as a write torn by a crash
+    /// would.
+    fn tear_fence_slot(root: &Path, slot: u64) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("control.fence"))
+            .unwrap();
+        let offset = slot * 512 + 12;
+        let mut byte = [0u8];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[byte[0] ^ 0xff]).unwrap();
+    }
+
+    /// Whether `node` accepts a sync at `index` in term 1 of epoch 0.
+    async fn fence_accepts(node: &TaskArrayNode, index: u64) -> bool {
+        let mut sync = request(vec![assignment(1, 10, &[])]);
+        sync.version = ControlVersion {
+            epoch: 0,
+            term: 1,
+            index,
+        };
+        let answer = node.sync(&sync).await.unwrap().arrays.remove(0);
+        match answer.refused {
+            None => true,
+            Some(reason) => {
+                assert!(reason.contains("persistent fence"), "{reason}");
+                false
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_moving_fence_is_rewritten_in_place_without_a_rename() {
+        // Under load the leader's applied index moves every tick, so the
+        // fence changes on nearly every sync. A create and a rename each
+        // queue behind other processes' flushes on macOS, and the rename
+        // needs its directory flushed too.
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(fence_accepts(&node, 1).await);
+        let fence = root.path().join("control.fence");
+        let first = std::fs::metadata(&fence).unwrap();
+        let flushes = node.control_syncs();
+        for index in 2..=50 {
+            assert!(fence_accepts(&node, index).await);
+        }
+        let last = std::fs::metadata(&fence).unwrap();
+        assert_eq!(first.ino(), last.ino(), "the fence file was replaced");
+        assert_eq!(first.len(), last.len());
+        assert_eq!(
+            node.control_syncs() - flushes,
+            49,
+            "one flush per new fence"
+        );
+        // And a restarted node still reads the newest one.
+        drop(node);
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(!fence_accepts(&restarted, 49).await);
+        assert!(fence_accepts(&restarted, 50).await);
+    }
+
+    #[tokio::test]
+    async fn a_torn_fence_slot_falls_back_to_the_last_acknowledged_version() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(fence_accepts(&node, 1).await);
+        assert!(fence_accepts(&node, 2).await);
+        // A crash tore the write of 2 before its flush returned, so the
+        // node never acted on it: the other slot still holds 1.
+        tear_fence_slot(root.path(), 1);
+        assert!(
+            !fence_accepts(&node, 0).await,
+            "a torn slot reset the fence"
+        );
+        assert!(fence_accepts(&node, 1).await);
+        // The next fence overwrites the torn slot, never the good one.
+        assert!(fence_accepts(&node, 3).await);
+        tear_fence_slot(root.path(), 1);
+        assert!(fence_accepts(&node, 2).await);
+    }
+
+    #[tokio::test]
+    async fn a_fence_with_no_valid_slot_refuses_every_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(fence_accepts(&node, 5).await);
+        tear_fence_slot(root.path(), 0);
+        tear_fence_slot(root.path(), 1);
+        // Reading it as no fence at all would let any delayed control
+        // message through.
+        assert!(!fence_accepts(&node, 4).await);
+        assert!(!fence_accepts(&node, 6).await);
+        assert!(!fence_accepts(&node, 1_000).await);
     }
 
     /// A disk that hangs every read until it is released, counting the

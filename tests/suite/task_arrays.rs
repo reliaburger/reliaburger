@@ -417,8 +417,16 @@ async fn failures_are_counted_and_their_output_kept() {
     assert_eq!(status, 404, "succeeded tasks keep no output");
 }
 
+/// Tasks in the Raft-entry test: twenty default chunks of 1,024.
+///
+/// Raft entries follow chunks and leader ticks, not tasks, so this many
+/// shows the ratio as well as 100,000 did. 100,000 fake tasks cost about
+/// 4.4 s of CPU in a debug build, which took 56 s at a load average of 80
+/// on a ten-core Mac and timed out at 60 s in a loaded `make test` (#896).
+const RAFT_ENTRY_TASKS: u64 = 20_000;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
+async fn twenty_thousand_tasks_cost_a_few_dozen_raft_entries() {
     let harness = Harness::start(Options {
         council: true,
         runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |task| {
@@ -444,17 +452,18 @@ async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
         .submit_ok(json!({
             "name": "many",
             "template": { "runtime":"process","exec": SHELL, "command": ["{index}"] },
-            "spec": { "count": 100_000 },
+            "spec": { "count": RAFT_ENTRY_TASKS },
         }))
         .await;
-    let summary = harness.wait_done(batch_id, 120).await;
+    let summary = harness.wait_done(batch_id, 50).await;
     assert_eq!(summary["status"], "Succeeded", "{summary}");
-    assert_eq!(summary["succeeded"], 100_000);
-    assert_eq!(summary["retried"], 100);
-    assert_eq!(summary["chunks_done"], 98);
+    assert_eq!(summary["succeeded"], RAFT_ENTRY_TASKS);
+    assert_eq!(summary["retried"], RAFT_ENTRY_TASKS / 1000);
+    assert_eq!(summary["chunks_done"], 20);
 
     // Registration plus at most one entry per sync that changed
-    // something: never anywhere near one per task.
+    // something: never anywhere near one per task. Three entries per
+    // thousand tasks is the budget 300 was for 100,000.
     let entries = council
         .raft()
         .metrics()
@@ -462,8 +471,12 @@ async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
         .last_log_index
         .unwrap_or(0)
         - before;
-    assert!(entries <= 300, "{entries} Raft entries for 100,000 tasks");
-    eprintln!("task_arrays: 100,000 tasks through Raft in {entries} entries");
+    let budget = RAFT_ENTRY_TASKS / 1000 * 3;
+    assert!(
+        entries <= budget,
+        "{entries} Raft entries for {RAFT_ENTRY_TASKS} tasks, over {budget}"
+    );
+    eprintln!("task_arrays: {RAFT_ENTRY_TASKS} tasks through Raft in {entries} entries");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

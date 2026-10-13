@@ -104,3 +104,23 @@ class WarmExecutablesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WarmExecutablesRecipe(unittest.TestCase):
+    """The Make recipe warms the binaries the suite then launches (#846)."""
+
+    def recipe(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import workflow_assembly
+        root = Path(__file__).resolve().parents[2]
+        return workflow_assembly.recipe((root / "Makefile").read_text(), "warm-executables")
+
+    def test_the_binaries_are_built_as_the_suite_builds_them_so_nextest_rebuilds_nothing(self):
+        # `cargo build --bins` resolves features without the dev-dependencies
+        # (proc-macro2's span-locations), so the suite's own build compiled
+        # the library and every binary a second time, about nine minutes of a
+        # macOS job, and replaced the binaries this step had just warmed.
+        lines = self.recipe()
+        self.assertEqual(lines[0], "$(CARGO) test --no-run")
+        self.assertFalse(any("build --bins" in line for line in lines))
+        self.assertIn("python3 scripts/ci/warm_executables.py", lines)

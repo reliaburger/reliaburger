@@ -3372,6 +3372,7 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
             oci_spec: None,
             identity: None,
             identity_mount: None,
+            launch_failure: None,
         },
     );
     agent
@@ -3526,7 +3527,7 @@ async fn enforce_image_signature_fails_closed_without_council() {
     let spec: AppSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
     // No cluster/council → the gate can't obtain verification material, so
     // it must refuse rather than skip (IMG2 fail-closed).
-    let result = agent.enforce_image_signature(&spec).await;
+    let result = agent.enforce_image_signature(spec.image.as_deref()).await;
     assert!(result.is_err(), "expected refusal, got {result:?}");
     assert!(
         result.unwrap_err().contains("requires a signature"),
@@ -3541,7 +3542,12 @@ async fn enforce_image_signature_allows_a_process_workload_without_council() {
     // A process workload has no image — nothing to verify, so it passes
     // even with require_signatures on and no council.
     let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
-    assert!(agent.enforce_image_signature(&spec).await.is_ok());
+    assert!(
+        agent
+            .enforce_image_signature(spec.image.as_deref())
+            .await
+            .is_ok()
+    );
 }
 
 // --- relish sign, end to end (operator key → attach → deploy gate) ---
@@ -3691,13 +3697,19 @@ async fn relish_signed_image_is_admitted_only_under_a_policy_trusting_its_key() 
     });
 
     // Signed with the trusted key: admitted, pinned to the signed digest.
-    let pinned = agent.enforce_image_signature(&app("myapp:v1")).await;
+    let pinned = agent
+        .enforce_image_signature(app("myapp:v1").image.as_deref())
+        .await;
     assert_eq!(pinned, Ok(Some(format!("myapp@sha256:{signed}"))));
     // Never signed: refused.
-    let unsigned = agent.enforce_image_signature(&app("unsigned:v1")).await;
+    let unsigned = agent
+        .enforce_image_signature(app("unsigned:v1").image.as_deref())
+        .await;
     assert!(unsigned.is_err(), "unsigned image admitted: {unsigned:?}");
     // Signed, but by a key the policy doesn't list: refused.
-    let untrusted = agent.enforce_image_signature(&app("stranger:v1")).await;
+    let untrusted = agent
+        .enforce_image_signature(app("stranger:v1").image.as_deref())
+        .await;
     assert!(
         untrusted
             .as_ref()
@@ -3730,7 +3742,9 @@ async fn moving_a_tag_after_signing_leaves_the_new_digest_unsigned() {
     // Someone re-pushes v1 with different bytes: the signature covered
     // the old digest, not the tag, so the new content is refused.
     push_manifest(&council, "myapp", "v1", &"4".repeat(64)).await;
-    let result = agent.enforce_image_signature(&app("myapp:v1")).await;
+    let result = agent
+        .enforce_image_signature(app("myapp:v1").image.as_deref())
+        .await;
     assert!(result.is_err(), "re-tagged content admitted: {result:?}");
 }
 
@@ -3785,7 +3799,7 @@ async fn pulling_agent(
 async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
     let (_council, agent) = pulling_agent(9310, official_images_only()).await;
     let refused = agent
-        .enforce_image_signature(&app("ghcr.io/evil/miner:1"))
+        .enforce_image_signature(app("ghcr.io/evil/miner:1").image.as_deref())
         .await;
     assert!(
         refused
@@ -3795,7 +3809,7 @@ async fn a_deploy_refuses_an_upstream_image_the_rules_do_not_allow() {
     );
     let digest = format!("sha256:{}", "a".repeat(64));
     let allowed = agent
-        .enforce_image_signature(&app(&format!("nginx:1.27@{digest}")))
+        .enforce_image_signature(app(&format!("nginx:1.27@{digest}")).image.as_deref())
         .await;
     assert_eq!(allowed, Ok(None));
 }
@@ -3806,7 +3820,7 @@ async fn a_deploy_leaves_pickle_images_to_require_signatures() {
     let (council, agent) = pulling_agent(9311, official_images_only()).await;
     push_manifest(&council, "team/web", "v1", &"5".repeat(64)).await;
     let result = agent
-        .enforce_image_signature(&app("localhost:5050/team/web:v1"))
+        .enforce_image_signature(app("localhost:5050/team/web:v1").image.as_deref())
         .await;
     assert_eq!(result, Ok(None));
 }
@@ -3819,7 +3833,7 @@ async fn upstream_rules_do_not_judge_images_a_process_runtime_never_pulls() {
     let mut agent = agent_with_council(council);
     agent.set_trust_policy(official_images_only());
     let result = agent
-        .enforce_image_signature(&app("proc-grill:image-ignored"))
+        .enforce_image_signature(app("proc-grill:image-ignored").image.as_deref())
         .await;
     assert_eq!(result, Ok(None));
 }
@@ -3969,6 +3983,49 @@ async fn deploy_command_creates_instances() {
 
     shutdown.cancel();
     agent_handle.await.unwrap();
+}
+
+/// #881: a binary the node can't run fails the deploy at once with the
+/// reason, and the instance is `failed` with that reason in its status,
+/// instead of sitting in `starting` while something retries.
+#[tokio::test]
+async fn a_refused_launch_fails_the_deploy_and_the_instance_with_its_reason() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_refused_launch(Some(crate::grill::LaunchProblem::BinaryNotFound(
+        "/opt/ghost/server".into(),
+    )));
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    let Some(ApplyEvent::Error { message }) = events.last() else {
+        panic!("the deploy must fail: {events:?}");
+    };
+    assert!(
+        message.contains("binary not found: /opt/ghost/server"),
+        "{message}"
+    );
+
+    let (response, result) = oneshot::channel();
+    tx.send(AgentCommand::Status { response }).await.unwrap();
+    let instances = result.await.unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    let web = instances
+        .iter()
+        .find(|instance| instance.app_name == "web")
+        .expect("the failed instance stays listed");
+    assert_eq!(web.state, "failed");
+    assert_eq!(
+        web.reason.as_deref(),
+        Some("binary not found: /opt/ghost/server")
+    );
+    assert!(
+        !grill.calls().iter().any(|(call, _)| call == "start"),
+        "a refused launch must never be started: {:?}",
+        grill.calls()
+    );
 }
 
 /// DEP4/codex-M3: a deploy that blocks on a slow image pull must not
@@ -8299,6 +8356,169 @@ async fn failing_init_container_reports_the_runtimes_stderr() {
     );
 }
 
+/// #701: an init container runs its own image, with the app's env and the
+/// app's volume and config-file mounts. It used to run in the app's image
+/// with no env and only the standard mounts, so a migration couldn't see
+/// `DATABASE_URL` and a config generator couldn't write a volume.
+#[tokio::test]
+async fn init_container_runs_its_own_image_with_the_app_env_and_mounts() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let own = InstanceId("default__web-0__init-0".to_string());
+    let inherited = InstanceId("default__web-0__init-1".to_string());
+    for init in [&own, &inherited] {
+        grill.set_state(init, ContainerState::Stopped);
+        grill.set_exit_code(init, Some(0));
+    }
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let config = Config::parse(
+        r#"
+            [app.web]
+            image = "myapp:v1"
+            env = { DATABASE_URL = "postgres://db/app" }
+
+            [[app.web.volumes]]
+            path = "/data"
+
+            [[app.web.config_file]]
+            path = "/etc/web/app.conf"
+            content = "key = value"
+
+            [[app.web.init]]
+            image = "migrate:v2"
+            command = ["migrate"]
+
+            [[app.web.init]]
+            command = ["echo", "inherits the app image"]
+        "#,
+    )
+    .unwrap();
+    let events = send_deploy(&tx, config).await;
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+    expect_complete(&events);
+
+    let own = grill
+        .created_spec(&own)
+        .expect("the first init was created");
+    assert_eq!(own.root.path, "migrate:v2");
+    assert_eq!(own.process.args, vec!["migrate".to_string()]);
+    assert!(
+        own.process
+            .env
+            .contains(&"DATABASE_URL=postgres://db/app".to_string()),
+        "{:?}",
+        own.process.env
+    );
+    for destination in ["/data", "/etc/web/app.conf"] {
+        assert!(
+            own.mounts
+                .iter()
+                .any(|m| m.destination == std::path::Path::new(destination)),
+            "init is missing {destination}: {:?}",
+            own.mounts
+        );
+    }
+    let inherited = grill
+        .created_spec(&inherited)
+        .expect("the second init was created");
+    assert_eq!(inherited.root.path, "myapp:v1");
+}
+
+/// #701: each instance reads its own copy of an inline config file, and the
+/// copy goes when the instance does.
+#[tokio::test]
+async fn stop_removes_each_instances_inline_config_files() {
+    let (mut agent, tx, shutdown) = test_agent();
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let config = Config::parse(
+        r#"
+            [app.web]
+            image = "myapp:v1"
+            replicas = 2
+
+            [[app.web.config_file]]
+            path = "/etc/web/app.conf"
+            content = "key = value"
+        "#,
+    )
+    .unwrap();
+    expect_complete(&send_deploy(&tx, config).await);
+    for instance in ["default__web-0", "default__web-1"] {
+        let dir = crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1, "{instance} has its own copy");
+    }
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AgentCommand::Stop {
+        app_name: "web".to_string(),
+        namespace: "default".to_string(),
+        response: resp_tx,
+    })
+    .await
+    .unwrap();
+    resp_rx.await.unwrap().unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    for instance in ["default__web-0", "default__web-1"] {
+        let dir = crate::grill::oci::inline_config_dir(volumes.path(), "default", "web", instance);
+        assert!(!dir.exists(), "{} survived the stop", dir.display());
+    }
+}
+
+/// #701: `health.port` defaults the probe's port, not the app's `port`.
+/// The rollout gate used to skip the probe when the app had no `port`, so
+/// a failing replacement was announced healthy.
+#[tokio::test]
+async fn rollout_gate_probes_health_port_without_app_port() {
+    let port = spawn_health_responder(500).await;
+    let (mut agent, tx, shutdown, _grill) = test_agent_with_grill();
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let v1 = Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+    expect_complete(&send_deploy(&tx, v1).await);
+    let v2 = Config::parse(&format!(
+        r#"
+            [app.web]
+            image = "myapp:v2"
+
+            [app.web.health]
+            path = "/healthz"
+            port = {port}
+
+            [app.web.deploy]
+            strategy = "rolling"
+            health_timeout = "1s"
+        "#
+    ))
+    .unwrap();
+    let events = send_deploy(&tx, v2).await;
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    let error = events
+        .iter()
+        .find_map(|e| match e {
+            ApplyEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the gate must probe health.port and refuse the failing replacement");
+    assert!(error.contains("failed its health check"), "{error}");
+}
+
 #[test]
 fn tail_lines_empty_string() {
     assert_eq!(super::tail_lines("", 5), "");
@@ -8531,6 +8751,7 @@ fn adoption_record(
         oci_spec: crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),
@@ -12434,6 +12655,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         pid: Some(7),
         runtime_unknown: false,
         status_age_ms: None,
+        reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();
     assert!(plain.get("runtime_unknown").is_none(), "{plain}");

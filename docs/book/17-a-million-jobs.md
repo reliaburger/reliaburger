@@ -149,7 +149,7 @@ let run = match arrays.entry(assignment.batch_id) {
 
 `entry` returns a handle to the slot, full or empty, and holding it keeps the map borrowed, so nothing else can change the map between the check and the insert.
 
-On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 100,000 fake tasks through a real single-node council: the whole array cost 51 Raft entries.
+On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 20,000 fake tasks through a real single-node council and allows three Raft entries per thousand tasks; a run usually costs about ten. It used to push 100,000, and the whole array cost 51 entries, but that was 4.4 seconds of CPU in a debug build, and on a laptop shared with other test runs it crept up to the 60-second test timeout. Entries follow chunks and leader ticks, not tasks, so a fifth of the work shows the same ratio (#896).
 
 What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
 
@@ -667,6 +667,117 @@ outcome getting lost. So the wait changed instead. Job tests now share
 on a miss the harness names the state the job was stuck in. A job that never
 runs (one on a disk with less than a gibibyte free, say) still fails. Under
 the same load, 128 of 128 runs passed, the slowest whole run in 13.3 s.
+
+### A fence that moves every tick
+
+"An idle tick now flushes nothing" was true, and it was the wrong case to fix.
+A busy tick isn't idle. The control fence holds the newest control version the
+node has acted on: the recovery epoch, the leader's term and the council's
+applied log index. Every tick that changes anything commits one Raft entry, so
+under load the index moves on every tick and the fence changes on nearly every
+sync. The hung-worker test (above, in "Dispatch at scale") had already had its
+bar lowered because the healthy node's syncs were slow on a busy Mac (#745).
+
+Each change replaced the file the usual safe way: write `control.tmp`,
+flush it, rename it over `control.json`, flush the directory. That's two
+`F_FULLFSYNC`s, plus a create and a rename that, as the previous section found,
+queue behind every other process's flushes. We measured it with a throwaway
+test that syncs one node 200 times, the index one higher each time, on the
+same 10-core Mac. Idle, a sync took 10 to 13 ms at the median. With 40 busy
+loops and four loops each writing 1 MiB and calling `F_FULLFSYNC` (load
+average 90 to 200, sibling builds included), the median was 50 to 61 ms, the
+99th percentile 90 to 124 ms, and one sync took 1.08 s.
+
+Could the node skip the flush? The fence is there so that a delayed sync built
+from an older snapshot can't undo something the node already did. The worst
+case is deletion: a sync's list of known arrays tells the node which array
+directories to delete, and an older list doesn't name newer arrays. That has
+to hold across a restart too, which is what
+`task_array_recovery::stale_control_cannot_delete_ledgers_after_a_restart`
+checks. Keeping the index in memory and persisting only epoch and term changes
+would probably be safe, because the leader waits for each node's answer, or
+gives up on it, before calling that node again. But "probably", resting on how another component happens to behave
+today, is exactly the kind of argument a fence exists to avoid. So every new
+version still reaches stable storage before the node acts on it. What changed
+is how it gets there.
+
+`control.fence` (in `src/bun/control_fence.rs`) is a fixed-size file with two
+32-byte slots, one at offset 0 and one at 512, so each sits in its own disk
+sector. A slot is a magic number, the three `u64`s and a CRC32 of the rest. A
+new version overwrites, in place, the slot that *doesn't* hold the current
+one, and flushes once:
+
+```rust
+file.seek(SeekFrom::Start((1 - current.slot) * SLOT_STRIDE))?;
+file.write_all(&encode(version))?;
+file.sync_data()
+```
+
+No create, no rename and no directory flush, because the file's size and its
+directory entry don't change. `sync_data` is `fdatasync` on Linux, which skips
+the timestamps, and `F_FULLFSYNC` on macOS, just like `sync_all`.
+
+Why is that still safe? A crash during the write can tear the slot being
+written, and the CRC then rejects it. The other slot still holds the previous
+version, which was flushed before the node acted on it. The torn one was never
+acted on: the sync carries on only after `sync_data` returns. Reading takes
+the newer of the valid slots, and the next write goes into whichever slot
+isn't current, so a torn slot is the first to be overwritten. The file only
+appears through the old write, flush and rename dance, once, when it's
+created, so there's never a half-written fence file. And a fence with *no*
+valid slot is an error, not "no fence": reading it as version zero would let
+any delayed sync through. The node refuses every sync until someone looks at
+the disk, exactly as it did with an unreadable `control.json`.
+
+Reading a slot is a nice small example of `Option` and `?` together:
+
+```rust
+fn decode(slot: &[u8]) -> Option<ControlVersion> {
+    let word = |at: usize| Some(u64::from_le_bytes(slot.get(at..at + 8)?.try_into().ok()?));
+    let crc = u32::from_le_bytes(slot.get(28..32)?.try_into().ok()?);
+    if slot.get(..4)? != MAGIC || crc32fast::hash(slot.get(..28)?) != crc {
+        return None;
+    }
+    // ...
+}
+```
+
+`slot.get(range)` returns an `Option<&[u8]>` instead of panicking when the
+range runs off the end, and `?` on an `Option` returns `None` from the
+enclosing function, or here from the closure, which is why `word` wraps its
+result in `Some`. `try_into()` turns a slice into a fixed-size array
+(`[u8; 8]`), which is what `u64::from_le_bytes` takes; it fails only when the
+lengths differ, and `.ok()` turns that `Result` into an `Option` so `?` can
+use it. No `unwrap`, and no way for a short slice to panic.
+
+One detail came from the hung-worker test. It hangs a worker by swapping the
+fence for a FIFO with no writer. A sync that read the real fence just before
+the swap would now open the path to write, and opening a FIFO for writing
+blocks until a reader turns up, which in that test is never. So the write
+opens with `O_NONBLOCK` (through `custom_flags`, from the `OpenOptionsExt`
+trait we met in Chapter 10). For a regular file that flag does nothing; for a
+FIFO the open fails at once with `ENXIO` and the sync answers with a refusal.
+`advancing_a_fence_swapped_for_a_fifo_fails_instead_of_blocking` pins it.
+
+The tests pin the rest. `a_sync_flushes_the_disk_only_when_the_fence_changes`
+now counts three flushes for a new fence file, none to repeat a version and
+one for the next. `a_moving_fence_is_rewritten_in_place_without_a_rename`
+advances the fence 49 times and checks that the file's inode never changes
+(no rename) and that it cost exactly 49 flushes, then restarts the node and
+checks that it refuses version 49 and accepts 50.
+`a_torn_fence_slot_falls_back_to_the_last_acknowledged_version` damages the
+newest slot by hand and checks that the node falls back to the previous
+version, still refuses anything older, and overwrites the torn slot rather
+than the good one. `a_fence_with_no_valid_slot_refuses_every_sync` damages
+both.
+
+Under the same load, the same 200 syncs took 15 to 19 ms at the median, 26
+to 62 ms at the 99th percentile, and at most 100 ms. That's about a third of
+the time, and the second-long outlier is gone. Idle, nothing changed (about
+12 ms): one `F_FULLFSYNC` is the floor for a fence that moves, and we've kept
+it on purpose. The grant fence, `grants.json` in each array's directory, still
+takes the replace-and-rename route on every new grant; it's the obvious next
+candidate for the same treatment.
 
 ### Fair shares: one tenant can't starve the rest
 

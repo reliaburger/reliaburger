@@ -61,6 +61,9 @@ pub struct WorkloadInstance {
     /// Path to the host directory where identity files are written.
     /// Bind-mounted into the container at `/run/reliaburger/identity/`.
     pub identity_mount: Option<std::path::PathBuf>,
+    /// Why the runtime refused to launch this instance (#881), shown by
+    /// `relish status` and `relish wtf`. Set only on a `Failed` instance.
+    pub launch_failure: Option<String>,
 }
 
 impl WorkloadInstance {
@@ -423,31 +426,21 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a GPU-requesting workload the node can't back (D15): either
-    /// `gpu_enabled = false` or the detector found no GPU. Makes
-    /// `gpu_enabled` effective instead of a silent lie.
+    /// Refuse every GPU-requesting workload (D41). Nothing passes a device
+    /// into the container yet and nothing counts which card a workload holds,
+    /// so admitting one would start it without its GPU. `relish apply`
+    /// refuses the request first; this is the node's second line, whatever
+    /// its `gpu_enabled` setting or detected cards say.
     fn admit_gpu(&self, app_name: &str, requested: u32) -> Result<(), BunError> {
         if requested == 0 {
             return Ok(());
         }
-        if !self.capabilities.gpu_enabled {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: "workload requests a GPU but GPU support is disabled on this node \
-                         ([resources] gpu_enabled = false)"
-                    .to_string(),
-            });
-        }
-        if self.capabilities.gpu_count < requested {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "workload requests {requested} gpu(s) but this node has {} available",
-                    self.capabilities.gpu_count
-                ),
-            });
-        }
-        Ok(())
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!(
+                "workload requests {requested} gpu(s), but GPU workloads aren't supported yet (#359)"
+            ),
+        })
     }
 
     /// Refuse a limit-requiring workload the node can't enforce (M22).
@@ -650,22 +643,17 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 None
             };
 
-            let health_config = if let Some(ref health_spec) = spec.health {
-                let app_port = match spec.port {
-                    Some(port) => port,
-                    None => {
-                        for port in &allocated_ports {
-                            let _ = self.port_allocator.release(*port).await;
-                        }
-                        return Err(BunError::NoPortForHealthCheck {
-                            app_name: app_name.to_string(),
-                        });
-                    }
-                };
-                Some(HealthCheckConfig::from_spec(health_spec, app_port))
-            } else {
-                None
-            };
+            // `health.port` is enough; only a health check with no port at
+            // all (which validation refuses) can't be probed.
+            let health_config = HealthCheckConfig::for_app(spec);
+            if spec.health.is_some() && health_config.is_none() {
+                for port in &allocated_ports {
+                    let _ = self.port_allocator.release(*port).await;
+                }
+                return Err(BunError::NoPortForHealthCheck {
+                    app_name: app_name.to_string(),
+                });
+            }
 
             prepared.push(WorkloadInstance {
                 id: instance_id,
@@ -685,6 +673,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
+                launch_failure: None,
             });
         }
 
@@ -1794,7 +1783,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gpu_workload_runs_when_gpu_available() {
+    async fn gpu_workload_refused_even_where_a_gpu_is_detected() {
+        // D41: without device passthrough a `gpu = 1` workload would start
+        // with no device, and two of them would share one card on paper.
+        // Validation refuses it first; this is the agent's second line.
         let mut sup = test_supervisor();
         sup.set_capabilities(PlatformCapabilities {
             gpu_count: 2,
@@ -1805,11 +1797,11 @@ mod tests {
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
-        let ids = sup
+        let err = sup
             .deploy_app("trainer", "default", &spec, Instant::now())
             .await
-            .expect("a GPU workload should run where a device exists");
-        assert_eq!(ids.len(), 1);
+            .unwrap_err();
+        assert!(err.to_string().contains("#359"), "{err}");
     }
 
     #[tokio::test]

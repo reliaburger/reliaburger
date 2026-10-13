@@ -57,7 +57,75 @@ and the limit to the same thing.
 
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
-`networking`, metrics scraping in `observability`.
+`networking`, metrics scraping in `observability`. Every `[app.*]` field is
+listed in `reference`.
+
+## Health checks
+
+```toml
+[app.api.health]
+path = "/healthz"
+port = 8081               # default: the app's `port`
+interval = 10             # seconds between probes (default 10)
+timeout = 5               # seconds per probe (default 5), at most interval
+threshold_unhealthy = 3   # failed probes before Unhealthy (default 3)
+threshold_healthy = 1     # passing probes before Running (default 1)
+initial_delay = 0         # seconds before the first probe (default 0)
+```
+
+`health.port` works without an app `port`, so an app can probe a separate
+admin listener. `relish apply` refuses a health check with neither, a zero
+interval, timeout or threshold, and a `timeout` longer than the
+`interval`. A new instance that never passes is given up after 60 failed
+probes (about ten minutes at the default interval) and restarted.
+
+## Init containers
+
+```toml
+[[app.api.init]]
+image = "ghcr.io/example/migrate:2.1"   # default: the app's image
+command = ["migrate", "up"]
+```
+
+Init containers run one after another before the app starts, each to
+completion; a failure (or 300 seconds without finishing) fails the instance.
+Each runs its own `image` (pulled, trust-checked and pinned to a digest like
+the app's), or the app's when it has none. It gets the app's environment,
+with secrets decrypted, and the app's volume and config-file mounts, so a
+migration can read `DATABASE_URL` and a config generator can write a volume.
+The volume stays the app's: an init container doesn't take it over, so run it
+as root (most images do) or as the app's user.
+
+## Config files
+
+```toml
+[[app.api.config_file]]
+path = "/etc/api/config.yaml"
+content = """
+log_level: info
+"""
+```
+
+Each instance gets its own read-only copy, so two files with the same name in
+different directories don't clash, and a rollout never changes the file under
+an instance that's already running. The copy goes when the instance does.
+`source` instead of `content` mounts a file from the node itself; see
+`images-and-volumes`.
+
+## What a field can't do
+
+`relish apply` refuses a field it can't honour, rather than run something
+different from the config:
+
+- `gpu` above 0: GPU workloads aren't supported yet
+  ([#359](https://github.com/reliaburger/reliaburger/issues/359)).
+- `egress.allow_franchise`: cross-cluster egress doesn't exist yet.
+- `volumes`, `config_file`, `run_as_user` and `run_as_group` on an `exec` or
+  `script` app: a process workload runs on the host, with no mounts and no
+  user switch.
+- A volume `size` the node can't enforce (see `images-and-volumes`), or a
+  changed `size` on a volume that already exists. Those fail the deploy on
+  that node.
 
 ## Autoscaling
 
@@ -154,6 +222,33 @@ An `exec` or `script` app only goes to nodes that would run it: the node's
 `[process_workloads] allowed_binaries` must name the `exec` path (`/bin/sh` for
 a script), and `mount_isolation` must be off. A node whose allowlist stops
 covering the binary loses the replica to one that still does.
+
+## When the binary isn't there
+
+The allowlist says a node may run a binary. It doesn't say the binary is
+installed. Bun checks just before it launches a process app: if the `exec`
+path, or the first word of `command`, doesn't exist or isn't executable, the
+deploy fails at once with the reason, and the instance goes to `failed`:
+
+```text
+$ relish apply ghost.toml
+  deploying app ghost (replicas: 1)
+  creating instance default__ghost-0
+error: API error (status 500): instance default__ghost-0 cannot launch: binary not found: /usr/local/bin/ghost-server
+
+$ relish status
+...
+
+default__ghost-0 (ghost, namespace default) failed on node-1: binary not found: /usr/local/bin/ghost-server
+```
+
+A bare name like `bun` is looked up on the app's `PATH`, the way a shell would.
+A directory, or a file without an execute bit, fails with `binary not
+executable` instead. `relish wtf` raises a critical `launch-failed` finding
+with the same reason. Waiting won't fix this one, so nothing waits: install
+the binary, or fix the spec and apply it again. In a cluster, the node's
+placement reconciler tries the deploy again on its usual backoff (five seconds,
+doubling to five minutes), so installing the binary is enough on its own.
 
 ## When a node stops reporting
 
