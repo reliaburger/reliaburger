@@ -54,6 +54,7 @@ mod log_export;
 mod logs_cross_node;
 mod managed_status;
 mod metrics_aggregation;
+mod missing_binary;
 mod node_issuer_validity;
 mod node_renewal;
 mod onion;

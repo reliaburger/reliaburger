@@ -325,6 +325,7 @@ mod tests {
             pid: Some(100),
             runtime_unknown: false,
             status_age_ms: None,
+            reason: None,
         }
     }
 

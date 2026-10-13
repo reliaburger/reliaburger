@@ -689,6 +689,33 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             continue;
         }
         found = true;
+        // #881: waiting won't start these. The runtime refused the launch,
+        // and only installing the binary or fixing the spec changes that.
+        if let Some(first) = app.launch_failures.first() {
+            report.critical.push(WtfFinding {
+                id: "launch-failed".to_string(),
+                title: format!(
+                    "app {}/{} cannot start: {}",
+                    app.app, app.namespace, first.reason
+                ),
+                details: app
+                    .launch_failures
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "{} on {}: {}",
+                            failure.instance, failure.node, failure.reason
+                        )
+                    })
+                    .collect(),
+                suggestion: "install the binary on the node, or fix the app's `exec` or \
+                             `command` and apply it again"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
+            continue;
+        }
         // The scheduler isn't failing to find room: the namespace quota
         // forbids it, and only the operator can change that.
         if let Some(reason) = &app.blocked {
@@ -1470,9 +1497,9 @@ mod tests {
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
         DeployObservation, DiskObservation, FaultObservation, GitOpsObservation,
-        IsolationObservation, LogObservation, NodeGitOpsDifference, NodeIsolation, NodeObservation,
-        RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
-        TokenObservation,
+        IsolationObservation, LaunchFailureObservation, LogObservation, NodeGitOpsDifference,
+        NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
+        RestartObservation, ServiceObservation, TokenObservation,
     };
 
     const NOW: u64 = 2_000_000;
@@ -1565,6 +1592,7 @@ mod tests {
                     volume_home_away: None,
                     unschedulable: None,
                     rollout_failed: None,
+                    launch_failures: Vec::new(),
                 }]),
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
@@ -2468,6 +2496,54 @@ mod tests {
         assert!(report.unknown.iter().any(|item| item.source == "restarts"));
     }
 
+    /// #881: an instance whose binary the node can't run will never start
+    /// by waiting. That's critical, and it names the binary and the node.
+    #[test]
+    fn a_refused_launch_is_critical_and_names_the_binary() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "ghost".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::new(),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: vec![LaunchFailureObservation {
+                node: "node-1".to_string(),
+                instance: "default__ghost-0".to_string(),
+                reason: "binary not found: /opt/ghost/server".to_string(),
+            }],
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|finding| finding.id == "launch-failed")
+            .expect("a refused launch is critical");
+        assert_eq!(
+            finding.title,
+            "app ghost/default cannot start: binary not found: /opt/ghost/server"
+        );
+        assert_eq!(
+            finding.details,
+            ["default__ghost-0 on node-1: binary not found: /opt/ghost/server"]
+        );
+        assert_eq!(finding.affected_resource, "app.ghost/default");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "under-replicated"),
+            "the launch failure is the finding, not a generic shortfall"
+        );
+    }
+
     /// Z6.7: with one of three frontends gone, `wtf` said every service had a
     /// healthy backend. Under-replication is its own finding, and it names
     /// the nodes whose placements aren't running.
@@ -2489,6 +2565,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2519,6 +2596,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -2547,6 +2625,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -2577,6 +2656,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: Some(reason.to_string()),
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2618,6 +2698,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2665,6 +2746,7 @@ mod tests {
                 reason: "api-g1-0 failed its health check".to_string(),
                 at_unix_ms: 1,
             }),
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2699,6 +2781,7 @@ mod tests {
             volume_home_away: Some("node-2".to_string()),
             unschedulable: None,
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2742,6 +2825,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         assert!(report.critical.is_empty(), "{:?}", report.critical);
@@ -2762,6 +2846,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         assert!(report.warnings.is_empty());
