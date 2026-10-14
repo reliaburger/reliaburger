@@ -5,9 +5,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{self, Output, ParamsString, PasswordHash, Salt, SaltString};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use super::types::{ApiRole, ApiToken, PreviousSecret, TokenRotation, TokenScope};
@@ -58,10 +58,27 @@ fn mint_secret() -> Result<MintedSecret, TokenError> {
 
     let plaintext = format!("rbrg_{}", hex::encode(token_bytes));
 
+    // The hash is the `argon2` crate's default (Argon2id, version 0x13,
+    // 19 MiB, two passes, one lane), written in the PHC string format its
+    // `hash_password` writes. Only the working memory differs: it comes from
+    // a [`WorkingMemory`] mapping, not the heap.
     let salt = SaltString::generate(&mut OsRng);
-    let password_hash = Argon2::default()
-        .hash_password(plaintext.as_bytes(), &salt)
-        .map_err(|e| TokenError::HashFailed(e.to_string()))?;
+    let hasher = Argon2::default();
+    let failed = |error: password_hash::Error| TokenError::HashFailed(error.to_string());
+    let mut salt_bytes = [0u8; Salt::MAX_LENGTH];
+    let salt_bytes = salt.decode_b64(&mut salt_bytes).map_err(failed)?;
+    let output_len = hasher
+        .params()
+        .output_len()
+        .unwrap_or(Params::DEFAULT_OUTPUT_LEN);
+    let output = hash_off_heap(&hasher, plaintext.as_bytes(), salt_bytes, output_len)?;
+    let password_hash = PasswordHash {
+        algorithm: Algorithm::default().ident(),
+        version: Some(Version::default().into()),
+        params: ParamsString::try_from(hasher.params()).map_err(failed)?,
+        salt: Some(salt.as_salt()),
+        hash: Some(output),
+    };
 
     Ok(MintedSecret {
         plaintext,
@@ -262,16 +279,112 @@ pub fn validate_token_at(
 }
 
 /// Whether `plaintext` is the secret behind the stored Argon2id `hash`.
+///
+/// The variant, version, cost and salt all come from the stored hash, as the
+/// `argon2` crate's own `verify_password` takes them. The difference is where
+/// the working memory comes from: see [`WorkingMemory`].
 fn hash_matches(plaintext: &str, hash: &[u8]) -> bool {
     let Ok(hash_str) = std::str::from_utf8(hash) else {
         return false;
     };
-    let Ok(parsed_hash) = PasswordHash::new(hash_str) else {
+    let Ok(stored) = PasswordHash::new(hash_str) else {
         return false;
     };
-    Argon2::default()
-        .verify_password(plaintext.as_bytes(), &parsed_hash)
-        .is_ok()
+    let Some(expected) = stored.hash else {
+        return false;
+    };
+    let Ok(algorithm) = Algorithm::try_from(stored.algorithm) else {
+        return false;
+    };
+    let version = match stored.version.map(Version::try_from) {
+        None => Version::default(),
+        Some(Ok(version)) => version,
+        Some(Err(_)) => return false,
+    };
+    let Ok(params) = Params::try_from(&stored) else {
+        return false;
+    };
+    let mut salt_bytes = [0u8; Salt::MAX_LENGTH];
+    let Some(Ok(salt)) = stored.salt.map(|salt| salt.decode_b64(&mut salt_bytes)) else {
+        return false;
+    };
+    let hasher = Argon2::new(algorithm, version, params);
+    match hash_off_heap(&hasher, plaintext.as_bytes(), salt, expected.len()) {
+        // `Output`'s `==` compares in constant time.
+        Ok(computed) => computed == expected,
+        Err(_) => false,
+    }
+}
+
+/// Argon2's working memory: a private anonymous mapping, never the heap.
+///
+/// At the default cost one hash fills 19 MiB, and every API request with a
+/// bearer token runs at least one. The `argon2` crate allocates that with
+/// `vec!`, so it came from glibc's heap. glibc serves a request that size
+/// from the arena of whichever thread asked, and keeps it there once it's
+/// freed: the hashes ran on Tokio's blocking pool, whose threads come and go
+/// across all of glibc's arenas (eight per CPU), so the API node ended up
+/// holding a 19 MiB block or more in most of them. In the 0.2.0 soak that
+/// was most of the gigabyte its Bun held on a 2 GiB VM (#945).
+///
+/// A mapping of our own goes back to the kernel the moment it's dropped, so
+/// a hash borrows 19 MiB for as long as it runs and no longer. The
+/// process-wide permit pool in `sesame::auth` bounds how many run at once.
+struct WorkingMemory {
+    map: memmap2::MmapMut,
+    blocks: usize,
+}
+
+// `blocks` reinterprets the mapping's bytes as `Block`s, so a `Block` must be
+// exactly `Block::SIZE` bytes and need no more alignment than a page gives.
+const _: () = assert!(std::mem::size_of::<Block>() == Block::SIZE);
+const _: () = assert!(std::mem::align_of::<Block>() <= 4096);
+
+impl WorkingMemory {
+    /// Map `blocks` zeroed Argon2 blocks.
+    fn new(blocks: usize) -> std::io::Result<Self> {
+        let bytes = blocks.checked_mul(Block::SIZE).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Argon2 memory cost overflows",
+            )
+        })?;
+        let map = memmap2::MmapOptions::new().len(bytes).map_anon()?;
+        Ok(Self { map, blocks })
+    }
+
+    /// The mapping as Argon2 blocks, for `hash_password_into_with_memory`.
+    fn blocks(&mut self) -> &mut [Block] {
+        // SAFETY: the mapping is `blocks * Block::SIZE` bytes long (checked in
+        // `new`), page-aligned, and `Block` is that size with an alignment no
+        // larger than a page (the `const` asserts above). A `Block` is 128
+        // `u64`s, so the mapping's zero bytes are a valid `Block` (they are
+        // `Block::new()`), and so is any bit pattern Argon2 writes. The slice
+        // borrows `self` mutably, so it can't outlive the mapping or alias it.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.map.as_mut_ptr().cast::<Block>(), self.blocks)
+        }
+    }
+}
+
+/// Hash `password` with `hasher`'s parameters into an output of
+/// `output_len` bytes, with the working memory in a [`WorkingMemory`].
+fn hash_off_heap(
+    hasher: &Argon2<'_>,
+    password: &[u8],
+    salt: &[u8],
+    output_len: usize,
+) -> Result<Output, TokenError> {
+    let failed = |error: &dyn std::fmt::Display| TokenError::HashFailed(error.to_string());
+    let mut memory = WorkingMemory::new(hasher.params().block_count()).map_err(|e| failed(&e))?;
+    let mut output = [0u8; Output::MAX_LENGTH];
+    let output = output
+        .get_mut(..output_len)
+        .ok_or_else(|| failed(&format!("Argon2 output length {output_len} is too long")))?;
+    hasher
+        .hash_password_into_with_memory(password, salt, output, memory.blocks())
+        .map_err(|e| failed(&e))?;
+    Output::new(output).map_err(|e| failed(&e))
 }
 
 /// Check that a token's role is sufficient for a required role.
@@ -421,6 +534,7 @@ pub fn derive_service_token(ikm: &[u8; 32]) -> Result<String, TokenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 
     #[test]
     fn service_token_is_deterministic_for_the_same_ikm() {
@@ -472,6 +586,64 @@ mod tests {
     fn argon2_hash_verify_round_trip() {
         let created = create_token("test", ApiRole::Deployer, TokenScope::default(), None).unwrap();
         validate_token(&created.plaintext, &created.token).unwrap();
+    }
+
+    /// A stored token whose hash the `argon2` crate made itself, with
+    /// `hasher`'s parameters.
+    fn hashed_by_the_crate(hasher: &Argon2<'_>, secret: &str) -> ApiToken {
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = hasher.hash_password(secret.as_bytes(), &salt).unwrap();
+        let mut token = create_token("crate", ApiRole::Admin, TokenScope::default(), None)
+            .unwrap()
+            .token;
+        token.token_hash = hash.to_string().into_bytes();
+        token
+    }
+
+    #[test]
+    fn a_hash_the_argon2_crate_made_verifies() {
+        let secret = format!("rbrg_{}", "a".repeat(64));
+        let stored = hashed_by_the_crate(&Argon2::default(), &secret);
+        validate_token(&secret, &stored).unwrap();
+        assert!(validate_token(&format!("rbrg_{}", "b".repeat(64)), &stored).is_err());
+    }
+
+    #[test]
+    fn a_minted_hash_verifies_with_the_argon2_crate() {
+        let created = create_token("t", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let hash = std::str::from_utf8(&created.token.token_hash).unwrap();
+        let parsed = PasswordHash::new(hash).unwrap();
+        assert_eq!(parsed.algorithm, argon2::Algorithm::Argon2id.ident());
+        Argon2::default()
+            .verify_password(created.plaintext.as_bytes(), &parsed)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_hash_with_other_argon2_parameters_verifies_with_its_own() {
+        // The memory, passes, lanes, variant and version all come from the
+        // stored hash, not from our defaults.
+        let params = argon2::Params::new(2048, 3, 2, None).unwrap();
+        let hasher = Argon2::new(argon2::Algorithm::Argon2i, argon2::Version::V0x10, params);
+        let secret = format!("rbrg_{}", "c".repeat(64));
+        let stored = hashed_by_the_crate(&hasher, &secret);
+        validate_token(&secret, &stored).unwrap();
+        assert!(validate_token(&format!("rbrg_{}", "d".repeat(64)), &stored).is_err());
+    }
+
+    #[test]
+    fn a_stored_hash_that_is_not_argon2_never_matches() {
+        let secret = format!("rbrg_{}", "e".repeat(64));
+        let mut stored = hashed_by_the_crate(&Argon2::default(), &secret);
+        for junk in [
+            "",
+            "not a hash",
+            "$scrypt$ln=16,r=8,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaA",
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ",
+        ] {
+            stored.token_hash = junk.as_bytes().to_vec();
+            assert!(validate_token(&secret, &stored).is_err(), "{junk:?}");
+        }
     }
 
     #[test]
