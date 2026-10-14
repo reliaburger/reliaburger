@@ -642,10 +642,11 @@ def report(snapshot):
             raft_entries_per_second=raft_rate,raft_leaders=raft.get("leaders",[]),
             raft_state_bytes_max=metrics.get("state_bytes_max") or None,
             targets=dict(million_task_array_wall_seconds=600,p99_start_lag_ms=1000,
-                         raft_entries_per_second="3 per second of batch runtime, plus 1",
-                         raft_state_bytes_per_million_tasks=256*1024,leader_rss_growth_mib=64,
+                         raft_entries_per_second="recorded only; the batch target counts only task-array writes",
+                         raft_state_bytes_per_million_tasks=256*1024,
+                         bun_steady_rss_mib=dict(api_node=512,other_nodes=384),
                          leader_cpu_cores=1,executor_overhead_cores_per_node=0.5,
-                         node_ledger_mib_per_million_tasks=16,retained_log_mb=50)))
+                         node_ledger_mib_per_million_tasks=64,retained_log_mb=50)))
 
 
 def coverage_failures(snapshot, nodes=(), kinds=FAULT_KINDS):

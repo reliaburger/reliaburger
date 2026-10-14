@@ -275,11 +275,93 @@ class JobQualification(unittest.TestCase):
         state["trends"]={"n":{"rss_kb":{"first":102400,"max":153600},"disk_kb logs":{"first":0,"max":20000}}}
         state["job_resources"]={"n":{"peak_storage_kb":{"task-arrays":8192}}}
         host=checker.job_host_metrics(state,2_000_000)
-        self.assertEqual(host["leader_rss_growth_mib"],50)
+        self.assertNotIn("leader_rss_growth_mib",host)
         self.assertEqual(host["leader_cpu_cores"],0.5)
         self.assertEqual(host["executor_overhead_cores_per_node"],0.03)
         self.assertEqual(host["retained_log_mb"],20.48)
         self.assertEqual(host["node_ledger_mib_per_million_tasks"],4)
+
+    def bun(self,state,node,ts,pid,rss_kb,image="i1",boot="b1"):
+        checker.job_metric_samples(state,node,dict(boot=[boot],bun_pid=[str(pid)],bun_image=[image],bun_rss_kb=[str(rss_kb)]),ts)
+
+    def test_steady_state_rss_is_per_process_across_a_restart_not_peak_minus_first(self):
+        # One node, two Bun processes: the first grows to 600 MiB and is
+        # restarted, the second settles at 200 MiB. Peak minus first across
+        # both (the old measure) would say 500 MiB of growth; each process
+        # gets its own median after its first ten minutes instead.
+        state={"nodes":["api","n2","n3"]}
+        start=1000
+        self.bun(state,"api",start,7,100*1024)
+        for minute in range(1,31):
+            self.bun(state,"api",start+60*minute,7,(300 if minute<30 else 600)*1024)
+        restart=start+31*60
+        self.bun(state,"api",restart,8,50*1024)
+        for minute in range(1,21):
+            self.bun(state,"api",restart+60*minute,8,200*1024)
+        host=checker.job_host_metrics(state,0)
+        processes=host["per_node"]["api"]["bun_processes"]
+        self.assertEqual([process["pid"] for process in processes],[7,8])
+        self.assertEqual([process["steady_rss_mib"] for process in processes],[300,200])
+        self.assertEqual([process["peak_rss_mib"] for process in processes],[600,200])
+        self.assertEqual(host["per_node"]["api"]["bun_steady_rss_mib"],300)
+        self.assertEqual(host["per_node"]["api"]["bun_peak_rss_mib"],600)
+
+    def test_an_upgrade_exec_with_the_same_pid_is_a_new_process(self):
+        state={"nodes":["api"]}
+        for minute in range(0,15):
+            self.bun(state,"api",60*minute,7,400*1024,image="old")
+        for minute in range(15,40):
+            self.bun(state,"api",60*minute,7,100*1024,image="new")
+        processes=checker.job_host_metrics(state,0)["per_node"]["api"]["bun_processes"]
+        self.assertEqual([(process["image"],process["steady_rss_mib"]) for process in processes],[("old",400),("new",100)])
+
+    def test_a_process_seen_for_less_than_the_settling_time_has_only_a_peak(self):
+        state={"nodes":["api"]}
+        self.bun(state,"api",0,7,100*1024)
+        self.bun(state,"api",checker.BUN_STEADY_AFTER-1,7,120*1024)
+        node=checker.job_host_metrics(state,0)["per_node"]["api"]
+        self.assertIsNone(node["bun_processes"][0]["steady_rss_mib"])
+        self.assertIsNone(node["bun_steady_rss_mib"])
+        self.assertEqual(node["bun_peak_rss_mib"],120)
+
+    def test_the_api_node_gets_512_mib_and_the_others_384_mib(self):
+        # Node 1 serves the API the harness and the job controller talk to.
+        state={"nodes":["n1","n2","n3"]}
+        for node,mib in (("n1",400),("n2",350),("n3",100)):
+            for minute in range(0,20):
+                self.bun(state,node,60*minute,7,mib*1024)
+        host=checker.job_host_metrics(state,0)
+        self.assertEqual({node:row["bun_rss_target_mib"] for node,row in host["per_node"].items()},dict(n1=512,n2=384,n3=384))
+        # The worst node is the closest to its own target: 350/384 beats 400/512.
+        self.assertEqual(host["bun_rss_worst"],dict(node="n2",steady_rss_mib=350,peak_rss_mib=350,target_mib=384))
+        lines="\n".join(checker.job_qualification_lines(dict(m8=host)))
+        self.assertIn("| n2: 350.00 MiB steady, 350.00 MiB peak | ≤ 384 MiB (≤ 512 MiB on node 1, which serves the API) |",lines)
+        self.assertIn("- Bun RSS on n1 (serves the API, target ≤ 512 MiB): pid 7: 400.00 MiB steady, 400.00 MiB peak",lines)
+        state={"nodes":["n1","n2"]}
+        for minute in range(0,20):
+            self.bun(state,"n1",60*minute,7,500*1024)
+            self.bun(state,"n2",60*minute,7,200*1024)
+        self.assertEqual(checker.job_host_metrics(state,0)["bun_rss_worst"]["node"],"n1")
+
+    def test_task_array_storage_is_compared_against_64_mib_per_million(self):
+        self.assertEqual(checker.TASK_ARRAY_STORAGE_TARGET_MIB,64)
+        state={"nodes":["n"],"job_metrics":{"n":{"bun_cpu_seconds":0.0,"executor_cpu_seconds":0.0}},
+               "job_resources":{"n":{"peak_storage_kb":{"task-arrays":45*1024}}}}
+        host=checker.job_host_metrics(state,1_000_000)
+        self.assertEqual(host["node_ledger_mib_per_million_tasks"],45)
+        lines=checker.job_qualification_lines(dict(m8=host))
+        row=next(line for line in lines if line.startswith("| Node task-array storage"))
+        self.assertTrue(row.endswith("| 45.00 MiB | ≤ 64 MiB, deleted after retirement |"),row)
+        self.assertEqual(jobs.report(dict(progress={}))["m8"]["targets"]["node_ledger_mib_per_million_tasks"],64)
+
+    def test_the_table_states_its_targets_and_the_decision_behind_them(self):
+        text="\n".join(checker.job_qualification_lines(dict(m8=dict(raft_entries_per_second=2.5))))
+        self.assertIn("| Measure (recorded, not gated) | Observed | Target |",text)
+        self.assertNotIn("September plan target",text)
+        self.assertIn("maintainer decision, 15 October 2026",text)
+        self.assertIn("https://github.com/reliaburger/reliaburger/issues/668",text)
+        self.assertIn("| Raft entries per second, all cluster writes | 2.50 | recorded only; the batch target counts only task-array writes |",text)
+        self.assertNotIn("Bun RSS growth",text)
 
     def test_render_writes_the_job_report_beside_the_record_and_never_replaces_it(self):
         with tempfile.TemporaryDirectory() as directory:

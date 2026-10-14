@@ -2618,6 +2618,27 @@ concurrency makes the verdict informational, because comparing unlike runs is
 how the misleading numbers above happened. The five-round rerun's forty reports
 are committed as the first baselines.
 
+The September table also didn't transfer as cleanly as we'd hoped. Its targets
+describe one 1M-task batch on a quiet cluster, and a soak is nothing like that.
+Take "leader RSS growth at most 64 MiB". The record computed it as the highest
+sample minus the first, but over 90 minutes a node runs ten or so Bun
+processes: crashes, kills, an upgrade exec'ing in place. The first sample came
+from a process that had just started and the highest from a different one that
+had been serving apps for an hour, so the difference measured nothing. Now each
+process (its boot, pid and image, since an upgrade keeps the pid) gets its own
+steady state, the median of its samples once it has been seen for ten minutes,
+reported with its peak. The node serving the API (node 1, the one the harness
+and the job controller talk to) gets 512 MiB and the others 384 MiB, since
+the Raft leader can be any of them. Storage
+moved to 64 MiB per million, above the measured 45. And the Raft counter reads
+the council's commit index, so it counts every write in the cluster: app
+deploys, leases and certificate renewals as well as task arrays. Comparing that
+with a per-batch budget would be meaningless, so the row is recorded without a
+target until the evidence separates task-array writes. The maintainer settled
+these on 15 October 2026 ([#668](https://github.com/reliaburger/reliaburger/issues/668)).
+They're still recorded, never gated: a leaking Bun fails the soak through
+`leak-rss` and the wtf report, as before.
+
 ### A task that failed before it ran
 
 Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of
