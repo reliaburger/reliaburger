@@ -4960,15 +4960,15 @@ its inventory read, and that `publish` timed its install and firewall sync.
 Issue #890 stays open until a soak's log line says which part it was.
 
 The next candidate's soak showed why the line matters. Its build predated
-this change, and node 3, about 11 s after the soak killed its Bun mid-deploy,
-took one `consumer_sync` turn of 5,292 ms. No other turn in the journals
-the harness kept took more than 510 ms. The view had five apps and the node three job
-runs in flight, so size was ruled out again. The inventory read and the
-firewall's cgroup reads both stop at the turn's 500 ms deadline, so neither
-can account for five seconds. That leaves the fsync, a lock, or a runtime
-thread that didn't get to the loop. The new line separates them: it shows
-which timed part took the time, and if none of them did, then it was
-something the line doesn't time.
+this change, and node 3, about 11 s after the soak killed its Bun mid-
+deploy, took one `consumer_sync` turn of 5,292 ms. No other turn in the
+journals the harness kept took more than 510 ms. The view had five apps and
+the node three job runs in flight, so size was ruled out again. The
+inventory read and the firewall's cgroup reads both stop at the turn's 500
+ms deadline, so neither can account for five seconds. That leaves the fsync,
+a lock, or a runtime thread that didn't get to the loop. The new line
+separates them: it shows which timed part took the time, and if none of them
+did, then it was something the line doesn't time.
 
 #### A test that raced the clock
 
