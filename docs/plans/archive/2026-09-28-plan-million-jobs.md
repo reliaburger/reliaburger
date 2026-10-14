@@ -199,6 +199,14 @@ RSS delta, reporting bytes per node per second, and ledger bytes on disk.
 | Node ledger on disk per 1M tasks | at most 16 MiB, deleted after retirement; measured bound since #678: at most 50 bytes per task (measured ledger 22.4 + result index 25.0 on APFS, about 45 MiB per 1M), deleted an hour after retirement on a leader timer | same | unit test and `make bench-task-arrays` |
 | Log volume retained | at most 50 MB for the whole run | same | Ketchup |
 
+The V02 and job soaks record these measurements against restated targets,
+because these targets were set for one 1M-task batch on a quiet cluster: at
+most 64 MiB of task-array storage per 1M accepted tasks, each Bun process's
+steady-state RSS at most 512 MiB on the node serving the API and 256 MiB on
+the others, and Raft entries recorded for all cluster writes without a target
+(maintainer decision, 15 October 2026,
+[#668](https://github.com/reliaburger/reliaburger/issues/668)).
+
 The laptop numbers are gated: the headline says "a million" only if M0 and the
 M4 prototype show the laptop sustaining 1,700 tasks/s with p99 start lag under
 a second. Otherwise the tour uses the original plan's claim, "100,000 jobs in

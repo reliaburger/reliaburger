@@ -629,7 +629,17 @@ the real `curl … | sh` install against it on every host we advertise.
    of a 1,048,576-task array, p99 start lag, Raft entries a second and run
    state, Bun memory and CPU, executor overhead, task-array storage per
    million tasks and retained logs. Those are recorded in every run and never
-   gate it. Commit both files. Bounded job storage
+   gate it. A soak compares three of them with restated targets
+   (maintainer decision, 15 October 2026,
+   [#668](https://github.com/reliaburger/reliaburger/issues/668)), since the
+   plan's were for one batch on a quiet cluster: task-array storage at most
+   64 MiB per million accepted tasks; each Bun process's steady-state RSS
+   (the median of its samples once it has been seen for 10 minutes, a process
+   being its boot, pid and image) at most 512 MiB on node 1, which serves the
+   API, and 256 MiB on the others, with the peak beside it; and Raft entries a
+   second for all cluster writes, recorded without a target because the batch
+   target counts only task-array writes. The gated memory checks are
+   unchanged. Commit both files. Bounded job storage
    ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
    pass before the 12-hour run: until it does, a full disk stops a worker
    taking grants and fails the run.
