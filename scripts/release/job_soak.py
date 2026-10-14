@@ -54,6 +54,11 @@ CAUSES = ("exit_code", "signal", "timeout", "unknown", "launch", "unrecorded")
 FAULT_KINDS = ("leader-kill", "follower-kill", "power-off")
 # Node-level faults the job qualification adds (#686, D19-B).
 NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
+# How long a drained fixture's result may stay on an unreachable node. A
+# killed or powered-off node is back within the soak's longest settle budget
+# (600 s); a result still missing after that is lost, not late (V02 candidate
+# 6, run 15, #954).
+RESULT_UNREACHABLE_GRACE = 600
 # Final-attempt and start-lag bucket upper bounds in milliseconds; None is +Inf.
 BUCKETS = [1 << i for i in range(15)] + [None]
 
@@ -484,7 +489,14 @@ class Campaign:
                 rows=[]
                 if intent["purpose"] in ("failure","timeout","limit") and not stop:
                     page=self.api.request("GET",f'/v1/batch/{intent["id"]}/results?limit=1&index=0')
-                    if page.get("unreachable") or page.get("truncated"): raise InvalidEvidence("failure result incomplete")
+                    if page.get("truncated"): raise InvalidEvidence("failure result incomplete")
+                    if page.get("unreachable"):
+                        # The node holding the row may be restarting after a
+                        # fault: read it again on a later poll, within a bound.
+                        since=intent.setdefault("result_unreachable_since",now); self.save()
+                        if now-since<RESULT_UNREACHABLE_GRACE: continue
+                        raise InvalidEvidence("failure result incomplete: "+", ".join(map(str,page["unreachable"]))
+                                              +f" unreachable for {now-since} s")
                     rows=page["rows"]
                     if intent["purpose"] == "timeout" and len(rows)==1:
                         if self.ledger_reader is None: raise InvalidEvidence("deadline start verifier unavailable")

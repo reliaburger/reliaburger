@@ -322,6 +322,64 @@ class UnexpectedFailure(unittest.TestCase):
             self.assertEqual(c.state["errors"],["runc short work (7): unexpected terminal failure in ordinary campaign work"])
 
 
+class ExpectedFailureResult(unittest.TestCase):
+    """V02 candidate 6, run 15: the shared-runc short failure fixture drained
+    four seconds after the soak killed the Bun on the node that held its one
+    result row, so the leader's results page named that node unreachable. The
+    harness recorded a permanent error, and every later settle failed on it
+    (#954)."""
+    class API(FakeAPI):
+        def __init__(self, unreachable_pages):
+            super().__init__(); self.unreachable_pages=unreachable_pages; self.result_calls=0
+        def request(self,method,path,body=None,raw=False):
+            if path=="/v1/jobs/runs": return super().request(method,path,body)
+            if "/results" in path:
+                self.result_calls+=1
+                if self.result_calls<=self.unreachable_pages:
+                    return dict(batch_id=15,rows=[],truncated=False,unreachable=["node-1"])
+                return dict(batch_id=15,rows=[dict(index=0,attempts=2,exit_code=7,succeeded=False,run_ms=3)],
+                            truncated=False,unreachable=[])
+            return summary(15,total=1,failed=1,queued=0,done=True,name="fixture",runtime="shared-runc",
+                           cpu_request_millicores=25,memory_request_bytes=self.memory)
+    def campaign(self, folder, api):
+        c=jobs.Campaign(folder,api,[],"token")
+        intent=c.prepare("shared-runc","short","failure",100); intent.update(id=15,name="fixture")
+        api.memory=int(c.body(intent)["definition"]["template"]["memory"][:-2])<<20
+        # Only the fixture under test: no other profile's run is admitted.
+        c.prepare=lambda *args: None
+        return c
+
+    def test_a_result_held_on_a_restarting_node_is_read_again_later(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api=self.API(unreachable_pages=1); c=self.campaign(folder,api)
+            c.step(101)
+            self.assertIn("shared-runc:short",c.state["active"])
+            self.assertEqual(c.state["errors"],[])
+            c.step(140)
+            self.assertNotIn("shared-runc:short",c.state["active"])
+            self.assertEqual(c.state["errors"],[])
+            self.assertTrue(c.state["coverage"]["shared-runc"]["failure"])
+
+    def test_a_result_unreachable_past_the_grace_fails_by_node(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api=self.API(unreachable_pages=1000); c=self.campaign(folder,api)
+            c.step(101)
+            c.step(101+jobs.RESULT_UNREACHABLE_GRACE-1)
+            self.assertEqual(c.state["errors"],[])
+            c.step(101+jobs.RESULT_UNREACHABLE_GRACE)
+            self.assertEqual(c.state["errors"],[f"shared-runc short failure (15): failure result incomplete: "
+                                                f"node-1 unreachable for {jobs.RESULT_UNREACHABLE_GRACE} s"])
+
+    def test_a_truncated_single_result_page_still_fails_at_once(self):
+        class API(self.API):
+            def request(self,method,path,body=None,raw=False):
+                if "/results" in path: return dict(batch_id=15,rows=[],truncated=True,unreachable=[])
+                return super().request(method,path,body,raw)
+        with tempfile.TemporaryDirectory() as folder:
+            c=self.campaign(folder,API(0)); c.step(101)
+            self.assertEqual(c.state["errors"],["shared-runc short failure (15): failure result incomplete"])
+
+
 class TargetLoad(unittest.TestCase):
     """#686: the #668 throughput target, retry causes and the M8 report."""
     def setUp(self):
