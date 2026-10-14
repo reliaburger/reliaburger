@@ -678,6 +678,29 @@ second one. So the run also fails when its median ratio is above two. That's the
 gate, asked of the median rather than of every benchmark, so the new gate passes everything the
 old one did.
 
+The median takes care of a slow machine. It can't take care of a slow minute. On 13 October,
+`storage/ledger_and_index_64k` failed twice in one day, once at 2.89 times its baseline, on pull
+requests that never touched storage, and passed on each re-run. That benchmark writes a ledger
+and a result index for 64k tasks to a temporary directory, so it's at the mercy of the hosted
+runner's disk, and a disk that stalls for a few seconds during one benchmark slows that benchmark
+alone. The rest of the run is fine, so the median can't see it.
+
+A real regression is repeatable. A stall isn't. So when a benchmark is over the limit, the
+gate measures it once more, on its own, and fails only when it's over the limit both times:
+
+```python
+def criterion_filter(names):
+    return "^(" + "|".join(re.escape(name) for name in sorted(names)) + ")$"
+```
+
+Criterion runs every benchmark whose name its filter matches *anywhere*, so the filter is
+anchored at both ends: `executor/process_true_256/1` mustn't drag in a `/16` sibling. The
+re-run costs a minute or so, against an hour of re-queuing a merge train. The run's median
+isn't re-measured: re-running the whole suite would double the job, and a whole-run slowdown
+is exactly what a disk stall *doesn't* cause. The step summary shows both measurements of
+anything it re-measured, so a benchmark that passed on its second try is still visible to
+anyone reading the trend.
+
 Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
 alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
 slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
