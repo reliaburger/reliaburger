@@ -93,6 +93,16 @@ def veth(identity):
     return "veth-%010x" % (digest & 0xffffffffff)
 
 
+def setup_peer(identity):
+    """The temporary container-side veth the runtime creates in the host
+    namespace before moving it into the task's netns: `vt` + `c-<hash>`, the
+    hash a wrapping 32-bit `h*31 + byte` (src/grill/netns.rs,
+    setup_container_network_with_commands)."""
+    digest = 0
+    for byte in identity.encode(): digest = (digest*31 + byte) & 0xffffffff
+    return "vtc-%08x" % digest
+
+
 def command(args):
     result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     if result.returncode or len(result.stdout) > (1<<20): raise InvalidInventory("kernel/storage inventory command failed: "+args[0])
@@ -259,7 +269,8 @@ def validate(value, started, boot=None, collected=None):
 
 
 def exemptions(value):
-    result={kind:set() for kind in ("runc","netns","lease","veth","cgroup")}
+    # setup_peer: names excused once, while a live owner's network is set up.
+    result={kind:set() for kind in ("runc","netns","lease","veth","cgroup","setup_peer")}
     for owner in value["owners"]:
         identity=owner["id"]
         _, _, group=identity_parts(identity,value["prefix"])
@@ -273,6 +284,7 @@ def exemptions(value):
         if owner["runtime"]!="process":
             result["runc"].add(identity); result["netns"].add("rb-"+identity)
             result["lease"].add(identity); result["veth"].add(veth(identity))
+            result["setup_peer"].add(setup_peer(identity))
     return result
 
 

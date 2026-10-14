@@ -46,7 +46,11 @@ DEFAULT_TARGET_RATE = 1390
 # containers can't approach the target, so their runs keep the calibration mix.
 TARGET_CAPS = {"shared-runc": 8, "process": 16}
 MILLION = 1 << 20
-CAUSES = ("exit_code", "signal", "timeout", "unknown", "unrecorded")
+# Why retried attempts failed: the fields of the product's `RetryCauses`
+# (src/meat/task_array_state.rs), the one list validation, progress totals,
+# the regression check and the record all read. test_job_soak.py fails when
+# the two disagree; a summary naming a cause missing here is refused by name.
+CAUSES = ("exit_code", "signal", "timeout", "unknown", "launch", "unrecorded")
 FAULT_KINDS = ("leader-kill", "follower-kill", "power-off")
 # Node-level faults the job qualification adds (#686, D19-B).
 NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
@@ -97,7 +101,15 @@ def validate_summary(value, previous=None, concurrency=None):
         raise InvalidEvidence("invalid verified active commands")
     causes = value.get("retry_causes")
     if causes is not None:
-        if not isinstance(causes, dict) or sum(number(causes, key) for key in CAUSES) != counts["retried"]:
+        if not isinstance(causes, dict):
+            raise InvalidEvidence("invalid retry causes")
+        unknown = sorted(set(causes) - set(CAUSES))
+        if unknown:
+            # A new product cause the harness can't count: say which, so the
+            # fix is obvious instead of a sum that never matches (#942).
+            raise InvalidEvidence("unknown retry cause " + ", ".join(unknown)
+                                  + "; add it to job_soak.CAUSES")
+        if sum(number(causes, key) for key in CAUSES) != counts["retried"]:
             raise InvalidEvidence("retry causes do not sum to accepted retries")
     if previous:
         if value["batch_id"] != previous["batch_id"] or value["total"] != previous["total"]:
@@ -450,7 +462,7 @@ class Campaign:
                 if value.get("retry_causes") is not None:
                     before=(old or {}).get("retry_causes") or {}
                     totals=progress.setdefault("retry_causes",{key:0 for key in CAUSES})
-                    for key in CAUSES: totals[key]+=value["retry_causes"][key]-before.get(key,0)
+                    for key in CAUSES: totals[key]=totals.get(key,0)+value["retry_causes"][key]-before.get(key,0)
                 if delta:
                     progress.setdefault("first_progress",now)
                     progress["latest_success"]=now
