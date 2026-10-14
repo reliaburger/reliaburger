@@ -12,6 +12,10 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 The limits below are the ones 0.1.6 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
+The [platform comparisons](website/compare/index.html) and
+[competitive research writeup](research/2026-10-15-competitor-review.md) compare installation, operations
+and trade-offs against other projects, with dated evidence and explicit release boundaries.
+
 ## Scope and limits
 
 - **Container clusters run on rootful Linux Runc with eBPF.** Set

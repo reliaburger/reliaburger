@@ -164,3 +164,25 @@ that default when you promote a newer one. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.
+
+### Comparison pages
+
+`compare/index.html` links six practical comparisons; `compare/methodology.html`
+explains the evidence and version boundaries. Public pages foreground Reliaburger’s
+strengths and honest trade-offs. Adaptation recommendations belong in the separate
+[Markdown research writeup](../research/2026-10-15-competitor-review.md).
+Each public page is hand-maintained static HTML,
+using `style.css` and the small `comparisons.css` extension. There is no generated
+copy or build dependency. The homepage links them under the stable `compare` id.
+
+Keep evidence adjacent to factual claims. Pin source-code links to the inspected
+commit or tag; date moving documentation. Distinguish the public installer release,
+the reviewed train implementation and planned features. Learning-curve judgements
+are qualitative, and source inspection is not a benchmark or security certification.
+When refreshing a comparison, review commands, installation assumptions and both
+application and platform upgrade procedures. Preserve section anchors.
+
+Serve the directory with the preview command above and open `/compare/` or
+`/compare/methodology.html`. Check all local links and fragments, desktop and narrow
+layouts, and the command examples with the current CLI's `RELISH_PARSE_ONLY=1`.
+The comparison pages use only `assets/copy.js`; they don't load the tour player.
