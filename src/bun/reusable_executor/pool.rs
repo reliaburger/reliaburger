@@ -285,6 +285,26 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .filter(|slot| slot.active_run == Some(run))
             .count() as u64
     }
+    /// This run's active commands and its `callers`, read while holding the
+    /// slot lock. A caller counts itself before it checks a slot out, and
+    /// stops counting only after it has vacated that slot, which also takes
+    /// the lock. So every command counted here has its caller counted too:
+    /// the lock orders the caller's increment before, and its decrement
+    /// after, this read, even though the counter itself is `Relaxed`.
+    pub(crate) async fn command_activity(
+        &self,
+        run: u64,
+        callers: &std::sync::atomic::AtomicU64,
+    ) -> crate::bun::task_executor::CommandActivity {
+        let slots = self.slots.lock().await;
+        crate::bun::task_executor::CommandActivity {
+            active: slots
+                .iter()
+                .filter(|slot| slot.active_run == Some(run))
+                .count() as u64,
+            callers: callers.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
     pub(crate) async fn available_slots(
         &self,
         key: Option<ExecutorKey>,
@@ -2171,6 +2191,59 @@ mod tests {
             .unwrap();
         assert!(existing.is_none() && lease.is_some());
         assert_eq!(pool.busy_slots(7).await, 1);
+    }
+
+    /// V02 candidate 5: a node answered "1 verified, 0 callers" because it
+    /// read the active commands, then awaited other samples, then read the
+    /// callers counter, and a millisecond command finished in between. One
+    /// sample must never count a command whose caller it doesn't count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_activity_never_counts_more_active_commands_than_callers() {
+        use std::sync::atomic::AtomicU64;
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let callers = Arc::new(AtomicU64::new(0));
+        let stop = CancellationToken::new();
+        // One caller after another, in the executor's order: counted, slot
+        // checked out, command started, slot vacated, no longer counted.
+        let caller = tokio::spawn({
+            let (pool, callers, stop) = (pool.clone(), callers.clone(), stop.clone());
+            async move {
+                let cancel = CancellationToken::new();
+                let mut cycles = 0u64;
+                while !stop.is_cancelled() {
+                    callers.fetch_add(1, Ordering::Relaxed);
+                    let (index, _, _) = pool
+                        .slot(key(1), reservation(), Some(7), &cancel)
+                        .await
+                        .unwrap();
+                    pool.slots.lock().await[index].active_run = Some(7);
+                    // The command runs for a moment...
+                    tokio::task::yield_now().await;
+                    pool.release(index, None).await;
+                    callers.fetch_sub(1, Ordering::Relaxed);
+                    cycles += 1;
+                    // ...and the next caller starts a moment after it ends.
+                    tokio::task::yield_now().await;
+                }
+                cycles
+            }
+        });
+        let mut seen_active = 0;
+        for _ in 0..20_000 {
+            let sample = pool.command_activity(7, &callers).await;
+            assert!(
+                sample.active <= sample.callers,
+                "{} active commands but {} callers",
+                sample.active,
+                sample.callers
+            );
+            seen_active += sample.active;
+            tokio::task::yield_now().await;
+        }
+        stop.cancel();
+        assert!(caller.await.unwrap() > 0, "the caller never cycled");
+        assert!(seen_active > 0, "never sampled an active command");
     }
 
     #[tokio::test]

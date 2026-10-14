@@ -191,6 +191,16 @@ impl Attempt {
     }
 }
 
+/// One sample of a run's verified commands and its executor callers on a
+/// node, read at the same instant so that `active` never exceeds `callers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandActivity {
+    /// Commands whose start was verified and whose cleanup is not yet proved.
+    pub active: u64,
+    /// The run's executor callers, including preparation and resource wait.
+    pub callers: u64,
+}
+
 /// Runs one attempt of one task.
 ///
 /// A trait because there are two real implementations: the process
@@ -209,6 +219,19 @@ pub trait TaskRunner: Send + Sync + 'static {
         _batch_id: u64,
         _template: Option<&crate::config::job::JobSpec>,
     ) -> impl Future<Output = Option<u64>> + Send {
+        async { None }
+    }
+
+    /// [`Self::active_commands`] together with the run's `callers` counter,
+    /// both read at one instant. A command's caller is counted from before
+    /// its start until after its cleanup, so a node that read the two apart
+    /// could report a command without its caller (V02 candidate 5).
+    fn command_activity(
+        &self,
+        _batch_id: u64,
+        _template: Option<&crate::config::job::JobSpec>,
+        _callers: &std::sync::atomic::AtomicU64,
+    ) -> impl Future<Output = Option<CommandActivity>> + Send {
         async { None }
     }
 

@@ -601,6 +601,26 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         let _ = (batch_id, template);
         None
     }
+    async fn command_activity(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+        callers: &std::sync::atomic::AtomicU64,
+    ) -> Option<super::task_executor::CommandActivity> {
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = self.pool_for(template?) {
+            return Some(match pool {
+                Some(pool) => pool.command_activity(batch_id, callers).await,
+                None => super::task_executor::CommandActivity {
+                    active: 0,
+                    callers: callers.load(std::sync::atomic::Ordering::Relaxed),
+                },
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (batch_id, template, callers);
+        None
+    }
     async fn busy_slots(
         &self,
         batch_id: u64,
