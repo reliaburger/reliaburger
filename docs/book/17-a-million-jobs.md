@@ -2628,7 +2628,8 @@ had been serving apps for an hour, so the difference measured nothing. Now each
 process (its boot, pid and image, since an upgrade keeps the pid) gets its own
 steady state, the median of its samples once it has been seen for ten minutes,
 reported with its peak. The node serving the API (node 1, the one the harness
-and the job controller talk to) gets 512 MiB and the others 256 MiB. Storage
+and the job controller talk to) gets 512 MiB and the others 384 MiB, since
+the Raft leader can be any of them. Storage
 moved to 64 MiB per million, above the measured 45. And the Raft counter reads
 the council's commit index, so it counts every write in the cluster: app
 deploys, leases and certificate renewals as well as task arrays. Comparing that

@@ -636,7 +636,7 @@ the real `curl … | sh` install against it on every host we advertise.
    64 MiB per million accepted tasks; each Bun process's steady-state RSS
    (the median of its samples once it has been seen for 10 minutes, a process
    being its boot, pid and image) at most 512 MiB on node 1, which serves the
-   API, and 256 MiB on the others, with the peak beside it; and Raft entries a
+   API, and 384 MiB on the others, with the peak beside it; and Raft entries a
    second for all cluster writes, recorded without a target because the batch
    target counts only task-array writes. The gated memory checks are
    unchanged. Commit both files. Bounded job storage

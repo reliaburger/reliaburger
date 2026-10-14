@@ -324,18 +324,18 @@ class JobQualification(unittest.TestCase):
         self.assertIsNone(node["bun_steady_rss_mib"])
         self.assertEqual(node["bun_peak_rss_mib"],120)
 
-    def test_the_api_node_gets_512_mib_and_the_others_256_mib(self):
+    def test_the_api_node_gets_512_mib_and_the_others_384_mib(self):
         # Node 1 serves the API the harness and the job controller talk to.
         state={"nodes":["n1","n2","n3"]}
-        for node,mib in (("n1",400),("n2",250),("n3",100)):
+        for node,mib in (("n1",400),("n2",350),("n3",100)):
             for minute in range(0,20):
                 self.bun(state,node,60*minute,7,mib*1024)
         host=checker.job_host_metrics(state,0)
-        self.assertEqual({node:row["bun_rss_target_mib"] for node,row in host["per_node"].items()},dict(n1=512,n2=256,n3=256))
-        # The worst node is the closest to its own target: 250/256 beats 400/512.
-        self.assertEqual(host["bun_rss_worst"],dict(node="n2",steady_rss_mib=250,peak_rss_mib=250,target_mib=256))
+        self.assertEqual({node:row["bun_rss_target_mib"] for node,row in host["per_node"].items()},dict(n1=512,n2=384,n3=384))
+        # The worst node is the closest to its own target: 350/384 beats 400/512.
+        self.assertEqual(host["bun_rss_worst"],dict(node="n2",steady_rss_mib=350,peak_rss_mib=350,target_mib=384))
         lines="\n".join(checker.job_qualification_lines(dict(m8=host)))
-        self.assertIn("| n2: 250.00 MiB steady, 250.00 MiB peak | ≤ 256 MiB (≤ 512 MiB on node 1, which serves the API) |",lines)
+        self.assertIn("| n2: 350.00 MiB steady, 350.00 MiB peak | ≤ 384 MiB (≤ 512 MiB on node 1, which serves the API) |",lines)
         self.assertIn("- Bun RSS on n1 (serves the API, target ≤ 512 MiB): pid 7: 400.00 MiB steady, 400.00 MiB peak",lines)
         state={"nodes":["n1","n2"]}
         for minute in range(0,20):

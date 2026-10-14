@@ -202,7 +202,7 @@ RSS delta, reporting bytes per node per second, and ledger bytes on disk.
 The V02 and job soaks record these measurements against restated targets,
 because these targets were set for one 1M-task batch on a quiet cluster: at
 most 64 MiB of task-array storage per 1M accepted tasks, each Bun process's
-steady-state RSS at most 512 MiB on the node serving the API and 256 MiB on
+steady-state RSS at most 512 MiB on the node serving the API and 384 MiB on
 the others, and Raft entries recorded for all cluster writes without a target
 (maintainer decision, 15 October 2026,
 [#668](https://github.com/reliaburger/reliaburger/issues/668)).

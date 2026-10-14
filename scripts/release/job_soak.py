@@ -644,7 +644,7 @@ def report(snapshot):
             targets=dict(million_task_array_wall_seconds=600,p99_start_lag_ms=1000,
                          raft_entries_per_second="recorded only; the batch target counts only task-array writes",
                          raft_state_bytes_per_million_tasks=256*1024,
-                         bun_steady_rss_mib=dict(api_node=512,other_nodes=256),
+                         bun_steady_rss_mib=dict(api_node=512,other_nodes=384),
                          leader_cpu_cores=1,executor_overhead_cores_per_node=0.5,
                          node_ledger_mib_per_million_tasks=64,retained_log_mb=50)))
 

@@ -56,7 +56,7 @@ RSS_GROWTH = 1.25
 # once it has been seen for BUN_STEADY_AFTER seconds.
 BUN_STEADY_AFTER = 600
 API_BUN_RSS_TARGET_MIB = 512
-BUN_RSS_TARGET_MIB = 256
+BUN_RSS_TARGET_MIB = 384
 TASK_ARRAY_STORAGE_TARGET_MIB = 64
 # A leak-fd window: floors over 10-minute buckets after a 10-minute warm-up,
 # each at least FD_STEP above the last, 25% up overall. Bun images rarely
