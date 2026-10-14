@@ -98,7 +98,7 @@ impl TestScenario {
                     name: "migrate".into(),
                     namespace: "default".into(),
                     instance_id: "migrate-0".into(),
-                    image: "proc-grill:image-ignored".into(),
+                    image: "app:v1".into(),
                     state: "stopped".into(),
                     restart_count: 0,
                     age_seconds: 60,

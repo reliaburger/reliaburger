@@ -376,7 +376,7 @@ The command-line interface that humans interact with.
 ### 10. Container runtime (`src/grill/`)
 
 - `state.rs` (325 lines) — `ContainerState` enum: `Pending` --> `Preparing` --> `Starting` --> `HealthWait` --> `Running` --> `Unhealthy` --> `Stopping` --> `Stopped` --> `Failed`. This is the full lifecycle state machine.
-- `process.rs` — `ProcessGrill`: spawns OS processes as workloads. Cross-platform fallback when you don't want a real container runtime. Uses `proc-grill:image-ignored` as a convention for process-based workloads.
+- `process.rs` — `ProcessGrill`: spawns OS processes as workloads. Cross-platform fallback when you don't want a real container runtime. It runs host `exec` and `script` apps only, and refuses an image app as needing a container runtime (#914).
 - `port.rs` — `PortAllocator`: random port selection with retry cap to avoid collisions.
 - `oci.rs` — OCI runtime spec generation for runc.
 - `mock.rs` — `MockGrill` for testing the agent without spawning real processes.

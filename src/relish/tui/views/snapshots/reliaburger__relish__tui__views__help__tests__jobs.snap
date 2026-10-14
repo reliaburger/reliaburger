@@ -6,7 +6,7 @@ expression: "render_to_string(&app, 120, 40)"
                                                                                                                         
 ┌jobs──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │NAME                 NODE         NS           STATE        RESTARTS  AGE      IMAGE                                  │
-│migrate              node-1       default      stopped             0      60s  proc-grill:image-ignored               │
+│migrate              node-1       default      stopped             0      60s  app:v1                                 │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

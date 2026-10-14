@@ -174,7 +174,7 @@ mod tests {
             allocated: Resources::new(cpu_used, 0, 0),
             labels,
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400, // 24h — full stability score
             cached_images: HashSet::new(),

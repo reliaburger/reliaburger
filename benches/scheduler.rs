@@ -34,7 +34,12 @@ fn cluster(nodes: usize) -> ClusterStateCache {
             allocated: Resources::new(2000 + used * 500, (4 + used * 2) * GIB, 0),
             labels: BTreeMap::from([("zone".to_string(), format!("z{}", index % 3))]),
             ready: true,
-            capabilities: Default::default(),
+            // The benchmark's apps run images, which only a node with a
+            // container runtime takes (#914).
+            capabilities: reliaburger::meat::cluster_state::NodeCapabilities {
+                containers: true,
+                ..Default::default()
+            },
             app_replicas: HashMap::new(),
             uptime_secs: 86400,
             cached_images: HashSet::new(),

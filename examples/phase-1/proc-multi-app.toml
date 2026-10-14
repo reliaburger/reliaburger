@@ -1,4 +1,4 @@
-# Multiple apps in a single config file (ProcessGrill version).
+# Multiple apps in a single config file (process-runtime version).
 #
 # All three apps deploy together and run testapp on different ports.
 # See container-multi-app.toml for the real-runtime version with OCI images.
@@ -6,12 +6,16 @@
 # Build first:
 #   cargo build
 #
+# Start Bun with the process runtime and the node config that allows
+# testapp, from the repository root:
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
+#
 # Deploy with:
 #   cargo run --bin relish -- apply examples/phase-1/proc-multi-app.toml
 
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
 replicas = 2
 
@@ -19,8 +23,8 @@ replicas = 2
 path = "/"
 
 [app.api]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "3000"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "3000"]
 port = 3000
 replicas = 2
 
@@ -31,5 +35,5 @@ NODE_ENV = "production"
 path = "/healthz"
 
 [app.worker]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "9090"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "9090"]

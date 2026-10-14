@@ -1793,10 +1793,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut task = assignment(1, 1, &[(0, 1)]);
         task.template = Some(Box::new(
-            toml::from_str(
-                "image='proc-grill:image-ignored'\ncommand=['true']\n[egress]\nallow=['192.0.2.1:443']",
-            )
-            .unwrap(),
+            toml::from_str("image='app:v1'\ncommand=['true']\n[egress]\nallow=['192.0.2.1:443']")
+                .unwrap(),
         ));
         let runner = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
             crate::grill::ProcessGrill::new(),
@@ -1929,7 +1927,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut task = assignment(1, 1, &[(0, 1)]);
         task.template = Some(Box::new(
-            toml::from_str("image='proc-grill:image-ignored'\ncommand=['true']").unwrap(),
+            toml::from_str("image='app:v1'\ncommand=['true']").unwrap(),
         ));
         let runner = super::super::task_runtime::OwnedRunner::new(crate::grill::AnyGrill::Process(
             crate::grill::ProcessGrill::new(),

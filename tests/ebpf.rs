@@ -536,8 +536,7 @@ async fn agent_deploy_populates_backend_map() {
     let config = Config::parse(&format!(
         r#"
         [app.{name}]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         port = 8080
     "#
     ))
@@ -621,8 +620,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     let config = Config::parse(&format!(
         r#"
         [app.{name}]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         port = {service_port}
     "#
     ))
@@ -2977,6 +2975,16 @@ fn test_agent<G: reliaburger::grill::Grill + Clone + 'static>(
 ) -> reliaburger::bun::agent::BunAgent<G> {
     let mut agent = reliaburger::bun::agent::BunAgent::new(grill, ports, commands, shutdown);
     agent.set_volumes_dir(volumes.to_path_buf());
+    // The process runtime runs host workloads only (#914), so ProcessGrill
+    // fixtures are `script` apps through `/bin/sh`. A test that needs other
+    // binaries replaces this policy.
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/sh".into()],
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
     agent
 }
 
@@ -5667,7 +5675,7 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     let task = tokio::spawn(async move { agent.run().await });
     let name = root_app_name("publication-refusal", root.path());
     let config = reliaburger::config::Config::parse(&format!(
-        "[app.{name}]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n"
+        "[app.{name}]\nscript = 'exec sleep 60'\nport = 8080\n"
     ))
     .unwrap();
     let (events, mut results) = mpsc::channel(64);
@@ -6098,7 +6106,7 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
     let id = InstanceId(format!("default__{name}-0"));
     let exercise = tokio::time::timeout(Duration::from_secs(12), async {
         let config = reliaburger::config::Config::parse(&format!(
-            "[app.{name}]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n[app.{name}.health]\npath = '/'\nport = {health_port}\ninterval = 1\ntimeout = 1\nthreshold_unhealthy = 1\nthreshold_healthy = 1\n"
+            "[app.{name}]\nscript = 'exec sleep 60'\nport = 8080\n[app.{name}.health]\npath = '/'\nport = {health_port}\ninterval = 1\ntimeout = 1\nthreshold_unhealthy = 1\nthreshold_healthy = 1\n"
         ))?;
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;

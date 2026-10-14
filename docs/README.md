@@ -465,11 +465,13 @@ are stable on consistent hardware.
 ### Portable first run
 
 This path needs no container runtime. Build all binaries first because the
-workload itself is the `testapp` binary:
+workload itself is the `testapp` binary, which the example app runs as a host
+`exec` workload. The example node config allows that binary; start Bun from the
+repository root:
 
 ```sh
 cargo build --bins
-target/debug/bun --runtime process
+target/debug/bun --runtime process --config examples/node/process-runtime.toml
 ```
 
 Leave Bun running. In a second terminal:
@@ -481,9 +483,10 @@ target/debug/relish top
 ```
 
 You should see the `hello` workload in `Running` state. Open
-<http://127.0.0.1:9117/> for the dashboard. ProcessGrill supervises a real OS
-process, but it doesn't isolate it; use Linux runc (through the managed VM on macOS) for container
-workloads.
+<http://127.0.0.1:9117/> for the dashboard. The process runtime supervises a
+real OS process, but it doesn't isolate it, and it runs no images: an app with
+an `image` needs a container runtime. Use Linux runc (through the managed VM on
+macOS) for container workloads.
 
 ### Node agent (bun)
 
@@ -507,8 +510,8 @@ Examples:
 # Start with auto-detected runtime (default)
 cargo run --bin bun
 
-# Force process runtime (no container tools needed)
-cargo run --bin bun -- --runtime process
+# Force process runtime (no container tools needed; host exec/script apps only)
+cargo run --bin bun -- --runtime process --config examples/node/process-runtime.toml
 
 # Use a custom loopback address
 cargo run --bin bun -- --listen 127.0.0.1:9217
@@ -852,15 +855,14 @@ exits 0). For `examples/phase-1/proc-minimal-app.toml`:
 Relish apply plan:
 
   + app.web
-      image     proc-grill:image-ignored
       replicas  1
       port      8080
       health    /healthz
 
   + app.worker
-      image     proc-grill:image-ignored
       replicas  1
-Plan: 2 to create, 0 to update, 0 to destroy.
+Plan: 2 to create, 0 to update, 0 unchanged.
+No live comparison was available; creates are an offline assumption.
 
 (dry run — nothing deployed)
 ```
@@ -977,7 +979,7 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 
 | Example | Demonstrates |
 |---------|-------------|
-| **ProcessGrill** (`proc-*`) | **Runs local processes — no container runtime needed** |
+| **ProcessGrill** (`proc-*`) | **Runs host `exec` apps — no container runtime needed; start Bun with `--config examples/node/process-runtime.toml`** |
 | [`proc-first-run.toml`](../examples/phase-1/proc-first-run.toml) | Collision-free portable first run |
 | [`proc-minimal-app.toml`](../examples/phase-1/proc-minimal-app.toml) | App with health check + worker |
 | [`proc-restarts.toml`](../examples/phase-1/proc-restarts.toml) | App that goes unhealthy and gets restarted |
@@ -986,7 +988,6 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`proc-init-container.toml`](../examples/phase-1/proc-init-container.toml) | App with init container |
 | [`proc-full-featured.toml`](../examples/phase-1/proc-full-featured.toml) | All Phase 1 features |
 | [`proc-multi-app.toml`](../examples/phase-1/proc-multi-app.toml) | Multiple apps in one config |
-| [`proc-volumes.toml`](../examples/phase-1/proc-volumes.toml) | Managed and HostPath volumes |
 | **Real containers** (`container-*`) | **Pulls OCI images — requires Linux runc** |
 | [`container-hello.toml`](../examples/phase-1/container-hello.toml) | Alpine hello world job |
 | [`container-nginx.toml`](../examples/phase-1/container-nginx.toml) | nginx with health check |
@@ -1090,8 +1091,8 @@ that name take `--volume`. `retain` must be at least 1 when `interval_secs` is s
 
 ```toml
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
 
 [app.web.health]
@@ -1100,7 +1101,7 @@ interval = 10
 timeout = 5
 ```
 
-The `image` field is required for the Linux runc runtime but **ignored by ProcessGrill**, which runs the `command` directly as an OS process. ProcessGrill examples use `proc-grill:image-ignored` to make this explicit. If no `command` is set, ProcessGrill falls back to `sleep 86400`.
+An app runs a host binary (`exec`, or an inline `script` through `/bin/sh`) or an `image`. A host app runs on the node itself, and only when the node's `[process_workloads] allowed_binaries` names its binary. An image app needs a container runtime. The process runtime (ProcessGrill) runs host apps only, so it refuses an image app: `relish apply`, `relish status` and `relish wtf` say it `needs a container runtime to run image ...`. In a cluster the scheduler places an image app only on nodes that run containers.
 
 On runc, an image app runs the way Kubernetes would run it. Everything below is optional:
 
@@ -1137,8 +1138,8 @@ An app that serves Prometheus metrics declares where, and every node scrapes its
 
 ```toml
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--port", "8080"]
 port = 8080
 metrics = {}                              # scrape http://<instance>:8080/metrics
 # metrics = { port = 9797, path = "/prom" } # a separate metrics listener
@@ -1152,18 +1153,18 @@ Jobs are run-to-completion tasks. They retry up to 3 times with exponential back
 
 ```toml
 [job.migrate]
-image = "proc-grill:image-ignored"
-command = ["echo", "migration complete"]
+runtime = "process"
+exec = "/bin/echo"
+command = ["migration complete"]
 ```
 
 ### Init containers
 
-Init containers run sequentially before the main app starts. If any init container fails, the app transitions to Failed. Each runs its own `image` (the app's when it names none) with the app's env, secrets and volume and config-file mounts.
+Init containers run sequentially before the main app starts. If any init container fails, the app transitions to Failed. Each runs its own `image` (the app's when it names none) with the app's env, secrets and volume and config-file mounts. An init of an `exec` or `script` app that names no image runs on the host, like its app; one that names an image needs a container runtime.
 
 ```toml
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["sleep", "60"]
+image = "public.ecr.aws/docker/library/redis:8.8.0"
 
 [[app.web.init]]
 command = ["echo", "initialising database"]

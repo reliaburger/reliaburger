@@ -132,6 +132,8 @@ pub struct Compatibility {
 /// A refused launch's `reason` on `/v1/status` instance rows (#881).
 /// The process owner record's `gate`, what the execution gate reported
 /// about its `exec`, and the gate's stdin is now a socket pair (#905).
+/// The capability report's `NodeCapabilities::containers`, and the
+/// `no_container_runtime` unschedulable reason in council state (#914).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

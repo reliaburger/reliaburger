@@ -800,7 +800,7 @@ mod tests {
             app_name: name.to_string(),
             namespace: "default".to_string(),
             instance_id: 0,
-            image: "proc-grill:image-ignored".to_string(),
+            image: "app:v1".to_string(),
             port: None,
             container_state: state,
             consecutive_unhealthy: 0,

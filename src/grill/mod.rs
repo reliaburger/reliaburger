@@ -270,6 +270,18 @@ pub enum LaunchProblem {
     /// The path names a directory, or a file without execute permission.
     #[error("binary not executable: {}", .0.display())]
     BinaryNotExecutable(PathBuf),
+    /// The workload is a container, and this node's runtime runs only host
+    /// processes (`--runtime process`, #914). An image needs a container
+    /// runtime: the process runtime never pulls one, and running the app's
+    /// `command` on the host instead would only pretend to run it.
+    ///
+    /// It carries the image: an app's or an init container's own (or, for
+    /// an app with only a `command`, the root filesystem it would run in).
+    #[error("needs a container runtime to run image {0}, and this node's runtime is process")]
+    NeedsContainerRuntime(String),
+    /// The spec names nothing to execute.
+    #[error("no command to run")]
+    NoCommand,
 }
 
 impl GrillError {
@@ -533,6 +545,11 @@ pub trait Grill: Send + Sync {
     /// Whether recovery can route an original backend without a fallback.
     fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
         self.runtime_kind() == kind
+    }
+    /// Whether this runtime runs containers, which an image app needs
+    /// (#914). The process runtime runs host workloads only.
+    fn runs_containers(&self) -> bool {
+        self.runtime_kind_for_host(false) != records::RuntimeKind::Process
     }
     /// Per-workload enforcement: whether this workload's process will run in
     /// the cgroup its spec names, so the agent can bind policy to it first.

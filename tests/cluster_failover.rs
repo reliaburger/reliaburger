@@ -174,6 +174,7 @@ impl Fixture {
             keep_data_dir: false,
             task_arrays: None,
             task_arrays_on_agent_budget: None,
+            process_only: false,
         })
         .await
     }
@@ -329,8 +330,7 @@ fn nodes_reporting_app(state: &AggregatedState, app: &str) -> usize {
 fn daemonset_spec(command_seconds: u32) -> reliaburger::config::app::AppSpec {
     toml::from_str(&format!(
         r#"
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "{command_seconds}"]
+        script = "exec sleep {command_seconds}"
         replicas = "*"
         "#
     ))
@@ -342,8 +342,7 @@ fn daemonset_spec(command_seconds: u32) -> reliaburger::config::app::AppSpec {
 fn ported_service_spec(name_port: u16) -> reliaburger::config::app::AppSpec {
     toml::from_str(&format!(
         r#"
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
         port = {name_port}
         "#
@@ -512,8 +511,7 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
 fn ingress_service_spec(port: u16, host: &str, extra: &str) -> reliaburger::config::app::AppSpec {
     toml::from_str(&format!(
         r#"
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
         port = {port}
         [ingress]

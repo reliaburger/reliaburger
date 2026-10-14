@@ -3246,8 +3246,7 @@ mod tests {
         config.app.keys().next().cloned().unwrap_or_default()
     }
 
-    const SLOW_APP: &str =
-        "[app.slow]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]";
+    const SLOW_APP: &str = "[app.slow]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]";
 
     /// V02 (#251 follow-up): a placement that had left this node waited for
     /// every deploy of the same cycle, each allowed five minutes, before it
@@ -3331,8 +3330,8 @@ mod tests {
     /// now waits for the allocation instead of spending a deploy on it.
     #[tokio::test]
     async fn a_placement_waits_for_its_committed_allocation_before_deploying() {
-        const WEB: &str = "[app.web]\nimage = \"proc-grill:image-ignored\"\n\
-                           command = [\"sleep\", \"60\"]\nport = 8080";
+        const WEB: &str =
+            "[app.web]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]\nport = 8080";
         let leader = ScriptedLeader::serve(NodeAssignments {
             apps: vec![assigned("web", "default", WEB)],
             ..Default::default()
@@ -3411,8 +3410,8 @@ mod tests {
     /// cluster tests run workers like this, with no scheduler on the leader).
     #[tokio::test]
     async fn a_placement_deploys_at_once_when_the_agent_allocates_locally() {
-        const WEB: &str = "[app.web]\nimage = \"proc-grill:image-ignored\"\n\
-                           command = [\"sleep\", \"60\"]\nport = 8080";
+        const WEB: &str =
+            "[app.web]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]\nport = 8080";
         let leader = ScriptedLeader::serve(NodeAssignments {
             apps: vec![assigned("web", "default", WEB)],
             ..Default::default()
@@ -3443,8 +3442,7 @@ mod tests {
     /// polling while it waits, and retires what those polls say has left.
     #[tokio::test]
     async fn a_released_lease_retires_while_a_deploy_is_still_in_flight() {
-        const LEASED_APP: &str =
-            "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]";
+        const LEASED_APP: &str = "[app.web]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]";
         let leader = ScriptedLeader::serve(NodeAssignments {
             apps: vec![
                 assigned("slow", "default", SLOW_APP),
@@ -3549,11 +3547,9 @@ mod tests {
     /// its return is deployed only once that retirement has answered.
     #[tokio::test]
     async fn a_volume_app_never_has_a_deploy_and_a_retirement_outstanding_at_once() {
-        const VOLUME_APP: &str = "[app.db]\nimage = \"proc-grill:image-ignored\"\n\
-                                  command = [\"sleep\", \"60\"]\n\
+        const VOLUME_APP: &str = "[app.db]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]\n\
                                   [[app.db.volumes]]\npath = \"/data\"\nsize = \"1Gi\"";
-        const VOLUME_APP_V2: &str = "[app.db]\nimage = \"proc-grill:image-ignored\"\n\
-                                     command = [\"sleep\", \"61\"]\n\
+        const VOLUME_APP_V2: &str = "[app.db]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"61\"]\n\
                                      [[app.db.volumes]]\npath = \"/data\"\nsize = \"1Gi\"";
         let leader = ScriptedLeader::serve(NodeAssignments {
             apps: vec![assigned("db", "default", VOLUME_APP)],
@@ -3640,8 +3636,7 @@ mod tests {
     /// start a volume app on a node the leader has already moved it from.
     #[tokio::test]
     async fn a_placement_withdrawn_while_a_deploy_runs_is_not_deployed_from_the_older_answer() {
-        const MOVED_APP: &str = "[app.db]\nimage = \"proc-grill:image-ignored\"\n\
-                                 command = [\"sleep\", \"60\"]\n\
+        const MOVED_APP: &str = "[app.db]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]\n\
                                  [[app.db.volumes]]\npath = \"/data\"\nsize = \"1Gi\"";
         let leader = ScriptedLeader::serve(NodeAssignments {
             apps: vec![
@@ -3701,9 +3696,7 @@ mod tests {
     /// skipped as already converged, and the app ran 2 of 3 replicas for good.
     #[tokio::test]
     async fn a_placement_returning_after_a_failed_retirement_is_deployed_again() {
-        let spec = spec_from_toml(
-            "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
-        );
+        let spec = spec_from_toml("[app.web]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]");
         let assignment = NodeAssignment {
             held: false,
             name: "web".into(),
@@ -3812,7 +3805,7 @@ mod tests {
                 namespace: "default".into(),
                 ordinals: vec![0],
                 spec: spec_from_toml(
-                    "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
+                    "[app.web]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]",
                 ),
             }],
             ..Default::default()
@@ -3924,7 +3917,7 @@ mod tests {
                 namespace: "default".into(),
                 ordinals: vec![0],
                 spec: spec_from_toml(
-                    "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
+                    "[app.web]\nimage = \"app:v1\"\ncommand = [\"sleep\", \"60\"]",
                 ),
             }],
             ..Default::default()
@@ -4233,7 +4226,7 @@ mod tests {
                 ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.broken]
-image = "proc-grill:image-ignored"
+image = "app:v1"
 command = ["false"]
 "#,
                 ),
@@ -4454,7 +4447,7 @@ image = "busybox:latest"
                 ordinals: vec![0],
                 spec: spec_from_toml(
                     r#"[app.interrupted]
-image = "proc-grill:image-ignored"
+image = "app:v1"
 command = ["sleep", "60"]
 namespace = "rbtest-interrupted"
 "#,
@@ -5017,6 +5010,7 @@ image = "busybox:latest"
                 },
                 dns: Default::default(),
                 process: Default::default(),
+                containers: true,
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,
@@ -5063,7 +5057,7 @@ image = "busybox:latest"
             .push(running_app("prod", "payer", 8080, true));
         let capability = crate::reporting::types::NodeCapabilityReport {
             node_id: NodeId::new("unsafe"),
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             egress_enforcement: vec![crate::reporting::types::EgressEnforcementEvidence {
                 app_name: "payer".to_string(),
                 namespace: "prod".to_string(),
@@ -5558,7 +5552,7 @@ image = "busybox:latest"
             allocated: Resources::default(),
             labels,
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -6110,6 +6104,16 @@ image = "busybox:latest"
             reports
                 .readiness
                 .insert(NodeId::new(name), readiness(name, true));
+            reports.capabilities.insert(
+                NodeId::new(name),
+                crate::reporting::types::NodeCapabilityReport {
+                    node_id: NodeId::new(name),
+                    capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
+                    egress_enforcement: Vec::new(),
+                    egress_degraded: false,
+                    egress_affected_workloads: Vec::new(),
+                },
+            );
         }
         reports.receive_deadlines = reports
             .reports
@@ -6555,7 +6559,7 @@ image = "busybox:latest"
                 NodeId::new(name),
                 crate::reporting::types::NodeCapabilityReport {
                     node_id: NodeId::new(name),
-                    capabilities: Default::default(),
+                    capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
                     egress_enforcement: Vec::new(),
                     egress_degraded: false,
                     egress_affected_workloads: Vec::new(),
@@ -7432,7 +7436,7 @@ mod audit_pending_reservations {
             allocated: Resources::default(),
             labels,
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -7493,7 +7497,7 @@ mod audit_daemon_self_reservation {
             allocated: Resources::default(),
             labels,
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -7570,7 +7574,7 @@ mod reconstructed_daemon_reservations {
             allocated: Resources::default(),
             labels: BTreeMap::new(),
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -7655,7 +7659,7 @@ mod audit_placement_revalidation {
             allocated: Resources::default(),
             labels,
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -7790,7 +7794,7 @@ mod revalidation_in_place {
             allocated: Resources::default(),
             labels: BTreeMap::from([("zone".to_string(), zone.to_string())]),
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -7923,6 +7927,16 @@ mod revalidation_in_place {
                     observed_at_unix_ms: 0,
                     subsystems: Vec::new(),
                 },
+            },
+        );
+        reports.capabilities.insert(
+            member.node_id.clone(),
+            crate::reporting::types::NodeCapabilityReport {
+                node_id: member.node_id.clone(),
+                capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
+                egress_enforcement: Vec::new(),
+                egress_degraded: false,
+                egress_affected_workloads: Vec::new(),
             },
         );
         reports.reports.insert(
@@ -8153,7 +8167,7 @@ mod scheduler_policy {
             allocated: Resources::default(),
             labels: BTreeMap::new(),
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -8677,5 +8691,67 @@ mod scheduler_policy {
         );
 
         assert_eq!(nodes_of(&plan.decisions[0]), ["n2"]);
+    }
+
+    /// #914: an image app needs a container runtime. With a process-only
+    /// node and a runc node, it lands on the runc node; with only the
+    /// process node, it's unschedulable and says why, rather than placed
+    /// where the node would refuse it.
+    #[test]
+    fn an_image_app_is_never_placed_on_a_process_only_node() {
+        let app = AppId::new("web", "default");
+        let spec = requesting(100, Replicas::Fixed(1));
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), spec);
+        let process_only = || {
+            let mut node = node("process", 4000);
+            node.capabilities.containers = false;
+            node
+        };
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(process_only());
+        cache.set_node(node("runc", 4000));
+        let members = PassMembers {
+            alive: names(&["process", "runc"]),
+            ..Default::default()
+        };
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+        assert_eq!(nodes_of(&plan.decisions[0]), ["runc"]);
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(process_only());
+        let members = PassMembers {
+            alive: names(&["process"]),
+            ..Default::default()
+        };
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+        assert!(
+            plan.decisions
+                .iter()
+                .all(|decision| decision.placements.is_empty()),
+            "{:?}",
+            plan.decisions
+        );
+        assert_eq!(
+            plan.unschedulable.get(&app),
+            Some(&Unschedulable {
+                placed: 0,
+                wanted: 1,
+                reason: UnplacedReason::NoContainerRuntime,
+            })
+        );
     }
 }

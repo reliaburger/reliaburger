@@ -6,11 +6,14 @@
 # Watch restart_count increment with: relish status
 #
 # Build first:  cargo build
+# Start Bun with the process runtime and the node config that allows
+# testapp, from the repository root:
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
 # Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-restarts.toml
 
 [app.flaky]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "unhealthy-after", "--count", "5", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "unhealthy-after", "--count", "5", "--port", "8080"]
 port = 8080
 
 [app.flaky.health]

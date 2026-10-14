@@ -345,6 +345,7 @@ mod tests {
                     enabled: true,
                     allowed_binaries: vec!["/usr/bin/python3".into()],
                 },
+                containers: true,
             },
             egress_enforcement: vec![EgressEnforcementEvidence {
                 app_name: "web".to_string(),

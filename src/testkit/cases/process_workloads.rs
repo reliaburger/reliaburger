@@ -129,7 +129,7 @@ mod tests {
         let row = |name: &str, state: &str| {
             serde_json::json!({
                 "node": "cluster", "name": name, "namespace": namespace,
-                "instance_id": "run-1", "image": "proc-grill:image-ignored",
+                "instance_id": "run-1", "image": "app:v1",
                 "state": state, "restart_count": 0, "age_seconds": 1,
             })
         };

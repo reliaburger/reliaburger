@@ -14,13 +14,14 @@ fn runtime(directory: &Path) -> ProcessGrill {
     ProcessGrill::with_owner(directory.to_path_buf(), env!("CARGO_BIN_EXE_bun").into())
 }
 
+/// A host workload: the only kind the process runtime runs (#914).
 fn spec(script: &str) -> OciSpec {
     OciSpec {
         reusable_executor: false,
-        host_process: false,
+        host_process: true,
         initialiser: false,
         root: OciRoot {
-            path: "/".into(),
+            path: reliaburger::grill::oci::HOST_ROOT.into(),
             readonly: false,
         },
         process: OciProcess {
@@ -1302,8 +1303,11 @@ async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
 
 /// An agent with a durable process runtime and records under `directory`,
 /// its loop running, and the sender that commands it.
+/// A running agent over the owned process runtime that allows `script`
+/// apps (`/bin/sh`) and `exec` apps of `binaries`.
 fn running_agent(
     directory: &Path,
+    binaries: &[&Path],
 ) -> (
     tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
     tokio_util::sync::CancellationToken,
@@ -1320,6 +1324,15 @@ fn running_agent(
     agent.set_records_dir(directory.to_path_buf());
     agent.set_volumes_dir(directory.join("volumes"));
     agent.set_perimeter_enabled(false);
+    let mut allowed_binaries = vec![std::path::PathBuf::from("/bin/sh")];
+    allowed_binaries.extend(binaries.iter().map(|binary| binary.to_path_buf()));
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries,
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
     let task = tokio::spawn(async move { agent.run().await });
     (sender, shutdown, task)
 }
@@ -1370,13 +1383,12 @@ async fn owners_forgotten(directory: &Path, ids: &[&str]) {
     );
 }
 
-const SLEEPER: &str =
-    "image = 'proc-grill:image-ignored'\ncommand = ['/bin/sh', '-c', 'sleep 60']\n";
+const SLEEPER: &str = "script = 'sleep 60'\n";
 
 #[tokio::test]
 async fn deleting_an_app_removes_the_ownership_journal_of_every_instance() {
     let directory = tempfile::tempdir().unwrap();
-    let (sender, shutdown, task) = running_agent(directory.path());
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
     deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 2\n")).await;
     let ids = ["default__web-0", "default__web-1"];
     assert!(
@@ -1407,7 +1419,7 @@ async fn deleting_an_app_removes_the_ownership_journal_of_every_instance() {
 #[tokio::test]
 async fn deleting_an_app_removes_its_init_containers_journals_and_a_redeploy_runs_its_own() {
     let directory = tempfile::tempdir().unwrap();
-    let (sender, shutdown, task) = running_agent(directory.path());
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
     let app =
         format!("[app.web]\n{SLEEPER}[[app.web.init]]\ncommand = ['/bin/sh', '-c', 'exit 0']\n");
     deploy(&sender, &app).await;
@@ -1459,7 +1471,7 @@ async fn deleting_an_app_removes_its_init_containers_journals_and_a_redeploy_run
 #[tokio::test]
 async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
     let directory = tempfile::tempdir().unwrap();
-    let (sender, shutdown, task) = running_agent(directory.path());
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
     deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 3\n")).await;
     let before = ["default__web-0", "default__web-1", "default__web-2"];
     deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 1\n")).await;
@@ -1478,7 +1490,7 @@ async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
 #[tokio::test]
 async fn restart_adoption_keeps_a_live_instances_journal_and_forgets_a_dead_ones() {
     let directory = tempfile::tempdir().unwrap();
-    let (sender, _shutdown, task) = running_agent(directory.path());
+    let (sender, _shutdown, task) = running_agent(directory.path(), &[]);
     deploy(
         &sender,
         &format!("[app.live]\n{SLEEPER}[app.dead]\n{SLEEPER}"),
@@ -1581,13 +1593,10 @@ async fn a_restart_after_the_binary_vanished_ends_failed_with_binary_not_found()
     // its own file and exits, so the restart finds no binary.
     std::fs::write(&tool, "#!/bin/sh\nsleep 1\nrm -f \"$0\"\nexit 1\n").unwrap();
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let (sender, shutdown, task) = running_agent(directory.path());
+    let (sender, shutdown, task) = running_agent(directory.path(), &[&tool]);
     deploy(
         &sender,
-        &format!(
-            "[app.ghost]\nimage = 'proc-grill:image-ignored'\ncommand = [{:?}]\n",
-            tool.display().to_string()
-        ),
+        &format!("[app.ghost]\nexec = {:?}\n", tool.display().to_string()),
     )
     .await;
 

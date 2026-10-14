@@ -5,8 +5,8 @@ completion (retried up to 3 times with backoff).
 
 ```toml
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
 
 [app.web.health]
@@ -15,12 +15,17 @@ interval = 10             # seconds between probes (default 10)
 timeout = 5               # seconds per probe (default 5)
 ```
 
-ProcessGrill runs `command` directly and ignores `image`; runc pulls `image`
-from a registry and runs it the way Kubernetes would (`command` replaces the
-image's entrypoint, `args` its default arguments). Try it from a source
-checkout, with `bun --runtime process` running:
+An app runs either a host binary (`exec`, or an inline `script`) or an
+`image`. A host app runs on the node itself, and only if the node allows the
+binary in `[process_workloads] allowed_binaries`. An image app needs a
+container runtime: runc pulls `image` from a registry and runs it the way
+Kubernetes would (`command` replaces the image's entrypoint, `args` its default
+arguments). The process runtime (`bun --runtime process`) runs host apps only
+and refuses an image app with `needs a container runtime`. Try it from a
+source checkout, with Bun started from the repository root:
 
 ```sh
+bun --runtime process --config examples/node/process-runtime.toml
 relish apply examples/phase-1/proc-minimal-app.toml
 relish status
 ```
@@ -525,7 +530,8 @@ lost with a worker's disk; accepted aggregate counts remain replicated.
 - Jobs: `examples/phase-1/proc-job-success.toml`,
   `proc-job-failure.toml` (watch the retries)
 - Init containers: `examples/phase-1/proc-init-container.toml`
-- Volumes (managed + host path): `examples/phase-1/proc-volumes.toml`
+- Volumes (managed + host path): `examples/phase-1/container-volumes.toml`
+  (volumes need a container runtime)
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
 - Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
   `relish batch-status <ID> --wait`
