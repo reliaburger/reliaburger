@@ -68,6 +68,15 @@ impl TestHarness {
         );
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // The process runtime runs only host workloads (#914), so fixture apps
+        // are `script` apps through `/bin/sh`.
+        agent.set_process_config(
+            reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                ..Default::default()
+            },
+        );
         // Tests mount host paths from their own temp directories; the
         // managed volumes directory stays off limits, as on a real node.
         agent.set_host_path_policy(reliaburger::bun::host_paths::HostPathPolicy::new(
@@ -253,7 +262,7 @@ impl TestHarness {
         Config::parse(&format!(
             r#"
             [app.testapp]
-            image = "test:v1"
+            script = "exec sleep 86400"
             port = {port}
 
             [app.testapp.health]
@@ -271,7 +280,7 @@ impl TestHarness {
         Config::parse(
             r#"
             [app.worker]
-            image = "test:v1"
+            script = "exec sleep 86400"
         "#,
         )
         .unwrap()

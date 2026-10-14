@@ -93,6 +93,11 @@ volumes = "{root}/volumes"
 registry_bind = "127.0.0.1"
 registry_port = 0
 
+# The process runtime runs host apps only (#914): allow testapp.
+[process_workloads]
+allowed_binaries = ["{testapp}"]
+mount_isolation = false
+
 [upgrades]
 binary_dir = "{bin}"
 external_signing_key = "{external}"
@@ -107,6 +112,7 @@ retain_versions = 3
                 bin = bin_dir.display(),
                 external = encode_public_key(&external_public),
                 release = encode_public_key(&release_public),
+                testapp = env!("CARGO_BIN_EXE_testapp"),
             ),
         )
         .unwrap();
@@ -226,8 +232,8 @@ retain_versions = 3
         let config = format!(
             r#"
 [app.{app}]
-image = "proc-grill:image-ignored"
-command = ["{testapp}", "--mode", "healthy", "--port", "{port}"]
+exec = "{testapp}"
+command = ["--mode", "healthy", "--port", "{port}"]
 "#,
             testapp = env!("CARGO_BIN_EXE_testapp"),
         );

@@ -5613,6 +5613,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-placement-an_image_app_is_never_placed_on_a_process_only_node",
+          "binary": "reliaburger::placement",
+          "test": "an_image_app_is_never_placed_on_a_process_only_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-placement-a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume",
           "binary": "reliaburger::placement",
           "test": "a_stopped_volume_app_starts_again_on_the_node_that_holds_its_volume",

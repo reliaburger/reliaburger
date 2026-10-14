@@ -41,6 +41,15 @@ impl TestHarness {
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // The process runtime runs host workloads only (#914): fixture apps are
+        // `script` apps through `/bin/sh`.
+        agent.set_process_config(
+            reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                ..Default::default()
+            },
+        );
 
         let agent_task = tokio::spawn(async move {
             agent.run().await;
@@ -84,9 +93,8 @@ fn app_with_port_config() -> Config {
     Config::parse(
         r#"
         [app.redis]
-        image = "test:v1"
         port = 6379
-        command = ["sleep", "86400"]
+        script = "exec sleep 86400"
     "#,
     )
     .unwrap()
@@ -96,8 +104,7 @@ fn app_without_port_config() -> Config {
     Config::parse(
         r#"
         [app.worker]
-        image = "test:v1"
-        command = ["sleep", "86400"]
+        script = "exec sleep 86400"
     "#,
     )
     .unwrap()
@@ -107,19 +114,16 @@ fn multi_app_config() -> Config {
     Config::parse(
         r#"
         [app.redis]
-        image = "test:v1"
         port = 6379
-        command = ["sleep", "86400"]
+        script = "exec sleep 86400"
 
         [app.web]
-        image = "test:v1"
         port = 8080
-        command = ["sleep", "86400"]
+        script = "exec sleep 86400"
 
         [app.api]
-        image = "test:v1"
         port = 3000
-        command = ["sleep", "86400"]
+        script = "exec sleep 86400"
     "#,
     )
     .unwrap()

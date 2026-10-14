@@ -1270,18 +1270,28 @@ The `_spec` parameter has a leading underscore. That's Rust telling you the para
 
 ### The `command` field
 
-Both apps and jobs have an optional `command` field in their TOML config:
+Both apps and jobs have an optional `command` field in their TOML config. What it means depends on what the app runs. An app runs either a host binary or an image:
 
 ```toml
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
+
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+command = ["/app/server", "--port", "8080"]
 ```
 
-The `image` field is required by real container runtimes (runc, Apple Container) to know which rootfs to use. But ProcessGrill doesn't pull images. It spawns OS processes. So for ProcessGrill, `command` is what actually matters. If neither `command` nor `image` produces something to run, ProcessGrill falls back to `sleep 86400` as a placeholder.
+For an `exec` app, `command` holds the binary's arguments. For an image app, it overrides the image's `ENTRYPOINT`, the way Kubernetes's `command` field does. The `image` field tells a real container runtime (runc, Apple Container) which root filesystem to use. ProcessGrill doesn't pull images. It spawns OS processes, so it runs `exec` and `script` apps and nothing else.
 
-This split is honest about the difference between development and production. During development, you'll run with ProcessGrill and use `command` to point at local binaries. In production, the OCI image provides the command, and `command` becomes an override (like Kubernetes's `command` field overriding the image's `ENTRYPOINT`).
+It didn't always. In the early iterations we wanted to demo apps before any container runtime was wired up, so ProcessGrill quietly ran an image app's `command` on the host, and `sleep 86400` when there was no command. The examples spelt the image `proc-grill:image-ignored` to make the trick visible. It was handy, and it lied: an app showed as running while its image never ran, and its `command` ran as a host process that no `[process_workloads]` allowlist had approved. In 0.2.1 we took it out (#914). ProcessGrill now refuses an image app before it launches anything:
+
+```text
+instance default__web-0 cannot launch: needs a container runtime to run image nginx:1.27, and this node's runtime is process
+```
+
+A spec with no command at all gets `no command to run` instead of a `sleep`. The examples that relied on the trick became `exec` apps: `examples/phase-1/proc-*` run `target/debug/testapp` as a host binary, and `examples/node/process-runtime.toml` is the node config that allows it.
 
 ### The TestApp binary
 
@@ -1293,7 +1303,7 @@ cargo run --bin testapp -- --mode unhealthy-after --count 5 --port 8080
 cargo run --bin testapp -- --mode slow --delay 3000 --port 8080
 ```
 
-It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1/proc-minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
+It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs run it as an `exec` app, so when you `relish apply examples/phase-1/proc-minimal-app.toml` against a Bun started with `--runtime process --config examples/node/process-runtime.toml`, you get real health checks against a real HTTP server. No containers needed.
 
 ## Health checking: priority queues and state transitions
 

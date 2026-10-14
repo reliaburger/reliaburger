@@ -141,7 +141,7 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 
 Example configs in `examples/phase-N/` use a runtime prefix so it's immediately clear what runtime they target:
 
-- **`proc-*`** — ProcessGrill (runs local processes, no container runtime needed). Uses `proc-grill:image-ignored` as the image name and `target/debug/testapp` or shell commands as the command.
+- **`proc-*`** — ProcessGrill (`--runtime process`; runs local processes, no container runtime needed). Host `exec` or `script` workloads with no `image`: ProcessGrill refuses an image app (#914). Use `exec = "target/debug/testapp"` (arguments in `command`) or an absolute host binary, and start Bun with `--config examples/node/process-runtime.toml` (or a node config whose `[process_workloads] allowed_binaries` names the binary, with `mount_isolation = false`).
 - **`container-*`** — Real OCI images pulled from Docker Hub. Works with runc (`--runtime runc`) or Apple Container (`--runtime apple`).
 - **`apple-*`** — Tests Apple Container-specific features (macOS only).
 - **`runc-*`** — Tests runc-specific features (Linux only).

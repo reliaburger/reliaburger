@@ -517,6 +517,7 @@ mod tests {
                 },
                 dns: Default::default(),
                 process: Default::default(),
+                containers: true,
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,

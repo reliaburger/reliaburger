@@ -119,7 +119,7 @@ mod tests {
             axum::Json(serde_json::json!({
                 "jobs": [{
                     "node": "cluster", "name": name, "namespace": namespace,
-                    "instance_id": "run-7", "image": "proc-grill:image-ignored",
+                    "instance_id": "run-7", "image": "app:v1",
                     "state": state, "restart_count": 0, "age_seconds": 1,
                 }],
                 "warnings": [],

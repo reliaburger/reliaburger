@@ -217,6 +217,9 @@ impl ProcessControl {
                 }
             })
             .await?;
+        if spec.process.args.is_empty() {
+            return Err(io::Error::other("process launch has no command to run"));
+        }
         let spec = spec.clone();
         self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
@@ -685,12 +688,10 @@ impl ProcessControl {
     }
 }
 
+/// What the owner's gate executes: the spec's own arguments. There is no
+/// stand-in for an empty command (#914); `prepare` refuses one.
 fn command(spec: &OciSpec) -> Vec<String> {
-    if spec.process.args.is_empty() {
-        vec!["sleep".into(), "86400".into()]
-    } else {
-        spec.process.args.clone()
-    }
+    spec.process.args.clone()
 }
 
 /// Recorded in full so the exec gate needs nothing from its own environment,

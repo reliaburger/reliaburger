@@ -2575,17 +2575,15 @@ impl StateMachineInner {
                 }
             }
         }
-        self.state.apps.insert(app_id.clone(), spec.clone());
         // A different spec is the operator's answer to a failed rollout
         // (#692, D11-B). The same spec again, a GitOps re-sync say, isn't:
-        // it would only fail the same way.
-        let fingerprint = crate::meat::deploy_types::rollout_fingerprint(spec);
-        if let Some(rollouts) = self.state.rollouts.get_mut(app_id)
-            && rollouts
-                .failed
-                .as_ref()
-                .is_some_and(|failure| failure.fingerprint != fingerprint)
-        {
+        // it would only fail the same way. "Different" means any change,
+        // a scale change included (#929): the version's fingerprint sets
+        // replicas aside, but an operator who changed the spec expects a
+        // new rollout, not the old failure.
+        let identical = self.state.apps.get(app_id) == Some(spec);
+        self.state.apps.insert(app_id.clone(), spec.clone());
+        if !identical && let Some(rollouts) = self.state.rollouts.get_mut(app_id) {
             rollouts.failed = None;
         }
         // Applying an app is how it starts again after `relish stop`.
@@ -3259,20 +3257,53 @@ mod tests {
     #[test]
     fn identical_spec_reapply_keeps_rollout_failed() {
         let (mut inner, app_id) = failed_rollout("web:v2");
-        // A GitOps re-sync applies the very same spec again; so does a
-        // scale change, which isn't a new version.
+        // A GitOps re-sync applies the very same spec again.
         inner.apply_request(&RaftRequest::AppSpec {
             app_id: app_id.clone(),
             spec: web_spec("web:v2"),
         });
+        let failed = inner.state.rollouts[&app_id].failed.clone();
+        assert_eq!(failed, Some(failure_of(&web_spec("web:v2"))));
+    }
+
+    /// #929: a scale change keeps the version, so the mark used to stay,
+    /// and the operator's new apply changed nothing they could see. Any
+    /// change to the spec answers the failure and starts a new rollout.
+    #[test]
+    fn scale_change_clears_rollout_failed() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
         let mut scaled = web_spec("web:v2");
         scaled.replicas = crate::config::Replicas::Fixed(5);
         inner.apply_request(&RaftRequest::AppSpec {
             app_id: app_id.clone(),
             spec: scaled,
         });
-        let failed = inner.state.rollouts[&app_id].failed.clone();
-        assert_eq!(failed, Some(failure_of(&web_spec("web:v2"))));
+        assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    /// #929: once a scale change has cleared the mark, the same version
+    /// can fail again, and is marked again.
+    #[test]
+    fn a_version_that_fails_again_after_a_scale_change_is_marked_again() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        let mut scaled = web_spec("web:v2");
+        scaled.replicas = crate::config::Replicas::Fixed(5);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: scaled.clone(),
+        });
+        let again = crate::meat::deploy_types::RolloutFailure {
+            at_unix_ms: 2,
+            ..failure_of(&scaled)
+        };
+        assert_eq!(
+            inner.apply_request(&RaftRequest::RolloutFailed {
+                app_id: app_id.clone(),
+                failure: again.clone(),
+            }),
+            None
+        );
+        assert_eq!(inner.state.rollouts[&app_id].failed, Some(again));
     }
 
     #[test]
@@ -8369,7 +8400,7 @@ mod tests {
             allocated: crate::meat::Resources::default(),
             labels: Default::default(),
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 0,
             cached_images: Default::default(),

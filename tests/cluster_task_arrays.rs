@@ -117,6 +117,7 @@ async fn start_node(
         keep_data_dir: false,
         task_arrays: Some(service(data)),
         task_arrays_on_agent_budget: None,
+        process_only: false,
     })
     .await
 }
@@ -596,6 +597,7 @@ async fn start_common_node(
             .with_cron_clock(jobs.cron_clock.clone()),
         )),
         task_arrays_on_agent_budget: None,
+        process_only: false,
     })
     .await
 }
@@ -1161,6 +1163,7 @@ async fn start_hung_node(
             Duration::from_secs(3),
         ))),
         task_arrays_on_agent_budget: None,
+        process_only: false,
     })
     .await
 }
@@ -1473,6 +1476,7 @@ async fn shared_budget_node(
             Duration::from_secs(10),
         ))),
         task_arrays_on_agent_budget: build,
+        process_only: false,
     })
     .await
 }
@@ -1570,10 +1574,7 @@ async fn app_replica_lands_on_the_idle_node_while_another_runs_an_array() {
         .write(reliaburger::council::RaftRequest::AppSpec {
             app_id: app.clone(),
             spec: Box::new(
-                toml::from_str(
-                    "image = 'proc-grill:image-ignored'\ncommand = ['sleep', '600']\ncpu = '1000m'\nreplicas = 3",
-                )
-                .unwrap(),
+                toml::from_str("script = 'exec sleep 600'\ncpu = '1000m'\nreplicas = 3").unwrap(),
             ),
         })
         .await

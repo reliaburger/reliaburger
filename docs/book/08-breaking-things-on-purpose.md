@@ -1349,6 +1349,37 @@ reason, so it costs little. Stopping it until the spec changes would need a
 typed signal from the node rather than a match on message text, and we'll add
 that only if the retries turn out to be a nuisance.
 
+The same refusal path took one more problem in 0.2.1 (#914). ProcessGrill used
+to run an image app's `command` on the host, or `sleep 86400` for an app with
+no command, which made an app look healthy while its image never ran. Now an
+image needs a container runtime, and `create` says so before it checks any
+binary:
+
+```rust
+fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
+    use super::LaunchProblem;
+    if !spec.host_process && spec.root.path != super::oci::HOST_ROOT {
+        return Some(LaunchProblem::NeedsContainerRuntime(spec.root.path.clone()));
+    }
+    spec.process
+        .args
+        .is_empty()
+        .then_some(LaunchProblem::NoCommand)
+}
+```
+
+`host_process` is set only for an `exec` or `script` app, so anything else is
+a container. The exception is an init container of a host app that names no
+image of its own: it inherits the app's root, `HOST_ROOT`, and runs on the host
+like its app. The last expression uses `bool::then_some`, which turns `true`
+into `Some(LaunchProblem::NoCommand)` and `false` into `None`, so a spec with
+something to run has no problem. Both new variants ride the `LaunchRefused`
+path above: the deploy fails at once with `needs a container runtime to run
+image nginx:1.27, and this node's runtime is process`, and the instance shows
+`failed` with that reason in `relish status` and `relish wtf`. In a cluster the
+scheduler keeps image apps off such nodes in the first place (see "Finding
+Friends").
+
 ## Batch scheduling
 
 The allocator below explains the original finite-batch design. Public jobs now

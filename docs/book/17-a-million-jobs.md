@@ -1629,10 +1629,10 @@ and nothing would stop a later edit from indexing before the check.
 
 Everything else still gets no route, so recovery refuses it as before. An
 instance both backends claim is conflicting ownership, not a runtime switch.
-An image app that `--runtime process` ran as a host process doesn't fit
-either: the mixed runtime would run it in a container, so it can't adopt that
-execution, and switching such a node from `process` to `mixed` still stops
-Bun (#827). An instance that already has a route keeps it, so running the step
+An image app that `--runtime process` ran as a host process wouldn't fit
+either: the mixed runtime would run it in a container, so it couldn't adopt
+that execution (#827). That case is gone in 0.2.1: the process runtime refuses
+image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists. An instance that already has a route keeps it, so running the step
 on every start changes nothing after the first.
 
 A file lock serialises route changes, and the adapter moves that lock into a

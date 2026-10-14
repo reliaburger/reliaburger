@@ -1934,6 +1934,15 @@ pub fn host_binary(spec: &AppSpec) -> Option<&Path> {
 
 `spec.exec` is an `Option<PathBuf>`, an owned path. `as_deref()` turns that into an `Option<&Path>`, a borrowed view, without copying anything; `PathBuf` is to `Path` what `String` is to `&str`. `or_else` runs its closure only when the first option is `None`, so a `script` app falls back to the interpreter, `/bin/sh`, which is the binary a node actually runs for it. One function answers "which binary does this app need?", so the node's own refusal, placement and (from #701) app validation can't give three different answers.
 
+The opposite constraint came in 0.2.1 (#914). A node on `--runtime process` runs host workloads only and refuses an app that names an image, so placing one there would fail after placement. Each node now reports `containers` in its capabilities, true for runc, Apple Container and the mixed runtime, and an image app needs it:
+
+```rust
+requires_containers: (spec.exec.is_none() && spec.script.is_none())
+    || spec.init.iter().any(|init| init.image.is_some()),
+```
+
+An app with neither `exec` nor `script` runs an image (or, with only a `command`, a root filesystem). An init container that names its own image is a container too, even in front of an `exec` app. `Iterator::any` stops at the first match, like a `for` loop with an early `return true`. The field defaults to `false`, so a node whose capability report hasn't arrived takes no image app. That's the same fail-closed rule DNS and egress follow.
+
 **Phase 2: Score.** Rank the surviving candidates. Spread goes first: a node running fewer replicas of this app always beats one running more. Between nodes running the same number, a weighted sum on a 0–90 scale decides:
 
 | Dimension | Weight | Logic |
@@ -2068,7 +2077,7 @@ pub struct Unplaced {
 
 There's no `Result` here, because a short placement isn't an error the caller can bail out on with `?`. It's an answer with two parts: what we placed, and, if anything is left over, how much and why. Capacity admission still wants all or nothing, so `schedule_app` keeps that contract and turns a non-empty `unplaced` into `NoEligibleNodes`.
 
-`UnplacedReason` is an enum of the hard constraints in filter order: no ready node, no node with the labels, no node that can enforce the app's needs or run its binary, no room. `unplaced_reason` walks the nodes once per constraint and stops at the first that nobody passes, so "no node in zone east" isn't misreported as "no room" just because the east nodes don't exist.
+`UnplacedReason` is an enum of the hard constraints in filter order: no ready node, no node with the labels, no node that runs containers for an image app, no node that can enforce the app's needs or run its binary, no room. `unplaced_reason` walks the nodes once per constraint and stops at the first that nobody passes, so "no node in zone east" isn't misreported as "no room" just because the east nodes don't exist.
 
 The pass keeps every replica that found a node, reservations and all, so the apps planned after it see the room it took. It records `Unschedulable { placed, wanted, reason }` per short app, and the leader writes the set to the council the same way it writes quota blocks: `RaftRequest::Unschedulable`, only when the set changes. `relish status` prints `web (namespace default) is unschedulable: placed 2 of 3 replicas: no node that can run it has room`, `relish inspect` adds an `Unplaced:` line, and `relish wtf` raises an `unschedulable` warning.
 

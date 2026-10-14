@@ -10,9 +10,9 @@
 #               storage.volumes/{namespace}/{app}/{path}.
 #
 # This config is designed for runc (on macOS, the managed Linux VM from
-# `relish setup --quickstart`). On ProcessGrill, apps without a `command`
-# field just sleep. See proc-volumes.toml for a ProcessGrill version
-# that uses testapp.
+# `relish setup --quickstart`). Volumes need a container runtime: the
+# process runtime refuses image apps, and host `exec`/`script` apps can't
+# mount volumes, so there's no process-runtime version of this example.
 #
 # Deploy with a real runtime:
 #   cargo run --bin bun -- --runtime runc

@@ -153,7 +153,7 @@ The page leads with the one-line install now that releases are published;
 building from source is the second path. Update the release-status paragraph
 (version, date and release-notes link) and the install section's release-notes
 link when you promote a release. The source quickstart intentionally matches
-`examples/phase-1/proc-first-run.toml`.
+`examples/phase-1/proc-first-run.toml` and `examples/node/process-runtime.toml`.
 
 `install.sh` is a small HTTPS bootstrap for the versioned release installer.
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where

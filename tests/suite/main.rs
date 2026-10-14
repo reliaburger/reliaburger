@@ -34,6 +34,7 @@ mod bun_startup_exit;
 mod ca_trust_rotation;
 mod cluster_fixtures;
 mod compatibility;
+mod container_runtime_required;
 mod council_persistence;
 mod council_snapshot_install;
 mod council_tcp;
@@ -74,6 +75,7 @@ mod registry_standard_clients;
 mod registry_upload;
 mod relish_cli;
 mod reporting_tree;
+mod rollout_failed;
 #[cfg(target_os = "linux")]
 mod root_teardown;
 mod runtime_executor;

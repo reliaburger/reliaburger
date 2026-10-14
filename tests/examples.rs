@@ -3,6 +3,7 @@
 //! Scenario files (those with `[[step]]` tables) go through
 //! `relish fault scenario --dry-run`; everything else, Kubernetes YAML
 //! included, through `relish apply --dry-run`. Neither needs a running agent.
+//! Node configs under `examples/node/` must parse as `NodeConfig`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,6 +33,17 @@ fn every_example_config_passes_a_dry_run() {
     for config in &configs {
         let contents = std::fs::read_to_string(config).unwrap();
         let path = config.to_str().unwrap();
+        // `examples/node/` holds node configs for `bun --config`, not
+        // workloads: they must parse as one.
+        if config.starts_with(root.join("examples/node")) {
+            if let Err(error) = reliaburger::config::NodeConfig::parse(&contents) {
+                failures.push(format!(
+                    "{}: not a node config: {error}",
+                    config.strip_prefix(root).unwrap().display()
+                ));
+            }
+            continue;
+        }
         let arguments: &[&str] = if contents.lines().any(|line| line.trim() == "[[cohort]]") {
             &["batch", "submit", path, "--dry-run"]
         } else if contents.lines().any(|line| line.trim() == "[[step]]") {

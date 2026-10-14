@@ -2,14 +2,19 @@
 #
 # Init containers run sequentially before the main app starts.
 # If any init container fails, the app transitions to Failed.
-# Here, the init runs "echo" (succeeds), then the main app starts.
+# Here, the init runs "echo" (succeeds), then the main app starts. An init
+# container of an `exec` app that names no image of its own runs on the
+# host, like its app; one with an image needs a container runtime.
 #
 # Build first:  cargo build
+# Start Bun with the process runtime and the node config that allows
+# testapp, from the repository root:
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
 # Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-init-container.toml
 
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
 
 [[app.web.init]]

@@ -1601,7 +1601,7 @@ mod tests {
             std::time::Duration::from_secs(30),
         ));
         let spec: crate::config::job::JobSpec =
-            toml::from_str("image = 'proc-grill:image-ignored'\ncommand = ['true']\n").unwrap();
+            toml::from_str("image = 'app:v1'\ncommand = ['true']\n").unwrap();
         let mut definition = crate::meat::job::JobDefinition::from_spec(spec.clone());
         definition.template.namespace = Some(namespace.into());
         write_standalone(

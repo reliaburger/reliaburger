@@ -1,25 +1,28 @@
-# Full-featured app using most Phase 1 capabilities (ProcessGrill version).
+# Full-featured app using most Phase 1 capabilities (process-runtime version).
 #
 # Demonstrates: replicas, port, health checks, environment variables,
-# volumes, init containers, resource limits, and a one-shot job.
+# init containers, and a one-shot job. Volumes and resource limits need a
+# container runtime, so only container-full-featured.toml shows them.
 #
-# This is the ProcessGrill version — it uses testapp so everything works
-# without a container runtime. See container-full-featured.toml for the real-runtime
-# version with OCI images.
+# This is the process-runtime version: the app runs testapp as a host
+# `exec` workload, so everything works without a container runtime. See
+# container-full-featured.toml for the real-runtime version with OCI images.
 #
 # Build first:
 #   cargo build
+#
+# Start Bun with the process runtime and the node config that allows
+# testapp, from the repository root:
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
 #
 # Deploy with:
 #   cargo run --bin relish -- apply examples/phase-1/proc-full-featured.toml
 
 [app.myapp]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
 replicas = 3
-cpu = "100m-500m"
-memory = "128Mi-512Mi"
 
 [app.myapp.health]
 path = "/healthz"
@@ -33,20 +36,9 @@ DATABASE_URL = "postgres://db:5432/myapp"
 LOG_LEVEL = "info"
 
 # Run database migrations before the app starts.
+# With no image of its own it runs on the host, like its app.
 [[app.myapp.init]]
-image = "proc-grill:image-ignored"
 command = ["echo", "running migrations..."]
-
-# Managed volume for persistent data.
-[[app.myapp.volumes]]
-path = "/data"
-# No `size`: only a root node on Linux can enforce one.
-
-# HostPath volume for shared config. The node mounts it only if its
-# node.toml allows the prefix: [storage] allowed_host_paths = ["/etc/myapp"].
-[[app.myapp.volumes]]
-source = "/etc/myapp"
-path = "/etc/myapp"
 
 # A one-shot migration job that runs independently.
 [job.db-seed]

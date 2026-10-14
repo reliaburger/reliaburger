@@ -89,9 +89,18 @@ mirror, `mirrors` now covers every image you apply.
   a bound image isn't drift; the tag re-resolves when the app changes in Git.
 
 Binding happens only where the leader's own runtime pulls images (runc, or
-Apple containers on a Mac). Under the process runtime an app's `image` is a
-placeholder nobody pulls, so it's stored as written. A cluster runs one
-runtime kind, so the leader's speaks for every node.
+Apple containers on a Mac). A cluster runs one runtime kind, so the leader's
+speaks for every node.
+
+An app that names an `image` needs a container runtime. The process runtime
+(`bun --runtime process`) runs host workloads only, `exec` and `script` apps,
+so it refuses an image app: `relish apply`, `relish status` and `relish wtf`
+say it `needs a container runtime to run image ...`. It doesn't run the app's
+`command` on the host instead, or start a placeholder. In a cluster, the
+scheduler places an image app only on nodes that run containers, and reports
+it unschedulable (`no ready node has a container runtime to run its image`)
+when none does. An init container that names its own image needs one too;
+one that names none runs where its app does.
 
 ## Storage ceiling
 

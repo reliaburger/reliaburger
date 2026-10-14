@@ -414,7 +414,7 @@ mod tests {
             name: name.into(),
             namespace: "default".into(),
             instance_id: format!("{name}-0"),
-            image: "proc-grill:image-ignored".into(),
+            image: "app:v1".into(),
             state: "stopped".into(),
             restart_count: 0,
             age_seconds: 5,
