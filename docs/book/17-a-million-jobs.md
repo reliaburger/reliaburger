@@ -2382,6 +2382,32 @@ stays in the campaign only until it drains (#888). That detail matters: a
 run's results expire after an hour, and by the time anyone looked, the cause
 of that one failure was gone (#889).
 
+Candidate 4 failed 17 times, and three of the causes were the harness again.
+The worst was a list. #909 taught Bun a sixth retry cause, `launch`, for an
+image pull a registry rate-limits, and the controller still summed five. The
+first launch retry made run 2 "not add up" on every poll, so it never drained,
+and that one stuck error failed every settle for the next hour. The cause
+names now live in one Python tuple that validation, the totals and the record
+all read. A test reads the `RetryCauses` struct out of
+`src/meat/task_array_state.rs` and fails when the two disagree, and a summary
+naming a cause the harness has never heard of is refused by that name, not as
+a sum that's mysteriously off (#942).
+
+The other two were the checker asking for things it couldn't have. Light
+checks run every 30 seconds and never ask the guests anything, yet the
+checker demanded a kernel inventory from them outside fault windows. Now only
+settle and heavy checks, which collect one, have to show it (#943). And the
+veth count caught Bun mid-setup: `ip link add` creates the pair with the
+container side still in the host namespace, under a temporary name
+`vtc-<hash>`, and the next command moves it into the task's netns. An
+inventory taken between the two saw one veth too many. The checker now
+computes that name for every owner the job inventory proves live (the same
+wrapping `h * 31 + byte` hash the runtime uses) and excuses it once. A peer
+still there at the next inventory isn't mid-setup any more, so it counts
+(#944). Replaying candidate 4's 408 snapshots through the fixed checker
+removed the light-check inventory findings and the veth findings and changed
+nothing else.
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work
