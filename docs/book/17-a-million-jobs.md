@@ -2983,6 +2983,29 @@ runs a caller through thousands of start-and-vacate cycles on one worker
 thread while another thread samples. It fails if any sample counts more
 commands than callers. Before the fix it failed (#950).
 
+Candidate 6 failed 33 times, and 693 of its 695 settle checks carried the
+same single finding. It was the harness again, and the timing was almost
+comic. Shared-runc run 15 is the fixture that's meant to fail: one task,
+exit 7, two attempts. It finished at about 11:25:29, the same second the
+soak killed Bun on node 1 with `kill -9`, and node 1 held the run's one
+result row. Four seconds later the controller asked the leader for that row.
+The leader couldn't reach node 1, so it listed it under `unreachable`, which
+is exactly what that field is for. The controller treated any unreachable
+node as missing evidence and recorded a permanent "failure result
+incomplete". By the next snapshot, nine seconds on, it had read the row and
+accepted it, but the error stayed, and every recovery for the next three
+hours "didn't settle". The job campaign stops at a fixed time, so with each
+settle eating its full five minutes, no fault reached node 3 before the
+campaign ended. That produced three more "missing coverage" findings.
+
+Now a page that names an unreachable node leaves the run in the campaign,
+and the controller reads it again on the next poll. The run fails only if
+the node is still unreachable after 600 seconds, the soak's longest settle
+budget, and the error then names the node and how long it was out.
+Replaying candidate 6's snapshots through the checker without that error
+turned every one of the 26 settle timeouts into a clean settle within 40
+seconds of its fault (#954).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work
