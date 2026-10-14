@@ -2963,6 +2963,41 @@ impl ExecutorResidue {
             .collect()
     }
 
+    /// The executor slot cgroups those executors still hold, as
+    /// `<namespace>/<app>/<slot>`.
+    fn slot_cgroups(&self) -> Vec<String> {
+        let stems = self.stems();
+        let ours = |app: &str| {
+            stems
+                .iter()
+                .any(|stem| app.starts_with(stem.as_str()) || app == stem.trim_end_matches('-'))
+        };
+        let directories = |path: std::path::PathBuf| {
+            std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        };
+        let mut slots = Vec::new();
+        for namespace in directories("/sys/fs/cgroup/reliaburger".into()) {
+            for app in directories(namespace.path()) {
+                let name = app.file_name().to_string_lossy().into_owned();
+                if !ours(&name) {
+                    continue;
+                }
+                for slot in directories(app.path()) {
+                    slots.push(format!(
+                        "{}/{name}/{}",
+                        namespace.file_name().to_string_lossy(),
+                        slot.file_name().to_string_lossy()
+                    ));
+                }
+            }
+        }
+        slots
+    }
+
     /// Kill the containers, then delete the namespaces, veths and cgroups.
     fn release(&self) {
         let state = self.root.join("state");
@@ -3385,9 +3420,13 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // The lost node's pool, which owned its executors' slot cgroups, is
+    // gone. A restarted Bun's sweep removes the ones it left (#952).
+    lost_runner.forget_retired_executors().await;
     drop(lost_runner);
     // Retirement tears each executor's network down with it (#786).
     assert_eq!(residue.namespaces(), Vec::<String>::new());
+    assert_eq!(residue.slot_cgroups(), Vec::<String>::new());
     shutdown.cancel();
     // Dropping the nodes joins their agent, API and Raft tasks. Each node's
     // leader loop stops by itself once its agent has, after finishing any
