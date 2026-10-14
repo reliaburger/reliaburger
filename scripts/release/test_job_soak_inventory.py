@@ -110,6 +110,41 @@ class Records(unittest.TestCase):
         self.assertIn("0 bytes",str(caught.exception))
 
 
+class Storage(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        (self.root/"a").mkdir(); (self.root/"a"/"f").write_bytes(b"x"*65536)
+        (self.root/"g").write_bytes(b"y"*8192)
+    def test_sizes_a_tree_in_kib_like_du(self):
+        expected=sum(os.lstat(p).st_blocks for p in [self.root,self.root/"a",self.root/"a"/"f",self.root/"g"])*512//1024
+        self.assertEqual(inventory.storage_kb(self.root),expected)
+    def test_a_missing_tree_uses_no_space(self):
+        self.assertEqual(inventory.storage_kb(self.root/"absent"),0)
+    def test_counts_a_hard_linked_file_once(self):
+        before=inventory.storage_kb(self.root)
+        os.link(self.root/"g",self.root/"a"/"g2")
+        self.assertEqual(inventory.storage_kb(self.root),before)
+    def test_an_entry_removed_during_the_walk_is_skipped(self):
+        # Jobs remove files under instances/ while the walk runs (#961).
+        from unittest import mock
+        real=os.lstat
+        def vanishing(path,*args,**kwargs):
+            if str(path).endswith("/g"): raise FileNotFoundError(2,"No such file or directory",str(path))
+            return real(path,*args,**kwargs)
+        with mock.patch.object(inventory.os,"lstat",side_effect=vanishing):
+            self.assertGreater(inventory.storage_kb(self.root),0)
+    def test_other_errors_fail_and_name_the_path(self):
+        from unittest import mock
+        real=os.lstat
+        def denied(path,*args,**kwargs):
+            if str(path).endswith("/f"): raise PermissionError(13,"Permission denied",str(path))
+            return real(path,*args,**kwargs)
+        with mock.patch.object(inventory.os,"lstat",side_effect=denied):
+            with self.assertRaisesRegex(inventory.InvalidInventory,"/a/f"):
+                inventory.storage_kb(self.root)
+
+
 class Collection(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
@@ -122,7 +157,7 @@ class Collection(unittest.TestCase):
         from unittest import mock
         with mock.patch.object(inventory,"kernel",side_effect=kernels), \
              mock.patch.object(inventory,"boot_id",return_value="boot"), \
-             mock.patch.object(inventory,"command",return_value="0\t/unused\n"):
+             mock.patch.object(inventory,"storage_kb",return_value=0):
             return inventory.collect(self.root)
     def test_a_slot_cgroup_without_an_owner_record_is_named_as_such(self):
         # A killed Bun's executor was retired and forgotten, but its slot's
