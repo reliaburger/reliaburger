@@ -112,6 +112,9 @@ pub struct OwnedRunner<G: Grill + Clone> {
     budget: Mutex<std::sync::Arc<super::execution_budget::ExecutionBudget>>,
     slots: Mutex<VecDeque<u32>>,
     prefix: String,
+    /// Where the kernel keeps workload cgroups: the startup sweep looks for
+    /// executor slot groups a previous Bun left behind under it.
+    cgroup_root: std::path::PathBuf,
     singletons: Mutex<BTreeMap<u64, std::sync::Arc<SingletonRuntime>>>,
     /// Fresh-runtime attempts running now, by run: their instance and cgroup,
     /// so the metrics loop can measure them.
@@ -148,6 +151,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             )),
             slots: Mutex::new((0..256).collect()),
             prefix,
+            cgroup_root: crate::grill::cgroup::CGROUP_ROOT.into(),
             singletons: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(BTreeMap::new()),
             available: Notify::new(),
@@ -157,6 +161,13 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             namespace_policy: None,
         }
+    }
+    /// Sweep `root` instead of the kernel's cgroup tree, so a test can stand
+    /// in for it with plain directories.
+    #[cfg(test)]
+    fn with_cgroup_root(mut self, root: &std::path::Path) -> Self {
+        self.cgroup_root = root.to_path_buf();
+        self
     }
     /// Whether this runner can hold `template`'s network policy. An egress
     /// allowlist or `allow_from` needs a container in its own cgroup and the
@@ -420,7 +431,8 @@ impl<G: Grill + Clone> OwnedRunner<G> {
 
     /// Forget the metadata of this node's retired executor identities, and of
     /// runtime routes no launch owns, so a restart reclaims what an
-    /// interrupted retirement kept (#678). Call it before the first task:
+    /// interrupted retirement kept (#678). Then remove the executor slot
+    /// cgroups no launch owns any more (#952). Call it before the first task:
     /// anything unretired or live is skipped and kept. Returns how many
     /// identities were forgotten.
     pub async fn forget_retired_executors(&self) -> usize {
@@ -454,6 +466,38 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         for id in candidates {
             if self.runtime.forget_retired(&id).await.is_ok() {
                 forgotten += 1;
+            }
+        }
+        // A slot's parent group belongs to the pool that ran it, and a killed
+        // Bun's pool died with it. Startup retirement removed the runtime's
+        // own groups beneath it, so each one left is empty, and nothing else
+        // would remove it until a task happened to need that slot again (#952).
+        // Only a complete inventory proves which slots no launch still owns.
+        match self.runtime.launch_inventory().await {
+            Ok(Some(launches)) => {
+                let live = launches
+                    .into_iter()
+                    .map(|launch| launch.instance_id.0)
+                    .collect();
+                let root = self.cgroup_root.clone();
+                let prefix = self.prefix.clone();
+                match tokio::task::spawn_blocking(move || {
+                    remove_vacant_executor_cgroups(&root, &prefix, &live)
+                })
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(removed) => {
+                        eprintln!("bun: removed {removed} vacant executor slot cgroup(s)");
+                    }
+                    Err(error) => {
+                        eprintln!("bun: executor cgroup sweep stopped: {error}");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("bun: executor cgroup sweep: inventory unavailable: {error}");
             }
         }
         forgotten
@@ -1174,6 +1218,69 @@ fn decrypt_template(
     Ok(spec)
 }
 
+/// Remove the slot cgroups of this node's executors (`prefix`) under `root`
+/// that no launch in `live` owns, with their `helper` and `task` leaves.
+/// Returns how many slots it removed.
+///
+/// Only empty groups go: the kernel refuses to remove a cgroup that still
+/// has processes or child groups, so a slot something still uses stays, as
+/// does every group of another Bun's executors or of an app.
+fn remove_vacant_executor_cgroups(
+    root: &std::path::Path,
+    prefix: &str,
+    live: &std::collections::HashSet<String>,
+) -> usize {
+    let apps = [
+        format!("executor-{prefix}"),
+        format!("executor-{prefix}-reuse"),
+        format!("executor-{prefix}-host"),
+    ];
+    // `remove_dir` on a missing path is fine: the slot may have no leaves.
+    let removed = |path: &std::path::Path| match std::fs::remove_dir(path) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let directories = |path: &std::path::Path| {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+    };
+    let mut count = 0;
+    for namespace in directories(root) {
+        let Ok(namespace_name) = namespace.file_name().into_string() else {
+            continue;
+        };
+        for app in &apps {
+            for slot in directories(&namespace.path().join(app)) {
+                // Slot names are canonical decimal ordinals; skip anything else.
+                let Some(ordinal) = slot
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u32>().ok().filter(|n| n.to_string() == name))
+                else {
+                    continue;
+                };
+                let id = crate::grill::InstanceIdentity::new(
+                    namespace_name.as_str(),
+                    app.as_str(),
+                    ordinal,
+                )
+                .instance_id();
+                if live.contains(&id.0) {
+                    continue;
+                }
+                let path = slot.path();
+                if removed(&path.join("task")) && removed(&path.join("helper")) && removed(&path) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1609,5 +1716,93 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(runner.slots.lock().unwrap().len(), 256);
+    }
+
+    /// A runtime launch of `id`, as the startup inventory lists a live executor.
+    fn executor_launch(id: &str) -> crate::grill::RuntimeLaunch {
+        crate::grill::RuntimeLaunch {
+            generation: crate::grill::RuntimeGeneration::process("live"),
+            instance_id: crate::grill::InstanceId(id.into()),
+            spec: serde_json::from_value(serde_json::json!({
+                "root": {"path": "/fixture", "readonly": true},
+                "process": {"args": ["/helper"], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                "mounts": [], "linux": {"namespaces": []}
+            }))
+            .unwrap(),
+            network_reference: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_removes_executor_slot_cgroups_a_killed_bun_left_behind() {
+        // A killed Bun's startup retirement stops its executors and removes
+        // their runtime cgroups, but each slot's parent group belonged to
+        // the dead process's pool. Nothing else removed it until a task
+        // happened to need that slot again, minutes later under a light
+        // load, so the node looked unsettled for that long.
+        let prefix = "ed580d8edc2f1746f4cf3b8ae09e40e1";
+        let root = tempfile::tempdir().unwrap();
+        let slot = |namespace: &str, app: &str, index: &str| {
+            root.path().join(namespace).join(app).join(index)
+        };
+        let reuse = format!("executor-{prefix}-reuse");
+        let host = format!("executor-{prefix}-host");
+        let fresh = format!("executor-{prefix}");
+        // Vacant leftovers: an empty slot, and one with empty leaves.
+        let vacant = [
+            slot("default", &reuse, "3"),
+            slot("default", &host, "2"),
+            slot("tenant-a", &fresh, "17"),
+        ];
+        std::fs::create_dir_all(&vacant[0]).unwrap();
+        std::fs::create_dir_all(vacant[1].join("helper")).unwrap();
+        std::fs::create_dir_all(vacant[1].join("task")).unwrap();
+        std::fs::create_dir_all(&vacant[2]).unwrap();
+        // Kept: a live executor, a group something still holds, another
+        // Bun's executor and an app replica.
+        let live = slot("default", &reuse, "0");
+        std::fs::create_dir_all(&live).unwrap();
+        let busy = slot("default", &reuse, "1");
+        std::fs::create_dir_all(busy.join("helper")).unwrap();
+        std::fs::write(busy.join("helper/cgroup.procs"), "42\n").unwrap();
+        let foreign = slot(
+            "default",
+            "executor-00000000000000000000000000000000-reuse",
+            "2",
+        );
+        std::fs::create_dir_all(&foreign).unwrap();
+        let app = slot("default", "web", "0");
+        std::fs::create_dir_all(&app).unwrap();
+
+        let runtime = crate::grill::mock::MockGrill::new();
+        runtime
+            .set_launch_inventory(vec![executor_launch(&format!(
+                "default__executor-{prefix}-reuse-0"
+            ))])
+            .await;
+        let runner = OwnedRunner::with_prefix(runtime, prefix.into()).with_cgroup_root(root.path());
+        runner.forget_retired_executors().await;
+
+        for path in &vacant {
+            assert!(!path.exists(), "{} was left behind", path.display());
+        }
+        for path in [&live, &busy, &foreign, &app] {
+            assert!(path.exists(), "{} was removed", path.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_keeps_executor_cgroups_without_a_runtime_inventory() {
+        // Without the inventory nothing proves a slot vacant.
+        let prefix = "ed580d8edc2f1746f4cf3b8ae09e40e1";
+        let root = tempfile::tempdir().unwrap();
+        let leftover = root
+            .path()
+            .join(format!("default/executor-{prefix}-reuse/3"));
+        std::fs::create_dir_all(&leftover).unwrap();
+        let runner = OwnedRunner::with_prefix(crate::grill::mock::MockGrill::new(), prefix.into())
+            .with_cgroup_root(root.path());
+        runner.forget_retired_executors().await;
+        assert!(leftover.exists());
     }
 }

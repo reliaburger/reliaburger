@@ -1355,6 +1355,57 @@ the same value but doesn't keep it alive, and `strong_count` says how many
 `Arc`s still do. When that reaches zero the service is gone, and nothing it
 owned can write any more.
 
+That startup sweep missed something, and a soak found it. In the fifth 0.2.0
+candidate, a follower's Bun was killed and took more than five minutes to
+settle, against a budget of 300 seconds (#952). Other follower kills in the
+same run settled in thirty. Every finding on the slow node traced back to one
+empty directory: `default/executor-<prefix>-reuse/3` under the Reliaburger
+cgroup tree. Nothing ran in it, and no runc container, network namespace,
+address lease or intent record existed for that executor.
+
+Here's how it got there. A reusable executor's cgroup has two levels: the
+slot group, and inside it the runtime's `helper` leaf and the pool's `task`
+leaf. The runtime owns the helper, so retiring the container removes it. The
+slot group belongs to the pool, which removes it when it retires the
+executor. Kill Bun and the pool dies with it. The restarted Bun's startup
+retirement stops the old executors and removes everything the runtime owns,
+the startup sweep forgets their records, and the slot group stays where it
+is. It goes only when the new pool starts an executor in that slot and later
+retires it. The pool picks the lowest free slot, so slot 3 is only used when
+four tasks run at once, and under the soak's job load that took anything from
+forty seconds to over five minutes. So the time to settle wasn't creeping up
+from one candidate to the next. It depended on which slot had been left
+behind, and on when the load next needed it.
+
+Raising the budget would have hidden a real leak. The cleanup Bun actually
+has to do takes seconds. The startup sweep now also removes this node's slot
+groups when no launch in a complete runtime inventory owns them:
+
+```rust
+let path = slot.path();
+if removed(&path.join("task")) && removed(&path.join("helper")) && removed(&path) {
+    count += 1;
+}
+```
+
+`removed` is a closure that counts a missing directory as removed. The sweep
+only ever calls `remove_dir`, which is `rmdir`, and the kernel refuses to
+remove a cgroup that still holds processes or child groups. So a slot that's
+somehow still in use stays put, with no extra check needed. Without a
+complete inventory nothing proves a slot vacant, and the sweep leaves them
+all. The unit test stands in for the cgroup tree with plain directories, and
+it failed before the change. The privileged leader-loss test now also checks
+that the lost node leaves no slot groups behind once its sweep has run.
+
+The soak harness made this harder to see than it needed to be. Its inventory
+reported the leftover as `invalid owner JSON`, the same words as #946, which
+we'd read as a torn write. The record wasn't torn. It wasn't there at all.
+The reader wrapped every failure (missing, unsafe, too big) in that one
+message, because its own error type inherits from Python's `ValueError`, and
+that's what the JSON decoder raises too. Now only a record that was read and
+doesn't parse is called invalid JSON, and the message carries its path, size
+and first and last bytes. A slot group with no record says so.
+
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
 secrets catalogue skipped all its container tests. Now the classifier sees the

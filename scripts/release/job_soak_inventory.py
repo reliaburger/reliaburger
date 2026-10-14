@@ -45,8 +45,14 @@ def safe_bytes(path, boundary, uid, limit=1<<20):
 
 
 def safe_json(path, boundary, uid):
-    try: return json.loads(safe_bytes(path, boundary, uid))
-    except (ValueError, UnicodeError) as error: raise InvalidInventory("invalid owner JSON") from error
+    # safe_bytes raises its own reasons (missing, unsafe, too big). Only a
+    # record that was read and doesn't parse is invalid JSON, and its size and
+    # edges say whether it was empty, zero-filled or cut short (#946).
+    value = safe_bytes(path, boundary, uid)
+    try: return json.loads(value)
+    except (ValueError, UnicodeError) as error:
+        raise InvalidInventory("invalid owner JSON in %s: %d bytes, head %r, tail %r"
+                               % (path, len(value), value[:16], value[-16:])) from error
 
 
 def identity_parts(identity, prefix):
@@ -139,16 +145,26 @@ def kernel(root):
     return dict(runc=runc, netns=netns, veth=[v["ifname"] for v in json.loads(links)], cgroup=cgroups, lease=leases)
 
 
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
 def collect(root):
     root = Path(root)
-    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    boot = boot_id()
     prefixpath=root/"batch-executor-id"
     prefix = safe_bytes(prefixpath, root, os.geteuid(), 32).decode() if prefixpath.exists() else None
     errors=[]; owners={}; resources={}
     # A disappearing owner/resource is normal churn. Recheck positive absence;
     # never excuse a still-present kernel object solely because its name fits.
     for attempt in range(3):
-        resources=kernel(root); owners={}; errors=[]
+        # The lease journal is read like an owner record, so it gets the
+        # same bounded retry before an unreadable one fails the scan (#946).
+        try: resources=kernel(root)
+        except InvalidInventory:
+            if attempt==2: raise
+            continue
+        owners={}; errors=[]
         candidates=set(resources["runc"]+resources["lease"])
         journals={}
         for base in (root/"instances/runc/bundles/.intents/records",root/"instances/process-owners"):
@@ -182,7 +198,12 @@ def collect(root):
                 native=root/"instances/process-owners"/identity/"owner.json"
                 container=root/"instances/runc/bundles/.intents/records"/identity/"intent.json"
                 journal=native if native.exists() and (pool=="-host" or not container.exists()) else container
-                record=journals.get(identity,(journal,None))[1] or safe_json(journal,root,os.geteuid())
+                record=journals.get(identity,(journal,None))[1]
+                if record is None:
+                    # Kernel objects with no record at all: say so, rather
+                    # than blame the record for not parsing (#952).
+                    if not journal.exists(): raise InvalidInventory("resources without an owner record")
+                    record=safe_json(journal,root,os.geteuid())
                 proof=owner_proof(record,identity,prefix,boot)
                 if "launch" in record:
                     socketpath=Path("/tmp")/("rbp-"+str(os.geteuid())+"-"+record["nonce"])/"control.sock"
@@ -193,7 +214,10 @@ def collect(root):
                 proof["limits"]={key:(path/key).read_text().strip() for key in ("cpu.max","memory.max")} if path.exists() else {}
                 owners[identity]=proof
             except (InvalidInventory,OSError) as error: errors.append(identity+": "+str(error))
-        current=kernel(root)
+        try: current=kernel(root)
+        except InvalidInventory:
+            if attempt==2: raise
+            continue
         resources={kind:sorted(set(values)&set(current[kind])) for kind,values in resources.items()}
         alive=set(resources["runc"]+resources["lease"]+[n[3:] for n in resources["netns"] if n.startswith("rb-")])
         alive.update(g.split("/")[0]+"__"+g.split("/")[1]+"-"+g.split("/")[2] for g in resources["cgroup"])
