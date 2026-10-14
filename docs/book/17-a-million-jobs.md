@@ -2408,6 +2408,36 @@ still there at the next inventory isn't mid-setup any more, so it counts
 removed the light-check inventory findings and the veth findings and changed
 nothing else.
 
+Candidate 5 failed because of a single poll. This time the product was wrong,
+though no task ran twice. Thirty seconds after the leader was killed, node 3
+reported one verified command and zero callers for a shared-runc run. Only a
+caller can start a command, so the controller refused the summary. The error
+stayed for the rest of the run and failed every settle after it. The node had
+built its answer from samples taken at different moments. First it counted
+the pool slots whose command had started, which takes the pool's slot lock.
+Then it awaited three more samples that take the same lock. Only after those
+did it read the run's `running` counter. The run's commands take a few
+milliseconds, so one could finish in that gap. Its caller vacated the slot
+and decremented the counter, and the next caller hadn't counted itself yet.
+Each number was true when it was read, but not at the same moment.
+
+The fix reads both at the same moment. `ReusablePool::command_activity`
+counts the started commands and loads the callers counter in one hold of the
+slot lock. The counter is a plain `AtomicU64` updated with
+`Ordering::Relaxed`, which on its own promises nothing about the order of any
+other memory access, so the lock has to supply the ordering. A caller
+increments the counter before it takes the lock to check a slot out. It
+decrements it only after it has taken the lock again to vacate that slot.
+Suppose the sampler holds the lock and sees a slot's command running. That
+caller's increment has already happened, because it came before the caller's
+earlier hold of the lock. Its decrement can't have happened yet, because it
+comes after the caller's next hold. This is the C++ memory model, which Rust's
+atomics follow: releasing a mutex *synchronises with* the next acquire, and
+that edge carries every write made before it, relaxed or not. A unit test
+runs a caller through thousands of start-and-vacate cycles on one worker
+thread while another thread samples. It fails if any sample counts more
+commands than callers. Before the fix it failed (#950).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work

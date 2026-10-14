@@ -257,6 +257,17 @@ impl TaskRunner for NodeRunner {
             Self::Process(_) | Self::Fake(_) => None,
         }
     }
+    async fn command_activity(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+        callers: &std::sync::atomic::AtomicU64,
+    ) -> Option<super::task_executor::CommandActivity> {
+        match self {
+            Self::Owned(runner) => runner.command_activity(batch_id, template, callers).await,
+            Self::Process(_) | Self::Fake(_) => None,
+        }
+    }
     async fn busy_slots(
         &self,
         batch_id: u64,
@@ -986,10 +997,23 @@ impl TaskArrayNode {
             );
         }
         let counters = run.pool.counters();
-        let active_commands = self
+        // The active commands and the callers come from one sample: read
+        // apart, with the awaits below between them, a millisecond command
+        // could finish in the gap and the node would report a verified
+        // command with no caller (V02 candidate 5).
+        let activity = self
             .runner
-            .active_commands(assignment.batch_id, assignment.template.as_deref())
+            .command_activity(
+                assignment.batch_id,
+                assignment.template.as_deref(),
+                &counters.running,
+            )
             .await;
+        let active_commands = activity.map(|sample| sample.active);
+        let callers = activity.map_or_else(
+            || counters.running.load(Ordering::Relaxed),
+            |sample| sample.callers,
+        );
         let busy_slots = self
             .runner
             .busy_slots(assignment.batch_id, assignment.template.as_deref())
@@ -1007,9 +1031,7 @@ impl TaskArrayNode {
                 failed: counters.failed.load(Ordering::Relaxed),
                 retried: counters.retried.load(Ordering::Relaxed),
             },
-            busy_slots
-                .or(active_commands)
-                .unwrap_or_else(|| counters.running.load(Ordering::Relaxed)),
+            busy_slots.or(active_commands).unwrap_or(callers),
             usage_targets,
         );
         ArrayProgress {
@@ -1046,7 +1068,7 @@ impl TaskArrayNode {
                 // commands that begin and end between samples.
                 let busy = match (reusable, busy_slots) {
                     (Some(_), Some(held)) => held,
-                    _ => counters.running.load(Ordering::Relaxed),
+                    _ => callers,
                 };
                 cap.min(u32::try_from(fits).unwrap_or(u32::MAX))
                     .saturating_add(u32::try_from(busy).unwrap_or(u32::MAX))
@@ -1056,7 +1078,7 @@ impl TaskArrayNode {
             unrunnable: false,
             finished,
             counters: NodeArrayCounters {
-                running: counters.running.load(Ordering::Relaxed),
+                running: callers,
                 active_commands,
                 attempts_started: counters.attempts_started.load(Ordering::Relaxed),
                 succeeded: counters.succeeded.load(Ordering::Relaxed),
