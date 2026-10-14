@@ -906,7 +906,64 @@ let ctx = tokio::task::spawn_blocking(move || {
 
 A `Semaphore` is a counter of permits: `acquire()` waits until one is free, and the permit is released when it drops. We hand it to the blocking closure so it's held for exactly the hashing and no longer. `spawn_blocking` moves CPU-heavy work off the async runtime's worker threads onto a dedicated pool; running Argon2 directly on an async task would stall every other task sharing that thread. Now a burst of bad bearers is turned away by a string check, the few that get through hash off-lock and at most four at a time, and an honest caller's request isn't stuck behind anyone's brute-force attempt.
 
-That held until 0.2.1, when we asked why the hash was slow at all. Chapter 4's "Token validation" tells that story: our tokens are 256 random bits, not passwords, so Argon2id bought no security and cost every request tens of milliseconds and about 19 MiB. With SHA-256 in its place a verification takes microseconds, which is less than the semaphore and the thread hop cost on their own, so both went (#912). `authenticate` checks the shape, hashes once and compares digests inline on the request's own task. Two of the three changes stayed: the middleware still clones the token list out from under the read lock (the handler it calls next can be slow, even if the hash isn't), and the shape check still turns junk away before any hashing.
+### Don't let the hash keep its memory
+
+The permits bound how much Argon2 runs at once. They said nothing about what it leaves behind, and a release soak found that out for us.
+
+In the 0.2.0 candidate 4 soak, node 1's Bun sat between 870 MB and 1.13 GB on a 2 GiB VM, and `memory_high` fired. Node 1 serves the API, so every `curl` from the job controller and every `relish` call from the harness lands there, and each one carries a bearer token. Its peers, which serve no API, sat near 200 MB. The soak records Bun's RSS every 13 seconds or so, and the numbers had a strange shape: from one sample to the next, RSS moved by 19,400 KB, or 38,900, or 58,300, or 97,100. Nearly every change was a whole multiple of 19,456 KiB. That's 19 MiB, the `m_cost` of `Argon2::default()`: one Argon2id hash fills nineteen thousand 1 KiB blocks.
+
+So the memory was Argon2's working space, and it wasn't going back. The `argon2` crate allocates those blocks with `vec!`, so they come from the process's allocator, which is glibc's `malloc`. Two things in glibc keep them:
+
+- **Arenas.** glibc gives threads separate heaps (arenas, up to eight per CPU, so sixteen on a two-CPU VM) so they don't fight over one lock. A thread that allocates gets an arena and keeps it. Our hashes run on Tokio's blocking pool, whose threads start when there's work and exit after ten idle seconds, so over an hour the hashes visit every arena. A freed block goes back to its own arena, not to the kernel, and the next small allocation that lands in the middle of it pins it there.
+- **The sliding mmap threshold.** glibc serves a large allocation (128 KiB and up, at first) with its own `mmap` and unmaps it on `free`. But when it frees one of those, it raises the threshold to that size, on the theory that the program will ask again. After the first hash, every later 19 MiB request comes from an arena, and glibc only gives the top of an arena back to the kernel once more than twice the threshold (38 MiB) is free there.
+
+None of this is a leak. Every byte is freed, and a heap profiler would show nothing live. The allocator just keeps it.
+
+The fix takes Argon2's memory away from the allocator altogether. The crate has a second entry point, `hash_password_into_with_memory`, that hashes into blocks you hand it. We hand it a private anonymous mapping of our own, and unmap it the moment the hash is done:
+
+```rust
+struct WorkingMemory {
+    map: memmap2::MmapMut,
+    blocks: usize,
+}
+
+impl WorkingMemory {
+    fn new(blocks: usize) -> std::io::Result<Self> {
+        let bytes = blocks.checked_mul(Block::SIZE).ok_or_else(/* … */)?;
+        let map = memmap2::MmapOptions::new().len(bytes).map_anon()?;
+        Ok(Self { map, blocks })
+    }
+
+    fn blocks(&mut self) -> &mut [Block] {
+        // SAFETY: page-aligned, exactly `blocks * Block::SIZE` bytes, and
+        // zero bytes are a valid `Block` (128 `u64`s).
+        unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr().cast::<Block>(), self.blocks) }
+    }
+}
+```
+
+`map_anon` asks the kernel for fresh, zero-filled pages that belong to no file. When a `WorkingMemory` drops, `MmapMut`'s own `Drop` calls `munmap`, and the pages go straight back to the kernel: no arena, no threshold, nothing for glibc to hold on to.
+
+The `unsafe` block turns raw bytes into a Rust type, so it deserves a closer look. `std::slice::from_raw_parts_mut` builds a `&mut [Block]` from a pointer and a length, and the compiler can't check either. We have to promise four things ourselves. The pointer is aligned for `Block`: a page is aligned to at least 4 KiB, and a `Block` needs 64 bytes. The memory really holds that many `Block`s: we mapped `blocks * Block::SIZE` bytes, and two `const` assertions check `Block`'s size and alignment at compile time. Every bit pattern in it is a valid `Block`: a block is just 128 `u64`s, and the zero page is exactly `Block::new()`. And nothing else touches that memory while the slice exists. That last one the borrow checker does for us: `blocks` takes `&mut self`, so the slice borrows the mapping and can't outlive it or alias it.
+
+Verifying a bearer and minting a token both go through one helper, `hash_off_heap`. Verification reads the variant, version, cost and salt from the stored hash, as the crate's own `verify_password` does, and compares the result with `password_hash::Output`'s `==`, which runs in constant time. A hash the crate made still verifies, a hash we mint still verifies with the crate, and a hash with other parameters verifies with its own. Unit tests pin all three, because a hand-rolled verifier that quietly accepted the wrong thing would be far worse than a fat heap.
+
+`tests/auth_memory.rs` is the test we wrote first. Like the upgrade and connection memory tests, it's a binary with a counting global allocator, so it sees every heap byte the check asks for. Checking a bearer against three stored tokens peaked at 19,922,944 heap bytes before the fix: one Argon2 block array, 19,456 KiB to the byte. After it, the same check stays under a 1 MiB ceiling, and so do refusing a wrong secret and minting a token.
+
+A heap test proves the bytes left the heap. It can't prove RSS, so we reproduced the soak in a two-CPU, 2 GiB Lima VM with swap off: one Bun, six job runs of the soak's calibration mix (262,144-task arrays and 512-task long runs on the process runtime), and the soak's request mix, each request a fresh `curl` through a forwarder that holds the connection open until Bun's idle timeout, as Lima's does. Thirty minutes, with a Bun restart at ten:
+
+| Load | Bun | Before: median RSS | Before: peak | After: median RSS | After: peak |
+|---|---|---|---|---|---|
+| The soak's mix | first | 506 MiB | 639 MiB | 154 MiB | 230 MiB |
+| The soak's mix | after the restart | 437 MiB | 578 MiB | 171 MiB | 247 MiB |
+| Three times the mix (20 minutes, restart at five) | first | 564 MiB | 621 MiB | 219 MiB | 265 MiB |
+| Three times the mix | after the restart | 507 MiB | 582 MiB | 221 MiB | 297 MiB |
+
+Before the fix, 133 of the 158 RSS changes bigger than 5 MB in the first run were whole multiples of 19,456 KiB, the soak's signature reproduced. After it, the peaks are the four permits' mappings coming and going while hashes run, and RSS falls back as soon as they finish. The `memory_high` line, 70% of 2 GiB, is 1,434 MiB; the worst we saw after the fix is about a fifth of that. Our forwarder held 100 to 200 connections against the soak's 200 to 430, so the soak's own numbers will be higher, which is why the next soak, not this table, gets the last word.
+
+Argon2 itself didn't change. A hash still needs 19 MiB while it runs, and the four permits still bound that at 76 MiB at once. The difference is that the 19 MiB goes back when the hash is done.
+
+All of this held until 0.2.1, when we asked why the hash was slow at all. Chapter 4's "Token validation" tells that story: our tokens are 256 random bits, not passwords, so Argon2id bought no security and cost every request tens of milliseconds and about 19 MiB. With SHA-256 in its place a verification takes microseconds, which is less than the semaphore and the thread hop cost on their own, so both went (#912), and `WorkingMemory` and `tests/auth_memory.rs` with them: SHA-256 has no working memory to give back. `authenticate` checks the shape, hashes once and compares digests inline on the request's own task. Two of the three changes stayed: the middleware still clones the token list out from under the read lock (the handler it calls next can be slow, even if the hash isn't), and the shape check still turns junk away before any hashing.
 
 ### Escaping for the context you're in
 
@@ -1717,6 +1774,8 @@ Why 12 bytes? Our tries are per-cgroup, so the key data is the cgroup id (8 byte
 Ports don't prefix-match, so they live in the value: a fixed array of up to eight allowed ports the hook scans (a BPF-friendly bounded loop). And longest-prefix matching has a sharp edge — with `10.0.0.0/8:443` and `10.1.0.0/16:80` both configured, a connect to `10.1.2.3:443` matches only the more specific /16 entry and would be denied, even though the /8 allows it. Userspace fixes this at programming time: `merge_cidr_ports` folds the ports of every enclosing prefix into each more specific entry, so the single entry the trie returns carries the union. It's a pure function, tested on macOS; more than eight merged ports on one prefix is a config error, reported at deploy time rather than mis-enforced at runtime.
 
 The parser grew the matching syntax: `10.0.0.0/8:443` and `[2001:db8::/32]:443`, prefix lengths bounds-checked per family. A network address with host bits set (`10.1.2.3/8`) is rejected with the normalised form in the error message — silently reinterpreting a typo'd firewall rule is how you allow things nobody asked for.
+
+The Lima test for all this allows `127.0.0.0/8` on one port and checks that a second listener, inside the same /8 on another port, is refused. It later failed once in CI: the "unlisted" connection went through. Was the trie leaking ports? No. The test bound its listeners on `127.0.0.5:0` and `127.0.0.6:0`, and port 0 means "kernel, pick one". The kernel picks per address, so nothing stops it handing both listeners the same number. In the Lima VM that happened once in 20,000 pairs of binds. When it does, the rule really does allow the second connection, and the hook is right to let it through. Bind the second listener on the allowed port on purpose and the one-in-thousands failure becomes five out of five. The fix belongs in the test: `listener_avoiding_port` binds again if it gets the port to avoid, and it keeps the colliding listener open while it does, so the kernel can't hand out the same port twice. A test that depends on "a different port" has to make sure the port is different. It can't leave that to the kernel.
 
 ### Closing the start window
 

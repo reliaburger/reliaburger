@@ -69,6 +69,49 @@ async fn timed_out_command_retains_authority_until_explicit_retirement() {
     );
 }
 
+/// Retirement kills a shell whose descendants it is waiting for, so the
+/// shell must never record the ordinary exit it would make once they die.
+/// macOS signals a process group one member at a time, newest first: a
+/// group kill reaches the shell's children before the shell itself, and the
+/// shell can run `exit 0` in between (#916). Many older siblings widen that
+/// window: before the fix about one round in thirteen recorded `Some(0)`.
+#[tokio::test]
+async fn retirement_records_a_shell_waiting_on_killed_children_as_killed() {
+    for round in 0..30 {
+        let root = tempfile::tempdir().unwrap();
+        let owner = commands(root.path());
+        let ready = root.path().join("ready");
+        let script = format!(
+            "i=0; while [ $i -lt 400 ]; do sleep 60 & i=$((i+1)); done; \
+             sleep 60 & touch '{}'; wait $!; exit 0",
+            ready.display()
+        );
+        let id = owner
+            .prepare(
+                Path::new("/bin/sh"),
+                &["-c".into(), script],
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        owner.start(&id).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "shell never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        owner.retire(&id, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            owner.state(&id).await.unwrap(),
+            CommandState::Retired { exit_code: None },
+            "round {round}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn prepared_command_can_be_retired_without_ever_executing() {
     let root = tempfile::tempdir().unwrap();

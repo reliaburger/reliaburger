@@ -292,6 +292,29 @@ impl GrillError {
             _ => None,
         }
     }
+
+    /// Whether this error says the workload's spec can't run as written,
+    /// so another launch would fail the same way: a launch the runtime
+    /// refused (a missing or unexecutable binary, nothing to run, or an image
+    /// on a node whose runtime runs only host processes), an image reference
+    /// that doesn't parse, or an image whose digest-verified config is
+    /// invalid.
+    ///
+    /// Every other error is the runtime, the host or a registry failing
+    /// (a pull, a runc call, disk, network setup), which a later attempt
+    /// may get past. When it isn't clear which, the answer is `false`: a
+    /// launch that never ran its command is safe to retry, and the retry
+    /// is bounded by the job's `max_attempts` (#889).
+    pub fn refuses_spec(&self) -> bool {
+        matches!(
+            self,
+            Self::LaunchRefused { .. }
+                | Self::ImagePull(
+                    image::ImageError::InvalidReference(_)
+                        | image::ImageError::InvalidConfig { .. }
+                )
+        )
+    }
 }
 
 /// Non-secret identity of one original runtime execution generation.
@@ -1200,6 +1223,67 @@ async fn which_exists(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_unusable_spec_refuses_a_launch() {
+        use super::image::ImageError;
+        let instance = InstanceId("default__job-0".into());
+        let refused = |problem| GrillError::LaunchRefused {
+            instance: instance.clone(),
+            problem,
+        };
+        let refusals = [
+            GrillError::ImagePull(ImageError::InvalidReference("no tag".into())),
+            GrillError::ImagePull(ImageError::InvalidConfig {
+                digest: "sha256:00".into(),
+                reason: "not JSON".into(),
+            }),
+            // The runtime's own launch refusals (#881, #914) are the spec's
+            // fault too, so a task is refused rather than retried (#889).
+            refused(LaunchProblem::BinaryNotFound("/missing".into())),
+            refused(LaunchProblem::BinaryNotExecutable("/etc".into())),
+            refused(LaunchProblem::NeedsContainerRuntime("busybox:1.36".into())),
+            refused(LaunchProblem::NoCommand),
+        ];
+        for error in &refusals {
+            assert!(error.refuses_spec(), "{error}");
+        }
+        let transient = [
+            GrillError::ImagePull(ImageError::ManifestPull {
+                image: "busybox".into(),
+                reason: "registry leader refused proposal: 503 Service Unavailable".into(),
+            }),
+            GrillError::ImagePull(ImageError::LayerPull {
+                digest: "sha256:00".into(),
+                reason: "connection reset".into(),
+            }),
+            GrillError::ImagePull(ImageError::DigestMismatch {
+                digest: "sha256:00".into(),
+                expected: "a".into(),
+                actual: "b".into(),
+            }),
+            GrillError::ImagePull(ImageError::UnpackFailed {
+                digest: "sha256:00".into(),
+                reason: "No space left on device".into(),
+            }),
+            GrillError::ImagePull(ImageError::Io(std::io::Error::other("disk"))),
+            GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "runc create: exit status 1".into(),
+            },
+            GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "runtime command did not finish within 5s".into(),
+            },
+            GrillError::InventoryUnavailable {
+                reason: "journal unreadable".into(),
+            },
+            GrillError::NotFound { instance },
+        ];
+        for error in &transient {
+            assert!(!error.refuses_spec(), "{error}");
+        }
+    }
+
     #[test]
     fn runtime_generation_wire_values_require_canonical_fingerprints() {
         let original = RuntimeGeneration::process("private-generation");

@@ -59,6 +59,8 @@ FD_RISES = 3
 FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
+# Snapshot kinds that collect the guest inventories (collect in qualify-sustained.sh).
+INVENTORY_KINDS = ("settle", "heavy")
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
 # The agent loop's turn budget (docs/plans/2026-09-30-agent-loop-review.md,
 # decision 1): a tier fails if any node runs one turn longer than this. Bun
@@ -250,11 +252,16 @@ def rotation_findings(state, node, rotation_state, now):
     return []
 
 
-def leak_findings(baseline, current, baseline_instances, current_instances, node, job_inventory=None):
-    """Resources beyond the baseline plus the node's current instances."""
+def leak_findings(baseline, current, baseline_instances, current_instances, node, job_inventory=None,
+                  lingering=()):
+    """Resources beyond the baseline plus the node's current instances.
+
+    A live job owner's temporary setup peer (`vtc-<hash>`) is excused, unless
+    it is in `lingering`: present in the previous inventory too (#944)."""
     findings = []
     if job_inventory is not None:
         owned = job_soak_inventory.exemptions(job_inventory)
+        owned["veth"] |= owned["setup_peer"] - set(lingering)
         # Compare the reconciled kernel snapshot with exact live owner proofs.
         current = dict(current, **{kind:[v for v in values if v not in owned[kind]]
                                   for kind,values in job_inventory["resources"].items()})
@@ -517,6 +524,18 @@ def job_findings(evidence, snapshot, now, fault_window):
     return [finding("jobs", "fail", item) for item in problems]
 
 
+def collection_end(snapshot, meta, now):
+    """When the harness finished collecting `snapshot`: meta.json's
+    `collected`, or for a snapshot from before it was recorded, when its last
+    collected file was written. The guests are asked after meta.json's `ts`,
+    so their evidence is stamped between the two."""
+    if type(meta.get("collected")) is int:
+        return meta["collected"]
+    written = [path.stat().st_mtime for path in Path(snapshot).iterdir()
+               if path.name not in ("meta.json", "verdict.json", "findings.txt")]
+    return max(now, int(max(written))) if written else now
+
+
 def evaluate(evidence, snapshot):
     state = load_state(evidence)
     meta = read_json(snapshot, "meta.json") or {}
@@ -636,7 +655,8 @@ def evaluate(evidence, snapshot):
             if jobs_enabled:
                 text=read(snapshot,f"jobs-{node}.txt")
                 try:
-                    owned=job_soak_inventory.validate(json.loads(text) if text else None,now,(inventory.get("boot") or [None])[0])
+                    owned=job_soak_inventory.validate(json.loads(text) if text else None,now,(inventory.get("boot") or [None])[0],
+                                                      collection_end(snapshot,meta,now))
                     # Refuse a forged proof even when there are no app instances.
                     job_soak_inventory.exemptions(owned)
                     usage=state.setdefault("job_resources",{}).setdefault(node,{})
@@ -650,10 +670,15 @@ def evaluate(evidence, snapshot):
                 except (job_soak_inventory.InvalidInventory,ValueError,KeyError,TypeError) as error:
                     problem=finding("job-inventory","info" if fault_window else "fail",str(error),node)
                     job_problems.append(problem); findings.append(problem)
+            lingering=state.get("setup_peers",{}).get(node,[])
+            if owned is not None:
+                # A setup peer lasts milliseconds; one seen by two inventories leaked.
+                state.setdefault("setup_peers",{})[node]=sorted(v for v in owned["resources"].get("veth",[]) if v.startswith("vtc-"))
             if by_node is not None and node in baseline:
                 leaks += leak_findings(baseline[node]["inventory"], inventory,
-                                       baseline[node]["instances"], by_node.get(node, []), node,owned)
-        elif jobs_enabled and not fault_window:
+                                       baseline[node]["instances"], by_node.get(node, []), node,owned,lingering)
+        elif jobs_enabled and not fault_window and meta.get("kind") in INVENTORY_KINDS:
+            # Light snapshots don't collect guest inventories (#943).
             problem=finding("job-inventory","fail","kernel/storage inventory missing",node)
             job_problems.append(problem); findings.append(problem)
         text = read(snapshot, f"export-{node}.txt")

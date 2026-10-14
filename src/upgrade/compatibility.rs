@@ -52,39 +52,35 @@ impl std::fmt::Display for QueryProgress {
     }
 }
 
-/// A private, executable copy of a candidate binary, written for one
-/// compatibility query. Dropping it deletes the file.
+/// A private, executable copy of a candidate binary, for one compatibility
+/// query. Dropping it deletes the file.
 pub(super) struct Probe(tempfile::TempPath);
 
-/// Write a private copy of verified bytes that [`query_probe`] can run.
-///
-/// This writes the whole binary, so it blocks: call it on the blocking
-/// pool, next to the signature check that read the same bytes (#794). A
-/// private copy keeps the probe independent of a mutable download path.
-pub(super) fn write_probe(bytes: &[u8], directory: &Path) -> Result<Probe, UpgradeError> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(directory)?;
-    let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    file.write_all(bytes)?;
-    file.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o700))?;
-    // Close the writable file before exec (Linux refuses ETXTBSY otherwise).
-    Ok(Probe(file.into_temp_path()))
+impl Probe {
+    /// Wrap a private executable file that has been signature-checked.
+    pub(super) fn new(path: tempfile::TempPath) -> Self {
+        Self(path)
+    }
+
+    /// The file, to stage once the query has passed.
+    pub(super) fn into_temp_path(self) -> tempfile::TempPath {
+        self.0
+    }
 }
 
-/// Run a probe whose bytes were signature-checked before it was written,
-/// and check that it reads and writes this build's formats.
-///
-/// The probe is deleted afterwards on the blocking pool: unlinking a
+/// Run a probe whose bytes were signature-checked before it was handed
+/// over, and check that it reads and writes this build's formats.
+pub(super) async fn query_probe(probe: &Probe) -> Result<(), UpgradeError> {
+    query(&probe.0).await
+}
+
+/// Delete a probe that won't be staged, on the blocking pool: unlinking a
 /// release-sized file frees all of its pages, which on a busy disk took
 /// longer than a Raft heartbeat on the caller's worker (#794).
-pub(super) async fn query_probe(probe: Probe) -> Result<(), UpgradeError> {
-    let answer = query(&probe.0).await;
+pub(super) async fn discard_probe(probe: Probe) {
     // A delete that fails leaves a stray temporary file behind, as
-    // `TempPath`'s own drop would; the answer is what the caller needs.
+    // `TempPath`'s own drop would; the caller has its answer already.
     let _ = tokio::task::spawn_blocking(move || probe.0.close()).await;
-    answer
 }
 
 /// Ask the executable at `executable` which formats it uses.
@@ -241,8 +237,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
         let script = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n");
-        let probe = write_probe(script.as_bytes(), directory.path()).unwrap();
-        let mut command = tokio::process::Command::new(&probe.0);
+        let probe = directory.path().join("probe");
+        std::fs::write(&probe, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut command = tokio::process::Command::new(&probe);
         command
             .arg("--compatibility")
             .stdin(std::process::Stdio::null())

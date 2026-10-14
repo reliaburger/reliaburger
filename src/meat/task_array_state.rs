@@ -98,6 +98,9 @@ pub struct RetryCauses {
     pub timeout: u64,
     /// The attempt's exit status couldn't be established (replayable work).
     pub unknown: u64,
+    /// The runtime, host or a registry failed before the command ran, for
+    /// example an image pull during registry churn (#889).
+    pub launch: u64,
     /// Read back from a node's ledger after a restart, which keeps attempt
     /// counts but not why the earlier attempts failed.
     pub unrecorded: u64,
@@ -106,9 +109,15 @@ pub struct RetryCauses {
 impl RetryCauses {
     /// All counted retries, or `None` if the sum overflows.
     pub fn total(&self) -> Option<u64> {
-        [self.signal, self.timeout, self.unknown, self.unrecorded]
-            .into_iter()
-            .try_fold(self.exit_code, u64::checked_add)
+        [
+            self.signal,
+            self.timeout,
+            self.unknown,
+            self.launch,
+            self.unrecorded,
+        ]
+        .into_iter()
+        .try_fold(self.exit_code, u64::checked_add)
     }
 
     /// Add another set of counts, saturating rather than wrapping.
@@ -117,6 +126,7 @@ impl RetryCauses {
         self.signal = self.signal.saturating_add(other.signal);
         self.timeout = self.timeout.saturating_add(other.timeout);
         self.unknown = self.unknown.saturating_add(other.unknown);
+        self.launch = self.launch.saturating_add(other.launch);
         self.unrecorded = self.unrecorded.saturating_add(other.unrecorded);
     }
 }
@@ -1577,18 +1587,19 @@ mod tests {
             ..RetryCauses::default()
         };
         let mut second = all_ok(&state, 1);
-        second.retried = 4;
+        second.retried = 5;
         second.retry_causes = RetryCauses {
             signal: 1,
             timeout: 1,
             unknown: 1,
+            launch: 1,
             unrecorded: 1,
             ..RetryCauses::default()
         };
         state.complete(&node("n1"), &first).unwrap();
         state.complete(&node("n1"), &second).unwrap();
         let summary = state.summary();
-        assert_eq!(summary.retried, 7);
+        assert_eq!(summary.retried, 8);
         assert_eq!(
             summary.retry_causes,
             RetryCauses {
@@ -1596,6 +1607,7 @@ mod tests {
                 signal: 3,
                 timeout: 1,
                 unknown: 1,
+                launch: 1,
                 unrecorded: 1,
             }
         );

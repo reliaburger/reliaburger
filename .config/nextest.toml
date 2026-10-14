@@ -69,6 +69,13 @@ filter = 'binary(relish_test_catalogue) & test(secure_catalogue_node_jobs_have_d
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Killing a shell with 400 sleeping children, thirty times (#916), holds
+# 400 processes at a time and takes several seconds.
+[[profile.default.overrides]]
+filter = 'test(/a_shell_waiting_on_killed_children_as_killed$/)'
+test-group = "process-heavy"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 [[profile.default.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
@@ -120,6 +127,13 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 # and instrumentation is what makes it slowest.
 [[profile.ci.overrides]]
 filter = 'binary(relish_test_catalogue) & test(secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup)'
+test-group = "process-heavy"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Killing a shell with 400 sleeping children, thirty times (#916), holds
+# 400 processes at a time and takes several seconds.
+[[profile.ci.overrides]]
+filter = 'test(/a_shell_waiting_on_killed_children_as_killed$/)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 

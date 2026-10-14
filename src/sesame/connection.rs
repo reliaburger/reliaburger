@@ -94,6 +94,23 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for LifetimeLimitedIo<S> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
+    // Forwarded so Hyper sees the inner stream's vectored writes. Without
+    // them it copies every response body into its own write buffer, which
+    // keeps the capacity of the largest answer for as long as the connection
+    // stays open (#892). See `StallGuardedIo`.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.check_deadline(cx)?;
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.check_deadline(cx)?;
         Pin::new(&mut self.inner).poll_flush(cx)
@@ -294,6 +311,28 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StallGuardedIo<S> {
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
         self.track_write(cx, poll)
+    }
+
+    // Hyper picks how to write a response from `is_write_vectored`. A
+    // wrapper that keeps the trait's default (`false`) makes it "flatten":
+    // copy every body chunk into one write buffer, whole, however big. That
+    // buffer is cleared but never shrunk between requests, so each kept-alive
+    // connection held the capacity of the largest answer it ever sent. On
+    // the soak's API node, where Lima's port forwarder keeps every forwarded
+    // connection open until its idle timeout, that was about 3 MB per open
+    // connection and over 400 MB in all (#892). Forwarding the inner
+    // stream's vectored writes lets Hyper queue the body's own buffers.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.track_write(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -517,6 +556,83 @@ mod tests {
         mtls, renewal::TlsPeerCertificate, types::SerialNumber,
     };
     use std::time::SystemTime;
+
+    /// A connected loopback TCP pair: a stream that supports vectored
+    /// writes, as the API's TLS and plain sockets do.
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    /// Write two slices in one vectored write and read back what arrived.
+    async fn vectored_round_trip<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        reader: &mut tokio::net::TcpStream,
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let slices = [io::IoSlice::new(b"head "), io::IoSlice::new(b"body")];
+        let written =
+            std::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write_vectored(cx, &slices))
+                .await
+                .unwrap();
+        writer.flush().await.unwrap();
+        let mut received = vec![0u8; written];
+        reader.read_exact(&mut received).await.unwrap();
+        received
+    }
+
+    /// #892: Hyper copies every response into a per-connection buffer it
+    /// never shrinks unless the stream says it takes vectored writes. The
+    /// guard must say what the socket under it says, and pass them through.
+    #[tokio::test]
+    async fn the_stall_guard_keeps_the_sockets_vectored_writes() {
+        let (client, mut server) = tcp_pair().await;
+        assert!(client.is_write_vectored());
+        let mut guarded =
+            StallGuardedIo::new(client, Duration::from_secs(5), Duration::from_secs(5));
+
+        assert!(guarded.is_write_vectored());
+        let received = vectored_round_trip(&mut guarded, &mut server).await;
+        assert!(b"head body".starts_with(&received) && !received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_lifetime_limit_keeps_the_sockets_vectored_writes() {
+        let (client, mut server) = tcp_pair().await;
+        let mut limited = LifetimeLimitedIo::new(client, Duration::from_secs(5));
+
+        assert!(limited.is_write_vectored());
+        let received = vectored_round_trip(&mut limited, &mut server).await;
+        assert!(b"head body".starts_with(&received) && !received.is_empty());
+    }
+
+    /// A vectored write that makes no progress still trips the stall limit.
+    #[tokio::test]
+    async fn a_stalled_vectored_write_fails_once_the_limit_passes() {
+        let (client, _server) = tcp_pair().await;
+        let mut guarded =
+            StallGuardedIo::new(client, Duration::from_secs(5), Duration::from_millis(200));
+        let piece = vec![0u8; 1024 * 1024];
+        let slices = [io::IoSlice::new(&piece)];
+        // Nobody reads the other end, so the socket buffers fill and stay full.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Err(error) = std::future::poll_fn(|cx| {
+                    Pin::new(&mut guarded).poll_write_vectored(cx, &slices)
+                })
+                .await
+                {
+                    return error;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome.kind(), io::ErrorKind::TimedOut);
+    }
 
     /// Bun execs straight after it answers an upgrade, and exec closes every
     /// socket, so the answer has to be on the wire first (#526). The

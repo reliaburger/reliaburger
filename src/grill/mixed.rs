@@ -285,10 +285,6 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
         }
         Ok(routed)
     }
-    fn selected_blocking(&self, id: &InstanceId) -> Result<Route, GrillError> {
-        self.load_blocking(id)?
-            .ok_or_else(|| Self::error(id, "mixed-runtime route is absent"))
-    }
     async fn selected(&self, id: &InstanceId) -> Result<Route, GrillError> {
         self.load(id)
             .await?
@@ -667,7 +663,7 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
             launches
                 .into_iter()
                 .map(|(is_host, launch)| {
-                    let route = this.selected_blocking(&launch.instance_id)?;
+                    let route = this.load_blocking(&launch.instance_id)?;
                     Ok((is_host, launch, route))
                 })
                 .collect::<Result<Vec<_>, GrillError>>()
@@ -677,6 +673,17 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         let mut result = Vec::new();
         for (is_host, launch, route) in snapshots {
             let id = launch.instance_id.clone();
+            let Some(route) = route else {
+                // `forget_route` removes the backend's launch before the
+                // route, so a launch listed just before a concurrent forget
+                // can lose its route by the time it is read. Gone from the
+                // backend now, it has left; still listed, it is a real
+                // inconsistency (#924).
+                if self.backend_absent(&id, is_host).await? {
+                    continue;
+                }
+                return Err(Self::error(&id, "mixed-runtime route is absent"));
+            };
             let selected = if (route.runtime == RuntimeKind::Process) != is_host {
                 // This is still an observation of the original backend, not
                 // permission to mutate its replacement. Check positive original
@@ -1261,6 +1268,50 @@ mod tests {
             assert!(!route.exists(), "route kept after retirement");
             assert!(!backend.has_launch(&id), "journal kept after retirement");
         }
+    }
+
+    /// An executor pool forgets retired executors while the agent reads the
+    /// inventory (#924). The read that listed one just before it was
+    /// forgotten finds its route gone; that launch has left, so the
+    /// inventory leaves it out instead of failing.
+    #[tokio::test]
+    async fn inventory_leaves_out_a_launch_forgotten_while_it_was_read() {
+        for host in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = pair(root.path()).await;
+            let id = InstanceId("tenant-a__executor-0".into());
+            runtime.create(&id, &spec(host)).await.unwrap();
+            runtime.start(&id).await.unwrap();
+            let backend = if host {
+                &runtime.host
+            } else {
+                &runtime.container
+            };
+            backend.set_state(&id, ContainerState::Stopped);
+            backend.set_launch_inventory(vec![]).await;
+            runtime.forget_retired(&id).await.unwrap();
+            // The backend was listed before the forget, its route read after.
+            backend.answer_next_inventory_with(vec![launch(&id, host)]);
+            let launches = runtime.launch_inventory().await.unwrap().unwrap();
+            assert!(launches.is_empty(), "host: {host}: {launches:?}");
+        }
+    }
+
+    /// A launch the backend still lists without its route is real
+    /// inconsistency, not a concurrent forget: the inventory still refuses.
+    #[tokio::test]
+    async fn inventory_refuses_a_listed_launch_without_its_route() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = pair(root.path()).await;
+        let routed = InstanceId("tenant-a__executor-0".into());
+        runtime.create(&routed, &spec(true)).await.unwrap();
+        let id = InstanceId("tenant-a__executor-1".into());
+        runtime
+            .host
+            .set_launch_inventory(vec![launch(&routed, true), launch(&id, true)])
+            .await;
+        let error = runtime.launch_inventory().await.unwrap_err();
+        assert!(error.to_string().contains("route is absent"), "{error}");
     }
 
     #[tokio::test]

@@ -45,8 +45,14 @@ def safe_bytes(path, boundary, uid, limit=1<<20):
 
 
 def safe_json(path, boundary, uid):
-    try: return json.loads(safe_bytes(path, boundary, uid))
-    except (ValueError, UnicodeError) as error: raise InvalidInventory("invalid owner JSON") from error
+    # safe_bytes raises its own reasons (missing, unsafe, too big). Only a
+    # record that was read and doesn't parse is invalid JSON, and its size and
+    # edges say whether it was empty, zero-filled or cut short (#946).
+    value = safe_bytes(path, boundary, uid)
+    try: return json.loads(value)
+    except (ValueError, UnicodeError) as error:
+        raise InvalidInventory("invalid owner JSON in %s: %d bytes, head %r, tail %r"
+                               % (path, len(value), value[:16], value[-16:])) from error
 
 
 def identity_parts(identity, prefix):
@@ -93,6 +99,16 @@ def veth(identity):
     return "veth-%010x" % (digest & 0xffffffffff)
 
 
+def setup_peer(identity):
+    """The temporary container-side veth the runtime creates in the host
+    namespace before moving it into the task's netns: `vt` + `c-<hash>`, the
+    hash a wrapping 32-bit `h*31 + byte` (src/grill/netns.rs,
+    setup_container_network_with_commands)."""
+    digest = 0
+    for byte in identity.encode(): digest = (digest*31 + byte) & 0xffffffff
+    return "vtc-%08x" % digest
+
+
 def command(args):
     result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     if result.returncode or len(result.stdout) > (1<<20): raise InvalidInventory("kernel/storage inventory command failed: "+args[0])
@@ -129,16 +145,26 @@ def kernel(root):
     return dict(runc=runc, netns=netns, veth=[v["ifname"] for v in json.loads(links)], cgroup=cgroups, lease=leases)
 
 
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
 def collect(root):
     root = Path(root)
-    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    boot = boot_id()
     prefixpath=root/"batch-executor-id"
     prefix = safe_bytes(prefixpath, root, os.geteuid(), 32).decode() if prefixpath.exists() else None
     errors=[]; owners={}; resources={}
     # A disappearing owner/resource is normal churn. Recheck positive absence;
     # never excuse a still-present kernel object solely because its name fits.
     for attempt in range(3):
-        resources=kernel(root); owners={}; errors=[]
+        # The lease journal is read like an owner record, so it gets the
+        # same bounded retry before an unreadable one fails the scan (#946).
+        try: resources=kernel(root)
+        except InvalidInventory:
+            if attempt==2: raise
+            continue
+        owners={}; errors=[]
         candidates=set(resources["runc"]+resources["lease"])
         journals={}
         for base in (root/"instances/runc/bundles/.intents/records",root/"instances/process-owners"):
@@ -172,7 +198,12 @@ def collect(root):
                 native=root/"instances/process-owners"/identity/"owner.json"
                 container=root/"instances/runc/bundles/.intents/records"/identity/"intent.json"
                 journal=native if native.exists() and (pool=="-host" or not container.exists()) else container
-                record=journals.get(identity,(journal,None))[1] or safe_json(journal,root,os.geteuid())
+                record=journals.get(identity,(journal,None))[1]
+                if record is None:
+                    # Kernel objects with no record at all: say so, rather
+                    # than blame the record for not parsing (#952).
+                    if not journal.exists(): raise InvalidInventory("resources without an owner record")
+                    record=safe_json(journal,root,os.geteuid())
                 proof=owner_proof(record,identity,prefix,boot)
                 if "launch" in record:
                     socketpath=Path("/tmp")/("rbp-"+str(os.geteuid())+"-"+record["nonce"])/"control.sock"
@@ -183,7 +214,10 @@ def collect(root):
                 proof["limits"]={key:(path/key).read_text().strip() for key in ("cpu.max","memory.max")} if path.exists() else {}
                 owners[identity]=proof
             except (InvalidInventory,OSError) as error: errors.append(identity+": "+str(error))
-        current=kernel(root)
+        try: current=kernel(root)
+        except InvalidInventory:
+            if attempt==2: raise
+            continue
         resources={kind:sorted(set(values)&set(current[kind])) for kind,values in resources.items()}
         alive=set(resources["runc"]+resources["lease"]+[n[3:] for n in resources["netns"] if n.startswith("rb-")])
         alive.update(g.split("/")[0]+"__"+g.split("/")[1]+"-"+g.split("/")[2] for g in resources["cgroup"])
@@ -232,10 +266,24 @@ def fresh_activity(root):
     return active
 
 
-def validate(value, now, boot=None):
+# A proof taken this long before its snapshot started says nothing about it.
+MAX_AGE = 90
+# Guest and host stamp whole seconds from separately synced clocks.
+CLOCK_SKEW = 2
+
+
+def validate(value, started, boot=None, collected=None):
+    """The guest's proof, if it is complete and belongs to this snapshot.
+
+    The harness stamps the snapshot (`started`) before it asks the guests and
+    finishes collecting at `collected`, so a fresh proof is stamped between
+    the two. One from more than MAX_AGE before the start, or from after the
+    collection ended, is refused. Without `collected` the window closes at
+    `started`."""
     if not isinstance(value,dict) or value.get("schema")!=1 or value.get("complete") is not True:
         raise InvalidInventory("complete job kernel/storage inventory missing")
-    if not 0 <= now-value.get("ts",0) <= 90 or boot and value.get("boot")!=boot:
+    end=(started if collected is None else collected)+CLOCK_SKEW
+    if not started-MAX_AGE <= value.get("ts",0) <= end or boot and value.get("boot")!=boot:
         raise InvalidInventory("job inventory stale or from another boot")
     if value.get("errors"): raise InvalidInventory("; ".join(value["errors"][:4]))
     if type(value.get("available_kb")) is not int or value["available_kb"] < 256*1024:
@@ -245,7 +293,8 @@ def validate(value, now, boot=None):
 
 
 def exemptions(value):
-    result={kind:set() for kind in ("runc","netns","lease","veth","cgroup")}
+    # setup_peer: names excused once, while a live owner's network is set up.
+    result={kind:set() for kind in ("runc","netns","lease","veth","cgroup","setup_peer")}
     for owner in value["owners"]:
         identity=owner["id"]
         _, _, group=identity_parts(identity,value["prefix"])
@@ -259,6 +308,7 @@ def exemptions(value):
         if owner["runtime"]!="process":
             result["runc"].add(identity); result["netns"].add("rb-"+identity)
             result["lease"].add(identity); result["veth"].add(veth(identity))
+            result["setup_peer"].add(setup_peer(identity))
     return result
 
 

@@ -1846,3 +1846,84 @@ let launched = tokio::task::spawn_blocking(move || {
 The command comes back because a launch that fails with `ETXTBSY` is retried. Blocking-pool threads carry the runtime's context, so the child is still one the runtime can wait on, and if the upgrade is cancelled mid-launch, the child is dropped when the launch finishes and `kill_on_drop` stops it. We had two other patterns to hand. The managed-status check pays the assessment ahead of time by running the binary once early, but here the probe *is* that first run, so there's nothing earlier to move it to. The boot-time hash runs on a detached `std::thread` so that a start-up error doesn't wait for it, but the probe's answer is the very next thing the upgrade needs, and a plain thread has no runtime to register the child with. `spawn_blocking` is the simplest of the three.
 
 `upgrade::compatibility`'s `a_slow_probe_launch_leaves_the_runtime_free` is the same ticker test, around a launch made slow on purpose. It can't rely on Gatekeeper being slow (CI's Linux has no Gatekeeper at all), and a script that sleeps doesn't help: `spawn` returns as soon as exec succeeds, before the script's first line runs. Instead the test gives the command a `pre_exec` hook, which runs in the forked child just before exec, that sleeps for a second. The parent's `spawn` waits that second on any host. Before the change the ticker saw a 1.0 s gap; now it sees milliseconds. The first draft of the test passed against the old code, though. On a one-thread runtime the ticker doesn't start until the test yields, and the old launch blocked before its first `.await`, so the ticker missed it entirely. A `tokio::task::yield_now().await` before the launch lets it take its first reading.
+
+## A binary too big to hold
+
+The 0.2.0 soak upgraded a three-node cluster of 2 GiB Lima VMs to a 114 MB signed build. Seven seconds after `relish upgrade start`, the kernel killed Bun on node 1: `Out of memory: Killed process 141380 (bun) ... anon-rss:1084604kB` ([#892](https://github.com/reliaburger/reliaburger/issues/892)). The harness had run `relish` on node 1, so the binary went into node 1's registry, and node 1 was the first node the leader told to upgrade. Then it fetched the binary from itself.
+
+Count the copies. The registry's blob `GET` read the whole file into a `Vec<u8>` before it answered. The upgrade manager's `fetch_once` collected the response with `response.bytes()` and turned that into a `Vec` with `to_vec()`, a second copy while the first was still alive. The leader's start-time check had just done the same against node 1's registry, which cost node 1 another read of the blob. So a node that already used 600 MB (more on that in [chapter 3](03-talking-to-each-other.md#the-buffer-every-connection-kept-020-soak-fix)) needed several hundred more for a few seconds, on a machine with 2 GiB and no swap.
+
+We wrote the test before touching the code. `tests/upgrade_memory.rs` is its own test binary with a counting global allocator, like `tests/mayo_memory.rs`: every heap allocation in the process goes through it, so it can say exactly how much heap a call had live at its peak. Each test writes a 64 MiB candidate to disk, signs it, drops the bytes, and only then starts counting. Before the fix:
+
+| Path | Peak heap above the start |
+|------|---------------------------|
+| `prepare` from a registry | 193 MB |
+| the leader's `check_candidate` | 193 MB |
+| `prepare` from a local file | 67 MB |
+| `prepare_rollback` | 67 MB |
+
+Three times the binary for a registry fetch, once for everything else. After the fix the four peaks are 388 KB, 518 KB, 3 KB and 3 KB, and the tests allow 4 MiB whatever the binary's size.
+
+### The candidate lives on disk
+
+The fix is a new type, `upgrade::candidate::Candidate`, a newtype around `tempfile::TempPath`: a private file, created owner-only under an unpredictable name in the binary directory, deleted when the value is dropped. A registry fetch writes each piece of the body to it as it arrives:
+
+```rust
+let (candidate, mut file) = Candidate::create(&self.candidate_directory()?).await?;
+while let Some(piece) = response
+    .chunk()
+    .await
+    .map_err(|e| unavailable(e.to_string()))?
+{
+    file.write_all(&piece).await?;
+}
+file.flush().await?;
+drop(file);
+Ok(candidate)
+```
+
+`response.chunk()` returns `Option<Bytes>`: the next piece of the body, or `None` at the end. `while let` loops for as long as the pattern matches, so the loop ends on `None`. A body cut off before its declared length comes back as an error, which the `map_err` turns into the same transient `FetchUnavailable` a dropped connection gives. The `flush` isn't decoration. A `tokio::fs::File` does its writes on the blocking pool, and `write_all` can return before the last one has landed. We also drop the handle on purpose, because Linux refuses to `exec` a file that something still holds open for writing (`ETXTBSY`), and the compatibility probe is about to run this very file.
+
+Every exit from that function that isn't `Ok` drops `candidate`, and its `Drop` deletes the file. So does a retry's timeout, which drops the whole `fetch_once` future mid-flight. A half-downloaded binary can't be mistaken for a whole one, and it can't pile up. A local-file upgrade (`relish upgrade start --binary` on a single node, or a download relish staged) goes through `Candidate::copy_from`, which copies the operator's file into a candidate with `std::io::copy`. On Linux that moves the bytes inside the kernel. The copy is the point: the operator's path can change after we read it, and the copy can't.
+
+### Verifying bytes you don't hold
+
+Hashing a file in pieces is easy. The signatures are the problem. Ed25519 signs the whole message, and `ring` checks a signature over one contiguous `&[u8]`. There's no streaming API to feed it pieces. We could have changed what gets signed (a signature over the SHA-256, say), but every release in the wild is signed over its raw bytes, so that would have been a new signing scheme to solve a memory problem.
+
+A read-only memory map gives `ring` its slice without putting the bytes on the heap:
+
+```rust
+let file = std::fs::File::open(&self.0)?;
+if file.metadata()?.len() == 0 {
+    return signing::verify_binary(&[], envelope, release_keys, external_key, network);
+}
+// SAFETY: the map is undefined behaviour only if the file changes
+// while it is mapped. This file is a private copy that this process
+// created owner-only, under an unpredictable name in the binary
+// directory, and has finished writing; nothing else writes it, and
+// the map is dropped before this function returns.
+let map = unsafe { memmap2::Mmap::map(&file)? };
+signing::verify_binary(&map, envelope, release_keys, external_key, network)
+```
+
+That `unsafe` block is worth reading slowly. `unsafe` doesn't switch off the borrow checker. It lets you call a function whose safety the compiler can't prove, and in exchange you write down why it holds. `Mmap::map` is `unsafe` because a `&[u8]` promises the bytes behind it won't change while it's alive, and the kernel makes no such promise about a file someone else can write (or truncate, which turns a read into a `SIGBUS`). Here nobody else can: we made the file, we stopped writing it, and nothing else knows its name. `Mmap` derefs to `&[u8]`, so `&map` passes straight to the existing `verify_binary`, and the old in-memory function is still the only place that decides whether a binary is trusted.
+
+Why is this better than reading the file? The mapped pages come from the page cache. They count as file-backed memory rather than anonymous memory, and under pressure the kernel can drop them and read them back later. The OOM killer's arithmetic in the journal (`anon-rss`) never sees them.
+
+The checked candidate then becomes the compatibility probe (`Candidate::into_probe` sets it to `0700`), and when the probe answers, `BinaryStore::stage_file` fsyncs it, makes it `0755` and renames it into place as `bun-v0.2.0`. The binary directory is on one filesystem, so that's a `rename(2)`, not a copy. There's a nice side effect: the bytes that run as the new Bun are the same file the signatures and the probe checked, not a second copy written from memory. The leader's `check_candidate` deletes its probe instead, on the blocking pool as before.
+
+A file Bun writes into the binary directory and then never removes is a new way to leak, this time on disk. A Bun killed mid-download can't run its `Drop`. So `startup_action` sweeps `.candidate-*` and `.staging-*` files left in the directory, but only ones nobody has touched for ten minutes: several local nodes can share one build directory, and one of them may be downloading right now.
+
+### The rest of the path
+
+Two more places held the whole binary. The registry's blob `GET` now opens the file and streams it with `tokio_util::io::ReaderStream` in 64 KiB pieces, with the length from the file's metadata. An open file stays readable even if garbage collection unlinks the blob halfway through, so the stream can't be cut short by GC. `pickle::api`'s `blob_get_streams_a_large_blob_in_bounded_pieces` reads a 3 MiB blob back and checks that no piece is bigger than the read buffer. Before, it arrived as one 3 MiB piece.
+
+And `relish` itself. It often runs on a node (the soak's harness does), and it read the operator's `--binary` into memory, then pushed `bytes.to_vec()`: two copies in a process on the same 2 GiB machine. Now it hashes the file in pieces, and `push_blob` streams it with `reqwest::Body::wrap_stream` and a declared `Content-Length`. The registry checks the digest, so a file that changed between the hash and the push is refused, not stored. A downloaded release still arrives in memory, because countersigning it with `--external-key` needs the bytes, but relish writes it to a private file straight after and frees them.
+
+The behaviour tests sit beside the memory ones in `upgrade::manager`. A registry that sends half the binary and closes the connection gets a transient refusal and leaves no file behind, and a retry after it stages the whole binary, not the first half with the second appended. A tampered binary is still a `HashMismatch`, now read from the file, and is deleted. A passed leader check leaves nothing in the binary directory.
+
+### What we decided not to do
+
+We didn't add a size limit to the download. The registry already refuses uploads over 512 MiB, and each attempt has a timeout, so a misbehaving registry can't stream into the file forever.
+
+We didn't stream the hash. `fetch_once` could feed SHA-256 as the pieces arrive and refuse a wrong hash before the signature check reads the file again. But `verify_binary` checks the hash first anyway, from the page cache, and one check in one place is easier to trust than two.

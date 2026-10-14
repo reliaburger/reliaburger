@@ -866,11 +866,20 @@ split_report() {
 
 snapshot_count=0
 snapshot_dir=
+snapshot_started=
 new_snapshot() {
     snapshot_count=$(( snapshot_count + 1 ))
     snapshot_dir=$evidence/snapshots/$(date -u +%Y%m%dT%H%M%S)-$1-$snapshot_count
+    snapshot_started=$(date +%s)
     mkdir -p "$snapshot_dir"
-    printf '{"ts": %s, "kind": "%s", "slot": "%s"}\n' "$(date +%s)" "$1" "${current_slot:-}" > "$snapshot_dir/meta.json"
+    printf '{"ts": %s, "kind": "%s", "slot": "%s"}\n' "$snapshot_started" "$1" "${current_slot:-}" > "$snapshot_dir/meta.json"
+}
+# The guests are asked after the snapshot starts, so their own timestamps are
+# later than meta.json's ts. Recording when collection ended lets the checker
+# accept exactly the evidence taken in between.
+finish_snapshot() {
+    printf '{"ts": %s, "kind": "%s", "slot": "%s", "collected": %s}\n' \
+        "$snapshot_started" "$1" "${current_slot:-}" "$(date +%s)" > "$snapshot_dir/meta.json"
 }
 
 collect_light() {
@@ -969,6 +978,7 @@ observe() {
     new_snapshot "$kind"
     directory=$snapshot_dir
     if [ "$kind" = light ]; then collect_light "$directory"; else collect "$kind" "$directory"; fi
+    finish_snapshot "$kind"
     output=$(check evaluate "$evidence" "$directory") || result=$?
     [ -z "$output" ] || printf '%s\n' "$output" > "$directory/findings.txt"
     if [ "$result" -eq 1 ]; then

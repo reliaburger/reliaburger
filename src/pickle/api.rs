@@ -1014,40 +1014,48 @@ async fn blob_head(state: &PickleState, _name: &str, digest_str: &str) -> Respon
     }
 }
 
+/// How much of a blob a GET reads from disk at a time (#892).
+const BLOB_READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// `GET /v2/{name}/blobs/{digest}` — download a blob.
+///
+/// The blob streams from its file a piece at a time. Reading it whole first
+/// cost the serving node a copy of the blob per fetch: an upgrade binary is
+/// over 100 MB, and the node it was pushed to served it to itself and to the
+/// leader at once, on top of its own working set, until the kernel killed
+/// it (#892). The file stays readable through its open handle even if
+/// garbage collection unlinks the blob while it streams.
 async fn blob_get(state: &PickleState, _name: &str, digest_str: &str) -> Response {
     let Ok(digest) = Digest::new(digest_str) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-
-    // read_blob is a synchronous `std::fs::read` of the whole blob (up to the
-    // request ceiling). Run it on the blocking pool (M7) so a large GET doesn't
-    // stall an async runtime worker while the file is read.
-    let store = Arc::clone(&state.store);
-    let read_digest = digest.clone();
-    let read = tokio::task::spawn_blocking(move || store.read_blob(&read_digest)).await;
-    match read {
-        Ok(Ok(data)) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "content-length",
-                data.len().to_string().parse().expect("ASCII header value"),
-            );
-            headers.insert(
-                "docker-content-digest",
-                digest.as_str().parse().expect("ASCII header value"),
-            );
-            headers.insert(
-                "content-type",
-                "application/octet-stream"
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            (StatusCode::OK, headers, data).into_response()
-        }
-        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    let Ok(file) = tokio::fs::File::open(state.store.blob_path(&digest)).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let length = match file.metadata().await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_LENGTH, length.into());
+    headers.insert(
+        "docker-content-digest",
+        digest.as_str().parse().expect("ASCII header value"),
+    );
+    headers.insert(
+        "content-type",
+        "application/octet-stream"
+            .parse()
+            .expect("ASCII header value"),
+    );
+    let pieces = tokio_util::io::ReaderStream::with_capacity(file, BLOB_READ_CHUNK_BYTES);
+    (
+        StatusCode::OK,
+        headers,
+        axum::body::Body::from_stream(pieces),
+    )
+        .into_response()
 }
 
 /// Query params for POST /v2/{name}/blobs/uploads/ (monolithic upload).
@@ -4955,6 +4963,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #892: a blob GET read the whole blob into memory before answering, so
+    /// a node serving a 114 MB upgrade binary held it once per fetch. It now
+    /// streams the file, in pieces no larger than the read buffer.
+    #[tokio::test]
+    async fn blob_get_streams_a_large_blob_in_bounded_pieces() {
+        let (state, _dir) = test_state();
+        let data: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        let digest = compute_sha256(&data);
+        state.store.write_blob(&data, &digest).unwrap();
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v2/myapp/blobs/{}", digest.as_str()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-length"],
+            data.len().to_string().as_str()
+        );
+        let mut frames = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        let mut largest = 0;
+        while let Some(frame) = frames.next().await {
+            let frame = frame.unwrap();
+            largest = largest.max(frame.len());
+            received.extend_from_slice(&frame);
+        }
+        assert_eq!(received, data);
+        assert!(
+            largest <= BLOB_READ_CHUNK_BYTES,
+            "a {}-byte blob arrived in a {largest}-byte piece",
+            data.len()
+        );
     }
 
     /// Helper: push a single blob through the upload API.

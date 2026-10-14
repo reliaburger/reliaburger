@@ -1259,20 +1259,33 @@ Three decisions shape everything that follows, and each earns its keep against t
    other refusal (409: a 4xx from the registry, a failed verification, a
    version the policy refuses) pauses the run at once.
 
+   The binary is never held in memory (#892). The body goes to a private
+   candidate file in the binary directory (`.candidate-*`, owner-only) as
+   it arrives; a local file is copied into one. A failed or timed-out
+   attempt deletes its file, and startup removes candidate files nobody
+   has touched for ten minutes (a killed Bun's leftovers). Pickle serves
+   the blob by streaming the file in 64 KiB pieces, and `relish upgrade
+   start` pushes it the same way, so no step on any node costs a copy of
+   the binary.
+
 3. Verify integrity, in this order:
-   a. SHA-256 of the received bytes matches binary_sha256.
+   a. SHA-256 of the received bytes matches binary_sha256. The checks read
+      the candidate through a read-only memory map: Ed25519 needs the whole
+      message as one slice, and mapped pages are file-backed, reclaimable
+      memory rather than heap.
    b. embedded_signature verifies against the key set compiled into the
       CURRENT running binary.
    c. external_signature verifies against external_signing_key in node.toml
       (required for network upgrades).
-   d. the verified bytes, written to a private temporary file, answer
+   d. the verified candidate file itself (made `0700`) answers
       `--compatibility` with this node's protocol and state pair. The
       candidate has 60 s from launch to answer; the bound is a hang guard,
       wide because macOS assesses the first exec of every new executable
       one file at a time across the host (about a second for a release
       `bun`, longer behind other new executables), and the copy is always
       new. A timeout names how far the candidate got (pid, first output,
-      exit).
+      exit). The probe that passed is the file staged in 4, renamed into
+      place, so the bytes that run are the bytes that were checked.
    Any failure aborts before staging: the node reports failure and does NOT
    swap.
 
@@ -1285,8 +1298,9 @@ Three decisions shape everything that follows, and each earns its keep against t
    Done in place they starved the node's Raft core, which missed the
    leader's heartbeats and called an election just before the exec,
    deposing a healthy leader on every voter swap (#783). So do the other
-   steps whose cost grows with the binary or the disk: writing and deleting
-   the probe's private copy in 3, and syncing the `Staged` marker. On a busy
+   steps whose cost grows with the binary or the disk: copying a local file
+   into its candidate and deleting an unstaged probe in 3, and syncing the
+   `Staged` marker. On a busy
    disk each of those alone held a worker for 0.2 to 0.6 s (#794). The
    worker only launches the probe and waits for its answer.
 
@@ -1461,7 +1475,7 @@ join = ["10.0.1.5:9443"]
 
 **Recovery:** systemd restarts Bun. On startup, Bun reconnects to running containers (see 5.1 reconnect), resumes all operations, and reconciles state with the cluster via the reporting tree.
 
-A restart may also change the runtime flag. When a node moves from `--runtime runc` or `--runtime process` to `mixed` (or to `auto`, which selects `mixed` where runc exists), its running workloads have no `runtime-routes` entry, because only the mixed runtime writes routes. Before startup recovery reads the launch inventory, Bun routes each launch that exactly one backend's ownership journal lists, and that fits that backend, to it, and logs the instances it routed. Without this step every `runc` to `mixed` restart with running containers failed and systemd restarted Bun in a loop (#823). A launch both backends list stays unrouted and recovery refuses it. An image app that the process runtime ran as a host process couldn't be routed either (#827), but the process runtime now refuses image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists to route.
+A restart may also change the runtime flag. When a node moves from `--runtime runc` or `--runtime process` to `mixed` (or to `auto`, which selects `mixed` where runc exists), its running workloads have no `runtime-routes` entry, because only the mixed runtime writes routes. Before startup recovery reads the launch inventory, and after the runtime has its workload DNS resolver (each runc launch records the resolver, and the runc journal refuses a live launch recorded under a different one, #839), Bun routes each launch that exactly one backend's ownership journal lists, and that fits that backend, to it, and logs the instances it routed. Without this step every `runc` to `mixed` restart with running containers failed and systemd restarted Bun in a loop (#823). A launch both backends list stays unrouted and recovery refuses it. An image app that the process runtime ran as a host process couldn't be routed either (#827), but the process runtime now refuses image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists to route.
 
 ### 7.2 Container Runtime (containerd) Crash
 
@@ -1500,7 +1514,7 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 - Two fences guard a worker against delayed syncs, across restarts: `task-arrays/control.fence`, the newest control version (epoch, term, applied index) it has acted on (#745), and `task-arrays/<id>/grants.fence`, the highest attempt it has accepted per chunk (#902). Both change on nearly every busy tick, so both are two-slot files (`bun::fence_file`): each slot holds a magic number, a generation, the payload and a CRC32, and a change overwrites the slot that doesn't hold the newest generation, in place, with one `sync_data` before the node acts on it. A slot torn by a crash fails its CRC, and the other slot still holds the last change the node acted on; a file with no valid slot is refused, never read as empty. A payload that outgrows its slot (a grant fence with many chunks) moves to a new file with at least twice the room, written, flushed, renamed and its directory flushed, so that costs two flushes per doubling. Compaction deletes `grants.fence` with the launch markers.
 - The leader prunes finished runs an hour after they finish with a replicated `Prune` write on its one-second tick, not only on the next registration, and each worker deletes a run's directory once the leader stops listing it. An idle cluster therefore returns to its baseline disk use.
 - Task data counts toward disk pressure, and so does the audit log under `{data}/audit` (#798; `disk_pressure::node_data_bytes`). When they pass a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
-- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it.
+- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. Forgets of different identities run concurrently and share one garbage directory; a deletion another forget finished counts as done, so concurrent forgets never leave a route behind. Inventory snapshots list, then read: a host owner directory, a runc intent record or a mixed route that a concurrent forget removed in between has left, and the snapshot leaves it out. A mixed launch the backend still lists without its route is still refused (#924). At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. The same sweep removes this node's executor slot cgroups (`<namespace>/executor-<prefix>[-reuse|-host]/<slot>`) that no launch in a complete runtime inventory owns (#952). A slot's group belongs to the executor pool that ran it, and a killed Bun's pool dies with it: startup retirement removes the runtime's `helper` and `task` leaves, but nothing else removed the empty slot until a task needed that slot again, minutes later under a light load. Only empty groups can go, since the kernel refuses to remove a populated cgroup.
 - App instance metadata is collected too (#738). App instances share none of the executor path: the agent asks the runtime to forget an instance once the supervisor has let it go, which happens when its app is deleted, when a scale-down or a rollout retires it (including a retirement that waited for remote release), and when startup retires a launch it doesn't adopt. A plain `relish stop` forgets nothing, because its stopped replicas stay owned until an apply rolls over them, and an adopted instance keeps everything. The deletion runs in a task, so no agent turn waits on its fsyncs, and the same refusal rules apply, including against a successor generation of a reused identity. Anything a refusal or a crash leaves behind is a retired launch with no adoption record, which the next start retires and forgets. Because the forget is spawned, it can rename a record away while an inventory read (startup adoption's, for one) is between listing the records and reading them; the inventory leaves out a record that vanished that way, since only a forget removes a published record and only a retired one, while a record directory that's still there without a readable intent still refuses (#877). An instance's init containers (`<id>__init-<n>`) go with it (#850). The deploy worker reads each initialiser's runtime generation straight after creating it and hands it to the loop, and retirement asks the runtime to forget exactly that generation (`Grill::forget_retired_generation`). An immediate redeploy reuses the same initialiser identity, so the runtime refuses while any other generation owns it: a forget that lands after the redeploy's initialiser launched can't delete the journal holding that initialiser's exit code. An initialiser a live or pending parent has registered again is skipped outright. One whose generation the runtime couldn't report, or that an adopted instance ran before a restart, is a launch without an adoption record, which the next start forgets. The process runtime's `prepare` starts again from nothing if a forget removed the retired generation while it waited for the identity's locks, so a redeploy can't fail on a journal that vanished under it.
 
 ### 7.4 Process Workload Binary Missing
@@ -1562,9 +1576,9 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **What happens:** A cold reusable executor (shared-runc or native host) fails while starting, before its helper connects: a runtime command misses its five-second bound on a loaded host, an I/O call fails, or the helper never connects. The job's command hasn't been sent anywhere yet.
 
-**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O and helper failures from refusals about the job itself.
+**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O, helper and slot-availability (`Unavailable`) failures from refusals about the job itself. A runtime error is a refusal only when `GrillError::refuses_spec` says so (see §7.13).
 
-**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second failure, or any refusal, fails the attempt with the runtime's reason as `SpawnFailed`.
+**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second transient failure ends the attempt as `LaunchFailed`, which the task pool retries within `max_attempts` (§7.13); a refusal ends it as `Refused`. Either way the reason is the attempt's output.
 
 **Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
 
@@ -1592,7 +1606,7 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **What happens:** A leader answer that changes a node's consumer view runs through the agent loop as a sequence of steps, one a turn (#505, #603): `candidate` reads the runtime's launch inventory and builds the view, `journal` records the answer and journals its first change, then `withdraw`, `prove_receipts` and `publish` after a recovery, then `activate` and `compact`. Each step takes at most one fsync'd discovery-journal write or one inventory read. The two steps that install a view (`journal` for a node that's already active, and `publish`) also write every service's kernel entry under the shared eBPF handle's lock, rebuild the routing table and reconcile the namespace firewall, whose runtime cgroup reads stop at the turn's 500 ms deadline. In the 0.2.0 fast soak two nodes took one such turn of about 1.9 s each in the same second (#890).
 
-**Detection:** The turn histogram `bun_agent_loop_turn_seconds{branch="follow_up"}`, which the V02 soak checks against the 1 s budget, and the slow-turn log line. The line names the step, and from 0.2.1 it also lists what the turn's timed parts took: the journal write, the inventory read, the wait for the eBPF lock (job tasks, fault injection and traces hold it too), the view install and the firewall sync. Parts can nest, so the lock wait also counts inside the install or the sync:
+**Detection:** The turn histogram `bun_agent_loop_turn_seconds{branch="follow_up"}`, which the V02 soak checks against the 1 s budget, and the slow-turn log line. The line names the step, and from 0.2.0 it also lists what the turn's timed parts took: the journal write, the inventory read, the wait for the eBPF lock (job tasks, fault injection and traces hold it too), the view install and the firewall sync. Parts can nest, so the lock wait also counts inside the install or the sync:
 
 ```
 bun: agent loop turn took 1902 ms in follow_up (consumer_sync/journal): journal write 1400 ms, kernel lock wait 3 ms, view install 6 ms, firewall sync 480 ms
@@ -1601,6 +1615,16 @@ bun: agent loop turn took 1902 ms in follow_up (consumer_sync/journal): journal 
 **Impact:** Every caller waits for the turn in progress, so status, commands and deploy steps on that node wait up to the turn's length. The view itself stays correct: the steps keep their order, and the journal lists every view that may be exposed before the kernel sees it.
 
 **Recovery:** Automatic; the next turn runs normally. The view's size isn't the cost: a thousand services, first published and then with every backend moved, take each turn well within the budget less its journal write (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`), and the soak runs a handful. Which await held the soak's turns is still open in #890. The next soak's log line will say.
+
+### 7.13 Task Attempt Fails to Launch
+
+**What happens:** A task attempt fails before its command is authorised to run: an image pull fails (a registry answering 503 during a Pickle leader change, a rate limit, a reset connection), a runc call or network setup fails, the disk fills while unpacking or preparing capture, or a reusable slot's previous executor hasn't retired. The command never ran. Or the spec can't run here at all: an image reference that doesn't parse, an image whose config is invalid, a missing or unusable executable, a runtime or network policy the node can't provide, revoked namespace credentials.
+
+**Detection:** The fresh path classifies its typed launch error (`LaunchError::outcome` in `src/bun/task_runtime.rs`); the reusable pools use `ExecutorError::is_transient`, and `helper_spawn_outcome` for the helper's `exec` errno. `GrillError::refuses_spec` is the one place that decides a runtime error is the spec's fault: `ImagePull` with `InvalidReference` or `InvalidConfig`, and any `LaunchRefused` (a missing or unexecutable binary, no command, or an image under `--runtime process`; #881, #905, #914). Errors that could be either (runc, disk, network setup) count as transient, because the command provably didn't run and the retry is bounded.
+
+**Impact:** A transient failure is `AttemptOutcome::LaunchFailed`: the task pool retries it with the ordinary backoff, under cancellation, counted against `max_attempts` and as a `launch` retry cause. A singleton without `replay_unknown` retries it too, since nothing ran. A permanent one is `AttemptOutcome::Refused` and fails the task at once. The reason is the attempt's output, kept for a failed task, and Bun logs `batch B task I attempt A/M: …` on stderr, at most 20 lines per run per minute plus a count of the rest (#889).
+
+**Recovery:** Automatic for transient failures, within the attempt budget. A refusal needs the spec fixed and the job resubmitted.
 
 ---
 

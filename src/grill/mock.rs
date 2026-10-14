@@ -1,3 +1,7 @@
+/// Builds the image error an injected create failure returns. A function
+/// pointer, because `ImageError` can't be cloned for every call.
+pub type ImageErrorFactory = fn() -> super::image::ImageError;
+
 /// Shared mock Grill for tests.
 ///
 /// Records all calls to the `Grill` trait so tests can assert on
@@ -71,6 +75,8 @@ pub struct MockGrill {
     fail_kill: Arc<AtomicBool>,
     fail_stop: Arc<AtomicBool>,
     inventory_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// One launch inventory answer read before a concurrent change.
+    stale_inventory: Arc<Mutex<Option<Vec<super::RuntimeLaunch>>>>,
     /// Time each force-kill request takes, as `runc kill` does on a loaded host.
     kill_delay: Arc<Mutex<Option<std::time::Duration>>>,
     pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
@@ -87,6 +93,8 @@ pub struct MockGrill {
     /// When set, `start` refuses the launch as the owner gate's failed
     /// `exec` would (#905).
     refused_start: Arc<Mutex<Option<super::LaunchProblem>>>,
+    /// Make creation fail with this image error, as a pull does.
+    create_image_error: Arc<Mutex<Option<ImageErrorFactory>>>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
@@ -150,6 +158,7 @@ impl Default for MockGrill {
             fail_kill: Arc::default(),
             fail_stop: Arc::default(),
             inventory_delay: Arc::default(),
+            stale_inventory: Arc::default(),
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
             workload_cgroup_delay: Arc::default(),
@@ -158,6 +167,7 @@ impl Default for MockGrill {
             fail_create: Arc::default(),
             refused_launch: Arc::default(),
             refused_start: Arc::default(),
+            create_image_error: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
@@ -248,6 +258,12 @@ impl MockGrill {
     /// deleted between `create` and the gate's `exec` does, or stop refusing.
     pub fn set_refused_start(&self, problem: Option<super::LaunchProblem>) {
         *self.refused_start.lock().unwrap() = problem;
+    }
+
+    /// Fail creation with the image error `error` builds, as a pull that
+    /// fails inside `create` does; `None` stops failing.
+    pub fn set_create_image_error(&self, error: Option<ImageErrorFactory>) {
+        *self.create_image_error.lock().unwrap() = error;
     }
 
     /// Fail start after recording the attempted runtime mutation.
@@ -471,6 +487,14 @@ impl MockGrill {
         *self.inventory_delay.lock().unwrap() = delay;
     }
 
+    /// Answer the next launch inventory read with `launches`, as a read that
+    /// listed the runtime just before a concurrent change. Later reads see
+    /// the inventory [`Self::set_launch_inventory`] supplies.
+    #[allow(dead_code)]
+    pub fn answer_next_inventory_with(&self, launches: Vec<super::RuntimeLaunch>) {
+        *self.stale_inventory.lock().unwrap() = Some(launches);
+    }
+
     /// Delay every pid read, as a runtime waiting on a busy lifecycle lock would.
     pub fn set_pid_delay(&self, delay: Option<std::time::Duration>) {
         *self.pid_delay.lock().unwrap() = delay;
@@ -622,6 +646,9 @@ impl super::Grill for MockGrill {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
+        if let Some(stale) = self.stale_inventory.lock().unwrap().take() {
+            return Ok(Some(stale));
+        }
         Ok(self.launch_inventory.lock().await.clone())
     }
 
@@ -713,6 +740,9 @@ impl super::Grill for MockGrill {
                 instance: instance.clone(),
                 problem,
             });
+        }
+        if let Some(error) = *self.create_image_error.lock().unwrap() {
+            return Err(GrillError::ImagePull(error()));
         }
         if let Some(path) = spec.linux.host_cgroup_path() {
             self.cgroup_paths
