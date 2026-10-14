@@ -285,6 +285,26 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .filter(|slot| slot.active_run == Some(run))
             .count() as u64
     }
+    /// This run's active commands and its `callers`, read while holding the
+    /// slot lock. A caller counts itself before it checks a slot out, and
+    /// stops counting only after it has vacated that slot, which also takes
+    /// the lock. So every command counted here has its caller counted too:
+    /// the lock orders the caller's increment before, and its decrement
+    /// after, this read, even though the counter itself is `Relaxed`.
+    pub(crate) async fn command_activity(
+        &self,
+        run: u64,
+        callers: &std::sync::atomic::AtomicU64,
+    ) -> crate::bun::task_executor::CommandActivity {
+        let slots = self.slots.lock().await;
+        crate::bun::task_executor::CommandActivity {
+            active: slots
+                .iter()
+                .filter(|slot| slot.active_run == Some(run))
+                .count() as u64,
+            callers: callers.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
     pub(crate) async fn available_slots(
         &self,
         key: Option<ExecutorKey>,
@@ -516,7 +536,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
-                return Err(ExecutorError::Configuration(
+                return Err(ExecutorError::Unavailable(
                     "old host executor has not retired",
                 ));
             }
@@ -700,7 +720,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         match self.runtime.state(&context.id).await {
             Ok(ContainerState::Stopped) | Err(crate::grill::GrillError::NotFound { .. }) => {}
             _ => {
-                return Err(ExecutorError::Configuration(
+                return Err(ExecutorError::Unavailable(
                     "old executor ownership has not retired",
                 ));
             }
@@ -845,7 +865,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         let pid = peer
             .pid()
             .and_then(|pid| u32::try_from(pid).ok())
-            .ok_or(ExecutorError::Configuration("missing helper peer pid"))?;
+            .ok_or(ExecutorError::Unavailable("missing helper peer pid"))?;
         runtime.authenticate_executor(&context.id, pid).await?;
         let mut magic = [0; 8];
         connection.read_exact(&mut magic).await?;
@@ -876,16 +896,14 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     {
         let CommandReporting { sink, singletons } = reporting;
         // The command never ran, so the reason is the only output the task
-        // keeps: without it a failed task shows nothing at all (#786).
+        // keeps: without it a failed task shows nothing at all (#786). A
+        // refusal about the job fails the task; a runtime, host, registry or
+        // helper failure is a launch failure the task pool retries (#889).
         let failed = |error: ExecutorError| {
-            let reason = error.to_string();
-            let mut output = CapturedOutput::default();
-            output.push(reason.as_bytes());
-            output.push(b"\n");
-            Attempt {
-                outcome: AttemptOutcome::SpawnFailed { reason },
-                output,
-                ran: None,
+            if error.is_transient() {
+                Attempt::launch_failed(error.to_string())
+            } else {
+                Attempt::refused(error.to_string())
             }
         };
         let job = task.run.as_ref().and_then(|run| run.job_name.as_deref());
@@ -932,7 +950,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             .is_some_and(|old| old.key != key || self.budget.has_waiters())
             && !checkout.retire_previous().await
         {
-            return failed(ExecutorError::Configuration(
+            return failed(ExecutorError::Unavailable(
                 "the slot's previous executor has not retired",
             ));
         }
@@ -995,7 +1013,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     }),
                     pulled = pull => match pulled {
                         Ok(Ok(image)) => Ok(image),
-                        Ok(Err(error)) => Err(failed(ExecutorError::Protocol(error.to_string()))),
+                        Ok(Err(error)) => Err(failed(ExecutorError::Runtime(error.into()))),
                         Err(error) => Err(failed(ExecutorError::Protocol(error.to_string()))),
                     },
                 };
@@ -1099,7 +1117,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         drop(admission_timer.take());
         let Some(context) = checkout.context.as_mut() else {
             checkout.release().await;
-            return failed(ExecutorError::Configuration("missing executor context"));
+            return failed(ExecutorError::Unavailable("missing executor context"));
         };
         if let Some(refresh) = refresh {
             let refreshed = refresh().await.ok().filter(|template| {
@@ -1156,7 +1174,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             context
                 .sequence
                 .checked_add(1)
-                .ok_or(ExecutorError::Configuration("executor sequence exhausted"))
+                .ok_or(ExecutorError::Unavailable("executor sequence exhausted"))
         })
         .and_then(|sequence| protocol::command(sequence, &process).map(|bytes| (sequence, bytes)));
         let (sequence, mut bytes) = match preparation {
@@ -1175,7 +1193,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let socket = context
                 .connection
                 .as_mut()
-                .ok_or(ExecutorError::Configuration("executor connection missing"))?;
+                .ok_or(ExecutorError::Unavailable("executor connection missing"))?;
             #[cfg(feature = "ebpf")]
             if let Some(policy) = &self.policy {
                 policy
@@ -1252,12 +1270,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                             ));
                         }
                         wait_empty_task(&context.base.join("task")).await?;
-                        return Ok(AttemptOutcome::SpawnFailed {
-                            reason: format!(
-                                "atomic cgroup launch: {}",
-                                std::io::Error::from_raw_os_error(error as i32)
-                            ),
-                        });
+                        return Ok(super::helper_spawn_outcome(error));
                     }
                     _ => {
                         return Err(ExecutorError::Protocol(
@@ -2199,6 +2212,59 @@ mod tests {
         assert_eq!(pool.busy_slots(7).await, 1);
     }
 
+    /// V02 candidate 5: a node answered "1 verified, 0 callers" because it
+    /// read the active commands, then awaited other samples, then read the
+    /// callers counter, and a millisecond command finished in between. One
+    /// sample must never count a command whose caller it doesn't count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_activity_never_counts_more_active_commands_than_callers() {
+        use std::sync::atomic::AtomicU64;
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let callers = Arc::new(AtomicU64::new(0));
+        let stop = CancellationToken::new();
+        // One caller after another, in the executor's order: counted, slot
+        // checked out, command started, slot vacated, no longer counted.
+        let caller = tokio::spawn({
+            let (pool, callers, stop) = (pool.clone(), callers.clone(), stop.clone());
+            async move {
+                let cancel = CancellationToken::new();
+                let mut cycles = 0u64;
+                while !stop.is_cancelled() {
+                    callers.fetch_add(1, Ordering::Relaxed);
+                    let (index, _, _) = pool
+                        .slot(key(1), reservation(), Some(7), &cancel)
+                        .await
+                        .unwrap();
+                    pool.slots.lock().await[index].active_run = Some(7);
+                    // The command runs for a moment...
+                    tokio::task::yield_now().await;
+                    pool.release(index, None).await;
+                    callers.fetch_sub(1, Ordering::Relaxed);
+                    cycles += 1;
+                    // ...and the next caller starts a moment after it ends.
+                    tokio::task::yield_now().await;
+                }
+                cycles
+            }
+        });
+        let mut seen_active = 0;
+        for _ in 0..20_000 {
+            let sample = pool.command_activity(7, &callers).await;
+            assert!(
+                sample.active <= sample.callers,
+                "{} active commands but {} callers",
+                sample.active,
+                sample.callers
+            );
+            seen_active += sample.active;
+            tokio::task::yield_now().await;
+        }
+        stop.cancel();
+        assert!(caller.await.unwrap() > 0, "the caller never cycled");
+        assert!(seen_active > 0, "never sampled an active command");
+    }
+
     #[tokio::test]
     async fn retiring_another_profiles_executor_stops_the_slot_counting_until_admitted() {
         let root = tempfile::tempdir().unwrap();
@@ -2517,7 +2583,7 @@ mod tests {
                 },
             )
             .await;
-        let AttemptOutcome::SpawnFailed { reason } = &attempt.outcome else {
+        let AttemptOutcome::Refused { reason } = &attempt.outcome else {
             panic!("expected a spawn failure: {attempt:?}");
         };
         // The task's kept output is all an operator sees of a failed task.

@@ -46,10 +46,19 @@ DEFAULT_TARGET_RATE = 1390
 # containers can't approach the target, so their runs keep the calibration mix.
 TARGET_CAPS = {"shared-runc": 8, "process": 16}
 MILLION = 1 << 20
-CAUSES = ("exit_code", "signal", "timeout", "unknown", "unrecorded")
+# Why retried attempts failed: the fields of the product's `RetryCauses`
+# (src/meat/task_array_state.rs), the one list validation, progress totals,
+# the regression check and the record all read. test_job_soak.py fails when
+# the two disagree; a summary naming a cause missing here is refused by name.
+CAUSES = ("exit_code", "signal", "timeout", "unknown", "launch", "unrecorded")
 FAULT_KINDS = ("leader-kill", "follower-kill", "power-off")
 # Node-level faults the job qualification adds (#686, D19-B).
 NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
+# How long a drained fixture's result may stay on an unreachable node. A
+# killed or powered-off node is back within the soak's longest settle budget
+# (600 s); a result still missing after that is lost, not late (V02 candidate
+# 6, run 15, #954).
+RESULT_UNREACHABLE_GRACE = 600
 # Final-attempt and start-lag bucket upper bounds in milliseconds; None is +Inf.
 BUCKETS = [1 << i for i in range(15)] + [None]
 
@@ -97,7 +106,15 @@ def validate_summary(value, previous=None, concurrency=None):
         raise InvalidEvidence("invalid verified active commands")
     causes = value.get("retry_causes")
     if causes is not None:
-        if not isinstance(causes, dict) or sum(number(causes, key) for key in CAUSES) != counts["retried"]:
+        if not isinstance(causes, dict):
+            raise InvalidEvidence("invalid retry causes")
+        unknown = sorted(set(causes) - set(CAUSES))
+        if unknown:
+            # A new product cause the harness can't count: say which, so the
+            # fix is obvious instead of a sum that never matches (#942).
+            raise InvalidEvidence("unknown retry cause " + ", ".join(unknown)
+                                  + "; add it to job_soak.CAUSES")
+        if sum(number(causes, key) for key in CAUSES) != counts["retried"]:
             raise InvalidEvidence("retry causes do not sum to accepted retries")
     if previous:
         if value["batch_id"] != previous["batch_id"] or value["total"] != previous["total"]:
@@ -116,7 +133,8 @@ def validate_summary(value, previous=None, concurrency=None):
         verified = node["counters"].get("active_commands")
         if verified is not None and (type(verified) is not int or verified < 0 or verified > callers
                                      or concurrency is not None and verified > concurrency):
-            raise InvalidEvidence("verified activity exceeds callers/profile cap")
+            raise InvalidEvidence(f'verified activity exceeds callers/profile cap on {node.get("node")}: '
+                                  f"{verified} verified, {callers} callers, cap {concurrency}")
     return counts
 
 
@@ -434,8 +452,14 @@ class Campaign:
                     raise InvalidEvidence("candidate changed the admitted runtime or resource profile")
                 if value["batch_id"] != intent["id"] or value.get("name") != intent["name"]:
                     raise InvalidEvidence("summary is for another admitted job")
-                if intent["purpose"] in ("work","audit","cancel") and value["failed"]:
-                    raise InvalidEvidence("unexpected terminal failure in ordinary campaign work")
+                if intent["purpose"] in ("work","audit","cancel") and value["failed"] and not intent.get("failed_at"):
+                    # Reported once, with the first failed task's cause, and
+                    # the run stays in the campaign until it drains: raising
+                    # on every poll kept it there forever, so the final drain
+                    # could never finish (V02 candidate 3, run 26).
+                    intent["failed_at"]=now
+                    self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): '
+                               "unexpected terminal failure in ordinary campaign work"+self.failure_cause(intent["id"]))
                 progress=self.state["progress"][intent["mode"]]
                 delta=value["succeeded"]-(old["succeeded"] if old else 0)
                 progress["succeeded"]+=delta
@@ -443,7 +467,7 @@ class Campaign:
                 if value.get("retry_causes") is not None:
                     before=(old or {}).get("retry_causes") or {}
                     totals=progress.setdefault("retry_causes",{key:0 for key in CAUSES})
-                    for key in CAUSES: totals[key]+=value["retry_causes"][key]-before.get(key,0)
+                    for key in CAUSES: totals[key]=totals.get(key,0)+value["retry_causes"][key]-before.get(key,0)
                 if delta:
                     progress.setdefault("first_progress",now)
                     progress["latest_success"]=now
@@ -465,13 +489,20 @@ class Campaign:
                 rows=[]
                 if intent["purpose"] in ("failure","timeout","limit") and not stop:
                     page=self.api.request("GET",f'/v1/batch/{intent["id"]}/results?limit=1&index=0')
-                    if page.get("unreachable") or page.get("truncated"): raise InvalidEvidence("failure result incomplete")
+                    if page.get("truncated"): raise InvalidEvidence("failure result incomplete")
+                    if page.get("unreachable"):
+                        # The node holding the row may be restarting after a
+                        # fault: read it again on a later poll, within a bound.
+                        since=intent.setdefault("result_unreachable_since",now); self.save()
+                        if now-since<RESULT_UNREACHABLE_GRACE: continue
+                        raise InvalidEvidence("failure result incomplete: "+", ".join(map(str,page["unreachable"]))
+                                              +f" unreachable for {now-since} s")
                     rows=page["rows"]
                     if intent["purpose"] == "timeout" and len(rows)==1:
                         if self.ledger_reader is None: raise InvalidEvidence("deadline start verifier unavailable")
                         audit_effects(1,self.ledger_reader(intent["name"]))
                         rows[0]["started_effect"]=True
-                if not stop:
+                if not stop and not intent.get("failed_at"):
                     judge_terminal(intent["purpose"],value,rows)
                     if intent["purpose"] == "audit":
                         if self.ledger_reader is None: raise InvalidEvidence("independent ledger unavailable")
@@ -489,6 +520,24 @@ class Campaign:
             except (InvalidEvidence,KeyError,TypeError) as error: self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): {error}')
         self.save(); self.publish(int(time.time()),fault)
         return not self.state["active"]
+    def failure_cause(self, identity):
+        """The first failed task's attempts, exit code and first output line,
+        as a suffix for the campaign error, or nothing when the candidate
+        can't say. The cause is gone once the run's details expire."""
+        try:
+            page=self.api.request("GET",f"/v1/batch/{identity}/results?failed=true&limit=1")
+            row=page["rows"][0]
+            index=int(row["index"])
+            exit_code=row.get("exit_code")
+            cause=f': task {index} after {int(row["attempts"])} attempt(s), '+("no exit code" if exit_code is None else f"exit {exit_code}")
+        except (Unavailable,InvalidEvidence,KeyError,IndexError,TypeError,ValueError):
+            return ""
+        try:
+            output=self.api.request("GET",f"/v1/batch/{identity}/tasks/{index}/logs",raw=True)
+        except (Unavailable,InvalidEvidence):
+            return cause
+        first=next((line.strip() for line in output.splitlines() if line.strip()),"")
+        return cause+(": "+first[:200] if first else "")
     def record_metrics(self, value):
         """Fold one drained run's M8 measurements into the bounded campaign record."""
         metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))

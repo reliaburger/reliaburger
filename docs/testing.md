@@ -12,6 +12,7 @@ run it.
 | Unit tests | Pure logic, state machines, parsers, every failure branch | `#[cfg(test)]` modules across [`src/`](../src) | `make test` |
 | 10,000-member gossip | One node's membership table and dissemination at 10,000 members, in about a second | [`tests/gossip_10k.rs`](../tests/gossip_10k.rs) | `make test` |
 | Mayo memory | Metrics reads (the periodic alert and rollup cycle, unbounded and old-window queries, the council rollup store and the object-store backend) need the same heap whether a node holds one hour of history or four, and the periodic ones leave nothing behind (a counting allocator in its own binary) | [`tests/mayo_memory.rs`](../tests/mayo_memory.rs), [record](qualification/2026-09-29-mayo-memory.md) | `make test` |
+| Upgrade and connection memory | Preparing an upgrade, the leader's candidate check and a rollback need the same heap for a 64 MiB binary as for a small one, and an idle API connection doesn't keep a copy of its largest answer (counting allocators, one binary each) | [`tests/upgrade_memory.rs`](../tests/upgrade_memory.rs), [`tests/connection_memory.rs`](../tests/connection_memory.rs) | `make test` |
 | Property tests | Invariants over generated inputs: scheduling, allocation, parsing | [`proptest`](https://docs.rs/proptest) blocks in `src/` | `make test` |
 | Snapshot tests | CLI output, rendered config and TUI frames stay exactly as reviewed | [`insta`](https://insta.rs) snapshots, e.g. [`src/relish/snapshots/`](../src/relish/snapshots) | `make test` |
 | Integration suite | Real Bun and Relish processes over HTTP, TLS and the registry | [`tests/suite/`](../tests/suite) | `make test` |
@@ -438,7 +439,9 @@ accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
 For the job qualification tiers they also parse `--plan` output (every node
 fault kind on every node in the fast tier, a day of them in the final one),
-the target-load bodies and rate gate, retry-cause accounting, CPU sampling
+the target-load bodies and rate gate, retry-cause accounting (the harness's
+cause list must match the fields of the product's `RetryCauses`, and an
+unknown cause is refused by name), CPU sampling
 across restarts and the `.jobs.json` report beside the record.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime

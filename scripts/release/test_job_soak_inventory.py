@@ -75,3 +75,65 @@ class Ownership(unittest.TestCase):
         native=dict(boot_id="boot",nonce="c"*32,phase={"state":"running","pid":42},
                     launch={"instance_id":fresh,"spec":{"linux":{"cgroupsPath":"/reliaburger/default/executor-"+self.prefix+"/0"}}})
         with self.assertRaises(inventory.InvalidInventory): inventory.owner_proof(native,fresh,self.prefix,"boot")
+
+
+class Records(unittest.TestCase):
+    """Why a record can't be read must survive into the finding (#946)."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name); self.path=self.root/"record.json"
+    def test_a_missing_record_is_unavailable_not_invalid_json(self):
+        with self.assertRaises(inventory.InvalidInventory) as caught:
+            inventory.safe_json(self.path,self.root,os.geteuid())
+        self.assertNotIn("invalid owner JSON",str(caught.exception))
+        self.assertIn("unavailable",str(caught.exception))
+    def test_an_unsafe_record_keeps_its_reason(self):
+        self.path.write_text("{}"); self.path.chmod(0o666)
+        with self.assertRaises(inventory.InvalidInventory) as caught:
+            inventory.safe_json(self.path,self.root,os.geteuid())
+        self.assertEqual(str(caught.exception),"unsafe owner record")
+    def test_an_unparseable_record_reports_its_path_size_and_edges(self):
+        body=b'{"allocations":{"default__soak-writer-0":'+b"7"*100
+        self.path.write_bytes(body); self.path.chmod(0o600)
+        with self.assertRaises(inventory.InvalidInventory) as caught:
+            inventory.safe_json(self.path,self.root,os.geteuid())
+        message=str(caught.exception)
+        self.assertTrue(message.startswith("invalid owner JSON"),message)
+        self.assertIn("record.json",message)
+        self.assertIn("%d bytes"%len(body),message)
+        self.assertIn(repr(body[:16]),message)
+        self.assertIn(repr(body[-16:]),message)
+    def test_an_empty_record_says_it_is_empty(self):
+        self.path.write_bytes(b""); self.path.chmod(0o600)
+        with self.assertRaises(inventory.InvalidInventory) as caught:
+            inventory.safe_json(self.path,self.root,os.geteuid())
+        self.assertIn("0 bytes",str(caught.exception))
+
+
+class Collection(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name); self.prefix="a"*32
+        (self.root/"batch-executor-id").write_text(self.prefix)
+        (self.root/"batch-executor-id").chmod(0o600)
+        self.root.chmod(0o700)
+        self.empty=dict(runc=[],netns=[],veth=[],cgroup=[],lease=[])
+    def collect(self, kernels):
+        from unittest import mock
+        with mock.patch.object(inventory,"kernel",side_effect=kernels), \
+             mock.patch.object(inventory,"boot_id",return_value="boot"), \
+             mock.patch.object(inventory,"command",return_value="0\t/unused\n"):
+            return inventory.collect(self.root)
+    def test_a_slot_cgroup_without_an_owner_record_is_named_as_such(self):
+        # A killed Bun's executor was retired and forgotten, but its slot's
+        # parent cgroup stayed (#952). There is no record to be invalid.
+        leftover=dict(self.empty,cgroup=["default/executor-"+self.prefix+"-reuse/3"])
+        value=self.collect([leftover]*6)
+        self.assertEqual(value["errors"],["default__executor-"+self.prefix+"-reuse-3: resources without an owner record"])
+    def test_an_unreadable_lease_journal_is_retried_like_owner_records(self):
+        value=self.collect([inventory.InvalidInventory("invalid owner JSON"),self.empty,self.empty])
+        self.assertTrue(value["complete"])
+        self.assertEqual(value["errors"],[])
+    def test_a_lease_journal_unreadable_on_every_attempt_fails_the_inventory(self):
+        with self.assertRaises(inventory.InvalidInventory):
+            self.collect([inventory.InvalidInventory("invalid owner JSON")]*6)

@@ -35,8 +35,9 @@ yaml_serde = "0.10"
 semver = "1"
 thiserror = "2"
 tempfile = "3"
+memmap2 = "0.9"
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 toml = "0.8"
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 flate2 = "1"

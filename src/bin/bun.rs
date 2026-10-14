@@ -1078,29 +1078,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         &config.images.mirrors,
     )
     .await?;
-    // A node switched to the mixed runtime from runc or process has live
-    // launches without routes. Route them before recovery reads them (#823).
-    #[cfg(target_os = "linux")]
-    if let AnyGrill::Mixed(mixed) = &runtime {
-        let routed = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            mixed.route_unrouted_launches(),
-        )
-        .await
-        .context("timed out routing launches from the previous runtime")?
-        .context("cannot route launches from the previous runtime")?;
-        if !routed.is_empty() {
-            eprintln!(
-                "bun: routed {} launch(es) from the previous runtime: {}",
-                routed.len(),
-                routed
-                    .iter()
-                    .map(|id| id.0.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
@@ -1135,10 +1112,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         );
     }
     // DNS is a workload capability, not a best-effort side task. Select the
-    // runtime first so we can derive its reachable resolver address, then bind
-    // both sockets before starting the agent, reporting readiness or adopting
-    // any surviving workloads.
-    let (runtime, bound_dns, dns_capability) = prepare_dns_runtime(runtime, &config.dns).await?;
+    // runtime first so we can derive its reachable resolver address, give the
+    // runtime that resolver, and only then route a previous runtime's
+    // launches, which recorded it (#839). Bind both sockets before starting
+    // the agent, reporting readiness or adopting any surviving workloads.
+    let (runtime, workload_dns) = prepare_runtime(runtime, &config.dns).await?;
+    let (bound_dns, dns_capability) = bind_workload_dns(workload_dns).await?;
     // Remember which runtime we settled on — `/v1/capabilities` reports it,
     // and several test cases are runtime-specific.
     let runtime_kind = match &runtime {
@@ -3886,23 +3865,73 @@ async fn bounded_version_command(program: &str, arguments: &[&str]) -> Option<St
         .map(|line| line.trim().to_string())
 }
 
-/// Bind and wire the `.internal` resolver for the selected runtime.
+/// A workload resolver the runtime was configured with, not yet bound.
+struct WorkloadDns {
+    config: reliaburger::onion::dns::DnsConfig,
+    nameserver: std::net::Ipv4Addr,
+    freebind: bool,
+}
+
+/// Make the selected runtime the one Bun will run with, before anything reads
+/// its launches.
+///
+/// Two steps, in this order. First the runtime gets its workload resolver,
+/// which is part of the configuration every runc launch records. Then the
+/// mixed runtime routes the launches a previous single runtime left behind
+/// (#823). Routing reads the runc launch journal, which refuses a live launch
+/// recorded under a different configuration, so routing before the resolver
+/// is set refuses every container a runc node started with DNS on (#839).
+async fn prepare_runtime(
+    runtime: AnyGrill,
+    section: &reliaburger::config::node::DnsSection,
+) -> anyhow::Result<(AnyGrill, Option<WorkloadDns>)> {
+    let (runtime, dns) = configure_dns_runtime(runtime, section)?;
+    route_previous_runtime_launches(&runtime).await?;
+    Ok((runtime, dns))
+}
+
+/// Route each launch from a previous single runtime to the backend that owns
+/// it, when the node now runs the mixed runtime (#823).
+async fn route_previous_runtime_launches(runtime: &AnyGrill) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let AnyGrill::Mixed(mixed) = runtime {
+        let routed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            mixed.route_unrouted_launches(),
+        )
+        .await
+        .context("timed out routing launches from the previous runtime")?
+        .context("cannot route launches from the previous runtime")?;
+        if !routed.is_empty() {
+            eprintln!(
+                "bun: routed {} launch(es) from the previous runtime: {}",
+                routed.len(),
+                routed
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = runtime;
+    Ok(())
+}
+
+/// Give the selected runtime its `.internal` resolver address.
 ///
 /// Rootful runc is the only runtime whose transparent resolver path is
 /// implemented today. Its workload address is the node-side veth gateway;
 /// `IP_FREEBIND` lets Bun bind that exact address before the first container
 /// network creates it. Other runtime/address combinations fail before the
-/// agent can create or adopt a workload.
-async fn prepare_dns_runtime(
+/// agent can create or adopt a workload. With DNS off there is no resolver.
+fn configure_dns_runtime(
     runtime: AnyGrill,
     section: &reliaburger::config::node::DnsSection,
-) -> anyhow::Result<(
-    AnyGrill,
-    Option<reliaburger::onion::dns::BoundDnsResponder>,
-    reliaburger::onion::dns::DnsCapability,
-)> {
+) -> anyhow::Result<(AnyGrill, Option<WorkloadDns>)> {
     if !section.enabled {
-        return Ok((runtime, None, Default::default()));
+        return Ok((runtime, None));
     }
 
     let mut config = section.to_dns_config()?;
@@ -3930,7 +3959,31 @@ async fn prepare_dns_runtime(
             "dns: every upstream resolver is this node's own DNS address {own_listen}; set [dns] upstream"
         );
     }
+    Ok((
+        runtime,
+        Some(WorkloadDns {
+            config,
+            nameserver,
+            freebind,
+        }),
+    ))
+}
 
+/// Bind the `.internal` resolver's sockets before Bun reports readiness.
+async fn bind_workload_dns(
+    dns: Option<WorkloadDns>,
+) -> anyhow::Result<(
+    Option<reliaburger::onion::dns::BoundDnsResponder>,
+    reliaburger::onion::dns::DnsCapability,
+)> {
+    let Some(WorkloadDns {
+        config,
+        nameserver,
+        freebind,
+    }) = dns
+    else {
+        return Ok((None, Default::default()));
+    };
     #[cfg(target_os = "linux")]
     let bound = if freebind {
         reliaburger::onion::dns::BoundDnsResponder::bind_freebind(config)
@@ -3953,7 +4006,7 @@ async fn prepare_dns_runtime(
         ipv6: false,
         workload_reachable: true,
     };
-    Ok((runtime, Some(bound), capability))
+    Ok((Some(bound), capability))
 }
 
 #[cfg(target_os = "linux")]
@@ -4306,6 +4359,129 @@ mod tests {
             .err()
             .expect("host loopback is isolated from the workload namespace");
         assert!(error.to_string().contains("host loopback"));
+    }
+
+    /// The DNS section a node with `[dns] enabled = true` runs with.
+    #[cfg(target_os = "linux")]
+    fn dns_section(enabled: bool) -> reliaburger::config::node::DnsSection {
+        reliaburger::config::node::DnsSection {
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    /// Record a live runc launch the way a `--runtime runc` Bun did: under
+    /// the runtime configuration that Bun computed, resolver included. The
+    /// journal is runc's own; nothing here needs root or a runc binary.
+    #[cfg(target_os = "linux")]
+    async fn record_runc_launch(
+        instances: &std::path::Path,
+        images: &std::path::Path,
+        nameserver: Option<std::net::Ipv4Addr>,
+        id: &reliaburger::grill::InstanceId,
+    ) {
+        use reliaburger::grill::runc_intent::{IntentConfiguration, IntentJournal};
+        let hostname =
+            std::fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "localhost".to_string());
+        let bundles = std::path::absolute(instances.join("runc").join("bundles")).unwrap();
+        std::fs::create_dir_all(&bundles).unwrap();
+        let journal = IntentJournal::new(
+            bundles.join(".intents"),
+            IntentConfiguration {
+                bundle_directory: bundles,
+                state_directory: std::path::absolute(instances.join("runc").join("state")).unwrap(),
+                image_directory: std::path::absolute(images).unwrap(),
+                runc_program: "runc".into(),
+                rootless: false,
+                dns_nameserver: nameserver,
+                node_index: reliaburger::grill::netns::node_index_from_id(hostname.trim()),
+            },
+        );
+        let job: reliaburger::config::job::JobSpec =
+            toml::from_str("image='alpine:3.20'\ncommand=['/bin/sleep','60']").unwrap();
+        let spec = reliaburger::grill::generate_job_oci_spec(
+            "frontend",
+            "default",
+            &job,
+            "/sys/fs/cgroup/reliaburger/default/frontend/2",
+            None,
+        );
+        journal
+            .claim(id, None)
+            .await
+            .unwrap()
+            .publish(&spec)
+            .await
+            .unwrap();
+    }
+
+    /// The runtimes a `--runtime runc` and a `--runtime mixed` Bun build
+    /// from the same node.toml, before DNS configures either.
+    #[cfg(target_os = "linux")]
+    fn runc_and_mixed(
+        instances: &std::path::Path,
+        images: &std::path::Path,
+    ) -> (AnyGrill, AnyGrill) {
+        let mirrors = reliaburger::grill::ImageMirrors::default();
+        let runc = || create_runc_runtime(instances, images, false, &mirrors).unwrap();
+        let mixed =
+            AnyGrill::with_host_processes(runc(), instances, std::env::current_exe().unwrap());
+        (AnyGrill::Runc(runc()), mixed)
+    }
+
+    /// #839: a runc node with DNS on records its resolver in every launch.
+    /// Restarted with `--runtime mixed`, Bun routed those launches before it
+    /// gave the runtime its resolver, so the runc journal refused each one
+    /// and Bun crash-looped. Routing has to see the configuration Bun runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runc_launches_with_dns_are_routed_once_the_mixed_runtime_has_its_resolver() {
+        use reliaburger::grill::Grill;
+        let temp = tempfile::tempdir().unwrap();
+        let (instances, images) = (temp.path().join("instances"), temp.path().join("images"));
+        let id = reliaburger::grill::InstanceId("default__frontend-2".into());
+        let section = dns_section(true);
+
+        let (runc, mixed) = runc_and_mixed(&instances, &images);
+        let (runc, _) = configure_dns_runtime(runc, &section).unwrap();
+        let nameserver = runc.runc_runtime().unwrap().dns_gateway_address();
+        record_runc_launch(&instances, &images, nameserver, &id).await;
+        // The runc Bun itself reads the launch back: the recorded
+        // configuration is the one a runc Bun computes.
+        assert_eq!(runc.launch_inventory().await.unwrap().unwrap().len(), 1);
+
+        // A mixed runtime without its resolver is not the one Bun runs.
+        assert!(
+            route_previous_runtime_launches(&mixed).await.is_err(),
+            "the journal accepted a launch recorded under another resolver"
+        );
+
+        let (mixed, dns) = prepare_runtime(mixed, &section).await.unwrap();
+        assert!(dns.is_some());
+        let launches = mixed.launch_inventory().await.unwrap().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].instance_id, id);
+    }
+
+    /// With DNS off neither runtime has a resolver, and routing still works.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runc_launches_without_dns_are_routed_by_the_mixed_runtime() {
+        use reliaburger::grill::Grill;
+        let temp = tempfile::tempdir().unwrap();
+        let (instances, images) = (temp.path().join("instances"), temp.path().join("images"));
+        let id = reliaburger::grill::InstanceId("default__frontend-2".into());
+        let section = dns_section(false);
+
+        let (runc, mixed) = runc_and_mixed(&instances, &images);
+        record_runc_launch(&instances, &images, None, &id).await;
+        assert_eq!(runc.launch_inventory().await.unwrap().unwrap().len(), 1);
+
+        let (mixed, dns) = prepare_runtime(mixed, &section).await.unwrap();
+        assert!(dns.is_none());
+        let launches = mixed.launch_inventory().await.unwrap().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].instance_id, id);
     }
 
     use reliaburger::council::CouncilNode;

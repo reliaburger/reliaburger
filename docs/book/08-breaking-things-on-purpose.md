@@ -1218,6 +1218,65 @@ runs the signalling step that `stop` and `kill` share. Before the fix it failed
 on every run on macOS with `Operation not permitted`; afterwards the original
 test passed 400 loaded iterations in a row.
 
+### Kill the shell before its children
+
+Both fallbacks above answered "why did the signal fail?". The next macOS
+surprise came from a signal that worked. A test retires a command,
+`/bin/sh -c 'sleep 60 & wait'`, and expects `Retired { exit_code: None }`,
+because a killed process has no exit code. Once, in a CI run, it recorded
+`Some(0)` instead ([#916](https://github.com/reliaburger/reliaburger/issues/916)).
+That's not a cosmetic difference. A job whose root was killed would read as a
+job that succeeded.
+
+The owner kills a workload with one `kill(-pid, SIGKILL)`, the whole group in
+one call. On Linux that's effectively atomic: the kernel walks the group
+holding a lock that a dying process needs before its parent can hear about
+it. XNU walks the group one member at a time, newest first, and it doesn't
+hold anything that stops the earlier victims from finishing. So the `sleep`
+dies first. The shell, blocked in `wait`, wakes up, sees its only child gone
+and exits with status 0, all before the signal loop gets round to it. By the
+time SIGKILL arrives, the shell is already exiting, and the kernel skips it.
+
+Can you make that window big enough to see? Give the shell 400 older
+siblings to signal in between. A shell that starts them, then one more
+`sleep` it waits for with `wait $!; exit 0`, recorded `Some(0)` in about one
+retirement in thirteen on a loaded Mac. The in-memory process runtime, which
+kills from inside Bun without the owner's 10 ms tick, failed in the first
+round or two of every run.
+
+The fix is an ordering, not a lock. Both signalling paths now signal the root
+first and the group second:
+
+```rust
+match kill(Pid::from_raw(root), signal) {
+    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+    Err(error) => return Err(error.into()),
+}
+match kill(Pid::from_raw(-root), signal) {
+    Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+    #[cfg(target_os = "macos")]
+    Err(nix::errno::Errno::EPERM) => Ok(()),
+    Err(error) => Err(error.into()),
+}
+```
+
+The root's exit status is the one retirement records, and once it has a
+SIGKILL pending it never runs user code again, so it can't turn its
+children's deaths into a clean exit. If it had already exited on its own
+before the kill, that exit is real and we report it. The direct signal also
+makes the old `EPERM` dance simpler. It succeeds while the root runs or
+exits, so a real permission refusal surfaces there, and a group that then
+refuses with `EPERM` has nothing left in it that needs the signal.
+Retirement still lists every group member before it writes `Retiring`.
+
+Two regression tests, one per path,
+`retirement_records_a_shell_waiting_on_killed_children_as_killed` and
+`kill_records_a_shell_waiting_on_killed_children_as_killed`, each run that
+400-sibling shell thirty times. Linux was never exposed, and neither were the
+task runner's own kills: it decides "timed out" or "cancelled" before it kills
+anything and never reads an exit code afterwards. A kill from somewhere else
+while a task ran on a Mac, though, could have been read as a success.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill

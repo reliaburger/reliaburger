@@ -302,7 +302,8 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
     assert_eq!(ran.output.head, b"ran", "{ran:?}");
     assert_eq!(runtime.starts(), 2, "the failed start was not retried");
     // Every later start fails: a different profile replaces the warm
-    // executor, tries twice and gives up with the runtime's reason.
+    // executor, tries twice and gives up with the runtime's reason, as a
+    // launch failure the task pool may retry on a later attempt (#889).
     runtime.failures.store(usize::MAX, Ordering::SeqCst);
     let refused = runner
         .run(
@@ -312,10 +313,10 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
         )
         .await;
     match &refused.outcome {
-        AttemptOutcome::SpawnFailed { reason } => {
+        AttemptOutcome::LaunchFailed { reason } => {
             assert!(reason.contains("did not finish within 5s"), "{reason}")
         }
-        other => panic!("a start that keeps failing was not refused: {other:?}"),
+        other => panic!("a start that keeps failing was not a launch failure: {other:?}"),
     }
     assert_eq!(runtime.starts(), 4, "the retry was not bounded");
     // Nothing is held once the refused command returns.
@@ -1547,6 +1548,8 @@ async fn runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_origin
 /// A node that ran `--runtime runc` and restarts with `--runtime mixed`
 /// keeps its running containers. The mixed runtime routes each one to the
 /// runc owner that launched it, so startup recovery can read them (#823).
+/// The runc node ran with a workload resolver, which every launch records:
+/// routing succeeds only once the mixed runtime has the same resolver (#839).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
 async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
@@ -1583,7 +1586,8 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
         "/sys/fs/cgroup/reliaburger/rbtest-switch/frontend/2",
         None,
     );
-    let single = AnyGrill::Runc(runc());
+    let resolver = runc().dns_gateway_address().unwrap();
+    let single = AnyGrill::Runc(runc().with_dns_nameserver(resolver));
     single.create(&container, &spec).await.unwrap();
     single.start(&container).await.unwrap();
     assert_eq!(
@@ -1592,18 +1596,24 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
     );
     drop(single);
 
-    let mixed = AnyGrill::with_host_processes(
+    // Bun builds the mixed runtime without a resolver and sets it later.
+    let AnyGrill::Mixed(router) = AnyGrill::with_host_processes(
         runc(),
         &root.join("instances"),
         env!("CARGO_BIN_EXE_bun").into(),
+    ) else {
+        panic!("with_host_processes did not build the mixed runtime");
+    };
+    assert!(
+        router.route_unrouted_launches().await.is_err(),
+        "a launch recorded under another resolver was routed"
     );
+    let router = router.with_container(runc().with_dns_nameserver(resolver));
+    let mixed = AnyGrill::Mixed(router.clone());
     assert!(
         mixed.launch_inventory().await.is_err(),
         "an unrouted runc launch was readable before routing"
     );
-    let AnyGrill::Mixed(router) = &mixed else {
-        panic!("with_host_processes did not build the mixed runtime");
-    };
     assert_eq!(
         router.route_unrouted_launches().await.unwrap(),
         vec![container.clone()]
@@ -1906,7 +1916,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .await
         .unwrap()
         .unwrap();
-    let AttemptOutcome::SpawnFailed { reason } = &result.outcome else {
+    let AttemptOutcome::Refused { reason } = &result.outcome else {
         panic!("queued command used a revoked decryption snapshot: {result:?}");
     };
     // The command never ran: its only output is the refusal (#786), never
@@ -3122,6 +3132,41 @@ impl ExecutorResidue {
             .collect()
     }
 
+    /// The executor slot cgroups those executors still hold, as
+    /// `<namespace>/<app>/<slot>`.
+    fn slot_cgroups(&self) -> Vec<String> {
+        let stems = self.stems();
+        let ours = |app: &str| {
+            stems
+                .iter()
+                .any(|stem| app.starts_with(stem.as_str()) || app == stem.trim_end_matches('-'))
+        };
+        let directories = |path: std::path::PathBuf| {
+            std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        };
+        let mut slots = Vec::new();
+        for namespace in directories("/sys/fs/cgroup/reliaburger".into()) {
+            for app in directories(namespace.path()) {
+                let name = app.file_name().to_string_lossy().into_owned();
+                if !ours(&name) {
+                    continue;
+                }
+                for slot in directories(app.path()) {
+                    slots.push(format!(
+                        "{}/{name}/{}",
+                        namespace.file_name().to_string_lossy(),
+                        slot.file_name().to_string_lossy()
+                    ));
+                }
+            }
+        }
+        slots
+    }
+
     /// Kill the containers, then delete the namespaces, veths and cgroups.
     fn release(&self) {
         let state = self.root.join("state");
@@ -3263,6 +3308,7 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
     let gossip_port = |index: usize| ports.base + index as u16 * LEADER_LOSS_PORTS_PER_NODE;
     let shutdown = CancellationToken::new();
     let mut nodes = Vec::new();
+    let mut services = Vec::new();
     for index in 0..3usize {
         let data = root.join(format!("node-{index}"));
         std::fs::create_dir_all(&data).unwrap();
@@ -3282,6 +3328,12 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
             },
             NodeRunner::Owned(Box::new(runner)),
         );
+        let service = Arc::new(TaskArrayService::with_timings(
+            Some(Arc::new(executor)),
+            Duration::from_millis(200),
+            Duration::from_secs(3),
+        ));
+        services.push(Arc::downgrade(&service));
         nodes.push(
             cluster_support::start_wired_node(cluster_support::WiredNodeOptions {
                 name: format!("loss{index}"),
@@ -3305,11 +3357,7 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
                 fault_injection: false,
                 labels: Default::default(),
                 keep_data_dir: false,
-                task_arrays: Some(Arc::new(TaskArrayService::with_timings(
-                    Some(Arc::new(executor)),
-                    Duration::from_millis(200),
-                    Duration::from_secs(3),
-                ))),
+                task_arrays: Some(service),
                 task_arrays_on_agent_budget: None,
                 process_only: false,
             })
@@ -3512,32 +3560,63 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
         template["runtime"],
         held_at_loss.len()
     );
-    shutdown.cancel();
-    // Idle executors retire on their own; leave no runtime owner behind.
+    // Every executor must retire and be forgotten while its node still
+    // runs. Cancelling the nodes first left their pools retiring executors
+    // the runtime already reported stopped: one pool's forget recreated
+    // its route claim under `root` while the teardown removed it (#924).
+    // The lost leader's pool went with its control plane, so its idle
+    // executors stop without being forgotten. A restarted Bun's startup
+    // sweep forgets them (#678); run that sweep here.
+    let lost_runner =
+        OwnedRunner::for_data_dir(runtime.clone(), &root.join(format!("node-{leader}"))).unwrap();
+    let routes = root.join("instances/runtime-routes");
     let until = deadline(120);
     loop {
-        let mut running = 0;
-        for launch in runtime
+        lost_runner.forget_retired_executors().await;
+        let launches: Vec<_> = runtime
             .launch_inventory()
             .await
             .unwrap()
             .unwrap_or_default()
-        {
-            if runtime.state(&launch.instance_id).await.ok() == Some(ContainerState::Running) {
-                running += 1;
-            }
-        }
-        if running == 0 {
+            .into_iter()
+            .map(|launch| launch.instance_id.0)
+            .collect();
+        let claims: Vec<_> = std::fs::read_dir(&routes)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        if launches.is_empty() && claims.is_empty() {
             break;
         }
         assert!(
             tokio::time::Instant::now() < until,
-            "{running} executors still running"
+            "executors not retired and forgotten: {launches:?}, route files {claims:?}"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // The lost node's pool, which owned its executors' slot cgroups, is
+    // gone. A restarted Bun's sweep removes the ones it left (#952).
+    lost_runner.forget_retired_executors().await;
+    drop(lost_runner);
     // Retirement tears each executor's network down with it (#786).
     assert_eq!(residue.namespaces(), Vec::<String>::new());
+    assert_eq!(residue.slot_cgroups(), Vec::<String>::new());
+    shutdown.cancel();
+    // Dropping the nodes joins their agent, API and Raft tasks. Each node's
+    // leader loop stops by itself once its agent has, after finishing any
+    // tick in progress, and that tick may still sync a node's ledger. The
+    // last reference to a node's task-array service goes with the loop.
+    drop(nodes);
+    let until = deadline(30);
+    while services.iter().any(|service| service.strong_count() > 0) {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "a node's task-array service outlived its node"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(residue);
     // The nodes' data lives here too, volumes and all.
     cluster_support::clear_fixture_dir(&root).unwrap();

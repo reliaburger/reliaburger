@@ -1635,6 +1635,46 @@ that execution (#827). That case is gone in 0.2.1: the process runtime refuses
 image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists. An instance that already has a route keeps it, so running the step
 on every start changes nothing after the first.
 
+The fix shipped, and the next soak failed at the same step (#839), this time
+with "instance default__frontend-2 was started with a different runtime
+configuration". Every runc launch records the configuration it ran under: the
+runtime directories, the `runc` program, the node's subnet index and the
+address of the workload DNS resolver. Recovery refuses a live launch whose
+record differs, because a container prepared with one resolver mounted can't
+be adopted by a runtime that would prepare it with another. The runc node had
+run with DNS on. The mixed Bun routed its launches straight after choosing the
+runtime, and only gave that runtime its resolver a few lines later. To the
+routing step, every container looked like it came from some other
+configuration.
+
+The tests for #823 built the runc and the mixed runtime with the same
+configuration, so they couldn't see the order. The fix moves the step into one
+function, `prepare_runtime`, that does both in the only order that works:
+
+```rust
+async fn prepare_runtime(
+    runtime: AnyGrill,
+    section: &DnsSection,
+) -> anyhow::Result<(AnyGrill, Option<WorkloadDns>)> {
+    let (runtime, dns) = configure_dns_runtime(runtime, section)?;
+    route_previous_runtime_launches(&runtime).await?;
+    Ok((runtime, dns))
+}
+```
+
+`configure_dns_runtime` takes the runtime by value and hands back a new one
+with the resolver set, so the old, resolver-less value can't be used by
+accident: after the first line it has been *moved*, and the compiler rejects
+any later use of it. Binding the resolver's sockets is a separate step that
+runs afterwards, so a test can call `prepare_runtime` without root. The
+regression tests write a launch into runc's own journal the way a runc Bun with
+DNS on does, then hand `prepare_runtime` a mixed runtime built the way Bun
+builds it. Swap the two lines and the test fails with the soak's error. A
+second test does the same with DNS off, where neither runtime has a resolver.
+The resolver was the only part of the configuration that differed: both
+runtimes build their runc backend with the same function, from the same
+directories, `runc` program, user and hostname.
+
 A file lock serialises route changes, and the adapter moves that lock into a
 spawned task. If the caller's future is dropped mid-create, the lock stays held
 until the runtime operation really finishes. That's right for create and stop.
@@ -1666,6 +1706,145 @@ A planted hard link has *two or more* links; zero means "replaced while you
 were looking". `read_bounded` now opens the path again in that case, a bounded
 number of times, and the test reproduces the exact interleaving: open, rename,
 validate.
+
+Forgetting has races of its own. An executor pool forgets each executor
+as it goes idle (#678): the host backend renames the executor's directory into
+a private `forgotten-process-owners` directory and deletes it there, then the
+mixed adapter removes the route and its lock. A three-node leader-loss test
+failed its very last line, `remove_dir_all` on the fixture, with "Directory not
+empty" (#924). Listing the fixture at that moment named the writer: a route
+lock, `runtime-routes/<executor>.lock`, created four milliseconds earlier. The
+test had waited until no executor was `Running`, cancelled the nodes, and
+deleted the tree. But a pool goes on retiring an executor after the runtime
+reports it stopped. It still removes the executor's files and forgets its
+identity, and taking the route's lock recreated the directory the test had
+just removed. Nothing was lying about being retired. The test was asking the
+wrong question.
+
+Looping the test in the VM turned up real bugs on the way. Forgets of
+different executors run at once and share the garbage directory, and each one
+starts by sweeping what earlier forgets left there. So one forget could delete
+another's directory mid-deletion, and the loser failed with "No such file or
+directory". Its executor was already out of the inventory, but the adapter
+gave up before removing the route, and the pool logged `metadata kept` about
+once a run. The deletion now treats a tree that someone else finished as
+deleted:
+
+```rust
+fn remove_forgotten(path: &Path) -> io::Result<()> {
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Err(absent) if absent.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(other) => return Err(other),
+                    Ok(_) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+```
+
+A match arm can carry a guard, `if error.kind() == ...`, and only matches when
+the guard holds. Any other error still fails the forget. The loop can't spin
+for ever: every pass removes what's left of a tree that only shrinks.
+
+The second bug was in inventory, three times over. Every layer builds its
+snapshot the same way: list a directory, then read each entry. The host
+backend lists its owner directories and loads each record; the runc intent
+journal lists its records and loads each one; the mixed adapter lists both
+backends and then reads each launch's route. A forget that finishes between
+the list and the read leaves the reader holding a name with nothing behind
+it, and all three failed the whole snapshot: "No such file or directory",
+"runtime intent disappeared during inventory", "mixed-runtime route is
+absent". That's the error an agent turn gets when it needs a complete
+inventory, so a busy job node could refuse turns while its pools tidied up.
+It also broke the forgets themselves, because a forget reads the inventory
+to prove the executor has gone, and gave up with the route still on disk.
+The runc variant of the leader-loss test, once it checked that every executor
+was really forgotten, failed four runs in twenty-nine on exactly that.
+
+Each fix leans on the same fact: a forget unpublishes with one `rename`, and
+publication is atomic too, so a published entry is never half there. A name
+that was listed and is now absent has left, and the snapshot leaves it out.
+(The 0.2.1 train had already met the runc and host halves of this race from
+the other side, an app instance forgotten during startup adoption, and fixed
+them the same way: chapter 1 tells that story, #877. When the two lines of
+work met, the train's version of those two reads stayed.)
+The mixed adapter needs one more step, because its two halves live in
+different places. A forget removes the backend's launch before the route, so
+a missing route means the backend no longer lists the launch, which has just
+left, or still lists it, which is a real inconsistency the snapshot still
+refuses. The mock runtime can now answer one inventory read from before a
+change, which makes that test exact: it failed with the error from the VM
+before the fix. The host and runc tests race many forgets against a reader
+and failed every run or most runs before.
+
+The test now waits for the real end state while the nodes still run: no
+launch in the inventory and no route files left. The lost leader's pool went
+with its control plane, so its idle executors stop without being forgotten;
+the test runs the startup sweep a restarted Bun would run for them. Only then
+does it cancel the nodes. Each node's task-array leader loop is detached and
+ends after its current tick, which may still write a ledger, so the test keeps
+a `Weak` reference to every node's task-array service and waits for those
+references to die. `Arc::downgrade` makes a `Weak` from an `Arc`: it points at
+the same value but doesn't keep it alive, and `strong_count` says how many
+`Arc`s still do. When that reaches zero the service is gone, and nothing it
+owned can write any more.
+
+That startup sweep missed something, and a soak found it. In the fifth 0.2.0
+candidate, a follower's Bun was killed and took more than five minutes to
+settle, against a budget of 300 seconds (#952). Other follower kills in the
+same run settled in thirty. Every finding on the slow node traced back to one
+empty directory: `default/executor-<prefix>-reuse/3` under the Reliaburger
+cgroup tree. Nothing ran in it, and no runc container, network namespace,
+address lease or intent record existed for that executor.
+
+Here's how it got there. A reusable executor's cgroup has two levels: the
+slot group, and inside it the runtime's `helper` leaf and the pool's `task`
+leaf. The runtime owns the helper, so retiring the container removes it. The
+slot group belongs to the pool, which removes it when it retires the
+executor. Kill Bun and the pool dies with it. The restarted Bun's startup
+retirement stops the old executors and removes everything the runtime owns,
+the startup sweep forgets their records, and the slot group stays where it
+is. It goes only when the new pool starts an executor in that slot and later
+retires it. The pool picks the lowest free slot, so slot 3 is only used when
+four tasks run at once, and under the soak's job load that took anything from
+forty seconds to over five minutes. So the time to settle wasn't creeping up
+from one candidate to the next. It depended on which slot had been left
+behind, and on when the load next needed it.
+
+Raising the budget would have hidden a real leak. The cleanup Bun actually
+has to do takes seconds. The startup sweep now also removes this node's slot
+groups when no launch in a complete runtime inventory owns them:
+
+```rust
+let path = slot.path();
+if removed(&path.join("task")) && removed(&path.join("helper")) && removed(&path) {
+    count += 1;
+}
+```
+
+`removed` is a closure that counts a missing directory as removed. The sweep
+only ever calls `remove_dir`, which is `rmdir`, and the kernel refuses to
+remove a cgroup that still holds processes or child groups. So a slot that's
+somehow still in use stays put, with no extra check needed. Without a
+complete inventory nothing proves a slot vacant, and the sweep leaves them
+all. The unit test stands in for the cgroup tree with plain directories, and
+it failed before the change. The privileged leader-loss test now also checks
+that the lost node leaves no slot groups behind once its sweep has run.
+
+The soak harness made this harder to see than it needed to be. Its inventory
+reported the leftover as `invalid owner JSON`, the same words as #946, which
+we'd read as a torn write. The record wasn't torn. It wasn't there at all.
+The reader wrapped every failure (missing, unsafe, too big) in that one
+message, because its own error type inherits from Python's `ValueError`, and
+that's what the JSON decoder raises too. Now only a record that was read and
+doesn't parse is called invalid JSON, and the message carries its path, size
+and first and last bytes. A slot group with no record says so.
 
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
@@ -2030,6 +2209,8 @@ dozens of cold executors read manifests from `public.ecr.aws` at once. Its
 anonymous rate limit answered `TOOMANYREQUESTS`. The registry client retried
 that four times with backoff, which is the 7.8 seconds, and then gave up. An
 image that can't be pulled is a `SpawnFailed`, so the task failed for good.
+(Until #889, that is: "A task that failed before it ran", below, splits that
+outcome in two.)
 
 The test now refuses to start without the mirror and says why. The real bug
 was that nobody could see any of this. The pool's `SpawnFailed` carried its
@@ -2727,6 +2908,104 @@ job evidence, stale heartbeats, orphaned owners or incomplete drain fail the
 release verdict. Drain begins inside the last two minutes, with no new settle
 allowance.
 
+The first soak to get past setup with all of this switched on (0.2.0
+candidate 3) failed every heavy check, and the cluster had nothing to do with
+it. The harness stamps a snapshot's `meta.json` and only then asks the three
+guests for their inventories, so a proof stamped four seconds later looked
+like one from the future, and "stale" really meant "too fresh". Every
+recovery waits for a clean check, so most faults then "didn't settle" either.
+The snapshot now records when its collection ended, and a proof counts if it
+was taken between 90 seconds before the snapshot started and that moment, plus
+two seconds for two clocks rounding to whole seconds (#887).
+
+The same run found a second trap. One task failing in ordinary work raised
+the same error on every poll, so its run never left the controller. The final
+drain ran out of time and the controller's heartbeat went stale for the rest of
+the run, failing every check after it. Now the failure is reported once, with
+the failed task's attempts, exit code and first line of output, and the run
+stays in the campaign only until it drains (#888). That detail matters: a
+run's results expire after an hour, and by the time anyone looked, the cause
+of that one failure was gone (#889).
+
+Candidate 4 failed 17 times, and three of the causes were the harness again.
+The worst was a list. #909 taught Bun a sixth retry cause, `launch`, for an
+image pull a registry rate-limits, and the controller still summed five. The
+first launch retry made run 2 "not add up" on every poll, so it never drained,
+and that one stuck error failed every settle for the next hour. The cause
+names now live in one Python tuple that validation, the totals and the record
+all read. A test reads the `RetryCauses` struct out of
+`src/meat/task_array_state.rs` and fails when the two disagree, and a summary
+naming a cause the harness has never heard of is refused by that name, not as
+a sum that's mysteriously off (#942).
+
+The other two were the checker asking for things it couldn't have. Light
+checks run every 30 seconds and never ask the guests anything, yet the
+checker demanded a kernel inventory from them outside fault windows. Now only
+settle and heavy checks, which collect one, have to show it (#943). And the
+veth count caught Bun mid-setup: `ip link add` creates the pair with the
+container side still in the host namespace, under a temporary name
+`vtc-<hash>`, and the next command moves it into the task's netns. An
+inventory taken between the two saw one veth too many. The checker now
+computes that name for every owner the job inventory proves live (the same
+wrapping `h * 31 + byte` hash the runtime uses) and excuses it once. A peer
+still there at the next inventory isn't mid-setup any more, so it counts
+(#944). Replaying candidate 4's 408 snapshots through the fixed checker
+removed the light-check inventory findings and the veth findings and changed
+nothing else.
+
+Candidate 5 failed because of a single poll. This time the product was wrong,
+though no task ran twice. Thirty seconds after the leader was killed, node 3
+reported one verified command and zero callers for a shared-runc run. Only a
+caller can start a command, so the controller refused the summary. The error
+stayed for the rest of the run and failed every settle after it. The node had
+built its answer from samples taken at different moments. First it counted
+the pool slots whose command had started, which takes the pool's slot lock.
+Then it awaited three more samples that take the same lock. Only after those
+did it read the run's `running` counter. The run's commands take a few
+milliseconds, so one could finish in that gap. Its caller vacated the slot
+and decremented the counter, and the next caller hadn't counted itself yet.
+Each number was true when it was read, but not at the same moment.
+
+The fix reads both at the same moment. `ReusablePool::command_activity`
+counts the started commands and loads the callers counter in one hold of the
+slot lock. The counter is a plain `AtomicU64` updated with
+`Ordering::Relaxed`, which on its own promises nothing about the order of any
+other memory access, so the lock has to supply the ordering. A caller
+increments the counter before it takes the lock to check a slot out. It
+decrements it only after it has taken the lock again to vacate that slot.
+Suppose the sampler holds the lock and sees a slot's command running. That
+caller's increment has already happened, because it came before the caller's
+earlier hold of the lock. Its decrement can't have happened yet, because it
+comes after the caller's next hold. This is the C++ memory model, which Rust's
+atomics follow: releasing a mutex *synchronises with* the next acquire, and
+that edge carries every write made before it, relaxed or not. A unit test
+runs a caller through thousands of start-and-vacate cycles on one worker
+thread while another thread samples. It fails if any sample counts more
+commands than callers. Before the fix it failed (#950).
+
+Candidate 6 failed 33 times, and 693 of its 695 settle checks carried the
+same single finding. It was the harness again, and the timing was almost
+comic. Shared-runc run 15 is the fixture that's meant to fail: one task,
+exit 7, two attempts. It finished at about 11:25:29, the same second the
+soak killed Bun on node 1 with `kill -9`, and node 1 held the run's one
+result row. Four seconds later the controller asked the leader for that row.
+The leader couldn't reach node 1, so it listed it under `unreachable`, which
+is exactly what that field is for. The controller treated any unreachable
+node as missing evidence and recorded a permanent "failure result
+incomplete". By the next snapshot, nine seconds on, it had read the row and
+accepted it, but the error stayed, and every recovery for the next three
+hours "didn't settle". The job campaign stops at a fixed time, so with each
+settle eating its full five minutes, no fault reached node 3 before the
+campaign ended. That produced three more "missing coverage" findings.
+
+Now a page that names an unreachable node leaves the run in the campaign,
+and the controller reads it again on the next poll. The run fails only if
+the node is still unreachable after 600 seconds, the soak's longest settle
+budget, and the error then names the node and how long it was out.
+Replaying candidate 6's snapshots through the checker without that error
+turned every one of the 26 settle timeouts into a clean settle within 40
+seconds of its fault (#954).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work
@@ -2778,19 +3057,21 @@ pub struct RetryCauses {
     pub signal: u64,
     pub timeout: u64,
     pub unknown: u64,
+    pub launch: u64,
     pub unrecorded: u64,
 }
 
 impl RetryCauses {
     pub fn total(&self) -> Option<u64> {
-        [self.signal, self.timeout, self.unknown, self.unrecorded]
+        [self.signal, self.timeout, self.unknown, self.launch, self.unrecorded]
             .into_iter()
             .try_fold(self.exit_code, u64::checked_add)
     }
 }
 ```
 
-Five numbers per chunk, never a row per task. `try_fold` walks the array with
+Six numbers per chunk, never a row per task (`launch` came later, for the
+failure in the next section). `try_fold` walks the array with
 an accumulator and stops at the first `None`, and `u64::checked_add` returns
 `None` on overflow, so `total()` can't wrap around to a small number the way
 an unsigned `a + b` does in C (and in a Rust release build, where overflow
@@ -2830,6 +3111,157 @@ same scenario and fails on a drop beyond `--tolerance`. A different window or
 concurrency makes the verdict informational, because comparing unlike runs is
 how the misleading numbers above happened. The five-round rerun's forty reports
 are committed as the first baselines.
+
+### A task that failed before it ran
+
+Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of
+hundreds, on its *first* attempt. The run allowed three, and it retried none.
+Node 2 was powered off at the time and node 3 was logging pull-through cache
+fallbacks: `registry leader refused proposal: 503 Service Unavailable`. And
+that was all we had. Bun didn't log a failed attempt's reason, the harness
+didn't fetch it, and the run's details expired after an hour (#889).
+
+The code told us more than the logs. In `TaskAttempts::run`, every outcome
+except one went back round the retry loop. That one was `SpawnFailed`, whose
+doc comment said "The process couldn't be started. Retrying can't fix that."
+That's true of a binary that doesn't exist. But the fresh-runc path turned
+*every* error before the command was authorised to start into `SpawnFailed`:
+the namespace policy lease, `runtime.create` (which pulls the image), egress
+enforcement, address publication and capture reset. An image pull that hit a
+registry mid-election cost the task all of its attempts. It's the same mistake
+the reusable pool had made with a slow `runc state` call, earlier in this
+chapter, one layer up.
+
+The maintainer's rule was short. An attempt whose launch fails on an image pull
+or a registry error is transient, and retries against `max_attempts` like any
+other failed attempt. A spec that is invalid or unsupported is permanent, and
+fails at once. Either way Bun logs the error, and the task keeps it.
+
+So `SpawnFailed` is gone, and the one outcome became two:
+
+```rust
+pub enum AttemptOutcome {
+    // ...
+    /// The attempt was refused before its command ran, because the job's
+    /// spec is invalid or unsupported here.
+    Refused { reason: String },
+    /// The runtime, the host or a registry failed before the command ran.
+    LaunchFailed { reason: String },
+    // ...
+}
+```
+
+`is_retryable` lists `LaunchFailed` beside exits, signals, timeouts and unknown
+outcomes, and leaves `Refused` out. Because it's a new enum variant, every
+`match` on `AttemptOutcome` stopped compiling until it said what to do with it.
+The retry-cause counter was one of them, which is how `RetryCauses` grew its
+`launch` field. In C, a `switch` with a forgotten `case` compiles happily, and
+here the gap would have been quiet: the chunk summary files any retry it can't
+explain under "not recorded across a restart", so a registry outage would have
+looked like a node restart.
+
+The harder question is which errors are which. We didn't want to match on
+error strings, so the classification lives on the types. `GrillError`, the
+runtime's error, answers one question:
+
+```rust
+pub fn refuses_spec(&self) -> bool {
+    matches!(
+        self,
+        Self::ImagePull(
+            image::ImageError::InvalidReference(_) | image::ImageError::InvalidConfig { .. }
+        )
+    )
+}
+```
+
+The `|` inside a pattern means "either of these", and `{ .. }` matches a struct
+variant whatever its fields hold. An image reference that doesn't parse, or an
+image whose digest-verified config isn't valid, will fail the same way every
+time. Everything else (a manifest or layer pull, a digest mismatch, a full
+disk while unpacking, a runc call, network setup) is the runtime or the host,
+and a later attempt may get past it.
+
+0.2.1 gave the runtime refusals of its own, found before anything is pulled
+or started: a binary that's missing or not executable (#881, #905), a spec
+with nothing to run, and an image on a node started with `--runtime process`,
+which runs only host processes (#914). They come back as
+`GrillError::LaunchRefused`, carrying a `LaunchProblem` that says which. Each
+is the spec's fault as surely as a bad image reference, so `refuses_spec`
+gained a third arm, `Self::LaunchRefused { .. }`. Without it, a job whose
+image can't run on a process-only node would have been launched
+`max_attempts` times, refused for the same reason each time.
+
+What about errors that could be either? A runc failure might be a bug in the
+spec or a busy host. A full disk might clear in a minute. We picked "retry"
+as the default, for two reasons. Every one of these errors happens before the
+command is authorised to start, so a retry can't run the user's command twice.
+And the retry is bounded: the existing backoff, cancellation and
+`max_attempts` all apply, so a fault that persists costs at most two more
+launches of a three-attempt task. Failing a task for good on a transient fault
+loses the work. Retrying a doomed one costs a few hundred milliseconds.
+
+The fresh path's launch block had one error type, `GrillError`, and one refusal
+that isn't a runtime error at all: a job whose namespace credentials were
+revoked while it waited. A small private enum gives it a home:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+enum LaunchError {
+    #[error(transparent)]
+    Runtime(#[from] crate::grill::GrillError),
+    #[error("{0}")]
+    Refused(&'static str),
+}
+```
+
+`#[from]` makes `thiserror` write a `From<GrillError>` impl, so the `?` on
+`self.runtime.create(&id, &oci).await?` still works inside the block: `?`
+calls `From::from` on the error before returning it. `#[error(transparent)]`
+passes `Display` straight through to the wrapped error. One method,
+`LaunchError::outcome(authorised)`, then picks `Unknown` once the command was
+authorised (it may have run), `Refused` for a refusal or a spec the runtime
+won't accept, and `LaunchFailed` for the rest.
+
+The reusable pools already had `ExecutorError::is_transient` for their own
+cold-start retry. Two changes made it agree. A runtime error now asks
+`refuses_spec` instead of counting as transient wholesale, and a pull failure
+keeps its type instead of being flattened into a `Protocol` string. And a
+handful of errors that were filed as `Configuration`, "the job's fault", plainly
+weren't: "the slot's previous executor has not retired" is a slot racing its
+own retirement. They moved to a new `Unavailable` variant, which retries. When
+the helper can't `exec` the command it reports an `errno`, and
+`helper_spawn_outcome` refuses the task for the ones that mean the executable
+is missing or unusable (`ENOENT`, `EACCES`, `ENOEXEC` and friends) and retries
+the ones that mean the host is short of something (`EAGAIN`, `ENOMEM`,
+`EMFILE`).
+
+Then the cause. Every launch failure and refusal is now the attempt's output,
+so `relish batch logs` on a failed task says why, even when the command never
+ran. And Bun logs it:
+
+```
+batch 26 task 20 attempt 1/3: launch failed, will retry: image pull failed: ...
+```
+
+A million-task array whose image can't be pulled would write three million of
+those lines, so each array's pool logs at most twenty a minute and then
+counts. The next line it logs says how many it left out. The limiter's state
+sits behind a `std::sync::Mutex`, not tokio's: the critical section is a few
+integer updates in a synchronous call, and it's never held across an `.await`,
+which is the one thing that makes a blocking mutex dangerous in async code.
+
+The tests are unit tests for each layer: `refuses_spec` against every image
+error and a few runtime errors; the fresh path with a mock runtime whose
+`create` fails as a 503 pull (a launch failure, reason as output) and as an
+unparseable reference (a refusal); and the task pool, where a `FakeRunner`
+that always fails to launch is tried exactly `max_attempts` times, with every
+retry counted as `launch`, while a refusal runs once. Cancelling during the
+retry's backoff starts no further attempt, and a singleton without
+`replay_unknown` retries a launch failure at once, because unlike an unknown
+outcome there's nothing for an operator to decide. The portable suite runs the
+same through the API, Raft and the leader's chunk check:
+`a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once`.
 
 ## One budget, two schedulers
 
@@ -3127,6 +3559,13 @@ binding, then treated the `pending` instance with no PID as a running process
 missing one. The waiter now waits through non-running states but still fails
 at once if a known running process has no PID. We kept the cases separate, so
 fixing the test couldn't hide the real missing-PID bug it was written to catch.
+
+**"Couldn't start" isn't one thing.** A missing binary and a registry in the
+middle of an election both stop a command before it runs, and for a while we
+gave them the same name and the same fate. Ask whether the command could have
+run, then whether a second try could go differently. When you can't tell, and
+the command provably never ran, retry within the budget: that's cheap, and
+failing for good isn't.
 
 **Write the gate down before you run it.** Three documents had three
 different "million-task gates", so no run could have passed all of them. One

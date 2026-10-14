@@ -1625,3 +1625,64 @@ async fn a_restart_after_the_binary_vanished_ends_failed_with_binary_not_found()
     assert_eq!(failed.reason.as_deref(), Some(reason.as_str()));
     assert_eq!(failed.restart_count, 1, "one attempt, not the whole budget");
 }
+
+/// An executor pool forgets each retired executor as it goes idle, so
+/// several forgets of different generations run at once while the agent
+/// reads the inventory. The forgets share one garbage directory, and each
+/// sweeps the others' leftovers: one finishing another's deletion is not a
+/// failure (#924). A spurious error left the mixed runtime's route and lock
+/// files behind until the next restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_forgets_of_retired_generations_all_succeed() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(&directory.path().join("instances"));
+    // Without the fix, one round failed about one run in six on macOS and
+    // four rounds failed most runs.
+    for round in 0..4 {
+        let ids: Vec<_> = (0..16)
+            .map(|index| InstanceId(format!("default__executor-{round}-{index}")))
+            .collect();
+        for id in &ids {
+            grill.create(id, &spec("exit 0")).await.unwrap();
+            grill.start(id).await.unwrap();
+        }
+        for id in &ids {
+            stopped(&grill, id).await;
+        }
+        let forgets = ids.iter().map(|id| {
+            let grill = grill.clone();
+            let id = id.clone();
+            tokio::spawn(async move { grill.forget_retired(&id).await })
+        });
+        // The agent reads the inventory meanwhile. A launch forgotten while
+        // it reads has left, and is no reason to fail the read.
+        let reader = grill.clone();
+        let reads = tokio::spawn(async move {
+            loop {
+                if reader
+                    .launch_inventory()
+                    .await?
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Ok::<_, reliaburger::grill::GrillError>(());
+                }
+            }
+        });
+        for (id, forget) in ids
+            .iter()
+            .zip(futures_util::future::join_all(forgets).await)
+        {
+            forget
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{}: {error}", id.0));
+        }
+        reads.await.unwrap().unwrap();
+    }
+    let garbage = directory.path().join("instances/forgotten-process-owners");
+    let kept: Vec<_> = std::fs::read_dir(&garbage)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(kept.is_empty(), "{kept:?}");
+}

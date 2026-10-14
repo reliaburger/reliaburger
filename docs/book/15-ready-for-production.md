@@ -624,10 +624,11 @@ is just another flake.
 
 At first the gate was absolute: fail when any benchmark is more than twice as slow as the
 baseline. That held until the night of 12 October 2026, when five runs in a row failed it,
-on `main` and on the 0.2.1 train alike. Every benchmark was 1.4 to 2.1 times slower, including
-`index_set/insert_sequential_1m`, at 2.07 in each run, and nobody had touched that code. The
-runner was slow, not our code. Once the merge queue requires the final gate, that's every merge
-blocked by a cloud provider's bad night.
+on `main` and on the 0.2.1 train alike, and then blocked the 0.2.0 candidate build three
+times. Every benchmark was 1.4 to 2.1 times slower, including `index_set/insert_sequential_1m`,
+at 2.07 in each run, and nobody had touched that code. The runner was slow, not our code. Once
+the merge queue requires the final gate, that's every merge and every release blocked by a
+cloud provider's bad night.
 
 So now each run measures its own runner. `bench_baseline.py` takes each benchmark's ratio to
 the baseline, then divides it by the median ratio of the *other* benchmarks in the same run. A
@@ -5153,6 +5154,17 @@ recovery's first answer one step a turn, through the same
 `compact`), that every step with a write timed one, that the candidate timed
 its inventory read, and that `publish` timed its install and firewall sync.
 Issue #890 stays open until a soak's log line says which part it was.
+
+The next candidate's soak showed why the line matters. Its build predated
+this change, and node 3, about 11 s after the soak killed its Bun
+mid-deploy, took one `consumer_sync` turn of 5,292 ms. No other turn in the
+journals the harness kept took more than 510 ms. The view had five apps and
+the node three job runs in flight, so size was ruled out again. The
+inventory read and the firewall's cgroup reads both stop at the turn's 500
+ms deadline, so neither can account for five seconds. That leaves the fsync,
+a lock, or a runtime thread that didn't get to the loop. The new line
+separates them: it shows which timed part took the time, and if none of them
+did, then it was something the line doesn't time.
 
 #### A test that raced the clock
 
