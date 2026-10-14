@@ -59,6 +59,8 @@ FD_RISES = 3
 FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
+# Snapshot kinds that collect the guest inventories (collect in qualify-sustained.sh).
+INVENTORY_KINDS = ("settle", "heavy")
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
 # The agent loop's turn budget (docs/plans/2026-09-30-agent-loop-review.md,
 # decision 1): a tier fails if any node runs one turn longer than this. Bun
@@ -250,11 +252,16 @@ def rotation_findings(state, node, rotation_state, now):
     return []
 
 
-def leak_findings(baseline, current, baseline_instances, current_instances, node, job_inventory=None):
-    """Resources beyond the baseline plus the node's current instances."""
+def leak_findings(baseline, current, baseline_instances, current_instances, node, job_inventory=None,
+                  lingering=()):
+    """Resources beyond the baseline plus the node's current instances.
+
+    A live job owner's temporary setup peer (`vtc-<hash>`) is excused, unless
+    it is in `lingering`: present in the previous inventory too (#944)."""
     findings = []
     if job_inventory is not None:
         owned = job_soak_inventory.exemptions(job_inventory)
+        owned["veth"] |= owned["setup_peer"] - set(lingering)
         # Compare the reconciled kernel snapshot with exact live owner proofs.
         current = dict(current, **{kind:[v for v in values if v not in owned[kind]]
                                   for kind,values in job_inventory["resources"].items()})
@@ -663,10 +670,15 @@ def evaluate(evidence, snapshot):
                 except (job_soak_inventory.InvalidInventory,ValueError,KeyError,TypeError) as error:
                     problem=finding("job-inventory","info" if fault_window else "fail",str(error),node)
                     job_problems.append(problem); findings.append(problem)
+            lingering=state.get("setup_peers",{}).get(node,[])
+            if owned is not None:
+                # A setup peer lasts milliseconds; one seen by two inventories leaked.
+                state.setdefault("setup_peers",{})[node]=sorted(v for v in owned["resources"].get("veth",[]) if v.startswith("vtc-"))
             if by_node is not None and node in baseline:
                 leaks += leak_findings(baseline[node]["inventory"], inventory,
-                                       baseline[node]["instances"], by_node.get(node, []), node,owned)
-        elif jobs_enabled and not fault_window:
+                                       baseline[node]["instances"], by_node.get(node, []), node,owned,lingering)
+        elif jobs_enabled and not fault_window and meta.get("kind") in INVENTORY_KINDS:
+            # Light snapshots don't collect guest inventories (#943).
             problem=finding("job-inventory","fail","kernel/storage inventory missing",node)
             job_problems.append(problem); findings.append(problem)
         text = read(snapshot, f"export-{node}.txt")

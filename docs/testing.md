@@ -319,7 +319,9 @@ accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
 For the job qualification tiers they also parse `--plan` output (every node
 fault kind on every node in the fast tier, a day of them in the final one),
-the target-load bodies and rate gate, retry-cause accounting, CPU sampling
+the target-load bodies and rate gate, retry-cause accounting (the harness's
+cause list must match the fields of the product's `RetryCauses`, and an
+unknown cause is refused by name), CPU sampling
 across restarts and the `.jobs.json` report beside the record.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime

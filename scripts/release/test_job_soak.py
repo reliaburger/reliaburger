@@ -354,13 +354,66 @@ class TargetLoad(unittest.TestCase):
         self.campaign()
 
     def test_retry_causes_must_sum_to_retries_and_never_regress(self):
-        causes=dict(exit_code=1,signal=1,timeout=0,unknown=0,unrecorded=0)
+        causes=dict(exit_code=1,signal=1,timeout=0,unknown=0,launch=0,unrecorded=0)
         jobs.validate_summary(summary(4,retried=2,retry_causes=causes))
         with self.assertRaises(jobs.InvalidEvidence):
             jobs.validate_summary(summary(4,retried=3,retry_causes=causes))
         old=summary(4,retried=2,retry_causes=dict(causes,signal=1))
         with self.assertRaises(jobs.InvalidEvidence):
             jobs.validate_summary(summary(4,retried=2,retry_causes=dict(causes,signal=0,exit_code=2)),old)
+
+    def test_a_launch_retry_validates_and_counts(self):
+        # V02 candidate 4 (#942): an image pull hit a registry rate limit and
+        # Bun retried the launch. The summary said retried 1, launch 1.
+        causes=dict(exit_code=0,signal=0,timeout=0,unknown=0,launch=0,unrecorded=0)
+        old=summary(2,total=512,succeeded=187,retried=0,retry_causes=causes)
+        new=summary(2,total=512,succeeded=187,retried=1,retry_causes=dict(causes,launch=1))
+        self.assertEqual(jobs.validate_summary(new,old)["retried"],1)
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"regressed"):
+            jobs.validate_summary(summary(2,total=512,succeeded=187,retried=1,retry_causes=dict(causes,exit_code=1)),new)
+
+    def test_an_unknown_retry_cause_fails_loudly_by_name(self):
+        causes=dict(exit_code=0,signal=0,timeout=0,unknown=0,launch=0,unrecorded=0,quota=1)
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"unknown retry cause.*quota.*CAUSES"):
+            jobs.validate_summary(summary(4,retried=1,retry_causes=causes))
+
+    def test_a_missing_retry_cause_is_refused(self):
+        causes=dict(exit_code=1,signal=0,timeout=0,unknown=0,unrecorded=0)
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"launch"):
+            jobs.validate_summary(summary(4,retried=1,retry_causes=causes))
+
+    def test_harness_causes_match_the_product_retry_causes(self):
+        # The product's RetryCauses fields are the wire names (serde keeps
+        # them). A new cause there must be added to CAUSES here, or every
+        # summary that uses it is refused and the campaign wedges (#942).
+        import re
+        source=(Path(__file__).resolve().parents[2]/"src/meat/task_array_state.rs").read_text()
+        body=re.search(r"pub struct RetryCauses \{(?P<body>.*?)\n\}",source,re.S)
+        self.assertIsNotNone(body)
+        fields=re.findall(r"^\s*pub (\w+): u64,",body.group("body"),re.M)
+        self.assertEqual(sorted(fields),sorted(jobs.CAUSES))
+        self.assertIn("launch",jobs.CAUSES)
+
+    def test_launch_retries_accumulate_in_the_progress_totals(self):
+        class API(FakeAPI):
+            def __init__(self): super().__init__(); self.polls={}
+            def request(self,method,path,body=None):
+                if path=="/v1/jobs/runs": return super().request(method,path,body)
+                identity=int(path.split("/")[3])
+                request=next(v for v in self.posts if self.runs[(v["name"],v["request_id"])]==identity)
+                retried=self.polls[identity]=self.polls.get(identity,0)+1
+                template=request["definition"]["template"]
+                return summary(identity,total=request["definition"]["tasks"]["count"],succeeded=retried,retried=retried,
+                               retry_causes=dict(exit_code=0,signal=0,timeout=0,unknown=0,launch=retried,unrecorded=0),
+                               name=request["name"],runtime=template["runtime"],cpu_request_millicores=25,
+                               memory_request_bytes=int(template["memory"][:-2])<<20)
+        api=API(); c=jobs.Campaign(self.path,api,[],"token",load="target",target_rate=jobs.DEFAULT_TARGET_RATE)
+        for now in (100,101,102,103): c.step(now)
+        self.assertFalse(c.state["errors"])
+        self.assertEqual(c.state["progress"]["process"]["retry_causes"]["launch"],6)
+        c.state.update(stopped=True,stop_requested_at=103); c.publish(103)
+        report=jobs.report(json.loads((self.path/"snapshot.json").read_text()))
+        self.assertEqual(report["retry_causes"]["process"]["launch"],6)
 
     def test_retry_causes_accumulate_per_runtime_across_polls(self):
         class API(FakeAPI):
@@ -372,7 +425,7 @@ class TargetLoad(unittest.TestCase):
                 retried=self.polls[identity]=self.polls.get(identity,0)+1
                 template=request["definition"]["template"]
                 return summary(identity,total=request["definition"]["tasks"]["count"],succeeded=retried,retried=retried,
-                               retry_causes=dict(exit_code=retried,signal=0,timeout=0,unknown=0,unrecorded=0),
+                               retry_causes=dict(exit_code=retried,signal=0,timeout=0,unknown=0,launch=0,unrecorded=0),
                                name=request["name"],runtime=template["runtime"],cpu_request_millicores=25,
                                memory_request_bytes=int(template["memory"][:-2])<<20)
         api=API(); c=jobs.Campaign(self.path,api,[],"token",load="target",target_rate=jobs.DEFAULT_TARGET_RATE)
