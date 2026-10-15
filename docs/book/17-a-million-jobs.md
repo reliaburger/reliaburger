@@ -2878,9 +2878,9 @@ that placement is the bug from the opening paragraph, just rarer.
 
 `try_acquire` doesn't queue (an app replica waiting behind task attempts would
 just be the same outage, slower), so the agent turns the refusal into
-evidence. When a fresh deploy fails with `BunError::Capacity`, it records the
-app's name and namespace with a timestamp; a successful deploy clears the
-entry, and an entry older than a minute drops out of the reports. The next
+evidence. When an admission fails with `BunError::Capacity`, it records the
+app's name and namespace, and a successful admission of the same app clears
+the entry. The next
 `StateReport` carries a `CapacityRefusal`, `build_cluster_cache` copies it into
 the scheduler's cache, and the rule that decides whether a committed placement
 stays put learns one more reason to say no:
@@ -2908,6 +2908,36 @@ cluster whose executors share their agents' budgets, fills one node with an
 array, and deploys a three-replica app. Both tests fail without the fix,
 which we checked by switching the addition off and watching the replica land
 on the full node, and pass with it.
+
+That covered half the problem, and the 0.2.0 candidate 7 jobs soak found the
+other half (#967). A `frontend` replica stayed missing for twenty minutes on a
+node whose budget the job campaign had filled, and the leader said nothing
+about it. Only the fresh-deploy path recorded a refusal. This replica was
+being added beside two that already ran, through `AddAppReplicas`, and a
+rolling or blue-green replacement reserves its new instance through
+`ReserveRollingInstance`. Both returned `BunError::Capacity` without a word to
+the report, so the leader's `keeps` saw a node with an unchanged request and
+called the app converged. Now all three operations hand their result to one
+helper, `note_admission`, which records a capacity refusal, clears the record
+on success and leaves it alone on any other error. A future path that leases
+app replicas needs one line, not a copy of the `match`.
+
+The timestamp went too. A refusal used to drop out of the reports after a
+minute, but the node's deploy retries back off to five minutes, so for four
+minutes in every five the leader saw no refusal and kept the placement. We
+could have raised the limit to the longest backoff plus a margin, but any
+fixed limit is a guess about another module's constant. Instead
+`capacity_refusals` became a `HashSet<(String, String)>`, and an entry lasts
+until something actually changes: an admission of that app succeeds here, or
+the app is stopped or retired here, which is what happens when the leader
+moves it away. Clearing it on retirement matters. A refusal left behind after
+the move would make the leader move the app off this node again the next time
+it placed it here, even with plenty of room.
+
+The candidate 7 error message also read `gpus=4294967295`. That's
+`u32::MAX`, which the node's budget holds as its GPU capacity because GPUs are
+admitted by a separate check. It looked like a corrupt counter, so the message
+now leaves GPUs out unless the app asks for some.
 
 ### Retiring the batch engine from Chapter 12
 
