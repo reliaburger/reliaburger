@@ -70,7 +70,7 @@ pub enum BunError {
     BatchCapacity(String),
 
     /// Admission could not reserve all requested resource dimensions.
-    #[error("node capacity cannot admit {requested}; available {available}")]
+    #[error("{}", capacity_refusal(.requested, .available))]
     Capacity {
         requested: crate::meat::Resources,
         available: crate::meat::Resources,
@@ -243,6 +243,65 @@ impl BunError {
             BunError::Grill(error) => error.launch_problem(),
             _ => None,
         }
+    }
+}
+
+/// The message for [`BunError::Capacity`]. A node's budget doesn't limit
+/// GPUs (GPU admission is a separate check), so it holds `u32::MAX` of them.
+/// Printing that read as a corrupt value, so the GPU count shows only when
+/// the request asks for GPUs.
+fn capacity_refusal(
+    requested: &crate::meat::Resources,
+    available: &crate::meat::Resources,
+) -> String {
+    let text = |resources: &crate::meat::Resources| {
+        let cpu_and_memory = format!(
+            "cpu={}m mem={}Mi",
+            resources.cpu_millicores,
+            resources.memory_bytes / (1024 * 1024)
+        );
+        if requested.gpus == 0 {
+            cpu_and_memory
+        } else {
+            format!("{cpu_and_memory} gpus={}", resources.gpus)
+        }
+    };
+    format!(
+        "node capacity cannot admit {}; available {}",
+        text(requested),
+        text(available)
+    )
+}
+
+#[cfg(test)]
+mod capacity_message_tests {
+    use super::BunError;
+    use crate::meat::Resources;
+
+    /// #967: the refusal printed `gpus=4294967295`, the budget's
+    /// unlimited-GPU value, for an app that asked for none.
+    #[test]
+    fn capacity_refusal_leaves_out_gpus_the_app_does_not_request() {
+        let error = BunError::Capacity {
+            requested: Resources::new(100, 32 << 20, 0),
+            available: Resources::new(95, 6 << 20, u32::MAX),
+        };
+        assert_eq!(
+            error.to_string(),
+            "node capacity cannot admit cpu=100m mem=32Mi; available cpu=95m mem=6Mi"
+        );
+    }
+
+    #[test]
+    fn capacity_refusal_shows_gpus_when_the_app_requests_them() {
+        let error = BunError::Capacity {
+            requested: Resources::new(100, 32 << 20, 2),
+            available: Resources::new(95, 6 << 20, 1),
+        };
+        assert_eq!(
+            error.to_string(),
+            "node capacity cannot admit cpu=100m mem=32Mi gpus=2; available cpu=95m mem=6Mi gpus=1"
+        );
     }
 }
 

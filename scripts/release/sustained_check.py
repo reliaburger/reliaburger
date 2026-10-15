@@ -35,6 +35,7 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import statistics
 import sys
 import time
 import job_soak
@@ -50,6 +51,13 @@ WTF_WARNING_LIMIT = 600
 NO_LEADER_LIMIT = 30
 RSS_WARMUP = 3600
 RSS_GROWTH = 1.25
+# Recorded job-cost targets for a soak (maintainer decision, 15 October 2026,
+# #668). A Bun process's steady-state RSS is the median of the samples taken
+# once it has been seen for BUN_STEADY_AFTER seconds.
+BUN_STEADY_AFTER = 600
+API_BUN_RSS_TARGET_MIB = 512
+BUN_RSS_TARGET_MIB = 384
+TASK_ARRAY_STORAGE_TARGET_MIB = 64
 # A leak-fd window: floors over 10-minute buckets after a 10-minute warm-up,
 # each at least FD_STEP above the last, 25% up overall. Bun images rarely
 # live more than two hours in the soak, so the window has to be short.
@@ -514,14 +522,28 @@ def read_json(snapshot, name):
         return None
 
 
-def job_findings(evidence, snapshot, now, fault_window):
+def job_findings(evidence, snapshot, now, fault_window, state=None):
+    """The job campaign's findings for one snapshot. The campaign keeps each
+    error it records for the whole run, so a check fails on an error only
+    the first time it sees it; after that it is `info`, and the final
+    verdict still fails on it through `job_soak.coverage_failures` (#968)."""
     metadata=read_json(evidence,"metadata.json") or {}
     if metadata.get("job_soak") is not True: return []
     value=read_json(snapshot,"jobs.json")
     problems=job_soak.findings(value,now,fault_window)
     if value and value.get("stopped") and now < metadata.get("job_stop_at",now):
         problems.append("job controller stopped before the final drain interval")
-    return [finding("jobs", "fail", item) for item in problems]
+    errors=set(value.get("errors",[])) if isinstance(value,dict) else set()
+    reported=state.setdefault("job_errors_reported",[]) if state is not None else []
+    result=[]
+    for item in problems:
+        if item in errors and item in reported:
+            result.append(finding("jobs","info","reported earlier: "+item))
+            continue
+        if item in errors and state is not None:
+            reported.append(item); state["job_errors_reported"]=reported[-64:]
+        result.append(finding("jobs","fail",item))
+    return result
 
 
 def collection_end(snapshot, meta, now):
@@ -628,8 +650,10 @@ def evaluate(evidence, snapshot):
     baseline = state.get("baseline", {})
     leaks = []
     jobs_enabled=(read_json(evidence,"metadata.json") or {}).get("job_soak") is True
-    job_problems=job_findings(evidence,snapshot,now,fault_window)
-    findings += job_problems
+    job_found=job_findings(evidence,snapshot,now,fault_window,state)
+    findings += job_found
+    # An error reported by an earlier check doesn't hold back this settle.
+    job_problems=[item for item in job_found if item["severity"]!="info"]
     for node in expected_nodes:
         diagnostics = read_json(snapshot, f"diagnostics-{node}.json")
         if diagnostics is not None:
@@ -762,7 +786,12 @@ def turn_findings(state, node, samples):
 
     The buckets count from the bun process's start, so the check remembers
     what it last saw per branch, and starts again from zero when the process
-    changes (a kill, an upgrade's exec), as the resource trends do."""
+    changes (a kill, an upgrade's exec), as the resource trends do.
+
+    On the node whose writes the soak throttles (`node-slow-fsync`), a turn
+    that journals is slow by construction: those turns are info, and stay out
+    of the record's over-budget count, while the window lasts (#972)."""
+    throttled = state.get("window") == "node-slow-fsync" and state.get("window_node") == node
     buckets = turn_buckets(samples)
     resources = state.get("resources", {}).get(node, {})
     process = [resources.get("pid"), resources.get("image")]
@@ -787,8 +816,11 @@ def turn_findings(state, node, samples):
                       if buckets.get((branch, bound)) == total), "+Inf")
         lower = {"2.5": "1", "5": "2.5", "10": "5", "+Inf": "10"}[worst]
         span = f"over {lower} s" if worst == "+Inf" else f"between {lower} and {worst} s"
-        findings.append(finding("agent-loop-turn", "fail",
-                                f"{new} {branch} turn(s) over the 1 s budget, the worst {span}", node))
+        detail = f"{new} {branch} turn(s) over the 1 s budget, the worst {span}"
+        if throttled:
+            findings.append(finding("agent-loop-turn", "info", detail + ", during the injected slow-fsync fault", node))
+            continue
+        findings.append(finding("agent-loop-turn", "fail", detail, node))
         state.setdefault("turns_over_budget", {})[node] = state.get("turns_over_budget", {}).get(node, 0) + new
     return findings
 
@@ -915,18 +947,49 @@ def job_metric_samples(state, node, inventory, now):
                 metrics["executor_cpu_seconds"] += (usec - previous[group]) / 1e6
         metrics["executor_wall_seconds"] = metrics.get("executor_wall_seconds", 0) + now - since
     metrics["executor_mark"] = [helpers, now]
+    bun_rss_samples(metrics, inventory, pid, now)
+
+
+def bun_rss_samples(metrics, inventory, pid, now):
+    """Keep each Bun process's RSS samples for its steady state.
+
+    The inventory gives no start time, so a process is its boot, pid and
+    image (an upgrade execs in place: same pid, new image), timed from the
+    first snapshot that saw it. A sample counts towards the steady state once
+    the process has been seen for BUN_STEADY_AFTER seconds."""
+    rss = inventory_number(inventory, "bun_rss_kb")
+    if rss is None:
+        return
+    key = dict(boot=(inventory.get("boot") or [None])[0], pid=pid, image=(inventory.get("bun_image") or [None])[0])
+    processes = metrics.setdefault("bun_processes", [])
+    if not processes or any(processes[-1][name] != value for name, value in key.items()):
+        processes.append(dict(key, first_seen=now, peak_kb=rss, steady_kb=[]))
+    process = processes[-1]
+    process["peak_kb"] = max(process["peak_kb"], rss)
+    if now - process["first_seen"] >= BUN_STEADY_AFTER:
+        process["steady_kb"].append(rss)
 
 
 def job_host_metrics(state, accepted):
     """M8 measurements the guests' inventories give, recorded and never gated."""
     trends = state.get("trends", {})
+    # Node 1 serves the API the harness and the job controller talk to.
+    api_node = (state.get("nodes") or [None])[0]
     per_node = {}
     for node, metrics in sorted(state.get("job_metrics", {}).items()):
-        rss = trends.get(node, {}).get("rss_kb", {})
         logs = trends.get(node, {}).get("disk_kb logs", {})
         ledger = state.get("job_resources", {}).get(node, {}).get("peak_storage_kb", {}).get("task-arrays")
+        processes = [dict(boot=process["boot"], pid=process["pid"], image=process["image"], first_seen=process["first_seen"],
+                          steady_samples=len(process["steady_kb"]),
+                          steady_rss_mib=statistics.median(process["steady_kb"]) / 1024 if process["steady_kb"] else None,
+                          peak_rss_mib=process["peak_kb"] / 1024)
+                     for process in metrics.get("bun_processes", [])]
+        steady = [process["steady_rss_mib"] for process in processes if process["steady_rss_mib"] is not None]
         per_node[node] = dict(
-            bun_rss_growth_mib=(rss["max"] - rss["first"]) / 1024 if rss else None,
+            bun_processes=processes,
+            bun_steady_rss_mib=max(steady) if steady else None,
+            bun_peak_rss_mib=max((process["peak_rss_mib"] for process in processes), default=None),
+            bun_rss_target_mib=API_BUN_RSS_TARGET_MIB if node == api_node else BUN_RSS_TARGET_MIB,
             bun_cpu_cores=metrics["bun_cpu_seconds"] / metrics["bun_wall_seconds"] if metrics.get("bun_wall_seconds") else None,
             executor_helper_cpu_cores=metrics["executor_cpu_seconds"] / metrics["executor_wall_seconds"] if metrics.get("executor_wall_seconds") else None,
             retained_log_mb=logs.get("max", 0) * 1024 / 1e6 if logs else None,
@@ -934,11 +997,16 @@ def job_host_metrics(state, accepted):
     def worst(key):
         values = [row[key] for row in per_node.values() if row[key] is not None]
         return max(values) if values else None
+    # Targets differ by node, so the worst node is the one closest to its own.
+    measured = [(node, row) for node, row in per_node.items() if row["bun_steady_rss_mib"] is not None]
+    rss_node, rss_row = max(measured, key=lambda item: item[1]["bun_steady_rss_mib"] / item[1]["bun_rss_target_mib"], default=(None, None))
     logs = [row["retained_log_mb"] for row in per_node.values() if row["retained_log_mb"] is not None]
     ledgers = [row["peak_task_array_storage_mib"] for row in per_node.values() if row["peak_task_array_storage_mib"] is not None]
     return dict(per_node=per_node,
-                # The leader moves during the soak: the worst Bun bounds it.
-                leader_rss_growth_mib=worst("bun_rss_growth_mib"),
+                api_node=api_node,
+                bun_rss_worst=dict(node=rss_node, steady_rss_mib=rss_row["bun_steady_rss_mib"], peak_rss_mib=rss_row["bun_peak_rss_mib"],
+                                   target_mib=rss_row["bun_rss_target_mib"]) if rss_row else None,
+                # The leader moves during the soak: the busiest Bun bounds it.
                 leader_cpu_cores=worst("bun_cpu_cores"),
                 executor_overhead_cores_per_node=worst("executor_helper_cpu_cores"),
                 retained_log_mb=sum(logs) if logs else None,
@@ -1352,19 +1420,40 @@ def job_qualification_lines(report):
     wall = m8.get("million_task_array_wall_seconds") or {}
     rate = report.get("accepted_successes_per_second") or 0
     target = report.get("target_rate")
+    rss = m8.get("bun_rss_worst")
+    rss_observed = (f"{rss['node']}: {show(rss['steady_rss_mib'], ' MiB')} steady, {show(rss['peak_rss_mib'], ' MiB')} peak"
+                    if rss else "not measured")
+    rss_target = (f"≤ {rss['target_mib']} MiB" if rss else f"≤ {BUN_RSS_TARGET_MIB} MiB") + \
+        f" (≤ {API_BUN_RSS_TARGET_MIB} MiB on node 1, which serves the API)"
     lines = ["## Job qualification (D18-C)", "",
              f"Load: {report.get('load')}; {report.get('gate', {}).get('nodes', 0)} nodes; "
              f"accepted {rate:,.1f}/s" + (f" against a {target}/s target: {'PASS' if report.get('target_met') else 'FAIL'}" if target else " (calibration load: not gated)") + ".", "",
-             "| Measure (recorded, not gated) | Observed | September plan target |", "|---|---|---|",
+             "The September plan set its targets for one 1M-task batch on a quiet cluster. A soak runs for hours with "
+             "restarts, upgrades and apps, so its storage, Bun memory and Raft targets are restated (maintainer decision, "
+             "15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). Bun's steady state is the "
+             f"median RSS of each process once it has been seen for {BUN_STEADY_AFTER // 60} minutes; "
+             "the gated memory checks are unchanged (`leak-rss`, and Mayo's 70% `memory_high` alert through `wtf`).", "",
+             "| Measure (recorded, not gated) | Observed | Target |", "|---|---|---|",
              f"| Wall time of a 1,048,576-task array (median / max of {wall.get('runs', 0)}) | {show(wall.get('median'), ' s')} / {show(wall.get('max'), ' s')} | ≤ 600 s |",
              f"| p99 start lag, pooled executors | {show(m8.get('p99_start_lag_ms'), ' ms')} (bucket upper bound) | < 1,000 ms |",
-             f"| Raft entries per second, all writes | {show(m8.get('raft_entries_per_second'))} | ≤ 3 per second of batch, plus 1 |",
+             f"| Raft entries per second, all cluster writes | {show(m8.get('raft_entries_per_second'))} | recorded only; the batch target counts only task-array writes |",
              f"| Raft state of one run, largest seen | {show(m8.get('raft_state_bytes_max'), ' B')} | ≤ 256 KiB per 1M tasks |",
-             f"| Bun RSS growth, worst node | {show(m8.get('leader_rss_growth_mib'), ' MiB')} | ≤ 64 MiB (leader) |",
+             f"| Bun steady-state RSS per process, worst node against its target | {rss_observed} | {rss_target} |",
              f"| Bun CPU, busiest node | {show(m8.get('leader_cpu_cores'), ' cores')} | ≤ 1 core (leader batch control) |",
              f"| Executor helper CPU, busiest node | {show(m8.get('executor_overhead_cores_per_node'), ' cores')} | ≤ 0.5 core |",
-             f"| Node task-array storage per 1M accepted tasks (peaks summed) | {show(m8.get('node_ledger_mib_per_million_tasks'), ' MiB')} | ≤ 16 MiB, deleted after retirement |",
+             f"| Node task-array storage per 1M accepted tasks (peaks summed) | {show(m8.get('node_ledger_mib_per_million_tasks'), ' MiB')} | ≤ {TASK_ARRAY_STORAGE_TARGET_MIB} MiB, deleted after retirement |",
              f"| Retained log volume, all nodes | {show(m8.get('retained_log_mb'), ' MB')} | ≤ 50 MB |", ""]
+    for node, row in (m8.get("per_node") or {}).items():
+        if not row.get("bun_processes"):
+            continue
+        role = "serves the API" if node == m8.get("api_node") else "node"
+        lines.append(f"- Bun RSS on {node} ({role}, target ≤ {row['bun_rss_target_mib']} MiB): " + "; ".join(
+            (f"pid {process['pid']}: {show(process['steady_rss_mib'], ' MiB')} steady, {show(process['peak_rss_mib'], ' MiB')} peak"
+             if process["steady_rss_mib"] is not None else
+             f"pid {process['pid']}: {show(process['peak_rss_mib'], ' MiB')} peak (seen for under {BUN_STEADY_AFTER // 60} minutes)")
+            for process in row["bun_processes"]))
+    if any((row.get("bun_processes") for row in (m8.get("per_node") or {}).values())):
+        lines.append("")
     causes = report.get("retry_causes") or {}
     for mode in job_soak.MODES:
         if causes.get(mode):
@@ -1412,6 +1501,7 @@ def main(argv=None):
     window.add_argument("action", choices=["open", "close", "settled"])
     window.add_argument("label", nargs="?")
     window.add_argument("--down", type=int, default=0)
+    window.add_argument("--node", help="the node a node fault targets")
     for name in ("baseline", "evaluate"):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
@@ -1468,8 +1558,13 @@ def main(argv=None):
         if args.action == "open":
             state["window"] = args.label or "fault"
             state["nodes_down"] = args.down
+            if args.node:
+                state["window_node"] = args.node
+            else:
+                state.pop("window_node", None)
         else:
             state.pop("window", None)
+            state.pop("window_node", None)
             state["nodes_down"] = 0
             if args.action == "settled":
                 state["last_settled"] = int(time.time())

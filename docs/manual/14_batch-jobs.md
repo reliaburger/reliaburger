@@ -730,7 +730,9 @@ commands from other in-flight attempts (waiting for resources, preparing or
 settling). Reusable executors count a command from its authenticated start
 receipt until positive descendant cleanup. Counts reflect the last node sync,
 and each node reads its active commands and its in-flight attempts at the same
-instant, so a node never shows a verified command without its attempt;
+instant, so a node never shows a verified command without its attempt.
+The run's count includes each node only up to the tasks it holds now, so a
+powered-off node's last report never pushes it above the held tasks;
 unsupported backends show `unknown`, rather than treating a runtime launcher
 or a resource waiter as a running command. A mixed summary is unknown if any
 executing profile cannot supply that receipt. Detail remains indexed and bounded.

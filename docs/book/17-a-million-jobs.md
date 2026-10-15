@@ -3006,6 +3006,56 @@ Replaying candidate 6's snapshots through the checker without that error
 turned every one of the 26 settle timeouts into a clean settle within 40
 seconds of its fault (#954).
 
+Candidate 7 failed once, at its last heavy check, and the harness had caused
+it. The campaign drains two minutes before the soak's end, disabling its three
+cron definitions on the way. But a cycle that has started finishes, and this
+one's rolling deploy came 3½ minutes after the drain. That deploy applied the
+whole workloads file, job fixtures included. An apply is the desired state:
+it ran the `run_before` hooks and the plain jobs once more, and it put back
+every cron schedule the drain had just disabled. The checker then found node
+1 launching a cron occurrence and called it a leak after the drain. It
+wasn't a leak. Every owner was live work, correctly attributed, and gone 15
+seconds later. Now the harness leaves the job fixtures out of any apply once
+the drain is asked for, or within a minute of it, because an apply's schedules
+commit after its hooks. Apply doesn't delete job definitions a file leaves
+out, so they stay exactly as the drain left them (#963).
+
+Candidate 7's jobs fast tier then turned one refused summary into eight
+failures. A shared-runc run reported two active commands against one held
+task. The run-level count adds up what each node said at its last sync, and
+the leader keeps a silent node's view until it answers again. Node 3 had been
+powered off holding the run's last chunk with one command running. The leader
+took the chunk back after the silence timeout and granted it to node 1, which
+reported its own command. Node 3's last view still said one, so the sum said
+two. (We're inferring that last step: the controller kept the message but not
+the body.)
+
+The rule now is that a node counts for at most what the leader says it holds:
+
+```rust
+let holds = state
+    .held_by(&node.node)
+    .map_or(0, |chunks| state.tasks_in(chunks));
+sum.checked_add(node.counters.active_commands?.min(holds))
+```
+
+`held_by` returns an `Option`, `None` for a node with no grant, and
+`map_or(0, ...)` turns that into zero tasks. The `?` inside the closure
+returns `None` from the whole fold when a node can't count its commands, so
+the summary says "unknown" instead of guessing. Grants never overlap, so the
+clamped sum can't exceed `held`, however stale a view is. A node that lost
+its chunks counts for nothing; its command still shows up in
+`other_in_flight_attempts`, because the leader can't prove it has stopped.
+
+The harness half was the old problem from candidates 5 and 6: the campaign
+keeps every error for the whole run, and the checker failed every settle that
+saw one. Now the checker fails on a campaign error once, records it in its
+state, and shows it as `info` on later checks, so each later fault is judged
+on its own recovery. The final verdict still fails on it, because
+`coverage_failures` reads the campaign's errors. And the controller now saves
+the refused summary body under `jobs/refused/` beside the error, so the next
+refusal won't need inferring (#968).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work
@@ -3111,6 +3161,27 @@ same scenario and fails on a drop beyond `--tolerance`. A different window or
 concurrency makes the verdict informational, because comparing unlike runs is
 how the misleading numbers above happened. The five-round rerun's forty reports
 are committed as the first baselines.
+
+The September table also didn't transfer as cleanly as we'd hoped. Its targets
+describe one 1M-task batch on a quiet cluster, and a soak is nothing like that.
+Take "leader RSS growth at most 64 MiB". The record computed it as the highest
+sample minus the first, but over 90 minutes a node runs ten or so Bun
+processes: crashes, kills, an upgrade exec'ing in place. The first sample came
+from a process that had just started and the highest from a different one that
+had been serving apps for an hour, so the difference measured nothing. Now each
+process (its boot, pid and image, since an upgrade keeps the pid) gets its own
+steady state, the median of its samples once it has been seen for ten minutes,
+reported with its peak. The node serving the API (node 1, the one the harness
+and the job controller talk to) gets 512 MiB and the others 384 MiB, since
+the Raft leader can be any of them. Storage
+moved to 64 MiB per million, above the measured 45. And the Raft counter reads
+the council's commit index, so it counts every write in the cluster: app
+deploys, leases and certificate renewals as well as task arrays. Comparing that
+with a per-batch budget would be meaningless, so the row is recorded without a
+target until the evidence separates task-array writes. The maintainer settled
+these on 15 October 2026 ([#668](https://github.com/reliaburger/reliaburger/issues/668)).
+They're still recorded, never gated: a leaking Bun fails the soak through
+`leak-rss` and the wtf report, as before.
 
 ### A task that failed before it ran
 
@@ -3347,9 +3418,9 @@ that placement is the bug from the opening paragraph, just rarer.
 
 `try_acquire` doesn't queue (an app replica waiting behind task attempts would
 just be the same outage, slower), so the agent turns the refusal into
-evidence. When a fresh deploy fails with `BunError::Capacity`, it records the
-app's name and namespace with a timestamp; a successful deploy clears the
-entry, and an entry older than a minute drops out of the reports. The next
+evidence. When an admission fails with `BunError::Capacity`, it records the
+app's name and namespace, and a successful admission of the same app clears
+the entry. The next
 `StateReport` carries a `CapacityRefusal`, `build_cluster_cache` copies it into
 the scheduler's cache, and the rule that decides whether a committed placement
 stays put learns one more reason to say no:
@@ -3377,6 +3448,36 @@ cluster whose executors share their agents' budgets, fills one node with an
 array, and deploys a three-replica app. Both tests fail without the fix,
 which we checked by switching the addition off and watching the replica land
 on the full node, and pass with it.
+
+That covered half the problem, and the 0.2.0 candidate 7 jobs soak found the
+other half (#967). A `frontend` replica stayed missing for twenty minutes on a
+node whose budget the job campaign had filled, and the leader said nothing
+about it. Only the fresh-deploy path recorded a refusal. This replica was
+being added beside two that already ran, through `AddAppReplicas`, and a
+rolling or blue-green replacement reserves its new instance through
+`ReserveRollingInstance`. Both returned `BunError::Capacity` without a word to
+the report, so the leader's `keeps` saw a node with an unchanged request and
+called the app converged. Now all three operations hand their result to one
+helper, `note_admission`, which records a capacity refusal, clears the record
+on success and leaves it alone on any other error. A future path that leases
+app replicas needs one line, not a copy of the `match`.
+
+The timestamp went too. A refusal used to drop out of the reports after a
+minute, but the node's deploy retries back off to five minutes, so for four
+minutes in every five the leader saw no refusal and kept the placement. We
+could have raised the limit to the longest backoff plus a margin, but any
+fixed limit is a guess about another module's constant. Instead
+`capacity_refusals` became a `HashSet<(String, String)>`, and an entry lasts
+until something actually changes: an admission of that app succeeds here, or
+the app is stopped or retired here, which is what happens when the leader
+moves it away. Clearing it on retirement matters. A refusal left behind after
+the move would make the leader move the app off this node again the next time
+it placed it here, even with plenty of room.
+
+The candidate 7 error message also read `gpus=4294967295`. That's
+`u32::MAX`, which the node's budget holds as its GPU capacity because GPUs are
+admitted by a separate check. It looked like a corrupt counter, so the message
+now leaves GPUs out unless the app asks for some.
 
 ### Retiring the batch engine from Chapter 12
 

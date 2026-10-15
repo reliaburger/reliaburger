@@ -724,6 +724,41 @@ class AgentLoopTurns(Evidence):
         self.assertEqual(code, 1)
         self.assertIn("agent-loop-turn", self.failures(verdict))
 
+    def slow_fsync_window(self, node):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), "open", "node-slow-fsync", "--node", node])
+
+    def test_slow_turns_on_a_node_whose_disk_the_soak_throttles_are_info(self):
+        # The jobs tier caps one node's writes at 20 IOPS (#972): a turn that
+        # journals there is slow by construction, not a regression.
+        self.slow_fsync_window("rb-a-2")
+        code, verdict = self.evaluate(self.snapshot(**{
+            "inventory__rb-a-2_txt": INVENTORY,
+            "turns__rb-a-2_json": turns(branch="follow_up", over=("10",))}))
+        self.assertNotIn("agent-loop-turn", self.failures(verdict))
+        note = next(item for item in verdict["findings"] if item["check"] == "agent-loop-turn")
+        self.assertEqual(note["severity"], "info")
+        self.assertIn("injected slow-fsync", note["detail"])
+        self.assertNotIn("rb-a-2", checker.load_state(self.evidence).get("turns_over_budget", {}))
+
+    def test_slow_turns_on_another_node_still_fail_during_a_slow_fsync_fault(self):
+        self.slow_fsync_window("rb-a-1")
+        code, verdict = self.evaluate(self.snapshot(**{
+            "inventory__rb-a-2_txt": INVENTORY,
+            "turns__rb-a-2_json": turns(branch="follow_up", over=("2.5",))}))
+        self.assertEqual(code, 1)
+        self.assertIn("agent-loop-turn", self.failures(verdict))
+
+    def test_slow_turns_fail_again_once_the_slow_fsync_window_closes(self):
+        self.slow_fsync_window("rb-a-2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), "settled"])
+        code, verdict = self.evaluate(self.snapshot(**{
+            "inventory__rb-a-2_txt": INVENTORY,
+            "turns__rb-a-2_json": turns(branch="follow_up", over=("2.5",))}))
+        self.assertEqual(code, 1)
+        self.assertIn("agent-loop-turn", self.failures(verdict))
+
     def test_the_record_counts_turns_over_the_budget_per_node(self):
         self.evaluate(self.snapshot(**{"turns__rb-a-1_json": turns(over=("2.5", "5")),
                                        "turns__rb-a-2_json": turns()}))

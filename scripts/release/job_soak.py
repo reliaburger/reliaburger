@@ -311,9 +311,18 @@ class Campaign:
                               metrics=dict(million_wall_seconds=[], start_lag_ms_counts=[0]*16, state_bytes_max=0, raft=None))
             self.save()
     def save(self): atomic(self.path, self.state)
-    def error(self, message):
+    def error(self, message, refused=None):
+        """Record a campaign error once. `refused` is the summary body the
+        controller refused, kept next to the error so the refusal can be
+        diagnosed afterwards (#968)."""
+        message=message[:400]
         if message not in self.state["errors"]:
-            self.state["errors"].append(message[:400]); self.state["errors"] = self.state["errors"][-32:]
+            self.state["errors"].append(message); self.state["errors"] = self.state["errors"][-32:]
+            if refused is not None:
+                folder=self.directory/"refused"; folder.mkdir(mode=0o700,exist_ok=True)
+                saved=sorted(folder.iterdir())
+                if len(saved)<32:
+                    atomic(folder/("%02d.json" % len(saved)),dict(error=message,ts=int(time.time()),summary=refused))
         self.save()
     def prepare(self, mode, profile, purpose, now):
         key = mode + ":" + profile
@@ -438,8 +447,8 @@ class Campaign:
             answers = list(workers.map(lambda intent: self.attempt(poll,intent),intents))
         for intent, answer in zip(intents, answers):
             if answer is None: continue
+            kind, value = answer
             try:
-                kind, value = answer
                 if kind == "error": raise InvalidEvidence(value)
                 if kind == "admit":
                     identity=number(value,"batch_id")
@@ -517,7 +526,9 @@ class Campaign:
                 del self.state["active"][intent["mode"]+":"+intent["profile"]]
                 self.save()
             except Unavailable: pass
-            except (InvalidEvidence,KeyError,TypeError) as error: self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): {error}')
+            except (InvalidEvidence,KeyError,TypeError) as error:
+                self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): {error}',
+                           value if kind=="summary" else None)
         self.save(); self.publish(int(time.time()),fault)
         return not self.state["active"]
     def failure_cause(self, identity):
@@ -642,10 +653,11 @@ def report(snapshot):
             raft_entries_per_second=raft_rate,raft_leaders=raft.get("leaders",[]),
             raft_state_bytes_max=metrics.get("state_bytes_max") or None,
             targets=dict(million_task_array_wall_seconds=600,p99_start_lag_ms=1000,
-                         raft_entries_per_second="3 per second of batch runtime, plus 1",
-                         raft_state_bytes_per_million_tasks=256*1024,leader_rss_growth_mib=64,
+                         raft_entries_per_second="recorded only; the batch target counts only task-array writes",
+                         raft_state_bytes_per_million_tasks=256*1024,
+                         bun_steady_rss_mib=dict(api_node=512,other_nodes=384),
                          leader_cpu_cores=1,executor_overhead_cores_per_node=0.5,
-                         node_ledger_mib_per_million_tasks=16,retained_log_mb=50)))
+                         node_ledger_mib_per_million_tasks=64,retained_log_mb=50)))
 
 
 def coverage_failures(snapshot, nodes=(), kinds=FAULT_KINDS):
