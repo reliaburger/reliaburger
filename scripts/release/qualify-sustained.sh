@@ -683,9 +683,22 @@ wait_cluster() {
 }
 
 generation=0
+# Whether an apply may carry the job fixtures. Not once the campaign drains,
+# nor in the minute before (an apply's schedules commit after its hooks): an
+# apply re-registers each cron schedule the drain disabled and runs every
+# run_before hook and plain job once more, so a deploy-kill after the drain
+# ran job work the campaign never saw (#963). Leaving them out keeps the
+# definitions as the drain left them: apply doesn't remove absent jobs.
+jobs_applied() {
+    [ -f "$evidence/jobs/installed" ] && [ ! -f "$evidence/jobs/stop" ] || return 1
+    local stop_at
+    stop_at=$(meta_get job_stop_at)
+    [ -z "$stop_at" ] || [ $(( $(date +%s) + 60 )) -lt "$stop_at" ]
+}
+
 write_workloads() {
     sed "s/SOAK_GENERATION = \"[0-9]*\"/SOAK_GENERATION = \"$generation\"/" "$workloads_template" > "$evidence/workloads.toml"
-    [ ! -f "$evidence/jobs/installed" ] || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
+    ! jobs_applied || cat "$repository/scripts/release/sustained/soak-jobs.toml" >> "$evidence/workloads.toml"
 }
 
 apply_workloads() {

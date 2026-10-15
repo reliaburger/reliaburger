@@ -2512,6 +2512,20 @@ Replaying candidate 6's snapshots through the checker without that error
 turned every one of the 26 settle timeouts into a clean settle within 40
 seconds of its fault (#954).
 
+Candidate 7 failed once, at its last heavy check, and the harness had caused
+it. The campaign drains two minutes before the soak's end, disabling its three
+cron definitions on the way. But a cycle that has started finishes, and this
+one's rolling deploy came 3½ minutes after the drain. That deploy applied the
+whole workloads file, job fixtures included. An apply is the desired state:
+it ran the `run_before` hooks and the plain jobs once more, and it put back
+every cron schedule the drain had just disabled. The checker then found node
+1 launching a cron occurrence and called it a leak after the drain. It
+wasn't a leak. Every owner was live work, correctly attributed, and gone 15
+seconds later. Now the harness leaves the job fixtures out of any apply once
+the drain is asked for, or within a minute of it, because an apply's schedules
+commit after its hooks. Apply doesn't delete job definitions a file leaves
+out, so they stay exactly as the drain left them (#963).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work
