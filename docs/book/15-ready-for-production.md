@@ -4970,6 +4970,58 @@ a lock, or a runtime thread that didn't get to the loop. The new line
 separates them: it shows which timed part took the time, and if none of them
 did, then it was something the line doesn't time.
 
+#### A 503 is an answer, not a verdict
+
+Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`
+got "blob upload POST returned 503 Service Unavailable". No fault was active.
+The two registry cases just before it had pushed fine, nine seconds earlier.
+The journals said why. Starting a blob upload in a leased repository claims
+the repository through the council leader, and the leader answers a forwarded
+proposal only after `ensure_linearizable` confirms it's still the leader. For
+about a minute the leader, under the pulse's load, sometimes heard only itself
+back from its heartbeat round, so it refused, and Pickle passed the refusal on
+as 503. That's the registry failing closed, as designed: nothing was accepted,
+and asking again is safe. Why a healthy leader misses its heartbeat round is a
+product question, and it's issue #928's. The test's mistake was treating the
+answer as a verdict.
+
+`relish test` already knew this for leases: lease creation retries a 503
+"retry shortly" for 30 seconds. The registry pushes in `testkit::oci` now do
+the same. Each step reports how it failed:
+
+```rust
+enum WriteFailure {
+    Unavailable(String),
+    Refused(String),
+}
+```
+
+and one helper runs a whole write again while it's `Unavailable` and the
+window is open:
+
+```rust
+async fn retry_unavailable<F, Fut>(retry: RegistryRetry, mut write: F) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), WriteFailure>>,
+```
+
+The `where` clause says what the generic types must be. `F` is something we
+can call more than once (`FnMut`) that returns `Fut`, and `Fut` is a future
+that resolves to the attempt's result. An `async fn` call is exactly that kind
+of value, so a blob push passes `|| push_blob_once(http, base, repo, data,
+digest, lease_id)`, and each call starts a fresh attempt. A blob starts again
+from its POST rather than resuming. The registry's TTL reaper retires the
+abandoned session, and pushing the same digest twice stores it once.
+
+The step code barely changed. It already built its errors as `String`s with
+`?`, so `impl From<String> for WriteFailure` makes every one of those a
+`Refused`, and only an explicit 503 becomes `Unavailable`. A 403, a quota
+refusal or a broken `Location` header fails the case on the first attempt, as
+it should. `a_registry_write_refused_as_unavailable_is_pushed_again` runs a
+fake registry that refuses the first two upload starts and the first two
+manifest PUTs. It failed with the soak's exact message before the change.
+
 #### A test that raced the clock
 
 One more from the same week, outside the loop. `exec_request_is_sent_again_until_the_owner_listens`
