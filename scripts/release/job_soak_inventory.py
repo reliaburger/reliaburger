@@ -15,6 +15,12 @@ import subprocess
 import time
 
 LIMIT = 4096
+# Bun makes a cold host executor slot's cgroup before it publishes the slot's
+# owner record, and on a busy node the gap lasts seconds (#980). An attempt
+# that still finds errors waits before the next, 5 s in all; a cgroup that
+# never gets a record (#952) still fails.
+ATTEMPTS = 11
+PAUSE_SECONDS = 0.5
 class InvalidInventory(ValueError): pass
 
 
@@ -187,12 +193,13 @@ def collect(root):
     errors=[]; owners={}; resources={}
     # A disappearing owner/resource is normal churn. Recheck positive absence;
     # never excuse a still-present kernel object solely because its name fits.
-    for attempt in range(3):
+    for attempt in range(ATTEMPTS):
+        if attempt: time.sleep(PAUSE_SECONDS)
         # The lease journal is read like an owner record, so it gets the
         # same bounded retry before an unreadable one fails the scan (#946).
         try: resources=kernel(root)
         except InvalidInventory:
-            if attempt==2: raise
+            if attempt==ATTEMPTS-1: raise
             continue
         owners={}; errors=[]
         candidates=set(resources["runc"]+resources["lease"])
@@ -246,7 +253,7 @@ def collect(root):
             except (InvalidInventory,OSError) as error: errors.append(identity+": "+str(error))
         try: current=kernel(root)
         except InvalidInventory:
-            if attempt==2: raise
+            if attempt==ATTEMPTS-1: raise
             continue
         resources={kind:sorted(set(values)&set(current[kind])) for kind,values in resources.items()}
         alive=set(resources["runc"]+resources["lease"]+[n[3:] for n in resources["netns"] if n.startswith("rb-")])
