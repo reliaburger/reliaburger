@@ -522,14 +522,28 @@ def read_json(snapshot, name):
         return None
 
 
-def job_findings(evidence, snapshot, now, fault_window):
+def job_findings(evidence, snapshot, now, fault_window, state=None):
+    """The job campaign's findings for one snapshot. The campaign keeps each
+    error it records for the whole run, so a check fails on an error only
+    the first time it sees it; after that it is `info`, and the final
+    verdict still fails on it through `job_soak.coverage_failures` (#968)."""
     metadata=read_json(evidence,"metadata.json") or {}
     if metadata.get("job_soak") is not True: return []
     value=read_json(snapshot,"jobs.json")
     problems=job_soak.findings(value,now,fault_window)
     if value and value.get("stopped") and now < metadata.get("job_stop_at",now):
         problems.append("job controller stopped before the final drain interval")
-    return [finding("jobs", "fail", item) for item in problems]
+    errors=set(value.get("errors",[])) if isinstance(value,dict) else set()
+    reported=state.setdefault("job_errors_reported",[]) if state is not None else []
+    result=[]
+    for item in problems:
+        if item in errors and item in reported:
+            result.append(finding("jobs","info","reported earlier: "+item))
+            continue
+        if item in errors and state is not None:
+            reported.append(item); state["job_errors_reported"]=reported[-64:]
+        result.append(finding("jobs","fail",item))
+    return result
 
 
 def collection_end(snapshot, meta, now):
@@ -636,8 +650,10 @@ def evaluate(evidence, snapshot):
     baseline = state.get("baseline", {})
     leaks = []
     jobs_enabled=(read_json(evidence,"metadata.json") or {}).get("job_soak") is True
-    job_problems=job_findings(evidence,snapshot,now,fault_window)
-    findings += job_problems
+    job_found=job_findings(evidence,snapshot,now,fault_window,state)
+    findings += job_found
+    # An error reported by an earlier check doesn't hold back this settle.
+    job_problems=[item for item in job_found if item["severity"]!="info"]
     for node in expected_nodes:
         diagnostics = read_json(snapshot, f"diagnostics-{node}.json")
         if diagnostics is not None:

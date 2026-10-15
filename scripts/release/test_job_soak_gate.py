@@ -51,6 +51,49 @@ class Gate(unittest.TestCase):
             self.assertIn("# Sustained soak (V02): FAIL",(root/"report.md").read_text())
 
 
+class StoredCampaignError(unittest.TestCase):
+    """#968: the campaign keeps each error for the whole run. One refused
+    summary failed every later settle, so seven later faults read as
+    "did not settle" when the cluster had recovered from each."""
+
+    ERROR="shared-runc long work (2): invalid verified active commands"
+
+    def evaluate(self, root, ts):
+        import contextlib,io
+        snap=root/("snap-"+str(ts)); snap.mkdir()
+        (snap/"meta.json").write_text(json.dumps(dict(ts=ts,kind="settle",collected=ts+1)))
+        (snap/"status.json").write_text("[]")
+        (snap/"jobs.json").write_text(json.dumps(dict(heartbeat=ts,errors=[self.ERROR],active=[],progress={},
+                                                       stopped=False,resume_grace_until=10**10)))
+        clean=checker.settle_clean
+        checker.settle_clean=lambda *arguments: True
+        try:
+            with contextlib.redirect_stdout(io.StringIO()): code=checker.evaluate(root,snap)
+        finally:
+            checker.settle_clean=clean
+        verdict=json.loads((snap/"verdict.json").read_text())
+        return code,verdict["settle_clean"],[(item["severity"],item["detail"]) for item in verdict["findings"] if item["check"]=="jobs"]
+
+    def test_a_stored_error_fails_once_then_stops_blocking_settles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/"metadata.json").write_text(json.dumps(dict(job_soak=True,job_stop_at=10**10)))
+            checker.save_state(root,dict(nodes=[]))
+            code,clean,jobs_found=self.evaluate(root,1000)
+            self.assertEqual(code,1)
+            self.assertFalse(clean)
+            self.assertEqual(jobs_found,[("fail",self.ERROR)])
+            # An hour later, past the repeat window too: still no new failure,
+            # and the settle is judged on its own recovery.
+            for ts in (1100,1000+3600):
+                code,clean,jobs_found=self.evaluate(root,ts)
+                self.assertEqual(code,0)
+                self.assertTrue(clean)
+                self.assertEqual(jobs_found,[("info","reported earlier: "+self.ERROR)])
+            # The campaign record keeps it, so the final verdict still fails.
+            final=json.loads((root/("snap-"+str(1000+3600))/"jobs.json").read_text())
+            self.assertIn(self.ERROR,jobs.coverage_failures(final))
+
 
 def inventory_proof(ts, boot="b1"):
     return dict(schema=1,complete=True,ts=ts,boot=boot,prefix="a"*32,owners=[],errors=[],
