@@ -157,18 +157,51 @@ class Collection(unittest.TestCase):
         from unittest import mock
         with mock.patch.object(inventory,"kernel",side_effect=kernels), \
              mock.patch.object(inventory,"boot_id",return_value="boot"), \
-             mock.patch.object(inventory,"storage_kb",return_value=0):
-            return inventory.collect(self.root)
+             mock.patch.object(inventory,"storage_kb",return_value=0), \
+             mock.patch.object(inventory.time,"sleep") as sleep:
+            value=inventory.collect(self.root)
+        self.pauses=sleep.call_count
+        return value
+    def publish_host_owner(self, slot):
+        identity="default__executor-"+self.prefix+"-host-"+str(slot)
+        directory=self.root/"instances/process-owners"/identity
+        directory.mkdir(parents=True,mode=0o700)
+        record=dict(boot_id="boot",nonce="c"*32,phase={"state":"prepared"},
+                    launch={"instance_id":identity,"spec":{"linux":{"cgroupsPath":"/reliaburger/default/executor-"+self.prefix+"-host/"+str(slot)+"/helper"}}})
+        path=directory/"owner.json"; path.write_text(json.dumps(record)); path.chmod(0o600)
     def test_a_slot_cgroup_without_an_owner_record_is_named_as_such(self):
         # A killed Bun's executor was retired and forgotten, but its slot's
         # parent cgroup stayed (#952). There is no record to be invalid.
         leftover=dict(self.empty,cgroup=["default/executor-"+self.prefix+"-reuse/3"])
-        value=self.collect([leftover]*6)
+        value=self.collect([leftover]*(2*inventory.ATTEMPTS))
         self.assertEqual(value["errors"],["default__executor-"+self.prefix+"-reuse-3: resources without an owner record"])
+    def test_a_host_slot_whose_owner_record_is_published_after_the_quick_retries_is_not_reported(self):
+        # Bun makes a cold host slot's cgroup before it publishes the slot's
+        # owner record, and on a busy node that gap lasts seconds (#980).
+        starting=dict(self.empty,cgroup=["default/executor-"+self.prefix+"-host/3"])
+        scans=[]
+        def kernel(root):
+            scans.append(root)
+            if len(scans)==7: self.publish_host_owner(3)
+            return starting
+        value=self.collect(kernel)
+        self.assertEqual(value["errors"],[])
+        self.assertEqual([owner["id"] for owner in value["owners"]],["default__executor-"+self.prefix+"-host-3"])
+        self.assertGreater(self.pauses,0)
+    def test_a_host_slot_cgroup_that_never_gets_a_record_fails_after_the_grace(self):
+        leftover=dict(self.empty,cgroup=["default/executor-"+self.prefix+"-host/3"])
+        value=self.collect([leftover]*(2*inventory.ATTEMPTS))
+        self.assertEqual(value["errors"],["default__executor-"+self.prefix+"-host-3: resources without an owner record"])
+        self.assertEqual(self.pauses,inventory.ATTEMPTS-1)
+        self.assertGreaterEqual(self.pauses*inventory.PAUSE_SECONDS,5)
+    def test_a_clean_inventory_does_not_wait(self):
+        value=self.collect([self.empty]*2)
+        self.assertEqual(value["errors"],[])
+        self.assertEqual(self.pauses,0)
     def test_an_unreadable_lease_journal_is_retried_like_owner_records(self):
         value=self.collect([inventory.InvalidInventory("invalid owner JSON"),self.empty,self.empty])
         self.assertTrue(value["complete"])
         self.assertEqual(value["errors"],[])
     def test_a_lease_journal_unreadable_on_every_attempt_fails_the_inventory(self):
         with self.assertRaises(inventory.InvalidInventory):
-            self.collect([inventory.InvalidInventory("invalid owner JSON")]*6)
+            self.collect([inventory.InvalidInventory("invalid owner JSON")]*(2*inventory.ATTEMPTS))

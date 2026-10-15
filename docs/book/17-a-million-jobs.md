@@ -1406,6 +1406,20 @@ that's what the JSON decoder raises too. Now only a record that was read and
 doesn't parse is called invalid JSON, and the message carries its path, size
 and first and last bytes. A slot group with no record says so.
 
+That message then caught something that wasn't a leak. The eighth candidate's
+job soak failed one heavy check on a slot group with no record, but this time
+the slot was brand new (#980). A cold host executor slot gets its cgroup
+first, and its owner record only when the process owner prepares the launch,
+an fsync later. On a busy node that gap lasts seconds. The inventory already
+retried three times to ride out churn, but back to back, in a few
+milliseconds, so all three landed in the gap. Now an attempt that still finds
+errors waits half a second before the next, for five seconds in all. A
+leftover slot like #952's never gets a record, so it still fails, five
+seconds later. Settle checks had absorbed the same signature several times
+in earlier runs, because a settle waits for two clean checks in a row. A
+heavy check gets one go, which is why it took until the eighth candidate to
+fail a run.
+
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
 secrets catalogue skipped all its container tests. Now the classifier sees the
