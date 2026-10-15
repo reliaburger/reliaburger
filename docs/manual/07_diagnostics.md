@@ -144,7 +144,11 @@ workload identity, ingress, volumes, process workloads, jobs, the image
 registry and cluster coordination. Each case runs in its own leased `rbtest-*`
 namespace and cleans up after itself. While the council changes leader, the
 server refuses new leases with a 503 "retry shortly"; the runner asks again
-for up to 30 seconds before it gives up on the case. Job cases hold a job
+for up to 30 seconds before it gives up on the case. The image-registry cases
+do the same with the registry: a push the registry refuses with 503, because
+it can't confirm the write with the council leader just then, is made again
+every half second for up to 30 seconds. Any other refusal fails the case at
+once. Job cases hold a job
 lease: their jobs run through the cluster's common job lifecycle like any
 other job, and releasing the lease cancels their runs and forgets their
 definitions. With a council the lease itself lives in Raft, so any node can
