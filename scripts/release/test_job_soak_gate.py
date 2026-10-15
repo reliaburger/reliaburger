@@ -394,3 +394,54 @@ class JobQualification(unittest.TestCase):
                 self.assertTrue(script.strip(),(kind,action))
                 subprocess.run(["bash","-n","-c",script],check=True)
         self.assertIn("netem delay",function); self.assertIn("fallocate",function); self.assertIn("IOWriteIOPSMax",function)
+
+
+class DrainedCampaignApply(unittest.TestCase):
+    """#963: a rolling deploy after the job campaign drained re-applied the job
+    fixtures. That re-registered the cron schedules the drain disabled and ran
+    every run_before hook and plain job once more, so job work ran (and held
+    executor resources) after the campaign had positively drained."""
+
+    release=Path(__file__).parent
+
+    def write(self, metadata, stop_file=False, now=None):
+        import os,re,subprocess,time
+        source=(self.release/"qualify-sustained.sh").read_text()
+        functions="".join(re.search(rf"^{name}\(\) \{{.*?(?:^\}}\n|\}}\n)",source,re.S|re.M).group(0)
+                          for name in ("meta_get","jobs_applied","write_workloads"))
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); evidence=root/"evidence"; (evidence/"jobs").mkdir(parents=True)
+            (evidence/"jobs/installed").write_text("")
+            if stop_file: (evidence/"jobs/stop").write_text("")
+            (evidence/"metadata.json").write_text(json.dumps(metadata))
+            (root/"apps.toml").write_text('[app.soak-identity]\nenv = { SOAK_GENERATION = "0" }\n')
+            (root/"scripts/release/sustained").mkdir(parents=True)
+            (root/"scripts/release/sustained/soak-jobs.toml").write_text('[job.soak-job-cron-runc]\nschedule = "* * * * *"\n')
+            # The clock is the only thing faked: a shell function shadows date(1).
+            clock=f"date() {{ echo {now if now is not None else int(time.time())}; }}\n"
+            subprocess.run(["bash","-c",clock+functions+"write_workloads"],check=True,
+                           env=dict(PATH=os.environ["PATH"],HOME=directory,evidence=str(evidence),generation="7",
+                                    workloads_template=str(root/"apps.toml"),repository=str(root)))
+            return (evidence/"workloads.toml").read_text()
+
+    def test_the_job_fixtures_are_applied_while_the_campaign_runs(self):
+        text=self.write(dict(job_stop_at=10**10))
+        self.assertIn('SOAK_GENERATION = "7"',text)
+        self.assertIn("soak-job-cron-runc",text)
+
+    def test_the_job_fixtures_are_applied_before_a_stop_time_is_known(self):
+        self.assertIn("soak-job-cron-runc",self.write({}))
+
+    def test_no_job_fixture_is_applied_once_the_scheduled_stop_has_passed(self):
+        text=self.write(dict(job_stop_at=1000),now=2000)
+        self.assertIn('SOAK_GENERATION = "7"',text)
+        self.assertNotIn("soak-job",text)
+
+    def test_no_job_fixture_is_applied_in_the_minute_before_the_stop(self):
+        # An apply that starts just before the stop can commit its schedules
+        # after the campaign last disabled them.
+        self.assertNotIn("soak-job",self.write(dict(job_stop_at=2030),now=2000))
+        self.assertIn("soak-job",self.write(dict(job_stop_at=2061),now=2000))
+
+    def test_no_job_fixture_is_applied_after_an_explicit_stop(self):
+        self.assertNotIn("soak-job",self.write(dict(job_stop_at=10**10),stop_file=True))
