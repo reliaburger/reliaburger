@@ -606,7 +606,11 @@ the real `curl … | sh` install against it on every host we advertise.
    approximation. `qualify-jobs-sustained.sh` runs it through the same soak,
    with the job campaign at the target load and a node-level fault in every
    cycle (inter-node delay, a full disk, slow fsync). Faults stay node-level in
-   0.2.0 (D19-B): nothing targets an individual job.
+   0.2.0 (D19-B): nothing targets an individual job. While slow fsync caps a
+   node's writes at 20 IOPS, that node's agent-loop turns over the 1 s budget
+   are recorded as info, not failures: a turn that journals there is slow by
+   construction (#972). Every other node's turns, and that node's once the
+   window closes, still fail the tier.
 
    ```sh
    # About 90 minutes, compressed: every fault kind on every node.

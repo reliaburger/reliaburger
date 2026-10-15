@@ -1007,7 +1007,7 @@ window_label=
 next_light=0
 next_heavy=$(( $(date +%s) + heavy_every ))
 next_rotation=$(( $(date +%s) + rotation ))
-open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}"; }
+open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}" ${3:+--node "$3"}; }
 close_window() { check window "$evidence" "${1:-close}"; window_label=; }
 
 # Wait for two consecutive clean settle checks after a fault.
@@ -1146,7 +1146,8 @@ slot_node_fault() {
     hold=$(random_between "$hold_min" "$hold_max")
     log=$evidence/snapshots/node-$kind-$node_fault_index.log
     say "fault: $kind on ${vm[node]} for $hold s"
-    open_window "node-$kind"
+    # The checker excuses slow turns only on the node the fault throttles (#972).
+    open_window "node-$kind" 0 "${vm[node]}"
     avoid=$node
     job_mark_fault "$node" "${current_slot%%:*}:$kind"
     gsh "$node" "PEER=${address[peer]}; $(node_fault_script "$kind" start)" > "$log" 2>&1 || result=$?

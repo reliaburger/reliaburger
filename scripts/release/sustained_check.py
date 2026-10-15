@@ -786,7 +786,12 @@ def turn_findings(state, node, samples):
 
     The buckets count from the bun process's start, so the check remembers
     what it last saw per branch, and starts again from zero when the process
-    changes (a kill, an upgrade's exec), as the resource trends do."""
+    changes (a kill, an upgrade's exec), as the resource trends do.
+
+    On the node whose writes the soak throttles (`node-slow-fsync`), a turn
+    that journals is slow by construction: those turns are info, and stay out
+    of the record's over-budget count, while the window lasts (#972)."""
+    throttled = state.get("window") == "node-slow-fsync" and state.get("window_node") == node
     buckets = turn_buckets(samples)
     resources = state.get("resources", {}).get(node, {})
     process = [resources.get("pid"), resources.get("image")]
@@ -811,8 +816,11 @@ def turn_findings(state, node, samples):
                       if buckets.get((branch, bound)) == total), "+Inf")
         lower = {"2.5": "1", "5": "2.5", "10": "5", "+Inf": "10"}[worst]
         span = f"over {lower} s" if worst == "+Inf" else f"between {lower} and {worst} s"
-        findings.append(finding("agent-loop-turn", "fail",
-                                f"{new} {branch} turn(s) over the 1 s budget, the worst {span}", node))
+        detail = f"{new} {branch} turn(s) over the 1 s budget, the worst {span}"
+        if throttled:
+            findings.append(finding("agent-loop-turn", "info", detail + ", during the injected slow-fsync fault", node))
+            continue
+        findings.append(finding("agent-loop-turn", "fail", detail, node))
         state.setdefault("turns_over_budget", {})[node] = state.get("turns_over_budget", {}).get(node, 0) + new
     return findings
 
@@ -1493,6 +1501,7 @@ def main(argv=None):
     window.add_argument("action", choices=["open", "close", "settled"])
     window.add_argument("label", nargs="?")
     window.add_argument("--down", type=int, default=0)
+    window.add_argument("--node", help="the node a node fault targets")
     for name in ("baseline", "evaluate"):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
@@ -1549,8 +1558,13 @@ def main(argv=None):
         if args.action == "open":
             state["window"] = args.label or "fault"
             state["nodes_down"] = args.down
+            if args.node:
+                state["window_node"] = args.node
+            else:
+                state.pop("window_node", None)
         else:
             state.pop("window", None)
+            state.pop("window_node", None)
             state["nodes_down"] = 0
             if args.action == "settled":
                 state["last_settled"] = int(time.time())
