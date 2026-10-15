@@ -149,11 +149,6 @@ const INIT_TIMEOUT_SECS: u64 = 300;
 /// in its last line or two, so a short tail says why without flooding logs.
 const INIT_FAILURE_STDERR_BYTES: u64 = 400;
 
-/// How long a capacity refusal stays in this node's state reports. A
-/// failing deploy refreshes it on every retry; a deploy that succeeds, or a
-/// leader that moved the app away, lets it lapse.
-const CAPACITY_REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// How many event-loop ticks (~1s each) between attempts to provision an
 /// identity for a running instance that has none — frequent enough to heal
 /// promptly, infrequent enough not to hammer an unreachable council.
@@ -675,11 +670,14 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
-    /// Apps whose last fresh deploy here failed because the execution
-    /// budget had no room (job leases may hold it), keyed by (app_name,
-    /// namespace), with when that happened. State reports carry recent ones
-    /// so the leader places the replicas elsewhere instead of holding them.
-    capacity_refusals: std::collections::HashMap<(String, String), tokio::time::Instant>,
+    /// Apps whose last admission here failed because the execution budget
+    /// had no room (job leases may hold it), keyed by (app_name, namespace).
+    /// Every state report carries them, so the leader places the replicas
+    /// elsewhere instead of holding them. An entry stays until an admission
+    /// of that app succeeds here or the app is stopped or retired here: a
+    /// deploy backs off for minutes between attempts, and the refusal must
+    /// not lapse in between (#967).
+    capacity_refusals: std::collections::HashSet<(String, String)>,
     /// The app versions this node's placement reconciler last finished
     /// deploying, as it last told the agent. State reports carry them so the
     /// leader can release a rollout node by node (#692).
@@ -915,7 +913,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashSet::new(),
             converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
@@ -1075,7 +1073,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashSet::new(),
             converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,

@@ -627,7 +627,11 @@ the real `curl … | sh` install against it on every host we advertise.
    approximation. `qualify-jobs-sustained.sh` runs it through the same soak,
    with the job campaign at the target load and a node-level fault in every
    cycle (inter-node delay, a full disk, slow fsync). Faults stay node-level in
-   0.2.0 (D19-B): nothing targets an individual job.
+   0.2.0 (D19-B): nothing targets an individual job. While slow fsync caps a
+   node's writes at 20 IOPS, that node's agent-loop turns over the 1 s budget
+   are recorded as info, not failures: a turn that journals there is slow by
+   construction (#972). Every other node's turns, and that node's once the
+   window closes, still fail the tier.
 
    ```sh
    # About 90 minutes, compressed: every fault kind on every node.
@@ -650,7 +654,17 @@ the real `curl … | sh` install against it on every host we advertise.
    of a 1,048,576-task array, p99 start lag, Raft entries a second and run
    state, Bun memory and CPU, executor overhead, task-array storage per
    million tasks and retained logs. Those are recorded in every run and never
-   gate it. Commit both files. Bounded job storage
+   gate it. A soak compares three of them with restated targets
+   (maintainer decision, 15 October 2026,
+   [#668](https://github.com/reliaburger/reliaburger/issues/668)), since the
+   plan's were for one batch on a quiet cluster: task-array storage at most
+   64 MiB per million accepted tasks; each Bun process's steady-state RSS
+   (the median of its samples once it has been seen for 10 minutes, a process
+   being its boot, pid and image) at most 512 MiB on node 1, which serves the
+   API, and 384 MiB on the others, with the peak beside it; and Raft entries a
+   second for all cluster writes, recorded without a target because the batch
+   target counts only task-array writes. The gated memory checks are
+   unchanged. Commit both files. Bounded job storage
    ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
    pass before the 12-hour run: until it does, a full disk stops a worker
    taking grants and fails the run.

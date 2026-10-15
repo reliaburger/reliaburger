@@ -115,6 +115,36 @@ def command(args):
     return result.stdout.decode()
 
 
+def storage_kb(top):
+    """KiB allocated under `top`, as `du -skx` counts it: blocks, not
+    lengths, on top's filesystem only, each hard-linked file once.
+
+    Jobs create and remove files under instances/ while the walk runs. An
+    entry that vanishes no longer uses space, so it is skipped; `du` exits 1
+    on one and threw the whole inventory away (#961). Any other error fails
+    and names its path."""
+    def failed(error):
+        if not isinstance(error,FileNotFoundError):
+            raise InvalidInventory(f"storage walk failed: {error.filename}: {error.strerror}")
+    try: device=os.lstat(top).st_dev
+    except FileNotFoundError: return 0
+    except OSError as error: failed(error)
+    seen=set(); blocks=0
+    for directory,directories,files in os.walk(top,onerror=failed):
+        for path in [directory]+[os.path.join(directory,name) for name in files]:
+            try: info=os.lstat(path)
+            except OSError as error: failed(error); continue
+            if info.st_dev!=device:
+                # A mount point: -x leaves the other filesystem out.
+                if path==directory: directories[:]=[]
+                continue
+            if info.st_nlink>1 and not stat.S_ISDIR(info.st_mode):
+                if (info.st_dev,info.st_ino) in seen: continue
+                seen.add((info.st_dev,info.st_ino))
+            blocks+=info.st_blocks
+    return blocks*512//1024
+
+
 def entries(path):
     if not path.exists(): return []
     with os.scandir(path) as directory:
@@ -230,7 +260,7 @@ def collect(root):
     sizes={}
     for name in ("task-arrays","job-state","instances"):
         path=root/name
-        sizes[name]=int(command(["du","-skx",str(path)]).split()[0]) if path.exists() else 0
+        sizes[name]=storage_kb(path)
     space=os.statvfs(root)
     return dict(schema=1,ts=int(time.time()),complete=True,boot=boot,prefix=prefix,
                 owners=list(owners.values()),resources=resources,errors=errors,storage_kb=sizes,
