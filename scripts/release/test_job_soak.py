@@ -322,6 +322,38 @@ class UnexpectedFailure(unittest.TestCase):
             self.assertEqual(c.state["errors"],["runc short work (7): unexpected terminal failure in ordinary campaign work"])
 
 
+class RefusedSummary(unittest.TestCase):
+    """#968: the controller refused a summary and kept only the message, so
+    nobody could see which node's numbers broke the invariant."""
+
+    class API(FakeAPI):
+        def request(self,method,path,body=None,raw=False):
+            if path=="/v1/jobs/runs": return super().request(method,path,body)
+            nodes=[dict(node="node-1",slots=4,counters=dict(running=1,active_commands=1)),
+                   dict(node="node-3",slots=4,counters=dict(running=1,active_commands=1))]
+            return summary(7,succeeded=7,queued=0,held=1,active_commands=2,nodes=nodes,name="fixture",
+                           runtime="shared-runc",cpu_request_millicores=25,memory_request_bytes=64<<20)
+
+    def test_a_refused_summary_is_saved_next_to_its_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            c=jobs.Campaign(folder,self.API(),[],"token")
+            intent=c.prepare("shared-runc","long","work",100); intent.update(id=7,name="fixture")
+            error="shared-runc long work (7): invalid verified active commands"
+            def saved():
+                records=[json.loads(path.read_text()) for path in sorted(Path(folder,"refused").iterdir())]
+                return [record for record in records if record["error"]==error]
+            c.step(101)
+            self.assertEqual(c.state["errors"],[error])
+            self.assertEqual(len(saved()),1)
+            record=saved()[0]
+            self.assertEqual(record["summary"]["active_commands"],2)
+            self.assertEqual(record["summary"]["nodes"][1]["node"],"node-3")
+            # The same refusal on later polls keeps the first body only.
+            c.step(102); c.step(103)
+            self.assertEqual(len(saved()),1)
+            self.assertEqual(c.state["errors"].count(error),1)
+
+
 class ExpectedFailureResult(unittest.TestCase):
     """V02 candidate 6, run 15: the shared-runc short failure fixture drained
     four seconds after the soak killed the Bun on the node that held its one

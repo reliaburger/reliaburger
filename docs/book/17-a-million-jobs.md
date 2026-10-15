@@ -2526,6 +2526,42 @@ the drain is asked for, or within a minute of it, because an apply's schedules
 commit after its hooks. Apply doesn't delete job definitions a file leaves
 out, so they stay exactly as the drain left them (#963).
 
+Candidate 7's jobs fast tier then turned one refused summary into eight
+failures. A shared-runc run reported two active commands against one held
+task. The run-level count adds up what each node said at its last sync, and
+the leader keeps a silent node's view until it answers again. Node 3 had been
+powered off holding the run's last chunk with one command running. The leader
+took the chunk back after the silence timeout and granted it to node 1, which
+reported its own command. Node 3's last view still said one, so the sum said
+two. (We're inferring that last step: the controller kept the message but not
+the body.)
+
+The rule now is that a node counts for at most what the leader says it holds:
+
+```rust
+let holds = state
+    .held_by(&node.node)
+    .map_or(0, |chunks| state.tasks_in(chunks));
+sum.checked_add(node.counters.active_commands?.min(holds))
+```
+
+`held_by` returns an `Option`, `None` for a node with no grant, and
+`map_or(0, ...)` turns that into zero tasks. The `?` inside the closure
+returns `None` from the whole fold when a node can't count its commands, so
+the summary says "unknown" instead of guessing. Grants never overlap, so the
+clamped sum can't exceed `held`, however stale a view is. A node that lost
+its chunks counts for nothing; its command still shows up in
+`other_in_flight_attempts`, because the leader can't prove it has stopped.
+
+The harness half was the old problem from candidates 5 and 6: the campaign
+keeps every error for the whole run, and the checker failed every settle that
+saw one. Now the checker fails on a campaign error once, records it in its
+state, and shows it as `info` on later checks, so each later fault is judged
+on its own recovery. The final verdict still fails on it, because
+`coverage_failures` reads the campaign's errors. And the controller now saves
+the refused summary body under `jobs/refused/` beside the error, so the next
+refusal won't need inferring (#968).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work

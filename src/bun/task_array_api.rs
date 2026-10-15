@@ -545,6 +545,11 @@ pub fn array_summary(
     let callers = nodes
         .iter()
         .try_fold(0u64, |sum, node| sum.checked_add(node.counters.running));
+    // A node's view is what it said at its last sync, and the leader keeps a
+    // silent node's view until it answers again. Count each node's active
+    // commands only up to the tasks the leader says it holds now: a node
+    // whose chunks were taken back counts for nothing, and because grants
+    // never overlap, the sum can't exceed `held` (#968).
     let active = if summary.status.is_terminal() {
         Some(0)
     } else if nodes.is_empty() {
@@ -554,7 +559,10 @@ pub fn array_summary(
             .iter()
             .filter(|node| node.refused.is_none())
             .try_fold(0u64, |sum, node| {
-                sum.checked_add(node.counters.active_commands?)
+                let holds = state
+                    .held_by(&node.node)
+                    .map_or(0, |chunks| state.tasks_in(chunks));
+                sum.checked_add(node.counters.active_commands?.min(holds))
             })
     };
     let failed: Vec<[u32; 2]> = state
@@ -1618,6 +1626,10 @@ mod tests {
         )
         .unwrap();
         record.terminal_at_epoch_secs = None;
+        record
+            .state
+            .grant(&NodeId::new("first"), &IndexRangeSet::from_range(0..=0))
+            .unwrap();
         assert!(array_summary(9, &record, &[])["active_commands"].is_null());
         let mut nodes = vec![NodeView {
             node: NodeId::new("first"),
@@ -1641,6 +1653,79 @@ mod tests {
         assert!(array_summary(9, &record, &nodes)["active_commands"].is_null());
         nodes[1].refused = Some("unsupported".into());
         assert_eq!(array_summary(9, &record, &nodes)["active_commands"], 3);
+    }
+
+    fn active_view(node: &str, active: u64) -> NodeView {
+        NodeView {
+            node: NodeId::new(node),
+            slots: 4,
+            refused: None,
+            counters: super::super::task_array_node::NodeArrayCounters {
+                running: active,
+                active_commands: Some(active),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_powered_off_nodes_remembered_activity_never_exceeds_held() {
+        // #968: node 3 held the last chunk with one active command and went
+        // dark. The leader took the chunk back and granted it to node 1, which
+        // now reports one active command too. The leader still remembers node
+        // 3's last view, but node 3 holds nothing, so it counts for nothing.
+        let mut record = record_with_failures(&[]);
+        record.state = crate::meat::task_array_state::TaskArrayState::new(
+            crate::meat::task_array::TaskArraySpec {
+                chunk_size: 1,
+                ..crate::meat::task_array::TaskArraySpec::with_count(2)
+            },
+            100,
+        )
+        .unwrap();
+        record.terminal_at_epoch_secs = None;
+        record
+            .state
+            .grant(&NodeId::new("n1"), &IndexRangeSet::from_range(1..=1))
+            .unwrap();
+        let nodes = vec![active_view("n1", 1), active_view("n3", 1)];
+        let summary = array_summary(9, &record, &nodes);
+        assert_eq!(summary["held"], 1);
+        assert_eq!(summary["active_commands"], 1);
+        // As far as the leader knows node 3's command may still run, so it
+        // shows up as another attempt in flight rather than vanishing.
+        assert_eq!(summary["other_in_flight_attempts"], 1);
+        // The per-node views are reported unchanged.
+        assert_eq!(summary["nodes"][1]["counters"]["active_commands"], 1);
+    }
+
+    #[test]
+    fn a_nodes_activity_counts_no_more_than_the_tasks_it_holds() {
+        // A node that lost one chunk and was granted another can still report
+        // the old command as active until its next sync: count at most what
+        // the leader says it holds now.
+        let mut record = record_with_failures(&[]);
+        record.state = crate::meat::task_array_state::TaskArrayState::new(
+            crate::meat::task_array::TaskArraySpec {
+                chunk_size: 1,
+                ..crate::meat::task_array::TaskArraySpec::with_count(4)
+            },
+            100,
+        )
+        .unwrap();
+        record.terminal_at_epoch_secs = None;
+        record
+            .state
+            .grant(&NodeId::new("n1"), &IndexRangeSet::from_range(0..=0))
+            .unwrap();
+        record
+            .state
+            .grant(&NodeId::new("n2"), &IndexRangeSet::from_range(1..=2))
+            .unwrap();
+        let nodes = vec![active_view("n1", 2), active_view("n2", 1)];
+        let summary = array_summary(9, &record, &nodes);
+        assert_eq!(summary["held"], 3);
+        assert_eq!(summary["active_commands"], 2);
     }
 
     #[test]
