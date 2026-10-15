@@ -88,6 +88,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok(()) => self.begin_app_stop(app_name, namespace).await,
             Err(error) => Err(error),
         };
+        // The app is leaving this node, so a refusal to admit it here is
+        // stale: it would move the app off this node again if the leader
+        // later places it here (#967). A refused stop (a deploy is still
+        // running) leaves the app, and the record, in place.
+        if matches!(begun, Ok(_) | Err(BunError::AppNotFound { .. })) {
+            self.capacity_refusals.remove(&key);
+        }
         match begun {
             Ok(stop) => {
                 let waiters = vec![StopWaiter { purpose, response }];

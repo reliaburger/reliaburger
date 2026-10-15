@@ -5692,6 +5692,41 @@ image = "busybox:latest"
         assert_eq!(nodes_of(&decisions[0]), ["idle"]);
     }
 
+    /// #967: candidate 7's jobs soak. Two replicas already run on a node
+    /// that job leases have since filled, and the third, added beside them,
+    /// is refused. The node reports the refusal while its deploy backs off,
+    /// so the leader re-places the app on the node with room rather than
+    /// calling it converged with a replica that can never start.
+    #[test]
+    fn a_refusal_to_add_a_replica_beside_running_ones_moves_the_app() {
+        let (members, mut reports) = job_filled_and_idle_reports();
+        let app = AppId::new("frontend", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["full", "full", "full"]));
+        let full = reports.reports.get_mut(&NodeId::new("full")).unwrap();
+        for ordinal in [1, 2] {
+            let mut replica = running_app("default", "frontend", 30000 + ordinal as u16, true);
+            replica.instance_id = ordinal;
+            full.running_apps.push(replica);
+        }
+        full.capacity_refusals
+            .push(crate::reporting::types::CapacityRefusal {
+                app_name: "frontend".to_string(),
+                namespace: "default".to_string(),
+            });
+        let alive = HashSet::from([NodeId::new("full"), NodeId::new("idle")]);
+        let mut cache = build_cluster_cache(&members, &reports);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["idle", "idle", "idle"]);
+    }
+
     /// A node mid-upgrade is cordoned, which the cache records as not
     /// ready. That's a reason to put nothing new on it, not to start its
     /// volume app somewhere else on an empty volume.

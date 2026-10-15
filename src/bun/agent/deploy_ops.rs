@@ -1030,6 +1030,27 @@ impl DeployOps {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Remember what an app admission on this node says about capacity, so
+    /// the next state report tells the leader (#681, #967).
+    ///
+    /// Every path that leases app replicas from the execution budget comes
+    /// through here: a fresh deploy, replicas added beside running ones and
+    /// a rolling or blue-green replacement. A refusal is kept until an
+    /// admission of the same app succeeds; any other failure says nothing
+    /// about capacity, so it leaves the record as it was.
+    fn note_admission<T>(&mut self, app_name: &str, namespace: &str, result: &Result<T, BunError>) {
+        let key = (app_name.to_string(), namespace.to_string());
+        match result {
+            Err(BunError::Capacity { .. }) => {
+                self.capacity_refusals.insert(key);
+            }
+            Ok(_) => {
+                self.capacity_refusals.remove(&key);
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Apply one deploy op from a spawned deploy task. This is where the
     /// supervisor state machine stays authoritative: the task owns the
     /// blocking grill I/O, but every state transition and every mutation of
@@ -1096,6 +1117,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .add_app_replicas(&app_name, &namespace, &spec, count, Instant::now())
                     .await;
+                self.note_admission(&app_name, &namespace, &result);
                 let _ = reply.send(result);
             }
             DeployOp::NextDeployGen { app_name, reply } => {
@@ -1141,17 +1163,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .deploy_app(&app_name, &namespace, &spec, now)
                     .await;
-                let key = (app_name, namespace);
-                match &result {
-                    Err(BunError::Capacity { .. }) => {
-                        self.capacity_refusals
-                            .insert(key, tokio::time::Instant::now());
-                    }
-                    Ok(_) => {
-                        self.capacity_refusals.remove(&key);
-                    }
-                    Err(_) => {}
-                }
+                self.note_admission(&app_name, &namespace, &result);
                 let _ = reply.send(result);
             }
             DeployOp::RegisterServiceApp {
@@ -1360,6 +1372,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self
                     .reserve_rolling_instance(&instance_id, &app_name, &namespace, &spec)
                     .await;
+                self.note_admission(&app_name, &namespace, &result);
                 let _ = reply.send(result);
             }
             DeployOp::PrepareRollingInstance {
