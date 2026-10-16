@@ -1875,6 +1875,27 @@ first choice when memory runs out (#984). A soak that only watched Bun's own
 memory would have called this a Bun leak. Asking the kernel what it killed,
 and what was holding the memory, settled it in a minute.
 
+The SSH forwarder had a flaw of its own. It sets up each port with one
+`ssh -O forward`, and if that fails just after a boot, it logs the error and
+never tries again. In the 12-hour jobs final it cut node 3 off from the Mac
+after an upgrade walk, and node 1 after a power-off. Inside, the cluster was
+fine. Outside, the harness saw settles time out, podinfo answer `000`, a
+`version ?` from the upgrade walk and a pulse fail: twelve failures that all
+looked like ours. The evidence that would have said otherwise, Lima's
+host-agent log, had been truncated by the next time those VMs started. Any
+forwarder can lose a port, so the harness now checks for exactly that
+(#987). Every check asks each forwarded port for a real HTTP answer from the
+host. A TCP connect isn't enough, because Lima's default gRPC forwarder
+accepts every connection on the host whether or not anything is behind it.
+When the host gets no answer, the harness asks the same port from inside the
+guest over `limactl shell`, which goes through SSH rather than the forwarder.
+Served inside but not outside, for more than a minute, is one `host-forward`
+failure for the whole incident, and the podinfo and registry checks that went
+through that port stop counting against the product. The harness also keeps
+each VM's host-agent log before every stop. And the job controller now counts
+which node missed a request and which node answered it instead, because the
+`leak-rss` on node 2 in that run was node 2 serving node 1's share of the API.
+
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
 secrets catalogue skipped all its container tests. Now the classifier sees the

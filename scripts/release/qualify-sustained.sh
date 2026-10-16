@@ -914,8 +914,35 @@ collect_light() {
     fi
     curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --max-time 5 -H 'Host: podinfo.localhost' \
         "http://127.0.0.1:$ingress_port/" > "$directory/http.txt" 2>/dev/null || true
+    probe_forwards "$directory"
     rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
     rel logs soak-redis-client --tail 20 > "$directory/redis-log.txt" 2>&1 || true
+}
+
+# Every forwarded port (each node's API, node 1's ingress and registry),
+# asked from the host, and from inside the guest when the host gets no
+# answer. Every check runs it, so it follows each reboot, power-off, upgrade
+# exec and Bun restart. A port the guest serves but the host can't reach is
+# one `host-forward` failure, and the checks through it are excused rather
+# than timing out settle after settle (#987).
+probe_forwards() {
+    local directory=$1 node down_nodes=()
+    for node in 1 2 3; do [ "${down[node]}" = 0 ] || down_nodes+=(--down "$node"); done
+    check forwards "$directory" --limactl "$limactl" --api-port "$api_port" --ingress-port "$ingress_port" \
+        --registry-port "$registry_port" --node "${vm[1]}" --node "${vm[2]}" --node "${vm[3]}" \
+        ${down_nodes[@]+"${down_nodes[@]}"} 2>> "$evidence/harness-errors.log" || true
+}
+
+# Lima truncates a VM's host-agent log (ha.stderr.log, where forwarding
+# errors land) when the VM starts again, so keep a copy before every stop
+# and at the end (#987).
+keep_host_logs() {
+    local reason=$1; shift
+    [ -n "${LIMA_HOME:-}" ] || return 0
+    local node names=()
+    for node in "$@"; do names+=("${vm[node]}"); done
+    check keep-host-logs "$evidence" --lima-home "$LIMA_HOME" --reason "$reason" "${names[@]}" \
+        2>> "$evidence/harness-errors.log" || true
 }
 
 # settle: what recovery needs; heavy: everything.
@@ -1102,6 +1129,7 @@ power_offs=0
 power_off() {
     local node=$1
     job_mark_fault "$node" "${current_slot:-power-off}"
+    keep_host_logs power-off "$node"
     down[node]=1
     check power-cut "$evidence"
     "$limactl" stop --force "${vm[node]}" > "$evidence/snapshots/power-off-$node-$(date +%s).log" 2>&1 || true
@@ -1267,6 +1295,7 @@ offline_export() {
 special_graceful() {
     say 'special: graceful whole-cluster stop and start'
     open_window graceful-stop 3
+    keep_host_logs graceful-stop 1 2 3
     down=(0 1 1 1)
     "$relish" local stop > "$evidence/snapshots/graceful-stop.log" 2>&1 || true
     event --phase special:graceful-stop
@@ -1372,15 +1401,25 @@ wait_upgrade_idle() {
     done
 }
 
-# The version each node's API reports, one line per node, "?" for a node
-# that doesn't answer.
+# The version each node's API reports, one line per node. A node the host
+# can't reach is asked from inside its guest, so a cut host forward (#987)
+# doesn't fail the walk; one that answers neither way is "?(why)".
 node_versions() {
-    local node
+    local node reply code reason
     for node in 1 2 3; do
-        curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
-            "https://${vm[node]}:9117/v1/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo '?'
+        code=0
+        reply=$(curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
+            "https://${vm[node]}:9117/v1/version" 2>/dev/null) || code=$?
+        if [ "$code" -eq 0 ] && version_of "$reply"; then continue; fi
+        if [ "$code" -eq 0 ]; then reason='bad reply'; else reason=$(check curl-reason "$code"); fi
+        if [ "${down[node]}" = 1 ]; then echo "?(host: $reason; powered off)"; continue; fi
+        code=0
+        reply=$(gsh "$node" 'curl -fsSk --max-time 5 https://127.0.0.1:9117/v1/version' 2>/dev/null) || code=$?
+        if [ "$code" -eq 0 ] && version_of "$reply"; then continue; fi
+        echo "?(host: $reason; guest: $(if [ "$code" -eq 0 ]; then echo 'bad reply'; else check curl-reason "$code"; fi))"
     done
 }
+version_of() { python3 -c 'import json,sys; print(json.loads(sys.argv[1])["version"])' "$1" 2>/dev/null; }
 
 wait_versions() {
     local want=$1 budget=$2 started=$3 label=$4 version versions
@@ -1525,6 +1564,7 @@ finish() {
     [ -z "${background_pid:-}" ] || kill "$background_pid" 2>/dev/null || true
     [ -f "$evidence/metadata.json" ] || { printf 'sustained: stopped before the soak started\n' >&2; exit "$result"; }
     meta finished_at "json:$(date +%s)"
+    [ -z "${vm[3]:-}" ] || keep_host_logs end 1 2 3
     if [ "$keep" = true ]; then
         teardown="kept: RELIABURGER_HOME=${home:-none}"
     elif ! teardown_cluster; then

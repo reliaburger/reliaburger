@@ -448,7 +448,13 @@ fits, a schedule that wouldn't is refused before it starts, a drained run
 frees its slot an hour later, a full budget still polls and drains its runs,
 and a run the candidate has pruned counts as drained only if the controller
 saw it drain), CPU sampling
-across restarts and the `.jobs.json` report beside the record.
+across restarts and the `.jobs.json` report beside the record. The
+host-forward probes (#987) are tested against local servers and a fake
+`limactl`: a port refused on the host while the guest serves it is one
+`host-forward` failure with no settle timeouts, a forward that hangs up the
+way Lima's gRPC forwarder does is caught too, a node down inside its guest is
+left to the other checks, host-agent logs are kept before Lima truncates
+them, and the controller's per-node API fallbacks reach the record.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
 fixtures with:

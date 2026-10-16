@@ -203,13 +203,24 @@ class API:
     def __init__(self, nodes, api_port, ca, header):
         self.nodes, self.api_port, self.ca, self.header = nodes, api_port, ca, header
         self.deadline = None
+        # Requests a node missed and the node that answered them instead
+        # (#987): a leak-rss on the node that took the load traces back here.
+        self.fallbacks = dict(missed={}, answered={})
+        self.fallback_lock = threading.Lock()
         self.identity = hashlib.sha256(Path(ca).read_bytes()+json.dumps(nodes,sort_keys=True).encode()+str(api_port).encode()).hexdigest()
+    def fell_back(self, missed, answered):
+        if not missed: return
+        with self.fallback_lock:
+            for name in missed: self.fallbacks["missed"][name] = self.fallbacks["missed"].get(name, 0) + 1
+            self.fallbacks["answered"][answered] = self.fallbacks["answered"].get(answered, 0) + 1
     def remaining(self, maximum):
         remaining = maximum if self.deadline is None else min(maximum, self.deadline-time.monotonic())
         if remaining <= 0: raise Unavailable("job drain request budget exhausted")
         return remaining
     def request(self, method, path, body=None, raw=False):
+        missed = []
         for index, node in enumerate(self.nodes):
+            if index: missed.append(self.nodes[index-1]["name"])
             timeout = self.remaining(7)
             with tempfile.TemporaryFile() as output:
                 command = ["curl", "--silent", "--show-error", "--write-out", "\n%{http_code}", "--max-time", str(min(5,timeout)),
@@ -230,6 +241,7 @@ class API:
                 output.seek(0)
                 payload, _, code = output.read().rpartition(b"\n")
                 if code in (b"408",b"409",b"429") or code.startswith(b"5"): continue
+                self.fell_back(missed, node["name"])
                 if code == b"404":
                     # Reads and cancels forward to the leader, so a 404 is authoritative.
                     raise Gone("candidate API refused "+method+" "+path+" (HTTP 404)")
@@ -338,6 +350,8 @@ class Campaign:
                 raise InvalidEvidence("campaign configuration changed on resume")
             if self.state.get("stopped"): raise InvalidEvidence("cannot resume a drained job campaign")
             self.state["resume_grace_until"] = int(time.time())+180
+            if hasattr(api, "fallbacks") and self.state.get("api_fallbacks"):
+                api.fallbacks = json.loads(json.dumps(self.state["api_fallbacks"]))
         else:
             self.state = dict(schema=2, cluster=getattr(api,"identity","test"), verifier=hashlib.sha256(token.encode()).hexdigest(), campaign=uuid.uuid4().hex[:12], auditors=auditors,
                               sequence=0, active={}, coverage={m:{} for m in MODES},
@@ -451,13 +465,21 @@ class Campaign:
         decisions[key]["accepted"]=True
         self.state["totals"]["operator_replay_decisions"]=sum(row["accepted"] for row in decisions.values())
         self.save()
+    def fallbacks(self):
+        """The API's fallback counts, kept in state so a resumed controller adds to them."""
+        counts = getattr(self.api, "fallbacks", None)
+        if counts is None: return self.state.get("api_fallbacks", dict(missed={}, answered={}))
+        with self.api.fallback_lock:
+            self.state["api_fallbacks"] = json.loads(json.dumps(counts))
+        return self.state["api_fallbacks"]
     def publish(self, now, fault=False):
         atomic(self.directory / "snapshot.json",dict(heartbeat=now,errors=self.state["errors"],
                active=list(self.state["active"].values()),progress=self.state["progress"],coverage=self.state["coverage"],
                totals=self.state["totals"],stopped=self.state["stopped"],fault_window=fault,
                load=self.state.get("load","calibration"),target_rate=self.state.get("target_rate"),
                started=self.state.get("started"),metrics=self.state.get("metrics",{}),
-               fresh_activity=self.state.get("fresh_activity",[]),discovered=self.state["discovered"],stop_requested_at=self.state.get("stop_requested_at"),last_fault=self.state.get("last_fault",0),resume_grace_until=self.state.get("resume_grace_until",0)))
+               fresh_activity=self.state.get("fresh_activity",[]),discovered=self.state["discovered"],
+               api_fallbacks=self.fallbacks(),stop_requested_at=self.state.get("stop_requested_at"),last_fault=self.state.get("last_fault",0),resume_grace_until=self.state.get("resume_grace_until",0)))
     def step(self, now, fault=False, stop=False):
         if fault: self.state["last_fault"]=now
         self.publish(now, fault)
@@ -709,6 +731,7 @@ def report(snapshot):
         accepted_successes_per_second=rate,target_met=None if target is None else rate>=target,
         retries=retries,retry_causes=causes,
         audited_attempts=totals.get("audit_attempts",0),
+        api_fallbacks=snapshot.get("api_fallbacks") or dict(missed={},answered={}),
         operator_replay_decisions=totals.get("operator_replay_decisions",0),
         fault_markers=totals.get("fault_markers",0),errors=list(snapshot.get("errors",[])),
         m8=dict(

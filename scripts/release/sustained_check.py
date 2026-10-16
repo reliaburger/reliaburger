@@ -22,6 +22,12 @@ Subcommands:
   nodes-json FILE leader|followers|alive|council
   utc-stamp EPOCH                       YYMMDDHHMMSSZ for `openssl ca -startdate/-enddate`
   registry EVIDENCE push|verify --port P --server-name N --ca CA --token-file F [--tag T]
+  forwards SNAPSHOT --limactl L --api-port P --ingress-port P --registry-port P --node VM... [--down I]
+                                        probe every forwarded port from the host, and from inside
+                                        the guest when the host gets no answer (#987)
+  keep-host-logs EVIDENCE --lima-home D --reason R VM...
+                                        keep Lima's host-agent logs before a stop truncates them
+  curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
 """
 import argparse
@@ -81,6 +87,16 @@ TURN_BUCKET_BOUNDS = ("2.5", "5", "10", "+Inf")
 # a quorum loss outlasts them and is judged against the fault window.
 REGISTRY_UNAVAILABLE_TRIES = 3
 REGISTRY_UNAVAILABLE_PAUSE = 5
+# The ports the quickstart forwards from the host (src/relish/quickstart/
+# runner.rs): every node's API, and node 1's ingress and registry. Each is
+# probed with a request the service answers, since Lima's gRPC forwarder
+# accepts every connection on the host even when the guest side is gone.
+FORWARDS = (("api", 9117, "https", "/v1/health"), ("ingress", 80, "http", "/"), ("registry", 5050, "https", "/v2/"))
+# A forward that has just come up after a boot may lag Bun by a few seconds;
+# one that stays cut this long is a failure (#987).
+HOST_FORWARD_GRACE = 60
+CURL_REASONS = {6: "no such host", 7: "refused", 22: "HTTP error", 28: "timeout", 35: "TLS", 52: "empty reply",
+                55: "send failed", 56: "reset", 58: "TLS", 60: "TLS", 77: "TLS", 90: "TLS", 91: "TLS"}
 
 
 # --- state -----------------------------------------------------------------
@@ -505,6 +521,130 @@ def settle_clean(report, nodes, nodes_problems, leaks, http_ok):
     return not nodes_problems and not leaks and http_ok is not False
 
 
+# --- host forwards (#987) --------------------------------------------------------
+
+def curl_reason(code):
+    """What a curl exit code means for a probe, in a word or two."""
+    return CURL_REASONS.get(code, f"curl exit {code}")
+
+
+def http_probe(port, scheme, path, timeout=5):
+    """None when something answers HTTP on 127.0.0.1:`port`, else why not.
+
+    Any status counts: the probe asks whether the forward reaches the
+    service, not whether the service is happy."""
+    if scheme == "https":
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        connection = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout, context=context)
+    else:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers={"Host": "podinfo.localhost"} if scheme == "http" else {})
+        connection.getresponse().read(64)
+        return None
+    except ConnectionRefusedError:
+        return "refused"
+    except (socket.timeout, TimeoutError):
+        return "timeout"
+    except ssl.SSLError:
+        return "TLS"
+    except (http.client.RemoteDisconnected, http.client.BadStatusLine):
+        return "empty reply"
+    except ConnectionResetError:
+        return "reset"
+    except OSError as error:
+        return "error " + (os.strerror(error.errno) if error.errno else type(error).__name__)
+    finally:
+        connection.close()
+
+
+def guest_probe(limactl, vm, port, scheme, path):
+    """The same probe from inside the guest, over `limactl shell` (SSH, not
+    the port forwarder): None when the service answers there."""
+    import subprocess
+    url = f"{scheme}://127.0.0.1:{port}{path}"
+    try:
+        result = subprocess.run([str(limactl), "shell", "--workdir", "/", vm, "sudo", "curl", "-sk", "-o", "/dev/null",
+                                 "-w", "%{http_code}", "--connect-timeout", "3", "--max-time", "5", url],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "limactl shell timeout"
+    except OSError as error:
+        return "limactl " + type(error).__name__
+    if result.returncode == 0 and result.stdout.strip() not in ("", "000"):
+        return None
+    return curl_reason(result.returncode) if result.returncode else "no HTTP answer"
+
+
+def probe_forwards(nodes, ports, down, limactl, host=http_probe, guest=guest_probe):
+    """One row per forwarded port of every node that is up. The guest is
+    asked only when the host gets no answer."""
+    rows = []
+    for index, node in enumerate(nodes, 1):
+        if index in down:
+            continue
+        for name, guest_port, scheme, path in FORWARDS:
+            if name != "api" and index != 1:
+                continue
+            port = ports["api"] + index - 1 if name == "api" else ports[name]
+            failed = host(port, scheme, path)
+            inside = None
+            if failed is not None:
+                inside = guest(limactl, node, guest_port, scheme, path) or "ok"
+            rows.append(dict(node=node, name=name, port=port, host=failed or "ok", guest=inside))
+    return rows
+
+
+def host_forward_findings(state, rows, now):
+    """A port the host can't reach while the guest serves it is cut off.
+    Once it has stayed cut for HOST_FORWARD_GRACE it is one failure for the
+    whole incident (later checks see it as info), not a cascade. Returns the
+    findings and the cut (node, name) pairs, which excuse the checks that
+    go through them."""
+    seen = state.setdefault("host_forward", {})
+    findings, cut, current = [], set(), set()
+    for row in rows:
+        if row.get("host") == "ok" or row.get("guest") != "ok":
+            continue
+        key = f"{row['node']} {row['port']}"
+        current.add(key)
+        cut.add((row["node"], row["name"]))
+        entry = seen.setdefault(key, {"since": now, "reported": False})
+        detail = (f"{row['name']} port {row['port']} {row['host']} from the host since {entry['since']} "
+                  f"while {row['node']} serves it inside the guest; checks through it are excused")
+        if entry["reported"] or now - entry["since"] < HOST_FORWARD_GRACE:
+            findings.append(finding("host-forward", "info", detail, key))
+        else:
+            entry["reported"] = True
+            findings.append(finding("host-forward", "fail", detail, key))
+    for key in list(seen):
+        if key not in current:
+            del seen[key]
+    return findings, cut
+
+
+def keep_host_logs(evidence, lima_home, reason, vms, now=None):
+    """Copy each VM's `ha.stderr.log`, which Lima truncates when the
+    instance starts again, into EVIDENCE/lima/VM/, gzipped."""
+    import gzip
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
+    for vm in vms:
+        source = Path(lima_home) / vm / "ha.stderr.log"
+        if not source.is_file():
+            continue
+        target = Path(evidence) / "lima" / vm
+        target.mkdir(parents=True, exist_ok=True)
+        name = f"{stamp}-{reason}"
+        sequence = 0
+        while (target / f"{name}.ha.stderr.log.gz").exists():
+            sequence += 1
+            name = f"{stamp}-{reason}-{sequence}"
+        with source.open("rb") as data, gzip.open(target / f"{name}.ha.stderr.log.gz", "wb") as out:
+            out.write(data.read())
+
+
 # --- evaluation ----------------------------------------------------------------
 
 def read(snapshot, name):
@@ -566,11 +706,23 @@ def evaluate(evidence, snapshot):
     expected_nodes = state.get("nodes", [])
     findings = []
 
+    forwards = read_json(snapshot, "forwards.json")
+    cut = set()
+    if isinstance(forwards, list):
+        forward_findings, cut = host_forward_findings(state, forwards, now)
+        findings += forward_findings
+    ingress_cut = any(name == "ingress" for _, name in cut)
+
     http = read(snapshot, "http.txt")
     http_ok = None
     if http is not None:
         http_ok = http.split()[:1] == ["200"]
-        if not http_ok:
+        if not http_ok and ingress_cut:
+            # The probe went through the cut forward: the product isn't judged by it.
+            http_ok = None
+            findings.append(finding("ingress-http", "info",
+                                    "podinfo answered " + (http.strip() or "nothing") + " through a cut host forward"))
+        elif not http_ok:
             findings.append(finding("ingress-http", "info" if fault_window else "fail",
                                     "podinfo answered " + (http.strip() or "nothing")))
 
@@ -718,7 +870,11 @@ def evaluate(evidence, snapshot):
     findings += [dict(leak, severity="info") if fault_window else leak for leak in leaks]
 
     registry = read_json(snapshot, "registry.json")
-    if registry is not None:
+    registry_cut = any(name == "registry" for _, name in cut)
+    if registry is not None and registry_cut:
+        for problem in registry.get("problems", []) + registry.get("unavailable", []):
+            findings.append(finding("registry", "info", problem + " (through a cut host forward)"))
+    elif registry is not None:
         for problem in registry.get("problems", []):
             findings.append(finding("registry", "fail", problem))
         # Refusing reads without a leader is Pickle failing closed, not data
@@ -1458,7 +1614,12 @@ def job_qualification_lines(report):
     for mode in job_soak.MODES:
         if causes.get(mode):
             lines.append(f"- {mode} retry causes: " + ", ".join(f"{key} {value}" for key, value in causes[mode].items()))
-    lines += [f"- Audited executions: {report.get('audited_attempts', 0)}; operator replay decisions: {report.get('operator_replay_decisions', 0)}", ""]
+    fallbacks = report.get("api_fallbacks") or {}
+    missed = ", ".join(f"{node} missed {count}" for node, count in sorted((fallbacks.get("missed") or {}).items()))
+    answered = ", ".join(f"{node} answered {count}" for node, count in sorted((fallbacks.get("answered") or {}).items()))
+    lines += [f"- Audited executions: {report.get('audited_attempts', 0)}; operator replay decisions: {report.get('operator_replay_decisions', 0)}",
+              "- Job controller API fallbacks: " + (f"{missed}; {answered}" if missed else "none") +
+              " (requests a node didn't answer, and the node that took them instead)", ""]
     return lines
 
 
@@ -1534,6 +1695,20 @@ def main(argv=None):
     for name in ("port", "server-name", "ca", "token-file"):
         registry.add_argument("--" + name, required=True, type=int if name == "port" else str)
     registry.add_argument("--tag", default="pulse")
+    forwards = commands.add_parser("forwards", help="probe the forwarded ports from the host and the guest (#987)")
+    forwards.add_argument("snapshot")
+    forwards.add_argument("--limactl", required=True)
+    for name in ("api-port", "ingress-port", "registry-port"):
+        forwards.add_argument("--" + name, required=True, type=int)
+    forwards.add_argument("--node", action="append", required=True, help="the VMs, node 1 first")
+    forwards.add_argument("--down", action="append", type=int, default=[], help="a node (1-3) that is powered off")
+    keep = commands.add_parser("keep-host-logs", help="keep Lima's host-agent logs before a stop truncates them")
+    keep.add_argument("evidence")
+    keep.add_argument("--lima-home", required=True)
+    keep.add_argument("--reason", required=True)
+    keep.add_argument("vms", nargs="+")
+    reason = commands.add_parser("curl-reason")
+    reason.add_argument("code", type=int)
     record = commands.add_parser("render")
     record.add_argument("evidence")
     record.add_argument("record")
@@ -1617,6 +1792,17 @@ def main(argv=None):
         return 0
     if args.command == "registry":
         return registry_command(args)
+    if args.command == "forwards":
+        rows = probe_forwards(args.node, {"api": args.api_port, "ingress": args.ingress_port, "registry": args.registry_port},
+                              set(args.down), args.limactl)
+        (Path(args.snapshot) / "forwards.json").write_text(json.dumps(rows, indent=1))
+        return 0
+    if args.command == "keep-host-logs":
+        keep_host_logs(args.evidence, args.lima_home, args.reason, args.vms)
+        return 0
+    if args.command == "curl-reason":
+        print(curl_reason(args.code))
+        return 0
     return render(args.evidence, args.record)
 
 
