@@ -143,13 +143,12 @@ case $duration_text in
     *) fail '--duration must look like 40m, 24h or 2d' ;;
 esac
 # Every port the harness reaches (API, ingress, registry) goes through Lima's
-# port forwarder. Lima 2.1's gRPC forwarder, its default, leaks a guest-agent
-# socket per forwarded connection (lima-vm/lima#5210, fixed in 2.2.0), and
-# the API node's guest agent reached 1 GiB in six hours of the job soak until
-# the kernel killed Bun (#982). The SSH forwarder doesn't use the guest agent.
-# limactl reads this when relish starts a VM, so the bootstrap and every
-# power-on inherit it.
-export LIMA_SSH_PORT_FORWARDER=true
+# port forwarder. The soak exercises the default gRPC forwarder quickstart
+# users run, so a caller's LIMA_SSH_PORT_FORWARDER (the 0.2.0 workaround for
+# the guest-agent leak fixed by Lima 2.2, #982, #983) must not switch it.
+# limactl reads it when relish starts a VM, so unsetting it here covers the
+# bootstrap and every power-on.
+unset LIMA_SSH_PORT_FORWARDER
 # Schedule parameters: cycle length, power-off hold, TLS rotation period, how
 # often the catalogue pulse, offline export and registry push run, and how many
 # chaos kinds each chaos slot runs. Two a slot lets an 8-hour full run (four
@@ -324,7 +323,7 @@ discover() {
     export RELIABURGER_HOME=$home RELIABURGER_NO_MODIFY_PATH=1
     export LIMA_HOME=$home/lima
     relish=$home/bin/relish
-    limactl=$home/tools/lima-2.1.0/bin/limactl
+    limactl=$home/tools/lima-2.2.1/bin/limactl
     if [ ! -x "$relish" ] || [ ! -x "$limactl" ]; then fail "no relish or limactl in $home"; fi
     local state=$home/clusters/laptop/state.json index name ip
     read -r api_port ingress_port registry_port < <(python3 -c '
@@ -1558,7 +1557,6 @@ start_run() {
     meta job_load "$job_load"
     [ -z "$target_rate" ] || meta target_rate "$target_rate"
     meta node_faults "json:$node_faults"
-    meta deviations+ 'Lima forwards ports over SSH (`LIMA_SSH_PORT_FORWARDER=true`), not its default gRPC forwarder, which leaks a guest-agent socket per forwarded connection in Lima 2.1 (lima-vm/lima#5210, #982)'
     meta ingress_rotation_secs "json:$rotation"
     [ -z "$base_url" ] || meta base_url "<$base_url>"
     meta candidate_digest "\`${qualified_digest:-not checked}\`"
@@ -1593,9 +1591,8 @@ if [ "$plan" = true ]; then
     special_quorum_loss() { printf 'plan: cycle %s special quorum-loss\n' "$index"; }
     # shellcheck disable=SC2329
     special_all_off() { printf 'plan: cycle %s special all-off\n' "$index"; }
-    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s port-forwarder %s\n' \
-        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults" \
-        "$([ "$LIMA_SSH_PORT_FORWARDER" = true ] && echo ssh || echo grpc)"
+    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s\n' \
+        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults"
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done

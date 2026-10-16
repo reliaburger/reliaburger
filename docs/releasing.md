@@ -632,13 +632,16 @@ the real `curl … | sh` install against it on every host we advertise.
    are recorded as info, not failures: a turn that journals there is slow by
    construction (#972). Every other node's turns, and that node's once the
    window closes, still fail the tier.
-   The soak VMs forward ports over SSH (`LIMA_SSH_PORT_FORWARDER=true`,
-   recorded as a deviation). Lima 2.1's default gRPC forwarder leaks a
-   guest-agent socket per forwarded connection
-   ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210)), and at
-   the job tier's API rate the API node's guest agent grew to 1 GiB in six
-   hours, until the kernel killed Bun
-   ([#982](https://github.com/reliaburger/reliaburger/issues/982)).
+   The soak VMs use Lima's default gRPC port forwarder, the one quickstart
+   users run; the harness unsets `LIMA_SSH_PORT_FORWARDER` so a caller's
+   shell can't switch it. 0.2.0's soaks forwarded over SSH instead, because
+   Lima 2.1's gRPC forwarder leaked a guest-agent socket per forwarded
+   connection ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210))
+   and at the job tier's API rate the API node's guest agent grew to 1 GiB in
+   six hours, until the kernel killed Bun
+   ([#982](https://github.com/reliaburger/reliaburger/issues/982)). The
+   quickstart pins Lima 2.2.1, which fixes the leak
+   ([#983](https://github.com/reliaburger/reliaburger/issues/983)).
 
    ```sh
    # About 90 minutes, compressed: every fault kind on every node.
@@ -706,10 +709,8 @@ the real `curl … | sh` install against it on every host we advertise.
    the warm sample, fds bounded) and a log-order swap when an instance moved
    nodes under the same name (fixed by #272: one adjacent swap in an
    unlabelled tail, the instance on different nodes in the status snapshots
-   either side). For 0.2.0 only, while soaks forward ports over SSH, a node
-   cut off from the host after a reboot or exec is a third (Lima never
-   retries a failed `ssh -O forward`; the cluster stays healthy from inside;
-   it goes with the SSH forwarder,
+   either side). For 0.2.0 only, a node cut off from the host by Lima's SSH
+   port forwarder was a third (gone with the forwarder, fixed by
    [#983](https://github.com/reliaburger/reliaburger/issues/983)), and the
    job controller running out of its 256-run budget in a 12-hour final is a
    fourth (fixed by
@@ -938,10 +939,10 @@ Why these choices:
   runner builds aarch64 and `ubuntu-24.04` builds x86_64, at native speed and
   without `/dev/kvm`, which libguestfs (`virt-customize`) would want, and
   without the `qemu-user-static` a cross-architecture chroot would need.
-- **qcow2 with zlib, not zstd or raw.** Lima 2.1.0 converts qcow2 itself, but
-  registers no zstd decompressor for qcow2 clusters, and it decompresses a
-  `.zst` or `.xz` file by running the `zstd` or `xz` command, which macOS
-  doesn't ship. zlib qcow2 is what Ubuntu itself publishes, so the quickstart
+- **qcow2 with zlib, not zstd or raw.** Lima (2.1.0 to 2.2.1) converts qcow2
+  itself, but registers no zstd decompressor for qcow2 clusters, and it
+  decompresses a `.zst` or `.xz` file by running the `zstd` or `xz` command,
+  which macOS doesn't ship. zlib qcow2 is what Ubuntu itself publishes, so the quickstart
   treats the built image exactly like the stock one.
 - **Live archive, not a snapshot.** `snapshot.ubuntu.com` doesn't serve
   `ubuntu-ports` (arm64) anonymously, so the build installs the current

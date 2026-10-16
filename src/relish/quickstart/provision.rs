@@ -56,7 +56,7 @@ pub fn vm_config(
 
 /// Shell that leaves the guest's wall clock to Lima's guest agent alone.
 ///
-/// Lima 2.1's host agent sets the guest clock to the host's every 10 s
+/// Lima's host agent (2.1 and 2.2 alike) sets the guest clock to the host's every 10 s
 /// whenever they differ by more than 100 ms, and has no setting to turn
 /// that off. With systemd-timesyncd also running, the two fought: timesyncd
 /// slewed the clock forward at its +500 ppm limit and the agent stepped it

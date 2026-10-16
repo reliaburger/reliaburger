@@ -56,7 +56,7 @@ class BuildScriptTests(unittest.TestCase):
             self.assertIn(step, text)
         self.assertLess(text.index("cloud-init clean"), text.index("qemu-img convert -c"))
         self.assertLess(seal, text.index("qemu-img convert -c"))
-        # zstd qcow2 clusters are unreadable to Lima 2.1.0.
+        # zstd qcow2 clusters are unreadable to Lima 2.2.1, the quickstart's pin.
         self.assertRegex(text, r"qemu-img convert -c -O qcow2 -o compression_type=zlib")
 
     def test_image_leaves_the_clock_to_the_lima_guest_agent(self):
