@@ -298,6 +298,12 @@ a user would install it. The runbook is [`releasing.md`](releasing.md).
 | Job qualification (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. Fast: 90 minutes compressed. Final: 12 hours on the full schedule, the #668 run (12 rather than #668's 24 hours is the maintainer's decision for 0.2.0, as a reasonable approximation). Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)) | [`qualify-jobs-sustained.sh --tier fast\|final`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c), [runbook](releasing.md#staging-a-candidate) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
 
+Every soak record also gets charts of each node's Bun memory, open fds and CPU,
+and of accepted jobs a second when jobs ran, with the faults marked along the
+time axis. `sustained_check.py render` draws them beside the record, and
+`sustained_check.py render-charts EVIDENCE DIRECTORY` redraws them from a kept
+evidence directory ([plan](plans/2026-10-17-soak-charts.md)).
+
 ## When a test flakes
 
 CI runs with `retries = 0`. A test that passes on a re-run still failed once,

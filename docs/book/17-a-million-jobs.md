@@ -2718,6 +2718,20 @@ these on 15 October 2026 ([#668](https://github.com/reliaburger/reliaburger/issu
 They're still recorded, never gated: a leaking Bun fails the soak through
 `leak-rss` and the wtf report, as before.
 
+A table of first, last and highest samples hides when things happened, and the
+evidence directory with the full series never leaves the release host. So the
+record now draws the series too: `sustained_check.py render` writes SVG charts
+of each node's Bun memory (with the 512 and 384 MiB lines), open fds, CPU and,
+for a job soak, accepted jobs a second against the target, with every fault,
+upgrade walk and special marked along the bottom. It's a few hundred lines of
+Python string formatting rather than a plotting library, because the release
+scripts use only the standard library, and the output is deterministic so a
+re-render shows no diff. The 0.2.0 jobs final shows why it was worth it: the
+jobs chart drops to zero at 10.5 hours, the moment the controller ran out of
+its run budget ([#989](https://github.com/reliaburger/reliaburger/issues/989)),
+while the memory chart beside it stays flat. The table said the same thing, but
+you had to know where to look.
+
 ### A task that failed before it ran
 
 Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of
