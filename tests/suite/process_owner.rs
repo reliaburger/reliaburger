@@ -292,11 +292,13 @@ fn own_oom_score() -> i32 {
 #[cfg(target_os = "linux")]
 #[test]
 fn owned_workload_starts_with_the_score_its_spec_asks_for() {
-    let wanted = reliaburger::grill::oci::WORKLOAD_OOM_SCORE_ADJ;
-    assert!(
-        own_oom_score() < wanted,
-        "the test needs to run below the workload score to see it raised"
-    );
+    // Ask for more than the test runs at, not for the product's +500:
+    // GitHub's runner already starts job processes at 500, so asking for
+    // that wouldn't show the gate raising anything. The specs' own value is
+    // pinned by the unit tests in `grill::oci`.
+    let own = own_oom_score();
+    assert!(own < 1000, "the test can't run at the maximum score");
+    let wanted = own + (1001 - own) / 2;
     assert_eq!(workload_oom_score(Some(wanted)), wanted);
 }
 

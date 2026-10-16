@@ -3449,10 +3449,14 @@ to its own `oom_score_adj` first and Bun inherits it. The job benchmark passes
 The tests come in three layers. `workloads_are_the_oom_killers_first_choice_before_bun`
 checks every spec generator carries the score, and
 `oom_score_is_written_as_the_oci_process_field` checks the JSON key runc reads.
-On Linux the portable suite runs a real owner: a workload that asks for +500
-reads +500 from `/proc/self/oom_score_adj`, one without a score reads its
-parent's, and one that asks for -1000 doesn't get it. The unit test in
-`provision.rs` from #700 still pins the unit's -900.
+On Linux the portable suite runs a real owner: a workload that asks for a
+higher score than the test's reads it back from `/proc/self/oom_score_adj`,
+one without a score reads its parent's, and one that asks for -1000 doesn't
+get it. The first version asked for +500 and failed in CI, because GitHub's
+runner already starts every job process at 500. Nothing was raised, so the
+test couldn't tell a working gate from a missing one, and its guard caught
+that. Now it asks for halfway between its own score and the maximum. The unit
+test in `provision.rs` from #700 still pins the unit's -900.
 
 ## One budget, two schedulers
 
