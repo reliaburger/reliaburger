@@ -1420,6 +1420,21 @@ in earlier runs, because a settle waits for two clean checks in a row. A
 heavy check gets one go, which is why it took until the eighth candidate to
 fail a run.
 
+The next failure looked much worse and wasn't ours either. Six hours into the
+same candidate's 12-hour job soak, the kernel's out-of-memory killer killed
+Bun on node 1, three times in twenty minutes (#982). Bun itself never went
+above 380 MiB. The memory belonged to `lima-guestagent`, Lima's helper inside
+the VM, which held 1 GiB and 58,500 open sockets. Every request from the
+harness to the API crosses into the VM through Lima's port forwarder, and
+the default one leaked a socket per connection (lima-vm/lima#5210, fixed
+upstream in 2.2.0). Node 1 serves the API, so it took nearly all of them.
+The guest agent protects itself from the OOM killer and Bun didn't, so Bun
+was the one killed. The soak now uses Lima's SSH forwarder, the quickstart
+will move to a fixed Lima (#983), and Bun should stop being the kernel's
+first choice when memory runs out (#984). A soak that only watched Bun's own
+memory would have called this a Bun leak. Asking the kernel what it killed,
+and what was holding the memory, settled it in a minute.
+
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
 secrets catalogue skipped all its container tests. Now the classifier sees the

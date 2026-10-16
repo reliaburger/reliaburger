@@ -611,6 +611,13 @@ the real `curl … | sh` install against it on every host we advertise.
    are recorded as info, not failures: a turn that journals there is slow by
    construction (#972). Every other node's turns, and that node's once the
    window closes, still fail the tier.
+   The soak VMs forward ports over SSH (`LIMA_SSH_PORT_FORWARDER=true`,
+   recorded as a deviation). Lima 2.1's default gRPC forwarder leaks a
+   guest-agent socket per forwarded connection
+   ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210)), and at
+   the job tier's API rate the API node's guest agent grew to 1 GiB in six
+   hours, until the kernel killed Bun
+   ([#982](https://github.com/reliaburger/reliaburger/issues/982)).
 
    ```sh
    # About 90 minutes, compressed: every fault kind on every node.
