@@ -14,12 +14,12 @@
 #       [qualify-sustained.sh options: --base-url, --qualified-digest, --record,
 #        --soak-bun, --evidence, --resume, --keep, --plan]
 #
-#   --tier fast    compressed schedule, 90 minutes: every fault kind in the
+#   --tier fast    compressed schedule, one hour: every fault kind in the
 #                  first cycles, for the fix-and-rerun loop and CI hosts
-#   --tier final   full schedule, 12 hours: the run #668 needs on the final
-#                  candidate (after #678, #679 and #680). 12 rather than 24
-#                  hours is the maintainer's decision for 0.2.0: a reasonable
-#                  approximation of a day
+#   --tier final   full schedule, 8 hours, on the final candidate: the release
+#                  gate's one final soak. It runs everything the V02 final
+#                  checks, plus the jobs, so it replaces it (maintainer
+#                  decision, 17 October 2026, #991)
 #   --target-rate  accepted successes a second (default 1390: 1,158, which is
 #                  100 million a day, plus 20% headroom)
 #   --plan         print the fault schedule and exit
@@ -42,7 +42,7 @@ done
 
 case $tier in
     fast) tier_options=(--tier fast) ;;
-    final) tier_options=(--tier final --duration 12h) ;;
+    final) tier_options=(--tier final --duration 8h) ;;
     *) usage >&2; fail '--tier must be fast or final' ;;
 esac
 
