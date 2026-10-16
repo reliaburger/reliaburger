@@ -467,15 +467,11 @@ async fn raft_rpc_closes_an_open_connection_once_its_peer_is_revoked() {
     let client_identity = tls.identity("n2", 11);
     let crl = CrlHandle::default();
     let acceptor = tokio_rustls::TlsAcceptor::from(
-        reliaburger::sesame::mtls::build_mtls_server_config(&server_identity, crl.clone())
-            .unwrap(),
+        reliaburger::sesame::mtls::build_mtls_server_config(&server_identity, crl.clone()).unwrap(),
     );
     let connector = tokio_rustls::TlsConnector::from(
-        reliaburger::sesame::mtls::build_mtls_client_config(
-            &client_identity,
-            CrlHandle::default(),
-        )
-        .unwrap(),
+        reliaburger::sesame::mtls::build_mtls_client_config(&client_identity, CrlHandle::default())
+            .unwrap(),
     );
 
     let council = lone_council(1).await;

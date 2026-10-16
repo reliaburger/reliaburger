@@ -801,7 +801,10 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
                 .tls_material
                 .as_ref()
                 .map(|material| material.identity.clone()),
-            crl: self.tls_material.as_ref().map(|material| material.crl.clone()),
+            crl: self
+                .tls_material
+                .as_ref()
+                .map(|material| material.crl.clone()),
             fence: self.fence.clone(),
             pool: self.pool.clone(),
         }
@@ -1361,11 +1364,7 @@ mod tests {
         serial: u64,
     ) -> (tempfile::TempDir, LiveNodeIdentity) {
         let directory = tempfile::tempdir().unwrap();
-        identity_store::save(
-            directory.path(),
-            &node_identity(hierarchy, node_id, serial),
-        )
-        .unwrap();
+        identity_store::save(directory.path(), &node_identity(hierarchy, node_id, serial)).unwrap();
         let live = LiveNodeIdentity::load(directory.path()).unwrap();
         (directory, live)
     }
@@ -1493,8 +1492,10 @@ mod tests {
             Some((server, CrlHandle::default())),
         )
         .await;
-        let mut factory =
-            TcpRaftNetworkFactory::new_tls_bound(1, RaftTlsMaterial::new(client, CrlHandle::default()));
+        let mut factory = TcpRaftNetworkFactory::new_tls_bound(
+            1,
+            RaftTlsMaterial::new(client, CrlHandle::default()),
+        );
 
         let mut network = factory.new_client(2, &peer_info(peer.address)).await;
         for _ in 0..20 {
@@ -1567,7 +1568,10 @@ mod tests {
             version: 1,
             updated_at: SystemTime::now(),
         });
-        assert!(!vote(&mut network).await, "a revoked peer must not be reached");
+        assert!(
+            !vote(&mut network).await,
+            "a revoked peer must not be reached"
+        );
         assert_eq!(peer.connections.load(Ordering::SeqCst), 1);
     }
 

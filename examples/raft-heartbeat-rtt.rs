@@ -87,10 +87,14 @@ async fn start_node(
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Node> {
     let directory = tempfile::tempdir()?;
-    identity_store::save(directory.path(), &identity(hierarchy, &format!("n{id}"), 10 + id)?)?;
+    identity_store::save(
+        directory.path(),
+        &identity(hierarchy, &format!("n{id}"), 10 + id)?,
+    )?;
     let live = LiveNodeIdentity::load(directory.path())?;
     let crl = CrlHandle::default();
-    let acceptor = tokio_rustls::TlsAcceptor::from(build_live_mtls_server_config(&live, crl.clone())?);
+    let acceptor =
+        tokio_rustls::TlsAcceptor::from(build_live_mtls_server_config(&live, crl.clone())?);
     let factory = TcpRaftNetworkFactory::new_tls_bound(id, RaftTlsMaterial::new(live, crl));
     let council = Arc::new(
         CouncilNode::new(
@@ -108,7 +112,14 @@ async fn start_node(
     let raft = council.raft().clone();
     let serving = shutdown.clone();
     tokio::spawn(async move {
-        serve_raft_rpc(listener, raft, serving, Some(acceptor), RecoveryFence::serving(0)).await;
+        serve_raft_rpc(
+            listener,
+            raft,
+            serving,
+            Some(acceptor),
+            RecoveryFence::serving(0),
+        )
+        .await;
     });
     Ok(Node {
         council,
