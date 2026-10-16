@@ -755,6 +755,11 @@ the real `curl … | sh` install against it on every host we advertise.
    website deploys from `main`, and publishes `/demo/*` from the tag the
    bootstrap installs, so merge that change after promotion, not before.
 
+   Add the release's paragraph to the top of the
+   [release log](release-log.md): the promotion date, how long qualifying it
+   took and how many candidates, what each soak found and what fixed it, and
+   any known issue it ships with, linking the records from step 6.
+
 ## Soaking a candidate in CI
 
 The V02 sustained soak ([plan](plans/2026-09-25-v02-sustained.md)) also runs
