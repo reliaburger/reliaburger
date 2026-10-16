@@ -28,7 +28,7 @@ use syn::visit::Visit;
 const TAG: &str = "LOOP-INLINE:";
 
 /// Async methods a turn doesn't run: `select!` awaits them to *find* work.
-const BRANCH_FUTURES: &[&str] = &["recv_snapshot"];
+const BRANCH_FUTURES: &[&str] = &["recv_snapshot", "discovery_write_done"];
 
 /// One parsed source file.
 struct Source {

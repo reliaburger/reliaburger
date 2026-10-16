@@ -38,7 +38,9 @@
 //! 2. An await that stays inline without the turn's deadline carries a
 //!    `// LOOP-INLINE: <why>` comment on its statement: an in-memory lock,
 //!    an fsync'd persist (allowed, and bounded by the harness's slow-disk
-//!    scenario), or the short sleep before an upgrade's exec.
+//!    scenario), or the short sleep before an upgrade's exec. A consumer
+//!    step's discovery-journal write is the exception: it waits only until
+//!    the turn's deadline, then lands off the loop (#890).
 //! 3. `loop_rule::every_inline_await_on_the_agent_loop_has_a_deadline_or_a_reason`
 //!    walks every method a turn can reach and fails on an await with
 //!    neither. Reviewers read the tags, not the whole call graph.
@@ -1581,8 +1583,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // (#505). Its steps take turns with everything below:
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
-                    _ = std::future::ready(()), if self.consumer_syncs.step_first() => {
+                    // No step runs while a step's write is in flight.
+                    _ = std::future::ready(()), if self.consumer_syncs.step_first()
+                        && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
+                        self.continue_consumer_sync().await;
+                        turn
+                    }
+                    // A step's write that outlasted its turn has landed
+                    // (#890): take the step's remainder now.
+                    outcome = Self::discovery_write_done(&mut self.discovery_ownership),
+                        if self.discovery_write_in_flight() => {
+                        let turn = self.begin_consumer_sync_turn();
+                        self.land_discovery_write(outcome).await;
                         self.continue_consumer_sync().await;
                         turn
                     }
@@ -1596,7 +1609,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.handle_command(cmd).await;
                         turn
                     }
-                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle() => {
+                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle()
+                        && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
