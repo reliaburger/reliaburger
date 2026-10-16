@@ -15,7 +15,7 @@ accepted one retry.
 |---|---:|---:|---:|---:|
 | Raw VM processes | 15,491.8/s (12,480.2–16,391.7) | 929,510 exits | 1.3B | 16,562.0/s |
 | Fresh containers | 12.7/s (12.2–12.9) | 762 accepted | 1.1M | 3.55/s |
-| Shared containers | 2,916.7/s (2,700.0–3,100.0) | 175,000 accepted | 252.0M | 966.7/s |
+| Shared containers | 2,916.7/s (2,700.0–3,100.0) | 175,000 accepted | 252M | 966.7/s |
 | Host jobs | 4,666.7/s (3,766.7–4,833.3) | 280,000 accepted | 403.2M | 4,900.0/s |
 
 Runs/day multiplies the minute count by 1,440; it isn't an observed daily

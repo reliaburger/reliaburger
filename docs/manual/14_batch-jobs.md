@@ -983,7 +983,7 @@ rounds:
 |---|---:|---:|---:|---:|
 | Raw VM processes | 929,510 exits | 15,491.8/s | 1.3B | Not applicable |
 | Fresh containers | 762 accepted successes | 12.7/s | 1.1M | 1 in five rounds |
-| Shared containers | 175,000 accepted successes | 2,916.7/s | 252.0M | 0 |
+| Shared containers | 175,000 accepted successes | 2,916.7/s | 252M | 0 |
 | Host jobs | 280,000 accepted successes | 4,666.7/s | 403.2M | 0 |
 
 No window had a terminal failure, and unused queued work was cancelled and
