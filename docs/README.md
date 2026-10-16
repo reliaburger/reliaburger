@@ -1525,7 +1525,8 @@ machines.
   VM.
 
 They're one part of a release's acceptance, not all of it; the
-[release runbook](releasing.md) lists the gates a candidate has to pass.
+[release runbook](releasing.md) lists the gates a candidate has to pass, and
+the [release log](release-log.md) says how each release went through them.
 
 ### Running jobs on a development build
 

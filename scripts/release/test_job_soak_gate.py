@@ -306,6 +306,20 @@ class JobQualification(unittest.TestCase):
         self.assertIn("job-load calibration target-rate none node-faults false",result.stdout)
         self.assertNotIn("node-fault ",result.stdout)
 
+    def test_every_soak_forwards_ports_over_ssh_whatever_the_caller_set(self):
+        # Lima 2.1's gRPC forwarder leaks a guest-agent socket per forwarded
+        # connection, so the API node ran out of memory (lima-vm/lima#5210).
+        import subprocess
+        for caller in ("", "false", "true"):
+            environment=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1",LIMA_SSH_PORT_FORWARDER=caller)
+            for script in ("qualify-sustained.sh","qualify-jobs-sustained.sh"):
+                result=subprocess.run([str(self.release/script),"--tier","fast","--plan"],stdout=subprocess.PIPE,
+                                      text=True,timeout=60,env=environment)
+                with self.subTest(script=script,caller=caller):
+                    self.assertEqual(result.returncode,0)
+                    header=result.stdout.splitlines()[0].split()[1:]
+                    self.assertEqual(dict(zip(header[::2],header[1::2]))["port-forwarder"],"ssh")
+
     def test_cpu_samples_count_forward_only_within_one_process_and_helper(self):
         state={}
         checker.job_metric_samples(state,"n",dict(bun_pid=["7"],bun_cpu_ticks=["1000"],clk_tck=["100"],executor_cpu=["d/e/0/helper 1000000"]),100)

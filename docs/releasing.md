@@ -632,6 +632,13 @@ the real `curl … | sh` install against it on every host we advertise.
    are recorded as info, not failures: a turn that journals there is slow by
    construction (#972). Every other node's turns, and that node's once the
    window closes, still fail the tier.
+   The soak VMs forward ports over SSH (`LIMA_SSH_PORT_FORWARDER=true`,
+   recorded as a deviation). Lima 2.1's default gRPC forwarder leaks a
+   guest-agent socket per forwarded connection
+   ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210)), and at
+   the job tier's API rate the API node's guest agent grew to 1 GiB in six
+   hours, until the kernel killed Bun
+   ([#982](https://github.com/reliaburger/reliaburger/issues/982)).
 
    ```sh
    # About 90 minutes, compressed: every fault kind on every node.
@@ -699,7 +706,14 @@ the real `curl … | sh` install against it on every host we advertise.
    the warm sample, fds bounded) and a log-order swap when an instance moved
    nodes under the same name (fixed by #272: one adjacent swap in an
    unlabelled tail, the instance on different nodes in the status snapshots
-   either side). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
+   either side). For 0.2.0 only, while soaks forward ports over SSH, a node
+   cut off from the host after a reboot or exec is a third (Lima never
+   retries a failed `ssh -O forward`; the cluster stays healthy from inside;
+   it goes with the SSH forwarder,
+   [#983](https://github.com/reliaburger/reliaburger/issues/983)), and the
+   job controller running out of its 256-run budget in a 12-hour final is a
+   fourth (fixed by
+   [#989](https://github.com/reliaburger/reliaburger/issues/989)). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
@@ -775,6 +789,11 @@ the real `curl … | sh` install against it on every host we advertise.
    ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
    website deploys from `main`, and publishes `/demo/*` from the tag the
    bootstrap installs, so merge that change after promotion, not before.
+
+   Add the release's paragraph to the top of the
+   [release log](release-log.md): the promotion date, how long qualifying it
+   took and how many candidates, what each soak found and what fixed it, and
+   any known issue it ships with, linking the records from step 6.
 
 ## Soaking a candidate in CI
 
