@@ -1316,6 +1316,214 @@ async fn a_local_address_stays_held_between_a_withdrawal_and_its_publication() {
     assert!(agent.own_view_names(&local));
 }
 
+/// How long one discovery-journal write took after a deploy-kill restarted
+/// a node's Bun in the 0.2.0 candidate 7 soak (#890): 1,574 ms of a
+/// 1,575 ms `consumer_sync/journal` turn. A throttled disk took up to 6 s.
+const STALLED_JOURNAL_WRITE: std::time::Duration = std::time::Duration::from_millis(1600);
+
+/// The host port the installed view sends `default/remote` to, if any.
+fn installed_remote_port(agent: &BunAgent<MockGrill>) -> Option<u16> {
+    agent
+        .service_map_tx
+        .borrow()
+        .resolve(&crate::onion::service_id::ServiceId::new(
+            "default", "remote",
+        ))
+        .and_then(|entry| entry.backends.first().map(|backend| backend.host_port))
+}
+
+/// A consumer that published the fixture's view, and the leader's next
+/// answer for it: the same service with its backend moved.
+async fn published_consumer() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    Vec<crate::cluster::orchestrate::IngressAssignment>,
+) {
+    let (mut agent, root, catalog, ingress) = recovered_consumer().await;
+    let published = agent
+        .synchronise_consumer(1, catalog, ingress.clone(), vec![])
+        .await
+        .unwrap();
+    assert!(published.published);
+    assert_eq!(installed_remote_port(&agent), Some(30001));
+    (agent, root, ingress)
+}
+
+/// Take one consumer-sync turn as `run_loop` does, and return it as the
+/// meter saw it.
+async fn one_consumer_sync_turn(
+    agent: &mut BunAgent<MockGrill>,
+) -> crate::bun::loop_meter::TurnRecord {
+    let turn = agent.begin_consumer_sync_turn();
+    agent.continue_consumer_sync().await;
+    agent.consumer_syncs.end_turn();
+    agent.turn_deadline = None;
+    agent.loop_meter.finish(turn);
+    agent.loop_meter.last_turn().unwrap()
+}
+
+/// The 0.2.0 soaks (#890): after a restart, one discovery-journal write
+/// took 1.6 s, and the consumer step that waited for it held the loop for
+/// all of it. A step now waits for its write only until the turn's runtime
+/// budget runs out. The write goes on off the loop, the turn ends, and a
+/// status queued meanwhile is answered; once the write lands, the step's
+/// next part runs. Each of the changed view's three writes is this slow.
+#[tokio::test]
+async fn status_answers_while_a_consumer_journal_write_outlasts_the_turn() {
+    let (agent, _root, ingress) = published_consumer().await;
+    let lease = agent.view_lease_handle();
+    let running = run_restarted(agent);
+    running
+        .stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    running.measure_from_here();
+    let reply = sync_consumer(&running.tx, 2, moved_remote_backend(), ingress).await;
+    // Let the journal step start its write before the status queues.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mid_write = running.status_latency().await;
+    let update = tokio::time::timeout(std::time::Duration::from_secs(20), reply)
+        .await
+        .expect("the sync was never answered")
+        .unwrap()
+        .unwrap();
+    assert!(update.published, "the changed view was not published");
+    assert!(lease.is_valid(), "the changed view did not renew the lease");
+    running
+        .stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    assert!(
+        mid_write.is_some_and(|latency| latency < TURN_BUDGET),
+        "status took {mid_write:?} while a journal write took {STALLED_JOURNAL_WRITE:?}"
+    );
+    running
+        .assert_responsive("each of a consumer sync's journal writes took 1.6 s")
+        .await;
+}
+
+/// Journal before kernel: a view reaches the kernel, DNS and Wrapper only
+/// after the write that records it has landed, however long that write
+/// takes and however many turns run meanwhile. The turn that starts the
+/// write ends within the budget with the old view still installed; the
+/// turn after the write lands installs the new one.
+#[tokio::test]
+async fn a_consumer_view_is_installed_only_after_its_journal_write_lands() {
+    let (mut agent, _root, ingress) = published_consumer().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (response, mut reply) = oneshot::channel();
+    agent
+        .request_consumer_sync(crate::bun::agent::consumer::ConsumerRequest {
+            generation: 2,
+            catalog: moved_remote_backend(),
+            ingress,
+            withdrawals: vec![],
+            answer: Some(crate::bun::agent::consumer::ConsumerAnswer {
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            }),
+        })
+        .await;
+    let candidate = one_consumer_sync_turn(&mut agent).await;
+    assert_eq!(candidate.detail, Some("consumer_sync/candidate"));
+    let journal = one_consumer_sync_turn(&mut agent).await;
+    assert_eq!(journal.detail, Some("consumer_sync/journal"));
+    assert!(journal.took < TURN_BUDGET, "{journal}");
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the write was waited for: {journal}"
+    );
+    assert_eq!(
+        installed_remote_port(&agent),
+        Some(30001),
+        "the view was installed before its journal write landed"
+    );
+    assert!(reply.try_recv().is_err(), "answered before its last step");
+
+    agent.settle_discovery_write().await;
+    assert!(!agent.discovery_write_in_flight());
+    assert_eq!(
+        installed_remote_port(&agent),
+        Some(30001),
+        "landing the write installed the view by itself"
+    );
+    let install = one_consumer_sync_turn(&mut agent).await;
+    assert_eq!(install.detail, Some("consumer_sync/install"));
+    assert_eq!(installed_remote_port(&agent), Some(30011));
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    while !agent.consumer_syncs.is_idle() {
+        one_consumer_sync_turn(&mut agent).await;
+    }
+    assert!(reply.await.unwrap().unwrap().published);
+    assert_eq!(
+        agent.consumer_owner().unwrap().phase,
+        crate::bun::consumer_owners::ConsumerPhase::Active
+    );
+}
+
+/// A journal write that fails after the turn moved on fences discovery as
+/// a failed inline write does: ownership becomes uncertain, readiness says
+/// so, the view it would have recorded never reaches the kernel, and the
+/// leader hears the failure.
+#[tokio::test]
+async fn a_journal_write_that_fails_off_the_turn_fences_discovery_and_installs_nothing() {
+    let (mut agent, _root, ingress) = published_consumer().await;
+    let readiness = crate::bun::readiness::ReadinessTracker::new();
+    agent.set_readiness_tracker(readiness.clone());
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (response, reply) = oneshot::channel();
+    agent
+        .request_consumer_sync(crate::bun::agent::consumer::ConsumerRequest {
+            generation: 2,
+            catalog: moved_remote_backend(),
+            ingress,
+            withdrawals: vec![],
+            answer: Some(crate::bun::agent::consumer::ConsumerAnswer {
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            }),
+        })
+        .await;
+    one_consumer_sync_turn(&mut agent).await;
+    let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+        &mut agent.discovery_ownership
+    else {
+        panic!("discovery ownership is not ready before the journal step");
+    };
+    journal.fail_next_write();
+    one_consumer_sync_turn(&mut agent).await;
+    assert!(agent.discovery_write_in_flight());
+
+    agent.settle_discovery_write().await;
+    assert!(matches!(
+        agent.discovery_ownership,
+        DiscoveryOwnership::Uncertain
+    ));
+    let degraded = readiness
+        .snapshot()
+        .await
+        .subsystems
+        .into_iter()
+        .find(|subsystem| subsystem.name == "discovery:journal")
+        .map(|subsystem| subsystem.state);
+    assert_eq!(
+        degraded,
+        Some(crate::bun::readiness::SubsystemState::Degraded)
+    );
+    while !agent.consumer_syncs.is_idle() {
+        one_consumer_sync_turn(&mut agent).await;
+    }
+    assert!(
+        reply.await.unwrap().is_err(),
+        "a failed write was published"
+    );
+    assert_eq!(installed_remote_port(&agent), Some(30001));
+}
+
 // ---- callers that can hold a turn ---------------------------------------------
 
 /// `relish logs -f --tail` sends the tail lines into the API's 64-slot
