@@ -183,7 +183,8 @@ a passing mixed-workload soak does not itself qualify sustained 100m/day.
 
 - `scripts/release/job_soak.py`: durable intents, bounded six-run campaign,
   independent authenticated effect ledger, targeted probes, fault markers and
-  bounded drain. At most 256 submissions, 32 unresolved named fixtures and 4096
+  bounded drain. At most 256 runs (active, or drained within the candidate's
+  hour of retention; #989), 32 unresolved named fixtures and 4096
   verifier effect identities are retained by the controller/verifier. The
   candidate's own storage lifetime is measured separately.
 - `scripts/release/job_soak_inventory.py`: complete bounded kernel scans and

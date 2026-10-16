@@ -1846,6 +1846,35 @@ that's what the JSON decoder raises too. Now only a record that was read and
 doesn't parse is called invalid JSON, and the message carries its path, size
 and first and last bytes. A slot group with no record says so.
 
+That message then caught something that wasn't a leak. The eighth candidate's
+job soak failed one heavy check on a slot group with no record, but this time
+the slot was brand new (#980). A cold host executor slot gets its cgroup
+first, and its owner record only when the process owner prepares the launch,
+an fsync later. On a busy node that gap lasts seconds. The inventory already
+retried three times to ride out churn, but back to back, in a few
+milliseconds, so all three landed in the gap. Now an attempt that still finds
+errors waits half a second before the next, for five seconds in all. A
+leftover slot like #952's never gets a record, so it still fails, five
+seconds later. Settle checks had absorbed the same signature several times
+in earlier runs, because a settle waits for two clean checks in a row. A
+heavy check gets one go, which is why it took until the eighth candidate to
+fail a run.
+
+The next failure looked much worse and wasn't ours either. Six hours into the
+same candidate's 12-hour job soak, the kernel's out-of-memory killer killed
+Bun on node 1, three times in twenty minutes (#982). Bun itself never went
+above 380 MiB. The memory belonged to `lima-guestagent`, Lima's helper inside
+the VM, which held 1 GiB and 58,500 open sockets. Every request from the
+harness to the API crosses into the VM through Lima's port forwarder, and
+the default one leaked a socket per connection (lima-vm/lima#5210, fixed
+upstream in 2.2.0). Node 1 serves the API, so it took nearly all of them.
+The guest agent protects itself from the OOM killer and Bun didn't, so Bun
+was the one killed. The soak now uses Lima's SSH forwarder, the quickstart
+will move to a fixed Lima (#983), and Bun should stop being the kernel's
+first choice when memory runs out (#984). A soak that only watched Bun's own
+memory would have called this a Bun leak. Asking the kernel what it killed,
+and what was holding the memory, settled it in a minute.
+
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
 secrets catalogue skipped all its container tests. Now the classifier sees the
@@ -3055,6 +3084,29 @@ on its own recovery. The final verdict still fails on it, because
 `coverage_failures` reads the campaign's errors. And the controller now saves
 the refused summary body under `jobs/refused/` beside the error, so the next
 refusal won't need inferring (#968).
+
+The first 12-hour jobs final to get that far ran out of runs. The controller
+admitted at most 256, a number picked when the longest tier was eight hours,
+and it prepares about 25 an hour. At 10.5 hours `prepare` raised "retained run
+budget exhausted", and because it raised out of the whole step, the
+controller never reached the polling below it. Every progress counter froze.
+An hour and a half later the drain asked to cancel runs it hadn't looked at
+since, and Bun answered 404: it had pruned them, as it does an hour after a
+run finishes (sooner when newer runs push it out). The drain retried those
+cancels until its deadline. The budget was bounding the wrong thing. It
+counted runs ever admitted, while the cost it guards against is runs held:
+the controller's state and the candidate's run store. Now a run counts from
+admission until an hour after the controller sees it drain, when the
+candidate would have pruned it anyway. A 12-hour run holds about 31 at its
+busiest, and `--plan` prints the expected count and that peak beside the
+limit, refusing a schedule that wouldn't fit. When the budget is full, the
+controller records it once and keeps polling, so the runs it has still drain
+and free their slots. A 404 is now a `Gone` error (a subclass of
+`InvalidEvidence`, so code that catches the parent still sees it), and the run
+leaves the campaign either way. Whether it drained is a separate question. If
+the controller's last look showed it drained, it did. Anything else, including
+a run last seen nearly finished, is an unknown outcome and fails the record.
+"Probably finished" is exactly the guess the soak exists to refuse (#989).
 
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;

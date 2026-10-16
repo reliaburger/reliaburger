@@ -1,4 +1,5 @@
 """A pretty job table must not turn missing or orphaned evidence into a pass."""
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -306,6 +307,20 @@ class JobQualification(unittest.TestCase):
         self.assertIn("job-load calibration target-rate none node-faults false",result.stdout)
         self.assertNotIn("node-fault ",result.stdout)
 
+    def test_every_soak_forwards_ports_over_ssh_whatever_the_caller_set(self):
+        # Lima 2.1's gRPC forwarder leaks a guest-agent socket per forwarded
+        # connection, so the API node ran out of memory (lima-vm/lima#5210).
+        import subprocess
+        for caller in ("", "false", "true"):
+            environment=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1",LIMA_SSH_PORT_FORWARDER=caller)
+            for script in ("qualify-sustained.sh","qualify-jobs-sustained.sh"):
+                result=subprocess.run([str(self.release/script),"--tier","fast","--plan"],stdout=subprocess.PIPE,
+                                      text=True,timeout=60,env=environment)
+                with self.subTest(script=script,caller=caller):
+                    self.assertEqual(result.returncode,0)
+                    header=result.stdout.splitlines()[0].split()[1:]
+                    self.assertEqual(dict(zip(header[::2],header[1::2]))["port-forwarder"],"ssh")
+
     def test_cpu_samples_count_forward_only_within_one_process_and_helper(self):
         state={}
         checker.job_metric_samples(state,"n",dict(bun_pid=["7"],bun_cpu_ticks=["1000"],clk_tck=["100"],executor_cpu=["d/e/0/helper 1000000"]),100)
@@ -488,3 +503,154 @@ class DrainedCampaignApply(unittest.TestCase):
 
     def test_no_job_fixture_is_applied_after_an_explicit_stop(self):
         self.assertNotIn("soak-job",self.write(dict(job_stop_at=10**10),stop_file=True))
+
+
+class RunBudget(unittest.TestCase):
+    """#989: a 12-hour final ran out of the controller's 256-run budget at
+    10.5 hours, then stopped polling the runs it had, so the drain met runs
+    the candidate had already pruned (HTTP 404) and failed."""
+
+    release=Path(__file__).parent
+
+    class API:
+        """Admits every intent; a run's summary is drained, pending or gone."""
+        def __init__(self, finish=True):
+            self.finish, self.posts, self.gets, self.gone = finish, {}, [], set()
+        def request(self, method, path, body=None, raw=False):
+            if path=="/v1/jobs/runs":
+                identity=self.posts.setdefault(body["request_id"],(len(self.posts)+1,copy.deepcopy(body)))[0]
+                return {"batch_id":identity}
+            identity=int(path.split("/")[3])
+            if identity in self.gone: raise jobs.Gone("candidate API refused "+method+" "+path+" (HTTP 404)")
+            if path.endswith("/cancel"): return {}
+            self.gets.append(identity)
+            body=next(b for i,b in self.posts.values() if i==identity)
+            template=body["definition"]["template"]; count=body["definition"]["tasks"]["count"]
+            done=self.finish
+            return dict(batch_id=identity,name=body["name"],total=count,succeeded=count if done else 1,failed=0,not_run=0,
+                        retried=0,queued=0 if done else count-1,held=0,active_commands=0,done=done,nodes=[],
+                        runtime=template["runtime"],cpu_request_millicores=25,
+                        memory_request_bytes=int(template["memory"][:-2])<<20)
+
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.path=Path(self.temp.name)/"jobs"
+
+    def campaign(self, api):
+        c=jobs.Campaign(self.path,api,[],"token")
+        # Every targeted probe already covered: each slot gets ordinary work.
+        for mode in jobs.MODES: c.state["coverage"][mode]={purpose:True for purpose in jobs.PURPOSES}
+        return c
+
+    def test_a_final_tier_plan_fits_within_its_limit(self):
+        # The 8-hour jobs final that replaces the V02 final (#991), and the
+        # 12-hour one that ran out for 0.2.0.
+        for hours in (8,12):
+            plan=jobs.run_budget(hours*3600)
+            self.assertTrue(plan["fits"],hours)
+            # 0.2.0's final prepared about 25 runs an hour; the plan allows twice that.
+            self.assertGreaterEqual(plan["expected_runs"],25*hours)
+            # More runs than the old fixed budget of 256 ever admitted.
+            self.assertGreater(plan["expected_runs"],256)
+            self.assertLessEqual(plan["peak_retained"],plan["limit"])
+            self.assertEqual(plan["limit"],jobs.RETAINED_RUNS)
+
+    def test_the_retention_window_is_the_products(self):
+        # A finished run frees its slot once the candidate would have pruned it.
+        import re
+        source=(Path(__file__).resolve().parents[2]/"src/meat/task_array_store.rs").read_text()
+        value=re.search(r"pub const TERMINAL_RETENTION_SECS: u64 = (\d+);",source)
+        self.assertEqual(int(value.group(1)),jobs.RETENTION_SECS)
+
+    def test_a_schedule_that_would_not_fit_is_refused_up_front(self):
+        import subprocess,sys
+        self.assertFalse(jobs.run_budget(12*3600,runs_per_hour=400)["fits"])
+        result=subprocess.run([sys.executable,str(self.release/"job_soak.py"),"budget","--duration","43200","--runs-per-hour","400"],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=60)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("limit %d" % jobs.RETAINED_RUNS,result.stderr)
+
+    def test_the_plan_prints_the_limit_next_to_the_expected_run_count(self):
+        import os,subprocess
+        result=subprocess.run([str(self.release/"qualify-jobs-sustained.sh"),"--tier","final","--plan"],stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,text=True,timeout=60,env=dict(os.environ,RELIABURGER_SOAK_CAFFEINATED="1"))
+        self.assertEqual(result.returncode,0,result.stderr)
+        header=next(line for line in result.stdout.splitlines() if line.startswith("plan: tier ")).split()[1:]
+        duration=int(dict(zip(header[::2],header[1::2]))["duration"])
+        line=next(line for line in result.stdout.splitlines() if line.startswith("plan: job-runs "))
+        fields=line.split()[2:]
+        fields=dict(zip(fields[::2],fields[1::2]))
+        plan=jobs.run_budget(duration)
+        self.assertEqual(fields,dict(expected=str(plan["expected_runs"]),**{"retained-peak":str(plan["peak_retained"])},
+                                     limit=str(jobs.RETAINED_RUNS)))
+
+    def test_finished_verified_runs_free_their_slot(self):
+        from unittest.mock import patch
+        api=self.API(finish=True)
+        with patch.object(jobs,"RETAINED_RUNS",6):
+            c=self.campaign(api)
+            c.step(1000)                       # six runs admitted
+            c.step(1002)                       # all six verified drained
+            self.assertEqual(c.state["active"],{})
+            c.step(1004)                       # their slots are held for the retention window
+            self.assertEqual(len(api.posts),6)
+            self.assertIn("retained run budget exhausted",";".join(c.state["errors"]))
+            c.step(1002+jobs.RETENTION_SECS)   # the candidate has pruned them: slots free
+            self.assertEqual(len(api.posts),12)
+            self.assertLess(len(c.state["finished"]),jobs.RETAINED_RUNS)
+
+    def test_an_exhausted_budget_keeps_polling_and_draining_its_runs(self):
+        from unittest.mock import patch
+        api=self.API(finish=False)
+        with patch.object(jobs,"RETAINED_RUNS",3):
+            c=self.campaign(api)
+            c.step(1000); c.step(1002)
+            self.assertEqual(len(api.posts),3)
+            self.assertEqual(sorted(set(api.gets)),[1,2,3])
+            polled=len(api.gets)
+            c.step(1004)
+            self.assertGreater(len(api.gets),polled)
+            self.assertEqual(sum("retained run budget exhausted" in e for e in c.state["errors"]),1)
+            self.assertGreater(c.state["progress"]["runc"]["succeeded"],0)
+            api.finish=True
+            self.assertTrue(c.step(1006,stop=True))
+
+    def test_a_run_pruned_before_its_drain_was_observed_is_unknown_not_drained(self):
+        api=self.API(finish=False)
+        c=self.campaign(api)
+        c.step(1000); c.step(1002)
+        api.gone.add(c.state["active"]["runc:short"]["id"])
+        c.step(1004,stop=True)
+        self.assertNotIn("runc:short",c.state["active"])
+        errors=";".join(c.state["errors"])
+        self.assertIn("no longer has this run",errors)
+        self.assertIn("outcome is unknown",errors)
+        self.assertNotIn("drain",c.state["coverage"]["runc"])
+
+    def test_a_run_pruned_after_its_drain_was_observed_is_drained(self):
+        api=self.API(finish=True)
+        c=self.campaign(api)
+        c.step(1000)
+        intent=c.state["active"]["runc:short"]
+        intent["previous"]=api.request("GET","/v1/batch/%d" % intent["id"])
+        api.gone.add(intent["id"])
+        c.step(1002,stop=True)
+        self.assertNotIn("runc:short",c.state["active"])
+        self.assertEqual(c.state["errors"],[])
+        self.assertTrue(c.state["coverage"]["runc"]["drain"])
+
+    def test_http_404_from_the_candidate_is_reported_as_gone(self):
+        from unittest.mock import patch
+        import subprocess
+        with tempfile.TemporaryDirectory() as folder:
+            ca=Path(folder)/"ca"; ca.write_bytes(b"candidate")
+            api=jobs.API([dict(name="n")],9117,ca,Path(folder)/"header")
+            def answer(command,input=None,stdout=None,stderr=None,timeout=None):
+                stdout.write(b'{"error":"not found"}\n404'); return subprocess.CompletedProcess(command,0)
+            with patch("job_soak.subprocess.run",side_effect=answer):
+                with self.assertRaises(jobs.Gone): api.request("GET","/v1/batch/7")
+            def refused(command,input=None,stdout=None,stderr=None,timeout=None):
+                stdout.write(b'{}\n403'); return subprocess.CompletedProcess(command,0)
+            with patch("job_soak.subprocess.run",side_effect=refused):
+                with self.assertRaises(jobs.InvalidEvidence) as caught: api.request("GET","/v1/batch/7")
+                self.assertNotIsInstance(caught.exception,jobs.Gone)

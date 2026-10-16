@@ -441,7 +441,11 @@ For the job qualification tiers they also parse `--plan` output (every node
 fault kind on every node in the fast tier, a day of them in the final one),
 the target-load bodies and rate gate, retry-cause accounting (the harness's
 cause list must match the fields of the product's `RetryCauses`, and an
-unknown cause is refused by name), CPU sampling
+unknown cause is refused by name), the retained-run limit (an 8- or 12-hour final
+fits, a schedule that wouldn't is refused before it starts, a drained run
+frees its slot an hour later, a full budget still polls and drains its runs,
+and a run the candidate has pruned counts as drained only if the controller
+saw it drain), CPU sampling
 across restarts and the `.jobs.json` report beside the record.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
