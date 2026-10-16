@@ -875,7 +875,7 @@ class Record(Evidence):
             state["renewals"]["workload-identity"] = {name: 16 for name in NODES}
             checker.save_state(self.evidence, state)
         else:
-            run.update(duration_target=90 * 60)
+            run.update(duration_target=60 * 60)
         run.update(tier=tier, **metadata)
         (self.evidence / "metadata.json").write_text(json.dumps(run))
         record = self.evidence / "record.md"

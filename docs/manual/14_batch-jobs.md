@@ -681,7 +681,7 @@ rollout headroom when planning a mixed cluster.
 bursts, retries, average task duration and the tightest CPU/memory dimension;
 container startup, images, output, storage and network cost also matter. This
 feature does not qualify that target by itself. A simulator benchmark and this
-short demo are not the 12-hour throughput and reliability qualification.
+short demo are not the 8-hour job final soak, the throughput and reliability qualification.
 
 Apps without explicit resource requests reserve zero, matching the existing
 app scheduler. Set requests for services sharing a node with batch work, and
@@ -1085,7 +1085,7 @@ high-water mark was 258.1 MiB. All 117 bounded
 storage scans were incomplete, so they don't establish a global storage bound.
 No inventory timeout appeared across the fixture lifetime. The
 [raw hour, resource observations and positive cleanup proofs](../qualification/2026-10-09-host-job-executors/README.md)
-retain these limits. This completed hour does not qualify 100m/day; 12-hour,
+retain these limits. This completed hour does not qualify 100m/day; the job final,
 fault and historical namespace/profile/cardinality work remains in #668.
 
 ### Historical one-hour host run

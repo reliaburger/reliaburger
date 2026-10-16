@@ -17,7 +17,7 @@ What 0.2.0 doesn't promise yet is the daily number. The whitepaper's target is
 100 million accepted successes a day, and the
 [timed-scenario record](../qualification/2026-10-09-timed-job-scenarios/README.md)
 projects past that from one-minute windows. A projection isn't a qualification:
-the 12-hour run at that rate, with bounded storage
+a final soak at that rate, with bounded storage
 ([#668](https://github.com/reliaburger/reliaburger/issues/668)) is the evidence
 that will, and until it passes we don't claim it. The end of the chapter lists
 the other gaps still open.
@@ -2906,8 +2906,8 @@ so waiting for a slot can't leak into execution time.
 A fast command completing a million times tells us little about what happens
 when Bun dies halfway through owning it. The release soak already kills agents,
 powers off nodes and loses quorum while data-bearing apps run. It now drives
-all three job runtimes through the same faults, within the existing 90-minute
-fast and eight-hour final tiers.
+all three job runtimes through the same faults, within the existing fast and
+final tiers (90 minutes and eight hours then; an hour and eight hours now).
 
 The [extension plan](../plans/2026-10-10-plan-release-job-soak.md) describes a
 bounded controller with two resource profiles per runtime. It persists each
@@ -3110,8 +3110,8 @@ a run last seen nearly finished, is an unknown outcome and fails the record.
 
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
-the hourly saturation measurements and #668's retained-storage and 12-hour work
-answer different questions. No extrapolated daily rate determines a soak pass.
+the hourly saturation measurements and #668's retained-storage work answer
+different questions. No extrapolated daily rate determines a soak pass.
 
 ### The exit gate: half a day of faults
 
@@ -3139,7 +3139,26 @@ a peer, a disk filled to its last 64 MiB, or Bun's own writes throttled to 20
 IOPS with a systemd property. And every run writes a `.jobs.json` beside its
 record with the accepted rates and the M8 measurements. `--plan` prints the
 schedule without touching a cluster, which is how the CI tests check that the
-90-minute fast tier puts every fault kind on every node.
+fast tier's first four cycles carry every fault kind and every special.
+
+Twelve hours didn't last past 0.2.0. Its release gate ran two final soaks back
+to back: the 8-hour V02 final, then the 12-hour job final, which is the same
+soak with the jobs and node faults added. The second checks everything the
+first does, so running both bought nothing but a day. For 0.2.1 the
+maintainer set one 8-hour slot for all the final soaks (17 October 2026,
+[#991](https://github.com/reliaburger/reliaburger/issues/991)): the job final
+runs 8 hours and replaces the V02 final in the gate, and
+`qualify-sustained.sh --tier final` stays for running the V02 soak alone. The
+fast tiers, which the fix-and-rerun loop runs again and again, went from 90
+minutes to one hour. That fits because the compressed schedule already put
+every fault kind and every special in its first four ten-minute cycles, which
+the harness always finishes however far the slots overrun. The node faults
+needed one change. They used to visit a node three cycles in a row (delay,
+disk, fsync on node 1, then the same on node 2), so in six cycles node 3 never
+got one. Now each round of three puts one kind on each node and the next round
+shifts them along by one, which reaches every node in the first three cycles
+and every kind on every node in nine. The 8-hour final's eight node faults
+cover eight of those nine pairs.
 
 Why node-level faults only? `relish fault kill` against a job is refused by the
 same replica rail that protects apps, and an array's attempts inside a shared
@@ -3675,7 +3694,7 @@ every accepted task used to leave ledger entries, output and executor metadata
 behind with nothing reclaiming them, which is what "Where the bytes went"
 fixed.
 
-What's left isn't code. The 12-hour job qualification on at least three nodes
+What's left isn't code. The job final on at least three nodes
 ([#668](https://github.com/reliaburger/reliaburger/issues/668)) runs against
 the release candidate, and until it passes, the hundred-million-a-day figure
 stays a target.

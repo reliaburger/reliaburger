@@ -21,9 +21,10 @@
 #                           to a copy (OpenSSL 3 needed); each walk upgrades to
 #                           it and rolls back to the version the candidate's
 #                           nodes report; without it the upgrade slots are skipped
-#   --tier T                fast (compressed schedule, 90m: the iteration loop
+#   --tier T                fast (compressed schedule, 60m: the iteration loop
 #                           after each round of fixes) or final (full schedule,
-#                           8h: the acceptance run on the final candidate)
+#                           8h); the release gate's final soak is the job
+#                           final, qualify-jobs-sustained.sh --tier final
 #   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
 #   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
 #                           default: the tier's, or full
@@ -130,7 +131,7 @@ case $job_load in
 esac
 # The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
 case $tier in
-    fast) : "${schedule:=compressed}" "${duration_text:=90m}" ;;
+    fast) : "${schedule:=compressed}" "${duration_text:=60m}" ;;
     final) : "${schedule:=full}" "${duration_text:=8h}" ;;
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
     *) fail '--tier must be fast or final' ;;
@@ -1136,6 +1137,10 @@ slot_power_off() {
 # throttles Bun's own writes (Raft log, ledgers) to 20 IOPS and 1 MiB/s.
 node_fault_index=0
 node_fault_kind() { local kinds=(delay disk-full slow-fsync); echo "${kinds[$1 % 3]}"; }
+# Every three cycles each node gets one kind, and each kind moves on a node, so
+# the hour-long fast tier reaches every node and puts each kind on two of them,
+# and every nine cycles put each kind on every node (the leader among them).
+node_fault_node() { echo $(( ($1 + $1 / 3) % 3 + 1 )); }
 node_fault_script() {
     case $1:$2 in
         delay:start) printf '%s\n' 'dev=$(ip -o route get "$PEER" | sed -n "s/.* dev \([^ ]*\).*/\1/p"); [ -n "$dev" ] && tc qdisc replace dev "$dev" root netem delay 200ms 50ms && echo "$dev" > /run/soak-delay-dev' ;;
@@ -1149,8 +1154,7 @@ node_fault_script() {
 slot_node_fault() {
     local kind node peer hold result=0 log
     kind=$(node_fault_kind "$node_fault_index")
-    # Each kind visits every node (the leader among them) every nine cycles.
-    node=$(( (node_fault_index / 3) % 3 + 1 ))
+    node=$(node_fault_node "$node_fault_index")
     node_fault_index=$(( node_fault_index + 1 ))
     [ "${down[node]}" = 0 ] || node=1
     peer=$(( node % 3 + 1 ))
@@ -1585,7 +1589,8 @@ if [ "$plan" = true ]; then
         case $1 in
             special_for_cycle) "$@" ;;
             slot_bun_kill) printf 'plan: cycle %s %s-kill\n' "$index" "$2" ;;
-            slot_node_fault) printf 'plan: cycle %s node-fault %s\n' "$index" "$(node_fault_kind "$node_fault_index")"
+            slot_node_fault) printf 'plan: cycle %s node-fault %s node %s\n' "$index" "$(node_fault_kind "$node_fault_index")" \
+                                 "$(node_fault_node "$node_fault_index")"
                              node_fault_index=$(( node_fault_index + 1 )) ;;
             *) printf 'plan: cycle %s %s\n' "$index" "$(printf '%s' "${1#slot_}" | tr _ -)" ;;
         esac

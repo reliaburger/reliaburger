@@ -23,7 +23,7 @@ on:
         type: string
       duration:
         description: Soak length after setup (40m, 2h); setup, one overrunning cycle and teardown must fit in 6 h
-        default: 90m
+        default: 60m
         type: string
       schedule:
         description: Fault schedule (compressed = 10-minute cycle, full = hourly cycle)

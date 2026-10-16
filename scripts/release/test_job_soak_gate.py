@@ -36,7 +36,7 @@ class Gate(unittest.TestCase):
             with self.assertRaises(inventory.InvalidInventory): inventory.validate(value,100)
     def test_job_work_does_not_extend_existing_tier_or_fault_budgets(self):
         script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
-        self.assertIn("duration_text:=90m",script)
+        self.assertIn("duration_text:=60m",script)
         self.assertIn("duration_text:=8h",script)
         self.assertIn("end - 120",script)
         self.assertNotIn("sleep 120",script)
@@ -270,25 +270,73 @@ class JobQualification(unittest.TestCase):
                               env=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1"))
         return result.returncode,[line.split()[1:] for line in result.stdout.splitlines() if line.startswith("plan: ")],result.stderr
 
-    def test_fast_tier_plans_every_node_fault_on_every_node_within_ninety_minutes(self):
+    def test_fast_tier_plans_every_fault_kind_and_special_within_an_hour(self):
+        # #991: the fast tiers went from 90 minutes to one hour (maintainer, 17 October 2026).
         code,lines,_=self.plan("--tier","fast")
         self.assertEqual(code,0)
         header=dict(zip(lines[0][::2],lines[0][1::2]))
-        self.assertEqual((header["tier"],header["schedule"],header["duration"]),("fast","compressed","5400"))
+        self.assertEqual((header["tier"],header["schedule"],header["duration"]),("fast","compressed","3600"))
         self.assertEqual((header["job-load"],header["target-rate"],header["node-faults"]),("target","1390","true"))
-        faults=[line[3] for line in lines[1:] if line[2]=="node-fault"]
-        self.assertEqual(faults,["delay","disk-full","slow-fsync"]*3)
-        slots={line[2] for line in lines[1:]}
-        self.assertTrue({"follower-kill","leader-kill","power-off","chaos","node-fault"}<=slots)
-        specials={line[3] for line in lines[1:] if line[2]=="special"}
+        cycles=[line for line in lines[1:] if line[0]=="cycle"]
+        self.assertEqual(len({line[1] for line in cycles})*int(header["cycle"]),3600)
+        # The guaranteed cycles (0-3) carry every kind and every special, so
+        # overrunning slots can't push one past the hour.
+        early=[line for line in cycles if int(line[1])<4]
+        faults=[line[3] for line in early if line[2]=="node-fault"]
+        self.assertEqual(set(faults),{"delay","disk-full","slow-fsync"})
+        slots={line[2] for line in early}
+        self.assertTrue({"follower-kill","leader-kill","deploy-kill","power-off","chaos","node-fault"}<=slots)
+        specials={line[3] for line in early if line[2]=="special"}
         self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
 
-    def test_final_tier_runs_twelve_hours_on_the_full_schedule_at_the_requested_rate(self):
+    def test_node_faults_reach_every_node_within_the_fast_hour(self):
+        code,lines,_=self.plan("--tier","fast")
+        self.assertEqual(code,0)
+        placed=[(line[3],line[5]) for line in lines[1:] if line[2]=="node-fault"]
+        self.assertEqual([kind for kind,_ in placed],["delay","disk-full","slow-fsync"]*2)
+        # The first three put one kind on each node; the next three move each kind on.
+        self.assertEqual({node for _,node in placed[:3]},{"1","2","3"})
+        for kind in ("delay","disk-full","slow-fsync"):
+            self.assertEqual(len({node for k,node in placed if k==kind}),2,kind)
+        # Nine cycles still put every kind on every node.
+        import subprocess
+        result=subprocess.run([str(self.release/"qualify-sustained.sh"),"--node-faults","--schedule","compressed","--duration","90m","--plan"],
+                              stdout=subprocess.PIPE,text=True,timeout=60,env=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1"))
+        nine={tuple(line.split()[4:7:2]) for line in result.stdout.splitlines() if " node-fault " in line}
+        self.assertEqual(len(nine),9)
+
+    def test_final_tier_runs_eight_hours_on_the_full_schedule_at_the_requested_rate(self):
+        # #991: one 8-hour job final replaces the separate V02 final.
         code,lines,_=self.plan("--tier","final","--target-rate","2000")
         self.assertEqual(code,0)
         header=dict(zip(lines[0][::2],lines[0][1::2]))
-        self.assertEqual((header["schedule"],header["duration"],header["target-rate"]),("full","43200","2000"))
-        self.assertEqual(sum(1 for line in lines[1:] if line[2]=="node-fault"),12)
+        self.assertEqual((header["tier"],header["schedule"],header["duration"],header["target-rate"]),("final","full","28800","2000"))
+        self.assertEqual(sum(1 for line in lines[1:] if line[2]=="node-fault"),8)
+        specials=[line[3] for line in lines[1:] if line[2]=="special"]
+        self.assertEqual(sorted(set(specials)),["all-off","graceful-stop","quorum-loss"])
+
+    def test_the_final_plans_cycles_and_run_budget_fit_together(self):
+        code,lines,_=self.plan("--tier","final")
+        self.assertEqual(code,0)
+        header=dict(zip(lines[0][::2],lines[0][1::2]))
+        budget=next(line for line in lines if line[0]=="job-runs")[1:]
+        budget=dict(zip(budget[::2],budget[1::2]))
+        cycles=len({line[1] for line in lines if line[0]=="cycle"})
+        # The campaign is sized for the whole schedule the plan prints...
+        self.assertEqual(cycles*int(header["cycle"]),int(header["duration"]))
+        plan=jobs.run_budget(cycles*int(header["cycle"]))
+        self.assertEqual((int(budget["expected"]),int(budget["retained-peak"])),(plan["expected_runs"],plan["peak_retained"]))
+        # ...and what it holds at once fits its limit.
+        self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
+
+    def test_the_release_soak_fast_tier_is_an_hour_too(self):
+        import subprocess
+        result=subprocess.run([str(self.release/"qualify-sustained.sh"),"--tier","fast","--plan"],stdout=subprocess.PIPE,
+                              text=True,timeout=60,env=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1"))
+        self.assertEqual(result.returncode,0)
+        self.assertIn("plan: tier fast schedule compressed duration 3600 ",result.stdout)
+        specials={line.split()[4] for line in result.stdout.splitlines() if " special " in line}
+        self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
 
     def test_job_tiers_refuse_a_rate_below_a_hundred_million_a_day_or_a_changed_schedule(self):
         code,_,error=self.plan("--tier","fast","--target-rate","1000")
