@@ -1,0 +1,474 @@
+{
+ "accepted_successes": {
+  "process": 81483500,
+  "runc": 27844,
+  "shared-runc": 28721638
+ },
+ "accepted_successes_per_second": 5101.017214252661,
+ "audited_attempts": 24,
+ "complete": false,
+ "elapsed_seconds": 21610,
+ "errors": [],
+ "fault_markers": 28,
+ "gate": {
+  "decision": "D18-C",
+  "fault_kinds": [
+   "leader-kill",
+   "follower-kill",
+   "power-off",
+   "delay",
+   "disk-full",
+   "slow-fsync"
+  ],
+  "node_faults": true,
+  "nodes": 3,
+  "schedule": "full",
+  "soak_seconds": 21594,
+  "tier": "final"
+ },
+ "load": "target",
+ "m8": {
+  "api_node": "rb-5de239cdf01a-1",
+  "bun_rss_worst": {
+   "node": "rb-5de239cdf01a-2",
+   "peak_rss_mib": 263.8359375,
+   "steady_rss_mib": 263.828125,
+   "target_mib": 384
+  },
+  "executor_overhead_cores_per_node": 0.009295096460629712,
+  "leader_cpu_cores": 0.37586859803414374,
+  "million_task_array_wall_seconds": {
+   "max": 1172,
+   "median": 275,
+   "runs": 64
+  },
+  "node_ledger_mib_per_million_tasks": 1.6347478017060266,
+  "p99_start_lag_ms": 32,
+  "per_node": {
+   "rb-5de239cdf01a-1": {
+    "bun_cpu_cores": 0.37586859803414374,
+    "bun_peak_rss_mib": 381.01171875,
+    "bun_processes": [
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792094179,
+      "image": "1495327613",
+      "peak_rss_mib": 269.890625,
+      "pid": 8009,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792094786,
+      "image": "1408130803",
+      "peak_rss_mib": 381.01171875,
+      "pid": 1344034,
+      "steady_rss_mib": 270.19921875,
+      "steady_samples": 22
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792097787,
+      "image": "110524063",
+      "peak_rss_mib": 234.79296875,
+      "pid": 3833475,
+      "steady_rss_mib": 230.078125,
+      "steady_samples": 5
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792099216,
+      "image": "3871236382",
+      "peak_rss_mib": 268.3828125,
+      "pid": 3833475,
+      "steady_rss_mib": 227.455078125,
+      "steady_samples": 20
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792102610,
+      "image": "2829060780",
+      "peak_rss_mib": 267.83984375,
+      "pid": 1658942,
+      "steady_rss_mib": 264.333984375,
+      "steady_samples": 18
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792104987,
+      "image": "1639367536",
+      "peak_rss_mib": 227.875,
+      "pid": 2529926,
+      "steady_rss_mib": 206.7109375,
+      "steady_samples": 4
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792106423,
+      "image": "2781932742",
+      "peak_rss_mib": 249.01171875,
+      "pid": 2529926,
+      "steady_rss_mib": 223.087890625,
+      "steady_samples": 28
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792110863,
+      "image": "60230520",
+      "peak_rss_mib": 194.5703125,
+      "pid": 2087608,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792111471,
+      "image": "1566300211",
+      "peak_rss_mib": 181.9609375,
+      "pid": 3411574,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792111886,
+      "image": "2931807986",
+      "peak_rss_mib": 290.16015625,
+      "pid": 86313,
+      "steady_rss_mib": 290.16015625,
+      "steady_samples": 1
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792112939,
+      "image": "729713279",
+      "peak_rss_mib": 189.96875,
+      "pid": 1829632,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792113875,
+      "image": "2520845496",
+      "peak_rss_mib": 271.01953125,
+      "pid": 1829632,
+      "steady_rss_mib": 226.234375,
+      "steady_samples": 3
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792115387,
+      "image": "2456111232",
+      "peak_rss_mib": 188.578125,
+      "pid": 2593583,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "f588aca8-1347-48ef-83b2-45a1bbca0573",
+      "first_seen": 1792115664,
+      "image": "3027328951",
+      "peak_rss_mib": 193.6796875,
+      "pid": 3314864,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     }
+    ],
+    "bun_rss_target_mib": 512,
+    "bun_steady_rss_mib": 290.16015625,
+    "executor_helper_cpu_cores": 0.009295096460629712,
+    "peak_task_array_storage_mib": 56.16015625,
+    "retained_log_mb": 9.240576
+   },
+   "rb-5de239cdf01a-2": {
+    "bun_cpu_cores": 0.30021610299376744,
+    "bun_peak_rss_mib": 263.8359375,
+    "bun_processes": [
+     {
+      "boot": "abcf77a6-27fe-410c-9417-92391e73afca",
+      "first_seen": 1792094179,
+      "image": "1913652430",
+      "peak_rss_mib": 117.09375,
+      "pid": 2370,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "abcf77a6-27fe-410c-9417-92391e73afca",
+      "first_seen": 1792094187,
+      "image": "2688543746",
+      "peak_rss_mib": 199.96484375,
+      "pid": 4783,
+      "steady_rss_mib": 199.89453125,
+      "steady_samples": 3
+     },
+     {
+      "boot": "abcf77a6-27fe-410c-9417-92391e73afca",
+      "first_seen": 1792095410,
+      "image": "3458517754",
+      "peak_rss_mib": 145.22265625,
+      "pid": 2890487,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "27326196-a1a8-4719-83c6-2de4b5220eed",
+      "first_seen": 1792096063,
+      "image": "2060153920",
+      "peak_rss_mib": 216.8515625,
+      "pid": 670,
+      "steady_rss_mib": 215.375,
+      "steady_samples": 20
+     },
+     {
+      "boot": "27326196-a1a8-4719-83c6-2de4b5220eed",
+      "first_seen": 1792099216,
+      "image": "3002632359",
+      "peak_rss_mib": 207.51171875,
+      "pid": 670,
+      "steady_rss_mib": 193.470703125,
+      "steady_samples": 10
+     },
+     {
+      "boot": "27326196-a1a8-4719-83c6-2de4b5220eed",
+      "first_seen": 1792101387,
+      "image": "2222318662",
+      "peak_rss_mib": 229.5390625,
+      "pid": 126899,
+      "steady_rss_mib": 206.4765625,
+      "steady_samples": 38
+     },
+     {
+      "boot": "27326196-a1a8-4719-83c6-2de4b5220eed",
+      "first_seen": 1792106423,
+      "image": "602968977",
+      "peak_rss_mib": 178.203125,
+      "pid": 126899,
+      "steady_rss_mib": 178.203125,
+      "steady_samples": 10
+     },
+     {
+      "boot": "27326196-a1a8-4719-83c6-2de4b5220eed",
+      "first_seen": 1792108587,
+      "image": "1304451680",
+      "peak_rss_mib": 211.79296875,
+      "pid": 113271,
+      "steady_rss_mib": 200.70703125,
+      "steady_samples": 24
+     },
+     {
+      "boot": "2502ac0f-8343-4361-ac8a-4bed86fc5782",
+      "first_seen": 1792112279,
+      "image": "2535522115",
+      "peak_rss_mib": 263.8359375,
+      "pid": 671,
+      "steady_rss_mib": 263.828125,
+      "steady_samples": 5
+     },
+     {
+      "boot": "eba3474e-c73e-4d97-b21b-16f77a3ddcc2",
+      "first_seen": 1792113875,
+      "image": "759407316",
+      "peak_rss_mib": 195.44140625,
+      "pid": 671,
+      "steady_rss_mib": 194.82421875,
+      "steady_samples": 9
+     }
+    ],
+    "bun_rss_target_mib": 384,
+    "bun_steady_rss_mib": 263.828125,
+    "executor_helper_cpu_cores": 0.006749489419096804,
+    "peak_task_array_storage_mib": 61.3359375,
+    "retained_log_mb": 9.224192
+   },
+   "rb-5de239cdf01a-3": {
+    "bun_cpu_cores": 0.3482437624878325,
+    "bun_peak_rss_mib": 249.3359375,
+    "bun_processes": [
+     {
+      "boot": "ceb3be76-25f7-4a2c-bc11-5de775dc6c5d",
+      "first_seen": 1792094179,
+      "image": "813740376",
+      "peak_rss_mib": 214.3203125,
+      "pid": 2155,
+      "steady_rss_mib": 157.6875,
+      "steady_samples": 31
+     },
+     {
+      "boot": "ceb3be76-25f7-4a2c-bc11-5de775dc6c5d",
+      "first_seen": 1792098387,
+      "image": "1951125075",
+      "peak_rss_mib": 184.296875,
+      "pid": 2043446,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "ceb3be76-25f7-4a2c-bc11-5de775dc6c5d",
+      "first_seen": 1792099216,
+      "image": "1579437263",
+      "peak_rss_mib": 224.1484375,
+      "pid": 3635460,
+      "steady_rss_mib": 191.53515625,
+      "steady_samples": 15
+     },
+     {
+      "boot": "ceb3be76-25f7-4a2c-bc11-5de775dc6c5d",
+      "first_seen": 1792101987,
+      "image": "443845381",
+      "peak_rss_mib": 213.0078125,
+      "pid": 2246801,
+      "steady_rss_mib": 183.32421875,
+      "steady_samples": 5
+     },
+     {
+      "boot": "a0359401-5e98-4d80-bcc4-ffb69e05fbf0",
+      "first_seen": 1792103264,
+      "image": "2936525352",
+      "peak_rss_mib": 227.5859375,
+      "pid": 673,
+      "steady_rss_mib": 190.28125,
+      "steady_samples": 17
+     },
+     {
+      "boot": "a0359401-5e98-4d80-bcc4-ffb69e05fbf0",
+      "first_seen": 1792105586,
+      "image": "3907522236",
+      "peak_rss_mib": 171.76953125,
+      "pid": 1432472,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "a0359401-5e98-4d80-bcc4-ffb69e05fbf0",
+      "first_seen": 1792106423,
+      "image": "4099635509",
+      "peak_rss_mib": 249.3359375,
+      "pid": 1432472,
+      "steady_rss_mib": 188.2265625,
+      "steady_samples": 15
+     },
+     {
+      "boot": "a0359401-5e98-4d80-bcc4-ffb69e05fbf0",
+      "first_seen": 1792109186,
+      "image": "1103590305",
+      "peak_rss_mib": 174.2578125,
+      "pid": 1743429,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "a0359401-5e98-4d80-bcc4-ffb69e05fbf0",
+      "first_seen": 1792109805,
+      "image": "2694072960",
+      "peak_rss_mib": 177.26953125,
+      "pid": 3266006,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "45c5a5ac-8884-414c-9df8-bf110aadcc70",
+      "first_seen": 1792110537,
+      "image": "2281855096",
+      "peak_rss_mib": 154.6875,
+      "pid": 671,
+      "steady_rss_mib": 150.9609375,
+      "steady_samples": 9
+     },
+     {
+      "boot": "58ba4d88-2aff-4649-89f7-d1e6a7506349",
+      "first_seen": 1792112279,
+      "image": "4125143830",
+      "peak_rss_mib": 135.71875,
+      "pid": 669,
+      "steady_rss_mib": null,
+      "steady_samples": 0
+     },
+     {
+      "boot": "58ba4d88-2aff-4649-89f7-d1e6a7506349",
+      "first_seen": 1792112339,
+      "image": "781798132",
+      "peak_rss_mib": 147.7109375,
+      "pid": 163172,
+      "steady_rss_mib": 143.87890625,
+      "steady_samples": 5
+     },
+     {
+      "boot": "58ba4d88-2aff-4649-89f7-d1e6a7506349",
+      "first_seen": 1792113875,
+      "image": "2382900261",
+      "peak_rss_mib": 165.80859375,
+      "pid": 163172,
+      "steady_rss_mib": 163.42578125,
+      "steady_samples": 9
+     }
+    ],
+    "bun_rss_target_mib": 384,
+    "bun_steady_rss_mib": 191.53515625,
+    "executor_helper_cpu_cores": 0.007553037812194781,
+    "peak_task_array_storage_mib": 62.70703125,
+    "retained_log_mb": 1.114112
+   }
+  },
+  "raft_entries_per_second": 8.600770337370644,
+  "raft_leaders": [
+   "rb-5de239cdf01a-1",
+   "rb-5de239cdf01a-3",
+   "rb-5de239cdf01a-2"
+  ],
+  "raft_state_bytes_max": 6624,
+  "retained_log_mb": 19.578879999999998,
+  "start_lag_samples": 95520817,
+  "targets": {
+   "bun_steady_rss_mib": {
+    "api_node": 512,
+    "other_nodes": 384
+   },
+   "executor_overhead_cores_per_node": 0.5,
+   "leader_cpu_cores": 1,
+   "million_task_array_wall_seconds": 600,
+   "node_ledger_mib_per_million_tasks": 64,
+   "p99_start_lag_ms": 1000,
+   "raft_entries_per_second": "recorded only; the batch target counts only task-array writes",
+   "raft_state_bytes_per_million_tasks": 262144,
+   "retained_log_mb": 50
+  }
+ },
+ "operator_replay_decisions": 149,
+ "retries": {
+  "process": 1,
+  "runc": 9,
+  "shared-runc": 15
+ },
+ "retry_causes": {
+  "process": {
+   "exit_code": 1,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  },
+  "runc": {
+   "exit_code": 1,
+   "launch": 7,
+   "signal": 0,
+   "timeout": 1,
+   "unknown": 0,
+   "unrecorded": 0
+  },
+  "shared-runc": {
+   "exit_code": 1,
+   "launch": 3,
+   "signal": 0,
+   "timeout": 11,
+   "unknown": 0,
+   "unrecorded": 0
+  }
+ },
+ "schema": 1,
+ "target_met": true,
+ "target_rate": 1390.0
+}
