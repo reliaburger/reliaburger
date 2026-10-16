@@ -1579,7 +1579,12 @@ mod tests {
     async fn panicking_owner_terminates_in_memory_process_tree() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("child.pid");
-        let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        // Write then rename: the redirection creates the file before `echo` fills
+        // it, and the wait below only checks that the file exists.
+        let script = format!(
+            "sleep 60 & echo $! > {0}.tmp && mv {0}.tmp {0}; wait",
+            pid_file.display()
+        );
         let task = tokio::spawn(async move {
             let grill = ProcessGrill::new();
             let id = InstanceId("panic-cleanup-0".to_string());
