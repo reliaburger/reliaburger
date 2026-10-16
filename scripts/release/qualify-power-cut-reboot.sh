@@ -133,7 +133,8 @@ limactl start --tty=false "$vm" > "$evidence/start.log" 2>&1 ||
 
 # Check the VM from inside before any lane: what Lima was asked for isn't
 # proof of what the guest got (a global Lima override can add mounts).
-facts=$(limactl shell "$vm" bash -s -- "$worktree" <<'GUEST'
+# --workdir: the host's working directory isn't in the guest.
+facts=$(limactl shell --workdir / "$vm" bash -s -- "$worktree" <<'GUEST'
 set -u
 printf 'swap_bytes=%s\n' "$(swapon --show=SIZE --bytes --noheadings | awk '{ s += $1 } END { print s + 0 }')"
 if touch "$1/.reliaburger-write-probe" 2>/dev/null; then
@@ -180,8 +181,8 @@ lane_claims=('C03: Exporter checkpoint and lock' 'C11: Lease stores' 'Council ba
 lane_commands=("qualify-storage-power-cut.sh --fixture exporter --iterations $iterations"
     "qualify-storage-power-cut.sh --fixture leases --iterations $iterations"
     "qualify-storage-power-cut.sh --fixture backups --iterations $iterations"
-    "qualify-oci-reboot.sh --vm $vm, $iterations times"
-    "qualify-discovery-reboot.sh --vm $vm, $iterations times")
+    "qualify-oci-reboot.sh --vm $vm, $iterations runs"
+    "qualify-discovery-reboot.sh --vm $vm, $iterations runs")
 lane_runs=(0 0 0 0 0)
 lane_failures=(- - - - -)
 retried=0

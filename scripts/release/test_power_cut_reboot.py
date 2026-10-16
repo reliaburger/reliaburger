@@ -278,7 +278,7 @@ class PowerCutRebootTests(unittest.TestCase):
         self.assertEqual(created, TEMPLATE.read_text().replace("__WORKTREE__", str(self.worktree)))
         # The guest is checked against the same checkout.
         shells = [call for call in calls if call[0] == "shell"]
-        self.assertEqual(shells[0][:2], ["shell", self.vm])
+        self.assertEqual(shells[0][:4], ["shell", "--workdir", "/", self.vm])
         self.assertEqual(shells[0][-1], str(self.worktree))
 
     def test_template_sizes_the_vm_like_the_release_gate_asks(self):
