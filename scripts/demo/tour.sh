@@ -395,11 +395,15 @@ while IFS= read -r command <&3; do
             esac
             ;;
         "${BURGER_FETCH}")
-            if curl -fsSI "${BURGER_URL}" >/dev/null 2>&1; then
+            # The site publishes the demo from the tag the installer fetches,
+            # so until a promotion's site change deploys, the live archive is
+            # the previous release's: published, but missing what this tour
+            # uses (0.1.6's had no jobs.toml).
+            if curl -fsSL "${BURGER_URL}" 2>/dev/null | tar tz 2>/dev/null | grep -qx 'burger/jobs.toml'; then
                 show_in_work "${command}"
             else
-                say "${BURGER_URL} is published with the site; until then,"
-                say "the same directory from the repository:"
+                say "${BURGER_URL} is published with the site, and this release's"
+                say "copy isn't there yet; the same directory from the repository:"
                 show_in_work "cp -R examples/demo/burger ."
             fi
             ;;
