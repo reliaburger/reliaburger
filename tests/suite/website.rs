@@ -972,3 +972,77 @@ fn the_demo_assets_come_from_the_installed_release() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&output.stdout), installer_default());
 }
+
+/// The page's `release-testing` section, from its opening tag to its end.
+fn release_testing_section(page: &str) -> &str {
+    let start = page
+        .find("<section id=\"release-testing\"")
+        .expect("the page has no release-testing section");
+    let end = start + page[start..].find("</section>").unwrap();
+    &page[start..end]
+}
+
+/// Every `X.Y.Z` version a text names, as numbers.
+fn versions_named(text: &str) -> Vec<(u64, u64, u64)> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter_map(|word| {
+            let parts: Vec<&str> = word.trim_matches('.').split('.').collect();
+            match parts.as_slice() {
+                [major, minor, patch] => Some((
+                    major.parse().ok()?,
+                    minor.parse().ok()?,
+                    patch.parse().ok()?,
+                )),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// "How a release is tested" follows the jobs section, shows the newest
+/// release's record and names no release older than the one the installer
+/// fetches, so a promotion can't leave it describing the last one (#979).
+#[test]
+fn the_release_testing_section_shows_the_installed_release() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id);
+    assert_eq!(
+        position("release-testing"),
+        position("job-throughput").map(|jobs| jobs + 1),
+        "the release-testing section should come straight after the jobs section"
+    );
+    let section = release_testing_section(&page);
+    let installed = installer_default();
+    let current = versions_named(&installed)[0];
+    let named = versions_named(&strip_tags(section));
+    assert!(
+        named.contains(&current),
+        "the release-testing section doesn't name {installed}"
+    );
+    for version in named {
+        assert!(
+            version >= current,
+            "the release-testing section names {version:?}, older than {installed}; \
+             refresh it (docs/releasing.md, step 9)"
+        );
+    }
+    let log = read("docs/release-log.md");
+    let newest = log
+        .lines()
+        .find(|line| line.starts_with("## "))
+        .expect("the release log has no entries");
+    assert!(
+        newest.starts_with(&format!("## {}:", installed.trim_start_matches('v'))),
+        "the release log's newest entry is {newest:?}, not {installed}"
+    );
+    for link in [
+        "docs/release-log.md",
+        "docs/testing.md#before-a-release",
+    ] {
+        assert!(
+            section.contains(link),
+            "the release-testing section doesn't link {link}"
+        );
+    }
+}

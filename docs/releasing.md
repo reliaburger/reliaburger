@@ -769,6 +769,14 @@ the real `curl … | sh` install against it on every host we advertise.
    website deploys from `main`, and publishes `/demo/*` from the tag the
    bootstrap installs, so merge that change after promotion, not before.
 
+   Refresh the homepage's
+   [How a release is tested](https://reliaburger.com/#release-testing)
+   section (`#release-testing` in `index.html`) to the new release: its
+   latest-release paragraph, its headline numbers with links to this
+   release's records, and the soak charts beside them. `tests/suite/website.rs`
+   fails while the section names a version older than the installer's
+   default, or the release log's newest entry isn't this release.
+
    Add the release's paragraph to the top of the
    [release log](release-log.md): the promotion date, how long qualifying it
    took and how many candidates, what each soak found and what fixed it, and

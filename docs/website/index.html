@@ -395,9 +395,93 @@
         </div>
       </section>
 
-      <section id="start" class="section start" aria-labelledby="start-title">
+      <section id="release-testing" class="section" aria-labelledby="release-testing-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">04 /</span>
+          <h2 id="release-testing-title">How a release is tested
+            <a class="permalink" href="#release-testing" aria-label="Link to how a release is tested">#</a></h2>
+        </div>
+        <div class="tour">
+        <p class="tour-note">Green unit tests don't ship a release. Every candidate is built
+          and signed once, installed the way you'd install it, then left running under
+          faults for a day's worth of hours. Only the maintainer promotes it, and only
+          the exact files that passed.</p>
+        <ol class="release-pipeline">
+          <li><strong>Build and sign.</strong> CI builds every binary and guest image at one
+            commit and signs them. Nothing is rebuilt after this.</li>
+          <li><strong>Stage.</strong> The signed files go up as a private pre-release.</li>
+          <li><strong>Install it like you would.</strong> <code>curl | sh</code> from empty
+            caches, twice, then the five-minute tour and a full teardown.</li>
+          <li><strong>Soak, fast then final.</strong> Three VMs run apps, a volume writer, Redis,
+            a log spammer and exporters while the harness breaks things every few
+            minutes: 90 minutes compressed, then 8 hours on the full schedule.</li>
+          <li><strong>Soak with jobs.</strong> The same, plus a job campaign at more than the
+            rate of 100 million jobs a day and a node-level fault every cycle: 90 minutes,
+            then 12 hours.</li>
+          <li><strong>Pull the plug.</strong> A throwaway VM loses power mid-write, 10 to 25 times
+            per storage path, and reboots as often with containers and network rules in
+            place.</li>
+          <li><strong>Promote.</strong> The maintainer tags the candidate's commit, and the
+            promotion copies the qualified files, byte for byte, into the release.</li>
+        </ol>
+        <div class="throughput-comparison" role="region" aria-label="Faults the soak injects" tabindex="0">
+        <table><caption>What the soak does to the cluster, every hour of the full schedule</caption>
+          <thead><tr><th scope="col">Fault</th><th scope="col">How</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Agent killed</th><td>SIGKILL Bun on a follower, then on the leader</td></tr>
+            <tr><th scope="row">Killed mid-deploy</th><td>A rolling deploy, with SIGKILL 0–20 s later on a node receiving a replacement</td></tr>
+            <tr><th scope="row">Power cut</th><td>A VM forced off for 60–180 s, then started again</td></tr>
+            <tr><th scope="row">Chaos</th><td><code>relish fault</code>: kill, pause, delay, drop, partition and DNS failure</td></tr>
+            <tr><th scope="row">Upgrade walk</th><td>Every node to a signed soak build and back, every other walk with a power-off or leader kill mid-walk</td></tr>
+            <tr><th scope="row">Node faults (jobs)</th><td>Inter-node delay, a full disk and slow fsync</td></tr>
+            <tr><th scope="row">Whole cluster</th><td>Graceful stop and start, quorum loss with two nodes off, and every VM off at once</td></tr>
+          </tbody>
+        </table></div>
+        <p>One occurrence of any of these fails the release: a lost write or a counter that
+          goes backwards, a certificate close to expiry, no leader for more than 30 seconds,
+          a fault that doesn't settle in time, leaked containers, namespaces or memory, an
+          upgrade on the wrong version, an agent panic or an unexplained restart, an agent
+          loop stalled for over a second, or a job that runs twice, goes missing or never
+          drains. A failure gets a root cause before anything else happens. A product fix
+          means a new candidate, and every soak starts again.</p>
+        <details class="tour-commands" id="release-testing-results">
+          <summary>Show 0.2.0's results <span class="tour-commands-note">headline numbers, each with its record</span></summary>
+          <!-- TODO(#979): the soak charts (Bun memory and fds per node, CPU, accepted jobs a
+               second against the target, faults on the time axis) go here, from
+               sustained_check.py render-charts. -->
+          <ul>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-15-v0.2.0-sustained-v02-final.md">8-hour soak</a>:
+              clean, 8 cycles, 4 upgrade round trips; the API node's agent held 390 MiB steady
+              against a 512 MiB target.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-17-v0.2.0-job-qualification.md">12-hour job soak</a>:
+              4,600 accepted jobs a second against a target of 1,390, every fault, no data lost,
+              agent memory within target. Its 15 failures were all the test harness's own, and the
+              record says why.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-16-power-cut-reboot.md">Power cuts and reboots</a>:
+              25 of 25 in each of five lanes.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-16-v0.2.0-release-closure.md">Every gate and every candidate</a>:
+              eight candidates, seven of them stopped by the soaks.</li>
+          </ul>
+        </details>
+        <p><strong>The latest: 0.2.0, 16 October 2026.</strong> Eight candidates over five
+          days. The soaks stopped seven of them, on Bun memory, a launch failure that was never
+          retried, stale executor slots and a replica that never moved. The eighth's first
+          12-hour job soak found a socket leak in the VM manager's port forwarder that let the
+          kernel kill the agent.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
+          has every release's story.</p>
+        <p>What the soaks don't prove: they run three small VMs on one laptop, so they say
+          nothing about large clusters, real networks between machines or hardware failing.
+          A VM forced off isn't a real power loss, the fault rates are a schedule, not
+          production traffic, and zero failures in 25 runs only rules out failure rates above
+          about 12%.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release">How each gate works</a>.</p>
+        </div>
+      </section>
+
+      <section id="start" class="section start" aria-labelledby="start-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">05 /</span>
           <h2 id="start-title">Or build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
         </div>
         <div class="start-grid">
@@ -431,7 +515,7 @@ target/debug/relish</code></pre>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">05 /</span>
+          <span class="section-number" aria-hidden="true">06 /</span>
           <h2 id="docs-title">Read before you deploy <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
@@ -480,7 +564,7 @@ target/debug/relish</code></pre>
 
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">06 /</span>
+          <span class="section-number" aria-hidden="true">07 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
