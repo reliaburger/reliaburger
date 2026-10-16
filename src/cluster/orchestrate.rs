@@ -6237,17 +6237,6 @@ image = "busybox:latest"
         (desired, build_cluster_cache(&members, &reports), alive)
     }
 
-    /// The `(node, ordinal)` pairs a decision places, in ordinal order.
-    fn ordinals_of(decision: &crate::meat::types::SchedulingDecision) -> Vec<(&str, u32)> {
-        let mut placed: Vec<_> = decision
-            .placements
-            .iter()
-            .map(|p| (p.node_id.0.as_str(), p.ordinal))
-            .collect();
-        placed.sort_by_key(|(_, ordinal)| *ordinal);
-        placed
-    }
-
     /// #967, #971: candidate 7's jobs soak. Two replicas already run on a
     /// node that job leases have since filled, and the third, added beside
     /// them, is refused. The node reports the refusal while its deploy backs
@@ -6265,7 +6254,7 @@ image = "busybox:latest"
         assert_eq!(decisions.len(), 1, "{decisions:?}");
         assert_eq!(
             ordinals_of(&decisions[0]),
-            [("idle", 0), ("full", 1), ("full", 2)]
+            [(0, "idle"), (1, "full"), (2, "full")]
         );
     }
 
@@ -6280,7 +6269,7 @@ image = "busybox:latest"
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
 
         assert_eq!(decisions.len(), 1, "{decisions:?}");
-        assert_eq!(ordinals_of(&decisions[0]), [("idle", 0), ("idle", 1)]);
+        assert_eq!(ordinals_of(&decisions[0]), [(0, "idle"), (1, "idle")]);
     }
 
     /// Once the refused replica has moved, the refusal names nothing the
@@ -6290,7 +6279,7 @@ image = "busybox:latest"
         let (mut desired, mut cache, alive) = frontend_refused_on_the_full_node(3, &[1, 2], &[0]);
         desired.scheduling.insert(
             AppId::new("frontend", "default"),
-            placed_as(&app_spec(100, 3), &[("idle", 0), ("full", 1), ("full", 2)]),
+            placed_as(&app_spec(100, 3), &[(0, "idle"), (1, "full"), (2, "full")]),
         );
 
         let decisions =
@@ -6374,10 +6363,10 @@ image = "busybox:latest"
                 plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
 
             proptest::prop_assert_eq!(decisions.len(), 1);
-            let expected: Vec<(&str, u32)> = (0..replicas)
+            let expected: Vec<(u32, &str)> = (0..replicas)
                 .map(|ordinal| {
                     let node = if refused.contains(&ordinal) { "idle" } else { "full" };
-                    (node, ordinal)
+                    (ordinal, node)
                 })
                 .collect();
             proptest::prop_assert_eq!(ordinals_of(&decisions[0]), expected);
