@@ -6279,7 +6279,7 @@ image = "busybox:latest"
         let (mut desired, mut cache, alive) = frontend_refused_on_the_full_node(3, &[1, 2], &[0]);
         desired.scheduling.insert(
             AppId::new("frontend", "default"),
-            placed_as(&app_spec(100, 3), &[(0, "idle"), (1, "full"), (2, "full")]),
+            placed_as(&app_spec(100, 3), &[("idle", 0), ("full", 1), ("full", 2)]),
         );
 
         let decisions =
