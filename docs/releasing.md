@@ -678,7 +678,14 @@ the real `curl … | sh` install against it on every host we advertise.
    the warm sample, fds bounded) and a log-order swap when an instance moved
    nodes under the same name (fixed by #272: one adjacent swap in an
    unlabelled tail, the instance on different nodes in the status snapshots
-   either side). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
+   either side). For 0.2.0 only, while soaks forward ports over SSH, a node
+   cut off from the host after a reboot or exec is a third (Lima never
+   retries a failed `ssh -O forward`; the cluster stays healthy from inside;
+   it goes with the SSH forwarder,
+   [#983](https://github.com/reliaburger/reliaburger/issues/983)), and the
+   job controller running out of its 256-run budget in a 12-hour final is a
+   fourth (fixed by
+   [#989](https://github.com/reliaburger/reliaburger/issues/989)). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
