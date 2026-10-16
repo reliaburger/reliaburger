@@ -3435,6 +3435,101 @@ outcome there's nothing for an operator to decide. The portable suite runs the
 same through the API, Raft and the leader's chunk check:
 `a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once`.
 
+### Who the OOM killer takes
+
+Six hours into run 1 of 0.2.0's jobs final, node 1 ran out of memory and the
+kernel killed Bun. Three times. Bun wasn't the culprit: it sat at 150 to 380
+MiB. Lima's guest agent held a gigabyte and was leaking a socket for every
+forwarded connection
+([record](../qualification/2026-10-16-v0.2.0-release-closure.md)). So why did
+the kernel pick Bun?
+
+When memory runs out across the whole machine, the kernel's OOM killer scores
+every process and kills the highest. The score is roughly the process's share
+of memory in thousandths, plus its `oom_score_adj`, a number from -1000 to
+1000 in `/proc/<pid>/oom_score_adj`. The guest agent runs at -500. Bun ran at
+0 in 0.2.0, which made a 300 MiB Bun a better target than a 1 GiB guest agent.
+
+0.2.1's units already set `OOMScoreAdjust=-900` (#700). That's half the fix,
+and on its own it backfires quietly: a child inherits its parent's score, and
+everything on the node is Bun's child. runc, the process owner, the reusable
+executor's helper and every task it forks would all run at -900, as protected
+as Bun itself. Under pressure the kernel would go for sshd or journald first.
+
+So the other half is a positive score for workloads
+([#984](https://github.com/reliaburger/reliaburger/issues/984)). The OCI
+runtime spec already has the field, `process.oomScoreAdj`, and runc applies it
+before the container's first instruction. `OciProcess` gains it:
+
+```rust
+#[serde(
+    rename = "oomScoreAdj",
+    default,
+    skip_serializing_if = "Option::is_none"
+)]
+pub oom_score_adj: Option<i32>,
+```
+
+`rename` gives the JSON key the spec's camel case; `default` lets an older
+record without the key still load as `None`; `skip_serializing_if` leaves the
+key out when there's nothing to say, so Bun's internal runtime commands keep
+the score they inherit. Every generator that builds a workload's spec (apps,
+init containers and jobs, which also covers each executor's helper and the
+fresh-container tasks) sets it to one constant, `WORKLOAD_OOM_SCORE_ADJ`, at
++500. That's above anything the node itself runs, so the smallest workload
+goes before the guest agent, the daemons and Bun. A task is the cheapest thing
+on a node to lose: it retries.
+
+Host workloads have no runc to apply the field, so the process owner's
+execution gate does it, right after joining the workload's cgroup and before
+it `exec`s the user's command:
+
+```rust
+fn raise_oom_score(spec: &super::oci::OciSpec) -> io::Result<()> {
+    let Some(wanted) = spec.process.oom_score_adj else {
+        return Ok(());
+    };
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let path = Path::new("/proc/self/oom_score_adj");
+    let current: i32 = std::fs::read_to_string(path)?
+        .trim()
+        .parse()
+        .map_err(|error| io::Error::other(format!("unreadable oom_score_adj: {error}")))?;
+    if wanted <= current {
+        return Ok(());
+    }
+    std::fs::write(path, wanted.to_string())
+        .map_err(|error| io::Error::other(format!("cannot raise oom_score_adj: {error}")))
+}
+```
+
+`cfg!(target_os = "linux")` is the expression form of `#[cfg]`: the code
+still compiles on macOS, where there's no `/proc`, but the branch is a
+constant there and the function returns early. `.parse()` picks its target
+type from the annotation on `current`, here `i32`. The gate only raises the
+score. Lowering it needs `CAP_SYS_RESOURCE`, and a spec asking for a lower
+score is asking to be protected, which no workload should get. If the write
+fails, the gate refuses to run the command, the same as a cgroup it can't
+join.
+
+The dev cluster launches Bun with `nohup`, not a unit, so its shell writes -900
+to its own `oom_score_adj` first and Bun inherits it. The job benchmark passes
+`--property=OOMScoreAdjust=-900` to `systemd-run`.
+
+The tests come in three layers. `workloads_are_the_oom_killers_first_choice_before_bun`
+checks every spec generator carries the score, and
+`oom_score_is_written_as_the_oci_process_field` checks the JSON key runc reads.
+On Linux the portable suite runs a real owner: a workload that asks for a
+higher score than the test's reads it back from `/proc/self/oom_score_adj`,
+one without a score reads its parent's, and one that asks for -1000 doesn't
+get it. The first version asked for +500 and failed in CI, because GitHub's
+runner already starts every job process at 500. Nothing was raised, so the
+test couldn't tell a working gate from a missing one, and its guard caught
+that. Now it asks for halfway between its own score and the maximum. The unit
+test in `provision.rs` from #700 still pins the unit's -900.
+
 ## One budget, two schedulers
 
 Here's a cluster that looks healthy and isn't. Three nodes, 8000 millicores

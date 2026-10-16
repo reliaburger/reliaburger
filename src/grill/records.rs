@@ -363,6 +363,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
