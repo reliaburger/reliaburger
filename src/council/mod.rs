@@ -12,6 +12,7 @@
 /// - `InMemoryRaftRouter` — in-memory network for testing
 pub mod apply;
 pub mod backup;
+pub(crate) mod connection_pool;
 pub mod durable_log;
 pub mod fence;
 pub mod handover;

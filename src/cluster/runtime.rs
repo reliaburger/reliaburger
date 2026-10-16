@@ -487,6 +487,9 @@ pub async fn start(
     let rpc_acceptor = raft_acceptor.clone();
     let rpc_node_gate = node_gate.clone();
     let rpc_fence = fence.clone();
+    // The listener re-checks each open connection's peer against the live
+    // CRL before every request (#928).
+    let rpc_crl = crl_handle.clone();
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
         serve_raft_rpc_with_node_gate(
             raft_listener,
@@ -495,6 +498,7 @@ pub async fn start(
             rpc_acceptor,
             rpc_fence,
             rpc_node_gate,
+            Some(rpc_crl),
         )
         .await;
     });

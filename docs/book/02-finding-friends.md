@@ -2105,9 +2105,76 @@ Each subsystem gets a production transport alongside its in-memory test double:
 
 **TCP for reporting.** `TcpReportingTransport` uses length-prefixed framing: 4 bytes for the payload length, then the bincode payload. The server side (council members) spawns an accept loop that pushes inbound messages into a channel. The client side (workers) opens a new connection for each report. At a 5-second reporting interval, one connection per report is fine.
 
-**TCP for Raft.** `TcpRaftNetwork` implements openraft's `RaftNetwork` trait over length-prefixed TCP, just like reporting. The Raft RPC server accepts connections, reads the request envelope (`AppendEntries`, `Vote`, or `InstallSnapshot`), dispatches to the local Raft instance, and writes the response. Connect-per-RPC is acceptable for Raft because RPC volume is low (heartbeats every 150ms, but they're tiny).
+**TCP for Raft.** `TcpRaftNetwork` implements openraft's `RaftNetwork` trait over length-prefixed TCP, just like reporting. The Raft RPC server accepts connections, reads the request envelope (`AppendEntries`, `Vote`, or `InstallSnapshot`), dispatches to the local Raft instance, and writes the response. We first opened a connection per RPC and reasoned that it was fine, because Raft's RPC volume is low (heartbeats every 150ms, but they're tiny). That reasoning didn't survive mTLS; the next section tells that story.
 
 All three transports use plain TCP/UDP for now. mTLS comes in Phase 4.
+
+### Keeping Raft connections open
+
+Volume was never the problem. Latency was. When the leader serves a linearizable read, openraft first checks it's still the leader: it sends every voter a heartbeat and waits for a quorum to answer, giving each heartbeat `heartbeat_interval` (150 ms). Once Chapter 4 wrapped the transport in mTLS, each of those heartbeats paid for a TCP handshake *and* a TLS handshake with two certificate verifications. On a `relish dev` cluster of debug-build VMs that blew the 150 ms budget every time, and every linearizable read on the leader failed. We papered over it by optimising `ring` in debug builds (Chapter 4 has the details) and filed [#928](https://github.com/reliaburger/reliaburger/issues/928) to remove the cause.
+
+The fix is the obvious one: keep connections open. There were two ways to do it. One multiplexed connection per peer (HTTP/2, or our own request ids on one stream) needs a background task to read responses and route them to whoever is waiting, and a way to clean up when a waiter gives up. A small pool of ordinary connections needs neither: an RPC takes a connection, sends one request, reads one response and gives it back. Raft sends to one peer from a single replication stream plus the occasional vote, so a pool rarely holds more than one or two connections per peer. We picked the pool.
+
+`RaftConnectionPool` (in `src/council/connection_pool.rs`) is a map from peer to a `Vec` of idle connections, behind an `Arc<tokio::sync::Mutex<...>>` so every client the factory hands out shares it. That sharing matters more than it looks. openraft calls `RaftNetworkFactory::new_client` for every replication stream and every vote, so a pool held by one `TcpRaftNetwork` would be thrown away at the next election. The lock is held only to push or pop, never across a network call.
+
+The pool holds both plain TCP and TLS streams, which are different types. Rust's answer is a *trait object*:
+
+```rust
+pub(crate) trait RaftIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> RaftIo for T {}
+
+pub(crate) struct RaftConnection {
+    pub(crate) stream: Box<dyn RaftIo>,
+    // ...
+}
+```
+
+`RaftIo` has no methods. It just names the four traits a connection needs, because `dyn` can only be followed by one trait (plus auto traits such as `Send`). The second line is a *blanket implementation*: "every `T` that has these four traits has `RaftIo` too", so `TcpStream` and `TlsStream<TcpStream>` both qualify without us writing anything for either. `Box<dyn RaftIo>` is then a pointer to some value of an unknown type plus a table of its methods, much like a Go interface value or a C struct of function pointers. It costs one indirect call per read or write, which is nothing next to a syscall.
+
+#### Cancellation safety comes from ownership
+
+The part we worried about most is cancellation. openraft gives up on an RPC by dropping its future: Rust has no other way to cancel async work, so a future can stop at any `.await` and simply never resume. Suppose a heartbeat is dropped after it wrote its request but before it read the answer. If that connection went back into the pool, the next RPC would write its own request and read the *previous* one's answer. That's the classic pooled-connection bug, and it hands one RPC another's response.
+
+Here the type system makes it impossible. `take` *moves* a `RaftConnection` out of the pool into the RPC's future, which owns it, and only `put` moves it back, after a complete request and response:
+
+```rust
+if let Some(mut connection) = self.pool.take(&self.peer, &check).await
+    && let Ok(response) = Self::exchange(&mut connection.stream, &payload).await
+{
+    self.release(connection, &response).await;
+    return Ok(response);
+}
+let mut connection = self.dial().await?;
+let response = Self::exchange(&mut connection.stream, &payload).await?;
+self.release(connection, &response).await;
+Ok(response)
+```
+
+If the future is dropped half-way, so is `connection`, and dropping a socket closes it. There is no code path that returns a connection with a request in flight, so there's nothing to remember. `if let ... && let ...` is a *let chain* (stable since Rust 1.88): both patterns must match for the block to run, and the second can use what the first bound. When the pooled connection fails, most often because the peer closed it while it sat idle, the RPC falls through to a fresh dial and sends again. Sending a Raft RPC twice is safe, because appends, votes and snapshot chunks are idempotent at the receiver.
+
+The test for this, `a_cancelled_rpc_does_not_return_its_connection_to_the_pool`, runs a stub peer that answers the first request 300 ms late, cancels the RPC at 50 ms, sends another and checks that it went over a second connection.
+
+#### Certificates outlive handshakes
+
+Chapter 4 told the story of a pooled `reqwest` connection that kept presenting an expired certificate, because a TLS resolver runs only at the handshake. A Raft pool would repeat that mistake, so a pooled connection is retired instead of reused when:
+
+- it is older than 30 seconds or has been idle for 10;
+- this node's identity changed since it was dialled. `LiveNodeIdentity::snapshot()` returns an `Arc<NodeIdentity>`, and each connection remembers the one it was dialled with. A renewal or a new trust set publishes a new `Arc`, and `Arc::ptr_eq` compares the two pointers, not the contents. It's one comparison and it can't miss a change;
+- the peer's certificate chain, saved at the handshake, is now on the CRL (`CrlHandle::admits`).
+
+The server applies the same rules from its side. It serves request after request on a connection until the peer goes quiet for 20 seconds or the connection turns 60, and before each request it re-checks the client's chain against the live CRL. A peer revoked mid-connection is cut off at its next RPC, as it was when every RPC paid a handshake. The client's limits are deliberately shorter than the server's, so the client retires a connection before the server closes it under it. Two `const` assertions check that at compile time:
+
+```rust
+const _: () = assert!(CONNECTION_MAX_AGE.as_secs() < SERVER_CONNECTION_MAX_AGE.as_secs());
+```
+
+A `const` item is evaluated by the compiler, so if someone raises the client's limit past the server's, `assert!` fails the build rather than a test. `Duration`'s `<` isn't allowed in a `const` context yet, which is why we compare seconds.
+
+Two small things also changed. A frame used to go out as two writes (the length prefix, then the payload), which on a long-lived TLS connection can become two records and two TCP segments; now it's one write. And both ends set `TCP_NODELAY`, so the kernel sends a small frame at once instead of holding it until the previous segment is acknowledged (Nagle's algorithm). With one request per connection that never mattered. With a connection carrying a heartbeat every 150 ms, it would.
+
+#### Did it help?
+
+`examples/raft-heartbeat-rtt.rs` forms a three-voter council over the real transport (TCP, mTLS, live identities, node-bound connectors) on loopback and times `ensure_linearizable` on the leader, which is exactly what a linearizable read pays. The results, before and after, in both build profiles and with and without CPU load, are in the [council design doc](../design/gossip-mustard.md#33-raft-integration). On an M2 Max with an idle host, the median leadership check fell from 2.50 ms to 0.53 ms in a debug build and from 1.43 ms to 0.26 ms in a release build. Under full CPU load the medians fell by similar factors, but the slowest checks barely moved: once every core is busy, the tail is the scheduler's, not the handshake's. No check came near 150 ms on loopback either way, because the debug builds already carried the `ring` fix and loopback has no virtual network in the way. The honest summary is that the pool takes the handshake out of the heartbeat's budget entirely, rather than making a slow cluster fast.
 
 ### The ClusterHandle
 
