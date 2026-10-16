@@ -58,13 +58,22 @@ struct Owner {
 
 impl Owner {
     fn start(script: &str) -> Self {
+        Self::start_with_oom_score(script, None)
+    }
+
+    /// Start an owner whose launch spec asks for `oom_score_adj`, as Bun's
+    /// generated workload specs do.
+    fn start_with_oom_score(script: &str, oom_score_adj: Option<i32>) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let nonce = generation();
-        let spec = owner_record(
+        let mut spec = owner_record(
             &nonce,
             serde_json::json!(["/bin/sh", "-c", script]),
             serde_json::json!({ "state": "prepared" }),
         );
+        if let Some(score) = oom_score_adj {
+            spec["launch"]["spec"]["process"]["oomScoreAdj"] = serde_json::json!(score);
+        }
         std::fs::write(
             directory.path().join("owner.json"),
             serde_json::to_vec(&spec).unwrap(),
@@ -249,6 +258,60 @@ fn owner_retires_children_after_the_foreground_parent_exits() {
         reliaburger::grill::records::process_start_time(pid).is_none(),
         "owner reported retirement with a surviving child"
     );
+}
+
+/// The workload's own OOM score, as the kernel reports it once user code runs.
+#[cfg(target_os = "linux")]
+fn workload_oom_score(oom_score_adj: Option<i32>) -> i32 {
+    let marker = tempfile::tempdir_in("/tmp").unwrap();
+    let path = marker.path().join("score");
+    let mut owner = Owner::start_with_oom_score(
+        &format!("cat /proc/self/oom_score_adj > '{}'", path.display()),
+        oom_score_adj,
+    );
+    owner.wait_phase("retired");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// The test process's own score, which a child inherits by default.
+#[cfg(target_os = "linux")]
+fn own_oom_score() -> i32 {
+    std::fs::read_to_string("/proc/self/oom_score_adj")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// #984: Bun's unit runs it at -900 and children inherit that, so without
+/// this a workload was as safe from the OOM killer as Bun itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn owned_workload_starts_with_the_score_its_spec_asks_for() {
+    let wanted = reliaburger::grill::oci::WORKLOAD_OOM_SCORE_ADJ;
+    assert!(
+        own_oom_score() < wanted,
+        "the test needs to run below the workload score to see it raised"
+    );
+    assert_eq!(workload_oom_score(Some(wanted)), wanted);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn owned_workload_without_a_score_keeps_the_one_it_inherits() {
+    assert_eq!(workload_oom_score(None), own_oom_score());
+}
+
+/// The gate only ever raises a score: lowering one needs privilege, and a
+/// workload already more killable than asked stays that way.
+#[cfg(target_os = "linux")]
+#[test]
+fn owned_workload_never_has_its_score_lowered() {
+    assert_eq!(workload_oom_score(Some(-1000)), own_oom_score());
 }
 
 #[test]

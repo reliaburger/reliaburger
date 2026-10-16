@@ -165,8 +165,9 @@ TLS and pinned cluster CAs. Explicit `--endpoint` settings don't inherit this
 context's credentials.
 
 Each VM runs Bun as `reliaburger.service`. systemd restarts it 2 seconds after
-it exits, and `OOMScoreAdjust=-900` makes the kernel kill containers before
-Bun when the guest runs out of memory. Containers resolve `.internal` names
+it exits, and `OOMScoreAdjust=-900` makes the kernel kill workloads before
+Bun when the guest runs out of memory: Bun starts every workload, job and task
+at `oom_score_adj` +500. Containers resolve `.internal` names
 through Bun, and everything else through the guest's own resolvers from
 `/etc/resolv.conf`, not a public one.
 

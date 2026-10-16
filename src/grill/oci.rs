@@ -18,6 +18,21 @@ use crate::grill::cgroup;
 /// filesystem, not an image. An init container of a host app inherits it.
 pub const HOST_ROOT: &str = "proc-grill:host";
 
+/// The `oom_score_adj` every workload process starts with: apps, init
+/// containers, jobs, task executors and the tasks they run.
+///
+/// The kernel's global OOM killer picks the process with the highest
+/// score, roughly its share of memory in thousandths plus this value
+/// (-1000 to 1000). The systemd units we ship run Bun at -900, and a child
+/// inherits its parent's value, so without this every workload ran at -900
+/// too and Bun was no safer than the workloads it supervises. At +500 a
+/// workload goes before Bun, before the node's own daemons (which run at 0
+/// or below) and before Lima's guest agent (-500), however small it is.
+/// Losing a task or one replica costs far less than losing the node agent.
+/// A workload's own cgroup `memory.max` still decides a cgroup OOM; this
+/// only orders the node-wide one.
+pub const WORKLOAD_OOM_SCORE_ADJ: i32 = 500;
+
 /// A simplified OCI runtime specification.
 ///
 /// Contains the fields Reliaburger actually uses. Additional fields
@@ -104,6 +119,15 @@ pub struct OciProcess {
     /// Linux capability sets. `None` gives the process no capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<OciCapabilities>,
+    /// The process's `oom_score_adj` (the OCI `oomScoreAdj` field, which runc
+    /// applies). Workloads carry [`WORKLOAD_OOM_SCORE_ADJ`]. `None` keeps the
+    /// score the process inherits, which suits Bun's own runtime commands.
+    #[serde(
+        rename = "oomScoreAdj",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub oom_score_adj: Option<i32>,
     /// What the workload asked for before its image config fills the gaps.
     ///
     /// Not part of the OCI runtime spec. `Some` means `args`, `env`, `cwd`
@@ -389,6 +413,7 @@ pub fn generate_oci_spec_with_decryptor(
                 gid: spec.run_as_group.unwrap_or(65534),
             },
             capabilities: None,
+            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
             overrides: app_overrides(spec),
         },
         mounts,
@@ -802,6 +827,7 @@ pub fn generate_job_oci_spec(
                 gid: 65534,
             },
             capabilities: None,
+            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
             overrides: (spec.image.is_some() && spec.exec.is_none() && spec.script.is_none()).then(
                 || ProcessOverrides {
                     command: spec.command.clone().unwrap_or_default(),
@@ -857,6 +883,7 @@ pub fn generate_init_oci_spec(
                 gid: 65534,
             },
             capabilities: None,
+            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
             overrides: from_image.then(|| ProcessOverrides {
                 command: init.command.clone(),
                 ..ProcessOverrides::default()
@@ -1850,6 +1877,55 @@ mod tests {
         );
         assert!(oci.process.env.is_empty());
         assert!(oci.linux.resources.is_none());
+    }
+
+    // -- OOM score (#984) -----------------------------------------------------
+
+    #[test]
+    fn workloads_are_the_oom_killers_first_choice_before_bun() {
+        // Bun's units ask for -900; every workload must sit well above it,
+        // and above zero, so a global OOM takes a workload or a task first.
+        const _: () = assert!(WORKLOAD_OOM_SCORE_ADJ > 0);
+        const _: () = assert!(WORKLOAD_OOM_SCORE_ADJ <= 1000);
+        let app = app_oci(&minimal_app());
+        let host_app: AppSpec = toml::from_str(r#"exec = "/bin/true""#).unwrap();
+        let host_app = app_oci(&host_app);
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &app);
+        let job = generate_job_oci_spec("migrate", "default", &minimal_job(), "/cg", None);
+        let host_job: JobSpec = toml::from_str(r#"script = "true""#).unwrap();
+        let host_job = generate_job_oci_spec("tidy", "default", &host_job, "/cg", None);
+        for (what, spec) in [
+            ("app", &app),
+            ("host app", &host_app),
+            ("init container", &init),
+            ("job", &job),
+            ("host job", &host_job),
+        ] {
+            assert_eq!(
+                spec.process.oom_score_adj,
+                Some(WORKLOAD_OOM_SCORE_ADJ),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn oom_score_is_written_as_the_oci_process_field() {
+        // runc reads `process.oomScoreAdj` from config.json.
+        let job = generate_job_oci_spec("migrate", "default", &minimal_job(), "/cg", None);
+        let json = serde_json::to_value(&job).unwrap();
+        assert_eq!(
+            json["process"]["oomScoreAdj"],
+            serde_json::json!(WORKLOAD_OOM_SCORE_ADJ)
+        );
+        // A spec without one (an internal runtime command) leaves the field
+        // out, so the process keeps the score it inherits.
+        let mut inherited = job.clone();
+        inherited.process.oom_score_adj = None;
+        let json = serde_json::to_value(&inherited).unwrap();
+        assert!(json["process"].get("oomScoreAdj").is_none(), "{json}");
+        let back: OciSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.process.oom_score_adj, None);
     }
 
     #[test]
