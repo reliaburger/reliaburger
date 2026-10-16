@@ -3085,6 +3085,29 @@ on its own recovery. The final verdict still fails on it, because
 the refused summary body under `jobs/refused/` beside the error, so the next
 refusal won't need inferring (#968).
 
+The first 12-hour jobs final to get that far ran out of runs. The controller
+admitted at most 256, a number picked when the longest tier was eight hours,
+and it prepares about 25 an hour. At 10.5 hours `prepare` raised "retained run
+budget exhausted", and because it raised out of the whole step, the
+controller never reached the polling below it. Every progress counter froze.
+An hour and a half later the drain asked to cancel runs it hadn't looked at
+since, and Bun answered 404: it had pruned them, as it does an hour after a
+run finishes (sooner when newer runs push it out). The drain retried those
+cancels until its deadline. The budget was bounding the wrong thing. It
+counted runs ever admitted, while the cost it guards against is runs held:
+the controller's state and the candidate's run store. Now a run counts from
+admission until an hour after the controller sees it drain, when the
+candidate would have pruned it anyway. A 12-hour run holds about 31 at its
+busiest, and `--plan` prints the expected count and that peak beside the
+limit, refusing a schedule that wouldn't fit. When the budget is full, the
+controller records it once and keeps polling, so the runs it has still drain
+and free their slots. A 404 is now a `Gone` error (a subclass of
+`InvalidEvidence`, so code that catches the parent still sees it), and the run
+leaves the campaign either way. Whether it drained is a separate question. If
+the controller's last look showed it drained, it did. Anything else, including
+a run last seen nearly finished, is an unknown outcome and fails the record.
+"Probably finished" is exactly the guess the soak exists to refuse (#989).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage and 12-hour work

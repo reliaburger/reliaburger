@@ -167,6 +167,9 @@ case $schedule in
     *) fail '--schedule must be full or compressed' ;;
 esac
 slot=$(( cycle / 6 ))
+# The job controller holds a bounded number of runs (#989): refuse a soak
+# whose job load wouldn't fit, now rather than hours in.
+job_runs=$(python3 "$job_controller" budget --duration "$duration") || fail 'the job campaign would outgrow its retained-run limit'
 light_every=30
 heavy_every=300
 leaf_lifetime=3600
@@ -1598,6 +1601,7 @@ if [ "$plan" = true ]; then
         "$([ "$LIMA_SSH_PORT_FORWARDER" = true ] && echo ssh || echo grpc)"
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
+    printf 'plan: %s\n' "$job_runs"
     for (( index = 0; index < plan_cycles; index++ )); do run_cycle "$index" 0; done
     rm -rf "$evidence"
     exit 0
