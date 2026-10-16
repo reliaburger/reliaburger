@@ -1115,14 +1115,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ///
     /// Every path that leases app replicas from the execution budget comes
     /// through here: a fresh deploy, replicas added beside running ones and
-    /// a rolling or blue-green replacement. A refusal is kept until an
-    /// admission of the same app succeeds; any other failure says nothing
-    /// about capacity, so it leaves the record as it was.
-    fn note_admission<T>(&mut self, app_name: &str, namespace: &str, result: &Result<T, BunError>) {
+    /// a rolling or blue-green replacement. `ordinals` are the replicas the
+    /// admission tried to start: the leader moves those, and only those,
+    /// off this node (#971). A refusal is kept until an admission of the
+    /// same app succeeds; any other failure says nothing about capacity, so
+    /// it leaves the record as it was.
+    fn note_admission<T>(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        mut ordinals: Vec<u32>,
+        result: &Result<T, BunError>,
+    ) {
         let key = (app_name.to_string(), namespace.to_string());
         match result {
             Err(BunError::Capacity { .. }) => {
-                self.capacity_refusals.insert(key);
+                ordinals.sort_unstable();
+                ordinals.dedup();
+                self.capacity_refusals.insert(key, ordinals);
             }
             Ok(_) => {
                 self.capacity_refusals.remove(&key);
@@ -1196,12 +1206,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 count,
                 reply,
             } => {
+                let adding = self
+                    .supervisor
+                    .ordinals_to_add(&app_name, &namespace, &spec, count);
                 // LOOP-INLINE: in-memory lock, no I/O
                 let result = self
                     .supervisor
                     .add_app_replicas(&app_name, &namespace, &spec, count, Instant::now())
                     .await;
-                self.note_admission(&app_name, &namespace, &result);
+                self.note_admission(&app_name, &namespace, adding, &result);
                 let _ = reply.send(result);
             }
             DeployOp::NextDeployGen { app_name, reply } => {
@@ -1247,7 +1260,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .deploy_app(&app_name, &namespace, &spec, now)
                     .await;
-                self.note_admission(&app_name, &namespace, &result);
+                self.note_admission(&app_name, &namespace, spec.replica_ordinals(), &result);
                 let _ = reply.send(result);
             }
             DeployOp::RegisterServiceApp {
@@ -1483,7 +1496,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self
                     .reserve_rolling_instance(&instance_id, &app_name, &namespace, &spec)
                     .await;
-                self.note_admission(&app_name, &namespace, &result);
+                // A rollout that can't start one replacement rolls back, so
+                // none of the new spec's replicas can run here.
+                self.note_admission(&app_name, &namespace, spec.replica_ordinals(), &result);
                 let _ = reply.send(result);
             }
             DeployOp::PrepareRollingInstance {

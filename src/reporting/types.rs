@@ -207,6 +207,12 @@ pub struct CapacityRefusal {
     pub app_name: String,
     /// Namespace the app belongs to.
     pub namespace: String,
+    /// The replica ordinals the node couldn't start, in ascending order. A
+    /// refused scale-up names only the replicas it tried to add, so the
+    /// leader moves those and leaves the running ones where they are
+    /// (#971). A refused fresh deploy or rolling replacement names every
+    /// ordinal of the node's share: none of them can run the new spec here.
+    pub ordinals: Vec<u32>,
 }
 
 /// Per-instance resource usage.

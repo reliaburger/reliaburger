@@ -1396,8 +1396,11 @@ impl Liveness<'_> {
     /// managed-volume app stays on its home whatever its node is doing
     /// (#423), even when its new request no longer fits there. Any other
     /// replica stays while its node holds it and still has room for the
-    /// request it makes now (#434), unless the node reported it couldn't fit
-    /// the app: job leases may have taken the room since it was placed.
+    /// request it makes now (#434), unless the node reported it couldn't
+    /// start this replica: job leases may have taken the room since it was
+    /// placed. A refusal names the ordinals the node couldn't start, so a
+    /// refused scale-up moves only the replicas it tried to add, and the
+    /// ones already running beside them stay (#971).
     fn keeps(
         &self,
         app_id: &crate::meat::types::AppId,
@@ -1419,7 +1422,7 @@ impl Liveness<'_> {
         if keeps_volume_home(placement, spec, self.retired) {
             return true;
         }
-        if cache.capacity_refused(&placement.node_id, app_id) {
+        if cache.capacity_refused(&placement.node_id, app_id, placement.ordinal) {
             return false;
         }
         placement_holds(placement, spec, cache, self) && admits_in_place(placement, spec, cache)
@@ -1972,6 +1975,7 @@ fn build_cluster_cache(
             cache.record_capacity_refusal(
                 &member.node_id,
                 &crate::meat::AppId::new(&refusal.app_name, &refusal.namespace),
+                &refusal.ordinals,
             );
         }
     }
@@ -6187,10 +6191,7 @@ image = "busybox:latest"
             .get_mut(&NodeId::new("full"))
             .unwrap()
             .capacity_refusals
-            .push(crate::reporting::types::CapacityRefusal {
-                app_name: "web".to_string(),
-                namespace: "default".to_string(),
-            });
+            .push(refused("web", &[0]));
         let mut cache = build_cluster_cache(&members, &reports);
         let decisions =
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
@@ -6199,39 +6200,188 @@ image = "busybox:latest"
         assert_eq!(nodes_of(&decisions[0]), ["idle"]);
     }
 
-    /// #967: candidate 7's jobs soak. Two replicas already run on a node
-    /// that job leases have since filled, and the third, added beside them,
-    /// is refused. The node reports the refusal while its deploy backs off,
-    /// so the leader re-places the app on the node with room rather than
-    /// calling it converged with a replica that can never start.
-    #[test]
-    fn a_refusal_to_add_a_replica_beside_running_ones_moves_the_app() {
+    /// A node's refusal to start `ordinals` of `app_name` in `default`.
+    fn refused(app_name: &str, ordinals: &[u32]) -> crate::reporting::types::CapacityRefusal {
+        crate::reporting::types::CapacityRefusal {
+            app_name: app_name.to_string(),
+            namespace: "default".to_string(),
+            ordinals: ordinals.to_vec(),
+        }
+    }
+
+    /// `frontend`'s replicas `running` already run on the job-filled node
+    /// `full`, where all `replicas` are committed, and `full` reports that
+    /// it couldn't start `refused_ordinals`.
+    fn frontend_refused_on_the_full_node(
+        replicas: u32,
+        running: &[u32],
+        refused_ordinals: &[u32],
+    ) -> (DesiredState, ClusterStateCache, HashSet<NodeId>) {
         let (members, mut reports) = job_filled_and_idle_reports();
         let app = AppId::new("frontend", "default");
         let mut desired = DesiredState::default();
-        desired.apps.insert(app.clone(), app_spec(100, 3));
-        desired
-            .scheduling
-            .insert(app.clone(), placed_on(&["full", "full", "full"]));
+        desired.apps.insert(app.clone(), app_spec(100, replicas));
+        let full_node = vec!["full"; replicas as usize];
+        desired.scheduling.insert(app, placed_on(&full_node));
         let full = reports.reports.get_mut(&NodeId::new("full")).unwrap();
-        for ordinal in [1, 2] {
+        for &ordinal in running {
             let mut replica = running_app("default", "frontend", 30000 + ordinal as u16, true);
             replica.instance_id = ordinal;
             full.running_apps.push(replica);
         }
-        full.capacity_refusals
-            .push(crate::reporting::types::CapacityRefusal {
-                app_name: "frontend".to_string(),
-                namespace: "default".to_string(),
-            });
+        if !refused_ordinals.is_empty() {
+            full.capacity_refusals
+                .push(refused("frontend", refused_ordinals));
+        }
         let alive = HashSet::from([NodeId::new("full"), NodeId::new("idle")]);
-        let mut cache = build_cluster_cache(&members, &reports);
+        (desired, build_cluster_cache(&members, &reports), alive)
+    }
+
+    /// The `(node, ordinal)` pairs a decision places, in ordinal order.
+    fn ordinals_of(decision: &crate::meat::types::SchedulingDecision) -> Vec<(&str, u32)> {
+        let mut placed: Vec<_> = decision
+            .placements
+            .iter()
+            .map(|p| (p.node_id.0.as_str(), p.ordinal))
+            .collect();
+        placed.sort_by_key(|(_, ordinal)| *ordinal);
+        placed
+    }
+
+    /// #967, #971: candidate 7's jobs soak. Two replicas already run on a
+    /// node that job leases have since filled, and the third, added beside
+    /// them, is refused. The node reports the refusal while its deploy backs
+    /// off, so the leader re-places that replica on the node with room
+    /// rather than calling it converged with a replica that can never start.
+    /// The two running replicas stay: moving them would restart healthy
+    /// workloads to make room for one that never started.
+    #[test]
+    fn a_refusal_to_add_a_replica_beside_running_ones_moves_only_that_replica() {
+        let (desired, mut cache, alive) = frontend_refused_on_the_full_node(3, &[1, 2], &[0]);
 
         let decisions =
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
 
         assert_eq!(decisions.len(), 1, "{decisions:?}");
-        assert_eq!(nodes_of(&decisions[0]), ["idle", "idle", "idle"]);
+        assert_eq!(
+            ordinals_of(&decisions[0]),
+            [("idle", 0), ("full", 1), ("full", 2)]
+        );
+    }
+
+    /// A refused rolling replacement names every ordinal the node runs:
+    /// none of them can run the new spec there, so they all move, even
+    /// though the old replicas are still running.
+    #[test]
+    fn a_refused_rolling_replacement_moves_every_replica_it_names() {
+        let (desired, mut cache, alive) = frontend_refused_on_the_full_node(2, &[0, 1], &[0, 1]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(ordinals_of(&decisions[0]), [("idle", 0), ("idle", 1)]);
+    }
+
+    /// Once the refused replica has moved, the refusal names nothing the
+    /// node still holds, so the next pass leaves the app alone.
+    #[test]
+    fn a_refusal_for_a_replica_that_already_moved_changes_nothing() {
+        let (mut desired, mut cache, alive) = frontend_refused_on_the_full_node(3, &[1, 2], &[0]);
+        desired.scheduling.insert(
+            AppId::new("frontend", "default"),
+            placed_as(&app_spec(100, 3), &[("idle", 0), ("full", 1), ("full", 2)]),
+        );
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// #971: with no other node to take the refused replica, it stays
+    /// committed where it was, the running replicas stay too, and the
+    /// shortfall is news once: the next pass, with the same refusal still
+    /// standing, has nothing new to log.
+    #[test]
+    fn a_standing_refusal_with_nowhere_to_go_is_logged_once() {
+        let (mut desired, mut cache, alive) = frontend_refused_on_the_full_node(3, &[1, 2], &[0]);
+        // Job leases fill the other node too.
+        let mut idle = cache.get_node(&NodeId::new("idle")).cloned().unwrap();
+        idle.allocated = idle.allocatable;
+        cache.set_node(idle);
+        let members = PassMembers {
+            alive,
+            ..PassMembers::default()
+        };
+        let mut first_cache = cache.clone();
+
+        let first = plan_pass(
+            &mut first_cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+
+        assert!(first.decisions.is_empty(), "{:?}", first.decisions);
+        let short = first
+            .unschedulable
+            .get(&AppId::new("frontend", "default"))
+            .copied()
+            .expect("the refused replica has no node");
+        assert_eq!((short.placed, short.wanted), (2, 3));
+        assert_eq!(
+            shortfall_changes(&desired.unschedulable, &first.unschedulable, &desired).len(),
+            1
+        );
+
+        desired.unschedulable = first.unschedulable.clone().into_iter().collect();
+        let second = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+
+        assert!(second.decisions.is_empty(), "{:?}", second.decisions);
+        assert!(
+            shortfall_changes(&desired.unschedulable, &second.unschedulable, &desired).is_empty(),
+            "a refusal that still stands is not news"
+        );
+    }
+
+    proptest::proptest! {
+        /// #971: whichever replicas a node refuses, those and only those
+        /// leave it. The rest stay where they run.
+        #[test]
+        fn a_refusal_moves_exactly_the_refused_replicas(
+            replicas in 1u32..6,
+            refused_mask in 1u32..64,
+        ) {
+            let refused: Vec<u32> = (0..replicas)
+                .filter(|ordinal| refused_mask & (1 << ordinal) != 0)
+                .collect();
+            proptest::prop_assume!(!refused.is_empty());
+            let running: Vec<u32> = (0..replicas)
+                .filter(|ordinal| !refused.contains(ordinal))
+                .collect();
+            let (desired, mut cache, alive) =
+                frontend_refused_on_the_full_node(replicas, &running, &refused);
+
+            let decisions =
+                plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+            proptest::prop_assert_eq!(decisions.len(), 1);
+            let expected: Vec<(&str, u32)> = (0..replicas)
+                .map(|ordinal| {
+                    let node = if refused.contains(&ordinal) { "idle" } else { "full" };
+                    (node, ordinal)
+                })
+                .collect();
+            proptest::prop_assert_eq!(ordinals_of(&decisions[0]), expected);
+        }
     }
 
     /// A node mid-upgrade is cordoned, which the cache records as not

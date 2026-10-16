@@ -4,7 +4,7 @@
 /// the membership table and aggregated StateReports. The scheduler
 /// reads this cache during the Filter and Score phases and updates
 /// it after each placement to reflect reserved resources.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,8 @@ impl SchedulerNodeState {
 pub struct ClusterStateCache {
     nodes: HashMap<NodeId, SchedulerNodeState>,
     accounted_instances: HashMap<(NodeId, AppId, u32), Resources>,
-    capacity_refusals: HashSet<(NodeId, AppId)>,
+    /// The replica ordinals each node reported it couldn't start, per app.
+    capacity_refusals: HashMap<(NodeId, AppId), BTreeSet<u32>>,
 }
 
 impl ClusterStateCache {
@@ -137,20 +138,25 @@ impl ClusterStateCache {
         Self {
             nodes: HashMap::new(),
             accounted_instances: HashMap::new(),
-            capacity_refusals: HashSet::new(),
+            capacity_refusals: HashMap::new(),
         }
     }
 
-    /// Record that `node_id` reported it couldn't fit `app_id`'s replicas.
-    pub fn record_capacity_refusal(&mut self, node_id: &NodeId, app_id: &AppId) {
+    /// Record that `node_id` reported it couldn't start `app_id`'s replicas
+    /// `ordinals` for lack of room.
+    pub fn record_capacity_refusal(&mut self, node_id: &NodeId, app_id: &AppId, ordinals: &[u32]) {
         self.capacity_refusals
-            .insert((node_id.clone(), app_id.clone()));
+            .entry((node_id.clone(), app_id.clone()))
+            .or_default()
+            .extend(ordinals.iter().copied());
     }
 
-    /// Whether `node_id` reported it couldn't fit `app_id`'s replicas.
-    pub fn capacity_refused(&self, node_id: &NodeId, app_id: &AppId) -> bool {
+    /// Whether `node_id` reported it couldn't start `app_id`'s replica
+    /// `ordinal`. Its other replicas there are untouched by the refusal.
+    pub fn capacity_refused(&self, node_id: &NodeId, app_id: &AppId, ordinal: u32) -> bool {
         self.capacity_refusals
-            .contains(&(node_id.clone(), app_id.clone()))
+            .get(&(node_id.clone(), app_id.clone()))
+            .is_some_and(|refused| refused.contains(&ordinal))
     }
 
     /// Add or replace a node's state.

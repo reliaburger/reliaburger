@@ -671,13 +671,14 @@ pub struct BunAgent<G: Grill> {
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
     /// Apps whose last admission here failed because the execution budget
-    /// had no room (job leases may hold it), keyed by (app_name, namespace).
-    /// Every state report carries them, so the leader places the replicas
-    /// elsewhere instead of holding them. An entry stays until an admission
-    /// of that app succeeds here or the app is stopped or retired here: a
+    /// had no room (job leases may hold it), keyed by (app_name, namespace),
+    /// with the replica ordinals the admission tried to start. Every state
+    /// report carries them, so the leader places those replicas elsewhere
+    /// instead of holding them (#971). An entry stays until an admission of
+    /// that app succeeds here or the app is stopped or retired here: a
     /// deploy backs off for minutes between attempts, and the refusal must
     /// not lapse in between (#967).
-    capacity_refusals: std::collections::HashSet<(String, String)>,
+    capacity_refusals: std::collections::HashMap<(String, String), Vec<u32>>,
     /// The app versions this node's placement reconciler last finished
     /// deploying, as it last told the agent. State reports carry them so the
     /// leader can release a rollout node by node (#692).
@@ -913,7 +914,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashSet::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
@@ -1073,7 +1074,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashSet::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
