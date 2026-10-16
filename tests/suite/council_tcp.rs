@@ -73,7 +73,12 @@ impl TlsSetup {
 }
 
 fn revoked_crl(serial: u64) -> CrlHandle {
-    CrlHandle::new(reliaburger::sesame::types::Crl {
+    CrlHandle::new(revoked(serial))
+}
+
+/// A CRL revoking one Node CA serial.
+fn revoked(serial: u64) -> reliaburger::sesame::types::Crl {
+    reliaburger::sesame::types::Crl {
         retired_nodes: Default::default(),
         entries: vec![CrlEntry {
             serial: SerialNumber(serial),
@@ -84,7 +89,7 @@ fn revoked_crl(serial: u64) -> CrlHandle {
         }],
         version: 1,
         updated_at: SystemTime::now(),
-    })
+    }
 }
 
 /// A test node paired with the address its Raft listener actually bound.
@@ -365,6 +370,143 @@ async fn raft_rpc_connection_permits_are_released() {
             })
             .unwrap();
     }
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Persistent connections (#928)
+// ---------------------------------------------------------------------------
+
+/// One stamped vote request, framed as the transport sends it.
+fn vote_frame() -> Vec<u8> {
+    let envelope = reliaburger::council::network::RaftRpcEnvelope {
+        compatibility: reliaburger::compatibility::CURRENT,
+        sender_recovery_epoch: 0,
+        sender_recovery_id: None,
+        rpc: reliaburger::council::network::RaftRpc::Vote(openraft::raft::VoteRequest::new(
+            openraft::Vote::new(1, 2),
+            None,
+        )),
+    };
+    let body = serde_json::to_vec(&envelope).unwrap();
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Send one vote and read the answer. `None` means the server closed the
+/// connection instead of answering.
+async fn ask_for_vote<S>(stream: &mut S) -> Option<serde_json::Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    stream.write_all(&vote_frame()).await.ok()?;
+    stream.flush().await.ok()?;
+    let read = async {
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).await.ok()?;
+        let mut body = vec![0u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut body).await.ok()?;
+        serde_json::from_slice::<serde_json::Value>(&body).ok()
+    };
+    tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("the server neither answered nor closed the connection")
+}
+
+async fn lone_council(id: u64) -> CouncilNode {
+    CouncilNode::new(
+        id,
+        CouncilConfig::default(),
+        TcpRaftNetworkFactory::new(id),
+        MemLogStore::new(),
+        CouncilStateMachine::new(),
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// The server side of #928: one connection carries request after request,
+/// so a peer that keeps its connection pays the handshake once.
+#[tokio::test]
+async fn raft_rpc_serves_many_requests_on_one_connection() {
+    let shutdown = CancellationToken::new();
+    let council = lone_council(1).await;
+    let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let raft = council.raft().clone();
+    let serving = shutdown.clone();
+    tokio::spawn(async move {
+        serve_raft_rpc(listener, raft, serving, None, RecoveryFence::serving(0)).await;
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+    for request in 0..5 {
+        let answer = ask_for_vote(&mut stream)
+            .await
+            .unwrap_or_else(|| panic!("request {request} got no answer on the open connection"));
+        assert!(answer["response"].get("Vote").is_some(), "{answer}");
+    }
+
+    shutdown.cancel();
+}
+
+/// A connection outlives its handshake, so the server re-checks the peer's
+/// certificate against the live CRL before each request: a peer revoked
+/// while connected is cut off at its next request, as it was when every
+/// request paid a fresh handshake.
+#[tokio::test]
+async fn raft_rpc_closes_an_open_connection_once_its_peer_is_revoked() {
+    let shutdown = CancellationToken::new();
+    let tls = TlsSetup::new();
+    let server_identity = tls.identity("n1", 10);
+    let client_identity = tls.identity("n2", 11);
+    let crl = CrlHandle::default();
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        reliaburger::sesame::mtls::build_mtls_server_config(&server_identity, crl.clone())
+            .unwrap(),
+    );
+    let connector = tokio_rustls::TlsConnector::from(
+        reliaburger::sesame::mtls::build_mtls_client_config(
+            &client_identity,
+            CrlHandle::default(),
+        )
+        .unwrap(),
+    );
+
+    let council = lone_council(1).await;
+    let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let raft = council.raft().clone();
+    let serving = shutdown.clone();
+    let serving_crl = crl.clone();
+    tokio::spawn(async move {
+        reliaburger::council::network::serve_raft_rpc_with_node_gate(
+            listener,
+            raft,
+            serving,
+            Some(acceptor),
+            RecoveryFence::serving(0),
+            reliaburger::smoker::node_fault::NodeTransportGate::new(),
+            Some(serving_crl),
+        )
+        .await;
+    });
+
+    let tcp = tokio::net::TcpStream::connect(bound).await.unwrap();
+    let server_name = rustls::pki_types::ServerName::IpAddress(bound.ip().into());
+    let mut stream = connector.connect(server_name, tcp).await.unwrap();
+    assert!(ask_for_vote(&mut stream).await.is_some());
+
+    crl.update(revoked(11));
+    assert!(
+        ask_for_vote(&mut stream).await.is_none(),
+        "a revoked peer's open connection must not be served"
+    );
 
     shutdown.cancel();
 }

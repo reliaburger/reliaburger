@@ -132,9 +132,13 @@ opt-level = 3
 A `[profile.<name>.package.<crate>]` table overrides settings for one
 dependency only, so `ring` is optimised while our own code keeps fast debug
 builds. We'd already done the same for the SHA-256 and Argon2 crates. Release
-builds, which `relish setup --quickstart` uses, were never affected. Reusing
-Raft connections would remove the cause rather than this symptom, but that's a
-bigger change for another day.
+builds, which `relish setup --quickstart` uses, were never affected. That
+treated the symptom. The cause went later, in
+[#928](https://github.com/reliaburger/reliaburger/issues/928): the Raft
+transport now keeps a small pool of open connections per peer, so a heartbeat
+no longer pays for a handshake at all. Chapter 2's "Keeping Raft connections
+open" explains the pool. We kept the `ring` override, since debug builds still
+handshake whenever a pooled connection is retired.
 
 The generated master key and security-bootstrap JSON both land as `0600`.
 That second file used to land as `0644`, while Bun's loader quite reasonably
