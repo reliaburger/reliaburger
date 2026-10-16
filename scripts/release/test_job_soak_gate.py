@@ -543,12 +543,17 @@ class RunBudget(unittest.TestCase):
         return c
 
     def test_a_final_tier_plan_fits_within_its_limit(self):
-        plan=jobs.run_budget(12*3600)
-        self.assertTrue(plan["fits"])
-        # The 12-hour final prepared about 25 runs an hour; the plan allows twice that.
-        self.assertGreaterEqual(plan["expected_runs"],25*12)
-        self.assertLessEqual(plan["peak_retained"],plan["limit"])
-        self.assertEqual(plan["limit"],jobs.RETAINED_RUNS)
+        # The 8-hour jobs final that replaces the V02 final (#991), and the
+        # 12-hour one that ran out for 0.2.0.
+        for hours in (8,12):
+            plan=jobs.run_budget(hours*3600)
+            self.assertTrue(plan["fits"],hours)
+            # 0.2.0's final prepared about 25 runs an hour; the plan allows twice that.
+            self.assertGreaterEqual(plan["expected_runs"],25*hours)
+            # More runs than the old fixed budget of 256 ever admitted.
+            self.assertGreater(plan["expected_runs"],256)
+            self.assertLessEqual(plan["peak_retained"],plan["limit"])
+            self.assertEqual(plan["limit"],jobs.RETAINED_RUNS)
 
     def test_the_retention_window_is_the_products(self):
         # A finished run frees its slot once the candidate would have pruned it.
@@ -570,10 +575,12 @@ class RunBudget(unittest.TestCase):
         result=subprocess.run([str(self.release/"qualify-jobs-sustained.sh"),"--tier","final","--plan"],stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,text=True,timeout=60,env=dict(os.environ,RELIABURGER_SOAK_CAFFEINATED="1"))
         self.assertEqual(result.returncode,0,result.stderr)
+        header=next(line for line in result.stdout.splitlines() if line.startswith("plan: tier ")).split()[1:]
+        duration=int(dict(zip(header[::2],header[1::2]))["duration"])
         line=next(line for line in result.stdout.splitlines() if line.startswith("plan: job-runs "))
         fields=line.split()[2:]
         fields=dict(zip(fields[::2],fields[1::2]))
-        plan=jobs.run_budget(43200)
+        plan=jobs.run_budget(duration)
         self.assertEqual(fields,dict(expected=str(plan["expected_runs"]),**{"retained-peak":str(plan["peak_retained"])},
                                      limit=str(jobs.RETAINED_RUNS)))
 
