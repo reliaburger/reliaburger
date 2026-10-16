@@ -2174,7 +2174,7 @@ Two small things also changed. A frame used to go out as two writes (the length 
 
 #### Did it help?
 
-`examples/raft-heartbeat-rtt.rs` forms a three-voter council over the real transport (TCP, mTLS, live identities, node-bound connectors) on loopback and times `ensure_linearizable` on the leader, which is exactly what a linearizable read pays. The results, before and after, in both build profiles and with and without CPU load, are in the [council design doc](../design/gossip-mustard.md#33-raft-integration). RESULTS_SUMMARY
+`examples/raft-heartbeat-rtt.rs` forms a three-voter council over the real transport (TCP, mTLS, live identities, node-bound connectors) on loopback and times `ensure_linearizable` on the leader, which is exactly what a linearizable read pays. The results, before and after, in both build profiles and with and without CPU load, are in the [council design doc](../design/gossip-mustard.md#33-raft-integration). On an M2 Max with an idle host, the median leadership check fell from 2.50 ms to 0.53 ms in a debug build and from 1.43 ms to 0.26 ms in a release build. Under full CPU load the medians fell by similar factors, but the slowest checks barely moved: once every core is busy, the tail is the scheduler's, not the handshake's. No check came near 150 ms on loopback either way, because the debug builds already carried the `ring` fix and loopback has no virtual network in the way. The honest summary is that the pool takes the handshake out of the heartbeat's budget entirely, rather than making a slow cluster fast.
 
 ### The ClusterHandle
 

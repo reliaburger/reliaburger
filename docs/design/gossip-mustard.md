@@ -164,6 +164,30 @@ Raft is **not** used for:
 - Failure detection (that is Mustard's job)
 - Communication with non-council nodes
 
+#### Raft transport connections
+
+Raft RPCs travel over TCP with mTLS (`src/council/network.rs`). Each node keeps a small pool of established connections per peer (`src/council/connection_pool.rs`, [#928](https://github.com/reliaburger/reliaburger/issues/928)), so a heartbeat or append doesn't pay for a TCP and TLS handshake. This matters because a leader confirming its leadership for a linearizable read gives each heartbeat only `heartbeat_interval` (150 ms) to come back; on a debug-build Lima cluster a handshake per RPC exceeded that (found while proving [#870](https://github.com/reliaburger/reliaburger/issues/870)).
+
+- **Client.** An RPC takes an idle connection for its peer (keyed by address and the node name the certificate is checked against) or dials one, sends one request, reads one response and returns the connection. A cancelled RPC drops its connection, so a connection with a request in flight is never reused. If a pooled connection fails, the RPC is sent once more on a fresh dial (Raft RPCs are idempotent at the receiver). At most 4 idle connections are kept per peer.
+- **Retirement.** A pooled connection is closed instead of reused once it is 30 s old or 10 s idle, when this node's identity changed since it was dialled (renewal or new trust set, so the next handshake presents the new certificate), or when the peer's presented chain is now on the CRL.
+- **Server.** A connection serves requests until the peer is idle for 20 s or the connection is 60 s old (the client's limits are shorter, checked by `const` assertions). Before each request it re-checks the node fault gate and the client's chain against the live CRL, so a revocation takes effect at the next RPC. The handshake and each request keep the 10 s deadline (CP11).
+- Both ends set `TCP_NODELAY`, and a frame goes out in one write.
+
+**Measured heartbeat round trips.** `examples/raft-heartbeat-rtt.rs` forms a three-voter council over the production transport (mTLS, live identities, node-bound connectors) on loopback and times 1,000 `ensure_linearizable` calls on the leader, 5 ms apart. Apple M2 Max (12 cores), 17 October 2026, host otherwise quiet (no builds, one-minute load average below 3 at the start); "loaded" adds 12 `yes > /dev/null` processes, one per core. Debug builds include the optimised `ring` override from [#922](https://github.com/reliaburger/reliaburger/pull/922). No sample failed or exceeded 150 ms in any run.
+
+| Build | Host | Transport | p50 | p90 | p99 | max |
+|-------|------|-----------|-----|-----|-----|-----|
+| debug | idle | handshake per RPC | 2.50 ms | 3.56 ms | 5.13 ms | 6.60 ms |
+| debug | idle | pooled | 0.53 ms | 1.82 ms | 2.44 ms | 3.65 ms |
+| release | idle | handshake per RPC | 1.43 ms | 2.29 ms | 3.62 ms | 4.66 ms |
+| release | idle | pooled | 0.26 ms | 0.58 ms | 1.20 ms | 4.06 ms |
+| debug | loaded | handshake per RPC | 3.13 ms | 6.11 ms | 14.07 ms | 21.06 ms |
+| debug | loaded | pooled | 0.91 ms | 5.62 ms | 11.50 ms | 20.10 ms |
+| release | loaded | handshake per RPC | 1.50 ms | 5.76 ms | 12.25 ms | 107.74 ms |
+| release | loaded | pooled | 0.28 ms | 4.16 ms | 10.33 ms | 16.92 ms |
+
+Pooling cuts the median by about five times in both profiles. Under load the tail is set by CPU scheduling rather than handshakes, so pooling helps less there, but it removed the one run whose worst heartbeat used most of the 150 ms budget. Loopback with the optimised `ring` doesn't reproduce the Lima failure itself, where each handshake also crossed virtual NICs on a slower, unoptimised build; the dev cluster was not re-measured.
+
 ### 3.4 Council Selection Algorithm
 
 The leader selects council members from the general node pool. Selection criteria, in priority order:
@@ -577,7 +601,7 @@ struct EncryptedRecoveryCandidateList {
 |-------|-----------|----------|------------------|
 | Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
 | Mustard anti-entropy (Sync push-pull) | UDP | bincode (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
-| Raft (AppendEntries, RequestVote) | TCP + mTLS | bincode | Unbounded (log entries can contain app specs) |
+| Raft (AppendEntries, Vote, InstallSnapshot) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
 | Reporting tree (StateReports) | TCP + mTLS | bincode | 1 MiB (bounded by max events per report) |
 
 All TCP connections use mTLS via Sesame's Node CA certificates.
