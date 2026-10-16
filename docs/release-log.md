@@ -11,7 +11,7 @@ paragraph goes at the top when a release is promoted
 ## 0.2.0: A million jobs
 
 TODO(records): promoted on DATE, promote run RUN_ID, tag `v0.2.0` at `cc5f6439`.
-Qualification ran from 12 to TODO(records) October 2026 and took eight
+Qualification ran from 12 to 17 October 2026 and took eight
 candidates ([closure record](qualification/2026-10-16-v0.2.0-release-closure.md)).
 All eight installed cleanly; the soaks, now carrying a job campaign alongside
 the apps, failed the first seven. Candidates 1 and 2 never got past setup:
@@ -31,8 +31,18 @@ request until the API node's guest agent held 1 GiB and the kernel killed Bun
 ([#982](https://github.com/reliaburger/reliaburger/issues/982),
 [lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210)). The rerun
 forwarded ports over SSH instead
-([#986](https://github.com/reliaburger/reliaburger/pull/986)) and
-TODO(records): result. TODO(records): power-cut and reboot lanes, 25 runs each.
+([#986](https://github.com/reliaburger/reliaburger/pull/986)) and ran the full
+12 hours at 4,600 accepted jobs a second, with Bun's memory within target. Its
+15 failures all came from the harness: SSH forwarding that Lima never retried
+after a reboot, cutting a healthy node off from the host, and the job
+controller running out of its run budget after 10.5 hours. The maintainer
+counted both as known harness artefacts, and 0.2.1 removes them
+([#983](https://github.com/reliaburger/reliaburger/issues/983),
+[#987](https://github.com/reliaburger/reliaburger/issues/987),
+[#989](https://github.com/reliaburger/reliaburger/issues/989);
+[record](qualification/2026-10-17-v0.2.0-job-qualification.md)). Every
+power-cut and reboot lane passed 25 of 25
+([record](qualification/2026-10-16-power-cut-reboot.md)).
 0.2.0 ships with the quickstart still pinning Lima 2.1.0, so with that leak
 and with CVE-2026-53657 (root in a QEMU-driven VM through the guest agent's
 socket); 0.2.1 bundles Lima 2.2.1
