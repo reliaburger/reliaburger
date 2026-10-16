@@ -246,6 +246,22 @@ When job data and the audit log (`audit/`, see
 free, the node keeps running the chunks it already holds but advertises no free
 slots, so it takes no new grants until retention frees space.
 
+## When a node runs out of memory
+
+A workload over its own `memory.limit` is killed inside its cgroup and
+restarts with backoff. When the whole machine runs out, the kernel's OOM
+killer picks a victim by `oom_score_adj` instead, and losing Bun stops the
+node's discovery updates, health checks and, on an API node, the API. So Bun
+runs at -900 (the `OOMScoreAdjust=-900` in the systemd units we ship and in
+`relish dev`'s launch), and every app, init container, job and task starts at
++500. The kernel takes a workload or a task first, then the machine's own
+daemons, and Bun last.
+
+Check a node with `cat /proc/$(pidof bun)/oom_score_adj`. If you run Bun from
+your own unit, copy `OOMScoreAdjust=-900` from
+[Linux servers](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md);
+without it Bun runs at 0 and can lose to any daemon that asked for less.
+
 ## GitOps
 
 Point the config at a repository and the council leader keeps the cluster in

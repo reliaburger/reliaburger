@@ -1214,6 +1214,17 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 > memory-pressure reclaim before the hard `memory.max` OOM. A limit-only spec
 > (no request) emits no unified entries and is byte-identical to before.
 
+**Node-wide OOM order (#984):** a cgroup's `memory.max` decides a cgroup OOM,
+but when the whole node runs out the kernel's global OOM killer picks by
+`oom_score_adj`. The systemd units we ship run Bun at `OOMScoreAdjust=-900`,
+and every workload spec Grill generates (apps, init containers, jobs, executor
+helpers and fresh-container tasks) carries `process.oomScoreAdj` of
+`WORKLOAD_OOM_SCORE_ADJ` (+500, `src/grill/oci.rs`). runc applies it to
+containers; the process owner's execution gate raises a host workload to it
+before `exec`, and never lowers a score. Without it every workload inherited
+Bun's -900. A node-wide OOM therefore takes a workload or a task before Bun,
+the node's daemons and Lima's guest agent (-500).
+
 > **OOM detection via `memory.events` inotify — planned, not yet implemented.** There is no inotify watch on `memory.events` today, so an OOM kill is observed only through the workload's exit and the ordinary restart path, not as a distinct structured OOM event with the cgroup's memory state.
 
 **GPU device isolation:**
@@ -1459,7 +1470,9 @@ join = ["10.0.1.5:9443"]
 
 ### 7.1 Bun Process Crash
 
-**What happens:** Bun exits unexpectedly (panic, SIGSEGV, OOM-killed).
+**What happens:** Bun exits unexpectedly (panic, SIGSEGV, OOM-killed). A
+node-wide OOM should take a workload first: Bun runs at -900 and every
+workload at +500 (see "Node-wide OOM order").
 
 **Detection:** systemd (or equivalent init system) detects the process exit. The Mustard gossip layer on peer nodes detects the heartbeat timeout (default 5 seconds).
 

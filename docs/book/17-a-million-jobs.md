@@ -17,7 +17,7 @@ What 0.2.0 doesn't promise yet is the daily number. The whitepaper's target is
 100 million accepted successes a day, and the
 [timed-scenario record](../qualification/2026-10-09-timed-job-scenarios/README.md)
 projects past that from one-minute windows. A projection isn't a qualification:
-the 12-hour run at that rate, with bounded storage
+a final soak at that rate, with bounded storage
 ([#668](https://github.com/reliaburger/reliaburger/issues/668)) is the evidence
 that will, and until it passes we don't claim it. The end of the chapter lists
 the other gaps still open.
@@ -1873,7 +1873,37 @@ was the one killed. The soak now uses Lima's SSH forwarder, the quickstart
 will move to a fixed Lima (#983), and Bun should stop being the kernel's
 first choice when memory runs out (#984). A soak that only watched Bun's own
 memory would have called this a Bun leak. Asking the kernel what it killed,
-and what was holding the memory, settled it in a minute.
+and what was holding the memory, settled it in a minute, once someone thought
+to log in to the live VM and ask. The soak asks now (#985). Every heavy check
+and every failure bundle keeps each node's `/proc/meminfo`, its biggest
+processes by RSS, the guest agent's RSS and open files, and any OOM report
+from the kernel log, cut from "invoked oom-killer" to "Killed process" so the
+per-process table comes with it. The same triage found a quieter gap. Bun had
+restarted three times without a harness kill, but only the first became a
+failure: the checker bundles one failure per check and node every half hour,
+and the next two looked like repeats of it. A restart count that rises again
+is a new restart, so each rise is now a failure of its own.
+
+The SSH forwarder had a flaw of its own. It sets up each port with one
+`ssh -O forward`, and if that fails just after a boot, it logs the error and
+never tries again. In the 12-hour jobs final it cut node 3 off from the Mac
+after an upgrade walk, and node 1 after a power-off. Inside, the cluster was
+fine. Outside, the harness saw settles time out, podinfo answer `000`, a
+`version ?` from the upgrade walk and a pulse fail: twelve failures that all
+looked like ours. The evidence that would have said otherwise, Lima's
+host-agent log, had been truncated by the next time those VMs started. Any
+forwarder can lose a port, so the harness now checks for exactly that
+(#987). Every check asks each forwarded port for a real HTTP answer from the
+host. A TCP connect isn't enough, because Lima's default gRPC forwarder
+accepts every connection on the host whether or not anything is behind it.
+When the host gets no answer, the harness asks the same port from inside the
+guest over `limactl shell`, which goes through SSH rather than the forwarder.
+Served inside but not outside, for more than a minute, is one `host-forward`
+failure for the whole incident, and the podinfo and registry checks that went
+through that port stop counting against the product. The harness also keeps
+each VM's host-agent log before every stop. And the job controller now counts
+which node missed a request and which node answered it instead, because the
+`leak-rss` on node 2 in that run was node 2 serving node 1's share of the API.
 
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
@@ -2906,8 +2936,8 @@ so waiting for a slot can't leak into execution time.
 A fast command completing a million times tells us little about what happens
 when Bun dies halfway through owning it. The release soak already kills agents,
 powers off nodes and loses quorum while data-bearing apps run. It now drives
-all three job runtimes through the same faults, within the existing 90-minute
-fast and eight-hour final tiers.
+all three job runtimes through the same faults, within the existing fast and
+final tiers (90 minutes and eight hours then; an hour and eight hours now).
 
 The [extension plan](../plans/2026-10-10-plan-release-job-soak.md) describes a
 bounded controller with two resource profiles per runtime. It persists each
@@ -3085,10 +3115,33 @@ on its own recovery. The final verdict still fails on it, because
 the refused summary body under `jobs/refused/` beside the error, so the next
 refusal won't need inferring (#968).
 
+The first 12-hour jobs final to get that far ran out of runs. The controller
+admitted at most 256, a number picked when the longest tier was eight hours,
+and it prepares about 25 an hour. At 10.5 hours `prepare` raised "retained run
+budget exhausted", and because it raised out of the whole step, the
+controller never reached the polling below it. Every progress counter froze.
+An hour and a half later the drain asked to cancel runs it hadn't looked at
+since, and Bun answered 404: it had pruned them, as it does an hour after a
+run finishes (sooner when newer runs push it out). The drain retried those
+cancels until its deadline. The budget was bounding the wrong thing. It
+counted runs ever admitted, while the cost it guards against is runs held:
+the controller's state and the candidate's run store. Now a run counts from
+admission until an hour after the controller sees it drain, when the
+candidate would have pruned it anyway. A 12-hour run holds about 31 at its
+busiest, and `--plan` prints the expected count and that peak beside the
+limit, refusing a schedule that wouldn't fit. When the budget is full, the
+controller records it once and keeps polling, so the runs it has still drain
+and free their slots. A 404 is now a `Gone` error (a subclass of
+`InvalidEvidence`, so code that catches the parent still sees it), and the run
+leaves the campaign either way. Whether it drained is a separate question. If
+the controller's last look showed it drained, it did. Anything else, including
+a run last seen nearly finished, is an unknown outcome and fails the record.
+"Probably finished" is exactly the guess the soak exists to refuse (#989).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
-the hourly saturation measurements and #668's retained-storage and 12-hour work
-answer different questions. No extrapolated daily rate determines a soak pass.
+the hourly saturation measurements and #668's retained-storage work answer
+different questions. No extrapolated daily rate determines a soak pass.
 
 ### The exit gate: half a day of faults
 
@@ -3116,7 +3169,26 @@ a peer, a disk filled to its last 64 MiB, or Bun's own writes throttled to 20
 IOPS with a systemd property. And every run writes a `.jobs.json` beside its
 record with the accepted rates and the M8 measurements. `--plan` prints the
 schedule without touching a cluster, which is how the CI tests check that the
-90-minute fast tier puts every fault kind on every node.
+fast tier's first four cycles carry every fault kind and every special.
+
+Twelve hours didn't last past 0.2.0. Its release gate ran two final soaks back
+to back: the 8-hour V02 final, then the 12-hour job final, which is the same
+soak with the jobs and node faults added. The second checks everything the
+first does, so running both bought nothing but a day. For 0.2.1 the
+maintainer set one 8-hour slot for all the final soaks (17 October 2026,
+[#991](https://github.com/reliaburger/reliaburger/issues/991)): the job final
+runs 8 hours and replaces the V02 final in the gate, and
+`qualify-sustained.sh --tier final` stays for running the V02 soak alone. The
+fast tiers, which the fix-and-rerun loop runs again and again, went from 90
+minutes to one hour. That fits because the compressed schedule already put
+every fault kind and every special in its first four ten-minute cycles, which
+the harness always finishes however far the slots overrun. The node faults
+needed one change. They used to visit a node three cycles in a row (delay,
+disk, fsync on node 1, then the same on node 2), so in six cycles node 3 never
+got one. Now each round of three puts one kind on each node and the next round
+shifts them along by one, which reaches every node in the first three cycles
+and every kind on every node in nine. The 8-hour final's eight node faults
+cover eight of those nine pairs.
 
 Why node-level faults only? `relish fault kill` against a job is refused by the
 same replica rail that protects apps, and an array's attempts inside a shared
@@ -3362,6 +3434,101 @@ retry's backoff starts no further attempt, and a singleton without
 outcome there's nothing for an operator to decide. The portable suite runs the
 same through the API, Raft and the leader's chunk check:
 `a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once`.
+
+### Who the OOM killer takes
+
+Six hours into run 1 of 0.2.0's jobs final, node 1 ran out of memory and the
+kernel killed Bun. Three times. Bun wasn't the culprit: it sat at 150 to 380
+MiB. Lima's guest agent held a gigabyte and was leaking a socket for every
+forwarded connection
+([record](../qualification/2026-10-16-v0.2.0-release-closure.md)). So why did
+the kernel pick Bun?
+
+When memory runs out across the whole machine, the kernel's OOM killer scores
+every process and kills the highest. The score is roughly the process's share
+of memory in thousandths, plus its `oom_score_adj`, a number from -1000 to
+1000 in `/proc/<pid>/oom_score_adj`. The guest agent runs at -500. Bun ran at
+0 in 0.2.0, which made a 300 MiB Bun a better target than a 1 GiB guest agent.
+
+0.2.1's units already set `OOMScoreAdjust=-900` (#700). That's half the fix,
+and on its own it backfires quietly: a child inherits its parent's score, and
+everything on the node is Bun's child. runc, the process owner, the reusable
+executor's helper and every task it forks would all run at -900, as protected
+as Bun itself. Under pressure the kernel would go for sshd or journald first.
+
+So the other half is a positive score for workloads
+([#984](https://github.com/reliaburger/reliaburger/issues/984)). The OCI
+runtime spec already has the field, `process.oomScoreAdj`, and runc applies it
+before the container's first instruction. `OciProcess` gains it:
+
+```rust
+#[serde(
+    rename = "oomScoreAdj",
+    default,
+    skip_serializing_if = "Option::is_none"
+)]
+pub oom_score_adj: Option<i32>,
+```
+
+`rename` gives the JSON key the spec's camel case; `default` lets an older
+record without the key still load as `None`; `skip_serializing_if` leaves the
+key out when there's nothing to say, so Bun's internal runtime commands keep
+the score they inherit. Every generator that builds a workload's spec (apps,
+init containers and jobs, which also covers each executor's helper and the
+fresh-container tasks) sets it to one constant, `WORKLOAD_OOM_SCORE_ADJ`, at
++500. That's above anything the node itself runs, so the smallest workload
+goes before the guest agent, the daemons and Bun. A task is the cheapest thing
+on a node to lose: it retries.
+
+Host workloads have no runc to apply the field, so the process owner's
+execution gate does it, right after joining the workload's cgroup and before
+it `exec`s the user's command:
+
+```rust
+fn raise_oom_score(spec: &super::oci::OciSpec) -> io::Result<()> {
+    let Some(wanted) = spec.process.oom_score_adj else {
+        return Ok(());
+    };
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let path = Path::new("/proc/self/oom_score_adj");
+    let current: i32 = std::fs::read_to_string(path)?
+        .trim()
+        .parse()
+        .map_err(|error| io::Error::other(format!("unreadable oom_score_adj: {error}")))?;
+    if wanted <= current {
+        return Ok(());
+    }
+    std::fs::write(path, wanted.to_string())
+        .map_err(|error| io::Error::other(format!("cannot raise oom_score_adj: {error}")))
+}
+```
+
+`cfg!(target_os = "linux")` is the expression form of `#[cfg]`: the code
+still compiles on macOS, where there's no `/proc`, but the branch is a
+constant there and the function returns early. `.parse()` picks its target
+type from the annotation on `current`, here `i32`. The gate only raises the
+score. Lowering it needs `CAP_SYS_RESOURCE`, and a spec asking for a lower
+score is asking to be protected, which no workload should get. If the write
+fails, the gate refuses to run the command, the same as a cgroup it can't
+join.
+
+The dev cluster launches Bun with `nohup`, not a unit, so its shell writes -900
+to its own `oom_score_adj` first and Bun inherits it. The job benchmark passes
+`--property=OOMScoreAdjust=-900` to `systemd-run`.
+
+The tests come in three layers. `workloads_are_the_oom_killers_first_choice_before_bun`
+checks every spec generator carries the score, and
+`oom_score_is_written_as_the_oci_process_field` checks the JSON key runc reads.
+On Linux the portable suite runs a real owner: a workload that asks for a
+higher score than the test's reads it back from `/proc/self/oom_score_adj`,
+one without a score reads its parent's, and one that asks for -1000 doesn't
+get it. The first version asked for +500 and failed in CI, because GitHub's
+runner already starts every job process at 500. Nothing was raised, so the
+test couldn't tell a working gate from a missing one, and its guard caught
+that. Now it asks for halfway between its own score and the maximum. The unit
+test in `provision.rs` from #700 still pins the unit's -900.
 
 ## One budget, two schedulers
 
@@ -3732,7 +3899,7 @@ every accepted task used to leave ledger entries, output and executor metadata
 behind with nothing reclaiming them, which is what "Where the bytes went"
 fixed.
 
-What's left isn't code. The 12-hour job qualification on at least three nodes
+What's left isn't code. The job final on at least three nodes
 ([#668](https://github.com/reliaburger/reliaburger/issues/668)) runs against
 the release candidate, and until it passes, the hundred-million-a-day figure
 stays a target.

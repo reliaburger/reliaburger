@@ -3,8 +3,9 @@
 10 October 2026. V02 extension for the 0.2.0 machinery in #654 and its review
 fixes in #669. The controller and release gate are implemented; staged fast
 and final qualification are still required on the integrated candidate. The
-90-minute fast and eight-hour final tiers, fault schedule and acceptance
-durations are unchanged.
+fast and final tiers, fault schedule and acceptance durations are unchanged
+(since 17 October 2026 the fast tiers run an hour and the job final replaces
+the V02 final, #991; see [the tiers](#job-qualification-tiers-686-decision-d18-c)).
 
 ## Run jobs alongside the apps
 
@@ -183,7 +184,8 @@ a passing mixed-workload soak does not itself qualify sustained 100m/day.
 
 - `scripts/release/job_soak.py`: durable intents, bounded six-run campaign,
   independent authenticated effect ledger, targeted probes, fault markers and
-  bounded drain. At most 256 submissions, 32 unresolved named fixtures and 4096
+  bounded drain. At most 256 runs (active, or drained within the candidate's
+  hour of retention; #989), 32 unresolved named fixtures and 4096
   verifier effect identities are retained by the controller/verifier. The
   candidate's own storage lifetime is measured separately.
 - `scripts/release/job_soak_inventory.py`: complete bounded kernel scans and
@@ -207,7 +209,7 @@ smoke check with `sudo python3 scripts/release/job_soak_linux.py --bun
 /absolute/path/to/bun` on rootful Linux with runc, cgroup v2 and BusyBox.
 The normal staged fast/final runs still need an integrated candidate, including
 #669's correctness fixes. Do not treat a local smoke result as that evidence.
-The global retained-storage bound and 12-hour qualification remain #668.
+The global retained-storage bound remains #668.
 
 ## Job qualification tiers (#686, decision D18-C)
 
@@ -234,10 +236,14 @@ fixes them per tier:
   and CPU, executor-helper CPU, task-array storage per million accepted
   tasks, and retained logs.
 
-`--tier fast` is the compressed 90-minute schedule (nine node faults, each
-kind on each node once); `--tier final` is the full schedule for 12 hours
-(the maintainer's decision for 0.2.0, as a reasonable approximation of 24),
-the run #668 needs on the final candidate after #678, #679 and #680. `--plan`
+`--tier fast` is the compressed schedule for an hour (six node faults: the
+first three put one kind on each node, the next three move each kind to
+another node; every fault kind and every special lands in cycles 0-3, which
+always run). `--tier final` is the full schedule for 8 hours on the final
+candidate, the release gate's only final soak: it is the V02 final with the
+job campaign and a node fault per cycle added, so it replaces the separate
+V02 final (maintainer decision, 17 October 2026,
+[#991](https://github.com/reliaburger/reliaburger/issues/991)). `--plan`
 prints either schedule without touching a cluster, which the CI script tests
 use. Until #678 bounds job storage, a disk-full fault is expected to fail
 the run: the worker stops taking grants until it is restarted.

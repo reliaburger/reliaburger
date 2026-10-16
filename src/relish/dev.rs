@@ -16,15 +16,19 @@ use super::quickstart::runner::JOIN_SCRIPT;
 /// without it the agent ignores the `[cluster]` config and runs single-node.
 /// Launched via `sudo bash -c` so bun gets root (runc/netns) and can write the
 /// log file under `/var/log`.
-/// The command that launches a node's `bun` agent under the given runtime.
+/// The command that launches a node's `bun` agent under the given runtime,
+/// at the same OOM score (-900) as the systemd units we ship.
 ///
 /// `runc` is the default for a realistic cluster; `process` runs workloads as
 /// host processes, which is what the built-in `relish test` suite needs — its
 /// `testapp` workload is a `bun` subcommand, so a process-runtime node runs it
 /// straight from the installed binary with no image.
 fn agent_launch_cmd(runtime: &str) -> String {
+    // The shell lowers its own OOM score first and Bun inherits it, as the
+    // shipped units' `OOMScoreAdjust=-900` would (#984).
     format!(
-        "nohup bun --cluster --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117 \
+        "echo -900 > /proc/self/oom_score_adj && \
+         nohup bun --cluster --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117 \
          --runtime {runtime} > /var/log/bun.log 2>&1 &"
     )
 }
@@ -1449,6 +1453,21 @@ mod tests {
         let launch = agent_launch_cmd("runc");
         assert!(launch.contains("--cluster"));
         assert!(launch.contains("--config /etc/reliaburger/node.toml"));
+    }
+
+    #[test]
+    fn agent_launch_ranks_bun_below_workloads_for_the_oom_killer() {
+        // A dev node has no systemd unit, so the launch itself must lower
+        // Bun's score as the shipped units' `OOMScoreAdjust=-900` does,
+        // before Bun starts, so Bun and only Bun inherits it (#984).
+        let launch = agent_launch_cmd("runc");
+        let lowered = launch
+            .find("echo -900 > /proc/self/oom_score_adj")
+            .expect(&launch);
+        assert!(
+            lowered < launch.find("nohup bun").expect(&launch),
+            "{launch}"
+        );
     }
 
     #[test]

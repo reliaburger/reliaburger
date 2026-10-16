@@ -252,9 +252,12 @@ WantedBy=multi-user.target
 > and refuses to bind anything but a loopback address such as `127.0.0.1:9117`.
 > You'll mint that token next, then open the listener in §3.5.
 
-`OOMScoreAdjust=-900` tells the kernel to kill containers before Bun when the
+`OOMScoreAdjust=-900` tells the kernel to kill workloads before Bun when the
 machine runs out of memory: a killed Bun stops updating the discovery maps for
-every workload on the node. The `[dns]` section above sets no `upstream`, so
+every workload on the node, and on an API node it takes the API down too. Bun
+starts every workload, job and task at `oom_score_adj` +500, so they don't
+inherit Bun's -900, and the kernel's first choice is a workload, not the node
+agent. The `[dns]` section above sets no `upstream`, so
 containers resolve names outside `.internal` through the resolvers in this
 machine's `/etc/resolv.conf`, tried in order. If that file names no usable
 resolver, Bun refuses to start; set `upstream = "ADDRESS:53"` under `[dns]`.

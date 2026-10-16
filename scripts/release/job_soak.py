@@ -24,6 +24,7 @@ import re
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import threading
@@ -36,7 +37,19 @@ IMAGE = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d77
 HOST_EXEC = "/var/lib/reliaburger/soak-jobs/busybox"
 PURPOSES = ("audit", "failure", "timeout", "limit", "cancel")
 REQUIRED = (*PURPOSES, "reuse", "profiles", "unknown", "cron", "hook", "published-job", "drain")
-MAX_RUNS = 256
+# The most runs the campaign holds at once (#989). A run counts from its
+# admission until the candidate would have pruned it: TERMINAL_RETENTION_SECS
+# (src/meat/task_array_store.rs) after the controller saw it drained. That
+# bounds the controller's state and the candidate's run store however long
+# the soak lasts, so a 12-hour final can't run out the way a fixed count of
+# submissions did at 10.5 hours.
+RETAINED_RUNS = 256
+RETENTION_SECS = 3600
+# The 12-hour jobs final for 0.2.0 prepared about 25 runs an hour; plan for
+# twice that.
+PLANNED_RUNS_PER_HOUR = 50
+# One intent per runtime and profile.
+SLOTS = 6
 MAX_RESPONSE = 2 << 20
 # 100 million accepted successes a day is 1,157.4 a second (#668).
 TARGET_FLOOR = 1158
@@ -69,6 +82,26 @@ class InvalidEvidence(ValueError):
 
 class Unavailable(RuntimeError):
     pass
+
+
+class Gone(InvalidEvidence):
+    """The candidate answered 404: it doesn't have this run (any more)."""
+
+
+class BudgetExhausted(InvalidEvidence):
+    pass
+
+
+def run_budget(duration, runs_per_hour=PLANNED_RUNS_PER_HOUR, limit=None):
+    """Whether a soak of `duration` seconds fits the retained-run limit.
+
+    `expected_runs` is how many runs the campaign may prepare in all;
+    `peak_retained` is how many it may hold at once: every slot's active run
+    plus those finished within the candidate's retention window."""
+    limit = RETAINED_RUNS if limit is None else limit
+    expected = -(-duration * runs_per_hour // 3600)
+    peak = -(-min(duration, RETENTION_SECS) * runs_per_hour // 3600) + SLOTS
+    return dict(expected_runs=expected, peak_retained=peak, limit=limit, fits=peak <= limit)
 
 
 def atomic(path, value):
@@ -170,13 +203,24 @@ class API:
     def __init__(self, nodes, api_port, ca, header):
         self.nodes, self.api_port, self.ca, self.header = nodes, api_port, ca, header
         self.deadline = None
+        # Requests a node missed and the node that answered them instead
+        # (#987): a leak-rss on the node that took the load traces back here.
+        self.fallbacks = dict(missed={}, answered={})
+        self.fallback_lock = threading.Lock()
         self.identity = hashlib.sha256(Path(ca).read_bytes()+json.dumps(nodes,sort_keys=True).encode()+str(api_port).encode()).hexdigest()
+    def fell_back(self, missed, answered):
+        if not missed: return
+        with self.fallback_lock:
+            for name in missed: self.fallbacks["missed"][name] = self.fallbacks["missed"].get(name, 0) + 1
+            self.fallbacks["answered"][answered] = self.fallbacks["answered"].get(answered, 0) + 1
     def remaining(self, maximum):
         remaining = maximum if self.deadline is None else min(maximum, self.deadline-time.monotonic())
         if remaining <= 0: raise Unavailable("job drain request budget exhausted")
         return remaining
     def request(self, method, path, body=None, raw=False):
+        missed = []
         for index, node in enumerate(self.nodes):
+            if index: missed.append(self.nodes[index-1]["name"])
             timeout = self.remaining(7)
             with tempfile.TemporaryFile() as output:
                 command = ["curl", "--silent", "--show-error", "--write-out", "\n%{http_code}", "--max-time", str(min(5,timeout)),
@@ -197,6 +241,10 @@ class API:
                 output.seek(0)
                 payload, _, code = output.read().rpartition(b"\n")
                 if code in (b"408",b"409",b"429") or code.startswith(b"5"): continue
+                self.fell_back(missed, node["name"])
+                if code == b"404":
+                    # Reads and cancels forward to the leader, so a 404 is authoritative.
+                    raise Gone("candidate API refused "+method+" "+path+" (HTTP 404)")
                 if not code.startswith(b"2"):
                     raise InvalidEvidence("candidate API refused "+method+" "+path+" (HTTP "+code.decode("ascii",errors="replace")+")")
                 try: return payload.decode() if raw else json.loads(payload)
@@ -302,6 +350,8 @@ class Campaign:
                 raise InvalidEvidence("campaign configuration changed on resume")
             if self.state.get("stopped"): raise InvalidEvidence("cannot resume a drained job campaign")
             self.state["resume_grace_until"] = int(time.time())+180
+            if hasattr(api, "fallbacks") and self.state.get("api_fallbacks"):
+                api.fallbacks = json.loads(json.dumps(self.state["api_fallbacks"]))
         else:
             self.state = dict(schema=2, cluster=getattr(api,"identity","test"), verifier=hashlib.sha256(token.encode()).hexdigest(), campaign=uuid.uuid4().hex[:12], auditors=auditors,
                               sequence=0, active={}, coverage={m:{} for m in MODES},
@@ -327,13 +377,20 @@ class Campaign:
     def prepare(self, mode, profile, purpose, now):
         key = mode + ":" + profile
         if key in self.state["active"]: raise InvalidEvidence("profile already has a pending intent")
-        if self.state["sequence"] >= MAX_RUNS: raise InvalidEvidence("retained run budget exhausted")
+        if self.retained(now) >= RETAINED_RUNS:
+            raise BudgetExhausted(f"retained run budget exhausted ({RETAINED_RUNS} runs active or finished "
+                                  f"within the candidate's {RETENTION_SECS} s retention)")
         self.state["sequence"] += 1
         intent = dict(mode=mode, profile=profile, purpose=purpose, created=now,
                       name=f'soak-{self.state["campaign"]}-{self.state["sequence"]}',
                       request_id=f'{self.state["campaign"]}:{self.state["sequence"]}', id=None, previous=None)
         self.state["active"][key] = intent; self.save()
         return intent
+    def retained(self, now):
+        """Runs the campaign holds: active ones, and drained ones the candidate still keeps."""
+        finished = [ts for ts in self.state.setdefault("finished", []) if now - ts < RETENTION_SECS]
+        self.state["finished"] = finished
+        return len(self.state["active"]) + len(finished)
     def targeted(self, intent):
         """Whether this intent is a target-load throughput run."""
         return (self.state.get("load") == "target" and intent["mode"] in TARGET_CAPS
@@ -408,23 +465,37 @@ class Campaign:
         decisions[key]["accepted"]=True
         self.state["totals"]["operator_replay_decisions"]=sum(row["accepted"] for row in decisions.values())
         self.save()
+    def fallbacks(self):
+        """The API's fallback counts, kept in state so a resumed controller adds to them."""
+        counts = getattr(self.api, "fallbacks", None)
+        if counts is None: return self.state.get("api_fallbacks", dict(missed={}, answered={}))
+        with self.api.fallback_lock:
+            self.state["api_fallbacks"] = json.loads(json.dumps(counts))
+        return self.state["api_fallbacks"]
     def publish(self, now, fault=False):
         atomic(self.directory / "snapshot.json",dict(heartbeat=now,errors=self.state["errors"],
                active=list(self.state["active"].values()),progress=self.state["progress"],coverage=self.state["coverage"],
                totals=self.state["totals"],stopped=self.state["stopped"],fault_window=fault,
                load=self.state.get("load","calibration"),target_rate=self.state.get("target_rate"),
                started=self.state.get("started"),metrics=self.state.get("metrics",{}),
-               fresh_activity=self.state.get("fresh_activity",[]),discovered=self.state["discovered"],stop_requested_at=self.state.get("stop_requested_at"),last_fault=self.state.get("last_fault",0),resume_grace_until=self.state.get("resume_grace_until",0)))
+               fresh_activity=self.state.get("fresh_activity",[]),discovered=self.state["discovered"],
+               api_fallbacks=self.fallbacks(),stop_requested_at=self.state.get("stop_requested_at"),last_fault=self.state.get("last_fault",0),resume_grace_until=self.state.get("resume_grace_until",0)))
     def step(self, now, fault=False, stop=False):
         if fault: self.state["last_fault"]=now
         self.publish(now, fault)
         if not stop:
-            for mode in MODES:
-                for profile in ("short", "long"):
-                    if mode+":"+profile not in self.state["active"]:
-                        coverage = self.state["coverage"][mode]
-                        purpose = "work" if profile == "long" else next((p for p in PURPOSES if not coverage.get(p)), "work")
-                        self.prepare(mode, profile, purpose, now)
+            try:
+                for mode in MODES:
+                    for profile in ("short", "long"):
+                        if mode+":"+profile not in self.state["active"]:
+                            coverage = self.state["coverage"][mode]
+                            purpose = "work" if profile == "long" else next((p for p in PURPOSES if not coverage.get(p)), "work")
+                            self.prepare(mode, profile, purpose, now)
+            except BudgetExhausted as error:
+                # Keep polling the runs already admitted: they still drain and
+                # free their slots, and a run left unpolled for an hour is
+                # pruned before the drain can see it (#989).
+                self.error(str(error))
         intents = list(self.state["active"].values())
         if self.activity_reader is not None:
             try:
@@ -450,6 +521,20 @@ class Campaign:
             kind, value = answer
             try:
                 if kind == "error": raise InvalidEvidence(value)
+                if kind == "gone":
+                    # Pruned after it finished (an hour on, or sooner when
+                    # newer runs push it out) or lost: the candidate can't
+                    # tell us which. Polling it again can't either, so it
+                    # leaves the campaign. Only a drain the controller saw
+                    # counts; anything else is an unknown outcome (#989).
+                    last=intent["previous"]
+                    del self.state["active"][intent["mode"]+":"+intent["profile"]]
+                    if last is not None and drained(last) and stop:
+                        self.state["coverage"][intent["mode"]]["drain"]=True; self.save(); continue
+                    seen=("never observed" if last is None else
+                          f'last seen {last["succeeded"]}/{last["total"]} succeeded, '
+                          +("drained before its verdict was read" if drained(last) else "not drained"))
+                    raise InvalidEvidence(f"the candidate no longer has this run ({value}); {seen}, so its outcome is unknown")
                 if kind == "admit":
                     identity=number(value,"batch_id")
                     if not identity: raise InvalidEvidence("admission returned no positive identity")
@@ -524,6 +609,7 @@ class Campaign:
                     coverage["profiles"]=all(coverage.get("profile:"+p) for p in ("short","long"))
                 self.state["coverage"][intent["mode"]]["drain"]=True
                 del self.state["active"][intent["mode"]+":"+intent["profile"]]
+                self.state.setdefault("finished",[]).append(now)
                 self.save()
             except Unavailable: pass
             except (InvalidEvidence,KeyError,TypeError) as error:
@@ -573,6 +659,7 @@ class Campaign:
     def attempt(self, callback, intent):
         try: return callback(intent)
         except Unavailable: return None
+        except Gone as error: return ("gone", str(error))
         except (InvalidEvidence,KeyError,TypeError) as error:
             return ("error", str(error))
 
@@ -644,6 +731,7 @@ def report(snapshot):
         accepted_successes_per_second=rate,target_met=None if target is None else rate>=target,
         retries=retries,retry_causes=causes,
         audited_attempts=totals.get("audit_attempts",0),
+        api_fallbacks=snapshot.get("api_fallbacks") or dict(missed={},answered={}),
         operator_replay_decisions=totals.get("operator_replay_decisions",0),
         fault_markers=totals.get("fault_markers",0),errors=list(snapshot.get("errors",[])),
         m8=dict(
@@ -843,10 +931,21 @@ def main():
     activity.add_argument("--database",type=Path,required=True); activity.add_argument("--node",required=True)
     activity.add_argument("--root",type=Path,default=Path("/var/lib/reliaburger/data"))
     activity.add_argument("--run",action="append",default=[])
+    budget=commands.add_parser("budget",help="check a soak's length against the retained-run limit")
+    budget.add_argument("--duration",type=int,required=True,help="soak length in seconds")
+    budget.add_argument("--runs-per-hour",type=int,default=PLANNED_RUNS_PER_HOUR)
     marker=commands.add_parser("mark")
     marker.add_argument("directory",type=Path); marker.add_argument("target"); marker.add_argument("kind")
     options=parser.parse_args()
     if options.command=="run": return run(options)
+    if options.command=="budget":
+        plan=run_budget(options.duration,options.runs_per_hour)
+        print("job-runs expected %(expected_runs)d retained-peak %(peak_retained)d limit %(limit)d" % plan)
+        if not plan["fits"]:
+            print("job_soak: up to %(peak_retained)d runs held at once won't fit the retained-run limit %(limit)d" % plan,
+                  file=sys.stderr)
+            return 1
+        return 0
     if options.command=="serve": serve(options.database,options.token_file.read_text().strip(),options.address,options.port)
     elif options.command=="activity":
         import job_soak_inventory

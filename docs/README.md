@@ -1325,7 +1325,7 @@ it measures per-job overhead rather than real work; see the batch manual for
 prerequisites and resource profiles. `--compare OLD.json` checks a scenario
 against an earlier report of the same scenario and fails on a drop beyond
 `--tolerance` (10% by default). The 100-million-a-day claim itself needs the
-12-hour job qualification (`scripts/release/qualify-jobs-sustained.sh`).
+8-hour job final (`scripts/release/qualify-jobs-sustained.sh --tier final`).
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,
@@ -1504,6 +1504,15 @@ machines.
   while it runs, and the step after it prints the low-water marks and, when
   the step didn't pass, every process left running with its kernel stacks
   ([#800](https://github.com/reliaburger/reliaburger/issues/800)).
+- `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N
+  --record-dir DIR` is release gate step 5 in one command. It makes a clean
+  checkout of `SHA`, creates a disposable Lima VM from
+  `scripts/release/power-cut-vm.yaml` with only that checkout mounted
+  read-only and 6 GiB of swap, checks both from inside the guest, runs the
+  three storage fixtures and both reboot lanes below `N` times each, stops at
+  the first failure, writes the records and a rule-of-three summary
+  (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
+  refuses `reliaburger-test`, an existing VM and a dirty checkout.
 - `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
   host. It starts real OCI executions, force-stops the VM and checks recovery
   after the new kernel boot, including address retention until explicit

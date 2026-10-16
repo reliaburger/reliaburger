@@ -513,6 +513,33 @@ fn enter_workload_cgroup(spec: &super::oci::OciSpec) -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("cannot join workload cgroup: {error}")))
 }
 
+/// Raise the calling process's `oom_score_adj` to the one its spec asks for,
+/// before user code runs, so the workload outranks Bun for the kernel's
+/// OOM killer (#984). The gate inherits Bun's own score (-900 under the
+/// units we ship), so without this a host workload was as protected as Bun.
+///
+/// Only ever raises: a lower score than the inherited one would need
+/// privilege and would protect a workload, which no spec should do. runc
+/// applies the same field to container workloads itself. Linux only.
+fn raise_oom_score(spec: &super::oci::OciSpec) -> io::Result<()> {
+    let Some(wanted) = spec.process.oom_score_adj else {
+        return Ok(());
+    };
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let path = Path::new("/proc/self/oom_score_adj");
+    let current: i32 = std::fs::read_to_string(path)?
+        .trim()
+        .parse()
+        .map_err(|error| io::Error::other(format!("unreadable oom_score_adj: {error}")))?;
+    if wanted <= current {
+        return Ok(());
+    }
+    std::fs::write(path, wanted.to_string())
+        .map_err(|error| io::Error::other(format!("cannot raise oom_score_adj: {error}")))
+}
+
 /// Run the child's internal gate and replace it with the foreground command.
 ///
 /// EOF, malformed activation or a mismatched durable child identity refuses
@@ -551,7 +578,8 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
 }
 
 /// Wait for activation and check it against the durable record, joining the
-/// workload's cgroup. Returns the record whose command the gate runs.
+/// workload's cgroup and taking the workload's OOM score. Returns the record
+/// whose command the gate runs.
 fn activate_execution(directory: &Path) -> io::Result<OwnerRecord> {
     let mut activation = [0u8; 9];
     io::stdin()
@@ -567,6 +595,7 @@ fn activate_execution(directory: &Path) -> io::Result<OwnerRecord> {
         ));
     }
     enter_workload_cgroup(&record.launch.spec)?;
+    raise_oom_score(&record.launch.spec)?;
     Ok(record)
 }
 
@@ -912,6 +941,7 @@ mod tests {
                         cwd: "/".into(),
                         user: OciUser { uid: 0, gid: 0 },
                         capabilities: None,
+                        oom_score_adj: None,
                         overrides: None,
                     },
                     mounts: vec![],
