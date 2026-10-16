@@ -1873,7 +1873,16 @@ was the one killed. The soak now uses Lima's SSH forwarder, the quickstart
 will move to a fixed Lima (#983), and Bun should stop being the kernel's
 first choice when memory runs out (#984). A soak that only watched Bun's own
 memory would have called this a Bun leak. Asking the kernel what it killed,
-and what was holding the memory, settled it in a minute.
+and what was holding the memory, settled it in a minute, once someone thought
+to log in to the live VM and ask. The soak asks now (#985). Every heavy check
+and every failure bundle keeps each node's `/proc/meminfo`, its biggest
+processes by RSS, the guest agent's RSS and open files, and any OOM report
+from the kernel log, cut from "invoked oom-killer" to "Killed process" so the
+per-process table comes with it. The same triage found a quieter gap. Bun had
+restarted three times without a harness kill, but only the first became a
+failure: the checker bundles one failure per check and node every half hour,
+and the next two looked like repeats of it. A restart count that rises again
+is a new restart, so each rise is now a failure of its own.
 
 The SSH forwarder had a flaw of its own. It sets up each port with one
 `ssh -O forward`, and if that fails just after a boot, it logs the error and

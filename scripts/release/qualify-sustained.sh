@@ -70,6 +70,7 @@ repository=$(cd "$(dirname "$0")/../.." && pwd)
 checker=$repository/scripts/release/sustained_check.py
 job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
+guest_memory=$repository/scripts/release/sustained/guest-memory.sh
 jobs_pid=
 workloads_template=$repository/scripts/release/sustained/soak-workloads.toml
 podinfo=$repository/examples/kubernetes/podinfo.yaml
@@ -882,6 +883,11 @@ done
 GUEST
 }
 
+# Guest memory, the guest agent and kernel OOM reports (#985). Heavy checks
+# read the kernel messages since the last heavy check; failure bundles the
+# last half hour.
+memory_report() { gsh_in "$1" "$2" < "$guest_memory" 2>/dev/null; }
+
 split_report() {
     local directory=$1 name=$2
     awk -v directory="$directory" -v name="$name" '
@@ -962,6 +968,7 @@ collect() {
         if [ "$kind" = heavy ]; then
             api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
             guest_report | gsh_in "$node" 2>/dev/null | split_report "$directory" "${vm[node]}" || true
+            memory_report "$node" cursor > "$directory/memory-${vm[node]}.txt" || true
             rel_on "$node" exec soak-identity cat /run/reliaburger/identity/cert.pem 2>/dev/null \
                 | openssl x509 -noout -serial -enddate > "$directory/identity-${vm[node]}.txt" 2>/dev/null || true
         else
@@ -1008,6 +1015,7 @@ PY
         [ "${down[node]}" = 0 ] || continue
         gsh "$node" 'journalctl -u reliaburger --since "-15min" --no-pager' > "$directory/journal-${vm[node]}.txt" 2>&1 || true
         api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
+        memory_report "$node" recent > "$directory/memory-${vm[node]}.txt" || true
     done
     rel --output json status > "$directory/status.json" 2>&1 || true
     rel --output json wtf > "$directory/wtf.json" 2>&1 || true

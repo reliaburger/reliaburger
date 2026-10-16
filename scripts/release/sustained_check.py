@@ -457,7 +457,11 @@ def restart_findings(state, node, inventory, expectations, now):
         explained = min(observed, len(fresh))
         restarts["used"] += explained
         if observed > explained:
-            findings.append(finding("bun-restart", "fail", f"{observed - explained} systemd restart(s) of bun without a harness kill", node))
+            item = finding("bun-restart", "fail", f"{observed - explained} systemd restart(s) of bun without a harness kill "
+                           f"(NRestarts now {count})", node)
+            # Each rise is a new restart, not a repeat of the last one (#985).
+            item["repeat_key"] = f"{node}|{boot}|{count}"
+            findings.append(item)
     else:
         # A new boot starts systemd's counter again; nothing carries over.
         restarts["used"] = len(expectations)
@@ -907,7 +911,7 @@ def suppress_repeats(state, findings, now):
     reported = state.setdefault("reported", {})
     result = []
     for item in findings:
-        key = f"{item['check']}|{item['target'] or ''}"
+        key = f"{item['check']}|{item.get('repeat_key') or item['target'] or ''}"
         if item["severity"] == "fail":
             if now - reported.get(key, -REPEAT_WINDOW) < REPEAT_WINDOW:
                 item = dict(item, severity="repeat")

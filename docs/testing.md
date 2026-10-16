@@ -454,7 +454,11 @@ host-forward probes (#987) are tested against local servers and a fake
 `host-forward` failure with no settle timeouts, a forward that hangs up the
 way Lima's gRPC forwarder does is caught too, a node down inside its guest is
 left to the other checks, host-agent logs are kept before Lima truncates
-them, and the controller's per-node API fallbacks reach the record.
+them, and the controller's per-node API fallbacks reach the record. The
+guest memory report (#985) runs against stub `ps`, `systemctl` and
+`journalctl` and a fake `/proc`: it keeps meminfo, the top RSS, the guest
+agent's RSS and fds and only the OOM report from the kernel log, and each
+rise in unexplained Bun restarts is a failure of its own.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
 fixtures with:
