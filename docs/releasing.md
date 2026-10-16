@@ -575,7 +575,7 @@ the real `curl … | sh` install against it on every host we advertise.
 4. **Soak it (V02)** on Apple silicon, in two tiers
    ([plan](plans/2026-09-25-v02-sustained.md), D3). Build and sign the soak
    bun first (D2). After each round of fixes, run the fast tier: every fault
-   kind and every special on the compressed schedule, in about 90 minutes.
+   kind and every special on the compressed schedule, in about an hour.
 
    ```sh
    scripts/release/qualify-sustained.sh --tier fast \
@@ -583,15 +583,16 @@ the real `curl … | sh` install against it on every host we advertise.
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1
    ```
 
-   Once the fast tier is clean on the final candidate, run the final tier
-   once: 8 hours on the full schedule, which catches slow accumulation.
-
-   ```sh
-   scripts/release/qualify-sustained.sh --tier final \
-     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT \
-     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1 \
-     --record docs/qualification/DATE-sustained-v02.md
-   ```
+   The final tier is 8 hours on the full schedule, which catches slow
+   accumulation. The release gate runs it once, as the job final below
+   (`qualify-jobs-sustained.sh --tier final`): that's the same soak with the
+   job campaign and a node fault added to each cycle, so it checks
+   everything the V02 final does, plus the jobs. All the final soaks fit in
+   one 8-hour slot that way (maintainer decision, 17 October 2026,
+   [#991](https://github.com/reliaburger/reliaburger/issues/991)).
+   `qualify-sustained.sh --tier final` still runs the V02 final on its own,
+   for example to separate a job problem from a cluster one, but it isn't a
+   release step.
 
    The record's second paragraph states the verdict. A fast run can only say
    "fast tier: clean"; only a clean final-tier run, 8 hours on the full
@@ -614,17 +615,17 @@ the real `curl … | sh` install against it on every host we advertise.
    Drain begins inside the final two minutes; tier and recovery budgets stay
    unchanged. Missing support or incomplete coverage fails instead of skipping
    a mode. A local smoke check is not staged fast/final acceptance, and global
-   storage bounds and the 12-hour job qualification remain #668.
+   storage bounds remain #668.
 
    **The 0.2.0 job gate (decision D18-C).** A release that claims sustained
    job throughput also needs the job qualification: #668's list on at least
-   three nodes, which is 12 hours at 1,158 accepted successes a second or
-   more (the rate of 100 million a day) plus headroom, with concurrent apps,
-   several resource profiles, worker and leader loss, delayed messages and
-   disk faults. #668's list said 24 hours; for 0.2.0 the maintainer set the
-   final tier at 12 (12 October 2026), still on the 3-node quickstart cluster
-   with every fault and at the default 1,390 a second, as a reasonable
-   approximation. `qualify-jobs-sustained.sh` runs it through the same soak,
+   three nodes, at 1,158 accepted successes a second or more (the rate of
+   100 million a day) plus headroom, with concurrent apps, several resource
+   profiles, worker and leader loss, delayed messages and disk faults. The
+   final tier runs 8 hours on the 3-node quickstart cluster, with every fault
+   and at the default 1,390 a second, and it is the release gate's only final
+   soak ([#991](https://github.com/reliaburger/reliaburger/issues/991),
+   above). `qualify-jobs-sustained.sh` runs it through the same soak,
    with the job campaign at the target load and a node-level fault in every
    cycle (inter-node delay, a full disk, slow fsync). Faults stay node-level in
    0.2.0 (D19-B): nothing targets an individual job. While slow fsync caps a
@@ -644,11 +645,11 @@ the real `curl … | sh` install against it on every host we advertise.
    ([#983](https://github.com/reliaburger/reliaburger/issues/983)).
 
    ```sh
-   # About 90 minutes, compressed: every fault kind on every node.
+   # About an hour, compressed: every fault kind, every node, every special.
    scripts/release/qualify-jobs-sustained.sh --tier fast \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST
-   # 12 hours on the full schedule: the #668 run, on the final candidate.
+   # 8 hours on the full schedule, on the final candidate: the one final soak.
    scripts/release/qualify-jobs-sustained.sh --tier final \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
@@ -656,7 +657,12 @@ the real `curl … | sh` install against it on every host we advertise.
    ```
 
    `--target-rate` raises the rate above the default 1,390 a second (the
-   floor plus 20%); `--plan` prints the schedule without touching anything.
+   floor plus 20%); `--plan` prints the schedule without touching anything,
+   including the job controller's `job-runs` line: how many runs it expects,
+   the most it holds at once and its limit of 256. The controller holds a run
+   from admission until an hour after it drains (the candidate's retention),
+   and a soak whose load wouldn't fit refuses to start
+   ([#989](https://github.com/reliaburger/reliaburger/issues/989)).
    The record fails if any job runtime misses a fault kind, loses or
    double-counts an accepted outcome, or averages less than the target rate.
    Beside it, `DATE-job-qualification.jobs.json` holds the accepted rates,
@@ -676,7 +682,7 @@ the real `curl … | sh` install against it on every host we advertise.
    target counts only task-array writes. The gated memory checks are
    unchanged. Commit both files. Bounded job storage
    ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
-   pass before the 12-hour run: until it does, a full disk stops a worker
+   pass before the final run: until it does, a full disk stops a worker
    taking grants and fails the run.
 
    Before release, re-record the published throughput table on the candidate
@@ -711,10 +717,11 @@ the real `curl … | sh` install against it on every host we advertise.
    unlabelled tail, the instance on different nodes in the status snapshots
    either side). For 0.2.0 only, a node cut off from the host by Lima's SSH
    port forwarder was a third (gone with the forwarder, fixed by
-   [#983](https://github.com/reliaburger/reliaburger/issues/983)), and the
-   job controller running out of its 256-run budget in a 12-hour final is a
-   fourth (fixed by
-   [#989](https://github.com/reliaburger/reliaburger/issues/989)). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
+   [#983](https://github.com/reliaburger/reliaburger/issues/983)). The job
+   controller running out of its 256-run budget in 0.2.0's 12-hour job final
+   was a fourth for 0.2.0 only; it's fixed by
+   [#989](https://github.com/reliaburger/reliaburger/issues/989) and excuses
+   nothing after it. The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
@@ -805,7 +812,7 @@ on a hosted Linux runner. Once a candidate is staged:
 gh workflow run soak.yml --ref main \
   -f staging_tag=staging-v0.1.0-RUN_ID-ATTEMPT \
   -f qualified_digest=QUALIFIED_DIGEST \
-  -f duration=90m -f schedule=compressed
+  -f duration=60m -f schedule=compressed
 ```
 
 `staging_tag` also takes the staged base URL. The job runs on `ubuntu-24.04`
