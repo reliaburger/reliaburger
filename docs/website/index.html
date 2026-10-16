@@ -351,29 +351,30 @@
           would dominate the work. Choose host jobs for maximum speed with no isolation,
           using an explicit allowlisted binary. All three use built-in resource
           admission, durable ownership, retries and accepted outcomes.</p>
-        <!-- TODO(#688): these figures come from development build 006aca5f. Re-measure on
-             the 0.2.0 release candidate at promotion, with #668's qualification and #640. -->
         <div class="throughput-comparison" role="region" aria-label="Measured job runtimes" tabindex="0">
-        <table><caption>Four scenarios, 60 seconds each. Same VM, BusyBox command
-          and concurrency cap of 27. Daily figures are extrapolated.</caption>
+        <table><caption>Released v0.2.0: the median of five rounds of the four
+          scenarios, 60 seconds each. Same VM, BusyBox command and concurrency cap of 27.
+          Daily figures are extrapolated.</caption>
           <thead><tr><th scope="col">Execution</th><th scope="col">Best for</th><th scope="col">Completed in 60 seconds</th><th scope="col">Rate</th><th scope="col">Extrapolated runs/day</th><th scope="col">Retries</th></tr></thead>
-          <tbody><tr><th scope="row">VM baseline</th><td>Raw-process reference on this VM</td><td>993,718 raw exits</td><td>16,562.0/s</td><td>1.4B</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>Fully isolated, independent jobs</td><td>213 accepted jobs</td><td>3.55/s</td><td>306.7k</td><td>0</td></tr><tr><th scope="row">Shared containers</th><td>Repeatable tasks; amortised container startup</td><td>58,000 accepted jobs</td><td>966.7/s</td><td>83.5M</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>Maximum speed for trusted commands; no isolation</td><td>294,000 accepted jobs</td><td>4,900.0/s</td><td>423.4M</td><td>0</td></tr></tbody>
+          <tbody><tr><th scope="row">VM baseline</th><td>Raw-process reference on this VM</td><td>929,510 raw exits</td><td>15,491.8/s</td><td>1.3B</td><td>Not applicable</td></tr><tr><th scope="row">Fresh containers</th><td>Fully isolated, independent jobs</td><td>762 accepted jobs</td><td>12.7/s</td><td>1.1M</td><td>1 in five rounds</td></tr><tr><th scope="row">Shared containers</th><td>Repeatable tasks; amortised container startup</td><td>175,000 accepted jobs</td><td>2,916.7/s</td><td>252.0M</td><td>0</td></tr><tr><th scope="row">Host jobs</th><td>Maximum speed for trusted commands; no isolation</td><td>280,000 accepted jobs</td><td>4,666.7/s</td><td>403.2M</td><td>0</td></tr></tbody>
         </table></div>
         <p>Testing rig: a local Lima VM on an Apple M2 Max host (12 physical cores,
           32 GiB host RAM), with 4 vCPU and 8 GiB allocated to Ubuntu 24.04 aarch64,
           Linux 6.8 and runc 1.4. These figures measure the per-job overhead of BusyBox
           <code>true</code>, a command that does no work; benchmark your real commands
-          on your own hardware when sizing a cluster. A five-round rerun on an older
-          M1 Max laptop measured raw and host-job rates 14–23% lower and the container
-          paths 1.7 to 3 times higher; with 13 ms of real work per task, host jobs
-          reached three quarters of the raw rate.</p>
+          on your own hardware when sizing a cluster. Single windows vary: across the
+          five rounds, raw and host-job rates varied by about a quarter and the
+          container paths by up to 15%. With 13 ms of real work per task, host jobs
+          reached three quarters of the raw rate in an earlier rerun.</p>
         <p>The VM baseline is a raw-process reference for this VM and command, not a
           ceiling. It counts successful exits without resource enforcement,
           durable ownership or task ledgers. Public rows count unique accepted successes
           received within the window; their rate gap includes those guarantees.
           Runs/day multiplies the minute count by 1,440; it isn't an observed daily total.</p>
-        <p>Optimised 0.2.0 development binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
-              aarch64. Pinned BusyBox commands, warm images and cold executors.
+        <p>The published v0.2.0 binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
+              aarch64, beside a 500m BusyBox web app. Pinned BusyBox commands, warm
+              images and cold executors. The recording above is an earlier
+              development build's single run.
               All public paths request 25m CPU / 32 MiB and enforce a one-core limit;
               native/shared helpers reserve another 10m / 8 MiB. One active submission
               caps each public mode at 27. Fresh containers use one-job receipt chunks;
@@ -381,11 +382,13 @@
               controls reporting, not resource admission. Counts conservatively exclude
               results after the last sample. Preparation, cancellation and verified
               cleanup remain visible outside the 60-second windows. All windows have
-              zero failures or retries. Real pauses are preserved; chapter jumps and
-              playback speed change only your view.</p>
+              zero failures; one fresh-container window accepted one retry. In the
+              recording, real pauses are preserved; chapter jumps and playback speed
+              change only your view.</p>
 
-        <p><a href="./assets/job-throughput-report.json">Measured report</a> ·
-          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-timed-job-scenarios">Raw results and reproduction</a> ·
+        <p><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-17-v0.2.0-job-throughput">v0.2.0 measurements</a> ·
+          <a href="./assets/job-throughput-report.json">Recording's report</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-timed-job-scenarios">The recording's raw results</a> ·
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
         <p>Use indexed work for data preparation, offline evaluation and independent
           inference commands. Fresh containers keep dependencies and jobs separate;
