@@ -720,27 +720,38 @@ the real `curl … | sh` install against it on every host we advertise.
 5. **Pull the plug.** Killing a process isn't a power cut: page-cache writes
    survive one and not the other. Run the power-cut and reboot qualifications
    ([what they prove](testing.md#pulling-the-plug)) on the candidate's commit,
-   against a disposable Lima VM. Never use the development VM; the drivers
-   refuse `reliaburger-test` by name. Create it from that VM's template with
-   4 vCPUs, 6 GiB of memory, 6 GiB of swap (so the linker isn't killed) and
-   only the checkout mounted, read-only. Then, from that checkout:
+   from the host:
 
    ```sh
-   for fixture in exporter leases backups; do
-     scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_VM \
-       --fixture "$fixture" --iterations 10 --record "power-cut-$fixture.md"
-   done
-   for i in $(seq 10); do scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_VM; done
-   for i in $(seq 10); do scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_VM; done
+   scripts/release/qualify-power-cut-reboot.sh --commit CANDIDATE_SHA --iterations 10 \
+     --record-dir docs/qualification/DATE-power-cut-reboot
    ```
+
+   Run it from an up-to-date checkout; the lanes themselves run from the
+   candidate's. It makes a clean detached checkout of the commit, creates a disposable
+   Lima VM `rb-pcut-<short sha>` from
+   [`power-cut-vm.yaml`](../scripts/release/power-cut-vm.yaml) (4 vCPUs,
+   6 GiB of memory, 6 GiB of swap so the linker isn't killed, and only that
+   checkout mounted, read-only), and checks all of that from inside the guest
+   before any lane runs. Then it runs the three storage fixtures
+   (`qualify-storage-power-cut.sh --fixture exporter|leases|backups`) and
+   the OCI and discovery reboot lanes (`qualify-oci-reboot.sh`,
+   `qualify-discovery-reboot.sh`) `N` times each, in that order, and stops at
+   the first failure. It writes each lane's record into the record directory
+   and a summary with each lane's runs and rule-of-three bound next to it, in
+   `docs/qualification/DATE-power-cut-reboot.md`, the shape of the
+   [16 October record](qualification/2026-10-16-power-cut-reboot.md). Fill in
+   anything the summary can't know (other load on the host, why this many
+   runs) before committing it. Afterwards it deletes the VM and the checkout;
+   `--keep` keeps both, and so does a failure, so the guest evidence survives.
+   It never touches the development VM: it refuses `--vm reliaburger-test`,
+   a VM that already exists and a dirty or wrong-commit `--worktree`. Ten
+   runs per lane take about half an hour on an M-series Mac, plus the first
+   boot's provisioning.
 
    Every iteration must pass. A row marked `PASS (VM start retried)` is the
    known Lima start failure straight after a forced stop, not a product
-   failure; any other failure is a release blocker. Record the commit, the
-   VM, each lane's runs and its rule-of-three bound in
-   `docs/qualification/DATE-power-cut-reboot.md`, as the
-   [11 October record](qualification/2026-10-11-power-cut-reboot.md) does.
-   Ten clean runs only rule out failure rates above 30%, so this catches a
+   failure; any other failure is a release blocker. Ten clean runs only rule out failure rates above 30%, so this catches a
    regression, not a rare race; a release that changes storage, locking or
    ownership (as #613 did) runs 25.
 

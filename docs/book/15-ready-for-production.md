@@ -5934,6 +5934,22 @@ programme. Nothing had broken, as it turned out: the [rerun](../qualification/20
 passed 25 power cuts per lane. But a check that only runs when someone remembers
 it isn't a gate. Now it's a numbered step of the release runbook.
 
+A numbered step done by hand is still easy to get subtly wrong, though. For
+0.2.0 it meant a hand-written VM template, a hand-made checkout of the
+candidate and a scratch loop, and any of those could quietly undermine the
+result: a writable mount lets a build change what's under test, a checkout at
+the wrong commit tests the wrong code, and a VM without swap loses the linker
+to the OOM killer before a single power cut. So
+`scripts/release/qualify-power-cut-reboot.sh` does the whole step. It makes a
+clean detached checkout of the candidate, creates a VM from a checked-in
+template, `power-cut-vm.yaml`, with that checkout as its only mount, and
+then distrusts its own work: before any lane it asks the guest how much swap
+it has, whether it can write to the checkout and what else is mounted. What
+Lima was asked for isn't proof of what the guest got. Then it runs the five
+lanes in order, stops at the first failure, writes the record and deletes the
+VM. Its tests run it against a fake `limactl` that logs every call, and one
+of them checks that the development VM's name never appears in that log.
+
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
 that. The snapshot uploader still needs its own fixture: it needs Btrfs
