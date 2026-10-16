@@ -40,6 +40,7 @@ import sys
 import time
 import job_soak
 import job_soak_inventory
+import soak_charts
 
 # Thresholds from section 4 of the plan (seconds unless stated).
 NODE_CERT_MARGIN = 300
@@ -1375,6 +1376,8 @@ def render(evidence, record):
         for measure, entry in sorted(trend.items()):
             lines.append(f"| {node} | {measure} | {entry['first']} | {entry.get('last', entry['first'])} | {entry['max']} |")
     lines.append("")
+    charts_directory = record.parent / f"{record.stem}-charts"
+    lines += soak_charts.section(soak_charts.write_charts(evidence, charts_directory), charts_directory.name)
     lines += ["## Failures", ""]
     if failures:
         lines += ["| # | First seen | Check | Symptom | Class | Cause | Action |", "|---|---|---|---|---|---|---|"]
@@ -1537,6 +1540,9 @@ def main(argv=None):
     record = commands.add_parser("render")
     record.add_argument("evidence")
     record.add_argument("record")
+    charts = commands.add_parser("render-charts", help="rebuild a record's charts from an existing evidence directory")
+    charts.add_argument("evidence")
+    charts.add_argument("directory")
     args = parser.parse_args(argv)
 
     if args.command == "event":
@@ -1617,6 +1623,11 @@ def main(argv=None):
         return 0
     if args.command == "registry":
         return registry_command(args)
+    if args.command == "render-charts":
+        directory = Path(args.directory)
+        written = soak_charts.write_charts(args.evidence, directory)
+        print("\n".join(soak_charts.section(written, directory.name)))
+        return 0
     return render(args.evidence, args.record)
 
 
