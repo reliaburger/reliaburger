@@ -1036,10 +1036,7 @@ fn the_release_testing_section_shows_the_installed_release() {
         newest.starts_with(&format!("## {}:", installed.trim_start_matches('v'))),
         "the release log's newest entry is {newest:?}, not {installed}"
     );
-    for link in [
-        "docs/release-log.md",
-        "docs/testing.md#before-a-release",
-    ] {
+    for link in ["docs/release-log.md", "docs/testing.md#before-a-release"] {
         assert!(
             section.contains(link),
             "the release-testing section doesn't link {link}"
