@@ -10,8 +10,9 @@ paragraph goes at the top when a release is promoted
 
 ## 0.2.0: A million jobs
 
-TODO(records): promoted on DATE, promote run RUN_ID, tag `v0.2.0` at `cc5f6439`.
-Qualification ran from 12 to 17 October 2026 and took eight
+Promoted on 16 October 2026 as tag `v0.2.0` at `cc5f6439`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/38944559201)).
+Qualification ran from 12 to 16 October 2026 (UTC) and took eight
 candidates ([closure record](qualification/2026-10-16-v0.2.0-release-closure.md)).
 All eight installed cleanly; the soaks, now carrying a job campaign alongside
 the apps, failed the first seven. Candidates 1 and 2 never got past setup:

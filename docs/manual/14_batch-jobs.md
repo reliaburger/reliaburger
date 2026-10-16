@@ -1037,7 +1037,7 @@ summaries now count retries by cause. The [full hourly
 record](../qualification/2026-10-09-timed-job-scenarios/README.md#hourly-sequence)
 includes resource samples, latency, cleanup proofs and these diagnostic limits.
 These completed hours establish saturation observations; global metadata bounds,
-fault qualification and a real daily run remain in #668.
+the 12-hour fault qualification is [its own record](../qualification/2026-10-17-v0.2.0-job-qualification.md).
 
 ### Previous continuous one-hour native host run
 

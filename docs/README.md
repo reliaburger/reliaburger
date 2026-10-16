@@ -5,7 +5,7 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.0 was released on RELEASE_DATE_0_2_0. Its signed binaries, guest images and
+0.2.0 was released on 16 October 2026. Its signed binaries, guest images and
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0),
 and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
@@ -1523,5 +1523,6 @@ refuse limits.
 The landing page's job recording uses the built-in `relish bench` scenarios.
 The [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md)
 record what each kind of job costs for 60 seconds on a small VM, with the rig
-and its limits. The sustained target of 100 million jobs a day isn't qualified
-yet (#668), and resident model workers (#641) are a separate, later feature.
+and its limits. The 12-hour job qualification on three nodes, at 4,600
+accepted jobs a second, is [its own record](qualification/2026-10-17-v0.2.0-job-qualification.md) (#668), and resident
+model workers (#641) are a separate, later feature.

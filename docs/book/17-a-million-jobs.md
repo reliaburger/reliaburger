@@ -3149,10 +3149,14 @@ every accepted task used to leave ledger entries, output and executor metadata
 behind with nothing reclaiming them, which is what "Where the bytes went"
 fixed.
 
-What's left isn't code. The 12-hour job qualification on at least three nodes
-([#668](https://github.com/reliaburger/reliaburger/issues/668)) runs against
-the release candidate, and until it passes, the hundred-million-a-day figure
-stays a target.
+What was left wasn't code. The 12-hour job qualification on three nodes
+([#668](https://github.com/reliaburger/reliaburger/issues/668)) ran against
+the eighth release candidate and accepted 4,600 jobs a second, four times the
+hundred-million-a-day rate, through every fault
+([record](../qualification/2026-10-17-v0.2.0-job-qualification.md)). It took two runs: the first found a socket leak in
+the VM manager's port forwarder that let the kernel kill Bun, and the second's
+failures were all the harness's own
+([release log](../release-log.md#020-a-million-jobs)).
 
 ## Lessons
 

@@ -101,7 +101,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 |--------|-------|----------|
 | Maximum nodes per cluster | 10,000 | Target (unmeasured). Only simulated gossip membership has run at this size (`tests/gossip_10k.rs`); every node still reports to the leader directly (§8.1) |
 | Maximum apps per node | 500 | Target (unmeasured) |
-| Job scheduling throughput | 100,000,000 jobs per day (~1,160 per second sustained) | Target (unqualified). Per-job overhead of each runtime on one small VM: [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md); the sustained gate is [#668](https://github.com/reliaburger/reliaburger/issues/668) |
+| Job scheduling throughput | 100,000,000 jobs per day (~1,160 per second sustained) | Met on a three-VM laptop cluster: 12 hours with apps and faults at 4,600 accepted a second ([record](qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)). Per-job overhead of each runtime on one small VM: [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md) |
 | Leader election time | < 5 seconds | Target (unmeasured) |
 | Time to full operability after leader loss | < 20 seconds (5s election + 15s learning period) | Target (unmeasured) |
 | State reconstruction time (cold start, full cluster) | < 30 seconds | Target (unmeasured) |
@@ -1207,7 +1207,7 @@ headroom or bounded historical metadata. One-hour soaks of each path then ran
 sequentially beside the same application, with no terminal failures and every
 application probe answered. Disk use grew materially during them and the
 capped storage scans were incomplete, so they are saturation observations, not
-a daily qualification; that remains in #668.
+a daily qualification; the 12-hour qualification is [its own record](qualification/2026-10-17-v0.2.0-job-qualification.md).
 
 
 ### AI workloads: resident models and coordinated training

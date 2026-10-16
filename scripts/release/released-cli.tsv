@@ -1,9 +1,15 @@
-# What relish v0.1.6 accepts, read from its -h pages by
+# What relish v0.2.0 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.1.6
+version	v0.2.0
 argument	relish apply	[PATH_OR_URL]
-argument	relish batch	<PATH>
+argument	relish batch	[PATH]
+argument	relish batch cancel	<ID>
+argument	relish batch logs	<ID>
+argument	relish batch replay	<ID>
+argument	relish batch results	<ID>
+argument	relish batch submit	<PATH>
+argument	relish batch watch	<ID>
 argument	relish batch-status	<ID>
 argument	relish build	<PATH>
 argument	relish ca verify	<FILE>
@@ -65,6 +71,7 @@ argument	relish metrics	<APP>
 argument	relish path	<SOURCE>
 argument	relish resolve	<NAME>
 argument	relish rollback	<APP>
+argument	relish run	[ARGS]...
 argument	relish secret encrypt	<VALUE>
 argument	relish secret pubkey	[DIR]
 argument	relish sign	<IMAGE>
@@ -83,7 +90,14 @@ argument	relish upgrade rollback	[VERSION]
 argument	relish upgrade start	[VERSION]
 command	relish
 command	relish apply
+command	relish audit
 command	relish batch
+command	relish batch cancel
+command	relish batch logs
+command	relish batch replay
+command	relish batch results
+command	relish batch submit
+command	relish batch watch
 command	relish batch-status
 command	relish bench
 command	relish build
@@ -142,6 +156,7 @@ command	relish images
 command	relish import
 command	relish init
 command	relish inspect
+command	relish jobs
 command	relish join
 command	relish join-token
 command	relish join-token create
@@ -158,6 +173,7 @@ command	relish path
 command	relish resolve
 command	relish rollback
 command	relish routes
+command	relish run
 command	relish secret
 command	relish secret encrypt
 command	relish secret pubkey
@@ -198,12 +214,40 @@ option	relish	--token	<TOKEN>
 option	relish apply	--dry-run		
 option	relish apply	--rerun-jobs		
 option	relish apply	-f,--file	<PATH_OR_URL>	
+option	relish audit	--action	<ACTION>	
+option	relish audit	--cluster		
+option	relish audit	--limit	<LIMIT>	
+option	relish audit	--namespace	<NAMESPACE>	
+option	relish audit	--principal	<PRINCIPAL>	
+option	relish audit	--since	<SINCE>	
+option	relish audit	--until	<UNTIL>	
+option	relish batch	--idempotency-key	<KEY>	
+option	relish batch logs	--index	<INDEX>	
+option	relish batch replay	--acknowledge-side-effects		
+option	relish batch replay	--grant-digest	<GRANT_DIGEST>	
+option	relish batch replay	--node	<NODE>	
+option	relish batch results	--after	<AFTER>	
+option	relish batch results	--failed		
+option	relish batch results	--index	<INDEX>	
+option	relish batch results	--limit	<LIMIT>	
+option	relish batch submit	--dry-run		
+option	relish batch submit	--idempotency-key	<KEY>	
+option	relish batch watch	--timeout	<TIMEOUT>	
 option	relish batch-status	--timeout	<TIMEOUT>	
 option	relish batch-status	--wait		
 option	relish bench	--capacity		
 option	relish bench	--compare	<COMPARE>	
+option	relish bench	--concurrency	<CONCURRENCY>	
+option	relish bench	--cpu-request	<CPU_REQUEST>	
 option	relish bench	--disruptive		
+option	relish bench	--exec	<EXEC>	
+option	relish bench	--image	<IMAGE>	
+option	relish bench	--namespace	<NAMESPACE>	
 option	relish bench	--quick		
+option	relish bench	--report	<REPORT>	
+option	relish bench	--scenario	<SCENARIO>	jobs-containers,jobs-shared-containers,jobs-host-processes,jobs-vm-baseline
+option	relish bench	--seconds	<SECONDS>	
+option	relish bench	--tolerance	<TOLERANCE>	
 option	relish bench	--yes		
 option	relish build	--registry-port	<REGISTRY_PORT>	
 option	relish build	--timeout	<TIMEOUT>	
@@ -391,6 +435,7 @@ option	relish import	-f,--file	<FILES>
 option	relish init	--cluster-name	<CLUSTER_NAME>	
 option	relish init	--development-plaintext		
 option	relish init	--node-id	<NODE_ID>	
+option	relish jobs	--definitions		
 option	relish join	--ca-fingerprint	<CA_FINGERPRINT>	
 option	relish join	--identity-dir	<IDENTITY_DIR>	
 option	relish join	--node-id	<NODE_ID>	
@@ -433,6 +478,22 @@ option	relish path	--port	<PORT>
 option	relish path	--to	<TO>	
 option	relish path	--to-namespace	<TO_NAMESPACE>	
 option	relish rollback	--namespace	<NAMESPACE>	
+option	relish run	--batch	<NAME>	
+option	relish run	--chunk	<CHUNK>	
+option	relish run	--concurrency	<CONCURRENCY>	
+option	relish run	--count	<COUNT>	
+option	relish run	--cpu	<CPU>	
+option	relish run	--env	<KEY=VALUE>	
+option	relish run	--exec	<EXEC>	
+option	relish run	--idempotency-key	<KEY>	
+option	relish run	--image	<IMAGE>	
+option	relish run	--max-attempts	<MAX_ATTEMPTS>	
+option	relish run	--max-failed	<MAX_FAILED>	
+option	relish run	--memory	<MEMORY>	
+option	relish run	--runtime	<RUNTIME>	runc,process,shared-runc
+option	relish run	--schedule	<SCHEDULE>	
+option	relish run	--timeout	<TIMEOUT>	
+option	relish run	-n,--namespace	<NAMESPACE>	
 option	relish secret encrypt	--pubkey	<PUBKEY>	
 option	relish secret pubkey	--namespace	<NAMESPACE>	
 option	relish secret rotate	--finalize		
@@ -498,6 +559,7 @@ option	relish upgrade plan	--parallel	<PARALLEL>
 option	relish upgrade rollback	--node-address	<NODE_ADDRESSES>	
 option	relish upgrade start	--allow-downgrade		
 option	relish upgrade start	--binary	<BINARY>	
+option	relish upgrade start	--external-key	<EXTERNAL_KEY>	
 option	relish upgrade start	--node-address	<NODE_ADDRESSES>	
 option	relish upgrade start	--parallel	<PARALLEL>	
 option	relish upgrade start	--registry	<REGISTRY>	
