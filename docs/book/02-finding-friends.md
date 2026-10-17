@@ -224,7 +224,7 @@ One subtlety: when we receive a gossip update about a node we've never seen, we 
 
 ### Piggyback dissemination
 
-SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, and each update is broadcast `ceil(log2(cluster_size))` times before it expires.
+SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, or fewer when they don't fit in the datagram (we'll get to that budget shortly), and each update is broadcast `ceil(log2(cluster_size))` times before it expires.
 
 Why `ceil(log2(N))`? Because SWIM's mathematical properties guarantee that an update will reach every node within O(log N) protocol periods with high probability. For a 10,000-node cluster, that's about 14 broadcasts per update — spread across 500ms protocol intervals, that's 7 seconds for full convergence. Not bad.
 
@@ -243,6 +243,23 @@ impl NodeState {
 ```
 
 Dead and suspect updates jump the queue. If the queue is full and we have to choose between telling people about a new join and telling them about a failure, the failure wins. Failure detection is time-sensitive; join announcements can wait.
+
+There's one update that has to beat even a failure, and the first version got it wrong. When peers suspect *us*, we refute with "I'm alive at a higher incarnation", which is an `Alive`, priority 1. Picture a rack failure: forty Dead and Suspect rumours in the queue, eight going out per message, and somewhere behind them a healthy node's refutation. It waits five messages while its suspicion timer runs, and if the timer wins, a node that was never down gets declared dead and then has to fight its way back. So the queue now has a separate lane: `enqueue_refutation` marks the update, and the ordering puts the refutation flag before everything else:
+
+```rust
+impl Ord for QueuedUpdate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.refutation
+            .cmp(&other.refutation)
+            .then_with(|| /* state priority */)
+            .then_with(|| /* remaining broadcasts */)
+    }
+}
+```
+
+`bool` implements `Ord` with `false < true`, and `BinaryHeap` pops the *largest* element, so `true` comes out first. `then_with` only runs its closure when the comparison so far is `Equal`, which is how you chain tie-breakers without nested `if`s.
+
+The other half is superseding. The queue used to happily send `n1 Suspect@5` after it already held `n1 Alive@6`: both went out, the stale one first because Suspect outranks Alive, and every receiver discarded it after spending datagram space on it. Now the queue keeps the best-ranked update it holds for each node (incarnation first, then state, the same order `resolve_conflict` uses) in a `HashMap`. An update that ranks below what's held is never queued, and an older entry that's still in the heap is thrown away when it's popped rather than sent. Why not remove it from the heap straight away? Because a binary heap can't find an element without scanning all of it, and on a 10,000-member cluster's first dissemination that's 10,000 scans of 10,000 entries. Marking stale and skipping later costs one hash lookup.
 
 ### The queue that had no ceiling, and the ceiling that was wrong
 
@@ -466,7 +483,54 @@ fn refute(&mut self) {
 }
 ```
 
-Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. The refutation update jumps onto the very next outgoing ACK message, so it propagates quickly.
+Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_refutation`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
+
+### Three holes in the probe cycle
+
+An audit of the gossip layer in 0.2.1 found three ways a healthy node could still be declared dead, all under exactly the conditions where a cluster is already busy.
+
+**Datagrams that were too big.** The transport refuses anything over 1,400 bytes, and every caller threw that error away with `let _ =`. Was anything ever that big? Do the arithmetic. A PING carries a header (sender name, incarnation, HMAC), eight piggybacked updates chosen *by count*, and since Phase 12 the sender's directory extension: its endpoints, the leader hint, a recovery claim and up to 512 bytes of labels. With 63-byte node names (the longest a DNS label can be), IPv6 addresses and a full label set, the extension alone is about 1,100 bytes and eight updates are another 840. The node's ACKs would be refused, silently, the moment its queue held enough updates; its peers would suspect it during exactly the churn that filled the queue. No test caught it, because the only worst-case size test was for `Sync`, which carries no extension.
+
+The fix is to choose updates by bytes, not by count. A probe is now built in order: header, then the extension, then updates until the next one doesn't fit:
+
+```rust
+let mut message = GossipMessage::new(self.node_id.clone(), self.incarnation, payload);
+let room = match self.local_extension() {
+    // Left off if it alone can't fit; returns the bytes still free.
+    Some(extension) => message.attach_extension(extension),
+    None => message.piggyback_room(), // 1,400 minus what's encoded so far
+};
+let updates = self.dissemination.select_updates_within(room, MAX_PIGGYBACK_UPDATES);
+*message.payload.updates_mut() = updates;
+```
+
+(The real `probe_message` also puts our claim about the peer first, as we'll see in "Coming back after maintenance".) `piggyback_room` measures the message with `bincode::serialized_size` rather than adding up constants, so when a later release adds a field to the header or the extension, the budget shrinks by itself. An update that doesn't fit stays queued with its broadcast count untouched; selection stops there rather than skipping ahead, so priority order holds across messages. In the very worst case a PING still carries one update and a PING-REQ may carry none. That's fine: anti-entropy sends no extension and makes up the difference. And a send that does fail is now counted and logged, at most once every ten seconds with a count of what it held back, so a node that can't get its datagrams out says so.
+
+**Replays.** Gossip has been HMAC-signed since Phase 4, but authentication stops forgery, not replay. "Coming back after maintenance" below deals with one replay, a stale `Left`. The audit found two more: `add_node` moved a known member to the UDP source address of *any* validly signed datagram from it, and directory fields were last-write-wins. So an attacker on the LAN could capture one of n2's PINGs and replay it from its own IP: everyone records n2 at the attacker's address, probes go there, and n2 is declared dead. Replay an old extension instead and n2's recovery epoch rolls back.
+
+The fix is a sequence number inside the HMAC. Every `GossipMessage::new` takes the next value of a process-wide counter, every receiver remembers the highest sequence it has accepted from each sender, and anything at or below that is dropped before a single field is applied:
+
+```rust
+static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
+
+fn next_sequence() -> u64 {
+    SEQUENCE
+        .get_or_init(|| AtomicU64::new(wall_clock_micros()))
+        .fetch_add(1, Ordering::Relaxed)
+}
+```
+
+`AtomicU64` is a `u64` that several threads can update without a lock; `fetch_add` adds one and returns the old value as a single indivisible step, so two callers can never get the same number. `Ordering::Relaxed` says we only need that atomicity, not any ordering guarantee about *other* memory, which is all a counter needs. (It's `std::sync::atomic::Ordering`, not the `cmp::Ordering` from the dissemination queue: same name, different job.) `OnceLock`, which we met in Chapter 1, runs the initialiser the first time anyone asks. Seeding from wall-clock microseconds is what makes the counter rise across restarts: a node sends a few dozen datagrams a second, nowhere near a million, so a restarted process always starts above everything its previous run sent.
+
+Why a counter and not just a timestamp in each message? Because a timestamp check needs the receiver's clock to agree with the sender's, and so it needs a tolerance window for skew. Anything captured inside that window replays fine. A counter needs no clock agreement at all: the only question is "is this newer than the last thing *you* sent me?", and only the sender can answer yes. The wall clock appears only once, as a seed, and the worst it can do is step backwards across a restart; then peers ignore the node until they reap its old record, which drops the remembered sequence too. The price of strict ordering is that a datagram UDP delivers out of order behind a newer one is dropped. Gossip already treats loss as normal, so that's one lost datagram, not an error.
+
+One wrinkle forced a wire change. A relay used to forward the target's ACK with `sender` set to the *target*, so the requester's `wait_for_ack` would recognise it. That datagram was physically stamped by the relay, with the relay's counter, under someone else's name: there's no way to give it a sequence that means anything. So a relay now sends the ACK in its own name and says whom it vouches for, `Ack { relayed_for: Some(target) }`. Every message has exactly one stamping node, a receiver ignores a directory extension that names anyone but the sender, and the M13 rule (never record the target at the relay's socket) falls out for free, because the only address a relayed ACK can teach is the relay's own.
+
+**Relays that went deaf.** A relay used to wait inline for the target's ACK: send the PING, then loop on `recv` for one probe timeout, applying piggybacked updates and ignoring everything else. Calling the full `handle_message` from in there would have meant async recursion (`handle_message` waits for the relay, which calls `handle_message`, which can wait for another relay), and Rust won't compile a recursive `async fn` without boxing it, because the future would have to contain itself. So the wait took a shortcut, and the shortcut dropped every PING and `Sync` that arrived for 200 ms. A busy relay stopped acknowledging its own probers and got itself suspected for helping someone else.
+
+Rather than box the recursion, we removed the wait. A relay records "forward b's ACK to a" with a deadline in a small bounded list and returns at once; b's ACK arrives through `handle_message` like any message, and the `Ack` arm forwards it. There's no waiting state left to be deaf in. `handle_message` now also returns whether it accepted the message, and `wait_for_ack` only counts an ACK that was accepted, so a replayed old ACK can't pass for a fresh one.
+
+The tests read as the scenarios they prevent: `replayed_ping_from_another_address_does_not_move_the_member`, `replayed_extension_cannot_roll_a_recovery_epoch_back`, `ping_during_a_relay_wait_is_acknowledged`, `own_refutation_goes_out_before_suspect_and_dead`, and in `message.rs`, `worst_case_ping_with_full_extension_fits_the_udp_budget`, which signs a datagram with every field at its maximum and checks the bytes. The gated `nodes_with_maximal_labels_stay_alive_during_churn` runs it for real: nodes with 63-byte names and full label sets over UDP, one leaving and one joining, and nobody else is ever declared dead.
 
 ### Dead node cleanup
 
@@ -712,7 +776,7 @@ Since `handle_message` already walks `message.payload.updates()`, every entry in
 
 memberlist swaps tables over TCP, because a table can be large: at 10,000 members it's hundreds of kilobytes. Mustard's gossip has only a UDP transport. We could add a TCP listener, with its own framing and authentication, for one message type. Or we could keep each exchange small enough for UDP. We chose the second.
 
-Each `Sync` datagram carries at most eight entries, the same as a PING's piggyback, and no directory extension (the extension can take 700 bytes with a full label set, and every probe carries it anyway). That keeps a datagram under 1,400 bytes even with 63-byte node names and IPv6 addresses, and a test builds exactly that worst case. One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (eight) datagrams, so at most 64 entries. A table that fits goes whole every time. A bigger one goes out as a window that rotates through the table:
+Each `Sync` datagram carries at most eight entries, the same as a PING's piggyback, and no directory extension (the extension can take 1,100 bytes with a full label set, and every probe carries it anyway). That keeps a datagram under 1,400 bytes even with 63-byte node names and IPv6 addresses, and a test builds exactly that worst case. One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (eight) datagrams, so at most 64 entries. A table that fits goes whole every time. A bigger one goes out as a window that rotates through the table:
 
 ```rust
 fn membership_window(&mut self) -> Vec<MembershipUpdate> {
@@ -1706,6 +1770,10 @@ The test itself took a couple of fixes before it stopped failing at random. It u
 
 Now each test builds a `Fixture`: a fresh temporary directory, plus a block of four ports per node leased from a range that every suite shares through file locks. Its `Drop` implementation cancels the cluster and clears the directory when the test ends, panic or not. Clearing unmounts anything still mounted beneath the directory and returns the error if removal fails, so a fixture can no longer inherit state silently. The tests ask which node leads each time they need one, because "the node that led a second ago" isn't an answer Raft promises.
 
+The OCI crash tests in `tests/oci_crash.rs` leaked the same mounts another way (#780). Their `RootCleanup` guard killed what a test had started, deleted its containers, cgroups and networks, and then simply stopped. It never removed the root, so every rootful run left its identity tmpfs mounted under `/tmp`. Now the guard ends with the same `clear_fixture_dir`, which moved into `tests/support/fixture_dir.rs` so both harnesses share one copy. A `Drop` can't return an error, though, so how does it fail loudly? It asks `std::thread::panicking()` whether the test is already unwinding from a failure. If not, it panics with the path, and a test that passed but left its root behind fails. If it is, the guard only prints the error. A second panic during unwinding doesn't fail the test, it aborts the whole test binary and hides the first failure. Two tests mount a nested pair of identity tmpfs under a root on purpose, one dropping the guard normally and one panicking past it, and check that `/proc/self/mountinfo` lists nothing beneath the root afterwards.
+
+The capacity harness in `tests/owned_runc.rs` turned out to have the quietest version of the bug (#852). It made a `tempfile::TempDir` for the agent's volumes and let it drop when the agent task finished. `TempDir`'s `Drop` tries `remove_dir_all` and ignores the result, because a destructor has nowhere to send an error. So a mounted identity tmpfs beneath it never failed anything. It just stayed. Now the harness keeps the path for as long as it lives, and its own `Drop` stops the agent first (nothing may mount while we're clearing) and then calls `clear_fixture_dir` with the same panicking check. The same pair of tests covers it: one drops the harness normally, one panics with the mounts in place.
+
 ## State reconstruction
 
 We have gossip for membership, Raft for desired state, and the reporting tree for runtime state. But there's still a gap. When a new leader is elected, it inherits the Raft log (the desired state), but it has no idea what's actually running on each worker node. The old leader knew because it had been receiving StateReports. The new leader is starting from scratch.
@@ -1839,23 +1907,47 @@ That's the Meat scheduler's job.
 
 Meat uses a four-phase placement pipeline: Filter → Score → Select → Commit. For each replica, the pipeline runs once. After placing a replica, the cluster state cache is updated before placing the next. This prevents the scheduler from accidentally sending all replicas to the same node.
 
-**Phase 1: Filter.** Eliminate nodes that can't run the workload. A node is filtered out if it's not ready (hasn't reported since the leader election, or is being drained), doesn't have enough CPU/memory/GPU capacity, or doesn't match the app's required placement labels.
+**Phase 1: Filter.** Eliminate nodes that can't run the workload. A node is filtered out if it's not ready (hasn't reported since the leader election, or is being drained), doesn't match the app's required placement labels, can't enforce what the app needs, or doesn't have enough CPU/memory/GPU capacity.
 
 ```rust
 pub fn filter_nodes(
-    resources: &Resources,
-    required_labels: &BTreeMap<String, String>,
+    requirements: &WorkloadRequirements,
     cluster: &ClusterStateCache,
 ) -> Vec<NodeId>
 ```
 
+`WorkloadRequirements` gathers every hard constraint an app puts on a node: its request, its `required` labels, whether it needs egress enforcement or internal DNS, and the host binary it runs, if any. The filter isn't its only reader. Daemon placement asks the same question, and so does the leader when it decides whether a committed placement still holds. Before 0.2.1 those three each took their own list of arguments, and they'd drifted: the filter ignored a process workload's binary allowlist entirely.
+
 Required labels are hard constraints. If an app says `required = ["gpu=a100"]`, only nodes with that label are eligible. If no nodes match, the app stays unscheduled. Preferred labels are soft constraints handled in scoring.
+
+The host binary is the newest constraint (#702). Nodes in one cluster can have different `[process_workloads]` policies: one allows `/usr/bin/python3`, another nothing at all. An `exec` app placed on a node that refuses it never starts, and its placement used to hold there for good. Now each node reports its policy in its capability report, next to egress and DNS, and the filter checks it:
+
+```rust
+pub fn host_binary(spec: &AppSpec) -> Option<&Path> {
+    spec.exec.as_deref().or_else(|| {
+        spec.script
+            .as_ref()
+            .map(|_| Path::new(crate::grill::process_workload::SCRIPT_INTERPRETER))
+    })
+}
+```
+
+`spec.exec` is an `Option<PathBuf>`, an owned path. `as_deref()` turns that into an `Option<&Path>`, a borrowed view, without copying anything; `PathBuf` is to `Path` what `String` is to `&str`. `or_else` runs its closure only when the first option is `None`, so a `script` app falls back to the interpreter, `/bin/sh`, which is the binary a node actually runs for it. One function answers "which binary does this app need?", so the node's own refusal, placement and (from #701) app validation can't give three different answers.
+
+The opposite constraint came in 0.2.1 (#914). A node on `--runtime process` runs host workloads only and refuses an app that names an image, so placing one there would fail after placement. Each node now reports `containers` in its capabilities, true for runc, Apple Container and the mixed runtime, and an image app needs it:
+
+```rust
+requires_containers: (spec.exec.is_none() && spec.script.is_none())
+    || spec.init.iter().any(|init| init.image.is_some()),
+```
+
+An app with neither `exec` nor `script` runs an image (or, with only a `command`, a root filesystem). An init container that names its own image is a container too, even in front of an `exec` app. `Iterator::any` stops at the first match, like a `for` loop with an early `return true`. The field defaults to `false`, so a node whose capability report hasn't arrived takes no image app. That's the same fail-closed rule DNS and egress follow.
 
 **Phase 2: Score.** Rank the surviving candidates. Spread goes first: a node running fewer replicas of this app always beats one running more. Between nodes running the same number, a weighted sum on a 0–90 scale decides:
 
 | Dimension | Weight | Logic |
 |-----------|--------|-------|
-| Bin-packing | 50 | Prefer fuller nodes (maximise density) |
+| Bin-packing | 50 | Prefer nodes fuller in CPU and memory, evenly (maximise density) |
 | Preferred labels | 20 | Prefer nodes matching soft constraints |
 | Image locality | 15 | Prefer nodes with cached images (Phase 5) |
 | Stability | 5 | Prefer longer-running nodes |
@@ -1870,7 +1962,43 @@ scored.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
 
 Each tuple is `(node, replicas, score)`. `cmp` returns an `Ordering` (less, equal or greater), and `then` only looks at the next key when the first says equal. Fewest replicas ascending, then score descending (note the swapped `b` and `a`), then node id ascending. It's the same idea as a SQL `ORDER BY replicas, score DESC, node_id`, and it keeps working however many weights we add later.
 
+Bin-packing scored CPU alone until 0.2.1. Picture a cache that asks for a tenth of a core and a gigabyte of memory. On CPU, two nodes with the same CPU load look identical, so the tie went to the alphabetically first one, even if the other had six gigabytes in use and room for exactly this. Memory-heavy apps spread thin and stranded memory everywhere. The design doc had always described a two-dimensional score, so we built that one (D30):
+
+```rust
+let score = match (cpu, memory) {
+    (Some(cpu), Some(memory)) => {
+        let average = (cpu + memory) / 2;
+        average.saturating_sub(cpu.abs_diff(memory) / 10)
+    }
+    (Some(only), None) | (None, Some(only)) => only,
+    (None, None) => 50,
+};
+```
+
+`cpu` and `memory` are each node's utilisation after the placement, in percent, or `None` when the node reports none of that resource (`checked_div` returns `None` rather than panicking on a zero divisor). The score is their average less a tenth of the gap between them. A node at 90% CPU and 30% memory averages 60 but scores 54; a node at 60% of both scores 60. The lopsided one would strand its memory, because nothing can use memory without CPU to run on.
+
+A few Rust details. `match` on a tuple lets us handle all four combinations of present and absent in one place, and the compiler refuses to build it if we miss one. The `|` in `(Some(only), None) | (None, Some(only))` is an or-pattern: both arms bind `only`, so they share one body. `abs_diff` gives the distance between two unsigned numbers without the underflow that `cpu - memory` would hit when memory is bigger (in debug builds that's a panic, in release a wrap to a huge number). `saturating_sub` stops at zero for the same reason. And the whole thing is integers: a float score could round differently on another machine and break a tie the other way, and determinism is the point of the tiebreak.
+
 **Phase 3: Select.** Pick the first node in that order. Ties end at `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
+
+For a long time this paragraph promised property tests that didn't exist. Example-based tests check the cases we thought of; a scheduler goes wrong in the ones we didn't. Since 0.2.1 `meat::scheduler::properties` generates random clusters (1 to 16 nodes of random size, already up to 90% used) and random apps, and checks four things hold for every one:
+
+```rust
+proptest! {
+    #[test]
+    fn never_overcommits_a_node(
+        shapes in prop::collection::vec(node_shape(), 1..16),
+        apps in prop::collection::vec(app_shape(), 1..10),
+    ) {
+        // place every app, then add up what landed on each node
+        // independently and check it still fits
+    }
+}
+```
+
+`proptest!` is a macro, code that writes code at compile time, a little like a C preprocessor macro but working on Rust syntax rather than text. Each argument names a *strategy*, a recipe for random values: `node_shape()` builds a node, and `prop::collection::vec(…, 1..16)` a list of one to fifteen of them. Proptest runs the body a few hundred times, and when an assertion fails it *shrinks* the input, retrying smaller versions until it finds the simplest one that still fails. That's the case you debug.
+
+The four properties: no node ends up with more allocated than it has; with room everywhere, no node gets more than `ceil(replicas / nodes)` replicas of one app; the same cluster gives the same plan whatever order its nodes were inserted in (a `HashMap` iterates in an order that depends on insertion and hashing, so this checks the tiebreak really does its job); and a whole pass, quotas included, never places more CPU in a namespace than its budget.
 
 **Phase 4: Commit.** Reserve the resources in the cluster state cache and record the placement. `ClusterStateCache::reserve()` adds to the node's allocated resources and counts one more replica of the app there, so the next replica sees it.
 
@@ -1929,6 +2057,34 @@ The tests read like the issue: an over-quota app shows its reason, the reason cl
 
 The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 
+### Placing what fits
+
+A quota isn't the only reason an app can't get all its replicas. Ask for three replicas in a cluster with room for two, and until 0.2.1 you got none: `schedule_fixed` returned an error at the first replica that didn't fit, the pass threw away the two it had already placed, and the leader logged `cannot place web` every two seconds. Nothing recorded the reason anywhere `relish status` could see.
+
+Kubernetes places what fits and leaves the rest pending, and that's what we do now (D29). The scheduler's leader-facing entry point says so in its return type:
+
+```rust
+pub struct Placed {
+    pub decision: SchedulingDecision,
+    pub unplaced: Option<Unplaced>,
+}
+
+pub struct Unplaced {
+    pub missing: u32,
+    pub reason: UnplacedReason,
+}
+```
+
+There's no `Result` here, because a short placement isn't an error the caller can bail out on with `?`. It's an answer with two parts: what we placed, and, if anything is left over, how much and why. Capacity admission still wants all or nothing, so `schedule_app` keeps that contract and turns a non-empty `unplaced` into `NoEligibleNodes`.
+
+`UnplacedReason` is an enum of the hard constraints in filter order: no ready node, no node with the labels, no node that runs containers for an image app, no node that can enforce the app's needs or run its binary, no room. `unplaced_reason` walks the nodes once per constraint and stops at the first that nobody passes, so "no node in zone east" isn't misreported as "no room" just because the east nodes don't exist.
+
+The pass keeps every replica that found a node, reservations and all, so the apps planned after it see the room it took. It records `Unschedulable { placed, wanted, reason }` per short app, and the leader writes the set to the council the same way it writes quota blocks: `RaftRequest::Unschedulable`, only when the set changes. `relish status` prints `web (namespace default) is unschedulable: placed 2 of 3 replicas: no node that can run it has room`, `relish inspect` adds an `Unplaced:` line, and `relish wtf` raises an `unschedulable` warning.
+
+Our first version of this had a hole, and CI found it. A lone node restarting into a new binary reported itself not ready for a moment. Its replica stopped holding, there was nowhere else to put it, and "place what fits" placed nothing and committed exactly that: an empty placement list, which retired the node's only workload. The old all-or-nothing code had hidden this by accident, since its error path committed nothing at all. The rule we wanted is narrower: nothing moves unless it has somewhere to go. A replica that no longer holds and finds no other node stays committed where it was (it isn't counted as placed), and moves when a node can take it. `a_replica_with_nowhere_to_go_stays_where_it_was` pins it.
+
+Two more things were needed to keep it quiet. A short app is never converged, so the pass plans it every tick, and every tick it comes up with the same two placements. Committing those again would add a Raft entry every two seconds for nothing, so the pass compares the plan with what's committed and skips an identical one. And the log: the leader compares the recorded set with the planned one and logs only a change (`shortfall_changes`), with a `placement` event when an app becomes short and when it clears. `cannot_place_is_logged_once_per_change` checks that a steady shortfall says nothing.
+
 The `check_quota` function is straightforward: for each limit that's set, check if current usage plus the requested resources exceeds it. No limit means unlimited.
 
 ### The cluster state cache
@@ -1949,9 +2105,109 @@ Each subsystem gets a production transport alongside its in-memory test double:
 
 **TCP for reporting.** `TcpReportingTransport` uses length-prefixed framing: 4 bytes for the payload length, then the bincode payload. The server side (council members) spawns an accept loop that pushes inbound messages into a channel. The client side (workers) opens a new connection for each report. At a 5-second reporting interval, one connection per report is fine.
 
-**TCP for Raft.** `TcpRaftNetwork` implements openraft's `RaftNetwork` trait over length-prefixed TCP, just like reporting. The Raft RPC server accepts connections, reads the request envelope (`AppendEntries`, `Vote`, or `InstallSnapshot`), dispatches to the local Raft instance, and writes the response. Connect-per-RPC is acceptable for Raft because RPC volume is low (heartbeats every 150ms, but they're tiny).
+**TCP for Raft.** `TcpRaftNetwork` implements openraft's `RaftNetwork` trait over length-prefixed TCP, just like reporting. The Raft RPC server accepts connections, reads the request envelope (`AppendEntries`, `Vote`, or `InstallSnapshot`), dispatches to the local Raft instance, and writes the response. We first opened a connection per RPC and reasoned that it was fine, because Raft's RPC volume is low (heartbeats every 150ms, but they're tiny). That reasoning didn't survive mTLS; the next section tells that story.
 
 All three transports use plain TCP/UDP for now. mTLS comes in Phase 4.
+
+### Keeping Raft connections open
+
+Volume was never the problem. Latency was. When the leader serves a linearizable read, openraft first checks it's still the leader: it sends every voter a heartbeat and waits for a quorum to answer, giving each heartbeat `heartbeat_interval` (150 ms). Once Chapter 4 wrapped the transport in mTLS, each of those heartbeats paid for a TCP handshake *and* a TLS handshake with two certificate verifications. On a `relish dev` cluster of debug-build VMs that blew the 150 ms budget every time, and every linearizable read on the leader failed. We papered over it by optimising `ring` in debug builds (Chapter 4 has the details) and filed [#928](https://github.com/reliaburger/reliaburger/issues/928) to remove the cause.
+
+The fix is the obvious one: keep connections open. There were two ways to do it. One multiplexed connection per peer (HTTP/2, or our own request ids on one stream) needs a background task to read responses and route them to whoever is waiting, and a way to clean up when a waiter gives up. A small pool of ordinary connections needs neither: an RPC takes a connection, sends one request, reads one response and gives it back. Raft sends to one peer from a single replication stream plus the occasional vote, so a pool rarely holds more than one or two connections per peer. We picked the pool.
+
+`RaftConnectionPool` (in `src/council/connection_pool.rs`) is a map from peer to a `Vec` of idle connections, behind an `Arc<tokio::sync::Mutex<...>>` so every client the factory hands out shares it. That sharing matters more than it looks. openraft calls `RaftNetworkFactory::new_client` for every replication stream and every vote, so a pool held by one `TcpRaftNetwork` would be thrown away at the next election. The lock is held only to push or pop, never across a network call.
+
+The pool holds both plain TCP and TLS streams, which are different types. Rust's answer is a *trait object*:
+
+```rust
+pub(crate) trait RaftIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> RaftIo for T {}
+
+pub(crate) struct RaftConnection {
+    pub(crate) stream: Box<dyn RaftIo>,
+    // ...
+}
+```
+
+`RaftIo` has no methods. It just names the four traits a connection needs, because `dyn` can only be followed by one trait (plus auto traits such as `Send`). The second line is a *blanket implementation*: "every `T` that has these four traits has `RaftIo` too", so `TcpStream` and `TlsStream<TcpStream>` both qualify without us writing anything for either. `Box<dyn RaftIo>` is then a pointer to some value of an unknown type plus a table of its methods, much like a Go interface value or a C struct of function pointers. It costs one indirect call per read or write, which is nothing next to a syscall.
+
+#### Cancellation safety comes from ownership
+
+The part we worried about most is cancellation. openraft gives up on an RPC by dropping its future: Rust has no other way to cancel async work, so a future can stop at any `.await` and simply never resume. Suppose a heartbeat is dropped after it wrote its request but before it read the answer. If that connection went back into the pool, the next RPC would write its own request and read the *previous* one's answer. That's the classic pooled-connection bug, and it hands one RPC another's response.
+
+Here the type system makes it impossible. `take` *moves* a `RaftConnection` out of the pool into the RPC's future, which owns it, and only `put` moves it back, after a complete request and response:
+
+```rust
+if let Some(mut connection) = self.pool.take(&self.peer, &check).await
+    && let Ok(response) = Self::exchange(&mut connection.stream, &payload).await
+{
+    self.release(connection, &response).await;
+    return Ok(response);
+}
+let mut connection = self.dial().await?;
+let response = Self::exchange(&mut connection.stream, &payload).await?;
+self.release(connection, &response).await;
+Ok(response)
+```
+
+If the future is dropped half-way, so is `connection`, and dropping a socket closes it. There is no code path that returns a connection with a request in flight, so there's nothing to remember. `if let ... && let ...` is a *let chain* (stable since Rust 1.88): both patterns must match for the block to run, and the second can use what the first bound. When the pooled connection fails, most often because the peer closed it while it sat idle, the RPC falls through to a fresh dial and sends again. Sending a Raft RPC twice is safe, because appends, votes and snapshot chunks are idempotent at the receiver.
+
+The test for this, `a_cancelled_rpc_does_not_return_its_connection_to_the_pool`, runs a stub peer that answers the first request 300 ms late, cancels the RPC at 50 ms, sends another and checks that it went over a second connection.
+
+#### Certificates outlive handshakes
+
+Chapter 4 told the story of a pooled `reqwest` connection that kept presenting an expired certificate, because a TLS resolver runs only at the handshake. A Raft pool would repeat that mistake, so a pooled connection is retired instead of reused when:
+
+- it is older than 30 seconds or has been idle for 10;
+- this node's identity changed since it was dialled. `LiveNodeIdentity::snapshot()` returns an `Arc<NodeIdentity>`, and each connection remembers the one it was dialled with. A renewal or a new trust set publishes a new `Arc`, and `Arc::ptr_eq` compares the two pointers, not the contents. It's one comparison and it can't miss a change;
+- the peer's certificate chain, saved at the handshake, is now on the CRL (`CrlHandle::admits`).
+
+The server applies the same rules from its side. It serves request after request on a connection until the peer goes quiet for 20 seconds or the connection turns 60, and before each request it re-checks the client's chain against the live CRL. A peer revoked mid-connection is cut off at its next RPC, as it was when every RPC paid a handshake. The client's limits are deliberately shorter than the server's, so the client retires a connection before the server closes it under it. Two `const` assertions check that at compile time:
+
+```rust
+const _: () = assert!(CONNECTION_MAX_AGE.as_secs() < SERVER_CONNECTION_MAX_AGE.as_secs());
+```
+
+A `const` item is evaluated by the compiler, so if someone raises the client's limit past the server's, `assert!` fails the build rather than a test. `Duration`'s `<` isn't allowed in a `const` context yet, which is why we compare seconds.
+
+Two small things also changed. A frame used to go out as two writes (the length prefix, then the payload), which on a long-lived TLS connection can become two records and two TCP segments; now it's one write. And both ends set `TCP_NODELAY`, so the kernel sends a small frame at once instead of holding it until the previous segment is acknowledged (Nagle's algorithm). With one request per connection that never mattered. With a connection carrying a heartbeat every 150 ms, it would.
+
+#### Did it help?
+
+`examples/raft-heartbeat-rtt.rs` forms a three-voter council over the real transport (TCP, mTLS, live identities, node-bound connectors) on loopback and times `ensure_linearizable` on the leader, which is exactly what a linearizable read pays. The results, before and after, in both build profiles and with and without CPU load, are in the [council design doc](../design/gossip-mustard.md#33-raft-integration). On an M2 Max with an idle host, the median leadership check fell from 2.50 ms to 0.53 ms in a debug build and from 1.43 ms to 0.26 ms in a release build. Under full CPU load the medians fell by similar factors, but the slowest checks barely moved: once every core is busy, the tail is the scheduler's, not the handshake's. No check came near 150 ms on loopback either way, because the debug builds already carried the `ring` fix and loopback has no virtual network in the way. The honest summary is that the pool takes the handshake out of the heartbeat's budget entirely, rather than making a slow cluster fast.
+
+#### One late round isn't a lost leader
+
+The tail still bit, in a merge queue on a saturated CI runner ([#1009](https://github.com/reliaburger/reliaburger/issues/1009)). A test asked the leader for a test lease right after creating it and got a 503 "retry shortly". The leader was settled: the test checked a moment later that it still led. What failed was the single leadership check behind the read. openraft's `ensure_linearizable` sends one heartbeat round and gives each follower one `heartbeat_interval` (150 ms) to answer. If both followers miss it, the leader can't prove a quorum, the check fails, and the route treats the node as "not leader". The node then tries to forward the read, sees that its own metrics name itself as leader, and answers 503 rather than forward to itself. Running the test in three parallel lanes at a load average of about 147, a probe of 3,600 reads against the settled leader got two 503s. That's rare, but every read pays the odds.
+
+The check itself is right: a leader that can't hear a quorum mustn't serve a linearizable read. Giving up after one round is the bug, because the route already had a 3-second budget for it. `CouncilNode::confirm_leadership` spends that budget:
+
+```rust
+pub async fn confirm_leadership(&self, within: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    let retry_pause = std::time::Duration::from_millis(self.raft.config().heartbeat_interval);
+    loop {
+        match tokio::time::timeout_at(deadline, self.is_leader()).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        let believes_it_leads = {
+            let metrics = self.metrics();
+            let metrics = metrics.borrow();
+            metrics.current_leader == Some(metrics.id)
+        };
+        if !believes_it_leads || tokio::time::Instant::now() + retry_pause >= deadline {
+            return false;
+        }
+        tokio::time::sleep(retry_pause).await;
+    }
+}
+```
+
+`timeout_at` is `timeout` with an absolute deadline instead of a duration, so every attempt shares the one budget, however many there are. It returns `Err` when the deadline passes, and `Ok` wrapping the inner future's answer otherwise, which is why the `match` has three arms. The `{ ... }` block that computes `believes_it_leads` is there for the borrow: `borrow()` on a `watch::Receiver` holds a read lock until the guard is dropped, and the guard is dropped at the block's closing brace, before the `sleep`'s `.await`. The retry only runs while the node still believes it leads. A follower knows another voter leads, so it gets "no" straight away and forwards the read, with no added delay.
+
+The unit test models the slow followers with the in-memory router: it holds elections on every voter, cuts the leader off from both followers, checks that one `is_leader` round fails, and heals the partition 300 ms later while `confirm_leadership` is running. With the same probe and load, 102 runs of the test made 30,600 reads and got no 503. The integration test also stopped treating the 503 as fatal: it retries that one documented answer for up to 30 seconds and asserts 200 on whatever comes back.
 
 ### The ClusterHandle
 
@@ -2090,25 +2346,25 @@ You don't need three machines, or even three terminals, to watch this happen. On
 $ relish dev create mycluster --nodes 3
 ```
 
-It builds `bun` and `relish` for Linux from your *current* source tree (in a reusable build VM, so the first run is slow and later ones are incremental — no cross-toolchain on your Mac needed), installs them on each node, and starts every agent with `--cluster`. What you test locally is the exact binary that runs in the VMs. There's a `--bun <path>` / `--relish <path>` escape hatch if you'd rather supply a prebuilt Linux binary and skip the build.
+It builds `bun` and `relish` for Linux from your *current* source tree (in a reusable build VM, so the first run is slow and later ones are incremental — no cross-toolchain on your Mac needed), installs them on each node, gives every node an mTLS identity, and starts every agent with `--cluster`. What you test locally is the exact binary that runs in the VMs. There's a `--bun <path>` / `--relish <path>` escape hatch if you'd rather supply a prebuilt Linux binary and skip the build.
 
-The VMs sit on Lima's `user-v2` network, which gives them VM-to-VM connectivity with no `socket_vmnet` or `sudo` dance, and each node advertises its own address on that network. That network isn't routable from the host, though, so you check on the cluster from *inside* a node, where `relish` reaches the local agent on `127.0.0.1:9117`:
+The VMs sit on Lima's `user-v2` network, which gives them VM-to-VM connectivity with no `socket_vmnet` or `sudo` dance, and each node advertises its own address on that network. That network isn't routable from the host, though, so you check on the cluster from *inside* a node, where `relish` reaches the local agent on `127.0.0.1:9117`. It does so over HTTPS: `dev create` leaves each VM's `relish` a context file with the cluster's root CA and an administrator token, so you don't pass either by hand (chapter 4 covers how the VMs get their identities):
 
 ```
-$ limactl shell reliaburger-1 relish council
-Leader: reliaburger-1
+$ limactl shell reliaburger-mycluster-1 relish council
+Leader: reliaburger-mycluster-1
 Term:   1
 
-RAFT_ID              NAME            ADDRESS
-2169132481472150103  reliaburger-1   192.168.104.1:9444
-2169132481472150104  reliaburger-2   192.168.104.3:9444
-2169132481472150105  reliaburger-3   192.168.104.4:9444
+RAFT_ID              NAME                      ADDRESS
+2169132481472150103  reliaburger-mycluster-1   192.168.104.1:9444
+2169132481472150104  reliaburger-mycluster-2   192.168.104.3:9444
+2169132481472150105  reliaburger-mycluster-3   192.168.104.4:9444
 
-$ limactl shell reliaburger-1 relish nodes
-NODE           ADDRESS               STATE   COUNCIL  LEADER
-reliaburger-1  192.168.104.1:9443    alive   yes      yes
-reliaburger-2  192.168.104.3:9443    alive   yes      -
-reliaburger-3  192.168.104.4:9443    alive   yes      -
+$ limactl shell reliaburger-mycluster-1 relish nodes
+NODE                     ADDRESS               STATE   COUNCIL  LEADER
+reliaburger-mycluster-1  192.168.104.1:9443    alive   yes      yes
+reliaburger-mycluster-2  192.168.104.3:9443    alive   yes      -
+reliaburger-mycluster-3  192.168.104.4:9443    alive   yes      -
 ```
 
 One thing you'll notice: the council forms in seconds, not the ten minutes the eligibility walk-through above would suggest. That ten-minute `min_node_age` gate belongs to `select_council_candidates()` — the careful, age-and-zone-aware selection meant for a production cluster that's already humming. The cluster *runtime* that `bun --cluster` actually runs sets `min_node_age` to zero, so a fresh node is eligible right away; age still orders candidates, it just doesn't block them. The reconciler then walks members in, one membership action per two-second tick, up to the council size cap. For a dev cluster you want to see form now, that's the right trade-off, and it's the same reconcile loop a production cluster runs.
@@ -2167,11 +2423,16 @@ The heart of the fix is a pure function, `plan_council_action()`, that looks at 
 pub enum CouncilAction {
     AddLearner(u64),
     Promote(u64),
+    PromotePair(u64, u64),
+    Replace { promote: u64, remove: u64 },
     RemoveVoter(u64),
+    RemoveVoterPair(u64, u64),
     RemoveLearner(u64),
     Nothing,
 }
 ```
+
+(It started with four actions. "Odd numbers only", below, explains the other three.)
 
 One action per tick is a deliberate straitjacket. Membership changes are the most dangerous writes a Raft cluster performs, and the failure modes multiply when several are in flight. So the planner refuses to pipeline: if a joint-consensus change is still committing, it returns `Nothing`; otherwise it proposes the single next step. If that step fails or times out, nothing is remembered — the next tick observes the actual state and re-plans from scratch. Idempotent planning means retrying is free, which is what keeps the reconciler non-wedging: every operation is bounded by a timeout, every error is logged and abandoned, and the loop never blocks on a peer that won't answer.
 
@@ -2198,12 +2459,57 @@ When a voter is confirmed dead and a spare exists, the planner walks a fixed seq
 
 1. **`AddLearner(spare)`** — the spare starts receiving log replication but has no vote. Quorum arithmetic is untouched.
 2. **Wait for catch-up.** Promotion is gated on the learner's replicated log index being within `max_promotion_lag` entries (64 by default) of the leader's last index, read from openraft's replication metrics. A learner that can't catch up simply never gets a vote.
-3. **`Promote(spare)`** — a joint-consensus `change_membership`. Take the three-voter case with one seat dead: the new config has four voters, three of them alive. The change must commit in *both* configs — majority of the old three (two votes: fine) and of the new four (three votes: also fine). At no point does anything wait on the dead node.
-4. **`RemoveVoter(dead)`** — another joint-consensus change, shrinking back to three healthy voters. This one uses openraft's non-retaining mode, so the evicted node is dropped from the membership entirely rather than lingering as a learner the leader keeps trying to replicate to.
+3. **`Replace { promote: spare, remove: dead }`**, one joint-consensus `change_membership`. Take the three-voter case with one seat dead: the old config is `{a, b, dead}` and the new one `{a, b, spare}`. The change must commit in *both* configs: a majority of the old three (two votes, `a` and `b`: fine) and of the new three (two of `a`, `b` and the caught-up spare: also fine). At no point does anything wait on the dead node. The change uses openraft's non-retaining mode, so the evicted node is dropped from the membership entirely rather than lingering as a learner the leader keeps trying to replicate to.
 
-Could we remove first and add later? Sometimes, and the planner will evict a dead seat early when the council is large enough to spare it. But removal is refused whenever it would shrink the voter set below `min_council_size`, so in the common three-voter case the replacement *must* land first. Add-before-remove is the order that never gambles on the dead node's vote coming back.
+The first version took two steps here: promote the spare (four voters), then evict the dead seat (back to three). That worked, but it parked the council on an even number of voters between the two, and the next subsection is about why we no longer do that. Joint consensus doesn't care how many nodes join or leave in one change, so doing both in one costs nothing.
+
+Could we remove first and add later? Removing a single dead voter from three would leave two, an even council that needs both survivors for every write. So the planner only ever evicts dead voters alone in pairs (five down to three, never below `min_council_size`) when nothing is left to replace them. Add-before-remove is the order that never gambles on the dead node's vote coming back.
 
 Two guards apply to every plan. Live voters must form a majority of both the current and the proposed config, otherwise the change couldn't commit and proposing it would just wedge a timeout loop (if quorum is already lost, membership surgery can't fix it — that's disaster recovery's job, a later theme). And the planner never, under any input, proposes removing the leader. Gossip claiming the leader is dead gets ignored: the planner runs *on* the leader, and a node that's executing code is not dead, whatever the rumour mill says. When the leader itself must one day step aside (disk pressure, planned drain), that path needs a leadership transfer first — and openraft 0.9 has no graceful transfer, as we discovered the hard way in the self-upgrade work of chapter 14. The seam is documented and deliberately left empty rather than stubbed with something that can't work.
+
+### Odd numbers only
+
+What's the right number of voters for a two-node cluster? We used to say two, because the reconciler promoted every eligible node up to `max_council_size`. Count the votes again. Two voters need two votes for a majority, so losing *either* node stops the control plane. One voter needs one vote, so losing the other node costs nothing, and losing the voter costs exactly what it did before. The second voter bought no fault tolerance at all, and it doubled the failures that hurt. The whitepaper claimed a 2-node survivor "continues operating in single-leader mode", which was true of nothing we'd shipped.
+
+The same arithmetic holds at every size. Four voters need three votes and survive one failure, same as three. Six need four and survive two, same as five. An even council never tolerates more failures than the odd one below it, and every write waits for one more acknowledgement. So the planner now aims at an odd target (D12):
+
+```rust
+pub fn largest_odd_at_most(n: usize) -> usize {
+    match n {
+        0 | 1 => 1,
+        n if n % 2 == 1 => n,
+        n => n - 1,
+    }
+}
+
+let target = largest_odd_at_most(pool.len().min(config.max_council_size));
+```
+
+`pool` is every live node the council could seat: live voters, live learners and live spare candidates. Two nodes give a target of one, four give three, and seven or more give seven.
+
+The awkward part is getting from one odd number to the next without stopping on an even one. Growing from one voter to three by single promotions would pass through two. So growth waits until two learners have caught up and promotes both in one change, `PromotePair`. Replacing a dead voter is the `Replace` swap above. And when the council is even on arrival, left over from an older release or a `relish decommission-node`, the planner returns it to odd: up by one with `Promote` if a caught-up learner and the live nodes allow it, otherwise down by one with `RemoveVoter`, a dead voter first.
+
+The planner's guards look a little different with pairs about. The old code had one shrink rule; now there are three ways to change the voter count, and each has to be committable. Rather than repeat the majority arithmetic in each branch, every candidate action is turned into the voter set it would produce, and one closure checks it:
+
+```rust
+let committable = |next: &BTreeSet<u64>| {
+    next.iter().filter(|id| alive(**id)).count() >= majority(next.len())
+};
+```
+
+Picking a pair out of a ranked list uses a bit of syntax we haven't needed yet:
+
+```rust
+if voters.len() + 2 <= target
+    && let [first, second, ..] = ready.as_slice()
+{
+    return CouncilAction::PromotePair(*first, *second);
+}
+```
+
+`[first, second, ..]` is a *slice pattern*. It matches any slice with at least two elements, binds the first two, and `..` ignores the rest. A slice with fewer than two doesn't match, so the condition is false and we fall through. In C you'd check the length and then index; in Python you'd unpack and catch the error. Rust folds the length check and the binding into one pattern, and there's no index to get wrong. The `&& let` part is a let chain (stable since Rust 1.88): every condition in the `if` must hold, and the bindings from the pattern are in scope inside the block.
+
+A two-node cluster ends up with one voter and one plain worker, and the gated `two_node_cluster_survives_losing_the_non_voter` test checks the half Raft can promise: kill the worker and the voter keeps committing alone. The upgrade planner's refusal of a two-voter council (chapter 14) stays, as a guard for councils an older release left behind.
 
 ### Hysteresis, or why flapping must not churn
 
@@ -2215,9 +2521,9 @@ While a voter is inside the dead window, its seat still counts as occupied. That
 
 ### Testing it
 
-The planner being pure pays for itself here. Seventeen unit tests feed it hand-built observations — dead voter with a spare, learner sixty entries behind, quorum already lost, leader reported dead by gossip — and assert the exact action. No cluster, no sleeps, no flakes.
+The planner being pure pays for itself here. Unit tests feed it hand-built observations — dead voter with a spare, learner sixty entries behind, quorum already lost, leader reported dead by gossip — and assert the exact action. No cluster, no sleeps, no flakes.
 
-On top of that sits a proptest. It generates arbitrary voter sets, learner sets, health maps and replication states, and asserts the invariants hold for all of them: the leader is never removed, evictions only target nodes dead past the window, no plan drops live voters below a committable majority or the set below its minimum size, and the planner is deterministic. Writing the properties down turned out to be the best design review the planner got — two of the guards above exist because early property runs found inputs that violated them.
+On top of that sits a proptest. It generates arbitrary voter sets, learner sets, health maps and replication states, and asserts the invariants hold for all of them: the leader is never removed, evictions only target nodes dead past the window (or resigning under disk pressure), no plan drops live voters below a committable majority, every change to the voter count lands on an odd number, and the planner is deterministic. A second property starts from odd councils only and checks that no action ever leaves an even one. Writing the properties down turned out to be the best design review the planner got — two of the guards above exist because early property runs found inputs that violated them.
 
 The full loop runs in three gated acceptance tests (`RELIABURGER_CLUSTER_TESTS=1`): kill a voter and watch a spare walk in while a writer hammers the council and asserts every write lands; kill a learner mid-catch-up (faked by partitioning it at the Raft layer while gossip still likes it) and confirm the voter set refuses to move until a healthy learner catches up; and flap a voter inside the window and confirm nothing changes at all. They use real `CouncilNode`s over the in-memory router with gossip supplied through a watch channel, so the tests control exactly who looks alive and when — the same trick the SWIM tests used, one layer up.
 
@@ -2226,6 +2532,12 @@ Those tests taught us one more thing, about the tests themselves. A few of them 
 That last sentence hid a stall, and it took a slow disk to find it. openraft changes voters in two steps: it commits a joint configuration, and then proposes the uniform one. The second proposal doesn't come from inside Raft, though. It comes from the `change_membership` future itself, after the joint step returns. The reconciler wraps every operation in a five-second `tokio::time::timeout`, and in Rust a timeout cancels a future by *dropping* it: the future simply never gets polled again, so nothing after its current `.await` ever runs. On a qualification run with slow test storage, one promotion took longer than five seconds to commit its joint step. The timeout dropped the future. The joint step committed anyway, a moment later, and nobody was left to propose the uniform step. The council sat in `{[a], [a, b]}` for good, and every later tick saw a change "in flight" and planned nothing, so the third node never got a seat (#673).
 
 openraft says as much in its docs: a caller that goes away between the steps leaves the cluster in the joint config. So the reconciler now finishes it. Before planning, the leader asks `unfinished_membership_change()`, which returns the target voter set when the membership is joint *and* that entry has been applied (so it committed). If there is one, the leader proposes that target as the next change. openraft turns a request for the joint config's own second half into the uniform config, so this is exactly the step the abandoned caller would have taken. It covers a leader that failed over between the two steps too, which no amount of patience in the caller could. The regression test makes the stall deterministic with the in-memory router. It partitions the learner so the joint step can't commit inside a 500 ms bound, heals the partition, waits for the joint step to commit, and then runs one reconciler tick, which must land the council on `{a, b}`.
+
+The same slow disk raised a second question: what else was inside that five-second bound? We measured each phase against a test log store that takes 20 ms per entry. Every operation starts with a guard no-op (46 ms), the barrier that makes an earlier node-fault grant visible before membership moves. Then come one membership entry for adding a learner (90 ms in all) or two for a promotion (147 ms). Those costs are fixed: a handful of commits, whatever the size of the log. The one cost that wasn't fixed was hiding in `add_learner`. We called openraft's `add_learner(id, node, true)`, and that `true` means "block until the learner is up to speed", where up to speed is openraft's `replication_lag_threshold`, 5,000 entries. A learner joining a busy council with a long log, or one that needs a snapshot first, could spend the whole bound there, and the operation timed out (#779).
+
+The wait was redundant anyway. The planner already refuses to promote a learner until it's within `max_promotion_lag` (64) entries of the leader. So `add_learner` now passes `false` and returns once the membership entry commits. The catch-up runs between ticks, where it can take as long as the log gap needs without holding anything up, and the next ticks plan nothing until the learner is ready. The bound stays at five seconds: it now covers a known number of commits, with plenty of room for a leader whose apply queue is busy. The regression test gives two learners a log store that takes half a millisecond per entry and an 8,000-entry gap, sets the bound to one second, and asserts that no reconciler tick reaches it while the council grows to three voters. Before the change, the first `add_learner` ran into it.
+
+The test needed a slow store, and `MemLogStore` already had one test hook, `fail_appends`, for the full-disk case. We added a second beside it, `slow_entry_writes`, which sleeps in `append` for each entry it writes. Both hooks are fields marked `#[cfg(test)]`, so they exist only when the crate is compiled for its own unit tests. A production build has neither the fields nor the code that reads them, unlike Go, where a test hook usually stays in the binary behind a flag. The delay is per entry rather than per call because catch-up time has to grow with the log gap, which is the thing we were testing.
 
 ## When the whole council dies
 
@@ -2271,6 +2583,43 @@ retain = 24
 
 Off by default. If you don't set `url`, the loop never starts and you pay nothing.
 
+"Each backend's standard credentials" was, for a while, a promise the code didn't keep. `object_store::parse_url` builds an S3 store with `AmazonS3Builder::new()`, which reads no environment at all, so `AWS_REGION` and friends were ignored and S3 quietly fell back to the instance's metadata credentials in `us-east-1` (#695). Chapter 15 has the fix in `object_storage::open`; the short version is that we now hand each builder its own `AWS_*` or `GOOGLE_*` variables.
+
+The other problem was the name. The first version called each object `council-{millis}.backup`, from the leader's `SystemTime::now()`, and both "restore the newest" and "keep the newest 24" sorted by it. Picture a former leader whose clock ran a day fast. Its backups are the "newest" for a day. Once it has written 24 of them, every correct backup the new leader uploads sorts older and is pruned straight after upload, and a restore picks the stale state. The wall clock is the one thing in a cluster nobody agrees on.
+
+Raft already gives us an order everybody agrees on: the log position. So a backup's key is the position of the state inside it.
+
+```rust
+pub struct BackupKey {
+    pub recovery_epoch: u64,
+    pub term: u64,
+    pub index: u64,
+    pub millis: u64,
+    pub recovery_id: Option<RecoveryId>,
+}
+
+impl Ord for BackupKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+```
+
+Recovery epoch first, because a recovered council's state supersedes the dead one's whatever their terms. Then term, then the last applied index, and only then the clock, as a tie-break. `Ord` is the trait behind `sort()` and `<`, a bit like implementing `Less` for Go's `sort.Interface`, except the compiler insists the ordering is total. We write it by hand rather than `#[derive(Ord)]` because a derived one would compare `Option<RecoveryId>`, and `RecoveryId` has no business being ordered. `order()` returns a tuple, and tuples compare field by field, left to right, which is exactly the rule we want. The object name zero-pads every field (`council-e00000000000000000001-t…-i…-m…-r….backup`), so a plain lexicographic listing agrees with `Ord`, and the key's term and index come from the same linearizable read that produced the state, so they can't drift from the bytes.
+
+Why is the recovery id in the name at all, when it doesn't order anything? Two survivors recovered independently from one backup land on the same epoch with fresh logs, so their first backups can agree on epoch, term, index and even the millisecond. Without the id, both councils would write the same object name, and the second upload would silently replace the first. With it, both survive, and `relish council backups` shows which council wrote which. The test `two_recoveries_on_one_epoch_never_share_a_backup_object` builds exactly that pair and checks both payloads come back.
+
+Parsing the name uses a slice pattern:
+
+```rust
+let fields: Vec<&str> = body.split('-').collect();
+let [epoch, term, index, millis, id] = fields.as_slice() else {
+    return None;
+};
+```
+
+`let ... else` binds the five fields if the slice has exactly five elements, and runs the `else` block (which must leave the function) otherwise. An old `council-{millis}.backup` name doesn't parse, so the listing logs it and leaves it alone: no compatibility before 1.0, but no silent deletes either.
+
 A word on `_config` — see the leading underscore? In Rust, an unused function parameter is a warning, and warnings are errors in our CI. The underscore tells the compiler "I know, I'm not using it yet." We keep the parameter because sealing may grow config-driven options later, and changing the signature then would ripple through every caller. It's a small hedge, marked honestly.
 
 ### The honest cost
@@ -2285,6 +2634,8 @@ Recovery is deliberately manual. You run `relish council recover` against a *sto
 relish council recover --data-dir /var/lib/reliaburger/data \
     --from s3://my-bucket/council
 ```
+
+It tries the newest backup first. One that won't download, decode, unseal or parse, or whose state isn't at the position its name claims, gets a log line saying why, and recovery moves on to the next older one. It fails only when every backup fails, and then the error lists each one with its reason. The first version took `latest()` and gave up on the first bad blob, which is exactly the wrong moment to be fussy: when you're restoring a dead cluster, one torn upload shouldn't cost you the 23 good backups behind it. `relish council backups --from <url>` lists them newest first, and `--backup <name>` restores one by name and never falls back, because an operator who names a backup means that one.
 
 It refuses if a council voter still answers, unless you pass `--force` with a loud warning — recovering a cluster that still has a quorum would give you two clusters that both think they're in charge, which is the split-brain we spend the whole chapter avoiding. In a genuine total loss the check simply passes, because there's nothing left to answer.
 
@@ -2325,8 +2676,9 @@ A monotonic counter, stamped into the restored state:
 
 ```rust
 impl DesiredState {
-    pub fn enter_recovery_epoch(&mut self) {
-        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+    pub fn enter_recovery_epoch(&mut self, floor: u64) {
+        self.recovery_epoch = self.recovery_epoch.max(floor).saturating_add(1);
+        self.recovery_id = Some(RecoveryId::random());
         self.last_applied_log = None;
         self.last_membership = StoredMembership::default();
         self.endpoint_withdrawals
@@ -2335,7 +2687,7 @@ impl DesiredState {
 }
 ```
 
-Both recovery paths call it: the offline one that writes the snapshot `relish council recover` leaves behind, and the in-process one the tests use. The last line comes later in this section, in "Three more from the field".
+Both recovery paths call it: the offline one that writes the snapshot `relish council recover` leaves behind, and the in-process one the tests use. The `floor` and the `recovery_id` arrived later, in "Two recoveries, one epoch" below, and the last line in "Three more from the field".
 
 `saturating_add` is Rust's "add, but clamp at the maximum instead of overflowing." A plain `+` on an integer that's already at `u64::MAX` would panic in a debug build and wrap around in a release build — both wrong. Saturating arithmetic is the boring-correct choice for a counter that only ever goes up. Recover a cluster twice and the epoch reads 2; anything tagged with epoch 0 or 1 is demonstrably pre-recovery. It's cheap, it's monotonic, and it never lies.
 
@@ -2363,13 +2715,16 @@ A node holding epoch 0 that hears about epoch 1 *from anywhere* fences itself, f
 The state lives in a `tokio::sync::watch` channel shared by the transport, the council node and the runtime. Moving between states goes through `send_if_modified`, which hands you a mutable reference to the current value inside a closure and only wakes the subscribers if the closure returns `true`:
 
 ```rust
-pub fn observe_peer_epoch(&self, peer_epoch: u64) -> bool {
+pub fn observe_peer(&self, peer: RecoveryClaim) -> bool {
     let was_fenced = self.is_fenced();
-    self.state
-        .send_if_modified(|current| fence_if_newer(current, peer_epoch));
+    self.state.send_if_modified(|current| {
+        fence_if_newer(current, peer.epoch) || split_if_conflicting(current, peer)
+    });
     !was_fenced && self.is_fenced()
 }
 ```
+
+(This is today's version. It took an epoch alone at first; the next-but-one subsection explains the `RecoveryClaim` and the second check.)
 
 In Go you'd reach for a mutex around a struct and a separate condition variable to tell the watchers. Here the channel is both. The closure runs while the channel's internal lock is held, so two RPC handlers learning about epoch 1 at the same moment can't interleave a half-made update, and nobody gets woken for a no-op.
 
@@ -2381,7 +2736,51 @@ And chasing that one turned up a fourth, which had nothing to do with recovery. 
 
 The last piece is seeing it. One node's council status is only that node's opinion, and a split brain looks perfectly healthy from either half. That was the "both report healthy" part of the report. So `relish council status`, the header `relish status` now prints, and `relish wtf` all ask *every* node, through the relay, and compare. Two serving epochs, two leaders or a fenced node is critical, and each finding names the nodes and the way back.
 
-Is the fence perfect now? No, and the manual says so. An old voter only learns of the new epoch from a node that holds it. Bring two old voters back where they can see each other but not the recovered side, and they have nothing to learn from. That's why the manual's advice after `council recover --force` is blunt: re-enrol the old voters before you start them. If you don't, `relish wtf` will tell you, loudly.
+Is the fence perfect now? No, and the manual says so. An old voter only learns of the new epoch from a node that holds it. Bring two old voters back where they can see each other but not the recovered side, and they have nothing to learn from. That's why the manual's advice after `council recover` is blunt: re-enrol the old voters before you start them. If you don't, `relish wtf` will tell you, loudly.
+
+### Two recoveries, one epoch
+
+The 0.2.1 audit (#694) found four more holes in that story, all in the parts we'd been proudest of.
+
+The first was the epoch itself. A new epoch was the restored state's epoch plus one. Recover survivor R to epoch 1, and old voter A fences itself at 1. Now an operator, perhaps a different one, recovers A from its own data directory. A's stores hold the state from epoch 0, so A lands on epoch 1 as well. Two councils, one epoch, and the fence admits a peer at an equal epoch. Neither fences the other. The same happens when two survivors are recovered independently, or a stale backup is restored twice.
+
+Two fixes, because there are two ways in. A's own fence record already knew about epoch 1, and recovery moved the record aside without reading it. So `recover_data_dir` now reads it first and passes it to `enter_recovery_epoch` as the `floor`: the new epoch is above the restored state's, the record's and the epoch that fenced it. A record that says the node was fenced is also refused outright unless you pass `--force`, because recovering a replaced council's stores starts a rival.
+
+That covers the case where the node knew. When neither node knew (two survivors, two operators, no contact), they really do land on the same epoch, and nothing about the number can tell them apart. So every recovery also draws a random 128-bit id:
+
+```rust
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct RecoveryId(pub u128);
+
+impl Serialize for RecoveryId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+```
+
+This is the first time we've written `Serialize` by hand instead of deriving it. A derived impl would write the `u128` as a JSON number, and a 128-bit integer doesn't survive a JavaScript `JSON.parse` (it rounds to a 53-bit float), which is how the dashboard and anything else reading `relish council status --output json` would see it. So it's written as 32 hex digits, and the matching `Deserialize` impl checks the length before parsing. `Serializer` is serde's trait for an output format; our impl doesn't know or care whether that's JSON, bincode for gossip, or redb's snapshot envelope.
+
+The id travels next to the epoch everywhere the epoch goes: in the snapshot, in the fence record, on every Raft RPC, in a `Fenced` refusal and in each node's gossip directory extension. A node that meets its own epoch with a *different* id moves to a fifth fence state, `Split { other_id }`, and tells the other side its own id so it fences too. Both halves stop. That sounds harsh, and it's meant to: neither side can know which recovery the operator meant to keep, and guessing wrong loses writes. `relish council status` shows `1 split`, `relish wtf` raises a critical finding, and the way out is the `--force` path above: recover the side you're keeping (its record says it's fenced, so it lands above the split epoch) and re-enrol the other. `RecoveryClaim::conflicts_with` treats an unknown id as no conflict, which is what keeps epoch 0 (no recovery, no id) and a node that only knows a newer epoch by number from tripping it.
+
+The second hole was the guard on `council recover`. It asked the *local* agent whether a live voter was visible. But the node has to be stopped before recovery can run, so nothing ever answered, and the check passed every time. `live_council_voter` had been reachable only from its own tests. The manual even admitted it. Now relish reads the voter set from the recovery source (the data directory's last membership, or the backup's) and asks each voter's `/v1/health`, which says `council_voter: true` on an unfenced voter. It refuses, naming the voter, while any of them says yes. A voter that doesn't answer counts as gone; one that answers with something relish can't read refuses too, and so does a source with no voters to ask. A guard that can't tell is not a guard, so it fails closed. The probe skips certificate checks, which looks alarming until you notice the worst a spoofed answer can do is make recovery refuse.
+
+The third was the five seconds. A restarted voter served Raft once five seconds had passed since the *process* started, whatever gossip had shown it, and gossip only comes up a few seconds into that. Old voters that could reach the recovered node but heard from it late would elect a leader at epoch 0, acknowledge writes, and then fence themselves and lose them. The window now opens when gossip has joined and completed its first push-pull table exchange (the Mustard node publishes that on a `watch` channel), stays open for two anti-entropy intervals so a peer that missed every piggybacked update still reaches us, and closes early only when every peer the node's persisted membership names has advertised a claim. `[cluster] recovery_probe_window_secs` lets an operator stretch it on a slow network.
+
+Testing a twenty-second window in real time would make a slow test, and testing it with `tokio::spawn` and paused time is a known trap: auto-advance can skip past a spawned task's work. So the supervisor is an `async fn` the test polls itself:
+
+```rust
+let (rig, supervisor) = rig(probing_fence(None));
+tokio::pin!(supervisor);
+run_for(&mut supervisor, Duration::from_secs(120)).await;
+assert_eq!(rig.fence.snapshot().state, FenceState::Probing);
+```
+
+`tokio::pin!` pins the future to the stack so we can poll it through `&mut` again and again, and `run_for` races it against a `sleep` in a `select!`. With `#[tokio::test(start_paused = true)]`, the runtime jumps the clock forward whenever everything is waiting, so two minutes of probing take microseconds. A future is just a value in Rust, and nothing runs it until something polls it, which is what makes this possible. In Go, a goroutine runs whether you watch it or not.
+
+The fourth was a one-liner. The supervisor set `recorded = current` even when `persist()` failed, so after a disk-full event the fence was never retried, and the next restart brought the node back unfenced. It now updates `recorded` only after a write lands, retries every five seconds, and keeps the error where `relish council status` and `relish wtf` can show it. Writing that test turned up a sibling: the supervisor assumed the fence it started with was already on disk, but a Raft RPC can fence or adopt a node before the supervisor's task first runs. It now writes once on its first pass.
+
+The gated tests replay the audit's scenarios on real transports and real data directories. `recovering_two_survivors_independently_fences_one` recovers two survivors of one council separately, watches them meet and both fence as a split, refuses the plain re-recovery of a fenced directory, and shows that `--force` leaves exactly one council serving. `slow_gossip_restart_never_acknowledges_on_the_old_epoch` brings two old voters back first, keeps the recovered node down for eight seconds (past the old window), and checks that neither old voter acknowledges a single write before it hears about epoch 1.
 
 ### Three more from the field
 
@@ -2471,20 +2870,79 @@ A resigning *leader* is the hard case, and it's where openraft 0.9 fought us.
 
 openraft 0.9 has no graceful leadership transfer. You cannot say "hand off to node 2 and step down." The self-healing planner worked around this by making "never remove the leader" an absolute rule and leaving the transfer seam for later. Later is now.
 
-The trick is to abuse the one lever openraft *does* give us: `trigger().elect()`, which forces a node to start a fresh election at a higher term:
+The trick is to abuse the one lever openraft *does* give us: `trigger().elect()`, which forces a node to start a fresh election at a higher term. A node can only trigger an election on itself, so the leader can't push anyone. Instead every voter's reconciler works out the same deposition target, a healthy voter that isn't under pressure itself, and that voter campaigns:
 
 ```rust
-if disk_pressured.contains(&self_id) {
-    if let Some(target) = pick_deposition_target(&voters, &health, self_id) {
-        council.raft().trigger().elect().await?;   // a healthy voter campaigns
-    }
-    return;   // never plan our own removal
+if let Some(leader) = current_leader
+    && leader != self_id
+    && disk_pressured.contains(&leader)
+    && pick_deposition_target(&voters, &health, leader, disk_pressured) == Some(self_id)
+{
+    council.raft().trigger().elect().await?;   // the chosen voter campaigns
+    return;
 }
 ```
 
-A follower campaigning at a higher term deposes the current leader by the normal rules of Raft — the leader sees a higher term and steps down. So a pressured leader picks a healthy voter, tells it to campaign, and gets demoted to an ordinary follower. Once it's an ordinary follower, the *new* leader's planner sees it as a pressured voter and replaces it with the follower path above. No new consensus primitive, no fork of openraft, just Raft's own term rules pointed at a useful outcome.
+A follower campaigning at a higher term deposes the current leader by the normal rules of Raft: the leader sees a higher term and steps down. Once it's an ordinary follower, the *new* leader's planner sees it as a pressured voter and replaces it with the follower path above. No new consensus primitive, no fork of openraft, just Raft's own term rules pointed at a useful outcome.
 
-Before building anything on this, we verified it actually works against openraft 0.9 in a gated test: elect a leader, make a healthy follower campaign, and assert the term advances and leadership moves. It does. Had it not, the fallback was an openraft version bump — a wire-and-storage compatibility risk we'd have flagged before taking. It held, so we didn't have to.
+Before building anything on this, we checked the lever against openraft 0.9 in a gated test: elect a leader, make a healthy follower campaign, and assert that the term advances and a single leader settles. It does. Had it not, the fallback was an openraft version bump, a wire-and-storage compatibility risk we'd have flagged before taking.
+
+Read that assertion again, though. It says *a* leader settles, not a *different* one. For a long time this chapter claimed the test showed leadership moving. It didn't, and the difference bit us.
+
+### Deposed is not replaced
+
+Deposing a leader only removes it. Who wins the election that follows is Raft's call, and Raft gives its vote to the most up-to-date log. On a busy cluster that's usually the old leader's: it wrote the newest entries, and a follower that campaigns a few milliseconds before receiving the latest one has the shorter log. The old leader and the other follower both refuse it. Its higher term still deposes the leader, and then the old leader's own election timer fires, it campaigns with the longest log, and it wins. The term went up, nothing moved.
+
+The cron test in chapter 17 hit exactly this (#646), and its fix pointed at the production one (#755). openraft exposes a runtime switch, `raft.runtime_config().elect(false)`, that stops a node starting elections on its own timer. It still votes, still replicates, and still leads if it's the leader. It just never campaigns. So a node that must give up leadership *holds its elections* first, and the only voters left in the race are the ones we want.
+
+Holding forever would be its own outage, so the hold is a little state machine with two ways out. The pure part is one function:
+
+```rust
+pub fn hold_ends(self_id: u64, current_leader: Option<u64>, now: Instant, until: Instant) -> bool {
+    current_leader.is_some_and(|leader| leader != self_id) || now >= until
+}
+```
+
+Another voter leads, so the handover worked and this node may campaign again. Or the deadline passed (30 seconds), so nobody else could win and the council needs this node back in the race. `Option::is_some_and` runs a test on the value if there is one and returns `false` for `None`, so "some other node leads" fits in one expression.
+
+The impure part lives in `ElectionHold`, which `CouncilNode` owns. It keeps the deadline in a `tokio::sync::watch` channel rather than behind a mutex:
+
+```rust
+pub(crate) fn hold_until(&self, until: Instant) {
+    let mut started = false;
+    self.until.send_modify(|held| {
+        started = held.is_none();
+        *held = Some(held.map_or(until, |current| current.max(until)));
+        self.raft.runtime_config().elect(false);
+    });
+    if started {
+        tokio::spawn(release_when_settled(/* ... */));
+    }
+}
+```
+
+`send_modify` runs the closure while it holds the channel's write lock, and the release task flips elections back on inside `send_if_modified` under the same lock. So a hold and a release can't interleave and leave elections switched on with a hold in place. The closure mutates `started`, a local outside it: Rust lets a closure borrow a local mutably as long as nothing else touches it until the closure is gone, and the compiler checks that for us. A repeated hold only pushes the deadline out (`max`), and only the first one spawns the release task, which waits on the Raft metrics watch and on the deadline, whichever moves first.
+
+The reconciler renews the hold on every tick while the pressured node leads *or nobody does*:
+
+```rust
+if pressured_voter_holds(
+    self_id,
+    current_leader,
+    disk_pressured.contains(&self_id),
+    pick_deposition_target(&voters, &health, self_id, disk_pressured).is_some(),
+) {
+    council.hold_elections_until(now + HANDOVER_HOLD);
+}
+```
+
+That "or nobody does" matters. The follower's campaign and the leader's tick race each other, and if the follower deposes the leader first, the leader is no longer a leader on its next tick. It still has to hold, because the election it must not win is the one happening right now. And the hold only starts when there's a successor that could lead and isn't under disk pressure itself. Three pressured voters holding each other's elections would be a council with no leader at all, so `pick_deposition_target` now skips pressured voters too.
+
+The admin endpoint got the same treatment. `POST /v1/cluster/elect` used to make the node that received it campaign once and report "election triggered", whoever won. Now the receiving voter first asks the leader to hold its elections (a forwarded call carrying the caller's own credential, so the leader repeats the admin check), then campaigns every one and a half leader leases until someone other than the old leader leads, and answers with who that is. Usually it's the node you asked. If another voter's log is longer, Raft picks that one instead, and that's still a handover. Sent to the leader itself, the request is refused: a leader can't campaign itself out of office.
+
+The new tests check the thing that matters, the identity of the next leader, not the term. A unit test builds the #646 situation on purpose: one follower misses an entry and campaigns at a higher term with the shorter log. Without the hold, the old leader wins back leadership on every run; with it, the up-to-date follower wins on every run. A gated test does five handovers in a row while a writer hammers whoever leads, and asserts each one moves leadership and no old leader ever leads at a later term. With the hold switched off, its first round never completes: under constant writes the old leader wins every election for 20 seconds straight.
+
+Is there anything here a reconciler timeout could abandon, the way #758 found a membership change left half done? No. `trigger().elect()` returns as soon as the campaign starts, and the hold is local state with its own deadline, so a slow tick leaves nothing half applied. A deposition in the middle of a membership change is #758's other case, a leader failing over between the two steps, and the new leader finishes it.
 
 ### Getting the signal to the person who can act on it
 
@@ -2550,7 +3008,7 @@ On the testing side, `relish test` now waits out a short leader change. Lease cr
 
 ### Testing the whole thing
 
-The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler and watches leadership move off it, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
+The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler, keeps writes flowing, and watches leadership move off it without the old leader ever winning it back, and a second gated test drives the *whole* signal path: a pressured follower advertises its bit over real gossip, the leader's directory learns it, and the consumer turns it into the pressured-voter set — proving the production wiring, not just the mechanism it feeds. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
 
 The three field bugs each got a test that failed first. `security_state_init_never_replaces_an_initialised_security_state` applies a bootstrap on top of a state holding a token, and `a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file` starts a real node, bootstrap file and all, on a recovered directory. `durable_consumer_follows_a_recovered_council_and_still_refuses_the_replaced_one` drives a node's real durable consumer through the old council's generation, the recovered one, and the old one again. And `a_voter_that_never_snapshotted_recovers_from_its_committed_log` runs a one-voter council on durable, encrypted stores, writes fifty entries, stops it and recovers from what's on disk, with unit tests beside it for the commit point, the tail after a snapshot and the missing key.
 
@@ -2583,7 +3041,7 @@ Partition a worker from all council members:
 
 1. The worker's apps keep running (data plane is independent of control plane)
 2. The leader stops receiving StateReports from the worker
-3. After the stale timeout, the leader marks the worker as unschedulable
+3. After the stale timeout, the leader stops placing new work on the worker; its running replicas keep their placements for the stale-node grace, then move
 4. When the partition heals, the worker reports again and becomes schedulable
 
 This tests the key invariant: running workloads survive control plane disruption.
@@ -2658,7 +3116,36 @@ fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<
 
 The `*node` is worth a second look. `alive.iter()` yields `&NodeId`, borrowed references into the set, and `filter` hands its closure a reference to each item, so inside the closure `node` is a `&&NodeId`. `contains_key` wants a `&NodeId`, and one `*` peels off the outer layer. At the end, `.cloned()` turns the surviving `&NodeId`s into owned `NodeId`s so they can live in a new set. In Go you'd write the loop and never think about it; in Rust the layers of borrowing are spelled out, which is noisier but means you can't accidentally keep a pointer into a set someone else is about to change.
 
-What still moves a replica is evidence: a node that's dead in gossip, one whose reports went stale, or one that reported itself not ready or unable to enforce what the app needs. Silence while the post is still arriving isn't evidence.
+What still moves a replica is evidence: a node that's dead in gossip, one whose reports have been stale for a while, or one that reported itself not ready or unable to enforce what the app needs. Silence while the post is still arriving isn't evidence.
+
+"For a while" is new in 0.2.1, and it fixed two bugs pointing in opposite directions. A node can be alive in gossip while its reports have stopped: the soak has caught report workers stalling for over a minute while the node and its workloads carried on. The scheduler's cache only holds nodes with a fresh report, so the stale node simply wasn't in it, and `placement_holds` ended in `cache.get_node(..).is_none_or(..)`: no entry, so the placement holds. Forever. Its daemon copies, meanwhile, were dropped at once, because a daemon set was re-planned over the eligible nodes, and a node missing from the cache isn't eligible.
+
+Which is right? Both have a case. Moving at once duplicates a replica just because its reporter wedged, the lesson of #423. Holding forever means a node whose agent died quietly keeps its replicas off the cluster for good. We split the difference (D28): a stale node's placements hold for a grace period, `[reporting_tree] stale_node_grace_secs`, five minutes by default, and then move. Daemon sets get the same rule. The aggregator already knew when it last heard from each node; it now publishes when each stale node went stale, and the leader turns that into the set of *lapsed* nodes:
+
+```rust
+fn lapsed_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState, grace: Duration)
+    -> HashSet<NodeId>
+{
+    let now = tokio::time::Instant::now();
+    alive
+        .iter()
+        .filter(|node| reports.stale_nodes.contains(*node))
+        .filter(|node| {
+            reports
+                .stale_since
+                .get(*node)
+                .is_some_and(|since| now.saturating_duration_since(*since) >= grace)
+        })
+        .cloned()
+        .collect()
+}
+```
+
+A placement on a lapsed node no longer holds; everything else about "holds" is unchanged. Two details. The clock is the leader's own monotonic `Instant`, never anything a node sent, for the same reason the aggregator ignores report timestamps. And a node this leader has never heard from counts from when the leader started listening, so a fresh leader gives every node the full grace instead of moving replicas off nodes whose first report simply hasn't arrived. `saturating_duration_since` returns zero rather than panicking if `since` is somehow in the future.
+
+For a daemon set the pass now keeps the committed copies on nodes it can't judge yet (stale within the grace, suspect, or unheard) and counts them in what the set wants, so it stays converged instead of dropping them. `a_daemon_on_a_stale_node_is_held_then_dropped_like_fixed_replicas` checks both halves.
+
+The grace meets #692's node-by-node rollout in one place. The rollout releases a new spec to one node at a time, waiting on the first node that hasn't converged. A stale node can't converge, so it used to hold the rollout up for as long as its reports stayed away. Once its grace runs out its replica moves and the rollout carries on, which `a_rollout_waiting_on_a_stale_node_moves_on_after_the_grace` pins.
 
 Neither is suspicion. The 0.1.1 tour recording showed node-2's frontend stopped and all three frontends on node-1 after node-3 went away, and the scheduler moved a replica for the same kind of reason in one more place: it only kept placements on nodes gossip called `Alive`. A `Suspect` node is one that missed a probe. SWIM gives it the suspicion timeout (five seconds) to refute that, and a three-node cluster that just lost a member has no third node left to relay an indirect probe, so one slow ack on a loaded laptop is enough to be suspected. The pass now takes the suspect set as well, and a placement on a suspect node holds until gossip declares it dead. Rescheduling a dead node's replicas waits those five seconds longer. That's the price, and we'd rather pay it than stop a healthy replica over a late packet.
 

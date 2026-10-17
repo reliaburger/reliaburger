@@ -26,6 +26,20 @@ fn secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup() {
     qualify_process_catalogue("jobs");
 }
 
+/// The process-workloads group's two job cases, by name. The group's app
+/// case runs `bun testapp` from where `relish dev` installs it, which this
+/// fixture doesn't have, so it would only spend its whole case budget
+/// waiting for an instance that never starts.
+const PROCESS_JOB_CASES: &str =
+    "process_job_with_exit_zero_succeeds,failing_job_retries_then_fails";
+
+/// #742: the process-workloads group's job cases ran under Applications
+/// leases, which refuse jobs, so they failed at apply.
+#[test]
+fn secure_catalogue_process_job_cases_run_under_job_leases() {
+    qualify_process_catalogue(PROCESS_JOB_CASES);
+}
+
 /// A secure single-node Bun on the process runtime, with an admin token.
 struct SecureNode {
     bun: bun_process::BunProcess,
@@ -126,7 +140,8 @@ fn start_secure_process_node(root: &std::path::Path) -> SecureNode {
     }
 }
 
-fn qualify_process_catalogue(group: &str) {
+/// Run `filter` (a group, or exact case names) through `relish test`.
+fn qualify_process_catalogue(filter: &str) {
     let root = tempfile::tempdir().unwrap();
     let secure = start_secure_process_node(root.path());
     let bun = secure.bun;
@@ -145,9 +160,14 @@ fn qualify_process_catalogue(group: &str) {
         "json",
         "test",
         "--filter",
-        group,
+        filter,
         "--timeout",
-        if group == "jobs" { "90s" } else { "15s" },
+        match filter {
+            "jobs" => "90s",
+            // The job cases take about 5 s; a passing case ends early.
+            PROCESS_JOB_CASES => "30s",
+            _ => "15s",
+        },
     ]);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
@@ -157,7 +177,7 @@ fn qualify_process_catalogue(group: &str) {
                 String::from_utf8_lossy(&output.stderr)
             )
         });
-    if group == "jobs" {
+    if filter == "jobs" {
         if !output.status.success() {
             // The report says what timed out; Bun's log says why.
             let log = bun_process::bun_log_diagnostic(&bun.log_path);
@@ -180,6 +200,20 @@ fn qualify_process_catalogue(group: &str) {
         let leases =
             std::fs::read_to_string(node_data.join("node-test-leases.json")).unwrap_or_default();
         assert!(!leases.contains("node-jobs-"), "{leases}");
+        return;
+    }
+    if filter == PROCESS_JOB_CASES {
+        assert_success(&output, "qualify process-workloads job cases");
+        let results = report["results"].as_array().unwrap();
+        let names: Vec<&str> = results
+            .iter()
+            .map(|case| case["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, PROCESS_JOB_CASES.split(',').collect::<Vec<_>>());
+        for case in results {
+            assert_eq!(case["outcome"]["status"], "pass", "{case}");
+            assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
+        }
         return;
     }
     let case = report["results"]

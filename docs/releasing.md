@@ -39,6 +39,27 @@ The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
 systems is not promised. macOS builds are not yet Developer ID signed or
 notarised; don't equate an Actions build with clean-host acceptance.
 
+## Merge trains and their CI
+
+Each release collects its changes on a merge-train branch named after the
+version (`release-0-2-1`), and one gate PR takes the train into `main`. CI
+treats the three kinds of run differently ([which jobs run](testing.md#which-jobs-a-pull-request-runs)):
+
+- **A PR into the train** gets the light set: lint and format, minimum Rust,
+  portable Linux with the coverage floor, the demo app and the optimised
+  contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
+  except the three macOS shards: privileged Linux, cluster, acceptance,
+  upgrades and benchmarks. macOS runs in the queue and on the push.
+- **The merge queue** on `release-*` runs every job, macOS shards and heavy
+  suites included, on the batch merged onto the train, before any of it
+  lands. The queue requires the single check `ignored-test evidence`, which
+  waits for every other job and demands every evidence owner.
+- **The push to the train**, and the gate PR into `main` (its head is a
+  train), run everything again on the result.
+
+So nothing reaches a train, or `main`, without the full set having passed on
+that exact commit.
+
 ## Compiler baseline
 
 The source minimum is Rust 1.97 (`Cargo.toml`); CI checks the locked dependency
@@ -554,7 +575,7 @@ the real `curl … | sh` install against it on every host we advertise.
 4. **Soak it (V02)** on Apple silicon, in two tiers
    ([plan](plans/2026-09-25-v02-sustained.md), D3). Build and sign the soak
    bun first (D2). After each round of fixes, run the fast tier: every fault
-   kind and every special on the compressed schedule, in about 90 minutes.
+   kind and every special on the compressed schedule, in about an hour.
 
    ```sh
    scripts/release/qualify-sustained.sh --tier fast \
@@ -562,15 +583,16 @@ the real `curl … | sh` install against it on every host we advertise.
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1
    ```
 
-   Once the fast tier is clean on the final candidate, run the final tier
-   once: 8 hours on the full schedule, which catches slow accumulation.
-
-   ```sh
-   scripts/release/qualify-sustained.sh --tier final \
-     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT \
-     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1 \
-     --record docs/qualification/DATE-sustained-v02.md
-   ```
+   The final tier is 8 hours on the full schedule, which catches slow
+   accumulation. The release gate runs it once, as the job final below
+   (`qualify-jobs-sustained.sh --tier final`): that's the same soak with the
+   job campaign and a node fault added to each cycle, so it checks
+   everything the V02 final does, plus the jobs. All the final soaks fit in
+   one 8-hour slot that way (maintainer decision, 17 October 2026,
+   [#991](https://github.com/reliaburger/reliaburger/issues/991)).
+   `qualify-sustained.sh --tier final` still runs the V02 final on its own,
+   for example to separate a job problem from a cluster one, but it isn't a
+   release step.
 
    The record's second paragraph states the verdict. A fast run can only say
    "fast tier: clean"; only a clean final-tier run, 8 hours on the full
@@ -593,17 +615,17 @@ the real `curl … | sh` install against it on every host we advertise.
    Drain begins inside the final two minutes; tier and recovery budgets stay
    unchanged. Missing support or incomplete coverage fails instead of skipping
    a mode. A local smoke check is not staged fast/final acceptance, and global
-   storage bounds and the 12-hour job qualification remain #668.
+   storage bounds remain #668.
 
    **The 0.2.0 job gate (decision D18-C).** A release that claims sustained
    job throughput also needs the job qualification: #668's list on at least
-   three nodes, which is 12 hours at 1,158 accepted successes a second or
-   more (the rate of 100 million a day) plus headroom, with concurrent apps,
-   several resource profiles, worker and leader loss, delayed messages and
-   disk faults. #668's list said 24 hours; for 0.2.0 the maintainer set the
-   final tier at 12 (12 October 2026), still on the 3-node quickstart cluster
-   with every fault and at the default 1,390 a second, as a reasonable
-   approximation. `qualify-jobs-sustained.sh` runs it through the same soak,
+   three nodes, at 1,158 accepted successes a second or more (the rate of
+   100 million a day) plus headroom, with concurrent apps, several resource
+   profiles, worker and leader loss, delayed messages and disk faults. The
+   final tier runs 8 hours on the 3-node quickstart cluster, with every fault
+   and at the default 1,390 a second, and it is the release gate's only final
+   soak ([#991](https://github.com/reliaburger/reliaburger/issues/991),
+   above). `qualify-jobs-sustained.sh` runs it through the same soak,
    with the job campaign at the target load and a node-level fault in every
    cycle (inter-node delay, a full disk, slow fsync). Faults stay node-level in
    0.2.0 (D19-B): nothing targets an individual job. While slow fsync caps a
@@ -611,20 +633,23 @@ the real `curl … | sh` install against it on every host we advertise.
    are recorded as info, not failures: a turn that journals there is slow by
    construction (#972). Every other node's turns, and that node's once the
    window closes, still fail the tier.
-   The soak VMs forward ports over SSH (`LIMA_SSH_PORT_FORWARDER=true`,
-   recorded as a deviation). Lima 2.1's default gRPC forwarder leaks a
-   guest-agent socket per forwarded connection
-   ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210)), and at
-   the job tier's API rate the API node's guest agent grew to 1 GiB in six
-   hours, until the kernel killed Bun
-   ([#982](https://github.com/reliaburger/reliaburger/issues/982)).
+   The soak VMs use Lima's default gRPC port forwarder, the one quickstart
+   users run; the harness unsets `LIMA_SSH_PORT_FORWARDER` so a caller's
+   shell can't switch it. 0.2.0's soaks forwarded over SSH instead, because
+   Lima 2.1's gRPC forwarder leaked a guest-agent socket per forwarded
+   connection ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210))
+   and at the job tier's API rate the API node's guest agent grew to 1 GiB in
+   six hours, until the kernel killed Bun
+   ([#982](https://github.com/reliaburger/reliaburger/issues/982)). The
+   quickstart pins Lima 2.2.1, which fixes the leak
+   ([#983](https://github.com/reliaburger/reliaburger/issues/983)).
 
    ```sh
-   # About 90 minutes, compressed: every fault kind on every node.
+   # About an hour, compressed: every fault kind, every node, every special.
    scripts/release/qualify-jobs-sustained.sh --tier fast \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST
-   # 12 hours on the full schedule: the #668 run, on the final candidate.
+   # 8 hours on the full schedule, on the final candidate: the one final soak.
    scripts/release/qualify-jobs-sustained.sh --tier final \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
@@ -632,7 +657,12 @@ the real `curl … | sh` install against it on every host we advertise.
    ```
 
    `--target-rate` raises the rate above the default 1,390 a second (the
-   floor plus 20%); `--plan` prints the schedule without touching anything.
+   floor plus 20%); `--plan` prints the schedule without touching anything,
+   including the job controller's `job-runs` line: how many runs it expects,
+   the most it holds at once and its limit of 256. The controller holds a run
+   from admission until an hour after it drains (the candidate's retention),
+   and a soak whose load wouldn't fit refuses to start
+   ([#989](https://github.com/reliaburger/reliaburger/issues/989)).
    The record fails if any job runtime misses a fault kind, loses or
    double-counts an accepted outcome, or averages less than the target rate.
    Beside it, `DATE-job-qualification.jobs.json` holds the accepted rates,
@@ -652,7 +682,7 @@ the real `curl … | sh` install against it on every host we advertise.
    target counts only task-array writes. The gated memory checks are
    unchanged. Commit both files. Bounded job storage
    ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
-   pass before the 12-hour run: until it does, a full disk stops a worker
+   pass before the final run: until it does, a full disk stops a worker
    taking grants and fails the run.
 
    Before release, re-record the published throughput table on the candidate
@@ -685,41 +715,51 @@ the real `curl … | sh` install against it on every host we advertise.
    the warm sample, fds bounded) and a log-order swap when an instance moved
    nodes under the same name (fixed by #272: one adjacent swap in an
    unlabelled tail, the instance on different nodes in the status snapshots
-   either side). For 0.2.0 only, while soaks forward ports over SSH, a node
-   cut off from the host after a reboot or exec is a third (Lima never
-   retries a failed `ssh -O forward`; the cluster stays healthy from inside;
-   it goes with the SSH forwarder,
-   [#983](https://github.com/reliaburger/reliaburger/issues/983)), and the
-   job controller running out of its 256-run budget in a 12-hour final is a
-   fourth (fixed by
-   [#989](https://github.com/reliaburger/reliaburger/issues/989)). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
+   either side). For 0.2.0 only, a node cut off from the host by Lima's SSH
+   port forwarder was a third (gone with the forwarder, fixed by
+   [#983](https://github.com/reliaburger/reliaburger/issues/983)). The job
+   controller running out of its 256-run budget in 0.2.0's 12-hour job final
+   was a fourth for 0.2.0 only; it's fixed by
+   [#989](https://github.com/reliaburger/reliaburger/issues/989) and excuses
+   nothing after it. The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
 5. **Pull the plug.** Killing a process isn't a power cut: page-cache writes
    survive one and not the other. Run the power-cut and reboot qualifications
    ([what they prove](testing.md#pulling-the-plug)) on the candidate's commit,
-   against a disposable Lima VM. Never use the development VM; the drivers
-   refuse `reliaburger-test` by name. Create it from that VM's template with
-   4 vCPUs, 6 GiB of memory, 6 GiB of swap (so the linker isn't killed) and
-   only the checkout mounted, read-only. Then, from that checkout:
+   from the host:
 
    ```sh
-   for fixture in exporter leases backups; do
-     scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_VM \
-       --fixture "$fixture" --iterations 10 --record "power-cut-$fixture.md"
-   done
-   for i in $(seq 10); do scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_VM; done
-   for i in $(seq 10); do scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_VM; done
+   scripts/release/qualify-power-cut-reboot.sh --commit CANDIDATE_SHA --iterations 10 \
+     --record-dir docs/qualification/DATE-power-cut-reboot
    ```
+
+   Run it from an up-to-date checkout; the lanes themselves run from the
+   candidate's. It makes a clean detached checkout of the commit, creates a disposable
+   Lima VM `rb-pcut-<short sha>` from
+   [`power-cut-vm.yaml`](../scripts/release/power-cut-vm.yaml) (4 vCPUs,
+   6 GiB of memory, 6 GiB of swap so the linker isn't killed, and only that
+   checkout mounted, read-only), and checks all of that from inside the guest
+   before any lane runs. Then it runs the three storage fixtures
+   (`qualify-storage-power-cut.sh --fixture exporter|leases|backups`) and
+   the OCI and discovery reboot lanes (`qualify-oci-reboot.sh`,
+   `qualify-discovery-reboot.sh`) `N` times each, in that order, and stops at
+   the first failure. It writes each lane's record into the record directory
+   and a summary with each lane's runs and rule-of-three bound next to it, in
+   `docs/qualification/DATE-power-cut-reboot.md`, the shape of the
+   [16 October record](qualification/2026-10-16-power-cut-reboot.md). Fill in
+   anything the summary can't know (other load on the host, why this many
+   runs) before committing it. Afterwards it deletes the VM and the checkout;
+   `--keep` keeps both, and so does a failure, so the guest evidence survives.
+   It never touches the development VM: it refuses `--vm reliaburger-test`,
+   a VM that already exists and a dirty or wrong-commit `--worktree`. Ten
+   runs per lane take about half an hour on an M-series Mac, plus the first
+   boot's provisioning.
 
    Every iteration must pass. A row marked `PASS (VM start retried)` is the
    known Lima start failure straight after a forced stop, not a product
-   failure; any other failure is a release blocker. Record the commit, the
-   VM, each lane's runs and its rule-of-three bound in
-   `docs/qualification/DATE-power-cut-reboot.md`, as the
-   [11 October record](qualification/2026-10-11-power-cut-reboot.md) does.
-   Ten clean runs only rule out failure rates above 30%, so this catches a
+   failure; any other failure is a release blocker. Ten clean runs only rule out failure rates above 30%, so this catches a
    regression, not a rare race; a release that changes storage, locking or
    ownership (as #613 did) runs 25.
 
@@ -795,7 +835,7 @@ on a hosted Linux runner. Once a candidate is staged:
 gh workflow run soak.yml --ref main \
   -f staging_tag=staging-v0.1.0-RUN_ID-ATTEMPT \
   -f qualified_digest=QUALIFIED_DIGEST \
-  -f duration=90m -f schedule=compressed
+  -f duration=60m -f schedule=compressed
 ```
 
 `staging_tag` also takes the staged base URL. The job runs on `ubuntu-24.04`
@@ -929,10 +969,10 @@ Why these choices:
   runner builds aarch64 and `ubuntu-24.04` builds x86_64, at native speed and
   without `/dev/kvm`, which libguestfs (`virt-customize`) would want, and
   without the `qemu-user-static` a cross-architecture chroot would need.
-- **qcow2 with zlib, not zstd or raw.** Lima 2.1.0 converts qcow2 itself, but
-  registers no zstd decompressor for qcow2 clusters, and it decompresses a
-  `.zst` or `.xz` file by running the `zstd` or `xz` command, which macOS
-  doesn't ship. zlib qcow2 is what Ubuntu itself publishes, so the quickstart
+- **qcow2 with zlib, not zstd or raw.** Lima (2.1.0 to 2.2.1) converts qcow2
+  itself, but registers no zstd decompressor for qcow2 clusters, and it
+  decompresses a `.zst` or `.xz` file by running the `zstd` or `xz` command,
+  which macOS doesn't ship. zlib qcow2 is what Ubuntu itself publishes, so the quickstart
   treats the built image exactly like the stock one.
 - **Live archive, not a snapshot.** `snapshot.ubuntu.com` doesn't serve
   `ubuntu-ports` (arm64) anonymously, so the build installs the current

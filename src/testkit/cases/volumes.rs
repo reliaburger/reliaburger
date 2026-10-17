@@ -8,6 +8,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -116,18 +117,21 @@ pub fn cases() -> Vec<TestCase> {
             name: "volume_data_survives_instance_restart",
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(volume_data_survives_instance_restart),
         },
         TestCase {
             name: "volume_is_isolated_per_app",
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(volume_is_isolated_per_app),
         },
         TestCase {
             name: "volume_size_limit_is_enforced",
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(volume_size_limit_is_enforced),
         },
     ]
@@ -249,6 +253,7 @@ mod tests {
             pid: None,
             runtime_unknown: false,
             status_age_ms: None,
+            reason: None,
         }
     }
 

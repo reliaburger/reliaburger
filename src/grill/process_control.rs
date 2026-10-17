@@ -21,6 +21,10 @@ use crate::file_lock::{FileLock, FileLockError};
 
 mod prune;
 
+/// How many times `prepare` starts again after a concurrent forget removed
+/// the identity it was replacing.
+const PREPARE_ATTEMPTS: usize = 3;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessControl {
     root: PathBuf,
@@ -74,6 +78,23 @@ impl ProcessControl {
             return Err(io::Error::other("invalid process instance identity"));
         }
         Ok(self.root.join(&id.0))
+    }
+
+    // An inventory's read of an entry it enumerated, or none once it is gone.
+    // Only a forget or a prune removes an owner directory, and only a retired
+    // one, renamed away whole, so a vanished entry owned nothing (#877). A
+    // directory that is still there but unreadable is corrupt and refuses.
+    fn load_enumerated(&self, id: &InstanceId) -> io::Result<Option<OwnerRecord>> {
+        match self.load(id) {
+            Ok(record) => Ok(Some(record)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(self.directory(id)?) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                    _ => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn load(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
@@ -134,20 +155,8 @@ impl ProcessControl {
                             continue;
                         }
                         let instance_id = InstanceId(name);
-                        let record = match this.load(&instance_id) {
-                            Ok(record) => record,
-                            // `forget_retired` unpublishes a generation with
-                            // one rename, so one listed above and gone now
-                            // was forgotten in between: it has left (#924).
-                            Err(error)
-                                if error.kind() == io::ErrorKind::NotFound
-                                    && std::fs::symlink_metadata(entry.path()).is_err_and(
-                                        |absent| absent.kind() == io::ErrorKind::NotFound,
-                                    ) =>
-                            {
-                                continue;
-                            }
-                            Err(error) => return Err(error),
+                        let Some(record) = this.load_enumerated(&instance_id)? else {
+                            continue;
                         };
                         let launch = record.launch;
                         launches.push(super::RuntimeLaunch {
@@ -166,7 +175,39 @@ impl ProcessControl {
             .await
     }
 
+    /// The generation of `id`'s current launch, or `None` when it has none.
+    pub(crate) async fn generation(
+        &self,
+        id: &InstanceId,
+    ) -> io::Result<Option<super::RuntimeGeneration>> {
+        self.run(id, |this, id| {
+            match std::fs::symlink_metadata(this.directory(&id)?) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+                Ok(_) => this
+                    .load(&id)
+                    .map(|record| Some(super::RuntimeGeneration::process(&record.nonce))),
+            }
+        })
+        .await
+    }
+
+    /// Publish a new prepared generation of `id`, replacing a retired one.
     pub(crate) async fn prepare(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
+        // Forgetting the retired generation (#738, #850) can remove the
+        // identity while this waits for its locks, as when an app is deleted
+        // and applied again at once. Nothing owns it then, so prepare again
+        // from nothing, exactly as on a new node.
+        for _ in 1..PREPARE_ATTEMPTS {
+            match self.prepare_once(id, spec).await {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                result => return result,
+            }
+        }
+        self.prepare_once(id, spec).await
+    }
+
+    async fn prepare_once(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
         let previous_nonce = self
             .run(id, |this, id| {
                 match std::fs::symlink_metadata(this.directory(&id)?) {
@@ -176,6 +217,9 @@ impl ProcessControl {
                 }
             })
             .await?;
+        if spec.process.args.is_empty() {
+            return Err(io::Error::other("process launch has no command to run"));
+        }
         let spec = spec.clone();
         self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
@@ -199,11 +243,13 @@ impl ProcessControl {
                     instance_id: id.clone(),
                     spec,
                 },
+                gate: None,
             };
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     if previous_nonce.is_some() {
-                        return Err(io::Error::other(
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
                             "process generation disappeared before preparation",
                         ));
                     }
@@ -247,7 +293,10 @@ impl ProcessControl {
         .await
     }
 
-    pub(crate) async fn start(&self, id: &InstanceId) -> io::Result<()> {
+    /// Launch the prepared generation's owner. Returns its record once the
+    /// execution gate has reported about `exec` (#905), or once the owner
+    /// has retired, which it may do without recording a report.
+    pub(crate) async fn start(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
         // Cancellation can leave a blocking mutation queued behind another
         // operation. Bind its authority before queueing that mutation, so it
         // cannot activate a successor prepared by the intervening lock holder.
@@ -308,12 +357,24 @@ impl ProcessControl {
                     return Err(io::Error::other("process launch generation changed"));
                 }
                 match current.phase {
-                    OwnerPhase::Running { .. }
-                    | OwnerPhase::Retiring { .. }
-                    | OwnerPhase::Retired { .. }
+                    // The gate reports moments after activation. Waiting
+                    // for it means a binary that vanished after `create`'s
+                    // check fails this start, with the reason (#905).
+                    OwnerPhase::Running { .. } if launch_status.is_some() => {
+                        if current.gate.is_some() {
+                            return Ok(current);
+                        }
+                        // An owner that died before recording the report
+                        // never will. Its lock is free then, and start
+                        // reports what it always did: the owner ran.
+                        if process_owner::lock_owner(&directory).is_ok() {
+                            return Ok(current);
+                        }
+                    }
+                    OwnerPhase::Retiring { .. } | OwnerPhase::Retired { .. }
                         if launch_status.is_some() =>
                     {
-                        return Ok(());
+                        return Ok(current);
                     }
                     OwnerPhase::Cancelled => {
                         return Err(io::Error::other("process launch was cancelled"));
@@ -627,12 +688,10 @@ impl ProcessControl {
     }
 }
 
+/// What the owner's gate executes: the spec's own arguments. There is no
+/// stand-in for an empty command (#914); `prepare` refuses one.
 fn command(spec: &OciSpec) -> Vec<String> {
-    if spec.process.args.is_empty() {
-        vec!["sleep".into(), "86400".into()]
-    } else {
-        spec.process.args.clone()
-    }
+    spec.process.args.clone()
 }
 
 /// Recorded in full so the exec gate needs nothing from its own environment,
@@ -861,6 +920,7 @@ mod tests {
         OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             root: OciRoot {
                 path: "/".into(),
                 readonly: false,
@@ -872,6 +932,7 @@ mod tests {
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
@@ -1068,6 +1129,61 @@ mod tests {
             control.load(&running).unwrap().phase,
             OwnerPhase::Running { .. }
         ));
+    }
+
+    /// A forget for a retired generation that arrives after the identity
+    /// launched again must leave the successor alone (#850).
+    #[tokio::test]
+    async fn forgetting_a_stale_generation_keeps_the_successors_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__web-0__init-0".into());
+        assert_eq!(control.generation(&id).await.unwrap(), None);
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        let retired = control.generation(&id).await.unwrap().unwrap();
+
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        let successor = control.generation(&id).await.unwrap().unwrap();
+        assert_ne!(retired, successor);
+
+        assert!(
+            control.forget_retired(&id, Some(&retired)).await.is_err(),
+            "a stale generation forgot its successor"
+        );
+        assert_eq!(
+            control.generation(&id).await.unwrap(),
+            Some(successor.clone())
+        );
+        control.forget_retired(&id, Some(&successor)).await.unwrap();
+        assert_eq!(control.generation(&id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn owner_forgotten_after_enumeration_is_absent_from_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("executor-0".into());
+        control.prepare(&id, &spec()).await.unwrap();
+        assert!(control.cancel_unstarted(&id).await.unwrap());
+        assert_eq!(control.inventory().await.unwrap().len(), 1);
+        // An inventory has enumerated the owner while a forget, such as the
+        // one startup spawns for each retirement it finishes, deletes it.
+        control.forget_retired(&id, None).await.unwrap();
+        assert!(control.load_enumerated(&id).unwrap().is_none());
+        assert!(control.inventory().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_without_its_record_still_refuses_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("executor-0".into());
+        control.prepare(&id, &spec()).await.unwrap();
+        std::fs::remove_file(control.directory(&id).unwrap().join("owner.json")).unwrap();
+        assert!(control.load_enumerated(&id).is_err());
+        assert!(control.inventory().await.is_err());
     }
 
     #[tokio::test]

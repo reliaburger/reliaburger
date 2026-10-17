@@ -176,14 +176,17 @@ impl<G: Grill + Clone> OwnedRunner<G> {
     pub fn enforces_network_policy(&self, template: &crate::config::job::JobSpec) -> bool {
         let wants_policy = !egress_allow(template).is_empty()
             || allow_from(template).is_some_and(|sources| !sources.is_empty());
-        if !wants_policy {
-            return true;
-        }
+        !wants_policy
+            || (template.runtime != crate::config::job::JobRuntime::Process
+                && self.enforces_container_network_policy())
+    }
+    /// Whether this runner enforces a container task's egress allowlist and
+    /// `allow_from` before it starts: eBPF namespace policy, and a runtime
+    /// that puts each container in its own cgroup.
+    pub fn enforces_container_network_policy(&self) -> bool {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         {
-            template.runtime != crate::config::job::JobRuntime::Process
-                && self.namespace_policy.is_some()
-                && self.runtime.honours_cgroup_path()
+            self.namespace_policy.is_some() && self.runtime.honours_cgroup_path()
         }
         #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
         false
@@ -263,7 +266,11 @@ impl<G: Grill + Clone> OwnedRunner<G> {
 
     /// Compatible idle contexts already own their complete resource request.
     #[cfg(target_os = "linux")]
-    pub(crate) async fn reusable_capacity(&self, template: &crate::config::job::JobSpec) -> u32
+    pub(crate) async fn reusable_capacity(
+        &self,
+        template: &crate::config::job::JobSpec,
+        job: Option<&str>,
+    ) -> u32
     where
         G: 'static,
     {
@@ -281,7 +288,8 @@ impl<G: Grill + Clone> OwnedRunner<G> {
                 .resolve_template(template)
                 .await
                 .ok()
-                .and_then(|resolved| ExecutorKey::new(&resolved).ok());
+                .and_then(|resolved| ExecutorKey::new(&resolved).ok())
+                .map(|key| key.for_job(job));
             return pool.available_slots(key, profile.reservation).await;
         }
         let budget = self
@@ -602,20 +610,19 @@ impl OwnedRunner<AnyGrill> {
         self.runtime
             .supports_runtime(crate::grill::records::RuntimeKind::Process)
     }
-    /// A singleton preserves the configured runtime's existing workload contract.
-    pub fn supports_singleton_image(&self, template: &crate::config::job::JobSpec) -> bool {
+    /// Whether this runner runs a single container task, with CPU or memory
+    /// `limits` or without. A singleton preserves the configured runtime's
+    /// existing workload contract, so rootless runc runs one only without
+    /// limits it can't enforce.
+    pub fn supports_singleton_images(&self, limits: bool) -> bool {
         #[cfg(not(target_os = "linux"))]
-        let _ = template;
-        #[cfg(target_os = "linux")]
-        let limits = template.cpu.is_some() || template.memory.is_some();
+        let _ = limits;
         match &self.runtime {
             AnyGrill::Process(_) => false,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => !runtime.is_rootless() || !limits,
             #[cfg(target_os = "linux")]
-            AnyGrill::Mixed(runtime) => {
-                (!runtime.container().is_rootless() && template.image.is_some()) || !limits
-            }
+            AnyGrill::Mixed(runtime) => !runtime.container().is_rootless() || !limits,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => true,
         }
@@ -915,6 +922,11 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         .enforce_egress(&cgroup, egress_allow(template))
                         .await
                         .map_err(failed)?;
+                    // Another namespace's `allow_from` names the task by
+                    // its job, so bind the cgroup to that before it runs.
+                    if let Some(job) = task.run.as_ref().and_then(|run| run.job_name.as_deref()) {
+                        lease.bind_source(&cgroup, job).await.map_err(failed)?;
+                    }
                     if let Some(address) = self.runtime.container_ip(&id).await {
                         lease
                             .publish_address(address, &id.0, allow_from(template))
@@ -1638,6 +1650,34 @@ mod tests {
             String::from_utf8_lossy(&result.output.head),
             format!("{reason}\n")
         );
+    }
+
+    #[tokio::test]
+    async fn a_launch_the_runtime_refuses_refuses_the_task_without_a_retry() {
+        // An image task on a `--runtime process` node (#914), or a missing
+        // binary (#881), fails the same way on every attempt (#889).
+        for problem in [
+            crate::grill::LaunchProblem::NeedsContainerRuntime("busybox:1.36".into()),
+            crate::grill::LaunchProblem::BinaryNotFound("/missing".into()),
+            crate::grill::LaunchProblem::NoCommand,
+        ] {
+            let runtime = crate::grill::mock::MockGrill::new();
+            runtime.set_refused_launch(Some(problem.clone()));
+            let runner = OwnedRunner::new(runtime);
+            let result = runner
+                .run(
+                    &invocation(),
+                    Duration::from_secs(1),
+                    &CancellationToken::new(),
+                )
+                .await;
+            let AttemptOutcome::Refused { reason } = &result.outcome else {
+                panic!("{problem} was retried: {result:?}");
+            };
+            assert!(reason.contains(&problem.to_string()), "{reason}");
+            assert!(!result.outcome.is_retryable());
+            assert_eq!(runner.slots.lock().unwrap().len(), 256);
+        }
     }
 
     #[tokio::test]

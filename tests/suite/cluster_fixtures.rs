@@ -8,7 +8,8 @@
 //! is an error the fixture reports instead of reusing.
 use std::path::{Path, PathBuf};
 
-use crate::cluster_support::{clear_fixture_dir, mounts_beneath};
+use crate::cluster_support::clear_fixture_dir;
+use crate::cluster_support::fixture_dir::mounts_beneath;
 
 #[test]
 fn clearing_a_missing_fixture_dir_succeeds() {

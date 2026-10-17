@@ -30,16 +30,51 @@ impl Bootstrap {
 
 /// Validate existing bootstrap credentials without generating or changing them.
 pub fn existing(operation: &Operation) -> Result<Bootstrap, RelishError> {
-    load(operation, &operation.directory.join("security"))
+    load(
+        &operation.directory.join("security"),
+        first_node(operation)?,
+    )
 }
 
 /// Generate credentials once, or validate and reuse the complete existing bundle.
 /// Call this on the blocking pool before creating any VM.
 pub fn prepare(operation: &Operation) -> Result<Bootstrap, RelishError> {
-    let directory = operation.directory.join("security");
+    prepare_in(
+        &operation.directory.join("security"),
+        &operation.state.spec.name,
+        first_node(operation)?,
+    )
+}
+
+fn first_node(operation: &Operation) -> Result<&str, RelishError> {
+    operation
+        .state
+        .nodes
+        .first()
+        .map(|node| node.name.as_str())
+        .ok_or_else(|| failed("cluster has no bootstrap node"))
+}
+
+/// Generate a cluster's credentials into `directory` once, or validate and
+/// reuse the complete bundle already there.
+///
+/// The bundle holds the master key, the security bootstrap (with one
+/// administrator token), that token's plaintext and the first node's
+/// identity, all owner-only. `relish setup --quickstart` and
+/// `relish dev create` both build their clusters from it. `directory` must
+/// not exist yet or must hold a complete bundle for `first_node`; its parent
+/// must exist.
+pub fn prepare_in(
+    directory: &Path,
+    cluster: &str,
+    first_node: &str,
+) -> Result<Bootstrap, RelishError> {
     if directory.exists() {
-        return load(operation, &directory);
+        return load(directory, first_node);
     }
+    let parent = directory
+        .parent()
+        .ok_or_else(|| failed("bootstrap directory has no parent"))?;
     let mut builder = tempfile::Builder::new();
     builder.prefix("bootstrap-");
     #[cfg(unix)]
@@ -47,18 +82,9 @@ pub fn prepare(operation: &Operation) -> Result<Bootstrap, RelishError> {
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    let staging = builder.tempdir_in(&operation.directory)?;
-    let first = operation
-        .state
-        .nodes
-        .first()
-        .ok_or_else(|| failed("cluster has no bootstrap node"))?;
-    let mut init = crate::sesame::init::initialize_cluster(
-        &operation.state.spec.name,
-        &first.name,
-        staging.path(),
-    )
-    .map_err(|error| failed(&format!("failed to generate bootstrap identity: {error}")))?;
+    let staging = builder.tempdir_in(parent)?;
+    let mut init = crate::sesame::init::initialize_cluster(cluster, first_node, staging.path())
+        .map_err(|error| failed(&format!("failed to generate bootstrap identity: {error}")))?;
     let administrator = crate::sesame::token::create_token(
         "laptop-admin",
         ApiRole::Admin,
@@ -84,14 +110,50 @@ pub fn prepare(operation: &Operation) -> Result<Bootstrap, RelishError> {
     std::fs::File::open(&init.sealed_root_ca_path)?.sync_all()?;
     #[cfg(unix)]
     std::fs::File::open(staging.path())?.sync_all()?;
-    std::fs::rename(staging.path(), &directory)?;
+    std::fs::rename(staging.path(), directory)?;
     let _ = staging.keep();
     #[cfg(unix)]
-    std::fs::File::open(&operation.directory)?.sync_all()?;
-    load(operation, &directory)
+    std::fs::File::open(parent)?.sync_all()?;
+    load(directory, first_node)
 }
 
-fn load(operation: &Operation, directory: &Path) -> Result<Bootstrap, RelishError> {
+/// The identity files of a bootstrap bundle, in install order: the commit
+/// marker comes last, just as the local identity store writes it.
+pub const IDENTITY_FILES: [&str; 7] = [
+    "node.crt",
+    "node.key",
+    "node-ca.crt",
+    "root-ca.crt",
+    "meta.json",
+    "node.bundle.json",
+    "bundle.committed",
+];
+
+/// The private files node `index` needs from the bundle in `directory`, as
+/// (host source, guest destination) pairs under `/etc/reliaburger`. Every
+/// node gets the master key; only the first also gets the security
+/// bootstrap and the first identity. The others enrol with `relish join`.
+pub fn node_security_files(directory: &Path, index: usize) -> Vec<(PathBuf, String)> {
+    let mut files = vec![(
+        directory.join("master.key"),
+        "/etc/reliaburger/master.key".to_string(),
+    )];
+    if index == 0 {
+        files.push((
+            directory.join("security-bootstrap.json"),
+            "/etc/reliaburger/security-bootstrap.json".to_string(),
+        ));
+        for file in IDENTITY_FILES {
+            files.push((
+                directory.join("identity").join(file),
+                format!("/etc/reliaburger/identity/{file}"),
+            ));
+        }
+    }
+    files
+}
+
+fn load(directory: &Path, first_node: &str) -> Result<Bootstrap, RelishError> {
     let identity =
         crate::sesame::identity_store::load(&directory.join("identity")).map_err(|error| {
             failed(&format!(
@@ -101,12 +163,7 @@ fn load(operation: &Operation, directory: &Path) -> Result<Bootstrap, RelishErro
     let identity = identity.ok_or_else(|| {
         failed("existing bootstrap identity is missing; refusing to regenerate it")
     })?;
-    let first = operation
-        .state
-        .nodes
-        .first()
-        .ok_or_else(|| failed("cluster has no bootstrap node"))?;
-    if identity.node_id != first.name {
+    if identity.node_id != first_node {
         return Err(failed(
             "bootstrap identity belongs to a different cluster operation",
         ));

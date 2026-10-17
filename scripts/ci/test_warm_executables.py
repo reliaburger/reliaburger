@@ -2,6 +2,7 @@
 from pathlib import Path
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -82,6 +83,13 @@ class WarmExecutablesTests(unittest.TestCase):
     def test_a_binary_that_hangs_is_stopped_and_the_next_still_runs(self):
         self.binary("bun", body="exec sleep 30")
         relish = self.binary("relish")
+        # The short timeout applies to every binary. A brand-new file's first
+        # exec waits for macOS to assess it, which took 0.13 s idle and over
+        # 0.5 s with sibling builds exec'ing new files (#849), so the healthy
+        # binary would be stopped too. Assess it now, as the script itself
+        # would, so the timeout only has to cover its run.
+        subprocess.run([str(relish), "--help"], env=dict(os.environ, CALLS=os.devnull),
+                       check=True, timeout=120)
         status, output = self.run_warm(timeout=0.5)
         self.assertEqual(status, 0)
         self.assertIn("bun did not exit", output)
@@ -96,3 +104,23 @@ class WarmExecutablesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WarmExecutablesRecipe(unittest.TestCase):
+    """The Make recipe warms the binaries the suite then launches (#846)."""
+
+    def recipe(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import workflow_assembly
+        root = Path(__file__).resolve().parents[2]
+        return workflow_assembly.recipe((root / "Makefile").read_text(), "warm-executables")
+
+    def test_the_binaries_are_built_as_the_suite_builds_them_so_nextest_rebuilds_nothing(self):
+        # `cargo build --bins` resolves features without the dev-dependencies
+        # (proc-macro2's span-locations), so the suite's own build compiled
+        # the library and every binary a second time, about nine minutes of a
+        # macOS job, and replaced the binaries this step had just warmed.
+        lines = self.recipe()
+        self.assertEqual(lines[0], "$(CARGO) test --no-run")
+        self.assertFalse(any("build --bins" in line for line in lines))
+        self.assertIn("python3 scripts/ci/warm_executables.py", lines)

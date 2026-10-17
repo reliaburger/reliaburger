@@ -12,6 +12,7 @@ pub mod build_runner;
 pub mod capabilities;
 pub mod cluster_view;
 pub mod consumer_owners;
+mod control_fence;
 pub mod deploy_operations;
 pub mod diagnostics;
 pub mod discovery_owners;
@@ -19,7 +20,9 @@ pub mod disk_pressure;
 mod egress_owners;
 pub mod events;
 pub mod execution_budget;
+mod fence_file;
 pub mod gpu;
+mod grant_fence;
 pub mod health;
 pub mod host_paths;
 pub mod job_events;
@@ -230,6 +233,17 @@ pub enum BunError {
     /// Self-upgrade is not configured on this node.
     #[error("self-upgrade is not available on this node (no upgrade manager)")]
     UpgradesUnavailable,
+}
+
+impl BunError {
+    /// Why the runtime refused to launch, if a refused launch is what failed
+    /// (#881, #905).
+    pub fn launch_problem(&self) -> Option<&crate::grill::LaunchProblem> {
+        match self {
+            BunError::Grill(error) => error.launch_problem(),
+            _ => None,
+        }
+    }
 }
 
 /// The message for [`BunError::Capacity`]. A node's budget doesn't limit

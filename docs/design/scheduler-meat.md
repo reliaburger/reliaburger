@@ -101,11 +101,14 @@ Meat uses a four-phase placement pipeline for App scheduling:
 - Node matches all `required` placement labels.
 - Node is not cordoned or draining.
 - Namespace quota would not be exceeded by this placement.
-- For process workloads: node has the required binary in its allowlist.
+- For image workloads: node runs containers. An app that names an `image` (or has only a `command`, which runs in a root filesystem), or an init container that names its own image, needs a container runtime (#914). Each node reports `NodeCapabilities::containers`, true when its runtime is runc, Apple Container or the mixed runtime, and false on `--runtime process`, which refuses image apps. A missing capability report counts as false. If no ready node with the labels runs containers, the app is unschedulable with `UnplacedReason::NoContainerRuntime` ("no ready node has a container runtime to run its image"), checked before the other capabilities.
+- For process workloads: node has the required binary in its allowlist. Each node reports its `[process_workloads]` policy in its capability report (`NodeCapabilities::process`): whether it runs host processes at all (its runtime can, and `mount_isolation` is off, since a node refuses every host workload under mount isolation until #714 implements it) and its `allowed_binaries`. An `exec` app needs its path there, and a `script` app needs `/bin/sh`. `meat::filter::host_binary` is the one place that says which binary an app needs, so the node's own refusal and app validation agree with placement. A placement whose node stops allowing the binary moves.
+
+The filter checks every node against one `WorkloadRequirements` value built from the spec, and so do daemon placement and the leader's check that a committed placement still holds (`meat::filter::node_can_run`), so the three can't disagree.
 
 **Phase 2: Score.** Rank remaining candidate nodes. Spread comes first: a node running fewer replicas of the App always ranks above one running more, which provides failure-domain diversity. Among nodes running the same number, a weighted score (0-90, higher is better) decides:
 
-- **Bin-packing score (weight 50):** Prefer nodes with the least remaining allocatable resources after placing this workload. This maximizes density.
+- **Bin-packing score (weight 50):** Prefer nodes fuller in both CPU and memory after placing this workload, evenly. This maximises density (see Bin-Packing Algorithm below).
 - **Preferred label score (weight 20):** Nodes matching `preferred` labels receive a bonus.
 - **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise).
 - **Node stability score (weight 5):** Prefer nodes with longer uptime, scaled from the node's reported uptime (full marks at 24h).
@@ -225,7 +228,7 @@ pub struct ResourceRange {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PlacementConstraint {
     /// Hard constraints: all labels must match. If no nodes match,
-    /// the workload remains unscheduled and an alert fires.
+    /// the workload remains unscheduled and the leader records why.
     pub required: BTreeMap<String, String>,
 
     /// Soft constraints: matching nodes are preferred but non-matching
@@ -620,6 +623,22 @@ When an App spec with `replicas = 3` is submitted:
 
 The iterative per-replica approach (rather than computing all placements at once) ensures that spread accumulates correctly: the second replica of an App ranks a given node lower if the first replica was already placed there.
 
+#### Short Capacity
+
+When only some replicas fit, Meat places those and leaves the rest unplaced, as Kubernetes does (D29). Until 0.2.1 a fixed-size app got none of its missing replicas when any one of them didn't fit, with nothing recorded but a log line every tick.
+
+- **What's placed stays placed.** Each replica that found a node is committed and keeps its reservation in the pass's cache, so the apps planned after it see it.
+- **Nothing moves without somewhere to go.** A committed replica whose node no longer holds it (not ready, gone, lapsed) but that no other node can take stays committed where it was, and isn't counted as placed. Dropping it would retire a workload that may still be running and replace it with nothing; the self-upgrade revert test caught exactly that on a lone node that briefly reported not ready while restarting. It moves as soon as a node can take it.
+- **The reason is durable.** The pass returns, for every short app, how many replicas it placed, how many it wants, and the first hard constraint no node met (`UnplacedReason`, checked in filter order): no ready node, no node with the `required` labels, no node that runs containers for an image app, no node that can enforce the app's egress or DNS needs or run its host binary, or no room. The leader proposes `RaftRequest::Unschedulable`, which replaces `DesiredState::unschedulable`, only when that set changes (`unschedulable_update`), like `QuotaBlocked`. Every node serves it in its desired-app evidence (`GET /v1/diagnostics/apps`, field `unschedulable`):
+  ```
+  $ relish status
+  web (namespace prod) is unschedulable: placed 2 of 3 replicas: no node that can run it has room
+  ```
+  `relish wtf` raises an `unschedulable` warning with the same reason in place of the generic under-replication.
+- **Logged once per change.** The leader logs `scheduler: cannot place every replica of …` when an app becomes short or its count or reason changes, and `every replica of … is placed` when it clears, and records a `placement` event when it starts and when it clears. A steady short app writes nothing to the Raft log: the pass skips a decision that repeats the committed placements.
+- **Clearing.** When a node joins, frees room or gains the label or capability, the next pass places the rest and the reason goes. Deleting the app removes it in the same Raft entry.
+- **Not covered.** A daemon set wants exactly the nodes that can run it, so it is never short. An app its namespace quota blocks is reported as `quota_blocked` instead (§5.6). There is no Mayo alert for a short app yet; the event and `relish wtf` are how it shows.
+
 #### Required Labels (Hard Constraints)
 
 ```toml
@@ -627,7 +646,7 @@ The iterative per-replica approach (rather than computing all placements at once
 required = { zone = "us-east-1", gpu_model = "a100" }
 ```
 
-During the Filter phase, every node's `labels` map is checked. A node passes the filter only if for every key-value pair in `required`, the node has that exact label. This is a logical AND across all required labels. If zero nodes pass the filter, the App remains unscheduled, an alert fires via Mayo, and the event is logged.
+During the Filter phase, every node's `labels` map is checked. A node passes the filter only if for every key-value pair in `required`, the node has that exact label. This is a logical AND across all required labels. If zero nodes pass the filter, the replicas stay unplaced and the leader records why (see Short Capacity below).
 
 #### Preferred Labels (Soft Constraints)
 
@@ -645,22 +664,24 @@ When both `required` and `preferred` are specified, `required` is enforced first
 The bin-packing score for a candidate node is calculated as:
 
 ```rust
-fn bin_packing_score(node: &NodeCapacity, request: &Resources) -> f64 {
-    let remaining_cpu = node.allocatable.cpu_millis - node.allocated.cpu_millis - request.cpu_millis;
-    let remaining_mem = node.allocatable.memory_bytes - node.allocated.memory_bytes - request.memory_bytes;
-
-    let cpu_utilization = 1.0 - (remaining_cpu as f64 / node.allocatable.cpu_millis as f64);
-    let mem_utilization = 1.0 - (remaining_mem as f64 / node.allocatable.memory_bytes as f64);
-
-    // Weighted average: we want both dimensions to be full, penalize imbalance.
-    let avg = (cpu_utilization + mem_utilization) / 2.0;
-    let imbalance_penalty = (cpu_utilization - mem_utilization).abs() * 0.1;
-
-    ((avg - imbalance_penalty) * 50.0).clamp(0.0, 50.0)
+fn bin_packing_score(node: &SchedulerNodeState, resources: &Resources) -> u32 {
+    let cpu = utilisation_after(node.allocated.cpu_millicores, resources.cpu_millicores,
+                                node.allocatable.cpu_millicores);
+    let memory = utilisation_after(node.allocated.memory_bytes, resources.memory_bytes,
+                                   node.allocatable.memory_bytes);
+    let score = match (cpu, memory) {
+        (Some(cpu), Some(memory)) => {
+            let average = (cpu + memory) / 2;
+            average.saturating_sub(cpu.abs_diff(memory) / 10)
+        }
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => 50,
+    };
+    u32::try_from(score).unwrap_or(100)
 }
 ```
 
-Higher utilisation after placement is better (the node is more "full"). An imbalance penalty discourages placing CPU-heavy workloads on memory-heavy nodes and vice versa, which would leave stranded resources.
+`utilisation_after` is the percentage of the allocatable resource in use once the request lands, capped at 100. Higher utilisation after placement is better (the node is more "full"). The score is the average of CPU and memory utilisation, less a tenth of the gap between them: an imbalance penalty discourages placing CPU-heavy workloads on memory-heavy nodes and vice versa, which would leave stranded resources. The 0-100 result is weighted 50 in the total. It works in integer percentages so the score, and so the tiebreak, is the same on every platform. Until 0.2.1 (D30) the score used CPU alone, so a memory-heavy app spread over half-empty nodes rather than packing onto the one with memory to spare.
 
 #### Apps with Managed Volumes
 
@@ -671,7 +692,7 @@ A managed volume lives on one node, so placement follows the data. Desired state
 - A home node that is out of the cluster (Suspect, Left, Dead, or reaped from gossip) also makes the app wait. A `systemctl restart bun` announces Left, and a reboot goes Suspect then Dead, with the data still on disk (#423).
 - A home node that was decommissioned (`relish decommission-node`), or that no longer matches the labels, is dropped, and that replica goes through the normal pipeline. Both are the operator moving the app on purpose, and the app starts on a new, empty volume.
 
-The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that went stale, reported not ready, was cordoned or left the cluster is replaced elsewhere. For a fixed-replica app with a managed volume (`keeps_volume_home`), the placement holds whatever the node is doing until the node is decommissioned or the app's `required` labels stop matching it, including for each replica of a multi-replica app. Moving it would restart it on an empty volume while its data sits on the node it left.
+The same rule keeps a *running* volume app where it is. For an app without a volume, a placement on a node that reported not ready, was cordoned or left the cluster is replaced elsewhere, and so is one on a node whose reports went stale, once the stale-node grace runs out (§7.5). For a fixed-replica app with a managed volume (`keeps_volume_home`), the placement holds whatever the node is doing until the node is decommissioned or the app's `required` labels stop matching it, including for each replica of a multi-replica app. Moving it would restart it on an empty volume while its data sits on the node it left.
 
 While an app waits for a home that is out of the cluster, the council's per-app evidence (`GET /v1/diagnostics/apps`) carries `volume_home_away`, the node it waits for. `relish status`, `relish inspect` and the dashboard show it, and `relish wtf` reports a critical `volume-home-away` finding naming the node and the decommission command.
 
@@ -984,6 +1005,8 @@ fn reconcile_daemon_apps(&self, membership_event: MembershipEvent) {
 }
 ```
 
+In the code a daemon set's target is the eligible nodes plus the copies it holds on nodes the leader can't judge yet: a suspect node, a live node whose readiness hasn't arrived, and a stale node within its grace (§7.5). Those copies stay; once the node is judged gone or lapses, its copy is dropped.
+
 ### 5.6 Namespace Quota Enforcement
 
 Quotas are enforced at scheduling time, not at apply time and not retroactively. `relish apply` commits an over-quota app to desired state like any other; the leader's scheduling pass (`plan_scheduling_pass` in `src/cluster/orchestrate.rs`) seeds a `QuotaLedger` with every converged app's footprint, then runs this check before placing each unconverged app. An app that fails it gets no placement that pass, and the pass returns the `QuotaError` beside its placements (`PassPlan::quota_blocked`). The leader keeps those reasons in council state, `DesiredState::quota_blocked`, so any node can say why an app isn't running (see §7.3). The check runs again every pass, so the app places once the namespace has room, and its reason clears in the same pass. `over_quota_app_is_not_placed_and_the_pass_says_why` pins this contract. The check, in outline:
@@ -1058,7 +1081,7 @@ Admission caps sit in the replicated store (`src/meat/task_array_store.rs`, deci
 
 A run's trigger decides its class: `Cron` and `Hook` triggers are *triggered*, everything else is *bulk*. A cron `Fire` refused even with the headroom is recorded rather than failed: the cursor advances, the definition keeps `skipped: {minute, reason: capacity}` and a count, and the leader emits a `job-skipped` event. `control_state_stays_within_budget_at_the_global_cap` justifies 128: at the cap, with the largest template and saturated failure ranges, job state stays under 32 MiB (half a Raft frame) and one node's sync call under its 8 MiB body limit. 256 would not.
 
-Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop takes at most sixteen due schedules per tick and starts each tick after the last one it fired, so a long list takes turns.
+Definitions with no cron and no hook expire in the same deterministic `prune` that drops their last run (D22), unless an unsettled deployment still owns the name. The cron loop takes at most sixteen due schedules per tick and starts each tick after the last one it fired, so a long list takes turns. It reads the minute from the service's `CronClock`: the UTC wall clock in production, a shared manual clock in tests (`TaskArrayService::with_cron_clock`), so a test decides exactly when an occurrence comes round instead of waiting for a real minute (#748). Only cron firing uses it; registration baselines, retention and run timestamps stay on the wall clock.
 
 #### The task-array leader loop at scale
 
@@ -1144,7 +1167,7 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 | `resources.reserved_cpu` | `"500m"` | CPU reserved for system and Bun overhead on each node. |
 | `resources.reserved_memory` | `"512Mi"` | Memory reserved for system and Bun overhead. |
 | `resources.reserved_disk` | `"10Gi"` | Disk reserved for system use. |
-| `network.port_range` | `"10000-60000"` | Ephemeral port range for host port allocation. |
+| `network.port_range` | `{ start = 10000, end = 32767 }` | Host port range for container port allocation, below Linux's ephemeral range. |
 
 ---
 
@@ -1216,7 +1239,8 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 
 **Response:** Meat moves as little as it can.
 
-1. Only a placement on a node gossip no longer lists as `Alive` or `Suspect` is lost, or one on a node that reported itself not ready, not capable, or went stale. A `Suspect` node missed a probe and has the suspicion timeout to refute it; in a three-node cluster that just lost a member there is no third node to relay an indirect probe, so a loaded survivor can be suspected for a late ack. Its placements hold until gossip declares it dead (#346). A live node whose readiness report hasn't reached a new leader yet keeps its placements too (§7.2).
+1. Only a placement on a node gossip no longer lists as `Alive` or `Suspect` is lost, or one on a node that reported itself not ready or not capable, or whose reports have been stale for longer than the stale-node grace. A `Suspect` node missed a probe and has the suspicion timeout to refute it; in a three-node cluster that just lost a member there is no third node to relay an indirect probe, so a loaded survivor can be suspected for a late ack. Its placements hold until gossip declares it dead (#346). A live node whose readiness report hasn't reached a new leader yet keeps its placements too (§7.2).
+   - **Stale but alive (D28).** Gossip can list a node alive while its report worker is wedged; the soak has seen workers stall for over a minute. Its replicas may well still be serving, and replacing them at once would duplicate them for a stalled reporter (the #423 lesson). So a stale node's placements hold for `[reporting_tree] stale_node_grace_secs` (default 300) from the moment its reports went stale, then move. The aggregator publishes when each node went stale (`AggregatedState::stale_since`): its last report plus `stale_report_timeout_secs`, or for a member the leader has never heard from, the moment this leadership epoch started listening, so a new leader gives every node the full grace. Daemon sets follow the same rule: a stale node's copy is held for the grace, then dropped. Until 0.2.1 fixed replicas on a stale node held for good while its daemon copies were dropped at once. A managed-volume app still never moves (§5.1).
 2. Every placement that holds stays where it is. Meat places only the missing replicas.
 3. Before placing them, the pass sets each node's replica count for the App from the kept placements (reports can lag a new leader), so spread sends each replacement to the eligible survivor running the fewest replicas. No node ends up with more than `ceil(replicas / eligible nodes)` unless the others lack room.
 4. The survivor that gains a replica receives the same spec with a higher count. Its agent starts only the added replica beside the running ones; it rolls its replicas only when the spec changed in any other way, or when not every replica is running.
@@ -1229,7 +1253,7 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 **Response:**
 
 1. For each failed node's App instances, Meat attempts to reschedule to surviving nodes.
-2. If surviving capacity is insufficient, some replicas remain unscheduled. An alert fires immediately.
+2. If surviving capacity is insufficient, Meat places the replicas that fit and records each short app's reason (§5.1, Short Capacity): `relish status` and `relish wtf` show it, and the leader records a `placement` event. No Mayo alert fires yet.
 3. Rescheduling currently processes apps in a deterministic order (alphabetical by app id), not by remaining healthy replicas. Priority ordering by criticality — rescheduling the apps with the fewest remaining healthy replicas first — is **planned, not yet implemented**.
 4. Batch jobs on failed nodes are re-allocated as described in 7.1.
 
@@ -1329,8 +1353,8 @@ This fits comfortably within a typical server's memory. The 312 MB total Bun age
 
 Meat's scheduling loop is designed to consume < 15% of a single core at sustained throughput. At the 1,150 jobs/sec target:
 
-- Each scheduling decision involves: one Filter pass (~50us), one Score pass (~20us), one Select (~1us), one Raft commit (~200us for the leader's local append; replication is async for scheduling decisions that are not App deploys).
-- Total: ~270us per decision. At 1,150 decisions/sec = ~310ms of CPU per second = 31% of one core.
+- App placement is measured by `benches/scheduler.rs` (`make bench`). One leader pass placing 150 replicas (50 apps of 3) took about 29 ms on 1,000 nodes, about 190 µs per placement, and about 330 ms on 10,000 nodes, about 2.2 ms per placement, on the development laptop (an Apple silicon MacBook, October 2026). Filter and Score each walk every node for every replica, so the cost grows with the cluster. A converged pass, the one the leader runs every tick once everything is placed, took about 0.2 ms on 1,000 nodes and 1.7 ms on 10,000. The Raft commit comes on top, once per pass rather than per decision.
+- An earlier version of this section estimated ~270 µs per decision with nothing to measure it against. The measurement above is close at 1,000 nodes and an order of magnitude off at 10,000; App placement rates are far below the job rates below, so it fits the budget, but per-node work in Filter and Score is the place to look if large clusters need faster placement.
 - With core pinning at > 1,000 nodes, this would be isolated from other Bun tasks (core pinning is planned, not yet implemented — see Section 1).
 
 In practice, the batch model means most scheduling decisions are batch allocations (one per node per batch, not one per instance), so the actual decision rate for 100M jobs/day is closer to 50-200 allocation decisions per second, well within budget.
@@ -1394,6 +1418,8 @@ Key simulation test scenarios:
 - **Batch throughput:** Simulate 100,000 job instances across 100 nodes and verify allocation completes in < 1 second of simulated time.
 - **Autoscaler stability:** Feed a sinusoidal load pattern into the autoscaler and verify it does not flap (the smoothing window and cooldown prevent oscillation).
 - **Rolling deploy with failure:** Start a rolling deploy where the new version fails health checks on the third replica. Verify halt (without auto_rollback) and full revert (with auto_rollback).
+
+The simulator above is the design; what ships today are property tests over random clusters (`meat::scheduler::properties`, with proptest): placement never overcommits a node, spreads no more than `ceil(replicas / eligible nodes)` per node when every node has room, gives the same plan whatever order the nodes were inserted in, and a pass never places more CPU than a namespace's quota. The unit tests in `cluster::orchestrate` drive `plan_pass` directly, including the stale-node grace and short capacity (`scheduler_policy`), and a proptest there checks that a capacity refusal moves exactly the replicas it names (`a_refusal_moves_exactly_the_refused_replicas`).
 
 ### 10.2 Integration Tests
 
@@ -1566,10 +1592,23 @@ instance. `build_cluster_cache` adds both into the node's `allocated` total,
 so `reserve_commitments` only reconciles committed app placements and never
 counts an app twice. A placement can still lose the race to attempts that start
 after the pass: `try_acquire` doesn't queue, so the agent records a
-`CapacityRefusal` for that app and the next report carries it. The leader then
-stops treating the placement as held (`Liveness::keeps`) and places the replica
-elsewhere; a managed-volume app still waits for its home node. Refusals lapse
-after a minute or on the app's next successful deploy.
+`CapacityRefusal` for that app and the next report carries it. The refusal
+names the replica ordinals the node couldn't start (#971): a scale-up names
+only the replicas it tried to add, while a fresh deploy and a rolling or
+blue-green replacement name the node's whole share, since none of the new
+spec's replicas can run there. The leader stops treating those placements as
+held (`Liveness::keeps`) and places them elsewhere; the app's other replicas
+on that node stay where they run, and a managed-volume app still waits for its
+home node. With nowhere to go, a refused replica stays committed where it was,
+and the shortfall is logged once, when it starts or changes (§5.1).
+
+A refusal lasts until an admission of that app succeeds on the node, or the
+app is stopped or retired there (#967). A refused scale-up records the spec the
+node ran before again, since it started nothing, so the node's retry adds the
+same replicas in place instead of rolling the app, which would need room for
+every new replica beside the old one. When the leader moves the refused
+replicas away, the node's share is the spec it already runs: that deploy adds
+nothing, rolls nothing, and its successful admission clears the refusal.
 
 Workers persist control provenance (recovery epoch, leadership term, committed
 log index) and highest chunk generation. Task outcomes stream into checksummed

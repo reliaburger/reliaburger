@@ -61,7 +61,7 @@ be visible until we remove its race.
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-standard-clients` | `crane` against Pickle's TLS listener | Linux, with a pinned `crane`; PRs into `main`, `main` and nightly |
+| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make test-gpu`, `make test-s3` | Real NVIDIA hardware; a real S3 bucket | Manual |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
@@ -81,7 +81,13 @@ acceptance uses Linux VMs (V04 in the roadmap's [known gaps](../roadmap.md#known
 
 Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
-PR targets `main` or a release's merge-train branch (`release-*`), and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+Pull requests into a release's merge-train branch (`release-*`) run the light set:
+lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
+contract boundaries. Labelled `full-ci`, they run every heavy owner but not the
+macOS shards (the `train-full` selection). The merge queue on the train, the push to it and the gate PR
+into `main` run everything, including the three macOS shards
+([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
 holds a fixture for each of these rules.
@@ -105,6 +111,7 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 | `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix make test-s3` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
 | `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
+| All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
 
 `.github/workflows/v02-loops.yml` is the other long-running lane. It runs only when
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
@@ -255,8 +262,10 @@ shape for a new fixture whose caller can take an interpreter; use `install_scrip
 caller needs a single executable path.
 
 The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
-depends on `make warm-executables`, which runs each of them once before the suite
-([#722](https://github.com/reliaburger/reliaburger/issues/722)).
+depends on `make warm-executables`, which builds them with `cargo test --no-run`, as the
+suite will, and runs each of them once before the suite
+([#722](https://github.com/reliaburger/reliaburger/issues/722),
+[#846](https://github.com/reliaburger/reliaburger/issues/846)).
 
 ## Benchmarks and coverage
 
@@ -297,8 +306,10 @@ own script declaration. No prefix matching or generic alias can widen the bridge
 The seventeen original manual/subprocess classifications remain outside CI
 inventory, with the original policy visible in the generated matrix.
 
-`workflow_assembly.py` defines eleven literal owners and derives portable/full
-selection from trusted current workflow inputs. `workflow_adapter.py` preserves
+`workflow_assembly.py` defines eleven literal owners and derives light, portable,
+train-full or full selection from trusted current workflow inputs; only a pull request may
+qualify with less than full. The macOS owner runs as three hash-partition
+shards, and aggregation proves their lists cover every test exactly once. `workflow_adapter.py` preserves
 those commands and their complete selections. Ordinary nextest producers retain
 discovery and JUnit under one selector/environment plan. `completion.py` retains
 libtest discovery, selected-case completion and the actual child exit for owned
@@ -309,7 +320,11 @@ context cannot qualify CI.
 The archive builder publishes current successful archive/runtime digests before
 archived jobs execute. Aggregation requires those builder outputs, successful
 selected jobs and each producer's sealed output digest. Commit, run ID, attempt,
-host, owner command, inputs and payload bytes all belong to that context. Do not
+host, owner command, inputs and payload bytes all belong to that context. Commit,
+run ID and host must equal the aggregator's; the attempt may be earlier, because
+re-running only the failed jobs keeps the passed jobs' attempt-N outputs, and all
+owners of one job must share an attempt. An archived owner takes the builder's
+attempt from the digest-bound archive runtime, never later than its own. Do not
 reconstruct authority from artifact filenames or let a late report choose which
 owners should have run. Always retain whole-command failure as failure, even if
 all finite required assertions passed before the command failed elsewhere.
@@ -390,8 +405,17 @@ tmpfs still mounted, which `start_wired_node` failed to remove and then reused. 
   or killing it. Leadership can move under load, and a write to a follower returns
   `ForwardToLeader`.
 
-Older suites (`placement`, `cluster_task_arrays`, `council_disaster_recovery`) still use
-fixed blocks below the leased 27000–30000 range; keep new fixed ports out of that range.
+`placement`, `cluster_task_arrays` and `council_disaster_recovery` lease their blocks the
+same way (#744), and so does `cluster_gossip` (#840). Before that, three
+`cluster_task_arrays` tests shared one fixed block and two more shared another, so two runs
+of the binary at once (two worktrees, say) failed with "Address already in use" on the
+second run's gossip bind. `cluster_gossip` was the last `make test-cluster` suite on fixed
+ports: two nextest processes running it at once lost 4 of their 16 tests that way. A new
+multi-node test leases its ports like these. The two leader-loss tests in
+`owned_task_arrays` (`make test-linux`) were the last on fixed bases (24510 and 24610);
+they lease their three nodes' ports the same way and keep the nodes' data under their own
+fixture root (#852). A port that has to stay fixed keeps out of the leased 27000–30000
+range.
 
 The same rule covers any port a process gives up and binds again: a crash fixture's
 restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
@@ -415,6 +439,22 @@ failed rootless run leaked its `slirp4netns` helper: the helper names only its g
 inherited, including the lock the shared Linux test VM queues its users on, and it held
 that lock for an hour. `RootCleanup` now reads each node's runtime intents for those
 directories and kills whatever names them too.
+
+Cleanup also removes the root, mounts and all. A rootful Bun mounts a `reliaburger-identity`
+tmpfs for each workload beneath its volumes directory, and the mounts outlive Bun. Until
+#780 `RootCleanup` never removed the root, so every rootful run left its identity tmpfs
+mounted under `/tmp`. It now finishes with `clear_fixture_dir` from
+[`tests/support/fixture_dir.rs`](../../tests/support/fixture_dir.rs), the helper the
+cluster fixtures use, which unmounts everything beneath the root deepest first and then
+removes it. A root it can't remove fails a passing test; while a failed test unwinds, the
+error goes to stderr, because a second panic would abort the test binary.
+
+The owned-runc capacity harness in `tests/owned_runc.rs` had the same leak in a quieter
+form (#852). It handed its agent a volumes `TempDir` and dropped it once the agent task
+ended, and dropping a `TempDir` ignores a failed removal, so a mounted identity tmpfs
+stayed behind without a word. The harness now owns the directory for its whole life; its
+`Drop` stops the agent and API first, then calls `clear_fixture_dir` with the same
+panic-or-print rule.
 
 Cleanup must also stop at what the test owns. The scan reads every process on the host, and
 on a CI runner that includes the runner. Until #800 it killed the whole process group of any

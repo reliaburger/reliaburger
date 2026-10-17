@@ -395,13 +395,15 @@ impl ClusterSource {
             PickleError::ReplicationFailed(format!("cache verification failed: {error}"))
         })??;
 
+        // `peers` are the live nodes, so a blob none of them holds has no
+        // effective holder: the image is Lost (#697, design §7.3).
         let plan = plan_downloads(&digests, &local, catalog, peers, self.state.node_raft_id);
         if !plan.unavailable.is_empty() {
-            let missing: Vec<String> = plan.unavailable.iter().map(|d| d.to_string()).collect();
-            return Err(PickleError::ReplicationFailed(format!(
-                "no reachable holder for layers: {}",
-                missing.join(", ")
-            )));
+            return Err(PickleError::ImageLost {
+                repository: repository.to_string(),
+                digest: manifest.digest.clone(),
+                missing: plan.unavailable.len(),
+            });
         }
 
         pull_layers_parallel(

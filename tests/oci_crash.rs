@@ -11,9 +11,21 @@ use reliaburger::relish::client::BunClient;
 
 #[path = "support/bun_process.rs"]
 mod bun_process;
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
 #[path = "support/root_processes.rs"]
 mod root_processes;
 use bun_process::PortBlockReservation;
+
+/// Whether recovery left `state`'s instance retired. Once it has, the agent
+/// may already have asked the runtime to forget the instance (#738), which
+/// the runtime does only for a retired generation.
+fn retired_or_forgotten(state: Result<ContainerState, reliaburger::grill::GrillError>) -> bool {
+    matches!(
+        state,
+        Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })
+    )
+}
 
 struct Node {
     child: tokio::process::Child,
@@ -136,8 +148,12 @@ impl Node {
 /// keeps its veth pair and /32 host route, and the next test's first
 /// container gets the same address and fails with "File exists". Drop can't
 /// await or return errors, so the teardown is synchronous and best-effort:
-/// nothing in it may panic, since a second panic during unwinding aborts the
+/// nothing in it may panic while unwinding, since a second panic aborts the
 /// test binary and hides the first.
+///
+/// Last of all it unmounts everything beneath the root and removes it. A
+/// root that can't be removed fails a passing test; during unwinding it's
+/// reported on stderr instead.
 struct RootCleanup(PathBuf);
 
 impl Drop for RootCleanup {
@@ -164,11 +180,21 @@ impl Drop for RootCleanup {
             retire_leaked_kernel(&node);
         }
         let suffix = root_suffix(&self.0);
-        if suffix.is_empty() {
-            return;
+        if !suffix.is_empty() {
+            remove_leaked_cgroups(&suffix);
+            remove_leaked_networks(&suffix);
         }
-        remove_leaked_cgroups(&suffix);
-        remove_leaked_networks(&suffix);
+        // Last, once nothing runs from the root: a rootful Bun's identity
+        // tmpfs stay mounted beneath it after the process dies, and while
+        // they do the root can't be removed (#780).
+        if let Err(error) = fixture_dir::clear_fixture_dir(&self.0) {
+            let message = format!("test cleanup: cannot remove {}: {error}", self.0.display());
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
     }
 }
 
@@ -547,14 +573,34 @@ command = ["/bin/busybox", "sh", "-c", "printf 'second\\n' >> /work/second"]
     config
 }
 
+/// How long a fixture waits for a workload to write its marker.
+///
+/// A first deploy here starts two init containers and the main one, and
+/// gives each its own network: about forty privileged commands, each run by
+/// a freshly spawned process owner. In the Lima VM that took about 9 s, but
+/// 41 to 58 s while the host was saturated, so the old 25 s often failed
+/// the clustered test on its first deploy (#908). This only bounds
+/// how long a broken deploy takes to report.
+const FIXTURE_WAIT: Duration = Duration::from_secs(90);
+
 async fn wait_file(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(25), async {
+    tokio::time::timeout(FIXTURE_WAIT, async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("fixture never reached {}", path.display()));
+    .unwrap_or_else(|_| {
+        // The Bun log of the test root the file lives in says why the
+        // workload never got there; without it the failure is a bare path.
+        let log = path
+            .ancestors()
+            .map(|directory| directory.join("bun.log"))
+            .find(|log| log.exists())
+            .and_then(|log| std::fs::read_to_string(log).ok())
+            .unwrap_or_default();
+        panic!("fixture never reached {}\nbun.log:\n{log}", path.display())
+    });
 }
 
 /// An app name unique to this test root.
@@ -575,6 +621,55 @@ fn root_suffix(root: &Path) -> String {
         .unwrap_or_default()
         .trim_start_matches('.')
         .to_ascii_lowercase()
+}
+
+/// Mount workload identity tmpfs beneath `root` the way a rootful Bun does
+/// for its containers, one nested inside the other, and leave them there as
+/// a killed Bun or a failed assertion would (#780).
+fn leave_identity_mounts(root: &Path) {
+    let outer = reliaburger::sesame::identity::instance_identity_dir(&root.join("volumes"), "a");
+    let inner = outer.join("nested");
+    for dir in [&outer, &inner] {
+        reliaburger::sesame::identity::prepare_identity_dir(dir).unwrap();
+    }
+    let mounted = mounts_under(root);
+    assert!(
+        mounted.contains(&outer) && mounted.contains(&inner),
+        "identity tmpfs not mounted: {mounted:?}"
+    );
+}
+
+/// The mount points `/proc/self/mountinfo` lists at or beneath `root`.
+fn mounts_under(root: &Path) -> Vec<PathBuf> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    fixture_dir::mounts_beneath(&mountinfo, root)
+}
+
+#[test]
+#[ignore = "requires Linux root to mount tmpfs; run through scripts/release/qualify-oci-interruptions.sh"]
+fn root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root() {
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap().keep();
+    let cleanup = RootCleanup(root.clone());
+    leave_identity_mounts(&root);
+    drop(cleanup);
+    assert_eq!(mounts_under(&root), Vec::<PathBuf>::new());
+    assert!(!root.exists(), "{} survived cleanup", root.display());
+}
+
+#[test]
+#[ignore = "requires Linux root to mount tmpfs; run through scripts/release/qualify-oci-interruptions.sh"]
+fn root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds() {
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap().keep();
+    let failed = std::panic::catch_unwind(|| {
+        let _cleanup = RootCleanup(root.clone());
+        leave_identity_mounts(&root);
+        panic!("a failed assertion with identity tmpfs still mounted");
+    });
+    assert!(failed.is_err());
+    assert_eq!(mounts_under(&root), Vec::<PathBuf>::new());
+    assert!(!root.exists(), "{} survived cleanup", root.display());
 }
 
 #[tokio::test]
@@ -676,12 +771,8 @@ registry_port = 0
             recovered.client.stop(&name, "default").await.unwrap();
         } else {
             for launch in &inventory {
-                assert_eq!(
-                    runtime(root.as_path())
-                        .state(&launch.instance_id)
-                        .await
-                        .unwrap(),
-                    ContainerState::Stopped,
+                assert!(
+                    retired_or_forgotten(runtime(root.as_path()).state(&launch.instance_id).await),
                     "unadopted {phase} execution survived recovery"
                 );
             }
@@ -945,10 +1036,7 @@ async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_succ
     std::fs::remove_file(root.join("armed")).unwrap();
     let mut recovered = Node::start(&root).await;
     assert!(recovered.client.status().await.unwrap().is_empty());
-    assert_eq!(
-        runtime(&root).state(&id).await.unwrap(),
-        ContainerState::Stopped
-    );
+    assert!(retired_or_forgotten(runtime(&root).state(&id).await));
     assert!(!record.exists());
     assert_eq!(kernel_manifest(&root), original_kernel);
     recovered.client.apply(&config).await.unwrap();
@@ -1869,10 +1957,9 @@ async fn actual_bun_kernel_discovery_host_reboot() {
                 node.client.status().await.unwrap().is_empty(),
                 "old runtime was republished"
             );
-            assert_eq!(
-                runtime(root).state(&reference.instance_id).await.unwrap(),
-                ContainerState::Stopped
-            );
+            assert!(retired_or_forgotten(
+                runtime(root).state(&reference.instance_id).await
+            ));
             assert_eq!(
                 runtime(root)
                     .exit_code(&reference.instance_id)

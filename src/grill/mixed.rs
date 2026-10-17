@@ -131,9 +131,15 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
     }
     /// Delete the route and lock files of an instance whose original backend
     /// has positively retired, after the backend forgets its own journal.
-    async fn forget_route(&self, id: &InstanceId) -> Result<(), GrillError> {
+    /// With `generation`, the backend forgets only that generation (#850).
+    async fn forget_route(
+        &self,
+        id: &InstanceId,
+        generation: Option<&super::RuntimeGeneration>,
+    ) -> Result<(), GrillError> {
         let this = self.clone();
         let id = id.clone();
+        let generation = generation.cloned();
         let error_id = id.clone();
         // Detached for the same reason as `operation`: the claim must outlive
         // a cancelled caller until the deletion it authorises has finished.
@@ -151,10 +157,17 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
                 // Absent from the original backend's inventory, or stopped
                 // without a published address: nothing it owns can remain.
                 this.prove_retired(&id, host, true).await?;
-                if host {
-                    this.host.forget_retired(&id).await?;
-                } else {
-                    this.container.forget_retired(&id).await?;
+                match (&generation, host) {
+                    (None, true) => this.host.forget_retired(&id).await?,
+                    (None, false) => this.container.forget_retired(&id).await?,
+                    (Some(generation), true) => {
+                        this.host.forget_retired_generation(&id, generation).await?
+                    }
+                    (Some(generation), false) => {
+                        this.container
+                            .forget_retired_generation(&id, generation)
+                            .await?
+                    }
                 }
             }
             let directory = this.directory.clone();
@@ -598,7 +611,26 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         .await
     }
     async fn forget_retired(&self, id: &InstanceId) -> Result<(), GrillError> {
-        self.forget_route(id).await
+        self.forget_route(id, None).await
+    }
+    async fn forget_retired_generation(
+        &self,
+        id: &InstanceId,
+        generation: &super::RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        self.forget_route(id, Some(generation)).await
+    }
+    async fn launch_generation(
+        &self,
+        id: &InstanceId,
+    ) -> Result<Option<super::RuntimeGeneration>, GrillError> {
+        match self.load(id).await? {
+            None => Ok(None),
+            Some(route) if route.runtime == RuntimeKind::Process => {
+                self.host.launch_generation(id).await
+            }
+            Some(_) => self.container.launch_generation(id).await,
+        }
     }
     async fn unlaunched_metadata(&self) -> Result<Vec<InstanceId>, GrillError> {
         self.orphan_routes().await
@@ -1191,6 +1223,50 @@ mod tests {
             backend.set_launch_inventory(vec![]).await;
             runtime.create(&id, &spec(host)).await.unwrap();
             assert!(route.exists());
+        }
+    }
+
+    /// A late forget for a retired generation leaves a successor launched
+    /// under the same identity, and its route, alone (#850).
+    #[tokio::test]
+    async fn a_stale_generation_keeps_the_successors_route_and_journal() {
+        for host in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = pair(root.path()).await;
+            let id = InstanceId("default__web-0__init-0".into());
+            let backend = if host {
+                &runtime.host
+            } else {
+                &runtime.container
+            };
+            backend.set_state(&id, ContainerState::Stopped);
+            backend.set_launch_inventory(vec![launch(&id, host)]).await;
+            runtime.create(&id, &spec(host)).await.unwrap();
+            let retired = runtime.launch_generation(&id).await.unwrap().unwrap();
+            runtime.create(&id, &spec(host)).await.unwrap();
+            let successor = runtime.launch_generation(&id).await.unwrap().unwrap();
+            assert_ne!(retired, successor);
+            let route = root.path().join("routes").join(format!("{}.json", id.0));
+
+            assert!(
+                runtime
+                    .forget_retired_generation(&id, &retired)
+                    .await
+                    .is_err(),
+                "a stale generation forgot its successor"
+            );
+            assert!(route.exists(), "a refused forget deleted the route");
+            assert!(
+                backend.has_launch(&id),
+                "a refused forget deleted the journal"
+            );
+
+            runtime
+                .forget_retired_generation(&id, &successor)
+                .await
+                .unwrap();
+            assert!(!route.exists(), "route kept after retirement");
+            assert!(!backend.has_launch(&id), "journal kept after retirement");
         }
     }
 

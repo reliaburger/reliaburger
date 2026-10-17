@@ -392,6 +392,11 @@ volumes = "{root}/volumes"
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
+
+# Plaintext on purpose: a loopback fixture with no node identity, which
+# callers also start with `--cluster`.
+[security]
+require_mtls = false
 "#,
             root = root.display(),
         ),

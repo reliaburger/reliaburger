@@ -3,8 +3,10 @@
 ## Service discovery
 
 Every app with a `port` gets a stable virtual IP (VIP). The eBPF connect hook
-in each node's kernel turns a connection to that VIP into a connection to a
-healthy backend, wherever it runs:
+in each node's kernel turns a TCP connection to that VIP into a connection to
+a healthy backend, wherever it runs. Services are TCP-only. The hook rewrites
+`connect()` calls, so UDP sent with `sendto()` to a VIP never reaches a
+backend, and published host ports are DNAT'd for TCP alone.
 
 ```sh
 relish resolve web        # VIP and healthy backends for an app
@@ -17,7 +19,7 @@ it answers with the VIP:
 ```toml
 [dns]
 enabled = true            # binds the runc gateway address, port 53
-upstream = "8.8.8.8:53"   # default, for everything outside .internal
+# upstream = "10.0.0.2:53"  # optional; default: the host's resolvers
 
 [ebpf]
 enabled = true            # VIP -> healthy backend in the connect hook
@@ -28,6 +30,13 @@ A short name like `redis.internal` resolves in the caller's own namespace;
 search list, so plain `redis:6379` and `redis.shop:6379` work as they would in
 a pod. Bun refuses combinations it can't serve truthfully: rootless runc and
 ProcessGrill don't get `.internal`.
+
+Names outside `.internal` go to the host's own resolvers: Bun reads the
+`nameserver` lines of `/etc/resolv.conf` at start and tries them in order, so
+split-horizon and corporate DNS keep working and nothing leaks to a public
+resolver. Set `upstream` to send them somewhere else. If DNS is on and there's
+no usable resolver (no `nameserver` lines, or only Bun's own address), Bun
+refuses to start and names `[dns] upstream`.
 
 ## Who may connect
 
@@ -49,6 +58,9 @@ allow_from = ["shop/api"]
 
 `allow_from` only opens cross-namespace paths; it doesn't restrict callers in
 the same namespace. One grant covers the VIP and the real addresses alike.
+A source can be a job as well as an app: `allow_from = ["reports/nightly"]`
+admits every task of the `nightly` job in `reports`, including tasks that
+haven't started yet.
 
 The eBPF hooks enforce all of this, so isolation needs `[ebpf]`. `relish init`
 turns `[ebpf]` and `[dns]` on when it runs as root on Linux with `runc`
@@ -84,7 +96,7 @@ An allowlist always lets the workload reach the node's DNS responder on port
 `.internal` names). Without `[dns]` there's no responder to allow: list your
 resolver yourself. An egress allowlist only works on rootful runc with eBPF,
 and Bun refuses to deploy an app with one anywhere else rather than run it
-unguarded. `allow_franchise` (cross-cluster egress) parses but is refused.
+unguarded. `allow_franchise` (cross-cluster egress) parses, but `relish apply` refuses it.
 Jobs take the same `[job.NAME.egress]` and `[job.NAME.firewall]` tables (see
 [Batch jobs](14_batch-jobs.md)).
 
@@ -105,7 +117,7 @@ host = "web.example.com"
 path = "/"                # default
 tls = "cluster"           # or "explicit"; omit for plain HTTP
 websocket = true          # allow WebSocket upgrades (default false)
-rate_limit_rps = 100      # optional, per client IP
+rate_limit_rps = 100      # optional, per node, per client IP
 rate_limit_burst = 200
 ```
 
@@ -118,8 +130,18 @@ HTTP redirects to HTTPS. `cluster` serves certificates signed by the cluster's
 own ingress CA, which renew themselves; your clients need to trust that CA.
 `explicit` uses the `tls_cert` and `tls_key` PEM files from this node's
 `[ingress]` section, reloaded when they change; Bun rejects a half-configured
-pair. There's no ACME: `auto` and `acme` fail route validation. The listener's
-self-signed fallback is for development, not a substitute for either mode.
+pair. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
+`acme`, as they do any other unknown mode. The listener's self-signed fallback
+is for development, not a substitute for either mode.
+
+Each node keeps its own rate limiter. Behind an L4 load balancer spreading a
+client over N nodes, that client gets up to N times `rate_limit_rps`. A zero
+rate or burst is refused at apply, and so is a rate too large to double into
+the default burst.
+
+If a route that slipped past those checks reaches the cluster anyway (say, one
+written before them), every node skips that one route, logs it with its app and
+namespace, and keeps serving discovery and ingress for every other app.
 
 Streaming responses pass through, and so do WebSockets on routes that allow
 them. A stopping instance drains its connections before it goes.

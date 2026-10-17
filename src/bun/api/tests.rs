@@ -55,6 +55,8 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         service_port: Some(8080),
         blocked: None,
         volume_home_away: None,
+        unschedulable: None,
+        rollout_failed: None,
         volume_homes: Vec::new(),
     };
 
@@ -2531,6 +2533,21 @@ async fn unparseable_peer_identity_is_refused_before_any_route() {
     council.shutdown().await.unwrap();
 }
 
+/// Wait until `council`'s applied log index has stopped moving for 200 ms,
+/// so a test can count the writes its own requests make.
+async fn wait_for_quiet_log(council: &crate::council::CouncilNode) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last = council.desired_state().await.last_applied_log;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let now = council.desired_state().await.last_applied_log;
+        if now == last || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        last = now;
+    }
+}
+
 #[tokio::test]
 async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
     let council = seeded_council("endpoint-consumer").await;
@@ -2545,6 +2562,10 @@ async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
         Some(council.clone()),
     )
     .await;
+    // The router's leader loops write to Raft once as they start. Token
+    // checks used to take long enough (Argon2) to hide that; now they don't,
+    // so wait for the log to settle before counting writes.
+    wait_for_quiet_log(&council).await;
     let path = "/v1/placements/worker";
     assert_eq!(
         get_authenticated(app.clone(), path, &user_key).await.0,
@@ -4234,12 +4255,20 @@ async fn workload_admission_fixture(
             crate::bun::task_executor::FakeRunner::always_succeeds(),
         ),
     );
+    // The leader loop ticks every 10ms. On the wall clock, an every-minute
+    // schedule applied just before a minute boundary would fire mid-test.
+    // Holding cron time still at the fixture's start means no occurrence can
+    // come due: apply stamps a schedule with the wall-clock minute, which is
+    // never earlier than this one (#868).
+    let cron_clock =
+        crate::bun::task_array_leader::CronClock::manual(crate::meat::batch_ids::epoch_now_secs());
     let service = Arc::new(
         crate::bun::task_array_leader::TaskArrayService::with_timings(
             Some(Arc::new(node)),
             std::time::Duration::from_millis(10),
             std::time::Duration::from_secs(30),
-        ),
+        )
+        .with_cron_clock(cron_clock),
     );
     let app = router_with_upgrade(
         tx,
@@ -5560,11 +5589,13 @@ async fn dashboard_nodes_fragment_reflects_real_membership() {
             node_id: crate::meat::NodeId::new("node-alpha"),
             address: "127.0.0.1:9101".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         },
         NodeMembershipInfo {
             node_id: crate::meat::NodeId::new("node-beta"),
             address: "127.0.0.1:9102".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         },
     ]));
     // No token store, so the request is open; membership at position 11.
@@ -5997,7 +6028,58 @@ async fn health_endpoint_returns_200() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    // A standalone node has no council to vote in.
+    assert_eq!(json["council_voter"], false);
     shutdown.cancel();
+}
+
+/// #694: `relish council recover` asks each persisted voter's unauthenticated
+/// health endpoint whether it still serves a council.
+#[tokio::test]
+async fn health_says_whether_this_node_is_a_council_voter() {
+    use crate::council::fence::RecoveryFence;
+    use crate::council::log_store::MemLogStore;
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::state_machine::CouncilStateMachine;
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo, RecoveryClaim};
+
+    async fn council(initialised: bool, fence: RecoveryFence) -> crate::council::CouncilNode {
+        let router = InMemoryRaftRouter::new();
+        let node = crate::council::CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, node.raft().clone()).await;
+        if initialised {
+            let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
+            node.initialize(std::collections::BTreeMap::from([(1, info)]))
+                .await
+                .unwrap();
+        }
+        node.with_recovery_fence(fence)
+    }
+
+    let voter = council(true, RecoveryFence::serving(0)).await;
+    assert!(super::node_info::serves_as_council_voter(&voter));
+
+    let worker = council(false, RecoveryFence::serving(0)).await;
+    assert!(!super::node_info::serves_as_council_voter(&worker));
+
+    let fence = RecoveryFence::serving(0);
+    fence.observe_peer(RecoveryClaim { epoch: 1, id: None });
+    let fenced = council(true, fence).await;
+    assert!(!super::node_info::serves_as_council_voter(&fenced));
 }
 
 /// Parse SSE events from a response body. Each event is a line
@@ -6104,6 +6186,7 @@ async fn cluster_status_refuses_to_report_success_when_a_member_is_unreachable()
         node_id: crate::meat::NodeId::new("unresponsive"),
         address,
         api_advertised: true,
+        jobs: None,
     }]));
     let app = router(
         cmd_tx,
@@ -6197,6 +6280,7 @@ async fn namespace_scoped_token_sees_only_its_namespace_in_status() {
         node_id: crate::meat::NodeId::new("peer"),
         address: peer_address,
         api_advertised: true,
+        jobs: None,
     }]));
     let app = router(
         cmd_tx,
@@ -6489,6 +6573,8 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
             volume_homes: Vec::new(),
         },
         crate::bun::diagnostics::DesiredAppEvidence {
@@ -6500,6 +6586,8 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
             volume_homes: Vec::new(),
         },
     ];
@@ -6696,6 +6784,7 @@ async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
             node_id: crate::meat::NodeId::new("one"),
             address: "[::1]:19117".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         },
         // Known to gossip, but its own directory extension hasn't
         // arrived: the address is only a port-offset guess.
@@ -6703,6 +6792,7 @@ async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
             node_id: crate::meat::NodeId::new("guessed"),
             address: "[::1]:19999".parse().unwrap(),
             api_advertised: false,
+            jobs: None,
         },
     ]));
     let app = router(
@@ -6759,6 +6849,7 @@ async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
             node_id: crate::meat::NodeId::new(name),
             address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             api_advertised: true,
+            jobs: None,
         },
         gossip_address: std::net::SocketAddr::from(([127, 0, 0, 1], port - 3)),
         state,
@@ -7134,45 +7225,18 @@ fn login_request(token: &str) -> axum::http::Request<Body> {
 }
 
 #[tokio::test]
-async fn a_malformed_login_is_refused_without_touching_argon2() {
-    // Every verification permit is held, so any login that reached the
-    // Argon2 path would block. A junk token must be refused by the shape
-    // check alone, promptly (B12).
+async fn a_malformed_login_is_refused_promptly() {
+    // A junk token is refused by the shape check alone, before any hashing
+    // (B12).
     let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
-    let _permits = crate::sesame::auth::hold_all_verify_permits().await;
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         app.clone().oneshot(login_request("nope")),
     )
     .await
-    .expect("a malformed login must not wait for an Argon2 permit")
+    .expect("a malformed login must be refused promptly")
     .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    shutdown.cancel();
-}
-
-#[tokio::test]
-async fn a_well_shaped_login_shares_the_argon2_concurrency_bound() {
-    // With every permit held, a login that looks like a real token has to
-    // queue for the same semaphore the bearer path uses (B12) rather than
-    // hashing on the blocking pool unbounded.
-    let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
-    let permits = crate::sesame::auth::hold_all_verify_permits().await;
-    let pending = tokio::spawn(app.clone().oneshot(login_request(&token)));
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(
-        !pending.is_finished(),
-        "login verified without waiting for a permit"
-    );
-
-    // Releasing the permits lets the queued login finish normally.
-    drop(permits);
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
-        .await
-        .expect("login should proceed once a permit frees up")
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     shutdown.cancel();
 }
 
@@ -8300,6 +8364,10 @@ async fn cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immedi
             .expression,
         "* * * * *"
     );
+    // Let the leader tick a few times in the applied minute: a schedule never
+    // fires in the minute it lands in.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let desired = council.desired_state().await;
     assert_eq!(desired.task_arrays.jobs().runs().count(), 0);
     assert!(commands.try_recv().is_err());
     council.shutdown().await.unwrap();
@@ -8882,6 +8950,7 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
             node_id: crate::meat::NodeId::new(&name),
             address,
             api_advertised: true,
+            jobs: None,
         });
         let node = Arc::new(
             crate::council::CouncilNode::new(
@@ -9082,4 +9151,167 @@ async fn ca_rotation_routes_hand_out_a_csr_and_refuse_bad_steps() {
             .is_none()
     );
     shutdown.cancel();
+}
+
+/// `POST /v1/cluster/elect` on a follower holds the leader's elections, then
+/// campaigns until another voter leads, and names the leader that took over
+/// (#755). Before, it fired one campaign that the old leader often won back.
+#[tokio::test]
+async fn electing_on_a_follower_moves_leadership_off_the_leader() {
+    let nodes = council_of(3).await;
+    let leader_id = nodes[0].current_leader().await.unwrap();
+    let leader = nodes[(leader_id - 1) as usize].clone();
+    let follower = nodes
+        .iter()
+        .find(|node| node.raft().metrics().borrow().id != leader_id)
+        .unwrap()
+        .clone();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while follower.current_leader().await != Some(leader_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("follower must know the elected leader before the HTTP request");
+    leader
+        .write(crate::council::RaftRequest::Noop)
+        .await
+        .unwrap();
+
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let follower_address = follower_listener.local_addr().unwrap();
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let holds_reached_leader = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shutdown = CancellationToken::new();
+    let mut servers = Vec::new();
+    for (node, listener, is_leader) in [
+        (leader.clone(), leader_listener, true),
+        (follower.clone(), follower_listener, false),
+    ] {
+        let (commands, _receiver) = mpsc::channel(4);
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(token.clone());
+        let mut app = router(
+            commands,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(node),
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            leader_port,
+            None,
+        );
+        if is_leader {
+            let reached = holds_reached_leader.clone();
+            app = app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let reached = reached.clone();
+                    async move {
+                        if request.uri().path() == "/v1/cluster/elect"
+                            && request
+                                .headers()
+                                .contains_key(super::nodes::ELECT_HOLD_HEADER)
+                        {
+                            reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+        }
+        let stop = shutdown.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stop.cancelled().await })
+                .await
+                .unwrap();
+        }));
+    }
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{follower_address}/v1/cluster/elect"))
+        .bearer_auth(&plaintext)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(
+        holds_reached_leader.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the leader must hold its elections before the campaign"
+    );
+    let new_leader = leader.current_leader().await.unwrap();
+    assert_ne!(new_leader, leader_id, "leadership did not move");
+    assert_eq!(body["previous_leader"], format!("node-{leader_id}"));
+    assert_eq!(body["leader"], format!("node-{new_leader}"));
+
+    shutdown.cancel();
+    for server in servers {
+        server.await.unwrap();
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A leader can't campaign itself out of office: the caller must ask the
+/// voter that should take over.
+#[tokio::test]
+async fn electing_on_the_leader_is_refused() {
+    let (app, shutdown, tok) =
+        setup_with_role("cluster-admin", crate::sesame::types::ApiRole::Admin).await;
+    let status = post_status(app, "/v1/cluster/elect", &tok, "").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    shutdown.cancel();
+}
+
+/// A forwarded hold makes the receiving node stop campaigning.
+#[tokio::test]
+async fn a_hold_request_holds_this_nodes_elections() {
+    let nodes = council_of(1).await;
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.push(token);
+    let (commands, _receiver) = mpsc::channel(4);
+    let app = router(
+        commands,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(nodes[0].clone()),
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/cluster/elect")
+                .header("authorization", format!("Bearer {plaintext}"))
+                .header(super::nodes::ELECT_HOLD_HEADER, "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(nodes[0].elections_held());
+    nodes[0].shutdown().await.unwrap();
 }

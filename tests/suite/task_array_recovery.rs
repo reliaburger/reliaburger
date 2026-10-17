@@ -79,7 +79,7 @@ async fn until_finished(
 ) -> reliaburger::bun::task_array_node::ArrayProgress {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let progress = node.sync(req).await.arrays.remove(0);
+        let progress = node.sync(req).await.unwrap().arrays.remove(0);
         if !progress.finished.is_empty() {
             return progress;
         }
@@ -120,9 +120,9 @@ async fn arrays_share_the_node_capacity() {
     let root = tempfile::tempdir().unwrap();
     let node = node(root.path(), Duration::from_secs(1), 2);
     let req = request(vec![assignment(1, 10, 1), assignment(2, 10, 1)]);
-    node.sync(&req).await;
+    node.sync(&req).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let progress = node.sync(&req).await;
+    let progress = node.sync(&req).await.unwrap();
     let running: u64 = progress.arrays.iter().map(|a| a.counters.running).sum();
     eprintln!("node configured for 2 slots, two arrays have {running} running attempts");
     assert_eq!(running, 2);
@@ -135,16 +135,16 @@ async fn arrays_share_the_node_capacity() {
             })
             .collect(),
     );
-    node.sync(&stopped).await;
+    node.sync(&stopped).await.unwrap();
 }
 #[tokio::test]
 async fn completed_tasks_are_durable_before_the_chunk_finishes() {
     let root = tempfile::tempdir().unwrap();
     let node = node(root.path(), Duration::from_millis(10), 1);
     let req = request(vec![assignment(1, 100, 1)]);
-    node.sync(&req).await;
+    node.sync(&req).await.unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let progress = node.sync(&req).await.arrays.remove(0);
+    let progress = node.sync(&req).await.unwrap().arrays.remove(0);
     let replay = task_ledger::replay(&node.array_dir(1).join("ledger")).unwrap();
     eprintln!(
         "completed {}, durable {} (150ms after start, 10ms commit interval)",
@@ -253,7 +253,7 @@ async fn stale_control_cannot_delete_ledgers_after_a_restart() {
         },
         ..Default::default()
     };
-    restarted.sync(&stale).await;
+    restarted.sync(&stale).await.unwrap();
     assert_eq!(
         task_ledger::replay(&restarted.array_dir(1).join("ledger"))
             .unwrap()
@@ -281,10 +281,10 @@ async fn mixed_profiles_share_capacity_with_an_application() {
     let mut small = assignment(2, 20, 1);
     small.resources = Resources::new(250, 32 << 20, 0);
     let mut req = request(vec![large, small]);
-    node.sync(&req).await;
+    node.sync(&req).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let progress = node.sync(&req).await;
+        let progress = node.sync(&req).await.unwrap();
         let large = progress.arrays[0].counters.running;
         let small = progress.arrays[1].counters.running;
         assert!(large * 2000 + small * 250 <= 2000);
@@ -299,7 +299,7 @@ async fn mixed_profiles_share_capacity_with_an_application() {
     for a in &mut req.arrays {
         a.stopping = true;
     }
-    node.sync(&req).await;
+    node.sync(&req).await.unwrap();
     assert_eq!(budget.available(), Resources::new(4000, 512 << 20, 0));
 }
 
@@ -356,13 +356,13 @@ async fn output_storage_failure_refuses_work_and_never_acknowledges_the_chunk() 
     let mut a = assignment(1, 100, 1);
     a.spec.max_attempts = 1;
     let req = request(vec![a]);
-    failing.sync(&req).await;
+    failing.sync(&req).await.unwrap();
     let output = directory.path().join("1/output");
     std::fs::remove_dir(&output).unwrap();
     std::fs::write(&output, b"unavailable output directory").unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let response = failing.sync(&req).await;
+            let response = failing.sync(&req).await.unwrap();
             let p = &response.arrays[0];
             assert!(p.finished.is_empty());
             if let Some(reason) = &p.refused {
@@ -402,7 +402,7 @@ async fn a_new_term_cannot_delete_data_using_a_snapshot_behind_the_committed_rev
         known: vec![],
         arrays: vec![],
     };
-    executor.sync(&delayed).await;
+    executor.sync(&delayed).await.unwrap();
     assert!(directory.path().join("1/ledger").exists());
     assert_eq!(executor.results(1, false, 1).await.unwrap().len(), 1);
 }

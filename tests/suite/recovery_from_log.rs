@@ -65,7 +65,7 @@ async fn a_voter_that_never_snapshotted_recovers_from_its_committed_log() {
     assert_eq!(state.config.get("key-49").map(String::as_str), Some("49"));
 
     // The recovered directory now holds that state as its snapshot.
-    recover_data_dir(root.path(), state).unwrap();
+    recover_data_dir(root.path(), state, false).unwrap();
     let (_log, fresh, machine) = open_raft_storage(&root.path().join("raft"), Some(key.to_vec()))
         .await
         .unwrap();

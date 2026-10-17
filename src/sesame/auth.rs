@@ -9,28 +9,10 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::RwLock;
 
 use super::token;
 use super::types::{ApiRole, ApiToken, TokenScope};
-
-/// Ceiling on concurrent Argon2 verifications across the whole process.
-///
-/// Argon2id is deliberately slow and memory-hungry, so a flood of bad bearers
-/// hashing in parallel would otherwise pin every CPU and exhaust memory (a
-/// trivial denial of service). We admit at most this many verifications at a
-/// time; the rest wait for a permit. Small enough to stay cheap, large enough
-/// that honest concurrent callers aren't serialised behind one another.
-const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
-
-/// Process-wide permit pool bounding concurrent Argon2 work (AUTH5).
-///
-/// `LazyLock` initialises this the first time it's read and never again, so
-/// every request shares one semaphore. It replaces the old behaviour where
-/// verification ran synchronously while the token-store read lock was held,
-/// serialising every request behind one another's hashing.
-static VERIFY_PERMITS: std::sync::LazyLock<Semaphore> =
-    std::sync::LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_VERIFICATIONS));
 
 /// Shared token store, readable by the auth middleware.
 ///
@@ -178,10 +160,20 @@ fn extract_bearer(header_value: &str) -> Option<&str> {
 /// Returns the `AuthContext` if the token is valid, or an HTTP error response.
 /// A token's old secret, inside the grace period after `relish token rotate`,
 /// authenticates as the same token but as its own principal (F05 I3).
+///
+/// Every path that checks a presented token against the store comes here:
+/// the bearer middleware, the `POST /ui/session` login and the registry.
+/// A bearer that doesn't even look like one of our tokens is turned away by
+/// a string check; any other costs one SHA-256 and a 32-byte comparison per
+/// stored secret, a few microseconds in all, so it runs inline on the async
+/// worker with no permit or blocking thread (#912).
 pub fn authenticate(
     plaintext_token: &str,
     tokens: &[ApiToken],
 ) -> Result<AuthContext, (StatusCode, String)> {
+    if !token::looks_like_token(plaintext_token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    }
     let (stored, matched) = match token::find_valid_token(plaintext_token, tokens) {
         Ok(found) => found,
         Err(token::TokenError::Expired) => {
@@ -228,7 +220,7 @@ pub(crate) fn token_principal_id(token: &ApiToken) -> String {
     principal_for_hash(&token.token_hash)
 }
 
-/// The principal id of the secret behind an Argon2id hash.
+/// The principal id of the secret behind a stored hash.
 fn principal_for_hash(token_hash: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, token_hash);
     format!("token:{}", hex::encode(digest.as_ref()))
@@ -279,72 +271,6 @@ fn session_credential_is_live(
     find_credential(&identity.principal_id, tokens)
         .is_some_and(|credential| credential.valid_until.is_none_or(|at| now < at))
 }
-/// Authenticate a bearer without holding the token-store lock (AUTH5).
-///
-/// Takes ownership of a cloned token list (the caller already released the
-/// read lock). A bearer that doesn't even look like one of our tokens is
-/// rejected by a string check, so a flood of junk never reaches Argon2. The
-/// real verification runs on a blocking thread under a process-wide semaphore,
-/// so concurrent bad bearers can't pin every core hashing in parallel.
-///
-/// `async fn` returning `Result` is Rust's way of saying "this may await and
-/// may fail"; `.await` on the `spawn_blocking` handle yields until the
-/// blocking thread finishes without parking the async worker.
-///
-/// Every path that verifies a presented token against the store goes through
-/// here: the bearer middleware and the unauthenticated `POST /ui/session`
-/// login alike, so neither can run unbounded Argon2 on a stranger's behalf.
-pub(crate) async fn authenticate_off_lock(
-    plaintext: &str,
-    tokens: Vec<ApiToken>,
-) -> Result<AuthContext, (StatusCode, String)> {
-    // Cheap shape check first: reject obviously-malformed bearers before we
-    // spend an Argon2 hash on them (the AUTH5 short-circuit index).
-    if !token::looks_like_token(plaintext) {
-        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
-    }
-
-    // Bound concurrent Argon2 work. The semaphore is a `static`, so its
-    // permits borrow for `'static` and can cross into the blocking closure.
-    let permit = match VERIFY_PERMITS.acquire().await {
-        Ok(permit) => permit,
-        // The semaphore is a `static` we never close, so this is unreachable
-        // in practice; treat a closed semaphore as a transient failure.
-        Err(_) => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication temporarily unavailable".to_string(),
-            ));
-        }
-    };
-
-    let candidate = plaintext.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        authenticate(&candidate, &tokens)
-    })
-    .await;
-
-    match result {
-        Ok(inner) => inner,
-        // The blocking task panicked; don't leak the panic, fail closed.
-        Err(_) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "authentication failed".to_string(),
-        )),
-    }
-}
-
-/// Hold every verification permit, so a test can prove a caller waits on the
-/// shared Argon2 bound instead of hashing on its own.
-#[cfg(test)]
-pub(crate) async fn hold_all_verify_permits() -> tokio::sync::SemaphorePermit<'static> {
-    VERIFY_PERMITS
-        .acquire_many(MAX_CONCURRENT_VERIFICATIONS as u32)
-        .await
-        .unwrap()
-}
-
 /// Check that the authenticated context has sufficient role.
 pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusCode, String)> {
     token::check_role(ctx.role, required).map_err(|_| {
@@ -411,14 +337,9 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Snapshot the token store under the read lock, then drop it (AUTH5).
-    //
-    // The old code held this read lock across the whole Argon2 verification.
-    // Argon2 is slow on purpose, so every authenticated request serialised
-    // behind every other one's hashing, and a Raft-driven token refresh (a
-    // writer) queued behind them all. We clone the small `Vec<ApiToken>` out
-    // and release the lock immediately; the hashing then happens off-lock and
-    // under a concurrency bound.
+    // Snapshot the token store under the read lock, then drop it (AUTH5), so
+    // a Raft-driven token refresh (a writer) never queues behind requests.
+    // The lock is released before the handler runs, which can be slow.
     let tokens = {
         let guard = state.tokens.read().await;
         guard.clone()
@@ -432,7 +353,7 @@ pub async fn auth_middleware(
     if let Some(bearer_token) = bearer {
         // A workload-identity JWT (three dot-separated parts) authenticates the
         // presenting workload as itself, confined read-only to its own
-        // app/namespace. Tried before the Argon2 token path because a JWT can
+        // app/namespace. Tried before the API token path because a JWT can
         // never match an `rbrg_` hash, and skipped when no verifier is set.
         if let Some(verifier) = &state.jwt_verifier
             && looks_like_jwt(bearer_token)
@@ -441,7 +362,7 @@ pub async fn auth_middleware(
             request.extensions_mut().insert(workload_context(&claims));
             return next.run(request).await;
         }
-        return match authenticate_off_lock(bearer_token, tokens).await {
+        return match authenticate(bearer_token, &tokens) {
             Ok(ctx) => {
                 record_token_use(&state.last_used, &ctx.principal_id).await;
                 request.extensions_mut().insert(ctx);
@@ -502,7 +423,7 @@ pub(crate) fn readonly_session_context(identity: &super::session::SessionIdentit
 
 /// Cheap shape check: does the bearer look like a compact JWS (three
 /// non-empty dot-separated segments)? Used only to route a bearer to the JWT
-/// verifier instead of the Argon2 token path; the real check is the signature.
+/// verifier instead of the API token path; the real check is the signature.
 fn looks_like_jwt(candidate: &str) -> bool {
     let mut parts = candidate.split('.');
     let ok = matches!((parts.next(), parts.next(), parts.next()), (Some(a), Some(b), Some(c)) if !a.is_empty() && !b.is_empty() && !c.is_empty());
@@ -1174,12 +1095,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revoked_bearer_is_refused_by_the_middleware() {
+        let admin = create_token("admin", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(admin.token);
+        store.write().await.push(user.token);
+        let state = AuthState::new(store.clone(), None);
+        let header = format!("Bearer {}", user.plaintext);
+        assert_eq!(
+            status_of(guarded_router(state.clone()), Some(&header)).await,
+            StatusCode::OK
+        );
+
+        store.write().await.retain(|token| token.name != "u");
+        assert_eq!(
+            status_of(guarded_router(state), Some(&header)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn a_rotated_tokens_new_and_old_secrets_both_authenticate_with_the_fast_hash() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let (new_secret, token) = rotate(&created, Duration::from_secs(3_600));
+        // Both secrets are stored as 32-byte SHA-256 digests.
+        assert_eq!(token.token_hash.len(), 32);
+        assert_eq!(
+            token.previous_secret.as_ref().map(|p| p.token_hash.len()),
+            Some(32)
+        );
+        let tokens = vec![token];
+        assert!(authenticate(&new_secret, &tokens).is_ok());
+        assert!(authenticate(&created.plaintext, &tokens).is_ok());
+    }
+
+    #[tokio::test]
     async fn a_burst_of_invalid_bearers_does_not_hold_the_store_lock() {
         // The whole point of AUTH5: bad bearers must not serialise on the
         // store lock. We hammer the middleware with junk bearers while a
         // writer keeps grabbing the write lock; if the middleware held the
-        // read lock across Argon2, the writer would starve. Here it doesn't,
-        // because the middleware clones out and hashes off-lock.
+        // read lock for long, the writer would starve. Here it doesn't,
+        // because the middleware clones out and verifies off-lock.
         let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
         let store = new_token_store();
         store.write().await.push(user.token);
@@ -1195,7 +1152,7 @@ mod tests {
         });
 
         // A burst of malformed bearers. `looks_like_token` rejects these
-        // before Argon2, so they can't pile up on permits either.
+        // before any hashing.
         let mut requests = Vec::new();
         for i in 0..32 {
             let router = guarded_router(state.clone());

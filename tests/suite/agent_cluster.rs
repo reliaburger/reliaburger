@@ -99,8 +99,12 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         council.clone(),
         membership_rx,
         reports_rx,
-        false,
-        Default::default(),
+        reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+            dns_required: false,
+            reconstruction: Default::default(),
+            stale_node_grace: Duration::from_secs(300),
+        },
+        None,
         None,
         shutdown.clone(),
     );
@@ -173,6 +177,7 @@ fn job_filled_report(
         timestamp: std::time::SystemTime::now(),
         running_apps: vec![],
         cached_specs: vec![],
+        rollouts: Vec::new(),
         resource_usage: reliaburger::reporting::types::ResourceUsage {
             cpu_total_millicores: 4000,
             memory_total_mb: 8192,
@@ -248,6 +253,21 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
             node.clone(),
             tokio::time::Instant::now() + Duration::from_secs(300),
         );
+        // Both nodes run containers, so the image app may go to either
+        // (#914).
+        reports.capabilities.insert(
+            node.clone(),
+            reliaburger::reporting::types::NodeCapabilityReport {
+                node_id: node.clone(),
+                capabilities: reliaburger::meat::cluster_state::NodeCapabilities {
+                    containers: true,
+                    ..Default::default()
+                },
+                egress_enforcement: Vec::new(),
+                egress_degraded: false,
+                egress_affected_workloads: Vec::new(),
+            },
+        );
         reports.readiness.insert(
             node.clone(),
             reliaburger::reporting::types::NodeReadinessReport {
@@ -267,8 +287,12 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
         council.clone(),
         membership_rx,
         reports_rx,
-        false,
-        Default::default(),
+        reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+            dns_required: false,
+            reconstruction: Default::default(),
+            stale_node_grace: Duration::from_secs(300),
+        },
+        None,
         None,
         shutdown.clone(),
     );
@@ -490,7 +514,7 @@ async fn udp_gossip_transport_round_trip() {
     let t1 = UdpMustardTransport::bind(addr(0)).await.unwrap();
     let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
 
-    let t2_addr = t2.local_addr();
+    let t2_addr = t2.local_addr().unwrap();
 
     let msg = GossipMessage::new(
         NodeId::new("sender"),
@@ -527,6 +551,7 @@ async fn tcp_reporting_transport_round_trip() {
         timestamp: SystemTime::now(),
         running_apps: vec![],
         cached_specs: vec![],
+        rollouts: Vec::new(),
         resource_usage: ResourceUsage::default(),
         event_log: vec![],
         job_reservations: Default::default(),

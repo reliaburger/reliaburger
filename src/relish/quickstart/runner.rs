@@ -314,7 +314,10 @@ async fn prepare_artifacts(
         step.record(result)
     };
     let tooling = async {
-        let step = progress.step(Stage::Download, "install Lima 2.1.0");
+        let step = progress.step(
+            Stage::Download,
+            format!("install Lima {}", artifacts::LIMA_VERSION),
+        );
         step.record(artifacts::tooling(root, downloader, &step).await)
     };
     let (lima, image, (bun, relish)) = tokio::try_join!(tooling, image, binaries)?;
@@ -503,12 +506,10 @@ async fn checkpoint(
 /// cluster's bootstrap identity, with its commit marker last, just as the
 /// local identity store writes it.
 fn node_files(sources: &NodeSources<'_>, index: usize, config: PathBuf) -> Vec<GuestFile> {
-    let security = sources.security;
     let mut files = vec![
         GuestFile::executable(sources.bun.to_owned(), "/usr/local/bin/bun"),
         GuestFile::executable(sources.relish.to_owned(), "/usr/local/bin/relish"),
         GuestFile::private(config, "/etc/reliaburger/node.toml"),
-        GuestFile::private(security.join("master.key"), "/etc/reliaburger/master.key"),
         GuestFile {
             mode: 0o644,
             ..GuestFile::private(
@@ -517,26 +518,11 @@ fn node_files(sources: &NodeSources<'_>, index: usize, config: PathBuf) -> Vec<G
             )
         },
     ];
-    if index == 0 {
-        files.push(GuestFile::private(
-            security.join("security-bootstrap.json"),
-            "/etc/reliaburger/security-bootstrap.json",
-        ));
-        for file in [
-            "node.crt",
-            "node.key",
-            "node-ca.crt",
-            "root-ca.crt",
-            "meta.json",
-            "node.bundle.json",
-            "bundle.committed",
-        ] {
-            files.push(GuestFile::private(
-                security.join("identity").join(file),
-                &format!("/etc/reliaburger/identity/{file}"),
-            ));
-        }
-    }
+    files.extend(
+        security::node_security_files(sources.security, index)
+            .into_iter()
+            .map(|(source, destination)| GuestFile::private(source, &destination)),
+    );
     files
 }
 
@@ -624,7 +610,7 @@ async fn configure_node(
 
 /// Guest script that stores a join token from standard input only for as
 /// long as `relish join` needs it. Arguments: node name, CA fingerprint, URL.
-const JOIN_SCRIPT: &str = "set -eu\numask 077\ntoken=/etc/reliaburger/join.token\n\
+pub(crate) const JOIN_SCRIPT: &str = "set -eu\numask 077\ntoken=/etc/reliaburger/join.token\n\
 trap 'rm -f -- \"$token\"' EXIT\ncat > \"$token\"\n\
 /usr/local/bin/relish join --token-file \"$token\" --node-id \"$1\" \
 --identity-dir /etc/reliaburger/identity --ca-fingerprint \"$2\" \"$3\"\n";

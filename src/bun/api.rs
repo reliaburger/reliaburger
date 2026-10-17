@@ -82,14 +82,16 @@ use faults::{
     fault_list_handler, node_fault_fence_handler, node_fault_reserve_handler,
     spawn_node_fault_reaper,
 };
-use gitops::gitops_webhook_handler;
+pub use gitops::GitOpsLocalCheck;
+use gitops::{gitops_config_handler, gitops_status_handler, gitops_webhook_handler};
 use identity::{
     identity_jwks_handler, identity_sign_handler, join_token_create_handler, token_create_handler,
     token_list_handler, token_revoke_handler, token_rotate_handler,
 };
 use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
-    producer_retirement_handler, refuse_retired_tls_peer, workload_csr_handler,
+    producer_retirement_handler, refuse_retired_tls_peer, rollout_failed_handler,
+    workload_csr_handler,
 };
 use join::{cluster_ca_handler, join_handler, node_renewal_handler, node_trust_ack_handler};
 use logs::{
@@ -156,6 +158,28 @@ pub struct NodeMembershipInfo {
     /// nodes listing) must wait for the real thing: nodes sharing a host
     /// pick their ports independently, so one node's offset is not another's.
     pub api_advertised: bool,
+    /// The kinds of job the node advertises over gossip, or `None` until it
+    /// has said (#788). The leader refuses a job run at submission when
+    /// every live member's summary refuses it.
+    pub jobs: Option<crate::meat::job_capability::JobCapabilities>,
+}
+
+impl NodeMembershipInfo {
+    /// A member as gossip describes it: its advertised API endpoint (or a
+    /// guess at `gossip_to_api_offset` from its gossip port until that
+    /// arrives) and the job capabilities it advertises.
+    pub fn from_gossip(
+        member: &crate::mustard::membership::MembershipSnapshot,
+        directory: &crate::mustard::directory::NodeDirectory,
+        gossip_to_api_offset: i32,
+    ) -> Self {
+        Self {
+            node_id: member.node_id.clone(),
+            address: directory.api_address(&member.node_id, member.address, gossip_to_api_offset),
+            api_advertised: directory.endpoints.contains_key(&member.node_id),
+            jobs: directory.jobs.get(&member.node_id).copied(),
+        }
+    }
 }
 
 /// Every member this node has seen through gossip, with its last API address:
@@ -761,6 +785,8 @@ pub fn router_with_upgrade(
         )
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
+        .route("/v1/gitops", get(gitops_status_handler))
+        .route("/v1/gitops/config", post(gitops_config_handler))
         .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/discovery/retire", post(producer_retirement_handler))
@@ -773,6 +799,7 @@ pub fn router_with_upgrade(
             post(endpoint_withdrawal_receipt_handler),
         )
         .route("/v1/test/leases/retired", post(test_lease_retired_handler))
+        .route("/v1/rollouts/failed", post(rollout_failed_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(super::batch::batch_submit_handler))
         .route(
@@ -888,11 +915,14 @@ fn system_time_millis(time: std::time::SystemTime) -> u64 {
 }
 
 /// Require a current quorum before a lease read or retirement instruction.
+///
+/// A leader gets the whole 3 s to prove it leads, so one heartbeat round its
+/// followers answer late doesn't turn a settled leader's read into a 503
+/// (#1009).
 async fn confirmed_lease_leader(council: &crate::council::CouncilNode) -> bool {
-    matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(3), council.is_leader()).await,
-        Ok(true)
-    )
+    council
+        .confirm_leadership(std::time::Duration::from_secs(3))
+        .await
 }
 
 /// Admin with cluster-wide authority. Upgrades, rollbacks and elections act

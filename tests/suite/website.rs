@@ -266,6 +266,87 @@ fn the_demo_app_is_published_from_the_tested_example() {
     assert_eq!(config.app["burger"].image.as_deref(), Some("burger:v1"));
 }
 
+/// Most tasks the tour's jobs step may submit. Fresh containers run at about
+/// 12.7 jobs a second on the quickstart VM, so a handful keeps the step to a
+/// few seconds of `relish batch watch` instead of most of the recording (#1015).
+const TOUR_JOBS_MAX: i64 = 16;
+
+/// Each cohort's `count` in the tour's job manifest, by cohort name.
+fn burger_job_counts() -> std::collections::BTreeMap<String, i64> {
+    let manifest: toml::Value = read(&format!("{BURGER_SOURCE}/jobs.toml")).parse().unwrap();
+    manifest["cohort"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|cohort| {
+            let count = cohort["count"].as_integer().unwrap();
+            let chunk = cohort["chunk_size"].as_integer().unwrap();
+            assert!(
+                (1..=count).contains(&chunk),
+                "a chunk of {chunk} for {count} tasks"
+            );
+            (cohort["name"].as_str().unwrap().to_string(), count)
+        })
+        .collect()
+}
+
+/// The tour submits a few fast jobs in two resource profiles, and every place
+/// that describes that step quotes the manifest's real counts.
+#[test]
+fn the_tour_jobs_step_is_short_and_quotes_the_manifest() {
+    let counts = burger_job_counts();
+    let names: Vec<&str> = counts.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        ["large", "small"],
+        "relish jobs should show two cohorts"
+    );
+    let (small, large) = (counts["small"], counts["large"]);
+    let total = small + large;
+    assert!(
+        total <= TOUR_JOBS_MAX,
+        "the tour submits {total} tasks; keep it to {TOUR_JOBS_MAX} or fewer"
+    );
+
+    let homepage = read("docs/website/index.html");
+    let manual = read("docs/manual/08_five-minute-tour.md");
+    let book = read("docs/book/17-a-million-jobs.md");
+    let batch_manual = read("docs/manual/14_batch-jobs.md");
+    let tour = read("scripts/demo/tour.sh");
+    let quotes = [
+        (
+            "homepage",
+            &homepage,
+            format!("{small} small and {large} larger"),
+        ),
+        ("tour chapter", &manual, format!("asks for {total} tasks")),
+        ("tour chapter", &manual, format!("{small} small ones")),
+        ("tour chapter", &manual, format!("{large} larger ones")),
+        ("book", &book, format!("{small} small and {large} larger")),
+        (
+            "batch chapter",
+            &batch_manual,
+            format!("{small} small tasks"),
+        ),
+        (
+            "batch chapter",
+            &batch_manual,
+            format!("{large} large tasks"),
+        ),
+        ("tour.sh", &tour, format!("s[\"succeeded\"]=={total} ")),
+        ("tour.sh", &tour, format!("All {total} tasks succeeded")),
+    ];
+    for (place, text, quote) in quotes {
+        assert!(text.contains(&quote), "the {place} should say {quote:?}");
+    }
+    for (place, text) in [("homepage", &homepage), ("tour chapter", &manual)] {
+        assert!(
+            !text.to_lowercase().contains("thousand jobs"),
+            "the {place} still promises a thousand jobs"
+        );
+    }
+}
+
 /// The workflow's `tar` line, run for real: unpacked, the tarball is a
 /// `burger/` directory holding the example's files byte for byte, which is
 /// what `curl … | tar xz` followed by `relish build burger/burger.toml` needs.

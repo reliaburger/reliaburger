@@ -11,7 +11,9 @@
         "coverage"
       ],
       "required_in": [
+        "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -39,7 +41,9 @@
         "test-contract-boundaries"
       ],
       "required_in": [
+        "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -53,6 +57,7 @@
         "test-rootless-runc"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -66,6 +71,7 @@
         "test-linux"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -78,6 +84,7 @@
         "scripts/release/qualify-oci-interruptions.sh"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -91,6 +98,7 @@
         "test-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -104,6 +112,7 @@
         "test-slow"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -117,6 +126,7 @@
         "test-upgrade-node"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -130,6 +140,7 @@
         "test-upgrade-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -143,6 +154,7 @@
         "test-standard-clients"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     }
@@ -1192,22 +1204,22 @@
     {
       "id": "issue-539",
       "issue": 539,
-      "promise": "Registry token verification shares bounded asynchronous API admission.",
+      "promise": "Registry token verification uses the shared API token check.",
       "supported_paths": [
-        "Bearer and Basic credentials on registry reads and writes resume after admission becomes available."
+        "Bearer and Basic credentials on registry reads and writes authenticate through the shared API token check."
       ],
       "refused_paths": [
-        "Malformed credentials return unauthorized without waiting for expensive verification admission."
+        "Malformed credentials return unauthorized before any hashing."
       ],
       "boundaries": [
-        "A saturated verifier does not execute verification before acquiring a permit.",
+        "Registry credentials go through the API token check, which hashes once with SHA-256 and runs inline since #912, so there is no admission permit to wait for.",
         "Related TLS lifecycle fixtures check pooled connection retirement at the credential deadline, with a disabled-retirement negative control."
       ],
       "cases": [
         {
-          "id": "issue-539-malformed_registry_credentials_do_not_wait_for_verification_admission",
+          "id": "issue-539-malformed_registry_credentials_are_refused_before_hashing",
           "binary": "reliaburger",
-          "test": "pickle::api::tests::malformed_registry_credentials_do_not_wait_for_verification_admission",
+          "test": "pickle::api::tests::malformed_registry_credentials_are_refused_before_hashing",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -1217,9 +1229,9 @@
           ]
         },
         {
-          "id": "issue-539-registry_reads_and_writes_share_the_api_verification_admission",
+          "id": "issue-539-registry_reads_and_writes_authenticate_bearer_and_basic_credentials",
           "binary": "reliaburger",
-          "test": "pickle::api::tests::registry_reads_and_writes_share_the_api_verification_admission",
+          "test": "pickle::api::tests::registry_reads_and_writes_authenticate_bearer_and_basic_credentials",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -4474,6 +4486,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-allow_from_can_name_a_delegated_job_as_its_source",
+          "binary": "reliaburger::ebpf",
+          "test": "allow_from_can_name_a_delegated_job_as_its_source",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-dns_responder_resolves_internal_name",
           "binary": "reliaburger::ebpf",
           "test": "dns_responder_resolves_internal_name",
@@ -5458,9 +5481,9 @@
           ]
         },
         {
-          "id": "legacy-ci-reliaburger-council_disaster_recovery-trigger_elect_advances_term_and_can_move_leadership",
+          "id": "legacy-ci-reliaburger-council_disaster_recovery-trigger_elect_advances_the_term_and_leadership_settles",
           "binary": "reliaburger::council_disaster_recovery",
-          "test": "trigger_elect_advances_term_and_can_move_leadership",
+          "test": "trigger_elect_advances_the_term_and_leadership_settles",
           "requires": [
             "cluster-tests"
           ],
@@ -5472,6 +5495,17 @@
           "id": "legacy-ci-reliaburger-council_disaster_recovery-pressured_leader_resigns_and_leadership_moves",
           "binary": "reliaburger::council_disaster_recovery",
           "test": "pressured_leader_resigns_and_leadership_moves",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-council_disaster_recovery-leadership_moves_off_the_leader_every_time_under_write_load",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "leadership_moves_off_the_leader_every_time_under_write_load",
           "requires": [
             "cluster-tests"
           ],
@@ -5571,6 +5605,17 @@
           "id": "legacy-ci-reliaburger-placement-cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
           "binary": "reliaburger::placement",
           "test": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-placement-an_image_app_is_never_placed_on_a_process_only_node",
+          "binary": "reliaburger::placement",
+          "test": "an_image_app_is_never_placed_on_a_process_only_node",
           "requires": [
             "cluster-tests"
           ],
@@ -6332,33 +6377,6 @@
       ]
     },
     {
-      "id": "issue-555-original-standard-clients",
-      "issue": 555,
-      "promise": "Complete all uncovered original ignored cases through their declared owner.",
-      "supported_paths": [
-        "Original finite source/test identity retains its owner binding."
-      ],
-      "refused_paths": [
-        "Missing, skipped, unfinished or wrong-owner success cannot qualify."
-      ],
-      "boundaries": [
-        "Inherited host/feature selection must be checked by actual discovery; source tables have no CI authority."
-      ],
-      "cases": [
-        {
-          "id": "legacy-ci-reliaburger-suite-registry_standard_clients-crane_logs_in_pushes_and_pulls_over_tls",
-          "binary": "reliaburger::suite",
-          "test": "registry_standard_clients::crane_logs_in_pushes_and_pulls_over_tls",
-          "requires": [
-            "standard-clients"
-          ],
-          "sources": [
-            "tests/suite/registry_standard_clients.rs"
-          ]
-        }
-      ]
-    },
-    {
       "id": "issue-588-a_task_array_survives_losing_a_node_mid_run",
       "issue": 588,
       "promise": "Delegated arrays retain unique accepted outcomes after worker loss.",
@@ -7043,6 +7061,82 @@
       ]
     },
     {
+      "id": "issue-694-recovery-fencing-and-odd-councils",
+      "issue": 694,
+      "promise": "No two recoveries share an epoch and recovery id; two that land on one epoch both fence as a split, a fenced data directory needs --force and lands above the fencing epoch, a restarted old voter serves nothing before gossip has synced and had its probe window, and a two-node cluster keeps one voter.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime and the in-memory Raft router"
+      ],
+      "cases": [
+        {
+          "id": "recovery-fencing-recovering_two_survivors_independently_fences_one",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "recovering_two_survivors_independently_fences_one",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "recovery-fencing-slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "odd-council-two_node_cluster_survives_losing_the_non_voter",
+          "binary": "reliaburger::council_self_healing",
+          "test": "two_node_cluster_survives_losing_the_non_voter",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_self_healing.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Recovering a data directory whose fence record says it was fenced is refused without --force."
+      ],
+      "boundaries": [
+        "Old voters that can reach only each other, never a node on the newer epoch, still can't learn of the recovery."
+      ]
+    },
+    {
+      "id": "issue-696-gossip-datagram-budget",
+      "issue": 696,
+      "promise": "Gossip probes from nodes with the longest names and a full label set fit the 1,400-byte datagram, so those nodes keep acknowledging and stay alive through churn.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime over loopback UDP"
+      ],
+      "cases": [
+        {
+          "id": "gossip-budget-nodes_with_maximal_labels_stay_alive_during_churn",
+          "binary": "reliaburger::cluster_gossip",
+          "test": "nodes_with_maximal_labels_stay_alive_during_churn",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_gossip.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A directory extension that cannot fit beside the header is left off the datagram rather than sent oversize."
+      ],
+      "boundaries": [
+        "A maximally labelled node piggybacks fewer updates per probe; anti-entropy, which carries no extension, makes up the difference."
+      ]
+    },
+    {
       "id": "issue-759-executor-start-retries-on-a-fresh-executor",
       "issue": 759,
       "promise": "An executor start that misses a runtime command's bound retires that executor and runs the command once on a fresh one, within the command's deadline.",
@@ -7067,6 +7161,33 @@
       ],
       "boundaries": [
         "The runtime failure is injected after a real start; a configuration refusal is never retried."
+      ]
+    },
+    {
+      "id": "issue-790-warm-pinned-cold-starts-read-no-registry",
+      "issue": 790,
+      "promise": "Cold shared-runc executors for a digest-pinned image this node has already verified and unpacked send no registry request, so a burst of them survives a registry that rate-limits every request.",
+      "supported_paths": [
+        "Rootful Linux shared-runc executors"
+      ],
+      "cases": [
+        {
+          "id": "warm-pin-runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Local metadata that no longer hashes to its digest is ignored and refetched, and a tag reference always asks the registry."
+      ],
+      "boundaries": [
+        "The first pull of an image on a node still reads the registry, and a cold pin fails as before once the registry's retries run out."
       ]
     },
     {
@@ -7229,6 +7350,86 @@
       ]
     },
     {
+      "id": "issue-780-root-cleanup-mounts",
+      "issue": 780,
+      "promise": "An OCI test's root is unmounted and removed when the test ends, whether it passed or panicked.",
+      "supported_paths": [
+        "Rootful runs that leave workload identity tmpfs mounted beneath the root"
+      ],
+      "cases": [
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        },
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A root that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
+      "id": "issue-852-capacity-harness-volumes",
+      "issue": 852,
+      "promise": "The owned-runc capacity harness keeps its volumes directory until it stops, then unmounts and removes it, whether the test passed or panicked.",
+      "supported_paths": [
+        "Rootful agents that leave workload identity tmpfs mounted beneath the harness's volumes directory"
+      ],
+      "cases": [
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        },
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A volumes directory that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
       "id": "issue-734-rootless-test-cleanup",
       "issue": 734,
       "promise": "A failed rootless OCI test leaves none of its network helpers running.",
@@ -7320,6 +7521,287 @@
       ]
     },
     {
+      "id": "issue-788-cluster-admission-refuses-unrunnable-jobs",
+      "issue": 788,
+      "promise": "In a cluster the leader refuses a job run no live node can take at submission, with HTTP 422 and the reason the leader's tick would give, from a compact job-capability summary every node advertises over gossip.",
+      "supported_paths": [
+        "Councils on every platform"
+      ],
+      "cases": [
+        {
+          "id": "issue-788-a_cluster_refuses_a_run_no_live_node_can_take_at_submission",
+          "binary": "reliaburger::suite",
+          "test": "task_arrays::a_cluster_refuses_a_run_no_live_node_can_take_at_submission",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_refuses_a_run_every_live_node_advertises_it_cannot_take",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_refuses_a_run_every_live_node_advertises_it_cannot_take",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_quotes_the_reasons_the_tick_would",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_quotes_the_reasons_the_tick_would",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_admits_a_run_any_live_node_might_take",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_admits_a_run_any_live_node_might_take",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-what_a_node_advertises_reaches_its_own_verdict_on_every_run",
+          "binary": "reliaburger",
+          "test": "bun::task_array_node::tests::what_a_node_advertises_reaches_its_own_verdict_on_every_run",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_node.rs"
+          ]
+        },
+        {
+          "id": "issue-788-probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram",
+          "binary": "reliaburger",
+          "test": "mustard::protocol::tests::probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/mustard/protocol.rs"
+          ]
+        },
+        {
+          "id": "issue-788-advertised_job_capabilities_reach_a_remote_member_via_gossip",
+          "binary": "reliaburger",
+          "test": "mustard::protocol::tests::advertised_job_capabilities_reach_a_remote_member_via_gossip",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/mustard/protocol.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A run any live node might take, or one a node hasn't advertised its capabilities for, is admitted and left to the nodes and the leader's tick."
+      ],
+      "boundaries": [
+        "Gossip says whether a node's allowed_binaries names anything; the paths come from its capability report, and until it has reported, a binary missing from a non-empty allowlist is caught by the tick, as are nodes that leave or change configuration after admission."
+      ]
+    },
+    {
+      "id": "issue-699-faults-revert-after-bun-restart",
+      "issue": 699,
+      "promise": "A chaos fault never outlives the Bun that injected it: CPU and memory caps, paused processes and pinned eBPF fault entries are undone when the next Bun adopts its workloads, and CPU and memory faults restore the workload's own cgroup values when they expire.",
+      "supported_paths": [
+        "Rootful Linux with cgroup v2, through the agent's adoption of recorded instances",
+        "The owned eBPF loader with maps pinned in bpffs"
+      ],
+      "cases": [
+        {
+          "id": "issue-699-cpu_fault_round_trip_restores_cpu_max",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_round_trip_restores_cpu_max",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-memory_fault_round_trip_restores_memory_high",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::memory_fault_round_trip_restores_memory_high",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-cpu_fault_is_reverted_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_is_reverted_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-paused_instance_resumes_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::paused_instance_resumes_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-owned_loader_clears_stale_fault_connect_entries",
+          "binary": "reliaburger::ebpf",
+          "test": "owned_loader_clears_stale_fault_connect_entries",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "The pinned egress policy is not cleared along with the fault entries."
+      ],
+      "boundaries": [
+        "Dropping an in-process agent stands in for a SIGKILL of Bun; the cgroup and the workload process are real."
+      ]
+    },
+    {
+      "id": "issue-697-image_survives_loss_of_the_pushing_node",
+      "issue": 697,
+      "promise": "A pushed image survives losing the node it was pushed to: heal counts only live copies and re-replicates from a survivor.",
+      "supported_paths": [
+        "Three-node TLS council with redundancy 2, each node on its own loopback address and the shared registry port."
+      ],
+      "refused_paths": [
+        "A dead node's recorded copy never counts towards redundancy, and the image is never reported Lost while a live copy exists."
+      ],
+      "boundaries": [
+        "Linux only: the fixture needs 127.0.0.2 and 127.0.0.3. It proves the OCI pull a deploy performs, not an app start under the process runtime."
+      ],
+      "cases": [
+        {
+          "id": "durability-image_survives_loss_of_the_pushing_node",
+          "binary": "reliaburger::registry_durability",
+          "test": "image_survives_loss_of_the_pushing_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/registry_durability.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-698-standard-clients",
+      "issue": 698,
+      "promise": "docker, podman, skopeo and crane log in to Pickle with an API token, verify the cluster CA, push an image and pull its layers back.",
+      "supported_paths": [
+        "A Pickle TLS listener on a non-loopback address under a name its node certificate carries, with the cluster root CA in /etc/docker/certs.d, /etc/containers/certs.d, skopeo --cert-dir or crane's SSL_CERT_FILE."
+      ],
+      "refused_paths": [
+        "A wrong token, a registry certificate from another CA, and a namespace-scoped token pushing outside its namespace are each refused by the client."
+      ],
+      "boundaries": [
+        "Linux only, on a host prepared by scripts/standard-clients-host.sh; client versions are whatever the runner image ships and are logged by the gate. oras is not exercised."
+      ],
+      "cases": [
+        {
+          "id": "standard-clients-docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_refuses_a_registry_signed_by_another_ca",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_refuses_a_registry_signed_by_another_ca",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-skopeo_copies_between_repositories_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::skopeo_copies_between_repositories_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-crane_pulls_layers_back_with_ca_verification",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-823-runc-launches-survive-a-switch-to-the-mixed-runtime",
       "issue": 823,
       "promise": "A node restarted from the runc runtime to the mixed runtime routes each running container to the runc owner that launched it, so startup recovery reads it instead of stopping Bun.",
@@ -7344,6 +7826,379 @@
       ],
       "boundaries": [
         "Run through the real Linux gate; the portable mixed-runtime tests cover the routing rules with mock backends."
+      ]
+    },
+    {
+      "id": "issue-692-rollout-safety",
+      "issue": 692,
+      "promise": "A cluster spec change reaches one node at a time, a failed rollout is marked RolloutFailed and never retried until the spec changes, and rollback targets survive every node restarting.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs"
+      ],
+      "cases": [
+        {
+          "id": "rollout-safety-three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "binary": "reliaburger::placement",
+          "test": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "binary": "reliaburger::placement",
+          "test": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-rollback_works_after_every_node_restarts",
+          "binary": "reliaburger::placement",
+          "test": "rollback_works_after_every_node_restarts",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Re-applying the identical failed spec keeps RolloutFailed; only a different spec clears it."
+      ],
+      "boundaries": [
+        "Rollout progress comes from node reports; full leader-coordinated rollouts with a cluster-wide budget are not claimed."
+      ]
+    },
+    {
+      "id": "issue-700-one-bad-ingress-route",
+      "issue": 700,
+      "promise": "One app whose ingress route no node can install never stops the cluster catalogue: every node skips that route, logs it, and keeps publishing discovery and ingress for every other app.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime, with the invalid spec written straight to the council"
+      ],
+      "cases": [
+        {
+          "id": "issue-700-invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+          "binary": "reliaburger::cluster_failover",
+          "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "relish apply and relish lint refuse an ingress with an unsupported TLS mode, a zero rate or burst, or a rate whose default burst overflows."
+      ],
+      "boundaries": [
+        "The skipped route stays uninstalled until its app is reapplied with a valid ingress."
+      ]
+    },
+    {
+      "id": "issue-695-interrupted-snapshot-is-cleaned-up",
+      "issue": 695,
+      "promise": "A volume snapshot whose create was cut between the Btrfs subvolume and its metadata never leaks a hidden subvolume: the next start deletes it, and a metadata-less subvolume without an intent is reported, never silently skipped.",
+      "supported_paths": [
+        "Rootful Linux with Btrfs-backed managed volumes"
+      ],
+      "cases": [
+        {
+          "id": "interrupted-snapshot-btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+          "binary": "reliaburger",
+          "test": "grill::snapshot::tests::btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/snapshot.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A metadata-less subvolume with no intent file is reported and kept, because nothing proves it is safe to delete."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate on a loop-mounted Btrfs; the portable tests cover every intent decision with plain directories. The power cut itself stays with the Btrfs power-cut fixture of #287."
+      ]
+    },
+    {
+      "id": "issue-702-stale-node-grace",
+      "issue": 702,
+      "promise": "A node alive in gossip whose reports stopped keeps its replicas for the stale-node grace, then loses them to the survivors.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs, with one node's agent stopped while its gossip and Raft carry on"
+      ],
+      "refused_paths": [
+        "The silent node's replica never moves before its reports have been stale for the grace."
+      ],
+      "boundaries": [
+        "The grace is measured on the leader's clock from when the node's reports went stale; a node the leader never heard from counts from when it started listening."
+      ],
+      "cases": [
+        {
+          "id": "stale-node-grace-replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "binary": "reliaburger::placement",
+          "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-701",
+      "issue": 701,
+      "promise": "Every [app.*] field is honoured as written or refused with a reason; none is parsed and then silently dropped.",
+      "supported_paths": [
+        "An init container runs its own image (or the app's) with the app's env, decrypted secrets, and volume and config-file mounts.",
+        "Inline config files are per instance and keyed on the container path, and go with the instance.",
+        "health.port without an app port is probed at deploy and by the rollout gate.",
+        "Removing [autoscale] clears its override; narrowing its bounds clamps it."
+      ],
+      "refused_paths": [
+        "volumes, config_file, run_as_user and run_as_group on exec or script apps.",
+        "A health check with no port, a zero interval, timeout or threshold, or a timeout longer than the interval.",
+        "gpu above 0 and egress.allow_franchise.",
+        "A volume size the node cannot enforce, or a changed size on an existing volume."
+      ],
+      "boundaries": [
+        "Running an init container's own image needs the provisioned Linux root gate; portable cases check the generated spec and the agent's wiring.",
+        "Volume size is refused on the node at deploy, not at apply."
+      ],
+      "cases": [
+        {
+          "id": "issue-701-runc_init_container_runs_its_own_image_with_app_env",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_init_container_runs_its_own_image_with_app_env",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_spec_uses_its_own_image",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::init_spec_uses_its_own_image",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_spec_gets_app_env_and_volume_mounts",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::init_spec_gets_app_env_and_volume_mounts",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_container_runs_its_own_image_with_the_app_env_and_mounts",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::init_container_runs_its_own_image_with_the_app_env_and_mounts",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/deploy_worker.rs"
+          ]
+        },
+        {
+          "id": "issue-701-inline_config_files_with_same_basename_do_not_collide",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::inline_config_files_with_same_basename_do_not_collide",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-stop_removes_each_instances_inline_config_files",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::stop_removes_each_instances_inline_config_files",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/retirement.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_volume_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_volume_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_config_file_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_config_file_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_run_as_user_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_run_as_user_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-removing_autoscale_clears_the_override",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::removing_autoscale_clears_the_override",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-701-narrowing_autoscale_bounds_clamps_the_override",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::narrowing_autoscale_bounds_clamps_the_override",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-701-health_port_without_app_port_is_valid",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::health_port_without_app_port_is_valid",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-zero_health_timeout_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::zero_health_timeout_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-rollout_gate_probes_health_port_without_app_port",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::rollout_gate_probes_health_port_without_app_port",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/health_checks.rs"
+          ]
+        },
+        {
+          "id": "issue-701-changing_size_of_existing_volume_is_refused",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::changing_size_of_existing_volume_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-701-unenforceable_size_is_refused",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::unenforceable_size_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-701-gpu_request_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::gpu_request_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-allow_franchise_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::allow_franchise_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        }
       ]
     }
   ]

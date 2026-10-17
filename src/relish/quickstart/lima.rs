@@ -84,9 +84,11 @@ impl Lima {
 
     /// Create Lima's shared SSH key before any VM starts.
     ///
-    /// Lima 2.1.0 generates `$LIMA_HOME/_config/user` on first start, but it
-    /// checks for the key before taking its lock and never checks again, so
-    /// VMs created concurrently can overwrite each other's key. We generate
+    /// Lima generates `$LIMA_HOME/_config/user` on first start, but it checks
+    /// for the key before taking its lock and never checks again, so VMs
+    /// created concurrently can overwrite each other's key. That is still true
+    /// of `DefaultPubKeys` in `pkg/sshutil` in 2.2.1 and on Lima's `master`
+    /// (checked 17 October 2026). We generate
     /// the same ed25519 key it would, publishing the public half first because
     /// Lima treats the private file as proof that both exist.
     pub async fn ensure_user_key(&self) -> Result<()> {

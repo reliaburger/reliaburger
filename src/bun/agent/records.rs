@@ -353,19 +353,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 return Err(error);
             }
 
+            // No fault survives its Bun: lift any cap or pause the previous
+            // process left on this instance before publishing it (#699).
+            self.release_leftover_faults(&runtime_id, &record.oci_spec)
+                .await;
+
             // The surviving instance still holds its port.
             if let Some(port) = record.host_port {
                 self.supervisor.port_allocator.reserve(port).await?;
             }
 
             // Rebuild the health check from the recorded app spec.
-            let health_config = record.app_spec.as_ref().and_then(|spec| {
-                let health = spec.health.as_ref()?;
-                let port = spec.port?;
-                Some(crate::bun::health::HealthCheckConfig::from_spec(
-                    health, port,
-                ))
-            });
+            let health_config = record
+                .app_spec
+                .as_ref()
+                .and_then(crate::bun::health::HealthCheckConfig::for_app);
             if let Some(config) = &health_config {
                 self.supervisor
                     .register_health(instance_id.clone(), config.clone(), now);
@@ -420,6 +422,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 oci_spec: Some(record.oci_spec.clone()),
                 identity,
                 identity_mount,
+                launch_failure: None,
             };
             self.supervisor
                 .instances

@@ -85,18 +85,52 @@ pub(super) async fn discard_probe(probe: Probe) {
 
 /// Ask the executable at `executable` which formats it uses.
 async fn query(executable: &Path) -> Result<(), UpgradeError> {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("--compatibility")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    query_with(command).await
+}
+
+/// What [`launch`] hands back: the command, for a retry, and its result.
+type Launched = (
+    tokio::process::Command,
+    std::io::Result<tokio::process::Child>,
+);
+
+/// Start `command` on the blocking pool and hand it back with the result.
+///
+/// Launching blocks until the new program has been exec'd, and on macOS
+/// the first exec of a new file waits for the host to assess it: seconds,
+/// for a release-sized binary on a busy host. That wait would stop every
+/// task on the caller's worker, the node's Raft core among them (#793).
+/// The command comes back so an `ETXTBSY` retry can launch it again.
+async fn launch(mut command: tokio::process::Command) -> Result<Launched, UpgradeError> {
+    // Blocking-pool threads carry the runtime's context, so the child is
+    // registered with the runtime that will wait for it. If the caller is
+    // cancelled first, the child is dropped when the launch finishes, and
+    // `kill_on_drop` stops it.
+    let launched = tokio::task::spawn_blocking(move || {
+        let launched = command.spawn();
+        (command, launched)
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    Ok(launched)
+}
+
+/// Run a prepared compatibility query and check the answer.
+async fn query_with(mut command: tokio::process::Command) -> Result<(), UpgradeError> {
     let started = tokio::time::Instant::now();
     let deadline = started + QUERY_DEADLINE;
     let mut progress = QueryProgress::default();
     let mut child = loop {
-        match tokio::process::Command::new(executable)
-            .arg("--compatibility")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-        {
+        let (returned, launched) = launch(command).await?;
+        command = returned;
+        match launched {
             Ok(child) => break child,
             // Another concurrent fork can briefly inherit the writable file
             // before its exec closes CLOEXEC descriptors. Retain the same
@@ -189,5 +223,83 @@ async fn query(executable: &Path) -> Result<(), UpgradeError> {
             found: formats,
             expected: crate::compatibility::CURRENT,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_slow_probe_launch_leaves_the_runtime_free() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        let directory = tempfile::tempdir().unwrap();
+        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
+        let script = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n");
+        let probe = directory.path().join("probe");
+        std::fs::write(&probe, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut command = tokio::process::Command::new(&probe);
+        command
+            .arg("--compatibility")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        // Stand in for macOS's first-launch assessment (#793), which holds
+        // the parent's spawn until the kernel has finished with the new
+        // file. A sleep between fork and exec holds it the same way, on any
+        // host. (A slow script can't: `spawn` returns once exec succeeds,
+        // before the script's first line runs.)
+        // SAFETY: the closure runs in the forked child before exec, where
+        // only async-signal-safe calls are allowed. `thread::sleep` is a
+        // loop around nanosleep, which is one, and it neither allocates nor
+        // takes a lock.
+        unsafe {
+            command.pre_exec(|| {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(())
+            });
+        }
+
+        let stop = CancellationToken::new();
+        let ticker = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let mut longest = Duration::ZERO;
+                let mut last = std::time::Instant::now();
+                while !stop.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    longest = longest.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                longest
+            }
+        });
+        // Let the ticker take its first reading: on this one-thread runtime
+        // it doesn't run until the test yields, and a launch that blocks
+        // before its first `.await` would otherwise go unseen.
+        tokio::task::yield_now().await;
+        let started = std::time::Instant::now();
+        let answered = query_with(command).await;
+        let took = started.elapsed();
+        stop.cancel();
+        let longest = ticker.await.unwrap();
+
+        answered.unwrap();
+        assert!(
+            took >= Duration::from_secs(1),
+            "the launch took only {took:?}"
+        );
+        // The same bound as `preparing_a_large_binary_leaves_the_runtime_free`:
+        // a quarter of Raft's shortest election timeout.
+        assert!(
+            longest < Duration::from_millis(250),
+            "the probe launch held the runtime for {longest:?} of its {took:?}"
+        );
     }
 }

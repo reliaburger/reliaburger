@@ -158,6 +158,7 @@ impl Harness {
                         timestamp: std::time::SystemTime::UNIX_EPOCH,
                         running_apps: vec![],
                         cached_specs: vec![],
+                        rollouts: Vec::new(),
                         resource_usage: reliaburger::reporting::types::ResourceUsage {
                             cpu_total_millicores: 8000,
                             cpu_used_millicores: 0,
@@ -383,6 +384,7 @@ fn capacity_options(council: Arc<CouncilNode>) -> HarnessOptions {
             node_id: reliaburger::meat::NodeId::new("node-1"),
             address: "127.0.0.1:9001".parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         }]),
         capacity_nodes: vec!["node-1".into()],
         ..Default::default()
@@ -489,7 +491,7 @@ async fn assert_batch_refuses_declarative_job_field(field: &str) {
     })
     .await;
     let mut spec = serde_json::json!({
-        "image": "proc-grill:image-ignored", "namespace": "default",
+        "image": "app:v1", "namespace": "default",
         "command": ["sh", "-c", format!("printf 'launch\\n' >> '{}'", launches.display())]
     });
     spec[field] = match field {
@@ -567,6 +569,7 @@ async fn a_previous_named_run_cannot_complete_a_new_batch_before_dispatch_acknow
                         pid: None,
                         runtime_unknown: false,
                         status_age_ms: None,
+                        reason: None,
                     }]);
                     let _ = observed_tx.send(()).await;
                 }
@@ -1084,6 +1087,7 @@ async fn follower_forwarding_cannot_bypass_a_failed_cluster_prerequisite() {
             node_id: reliaburger::meat::NodeId::new("node-1"),
             address: format!("127.0.0.1:{}", leader.port).parse().unwrap(),
             api_advertised: true,
+            jobs: None,
         }]),
         ..Default::default()
     })
@@ -1363,8 +1367,8 @@ async fn invalid_cluster_prerequisites_are_refused_before_any_app_commit() {
     let http = reqwest::Client::new();
     for body in [
         "[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['app.absent']\n",
-        "[app.web]\nimage='proc-grill:image-ignored'\nnamespace='production'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nnamespace='other'\nrun_before=['app.web']\n",
-        "[app.web]\nimage='proc-grill:image-ignored'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['job.web']\n",
+        "[app.web]\nimage='app:v1'\nnamespace='production'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nnamespace='other'\nrun_before=['app.web']\n",
+        "[app.web]\nimage='app:v1'\n[job.migrate]\nruntime = \"process\"\nexec = \"/usr/bin/true\"\ncommand=[]\nrun_before=['job.web']\n",
     ] {
         let response = http
             .post(format!("{}/v1/apply", harness.base_url))

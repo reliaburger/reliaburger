@@ -19,7 +19,7 @@ glibc builds; static builds are planned for 0.3.0
 It applies most Kubernetes manifests directly and tells you what it had to
 change or drop (see [what converts](docs/manual/09_kubernetes.md)). The tour below
 takes a laptop to a three-node cluster, runs a real Kubernetes app and a
-thousand jobs on it, breaks it and watches it heal. Five minutes is the target.
+batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
@@ -45,7 +45,7 @@ relish images                        # burger:v1, built for amd64 and arm64
 relish apply burger/burger.toml
 curl http://burger.localhost:18080/order   # calls podinfo's backend by name
 
-# A thousand jobs from the same image, packed around the running apps
+# Ten jobs from the same image, packed around the running apps
 relish batch submit burger/jobs.toml
 relish batch watch 1                 # the number submit printed
 relish jobs                          # the finished run and its rate
@@ -94,6 +94,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
+  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL *(0.2.1, not in 0.2.0)*
   - `relish council re-enrol --data-dir <DATA_DIR>`: Re-enrol a voter fenced out by `council recover`
 - `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
 - `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
@@ -159,7 +160,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish fault drop <TARGET> <PERCENTAGE>`: Fail a percentage of connections
   - `relish fault dns <TARGET> <FAULT_TYPE>`: Return NXDOMAIN for DNS resolution
   - `relish fault partition <TARGET>`: Block traffic between services
-  - `relish fault bandwidth <TARGET> <LIMIT>`: Throttle bandwidth to a service
+  - `relish fault bandwidth <TARGET> <LIMIT>`: Throttle bandwidth to a service (not implemented yet: Bun refuses it, #366)
   - `relish fault cpu <TARGET> <PERCENTAGE>`: Consume CPU in a service's cgroup
   - `relish fault memory <TARGET> <VALUE>`: Push memory usage toward a service's limit
   - `relish fault disk-io <TARGET> <LIMIT>`: Throttle disk I/O for a service
@@ -194,7 +195,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
-- `relish images`: List images in the local Pickle registry
+- `relish images`: List images in the Pickle registry, or delete a tag
+  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.1, not in 0.2.0)*
 - `relish build <PATH>`: Build an OCI image and push to Pickle
 - `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
   - `relish snapshot create <APP>`: Snapshot an app's managed volumes
@@ -202,7 +204,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish snapshot restore <APP> <NAME>`: Restore a snapshot over its live volume (stop the app first)
   - `relish snapshot delete <APP> <NAME>`: Delete a snapshot
 
-**Upgrades** ([operations](docs/manual/12_operations.md))
+**Upgrades and GitOps** ([operations](docs/manual/12_operations.md))
 
 - `relish upgrade`: Roll a new bun binary across the cluster, or back
   - `relish upgrade check`: Check for available updates
@@ -212,6 +214,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
+- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.1, not in 0.2.0)*
+  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.1, not in 0.2.0)*
+  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.1, not in 0.2.0)*
+  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.1, not in 0.2.0)*
 
 **Learn** ([under the hood](docs/manual/06_under-the-hood.md))
 
@@ -251,8 +257,10 @@ a warning, `envFrom` is dropped, and their values have to move into `env` or
 `relish import` writes the equivalent TOML if you'd rather keep that.
 
 **Clustering without etcd.** Nodes find each other and detect failure with SWIM
-gossip. A small Raft council, embedded in the agent, holds cluster state. Lose
-a node and the scheduler moves its workloads to the survivors. Lose the whole
+gossip. A small Raft council, embedded in the agent, holds cluster state. It
+always has an odd number of voters, so two nodes run one voter and high
+availability starts at three. Lose a node and the scheduler moves its
+workloads to the survivors. Lose the whole
 council and `relish council recover` rebuilds it from a backup, fencing off the
 old voters if they return; `relish council status` shows every node's view.
 
@@ -386,7 +394,9 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
   your own files.
 - **No PromQL.** Metrics are read through `relish metrics`, the dashboards and
   the API.
-- **`fault bandwidth` is refused**, and `fault delay` needs runc containers.
+- **`fault bandwidth` is refused** until it's implemented
+  ([#366](https://github.com/reliaburger/reliaburger/issues/366)), and `fault
+  delay` needs runc containers.
 - **Kubernetes import covers the kinds listed above.** Anything else is reported,
   not applied.
 - **Clusters start fresh.** Development-build state isn't migrated, and rolling
@@ -404,13 +414,15 @@ detail in GitHub milestones and issues.
 You'll need Rust 1.97 or later. On Linux the build also compiles two small
 static C helpers, so it needs a C compiler and a static libc (`build-essential`
 on Debian and Ubuntu, `gcc glibc-static` on Fedora). This runs a process
-workload with no container runtime, on macOS or Linux:
+workload with no container runtime, on macOS or Linux. The process runtime
+runs host binaries the node allows, not images, so start Bun with the example
+node config that allows the `testapp` workload:
 
 ```sh
 git clone https://github.com/reliaburger/reliaburger
 cd reliaburger
 cargo build --locked --bins
-target/debug/bun --runtime process
+target/debug/bun --runtime process --config examples/node/process-runtime.toml
 
 # In another terminal
 target/debug/relish apply examples/phase-1/proc-first-run.toml

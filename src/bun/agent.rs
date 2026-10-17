@@ -38,7 +38,9 @@
 //! 2. An await that stays inline without the turn's deadline carries a
 //!    `// LOOP-INLINE: <why>` comment on its statement: an in-memory lock,
 //!    an fsync'd persist (allowed, and bounded by the harness's slow-disk
-//!    scenario), or the short sleep before an upgrade's exec.
+//!    scenario), or the short sleep before an upgrade's exec. A consumer
+//!    step's discovery-journal write is the exception: it waits only until
+//!    the turn's deadline, then lands off the loop (#890).
 //! 3. `loop_rule::every_inline_await_on_the_agent_loop_has_a_deadline_or_a_reason`
 //!    walks every method a turn can reach and fails on an await with
 //!    neither. Reviewers read the tags, not the whole call graph.
@@ -488,6 +490,9 @@ pub struct BunAgent<G: Grill> {
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
+    /// Where the cgroup v2 hierarchy is mounted: `/sys/fs/cgroup`, except in
+    /// tests that stand a directory in for it.
+    cgroup_mount: PathBuf,
     /// Which apps' volumes a snapshot operation owns right now.
     volume_maintenance: crate::bun::volume_maintenance::VolumeMaintenance,
     /// Test hook: an accepted restore waits here before touching the disk.
@@ -640,6 +645,13 @@ pub struct BunAgent<G: Grill> {
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// The runtime generation each parent's initialisers last launched, so
+    /// the parent's retirement can forget exactly those journals and never
+    /// a successor's under the same identity (#850).
+    initialiser_generations: std::collections::HashMap<
+        InstanceId,
+        std::collections::HashMap<InstanceId, crate::grill::RuntimeGeneration>,
+    >,
     /// Captured before startup; a recovered runtime hold needs original discovery
     /// reconciliation rather than an empty in-memory map authorising release.
     /// Original executions awaiting cluster cleanup after the API becomes available.
@@ -661,13 +673,18 @@ pub struct BunAgent<G: Grill> {
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
     /// Apps whose last admission here failed because the execution budget
-    /// had no room (job leases may hold it), keyed by (app_name, namespace).
-    /// Every state report carries them, so the leader places the replicas
-    /// elsewhere instead of holding them. An entry stays until an admission
-    /// of that app succeeds here or the app is stopped or retired here: a
+    /// had no room (job leases may hold it), keyed by (app_name, namespace),
+    /// with the replica ordinals the admission tried to start. Every state
+    /// report carries them, so the leader places those replicas elsewhere
+    /// instead of holding them (#971). An entry stays until an admission of
+    /// that app succeeds here or the app is stopped or retired here: a
     /// deploy backs off for minutes between attempts, and the refusal must
     /// not lapse in between (#967).
-    capacity_refusals: std::collections::HashSet<(String, String)>,
+    capacity_refusals: std::collections::HashMap<(String, String), Vec<u32>>,
+    /// The app versions this node's placement reconciler last finished
+    /// deploying, as it last told the agent. State reports carry them so the
+    /// leader can release a rollout node by node (#692).
+    converged_rollouts: Vec<crate::reporting::types::RolloutReport>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; reservations advance beyond both this counter and all restored owners.
@@ -817,6 +834,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -891,13 +909,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashSet::new(),
+            capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
             capture_offsets: Arc::default(),
@@ -963,6 +983,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -1048,13 +1069,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashSet::new(),
+            capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
             capture_offsets: Arc::default(),
@@ -1266,6 +1289,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The constructors default it; the binary overrides from config.
     pub fn set_volumes_dir(&mut self, dir: std::path::PathBuf) {
         self.volumes_dir = dir;
+    }
+
+    /// Stand a directory in for the cgroup v2 mount.
+    #[cfg(test)]
+    pub(crate) fn set_cgroup_mount(&mut self, mount: std::path::PathBuf) {
+        self.cgroup_mount = mount;
     }
 
     /// Configure the actual protected listener ports, explicit enrolment peers
@@ -1555,8 +1584,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // (#505). Its steps take turns with everything below:
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
-                    _ = std::future::ready(()), if self.consumer_syncs.step_first() => {
+                    // No step runs while a step's write is in flight.
+                    _ = std::future::ready(()), if self.consumer_syncs.step_first()
+                        && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
+                        self.continue_consumer_sync().await;
+                        turn
+                    }
+                    // A step's write that outlasted its turn has landed
+                    // (#890): take the step's remainder now.
+                    outcome = Self::discovery_write_done(&mut self.discovery_ownership),
+                        if self.discovery_write_in_flight() => {
+                        let turn = self.begin_consumer_sync_turn();
+                        self.land_discovery_write(outcome).await;
                         self.continue_consumer_sync().await;
                         turn
                     }
@@ -1570,7 +1610,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.handle_command(cmd).await;
                         turn
                     }
-                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle() => {
+                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle()
+                        && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn

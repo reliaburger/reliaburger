@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::bun::api;
-use reliaburger::bun::task_array_leader::TaskArrayService;
+use reliaburger::bun::task_array_leader::{CronClock, TaskArrayService};
 use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
 use reliaburger::bun::task_executor::{AttemptOutcome, FakeRunner, ProcessRunner};
 use reliaburger::bun::task_ledger::GroupCommit;
@@ -24,11 +24,15 @@ use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRout
 use reliaburger::council::node::CouncilNode;
 use reliaburger::council::state_machine::CouncilStateMachine;
 use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
+use reliaburger::meat::job_capability::JobCapabilities;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::task_harness::TestTasks;
+
+/// The live members the leader's API sees, as `bun` builds them from gossip.
+type Members = Arc<tokio::sync::RwLock<Vec<api::NodeMembershipInfo>>>;
 
 const SHELL: &str = "/bin/sh";
 const NODE: &str = "node-1";
@@ -39,6 +43,8 @@ struct Harness {
     base_url: String,
     http: reqwest::Client,
     council: Option<Arc<CouncilNode>>,
+    /// The job capabilities this harness's node advertises (#788).
+    job_capabilities: JobCapabilities,
     _data: tempfile::TempDir,
     _tasks: TestTasks,
 }
@@ -131,6 +137,35 @@ impl Harness {
         tokens: Option<reliaburger::sesame::auth::TokenStore>,
         data: tempfile::TempDir,
     ) -> Self {
+        Self::start_in_with_cron_clock(options, tokens, data, CronClock::System, None).await
+    }
+
+    /// A harness whose leader sees `membership` as the cluster's live
+    /// members, as `bun` builds it from gossip.
+    async fn start_with_membership(options: Options, membership: Members) -> Self {
+        Self::start_in_with_cron_clock(
+            options,
+            None,
+            tempfile::tempdir().unwrap(),
+            CronClock::System,
+            Some(membership),
+        )
+        .await
+    }
+
+    /// A harness whose leader fires cron schedules at `clock`'s time.
+    async fn start_with_cron_clock(options: Options, clock: CronClock) -> Self {
+        Self::start_in_with_cron_clock(options, None, tempfile::tempdir().unwrap(), clock, None)
+            .await
+    }
+
+    async fn start_in_with_cron_clock(
+        options: Options,
+        tokens: Option<reliaburger::sesame::auth::TokenStore>,
+        data: tempfile::TempDir,
+        cron_clock: CronClock,
+        membership: Option<Members>,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         // No agent: task arrays don't go through it. Holding the receiver
@@ -168,6 +203,7 @@ impl Harness {
             },
             options.runner,
         );
+        let job_capabilities = node.job_capabilities();
         let service = Arc::new(
             TaskArrayService::with_timings(
                 Some(Arc::new(node)),
@@ -175,6 +211,7 @@ impl Harness {
                 Duration::from_secs(30),
             )
             .with_retention(options.retention)
+            .with_cron_clock(cron_clock)
             .with_storage(data.path())
             .await
             .unwrap(),
@@ -198,7 +235,7 @@ impl Harness {
             tokens,
             None,
             None,
-            None,
+            membership,
             None,
             None,
             port,
@@ -231,6 +268,7 @@ impl Harness {
             base_url: format!("http://127.0.0.1:{port}"),
             http: reqwest::Client::new(),
             council,
+            job_capabilities,
             _data: data,
             _tasks: TestTasks::new(shutdown, vec![agent, server]),
         }
@@ -379,6 +417,14 @@ async fn failures_are_counted_and_their_output_kept() {
     assert_eq!(status, 404, "succeeded tasks keep no output");
 }
 
+/// Tasks in the Raft-entry test: twenty default chunks of 1,024.
+///
+/// Raft entries follow chunks and leader ticks, not tasks, so this many
+/// shows the ratio as well as 100,000 did. 100,000 fake tasks cost about
+/// 4.4 s of CPU in a debug build, which took 56 s at a load average of 80
+/// on a ten-core Mac and timed out at 60 s in a loaded `make test` (#896).
+const RAFT_ENTRY_TASKS: u64 = 20_000;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once() {
     // #889: index 3's first launch fails as an image pull would during
@@ -424,7 +470,7 @@ async fn a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
+async fn twenty_thousand_tasks_cost_a_few_dozen_raft_entries() {
     let harness = Harness::start(Options {
         council: true,
         runner: NodeRunner::Fake(FakeRunner::new(Duration::ZERO, |task| {
@@ -450,17 +496,18 @@ async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
         .submit_ok(json!({
             "name": "many",
             "template": { "runtime":"process","exec": SHELL, "command": ["{index}"] },
-            "spec": { "count": 100_000 },
+            "spec": { "count": RAFT_ENTRY_TASKS },
         }))
         .await;
-    let summary = harness.wait_done(batch_id, 120).await;
+    let summary = harness.wait_done(batch_id, 50).await;
     assert_eq!(summary["status"], "Succeeded", "{summary}");
-    assert_eq!(summary["succeeded"], 100_000);
-    assert_eq!(summary["retried"], 100);
-    assert_eq!(summary["chunks_done"], 98);
+    assert_eq!(summary["succeeded"], RAFT_ENTRY_TASKS);
+    assert_eq!(summary["retried"], RAFT_ENTRY_TASKS / 1000);
+    assert_eq!(summary["chunks_done"], 20);
 
     // Registration plus at most one entry per sync that changed
-    // something: never anywhere near one per task.
+    // something: never anywhere near one per task. Three entries per
+    // thousand tasks is the budget 300 was for 100,000.
     let entries = council
         .raft()
         .metrics()
@@ -468,8 +515,12 @@ async fn a_hundred_thousand_tasks_cost_a_few_hundred_raft_entries() {
         .last_log_index
         .unwrap_or(0)
         - before;
-    assert!(entries <= 300, "{entries} Raft entries for 100,000 tasks");
-    eprintln!("task_arrays: 100,000 tasks through Raft in {entries} entries");
+    let budget = RAFT_ENTRY_TASKS / 1000 * 3;
+    assert!(
+        entries <= budget,
+        "{entries} Raft entries for {RAFT_ENTRY_TASKS} tasks, over {budget}"
+    );
+    eprintln!("task_arrays: {RAFT_ENTRY_TASKS} tasks through Raft in {entries} entries");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -608,6 +659,174 @@ async fn host_runs_under_mount_isolation_are_refused_with_the_reason() {
     assert_eq!(summary["not_run"], 20, "{summary}");
     let reason = summary["unrunnable_reason"].as_str().unwrap();
     assert!(reason.contains("mount_isolation"), "{reason}");
+}
+
+/// Two nodes gossiping in memory, as `bun` wires them for #788: `NODE`,
+/// the harness's leader, and a peer, each advertising its job capabilities
+/// through a watch.
+struct GossipPair {
+    peer_jobs: tokio::sync::watch::Sender<Option<JobCapabilities>>,
+    _leader_jobs: tokio::sync::watch::Sender<Option<JobCapabilities>>,
+    directory: tokio::sync::watch::Receiver<reliaburger::mustard::directory::NodeDirectory>,
+    membership:
+        tokio::sync::watch::Receiver<Vec<reliaburger::mustard::membership::MembershipSnapshot>>,
+    _tasks: TestTasks,
+}
+
+const PEER: &str = "node-2";
+
+impl GossipPair {
+    async fn start(leader: JobCapabilities, peer: JobCapabilities) -> Self {
+        use reliaburger::meat::NodeId;
+        use reliaburger::mustard::transport::InMemoryNetwork;
+        use reliaburger::mustard::{GossipConfig, MustardNode};
+        use tokio::sync::watch;
+
+        let config = GossipConfig {
+            protocol_interval: Duration::from_millis(20),
+            probe_timeout: Duration::from_millis(50),
+            suspicion_timeout: Duration::from_secs(5),
+            indirect_probe_count: 1,
+            cleanup_timeout: Duration::from_secs(30),
+            push_pull_interval: Duration::from_millis(200),
+        };
+        let net = InMemoryNetwork::new();
+        let leader_address = "127.0.0.1:17901".parse().unwrap();
+        let peer_address = "127.0.0.1:17902".parse().unwrap();
+        let mut leader_node = MustardNode::new(
+            NodeId::new(NODE),
+            leader_address,
+            config.clone(),
+            net.register(leader_address).await,
+        );
+        let mut peer_node = MustardNode::new(
+            NodeId::new(PEER),
+            peer_address,
+            config,
+            net.register(peer_address).await,
+        );
+        // Port 9 refuses connections, so the leader's syncs to the peer
+        // fail at once rather than hanging.
+        leader_node.set_advertised_endpoints(9, 9, BTreeMap::new());
+        peer_node.set_advertised_endpoints(9, 9, BTreeMap::new());
+        let (leader_jobs, leader_jobs_rx) = watch::channel(Some(leader));
+        leader_node.set_job_capabilities_watch(leader_jobs_rx);
+        let (peer_jobs, peer_jobs_rx) = watch::channel(Some(peer));
+        peer_node.set_job_capabilities_watch(peer_jobs_rx);
+        let (directory_tx, directory) = watch::channel(Default::default());
+        leader_node.set_directory_watch(directory_tx);
+        let (membership_tx, membership) = watch::channel(Vec::new());
+        leader_node.set_membership_watch(membership_tx);
+        leader_node.add_seed(NodeId::new(PEER), peer_address);
+
+        let shutdown = CancellationToken::new();
+        let leader_shutdown = shutdown.clone();
+        let peer_shutdown = shutdown.clone();
+        let tasks = vec![
+            tokio::spawn(async move { leader_node.run(leader_shutdown).await }),
+            tokio::spawn(async move { peer_node.run(peer_shutdown).await }),
+        ];
+        Self {
+            peer_jobs,
+            _leader_jobs: leader_jobs,
+            directory,
+            membership,
+            _tasks: TestTasks::new(shutdown, tasks),
+        }
+    }
+
+    /// Whether the leader has heard the peer advertising `peer`, and lists
+    /// itself and the peer as members.
+    fn heard(&self, peer: &JobCapabilities) -> bool {
+        let node = reliaburger::meat::NodeId::new(PEER);
+        let directory = self.directory.borrow();
+        directory.jobs.get(&node) == Some(peer)
+            && directory
+                .jobs
+                .contains_key(&reliaburger::meat::NodeId::new(NODE))
+            && self
+                .membership
+                .borrow()
+                .iter()
+                .any(|member| member.node_id == node)
+    }
+
+    /// Wait until the leader's directory has learned the peer advertising
+    /// `peer`, then publish the live members to `members` as `bun` does.
+    async fn publish_once_peer_advertises(&self, peer: JobCapabilities, members: &Members) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !self.heard(&peer) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader never heard the peer's job capabilities"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let directory = self.directory.borrow().clone();
+        let live: Vec<api::NodeMembershipInfo> = self
+            .membership
+            .borrow()
+            .iter()
+            .filter(|member| member.state == reliaburger::mustard::state::NodeState::Alive)
+            .map(|member| api::NodeMembershipInfo::from_gossip(member, &directory, 0))
+            .collect();
+        *members.write().await = live;
+    }
+}
+
+/// #788: in a cluster the leader refuses a run no live node can take at
+/// submission, with HTTP 422 and the reason its tick would give, using the
+/// job capabilities every node advertises over gossip. Once one node could
+/// take the run, it is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_refuses_a_run_no_live_node_can_take_at_submission() {
+    let members: Members = Arc::default();
+    let harness = Harness::start_with_membership(
+        Options {
+            mount_isolation: true,
+            ..Options::processes(true)
+        },
+        Arc::clone(&members),
+    )
+    .await;
+    let isolated = harness.job_capabilities;
+    assert!(isolated.mount_isolation);
+    let gossip = GossipPair::start(isolated, isolated).await;
+    gossip
+        .publish_once_peer_advertises(isolated, &members)
+        .await;
+
+    let started = tokio::time::Instant::now();
+    let (status, answer) = harness.submit(shell_array(20, 10, "exit 0")).await;
+    assert_eq!(status, 422, "{answer}");
+    let error = answer["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("no node can run job default/render: "),
+        "{error}"
+    );
+    assert_eq!(
+        error.matches("host jobs don't run under").count(),
+        1,
+        "both nodes give one reason, quoted once: {error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let response = harness
+        .http
+        .post(format!("{}/v1/jobs/runs", harness.base_url))
+        .json(&json!({"name":"single","request_id":"one","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+
+    // The peer turns mount isolation off, so it could take the run.
+    let open = JobCapabilities {
+        mount_isolation: false,
+        ..isolated
+    };
+    gossip.peer_jobs.send(Some(open)).unwrap();
+    gossip.publish_once_peer_advertises(open, &members).await;
+    harness.submit_ok(shell_array(20, 10, "exit 0")).await;
 }
 
 /// One Raft submission accepts all profiles; the summary list never expands indexes.
@@ -895,7 +1114,10 @@ async fn manual_singletons_use_common_runs_and_repeat_requests_keep_the_same_ide
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cron_registration_is_durable_without_launching_a_manual_run() {
-    let harness = Harness::start(Options::processes(true)).await;
+    // Cron time held at the start, so the every-minute schedule can't come
+    // due if the test crosses a minute boundary (#868).
+    let clock = CronClock::manual(reliaburger::meat::batch_ids::epoch_now_secs());
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock).await;
     let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     let response = harness
         .http
@@ -923,6 +1145,81 @@ async fn cron_registration_is_durable_without_launching_a_manual_run() {
             .is_some()
     );
     assert!(arrays.ids().is_empty());
+}
+
+/// The leader reads cron time from the service's cron clock, so a test can
+/// hold time still and move it on exactly when it wants an occurrence.
+/// Nothing fires while the clock stands before the scheduled minute, however
+/// many leader ticks pass, and the occurrence fires once it gets there (#748).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cron_occurrence_fires_only_when_the_cron_clock_reaches_its_minute() {
+    let start = reliaburger::meat::batch_ids::epoch_now_secs() / 60 * 60;
+    let clock = CronClock::manual(start);
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock.clone()).await;
+    // Well past the minute registration lands in, which a schedule never fires in.
+    let occurrence = start + 30 * 60;
+    let at = time::OffsetDateTime::from_unix_timestamp(occurrence as i64).unwrap();
+    let expression = format!(
+        "{} {} {} {} *",
+        at.minute(),
+        at.hour(),
+        at.day(),
+        u8::from(at.month())
+    );
+    let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":expression}}});
+    let response = harness
+        .http
+        .post(format!("{}/v1/jobs/runs", harness.base_url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let council = harness.council.as_ref().unwrap();
+    let fired = async || {
+        council
+            .desired_state()
+            .await
+            .task_arrays
+            .jobs()
+            .runs()
+            .any(|(_, run)| run.name == "nightly")
+    };
+
+    // Twenty leader ticks with the clock held still.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!fired().await, "the occurrence fired before its minute");
+
+    clock.set(occurrence);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !fired().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the occurrence never fired"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let arrays = council.desired_state().await.task_arrays;
+    let run = arrays
+        .jobs()
+        .runs()
+        .find(|(_, run)| run.name == "nightly")
+        .unwrap()
+        .1;
+    assert_eq!(
+        run.trigger,
+        reliaburger::meat::job::RunTrigger::Cron {
+            minute: (occurrence / 60) as i64
+        }
+    );
+    assert_eq!(
+        arrays
+            .jobs()
+            .definition("default", "nightly")
+            .unwrap()
+            .skipped,
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1012,7 +1309,10 @@ async fn finite_batches_are_common_singletons_and_repeated_submissions_keep_the_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jobs_inventory_and_stop_use_durable_schedule_definitions() {
-    let harness = Harness::start(Options::processes(true)).await;
+    // Cron time held at the start, so the every-minute schedule can't come
+    // due if the test crosses a minute boundary (#868).
+    let clock = CronClock::manual(reliaburger::meat::batch_ids::epoch_now_secs());
+    let harness = Harness::start_with_cron_clock(Options::processes(true), clock).await;
     let body = json!({"name":"nightly","definition":{"template":{"runtime":"process","exec":SHELL,"command":["-c","exit 0"]},"cron":{"expression":"* * * * *"}}});
     assert_eq!(
         harness

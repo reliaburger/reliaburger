@@ -58,6 +58,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// The spec every adopted instance of an app was launched from, when
+    /// their records agree on one.
+    pub(super) fn adopted_spec(&self, app_name: &str, namespace: &str) -> Option<AppSpec> {
+        self.adopted_apps
+            .get(&(app_name.to_string(), namespace.to_string()))
+            .and_then(|adopted| adopted.spec.clone())
+    }
+
     /// Forget adoption evidence for an app this agent deploys again.
     pub(super) fn forget_adopted_app(&mut self, app_name: &str, namespace: &str) {
         self.adopted_apps

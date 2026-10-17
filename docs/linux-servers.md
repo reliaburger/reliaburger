@@ -62,7 +62,7 @@ Ensure the following ports are open:
 | `9444` | TCP | Raft consensus (Council) | Node-to-node |
 | `9445` | TCP | Reporting tree (state reports to the council) | Node-to-node |
 | `5050` | TCP | Pickle OCI image registry | Node-to-node |
-| `10000`-`60000` | TCP | Container host ports (`[network] port_range`); ingress reaches replicas on other nodes through them | Node-to-node |
+| `10000`-`32767` | TCP | Container host ports (`[network] port_range`); ingress reaches replicas on other nodes through them | Node-to-node |
 | `53` | UDP and TCP | Service discovery DNS (`.internal`) | Workloads to their own node |
 | `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External |
 
@@ -75,7 +75,7 @@ still has to let that traffic in. With UFW, run this on every node:
 ```sh
 for peer in 192.168.0.101 192.168.0.102 192.168.0.103; do
   sudo ufw allow proto udp from "$peer" to any port 9443
-  sudo ufw allow proto tcp from "$peer" to any port 9117,9444,9445,5050,10000:60000
+  sudo ufw allow proto tcp from "$peer" to any port 9117,9444,9445,5050,10000:32767
 done
 sudo ufw allow 53/udp
 sudo ufw allow 53/tcp
@@ -238,6 +238,7 @@ ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 127.0.0.1:9117
 Restart=always
 RestartSec=2
+OOMScoreAdjust=-900
 LimitNOFILE=1048576
 KillMode=process
 TimeoutStopSec=30
@@ -250,6 +251,16 @@ WantedBy=multi-user.target
 > exists, the API has no credentials to check, so Bun fails closed (`AUTH3`)
 > and refuses to bind anything but a loopback address such as `127.0.0.1:9117`.
 > You'll mint that token next, then open the listener in §3.5.
+
+`OOMScoreAdjust=-900` tells the kernel to kill workloads before Bun when the
+machine runs out of memory: a killed Bun stops updating the discovery maps for
+every workload on the node, and on an API node it takes the API down too. Bun
+starts every workload, job and task at `oom_score_adj` +500, so they don't
+inherit Bun's -900, and the kernel's first choice is a workload, not the node
+agent. The `[dns]` section above sets no `upstream`, so
+containers resolve names outside `.internal` through the resolvers in this
+machine's `/etc/resolv.conf`, tried in order. If that file names no usable
+resolver, Bun refuses to start; set `upstream = "ADDRESS:53"` under `[dns]`.
 
 Enable and start the service:
 
@@ -422,6 +433,7 @@ ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
 Restart=always
 RestartSec=2
+OOMScoreAdjust=-900
 LimitNOFILE=1048576
 KillMode=process
 TimeoutStopSec=30
@@ -500,6 +512,7 @@ ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
 Restart=always
 RestartSec=2
+OOMScoreAdjust=-900
 LimitNOFILE=1048576
 KillMode=process
 TimeoutStopSec=30

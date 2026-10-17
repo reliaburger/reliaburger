@@ -180,7 +180,7 @@ Every command supports three output modes via the `--output` flag:
 |------|------|-------------|
 | Human | `--output human` (default) | Coloured, aligned terminal output with Unicode symbols |
 | JSON | `--output json` | Machine-readable JSON, one object per line for streaming commands |
-| YAML | `--output yaml` | YAML serialisation via `serde_yaml`, useful for config round-tripping |
+| YAML | `--output yaml` | YAML serialisation via `yaml_serde`, useful for config round-tripping |
 
 Human-readable output uses ANSI colours (auto-detected, disabled when piped). Status indicators use Unicode: checkmarks, crosses, warning triangles, and bullets. Progress bars use `indicatif` for long-running operations (apply, upgrade, bench).
 
@@ -672,10 +672,11 @@ relish exec <app> --namespace <ns> <cmd...>  # Scope to a namespace
 
 # Cluster lifecycle
 relish init [dir] --cluster-name <name> --node-id <id> # Generate config + PKI
-relish init [dir] --development-plaintext              # Local-only plaintext transports
+relish init [dir] --development-plaintext              # Local-only plaintext transports (explicit opt-in; no cluster registry)
 relish nodes                        # Gossip membership and node state
 relish council [status]             # Every node's council view: role, epoch, term, log, quorum
-relish council recover --data-dir <dir> [--from <url>] [--master-key <path>] [--force]
+relish council recover --data-dir <dir> [--from <url> [--backup <name>]] [--master-key <path>] [--api-port <port>] [--force]
+relish council backups --from <url>                # List sealed backups, newest first by epoch, term and index
 relish council re-enrol --data-dir <dir> [--force]  # Drop a fenced voter's Raft state to rejoin
 relish join --token <token> --node-id <id> <api-addr>  # Enrol a node identity
 relish join --token <t> --node-id <id> <addr> --ca-fingerprint sha256:... [--identity-dir <dir>]
@@ -1268,6 +1269,10 @@ state and the first node's identity. It prints the one-use join token and root
 CA fingerprint. It does **not** start Bun. The operator starts the first node
 explicitly with `bun --cluster --config <dir>/reliaburger.toml`; the generated
 config requires mTLS unless `--development-plaintext` was explicitly used.
+`require_mtls` also defaults to `true` when a config omits it, so a hand-written
+config without an identity makes `bun --cluster` refuse and name `relish init`.
+`--development-plaintext` is the only generator of a plaintext config; such a
+cluster has no cluster registry and can't pull Docker Hub short names.
 
 **`relish join --token <token> --node-id <id> <api-address>`**
 
@@ -1333,7 +1338,9 @@ digest, not `latest`. The index resolves to `linux/amd64` under runc and
 `linux/arm64` under Apple Container. Both runtime gates create, start and
 execute the pinned workload; a pull, platform-selection or exec failure fails
 the gate. ProcessGrill remains a separate profile and launches `bun testapp`
-from each node.
+from each node as an `exec` app of `/usr/local/bin/bun`, which the node's
+`[process_workloads] allowed_binaries` must name: the process runtime runs no
+images (#914).
 
 Every case reports exactly one of `Pass`, `Fail`, `Skipped` or `Unknown`.
 `Pass` needs directly observed evidence. `Skipped` means a known missing
@@ -1919,7 +1926,7 @@ Relish is implemented in Rust. The following crates are used:
 | `reqwest` | 0.12.x | HTTP/2 client with mTLS, connection pooling, streaming |
 | `tokio` | 1.x | Async runtime for concurrent API calls, WebSocket streams, and TUI event loop |
 | `tokio-tungstenite` | 0.28.x | WebSocket client for streaming logs, events, and exec sessions |
-| `serde_yaml` | 0.9.x | YAML serialisation for `--output yaml` mode |
+| `yaml_serde` | 0.10.x | YAML serialisation for `--output yaml` mode and Kubernetes import (the maintained successor to `serde_yaml`) |
 | `serde` | 1.x | Serialisation/deserialisation for config, API responses, output |
 | `serde_json` | 1.x | JSON formatting for `--output json` |
 | `toml` | 0.8.x | TOML parsing for configuration files and `compile`/`lint`/`fmt` |

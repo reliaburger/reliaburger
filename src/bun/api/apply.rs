@@ -660,10 +660,21 @@ pub(super) async fn cluster_apply(
         }
     }
 
+    // A manual apply of a GitOps-managed resource goes ahead, with a warning
+    // that the next sync puts back what git declares (#693).
+    let gitops_warnings: Vec<String> = council
+        .desired_state()
+        .await
+        .gitops_owned
+        .managed_in(&config)
+        .iter()
+        .map(|resource| crate::lettuce::types::managed_apply_warning(resource))
+        .collect();
+
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     tokio::spawn(async move {
         let mut config = config;
-        for message in host_path_notes(&config) {
+        for message in gitops_warnings.into_iter().chain(host_path_notes(&config)) {
             let _ = event_tx.send(ApplyEvent::Progress { message }).await;
         }
         // Bind inside the stream, so a slow registry shows as a wait in
@@ -718,6 +729,13 @@ pub(super) async fn cluster_apply(
         };
         for request in writes {
             let describe = describe_write(&request);
+            let app_id = match &request {
+                crate::council::RaftRequest::AppSpec { app_id, .. }
+                | crate::council::RaftRequest::TestLeaseAppSpec { app_id, .. } => {
+                    Some(app_id.clone())
+                }
+                _ => None,
+            };
             match council.write(request).await {
                 // A state-machine refusal (lease expired, in cleanup, resource
                 // owned elsewhere, quota) is NOT a commit — surfacing it as an
@@ -738,6 +756,19 @@ pub(super) async fn cluster_apply(
                             message: format!("{describe}: committed to the cluster"),
                         })
                         .await;
+                    // Committing a spec clears a failed rollout unless it's
+                    // the identical spec, which isn't retried (#929).
+                    let notice = match &app_id {
+                        Some(app_id) => {
+                            council
+                                .read_desired(|desired| rollout_failed_notice(desired, app_id))
+                                .await
+                        }
+                        None => None,
+                    };
+                    if let Some(message) = notice {
+                        let _ = event_tx.send(ApplyEvent::Progress { message }).await;
+                    }
                 }
                 Err(e) => {
                     let _ = event_tx
@@ -763,6 +794,25 @@ pub(super) async fn cluster_apply(
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
     Sse::new(stream).into_response()
+}
+
+/// What `relish apply` says after committing an app whose current spec is
+/// still `RolloutFailed`: the apply re-sent the identical spec, and the
+/// leader doesn't retry it (#692, D11-B; #929).
+fn rollout_failed_notice(
+    desired: &crate::council::types::DesiredState,
+    app_id: &crate::meat::AppId,
+) -> Option<String> {
+    let spec = desired.apps.get(app_id)?;
+    let failure = desired
+        .rollouts
+        .get(app_id)?
+        .failed_for(&crate::meat::deploy_types::rollout_fingerprint(spec))?;
+    Some(format!(
+        "warning: app '{}' in namespace '{}' is RolloutFailed on {} ({}); the same spec \
+         again isn't retried. Change the spec, or run relish rollback",
+        app_id.name, app_id.namespace, failure.node, failure.reason
+    ))
 }
 
 /// A short human-readable label for an apply progress message.

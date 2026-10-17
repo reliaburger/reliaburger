@@ -164,6 +164,7 @@ mod tests {
                     timestamp: SystemTime::now(),
                     running_apps,
                     cached_specs: vec![],
+                    rollouts: Vec::new(),
                     resource_usage: ResourceUsage::default(),
                     event_log: vec![],
                     job_reservations: Default::default(),
@@ -176,6 +177,7 @@ mod tests {
             receive_deadlines: Default::default(),
             reports,
             stale_nodes: vec![],
+            stale_since: Default::default(),
             capabilities: HashMap::new(),
             readiness: HashMap::new(),
         }

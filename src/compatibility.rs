@@ -81,9 +81,66 @@ pub struct Compatibility {
 /// isolation (50/67, #639). The decaying recent-duration histogram that grant
 /// lookahead learns from (`TaskArrayState::recent_duration_counts`), which
 /// travels in Raft snapshots as well as on disk (51/68).
+/// 0.2.1, cluster safety (52/69): one bump for the whole release, made when
+/// the train opened. Each 0.2.1 change to the wire or durable state adds its
+/// line below this one, not another bump.
+/// GitOps ownership and configuration in Raft (`DesiredState::gitops_owned`
+/// and `gitops_config`, `SyncState::warnings`, and the `GitOpsWrite`,
+/// `GitOpsConfigSet`, `TestLeaseAppDelete` and `TestLeaseNamespaceDelete`
+/// requests, #693).
+/// Recovery ids (#694): `DesiredState::recovery_id` in snapshots, the
+/// fence record's `recovery_id` and `split_with`, `sender_recovery_id` on
+/// every Raft RPC and `recovery_id` in its fenced reply, and the gossip
+/// directory extension's `recovery_id`.
+/// Registry durability (#697): the manifest catalogue's `untagged_at`,
+/// `DeleteTag::deleted_at_unix_ms` (deleting a tag now untags), the
+/// `ExpireManifest` request and `RegistryMutation::DeleteTag`; the registry
+/// `Usage` query is gone.
+/// Node-by-node rollouts and `RolloutFailed` (`DesiredState::rollouts`, the
+/// `RolloutFailed` and `RolloutReleased` requests, `StateReport::rollouts`,
+/// `NodeAssignment::held`, `/v1/rollouts/failed` and the
+/// `ApplyEvent::RolloutAborted` stream event, #692).
+/// Scheduler policy (#702): each node's process-workload policy in its
+/// capability report (`NodeCapabilities::process`), the apps placed only in
+/// part (`RaftRequest::Unschedulable`, `DesiredState::unschedulable` and
+/// `DesiredAppEvidence::unschedulable`), and the `placement` event kind.
+/// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
+/// Gossip robustness (#696): `GossipMessage::sequence` for replay
+/// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
+/// its own name) in place of `relayed`, and the reporting
+/// `ReportingMessage::AggregatedReport` variant is gone.
+/// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
+/// sources with bit 63 set name a job's run identity (#737).
+/// Compacted task results (#739): a worker rewrites a finished run's ledger
+/// and live index into `task-arrays/<id>/results`, 14-byte slots, and
+/// deletes both, so a finished run no longer has a ledger to replay.
+/// The gossip directory extension's `jobs`, each node's job capability
+/// summary, which the leader's job admission reads (#788).
+/// App config fields (#701): applying an `AppSpec` without `[autoscale]`
+/// clears its override and narrowed bounds clamp it, an `AutoscaleOverride`
+/// for an app that doesn't autoscale is refused, `OciSpec::initialiser` marks
+/// an init container's spec, managed-volume sidecars record `size_bytes`, and
+/// inline config files move to a per-instance directory.
+/// A task-array node's control fence is `control.fence`, two checksummed
+/// slots rewritten in place, not `control.json` (#745).
+/// API token hashes are SHA-256 digests of the full token, not Argon2id, and
+/// `ApiToken`, `PreviousSecret` and `TokenRotation` lose `token_salt`, so
+/// tokens must be reissued on the fresh 0.2.1 cluster (#912).
+/// Each array's grant fence is `grants.fence`, not `grants.json`, and both
+/// fences share one slot format: magic, generation, payload length, payload
+/// and CRC32, two slots of a power-of-two stride of at least 512 bytes (#902).
+/// A refused launch's `reason` on `/v1/status` instance rows (#881).
+/// The process owner record's `gate`, what the execution gate reported
+/// about its `exec`, and the gate's stdin is now a socket pair (#905).
+/// The capability report's `NodeCapabilities::containers`, and the
+/// `no_container_runtime` unschedulable reason in council state (#914).
+/// Workload OCI specs carry `process.oomScoreAdj`, including the ones in
+/// process owner and runc adoption records (#984).
+/// The state report's `CapacityRefusal::ordinals`, the replicas a node
+/// couldn't start, so a refused scale-up moves only those (#971).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 51,
-    state: 68,
+    protocol: 52,
+    state: 69,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

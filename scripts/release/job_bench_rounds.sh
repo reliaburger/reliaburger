@@ -64,7 +64,7 @@ text = text.replace('[process_workloads]\nallowed_binaries = []',
 text = text.replace('[ebpf]\nenabled = false', '[ebpf]\nenabled = true')
 open(path, 'w').write(text)
 EOF
-systemd-run --unit=rb-bun --collect --property=WorkingDirectory="$work" \
+systemd-run --unit=rb-bun --collect --property=WorkingDirectory="$work" --property=OOMScoreAdjust=-900 \
     --property=StandardOutput=append:"$work/bun.log" --property=StandardError=append:"$work/bun.log" \
     /usr/local/bin/rb-bun --cluster --runtime auto --config cluster/reliaburger.toml
 trap 'systemctl stop rb-bun 2>/dev/null || true' EXIT

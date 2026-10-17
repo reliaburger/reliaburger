@@ -43,6 +43,7 @@ pub mod plan;
 pub mod quickstart;
 pub mod reader;
 pub mod readiness;
+pub mod recover_guard;
 pub mod released_cli;
 pub mod setup;
 pub mod source;
@@ -102,7 +103,7 @@ pub enum RelishError {
 
     /// YAML serialisation failure.
     #[error("failed to serialise YAML: {0}")]
-    SerialiseYaml(serde_yaml::Error),
+    SerialiseYaml(yaml_serde::Error),
 
     /// Command requires a running Bun agent.
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
@@ -176,6 +177,16 @@ pub enum RelishError {
     )]
     ImageNotInRegistry { image: String },
 
+    /// `relish images delete` takes a tag, never a digest or a bare name.
+    #[error(
+        "expected repository:tag (e.g. team/web:v1), got {reference:?}; an image leaves by losing its tags, never by digest"
+    )]
+    InvalidImageTag { reference: String },
+
+    /// The agent reported no registry listener to send the request to.
+    #[error("the agent reports no Pickle registry endpoint")]
+    RegistryUnavailable,
+
     /// Image signing key error (generation, parsing, signing).
     #[error("{0}")]
     ImageSigning(#[from] crate::pickle::signing::SigningError),
@@ -192,6 +203,11 @@ pub enum RelishError {
     /// Council disaster recovery failed (12b.2 D21/CP12).
     #[error("council recover failed: {0}")]
     Recovery(String),
+
+    /// A chaos scenario was invalid, or one of its steps was refused or
+    /// failed, so the command exits non-zero.
+    #[error("scenario: {0}")]
+    Scenario(String),
 
     /// `relish uninstall` refused or could not remove something.
     #[error("{0}")]

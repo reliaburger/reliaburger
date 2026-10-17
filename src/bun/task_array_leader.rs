@@ -64,6 +64,45 @@ pub fn sync_deadline(interval: Duration) -> Duration {
 /// (the entry may still commit; every write is safe to repeat or drop).
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Where the leader reads the time it fires cron schedules at.
+///
+/// Production always uses [`CronClock::System`]. A test that needs an
+/// occurrence to come round at an exact point, say after it has filled the
+/// cluster with other work, holds a [`CronClock::Manual`] still and moves it
+/// on with [`CronClock::set`], instead of racing the wall clock (#748).
+#[derive(Debug, Clone, Default)]
+pub enum CronClock {
+    /// The host's UTC wall clock.
+    #[default]
+    System,
+    /// Seconds since the Unix epoch, shared by every clone and changed only
+    /// by [`CronClock::set`].
+    Manual(Arc<std::sync::atomic::AtomicU64>),
+}
+
+impl CronClock {
+    /// A manual clock that stands at `epoch_secs` until it is set.
+    pub fn manual(epoch_secs: u64) -> Self {
+        Self::Manual(Arc::new(std::sync::atomic::AtomicU64::new(epoch_secs)))
+    }
+
+    /// Move a manual clock, and every clone of it, to `epoch_secs`. The
+    /// system clock can't be moved, so this does nothing to it.
+    pub fn set(&self, epoch_secs: u64) {
+        if let Self::Manual(time) = self {
+            time.store(epoch_secs, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Seconds since the Unix epoch, by this clock.
+    pub fn now_epoch_secs(&self) -> u64 {
+        match self {
+            Self::System => crate::meat::batch_ids::epoch_now_secs(),
+            Self::Manual(time) => time.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+}
+
 /// The latest word from one node about one array, for status views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeView {
@@ -101,6 +140,8 @@ pub struct TaskArrayService {
     pub silence_timeout: Duration,
     /// How long a finished run stays readable before the leader prunes it.
     pub retention: Duration,
+    /// The time cron schedules fire at.
+    cron_clock: CronClock,
     /// Standalone copy of the arrays (unused with a council).
     local: Mutex<TaskArrays>,
     /// The id counter for `local`. With a council the counter lives in Raft.
@@ -165,6 +206,7 @@ impl TaskArrayService {
             sync_interval,
             silence_timeout,
             retention: Duration::from_secs(crate::meat::task_array_store::TERMINAL_RETENTION_SECS),
+            cron_clock: CronClock::System,
             local: Mutex::new(TaskArrays::default()),
             local_ids: Mutex::new(crate::meat::batch_ids::BatchIds::default()),
             views: Mutex::new(HashMap::new()),
@@ -177,6 +219,13 @@ impl TaskArrayService {
     /// hour. Tests use a short window to watch collection happen.
     pub fn with_retention(mut self, retention: Duration) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Fire cron schedules at `clock`'s time instead of the wall clock's.
+    /// Tests use a manual clock to say exactly when an occurrence comes round.
+    pub fn with_cron_clock(mut self, clock: CronClock) -> Self {
+        self.cron_clock = clock;
         self
     }
 
@@ -848,6 +897,12 @@ pub fn unrunnable_reason(
         }
         reasons.insert(progress.refused.as_deref()?);
     }
+    Some(format!("no node can run it: {}", quote_reasons(&reasons)))
+}
+
+/// The distinct reasons nodes gave for refusing a run, joined for a user:
+/// at most [`MAX_UNRUNNABLE_REASONS`] of them, each cut to 256 bytes.
+fn quote_reasons(reasons: &BTreeSet<&str>) -> String {
     let mut quoted: Vec<String> = reasons
         .iter()
         .take(MAX_UNRUNNABLE_REASONS)
@@ -866,7 +921,50 @@ pub fn unrunnable_reason(
             reasons.len() - MAX_UNRUNNABLE_REASONS
         ));
     }
-    Some(format!("no node can run it: {}", quoted.join("; ")))
+    quoted.join("; ")
+}
+
+/// A live node as the leader sees it when it admits a job run (#788).
+pub struct AdvertisedNode<'a> {
+    /// The node.
+    pub node: NodeId,
+    /// The kinds of job it advertises over gossip, or `None` if the leader
+    /// hasn't heard.
+    pub jobs: Option<crate::meat::job_capability::JobCapabilities>,
+    /// Its `[process_workloads] allowed_binaries`, from its capability
+    /// report, when the leader holds one.
+    pub allowed_binaries: Option<&'a [std::path::PathBuf]>,
+}
+
+/// Why no live node can run `record`, from what the nodes advertise: each
+/// distinct reason, quoted as [`unrunnable_reason`] quotes them. `None`
+/// while any node might take it (#788).
+///
+/// Admission only refuses when it is sure: every node must have advertised
+/// a summary, and a node with a non-empty allowlist the leader holds no
+/// report of counts as allowing the binary. The tick ([`unrunnable_reason`]) stays
+/// the backstop for whatever this lets through, and for races such as a
+/// node leaving or changing its configuration after admission.
+pub fn admission_refusal(record: &TaskArrayRecord, nodes: &[AdvertisedNode<'_>]) -> Option<String> {
+    let [first, ..] = nodes else {
+        return None;
+    };
+    // The assignment a node would be sent, so the checks see what it sees.
+    let assignment = assignment_for(0, record, &first.node);
+    let mut refusals = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let jobs = node.jobs?;
+        let binary_allowed = node.allowed_binaries.map_or(jobs.binaries, |allowed| {
+            allowed.contains(&assignment.program)
+        });
+        refusals.push(super::task_array_node::capability_refusal(
+            &jobs,
+            &assignment,
+            binary_allowed,
+        )?);
+    }
+    let reasons: BTreeSet<&str> = refusals.iter().map(String::as_str).collect();
+    Some(quote_reasons(&reasons))
 }
 
 /// One node's answer to a sync call, with the `known` list it was sent.
@@ -1136,7 +1234,7 @@ async fn sync_targets(state: &ApiState) -> Vec<(NodeId, Option<String>)> {
 }
 
 async fn fire_due_schedules(state: &ApiState, cursor: &mut Option<String>) {
-    let now = crate::meat::batch_ids::epoch_now_secs();
+    let now = state.task_arrays.cron_clock.now_epoch_secs();
     let Ok(minute) = i64::try_from(now / 60) else {
         return;
     };
@@ -1487,7 +1585,7 @@ async fn sync_node(
 ) -> Result<NodeSyncResponse, String> {
     let Some(url) = url else {
         return match &state.task_arrays.node {
-            Some(node) => Ok(node.sync(request).await),
+            Some(node) => node.sync(request).await.map_err(|error| error.to_string()),
             None => Err("this node has no task executor".to_string()),
         };
     };
@@ -1517,8 +1615,33 @@ mod tests {
     use super::*;
     use crate::config::job::JobSpec;
     use crate::meat::index_set::IndexRangeSet;
+    use crate::meat::job_capability::JobCapabilities;
     use crate::meat::task_array::TaskArraySpec;
     use crate::meat::task_array_state::{ChunkResult, TaskArrayState};
+
+    #[test]
+    fn a_manual_cron_clock_holds_its_time_until_set_and_its_clones_share_it() {
+        let clock = CronClock::manual(1_000);
+        let shared = clock.clone();
+        assert_eq!(clock.now_epoch_secs(), 1_000);
+        shared.set(4_600);
+        assert_eq!(clock.now_epoch_secs(), 4_600);
+    }
+
+    #[test]
+    fn the_system_cron_clock_follows_the_wall_clock() {
+        let before = crate::meat::batch_ids::epoch_now_secs();
+        let now = CronClock::System.now_epoch_secs();
+        assert!(now >= before);
+        assert!(now <= crate::meat::batch_ids::epoch_now_secs());
+    }
+
+    #[test]
+    fn setting_the_system_cron_clock_changes_nothing() {
+        let clock = CronClock::System;
+        clock.set(5);
+        assert!(clock.now_epoch_secs() > 5);
+    }
 
     fn record(count: u32, chunk_size: u32) -> TaskArrayRecord {
         let mut env = BTreeMap::new();
@@ -2061,6 +2184,171 @@ mod tests {
         )));
         // Nobody answered at all.
         assert!(!unrunnable(&plan_tick(&arrays, None, &inputs(&[], &heard))));
+    }
+
+    /// A node that runs every kind of job, with `/usr/bin/render` among
+    /// others on its allowlist.
+    fn capable() -> JobCapabilities {
+        JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: true,
+            singleton_images: true,
+            singleton_image_limits: true,
+            encrypted_env: true,
+            network_policy: true,
+            mount_isolation: false,
+            binaries: true,
+        }
+    }
+
+    fn isolated() -> JobCapabilities {
+        JobCapabilities {
+            mount_isolation: true,
+            ..capable()
+        }
+    }
+
+    fn advertised(name: &str, jobs: Option<JobCapabilities>) -> AdvertisedNode<'static> {
+        AdvertisedNode {
+            node: node(name),
+            jobs,
+            allowed_binaries: None,
+        }
+    }
+
+    /// #788: when every live node advertises that it can't take a run, the
+    /// leader refuses it at submission, naming each distinct reason once.
+    #[test]
+    fn admission_refuses_a_run_every_live_node_advertises_it_cannot_take() {
+        let record = record(20, 10);
+        let no_host = JobCapabilities {
+            host: false,
+            ..capable()
+        };
+        let nodes = [
+            advertised("a", Some(isolated())),
+            advertised("b", Some(isolated())),
+            advertised("c", Some(no_host)),
+        ];
+        let reason = admission_refusal(&record, &nodes).expect("no node can take it");
+        assert_eq!(
+            reason.matches("host jobs don't run under").count(),
+            1,
+            "{reason}"
+        );
+        assert!(reason.contains("host arrays require"), "{reason}");
+    }
+
+    /// #788: admission and the tick backstop quote the same reasons, so a
+    /// user sees the same words whichever of them refuses the run.
+    #[test]
+    fn admission_quotes_the_reasons_the_tick_would() {
+        let arrays = running_arrays(1);
+        let running = arrays.get(1).unwrap();
+        let assignment = assignment_for(1, running, &node("a"));
+        let refused =
+            crate::bun::task_array_node::capability_refusal(&isolated(), &assignment, true)
+                .expect("an isolated node refuses host work");
+        let answers = [
+            (node("a"), refusal_for(&arrays, &refused, true)),
+            (node("b"), refusal_for(&arrays, &refused, true)),
+        ];
+        let heard = HashMap::new();
+        let writes = plan_tick(&arrays, None, &inputs(&answers, &heard));
+        let [TaskArrayWrite::Unrunnable { reason: ticked, .. }] = &writes[..] else {
+            panic!("expected one unrunnable write, got {writes:?}");
+        };
+        let admitted = admission_refusal(
+            running,
+            &[
+                advertised("a", Some(isolated())),
+                advertised("b", Some(isolated())),
+            ],
+        )
+        .expect("both nodes refuse it");
+        assert_eq!(*ticked, format!("no node can run it: {admitted}"));
+    }
+
+    /// #788: admission only refuses when it is sure. A node that might take
+    /// the run, or one whose capabilities the leader hasn't heard yet,
+    /// leaves the decision to the nodes and the tick.
+    #[test]
+    fn admission_admits_a_run_any_live_node_might_take() {
+        let record = record(20, 10);
+        assert_eq!(
+            admission_refusal(
+                &record,
+                &[
+                    advertised("a", Some(isolated())),
+                    advertised("b", Some(capable()))
+                ]
+            ),
+            None
+        );
+        assert_eq!(
+            admission_refusal(
+                &record,
+                &[advertised("a", Some(isolated())), advertised("b", None)]
+            ),
+            None,
+            "a node that hasn't said might take it"
+        );
+        assert_eq!(admission_refusal(&record, &[]), None, "no members known");
+    }
+
+    /// #788: a container run nobody can start is refused too, not only
+    /// host work.
+    #[test]
+    fn admission_refuses_containers_where_no_node_runs_them() {
+        let mut record = record(100, 10);
+        record.template.runtime = crate::config::job::JobRuntime::Runc;
+        record.template.exec = None;
+        record.template.image = Some("fixture:v1".into());
+        let process_only = JobCapabilities {
+            containers: false,
+            singleton_images: false,
+            singleton_image_limits: false,
+            ..capable()
+        };
+        let reason = admission_refusal(&record, &[advertised("a", Some(process_only))]).unwrap();
+        assert!(reason.contains("container tasks require"), "{reason}");
+        assert_eq!(
+            admission_refusal(&record, &[advertised("a", Some(isolated()))]),
+            None,
+            "mount isolation doesn't stop containers"
+        );
+    }
+
+    /// #788: the gossip summary only says whether a node allows any binary.
+    /// Where the leader holds the node's capability report, it checks the
+    /// run's binary against the full allowlist; without it, a node with a
+    /// non-empty allowlist might allow the binary.
+    #[test]
+    fn admission_checks_the_binary_against_a_reported_allowlist() {
+        let record = record(20, 10);
+        let elsewhere = [std::path::PathBuf::from("/usr/bin/true")];
+        let reported = AdvertisedNode {
+            allowed_binaries: Some(&elsewhere),
+            ..advertised("a", Some(capable()))
+        };
+        let reason = admission_refusal(&record, &[reported]).unwrap();
+        assert!(
+            reason.contains(
+                "/usr/bin/render isn't in this node's [process_workloads] allowed_binaries"
+            ),
+            "{reason}"
+        );
+        assert_eq!(
+            admission_refusal(&record, &[advertised("a", Some(capable()))]),
+            None
+        );
+        let empty = JobCapabilities {
+            binaries: false,
+            ..capable()
+        };
+        let reason = admission_refusal(&record, &[advertised("a", Some(empty))]).unwrap();
+        assert!(reason.contains("allowed_binaries"), "{reason}");
     }
 
     #[test]

@@ -350,6 +350,7 @@ mod tests {
         OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
@@ -362,6 +363,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],

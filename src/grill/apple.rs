@@ -945,6 +945,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
@@ -957,6 +958,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
@@ -1018,6 +1020,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
@@ -1030,6 +1033,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],

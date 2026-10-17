@@ -130,6 +130,7 @@ impl OwnedCommands {
         let spec = OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             root: OciRoot {
                 path: "/".into(),
                 readonly: false,
@@ -146,6 +147,7 @@ impl OwnedCommands {
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: Vec::new(),
@@ -188,7 +190,8 @@ impl OwnedCommands {
 
     /// Activate the prepared generation through its independent owner.
     pub async fn start(&self, id: &CommandId) -> Result<(), CommandError> {
-        Ok(self.control.start(&id.0).await?)
+        self.control.start(&id.0).await?;
+        Ok(())
     }
 
     /// Cancel an attempt that was prepared but whose owner never started,

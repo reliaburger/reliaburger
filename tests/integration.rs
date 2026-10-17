@@ -175,11 +175,11 @@ async fn deploy_multiple_apps() {
     let config = Config::parse(
         r#"
         [app.web]
-        image = "web:v1"
+        script = "exec sleep 86400"
         port = 8080
 
         [app.api]
-        image = "api:v1"
+        script = "exec sleep 86400"
     "#,
     )
     .unwrap();
@@ -345,8 +345,7 @@ async fn tui_websocket_logs_replay_known_line() {
     let config = Config::parse(
         r#"
         [app.streamer]
-        image = "test:v1"
-        command = ["sh", "-c", "echo phase-thirteen-line; sleep 2"]
+        script = "echo phase-thirteen-line; sleep 2"
     "#,
     )
     .unwrap();
@@ -410,8 +409,7 @@ async fn init_container_success_allows_app_start() {
     let config = Config::parse(
         r#"
         [app.web]
-        image = "test:v1"
-        command = ["sleep", "60"]
+        script = "exec sleep 60"
 
         [[app.web.init]]
         command = ["echo", "init done"]
@@ -433,8 +431,7 @@ async fn init_container_failure_prevents_start() {
     let config = Config::parse(
         r#"
         [app.web]
-        image = "test:v1"
-        command = ["sleep", "60"]
+        script = "exec sleep 60"
 
         [[app.web.init]]
         command = ["false"]
@@ -541,8 +538,7 @@ async fn logs_with_tail_returns_limited_lines() {
     let config = Config::parse(
         r#"
         [app.echoer]
-        image = "test:v1"
-        command = ["sh", "-c", "echo line1; echo line2; echo line3"]
+        script = "echo line1; echo line2; echo line3"
     "#,
     )
     .unwrap();
@@ -568,8 +564,7 @@ async fn logs_grep_filters_lines() {
     let config = Config::parse(
         r#"
         [app.grepper]
-        image = "test:v1"
-        command = ["sh", "-c", "echo alpha-one; echo beta-two; echo alpha-three"]
+        script = "echo alpha-one; echo beta-two; echo alpha-three"
     "#,
     )
     .unwrap();
@@ -594,8 +589,7 @@ async fn logs_json_field_filters_structured_lines() {
     let config = Config::parse(
         r#"
         [app.jsonlogger]
-        image = "test:v1"
-        command = ["sh", "-c", "echo '{\"level\":\"error\",\"msg\":\"boom\"}'; echo '{\"level\":\"info\",\"msg\":\"fine\"}'; echo plain-text"]
+        script = "echo '{\"level\":\"error\",\"msg\":\"boom\"}'; echo '{\"level\":\"info\",\"msg\":\"fine\"}'; echo plain-text"
     "#,
     )
     .unwrap();
@@ -662,8 +656,7 @@ async fn exec_runs_command_and_returns_output() {
     let config = Config::parse(
         r#"
         [app.sleeper]
-        image = "test:v1"
-        command = ["sleep", "60"]
+        script = "exec sleep 60"
     "#,
     )
     .unwrap();
@@ -695,8 +688,11 @@ async fn exec_nonexistent_app_returns_error() {
     assert!(result.is_err(), "expected error for nonexistent app");
 }
 
+/// #914: a volume app runs an image, so it needs a container runtime. The
+/// process runtime used to "deploy" it by running its command on the host
+/// with no mount at all; now it refuses it and says why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn volume_config_deploys_successfully() {
+async fn a_volume_app_is_refused_for_want_of_a_container_runtime() {
     let harness = TestHarness::start().await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -717,12 +713,16 @@ async fn volume_config_deploys_successfully() {
     ))
     .unwrap();
 
-    let result = harness.client.apply(&config).await.unwrap();
-    assert_eq!(result.created, 1);
+    let error = harness.client.apply(&config).await.unwrap_err().to_string();
+    assert!(
+        error.contains("default__volapp-0")
+            && error.contains("needs a container runtime to run image test:v1"),
+        "{error}"
+    );
 
     let statuses = harness.client.status().await.unwrap();
     assert_eq!(statuses[0].app_name, "volapp");
-    assert_eq!(statuses[0].state, "running");
+    assert_eq!(statuses[0].state, "failed");
 }
 
 /// X3 regression: `relish rollback` used to only print advice. The
@@ -737,8 +737,7 @@ async fn rollback_redeploys_the_previous_spec() {
     let v1 = Config::parse(
         r#"
         [app.svc]
-        image = "test:v1"
-        command = ["sh", "-c", "echo VERSION-ONE; sleep 300"]
+        script = "echo VERSION-ONE; sleep 300"
     "#,
     )
     .unwrap();
@@ -747,8 +746,7 @@ async fn rollback_redeploys_the_previous_spec() {
     let v2 = Config::parse(
         r#"
         [app.svc]
-        image = "test:v2"
-        command = ["sh", "-c", "echo VERSION-TWO; sleep 300"]
+        script = "echo VERSION-TWO; sleep 300"
     "#,
     )
     .unwrap();
@@ -773,7 +771,7 @@ async fn rollback_redeploys_the_previous_spec() {
         "history entries must carry the spec for rollback"
     );
 
-    // Roll back: redeploys v1's spec (test:v1).
+    // Roll back: redeploys v1's spec.
     harness.client.rollback("svc", "default").await.unwrap();
 
     // The newest history entry is now v1 again.
@@ -791,9 +789,9 @@ async fn rollback_redeploys_the_previous_spec() {
     let entries = history["history"].as_array().unwrap();
     let newest = entries.last().unwrap();
     assert_eq!(
-        newest["image"].as_str(),
-        Some("test:v1"),
-        "rollback should have redeployed v1"
+        newest["spec"]["script"].as_str(),
+        Some("echo VERSION-ONE; sleep 300"),
+        "rollback should have redeployed v1: {newest}"
     );
 }
 
@@ -805,8 +803,7 @@ async fn rollback_without_history_returns_not_found() {
     let config = Config::parse(
         r#"
         [app.only]
-        image = "test:v1"
-        command = ["sleep", "300"]
+        script = "exec sleep 300"
     "#,
     )
     .unwrap();
@@ -840,8 +837,7 @@ async fn kill_fault_actually_kills_the_instance() {
     let config = Config::parse(
         r#"
         [app.victim]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 2
     "#,
     )
@@ -920,8 +916,7 @@ async fn network_fault_without_ebpf_is_rejected_not_faked() {
     let config = Config::parse(
         r#"
         [app.svc]
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
     "#,
     )
     .unwrap();
@@ -1068,7 +1063,7 @@ async fn standalone_apps_and_common_definitions_cannot_share_a_logical_identity(
     let harness = TestHarness::start().await;
     harness
         .client
-        .apply(&Config::parse("[app.app-first]\nimage='test:v1'\ncommand=['sleep','30']").unwrap())
+        .apply(&Config::parse("[app.app-first]\nscript='exec sleep 30'").unwrap())
         .await
         .unwrap();
     let result = harness
@@ -1091,7 +1086,7 @@ async fn standalone_apps_and_common_definitions_cannot_share_a_logical_identity(
         .await;
     let result = harness
         .client
-        .apply(&Config::parse("[app.job-first]\nimage='test:v1'\ncommand=['sleep','30']").unwrap())
+        .apply(&Config::parse("[app.job-first]\nscript='exec sleep 30'").unwrap())
         .await;
     assert!(
         result.is_err(),

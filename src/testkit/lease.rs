@@ -1222,7 +1222,8 @@ pub async fn cleanup_cluster_lease(
             LeasedResource::App { app_id } => {
                 if let Err(error) = write_cluster_lease_request(
                     council,
-                    crate::council::RaftRequest::AppDelete {
+                    crate::council::RaftRequest::TestLeaseAppDelete {
+                        lease_id: lease_id.to_string(),
                         app_id: app_id.clone(),
                     },
                 )
@@ -1235,7 +1236,10 @@ pub async fn cleanup_cluster_lease(
             LeasedResource::Namespace { name } => {
                 if let Err(error) = write_cluster_lease_request(
                     council,
-                    crate::council::RaftRequest::NamespaceDelete { name: name.clone() },
+                    crate::council::RaftRequest::TestLeaseNamespaceDelete {
+                        lease_id: lease_id.to_string(),
+                        name: name.clone(),
+                    },
                 )
                 .await
                 {
@@ -1597,7 +1601,7 @@ mod tests {
             std::time::Duration::from_secs(30),
         ));
         let spec: crate::config::job::JobSpec =
-            toml::from_str("image = 'proc-grill:image-ignored'\ncommand = ['true']\n").unwrap();
+            toml::from_str("image = 'app:v1'\ncommand = ['true']\n").unwrap();
         let mut definition = crate::meat::job::JobDefinition::from_spec(spec.clone());
         definition.template.namespace = Some(namespace.into());
         write_standalone(

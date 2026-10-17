@@ -15,7 +15,7 @@ Bun's responsibilities on every node:
 
 - **Container management (Grill):** Start, stop, health-check, and monitor OCI containers via the Grill abstraction layer. Grill drives the runtimes directly (runc on Linux, Apple Container on macOS, and a `process` mode with no runtime at all); it does not shell through containerd.
 - **Process workload management:** Start, stop, and health-check non-container workloads (host binaries and inline scripts), gated by a deny-by-default binary allowlist. (The namespace/cgroup isolation stack for these host processes is planned; see §5.2.)
-- **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000-60000) and map them to container-internal ports.
+- **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000 up to, not including, 32767: below Linux's ephemeral range) and map them to container-internal ports. Ports a host daemon already listens on are skipped.
 - **eBPF service discovery (Onion):** Load and maintain the Onion eBPF programs and kernel maps for socket-level service discovery and firewall enforcement.
 - **Log collection (Ketchup):** Capture stdout/stderr from all workloads and feed them into the structured log pipeline.
 - **Metrics collection (Mayo):** Scrape per-workload metrics endpoints and feed them into the time-series store.
@@ -205,7 +205,12 @@ linear backoff; only when all of them exit before serving the API does
 `state()` return "exited before readiness" with the last attempt's stderr.
 Connection-level API failures (missing or refused socket, reset, EOF) are
 retried within the 5 s readiness window; API refusals and conflicting
-forwarding inventories fail immediately. Rootless cgroup limits remain an admission-time refusal: Bun
+forwarding inventories fail immediately. A Bun that execs mid-replacement can
+leave the new helper bound but never started; the next supervision pass
+cancels it under the generation claim and starts another, and gives a helper
+whose owner is starting it up to 5 s. Replacement likewise waits up to 5 s for
+an earlier helper to retire, then refuses: a helper still running after that
+is a live owner, never replaced alongside. Rootless cgroup limits remain an admission-time refusal: Bun
 doesn't create a delegated user scope, so the OCI rewrite removes the rootful
 cgroup path rather than fabricating a path runc cannot write.
 
@@ -814,7 +819,7 @@ pub struct NetworkConfig {
     /// Default: auto-detected from the default route interface.
     pub advertise_address: Option<IpAddr>,
     /// Ephemeral port range for container port mapping.
-    pub port_range: PortRange,   // default: 10000-60000
+    pub port_range: PortRange,   // default: 10000..32767 (end exclusive)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1041,14 +1046,14 @@ before their Phase 15 cases can use this contract.
 
 1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler via the reporting tree).
 2. Transition state to `Pending`.
-3. **Prepare image:** Check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
-4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000-60000) and marks it as in-use.
+3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.11). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
+4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000..32767), skips any port a TCP bind on the host shows is already taken, and marks it as in-use.
 5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a request, the request-derived soft controls `cpu.weight` and `memory.high` in the `linux.resources.unified` map (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
 9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was checked against `[storage] allowed_host_paths` at admission and again when the OCI spec was built, which mounts the resolved path that check approved). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
-10. **Run init containers (Initialising):** For each init container in declaration order, create a container via containerd sharing the main container's network namespace and volumes. Wait for exit code 0. If any fails, transition to `Failed` and emit event.
+10. **Run init containers (Initialising):** For each init container in declaration order, create a container from its own image (the app's when it names none, trust-checked and digest-pinned like the app's) with the app's environment, decrypted secrets, cgroup and volume and config-file mounts, built from the app's finished OCI spec (`generate_init_oci_spec`, #701). It gets its own network namespace and leaves the volumes owned by the app's user. Wait for exit code 0. If any fails, or none finishes within 300 s, transition to `Failed` and emit event.
 11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
 12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
 13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event to the reporting tree.
@@ -1096,10 +1101,10 @@ before their Phase 15 cases can use this contract.
 10. **Decrypt secrets and prepare identity:** Identical to container workloads (steps 7-8 of 5.1).
 11. **Apply seccomp profile:** Load the default seccomp profile (blocks `mount`, `reboot`, `kexec_load`, `init_module`, etc.). Identical to the container seccomp profile.
 12. **Drop privileges:** Switch to the `burger` user. Apply granted capabilities (if any) via `prctl(PR_CAP_AMBIENT)`.
-13. **Exec the binary (Starting):** `execve()` the binary with args (for Exec), or the temp script file (for Script). Capture stdout/stderr and pipe to Ketchup.
+13. **Exec the binary (Starting):** `execve()` the binary with args (for Exec), or the temp script file (for Script). Capture stdout/stderr and pipe to Ketchup. Before any launch generation exists, `ProcessGrill::create` resolves the program the way `execvp` would (a path directly, a bare name on the workload's `PATH`). A missing file, a directory or a file with no execute bit returns `GrillError::LaunchRefused` (`binary not found: <path>` or `binary not executable: <path>`). The deploy fails at once, the instance moves to `Failed` with that reason, and `/v1/status` reports it as the row's `reason` for `relish status` and `relish wtf` (#881). The same check refuses a spec that isn't a host workload: an image app, or an init container with its own image, fails with `needs a container runtime to run image <image>, and this node's runtime is process` (`LaunchProblem::NeedsContainerRuntime`, #914). The process runtime used to run an image app's `command` on the host, bypassing the allowlist, and `sleep 86400` for an app with no command, so the app looked as though it ran. A spec with no command at all is refused as `no command to run`; nothing stands in for it. Evidence that can't be read for another reason doesn't refuse; the launch reports what it finds. A binary deleted after that check is caught at `exec`: the execution gate holds a close-on-exec copy of its activation socket, so a successful `exec` closes it silently and a failed one writes a `GateReport` (with its `errno`) back to the owner, which records it as `gate` in its durable record. `ProcessGrill::start` waits for that record and turns ENOENT into the same `LaunchRefused` (EACCES into `binary not executable`), and any other gate failure into `StartFailed` with the gate's reason (#905). A restart whose create or start is refused goes straight to `Failed` with the reason, without spending its restart budget.
 14. **Health wait, running, health checking:** Identical to container workloads (steps 12-15 of 5.1).
 
-**GPU and rootless admission.** The same admission gate rejects two more silent lies the review flagged. A workload requesting a GPU (`gpu = N`) is refused when `[resources] gpu_enabled = false` or when GPU detection found fewer than `N` devices on the node -- `gpu_enabled` is now effective rather than a node that reports zero GPUs quietly accepting the work. GPU detection is real: Bun probes `/dev/nvidia0` and, when present, parses `nvidia-smi --query-gpu` to count cards, falling back cleanly to "no GPUs" on any node without the hardware or the tool. (OCI `/dev/nvidia*` device passthrough into the container spec is a follow-up; this pass makes placement honest rather than passing an ungoverned device set.) On a **rootless** node, a workload declaring cpu/memory limits is refused rather than run silently unlimited: rootless runc can't set cgroup limits without a systemd user scope Bun doesn't yet wire, so the honest answer is to fail the deploy and tell the operator to run as root or drop the limits.
+**GPU and rootless admission.** The same admission gate rejects two more silent lies the review flagged. A workload requesting a GPU (`gpu = N`, N above 0) is refused on every node, whatever `[resources] gpu_enabled` and detection say: nothing passes a device into the container or counts which card a workload holds, so admitting one would start it without its GPU (D41, #701). `relish apply` refuses it first; this gate is the second line. GPU detection is real: Bun probes `/dev/nvidia0` and, when present, parses `nvidia-smi --query-gpu` to count cards, falling back cleanly to "no GPUs" on any node without the hardware or the tool. (OCI `/dev/nvidia*` device passthrough into the container spec is a follow-up; this pass makes placement honest rather than passing an ungoverned device set.) On a **rootless** node, a workload declaring cpu/memory limits is refused rather than run silently unlimited: rootless runc can't set cgroup limits without a systemd user scope Bun doesn't yet wire, so the honest answer is to fail the deploy and tell the operator to run as root or drop the limits.
 
 **Stop a process workload:**
 
@@ -1209,11 +1214,22 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 > memory-pressure reclaim before the hard `memory.max` OOM. A limit-only spec
 > (no request) emits no unified entries and is byte-identical to before.
 
+**Node-wide OOM order (#984):** a cgroup's `memory.max` decides a cgroup OOM,
+but when the whole node runs out the kernel's global OOM killer picks by
+`oom_score_adj`. The systemd units we ship run Bun at `OOMScoreAdjust=-900`,
+and every workload spec Grill generates (apps, init containers, jobs, executor
+helpers and fresh-container tasks) carries `process.oomScoreAdj` of
+`WORKLOAD_OOM_SCORE_ADJ` (+500, `src/grill/oci.rs`). runc applies it to
+containers; the process owner's execution gate raises a host workload to it
+before `exec`, and never lowers a score. Without it every workload inherited
+Bun's -900. A node-wide OOM therefore takes a workload or a task before Bun,
+the node's daemons and Lima's guest agent (-500).
+
 > **OOM detection via `memory.events` inotify — planned, not yet implemented.** There is no inotify watch on `memory.events` today, so an OOM kill is observed only through the workload's exit and the ordinary restart path, not as a distinct structured OOM event with the cgroup's memory state.
 
 **GPU device isolation:**
 
-- Bun detects NVIDIA GPUs at startup by probing `/dev/nvidia0` and parsing `nvidia-smi --query-gpu` (Linux only, no vendor library linked in), and admission refuses a GPU workload when GPU support is off or fewer cards exist than requested (see the admission gate in §5.3.1).
+- Bun detects NVIDIA GPUs at startup by probing `/dev/nvidia0` and parsing `nvidia-smi --query-gpu` (Linux only, no vendor library linked in), and admission refuses every GPU workload until device passthrough lands (#359; see the admission gate in §5.3.1).
 - Writing `devices.allow` for the specific `/dev/nvidia{N}` device, and setting `NVIDIA_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` in the workload's environment, is the OCI passthrough follow-up: placement is honest today, but the allocated device is not yet plumbed into the container spec. **TODO(Phase-follow-up):** OCI `/dev/nvidia*` device passthrough.
 
 ### 5.5 Self-Upgrade Sequence
@@ -1224,7 +1240,7 @@ Three decisions shape everything that follows, and each earns its keep against t
 
 1. **Directives travel over the node HTTP API, not the reporting tree.** The reporting tree is upstream-only (reports and acks flow towards the leader). Adding a downstream command path would have changed its bincode wire format mid-phase, and mixed-version wire formats are exactly what an upgrade creates. So the leader POSTs to each node's token-authenticated `/v1/upgrade/apply` instead.
 2. **Version discovery polls `GET /v1/version`, not gossip.** Adding a version field to the gossip `MembershipUpdate` would break bincode decoding for the old nodes still running during the mixed-version window. Polling an HTTP endpoint carries no such wire-format risk. Rejoin is confirmed separately (see the orchestrator's completion gate below): a node is only "done" once it is back in the gossip mesh *and* HTTP-healthy at the target version.
-3. **The leader upgrades in place; there is no leadership transfer.** openraft 0.9 has no graceful transfer, and a naive `raft.trigger().elect()` on a follower can't win against a live leader's heartbeats (anti-disruption / leader-stickiness). So the leader execs itself LAST: exec is sub-second, a council of ≥3 keeps quorum through the bounce, and the returning node re-establishes leadership and finishes the run via the orchestrator's poll-first idempotency. (`POST /v1/cluster/elect` stays a manual admin recovery tool; the upgrade path does not use it.)
+3. **The leader upgrades in place; there is no leadership transfer.** openraft 0.9 has no graceful transfer, and a naive `raft.trigger().elect()` on a follower can't win against a live leader's heartbeats (anti-disruption / leader-stickiness). So the leader execs itself LAST: exec is sub-second, a council of ≥3 keeps quorum through the bounce, and the returning node re-establishes leadership and finishes the run via the orchestrator's poll-first idempotency. (`POST /v1/cluster/elect` stays a manual admin tool for moving leadership before maintenance; the upgrade path does not use it. Since 0.2.1 it holds the old leader's elections before campaigning, so the move sticks: see `gossip-mustard.md` §5.2, "Moving leadership off a voter".)
 
 **Node-level upgrade sequence (executed on each node that receives a directive):**
 
@@ -1417,7 +1433,7 @@ join = ["10.0.1.5:9443"]
 | `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
 | `[resources]` | `gpu_enabled` | `true` | bool | Auto-detect NVIDIA GPUs (probe `/dev/nvidia0`, parse `nvidia-smi`) at startup. When false, GPU workloads are refused on this node. |
 | `[network]` | `advertise_address` | auto-detect | IP address | IP address this node advertises to the cluster. |
-| `[network]` | `port_range` | `"10000-60000"` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
+| `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
 | `[images]` | `max_storage` | `"50Gi"` | resource string (bytes) | Maximum disk space for Pickle image layers. |
 | `[images]` | `redundancy` | `2` | 1-10 | Number of peers to replicate pushed images to immediately. |
 | `[images]` | `gc_retain_tags` | `10` | 1-1000 | Keep this many most-recent tags per repository. |
@@ -1454,7 +1470,9 @@ join = ["10.0.1.5:9443"]
 
 ### 7.1 Bun Process Crash
 
-**What happens:** Bun exits unexpectedly (panic, SIGSEGV, OOM-killed).
+**What happens:** Bun exits unexpectedly (panic, SIGSEGV, OOM-killed). A
+node-wide OOM should take a workload first: Bun runs at -900 and every
+workload at +500 (see "Node-wide OOM order").
 
 **Detection:** systemd (or equivalent init system) detects the process exit. The Mustard gossip layer on peer nodes detects the heartbeat timeout (default 5 seconds).
 
@@ -1470,7 +1488,7 @@ join = ["10.0.1.5:9443"]
 
 **Recovery:** systemd restarts Bun. On startup, Bun reconnects to running containers (see 5.1 reconnect), resumes all operations, and reconciles state with the cluster via the reporting tree.
 
-A restart may also change the runtime flag. When a node moves from `--runtime runc` or `--runtime process` to `mixed` (or to `auto`, which selects `mixed` where runc exists), its running workloads have no `runtime-routes` entry, because only the mixed runtime writes routes. Before startup recovery reads the launch inventory, and after the runtime has its workload DNS resolver (each runc launch records the resolver, and the runc journal refuses a live launch recorded under a different one, #839), Bun routes each launch that exactly one backend's ownership journal lists, and that fits that backend, to it, and logs the instances it routed. Without this step every `runc` to `mixed` restart with running containers failed and systemd restarted Bun in a loop (#823). A launch both backends list stays unrouted and recovery refuses it. So does an image app that the process runtime ran as a host process, which the mixed runtime would contain instead (#827).
+A restart may also change the runtime flag. When a node moves from `--runtime runc` or `--runtime process` to `mixed` (or to `auto`, which selects `mixed` where runc exists), its running workloads have no `runtime-routes` entry, because only the mixed runtime writes routes. Before startup recovery reads the launch inventory, and after the runtime has its workload DNS resolver (each runc launch records the resolver, and the runc journal refuses a live launch recorded under a different one, #839), Bun routes each launch that exactly one backend's ownership journal lists, and that fits that backend, to it, and logs the instances it routed. Without this step every `runc` to `mixed` restart with running containers failed and systemd restarted Bun in a loop (#823). A launch both backends list stays unrouted and recovery refuses it. An image app that the process runtime ran as a host process couldn't be routed either (#827), but the process runtime now refuses image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists to route.
 
 ### 7.2 Container Runtime (containerd) Crash
 
@@ -1505,10 +1523,12 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 **Bounds that keep it from happening (#678):**
 
 - `[logs]` and `[metrics]` default to `max_storage_mb = 2048` and `1024`. `0` is an explicit opt-out, and Bun refuses at startup a cap larger than the filesystem holding its data directory.
-- Task data under `<data>/task-arrays/<id>/` is a 22-byte-per-task ledger, a dense result index of 24-byte slots (a sparse file, so a worker pays only for the tasks it ran) and kept failure output: one append-only segment per chunk grant, holding the head and tail of the first 16 failed tasks, written with one fsync per batch. A million tasks measure about 47 bytes per task (`make bench-task-arrays` fails above 50). The index replaced a redb B-tree that measured 87 bytes per task, four times the ledger; ledger plus index, about 109 bytes per task, is the same order as the 82 bytes per accepted task the October qualification rig lost, and nothing else on the task path grows per task.
+- Task data under `<data>/task-arrays/<id>/` is, while the run is active, a 22-byte-per-task ledger and a dense result index of 24-byte slots (a sparse file, so a worker pays only for the tasks it ran), plus kept failure output: one append-only segment per chunk grant, holding the head and tail of the first 16 failed tasks, written with one fsync per batch. A million tasks measure about 47 bytes per task while the run is active (`make bench-task-arrays` fails above 50). Once the run is terminal (the leader keeps it but no longer runs it) and the ledger writer has closed, the worker compacts it (#739): it rewrites the ledger's outcomes into `results`, one 14-byte slot per task (outcome, attempts, exit code, run time and a 32-bit grant attempt; the position is the index), fsyncs and renames it into place, then deletes the ledger, the live index and the launch fences. A finished run then measures 14.0 to 14.4 bytes per task, under the 16 MiB per million the plan asked for (`make bench-task-arrays` fails above 16). A compacted run is never opened to run again, and a grant attempt too large for 32 bits keeps the ledger instead. The index replaced a redb B-tree that measured 87 bytes per task, four times the ledger; ledger plus index, about 109 bytes per task, is the same order as the 82 bytes per accepted task the October qualification rig lost, and nothing else on the task path grows per task.
+- Two fences guard a worker against delayed syncs, across restarts: `task-arrays/control.fence`, the newest control version (epoch, term, applied index) it has acted on (#745), and `task-arrays/<id>/grants.fence`, the highest attempt it has accepted per chunk (#902). Both change on nearly every busy tick, so both are two-slot files (`bun::fence_file`): each slot holds a magic number, a generation, the payload and a CRC32, and a change overwrites the slot that doesn't hold the newest generation, in place, with one `sync_data` before the node acts on it. A slot torn by a crash fails its CRC, and the other slot still holds the last change the node acted on; a file with no valid slot is refused, never read as empty. A payload that outgrows its slot (a grant fence with many chunks) moves to a new file with at least twice the room, written, flushed, renamed and its directory flushed, so that costs two flushes per doubling. Compaction deletes `grants.fence` with the launch markers.
 - The leader prunes finished runs an hour after they finish with a replicated `Prune` write on its one-second tick, not only on the next registration, and each worker deletes a run's directory once the leader stops listing it. An idle cluster therefore returns to its baseline disk use.
 - Task data counts toward disk pressure, and so does the audit log under `{data}/audit` (#798; `disk_pressure::node_data_bytes`). When they pass a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
-- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. Forgets of different identities run concurrently and share one garbage directory; a deletion another forget finished counts as done, so concurrent forgets never leave a route behind. Inventory snapshots list, then read: a host owner directory, a runc intent record or a mixed route that a concurrent forget removed in between has left, and the snapshot leaves it out. A mixed launch the backend still lists without its route is still refused (#924). At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. The same sweep removes this node's executor slot cgroups (`<namespace>/executor-<prefix>[-reuse|-host]/<slot>`) that no launch in a complete runtime inventory owns (#952). A slot's group belongs to the executor pool that ran it, and a killed Bun's pool dies with it: startup retirement removes the runtime's `helper` and `task` leaves, but nothing else removed the empty slot until a task needed that slot again, minutes later under a light load. Only empty groups can go, since the kernel refuses to remove a populated cgroup. Ordinary app instances don't call it yet, so their route and journal files still outlive a deleted app.
+- Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. Forgets of different identities run concurrently and share one garbage directory; a deletion another forget finished counts as done, so concurrent forgets never leave a route behind. Inventory snapshots list, then read: a host owner directory, a runc intent record or a mixed route that a concurrent forget removed in between has left, and the snapshot leaves it out. A mixed launch the backend still lists without its route is still refused (#924). At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. The same sweep removes this node's executor slot cgroups (`<namespace>/executor-<prefix>[-reuse|-host]/<slot>`) that no launch in a complete runtime inventory owns (#952). A slot's group belongs to the executor pool that ran it, and a killed Bun's pool dies with it: startup retirement removes the runtime's `helper` and `task` leaves, but nothing else removed the empty slot until a task needed that slot again, minutes later under a light load. Only empty groups can go, since the kernel refuses to remove a populated cgroup.
+- App instance metadata is collected too (#738). App instances share none of the executor path: the agent asks the runtime to forget an instance once the supervisor has let it go, which happens when its app is deleted, when a scale-down or a rollout retires it (including a retirement that waited for remote release), and when startup retires a launch it doesn't adopt. A plain `relish stop` forgets nothing, because its stopped replicas stay owned until an apply rolls over them, and an adopted instance keeps everything. The deletion runs in a task, so no agent turn waits on its fsyncs, and the same refusal rules apply, including against a successor generation of a reused identity. Anything a refusal or a crash leaves behind is a retired launch with no adoption record, which the next start retires and forgets. Because the forget is spawned, it can rename a record away while an inventory read (startup adoption's, for one) is between listing the records and reading them; the inventory leaves out a record that vanished that way, since only a forget removes a published record and only a retired one, while a record directory that's still there without a readable intent still refuses (#877). An instance's init containers (`<id>__init-<n>`) go with it (#850). The deploy worker reads each initialiser's runtime generation straight after creating it and hands it to the loop, and retirement asks the runtime to forget exactly that generation (`Grill::forget_retired_generation`). An immediate redeploy reuses the same initialiser identity, so the runtime refuses while any other generation owns it: a forget that lands after the redeploy's initialiser launched can't delete the journal holding that initialiser's exit code. An initialiser a live or pending parent has registered again is skipped outright. One whose generation the runtime couldn't report, or that an adopted instance ran before a restart, is a launch without an adoption record, which the next start forgets. The process runtime's `prepare` starts again from nothing if a forget removed the retired generation while it waited for the identity's locks, so a redeploy can't fail on a journal that vanished under it.
 
 ### 7.4 Process Workload Binary Missing
 
@@ -1534,7 +1554,7 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **What happens:** The new binary fails to start after the upgrade exec.
 
-**Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)).
+**Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)). Bun starts that hash at boot on a detached thread, not Tokio's blocking pool, because dropping the runtime waits for blocking-pool tasks: a start-up error exits at once rather than after the hash of a large binary finishes ([#816](https://github.com/reliaburger/reliaburger/issues/816)).
 
 **Impact:** This node is temporarily unable to accept new work. Running containers are unaffected (containerd manages them independently).
 
@@ -1569,25 +1589,33 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **What happens:** A cold reusable executor (shared-runc or native host) fails while starting, before its helper connects: a runtime command misses its five-second bound on a loaded host, an I/O call fails, or the helper never connects. The job's command hasn't been sent anywhere yet.
 
-**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O, helper and slot-availability (`Unavailable`) failures from refusals about the job itself. A runtime error is a refusal only when `GrillError::refuses_spec` says so (see §7.10).
+**Detection:** `ReusablePool::start` returns an error; `ExecutorError::is_transient` separates runtime, I/O, helper and slot-availability (`Unavailable`) failures from refusals about the job itself. A runtime error is a refusal only when `GrillError::refuses_spec` says so (see §7.13).
 
-**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second transient failure ends the attempt as `LaunchFailed`, which the task pool retries within `max_attempts` (§7.10); a refusal ends it as `Refused`. Either way the reason is the attempt's output.
+**Impact:** None on the command, unless it happens twice (#759). The pool retires the failed executor and starts one fresh one in the same slot, within the command's deadline, so the command runs at most once. A second transient failure ends the attempt as `LaunchFailed`, which the task pool retries within `max_attempts` (§7.13); a refusal ends it as `Refused`. Either way the reason is the attempt's output.
 
 **Recovery:** Automatic. An executor that doesn't positively retire is never replaced: its slot and reservation stay quarantined and the eviction loop keeps retrying, as for any retirement past its deadline.
 
----
+### 7.10 Task-Array Sync on a Stuck Disk
 
-### 7.10 Task Attempt Fails to Launch
+**What happens:** A worker's disk stops answering (a hung device, a dead network filesystem) while the leader's once-a-second task-array sync is reading or writing the worker's control fence, grant fences, ledgers or launch markers. Each of those calls runs on a tokio blocking thread, and a blocked `read` can't be interrupted, not even by a signal.
 
-**What happens:** A task attempt fails before its command is authorised to run: an image pull fails (a registry answering 503 during a Pickle leader change, a rate limit, a reset connection), a runc call or network setup fails, the disk fills while unpacking or preparing capture, or a reusable slot's previous executor hasn't retired. The command never ran. Or the spec can't run here at all: an image reference that doesn't parse, an image whose config is invalid, a missing or unusable executable, a runtime or network policy the node can't provide, revoked namespace credentials.
+**Detection:** The leader's per-tick deadline and its 3-second `NODE_SYNC_TIMEOUT`. It drops the call and marks the node failing.
 
-**Detection:** The fresh path classifies its typed launch error (`LaunchError::outcome` in `src/bun/task_runtime.rs`); the reusable pools use `ExecutorError::is_transient`, and `helper_spawn_outcome` for the helper's `exec` errno. `GrillError::refuses_spec` is the one place that decides a runtime error is the spec's fault: `ImagePull` with `InvalidReference` or `InvalidConfig`. Errors that could be either (runc, disk, network setup) count as transient, because the command provably didn't run and the retry is bounded.
+**Impact:** One blocking thread, not one per retry (#770). Dropping the HTTP request drops the worker's handler, but the stuck call keeps running and holds the worker's single sync claim (`SyncClaim` in `task_array_node.rs`, one `OwnedSemaphorePermit` shared by the sync and every blocking call it starts). While the claim is held, later syncs fail at once with `SyncBusy`, answered as `503 Service Unavailable`, without touching the disk. Before this, each sync the leader gave up on left one more thread blocked on the disk, until the blocking pool filled and stalled unrelated work in Bun. The leader counts a busy answer as a failed sync, exactly like a timeout, so the node stops counting towards a run's eligible nodes and its held chunks move elsewhere after the 30-second silence timeout. Chunks already running on the worker carry on as long as their own disk writes do.
 
-**Impact:** A transient failure is `AttemptOutcome::LaunchFailed`: the task pool retries it with the ordinary backoff, under cancellation, counted against `max_attempts` and as a `launch` retry cause. A singleton without `replay_unknown` retries it too, since nothing ran. A permanent one is `AttemptOutcome::Refused` and fails the task at once. The reason is the attempt's output, kept for a failed task, and Bun logs `batch B task I attempt A/M: …` on stderr, at most 20 lines per run per minute plus a count of the rest (#889).
+**Recovery:** Automatic. When the stuck call returns, the claim frees itself and the next sync runs normally.
 
-**Recovery:** Automatic for transient failures, within the attempt budget. A refusal needs the spec fixed and the job resubmitted.
+### 7.11 Registry Rate-Limits a Burst of Cold Starts
 
-### 7.11 A Consumer-Sync Turn Over the Turn Budget
+**What happens:** Dozens of reusable executors cold-start together, and each one prepares its image twice: once in the pool, to resolve the command against the image config, and once in runc's create, to build the bundle. An anonymous registry such as `public.ecr.aws` answers `TOOMANYREQUESTS`.
+
+**Detection:** The registry client retries four times with backoff, then the pull fails with `ImageError::ManifestPull` and the attempt with `SpawnFailed`, its reason in the task's output.
+
+**Impact:** None for a digest-pinned image this node has already pulled and unpacked (#790). `ImageStore::pull_and_unpack` first resolves a pin from local storage: the raw index, platform manifest and config it verified on the first pull, kept under `metadata/sha256/{digest}` and re-hashed against the digest that names them on every read, plus a rootfs generation with its `.complete` marker. Then neither pull sends a request. Only the first pull of an image on a node, a tag reference, or a pin whose local metadata or rootfs is missing or fails verification asks the registry.
+
+**Recovery:** Automatic for a warm pin. For a cold one, the task fails after the client's retries and the task pool retries the attempt as usual. Configure `[images] mirrors` to keep a public registry's rate limit out of the path.
+
+### 7.12 A Consumer-Sync Turn Over the Turn Budget
 
 **What happens:** A leader answer that changes a node's consumer view runs through the agent loop as a sequence of steps, one a turn (#505, #603): `candidate` reads the runtime's launch inventory and builds the view, `journal` records the answer and journals its first change, then `withdraw`, `prove_receipts` and `publish` after a recovery, then `activate` and `compact`. Each step takes at most one fsync'd discovery-journal write or one inventory read. The two steps that install a view (`journal` for a node that's already active, and `publish`) also write every service's kernel entry under the shared eBPF handle's lock, rebuild the routing table and reconcile the namespace firewall, whose runtime cgroup reads stop at the turn's 500 ms deadline. In the 0.2.0 fast soak two nodes took one such turn of about 1.9 s each in the same second (#890).
 
@@ -1597,9 +1625,25 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 bun: agent loop turn took 1902 ms in follow_up (consumer_sync/journal): journal write 1400 ms, kernel lock wait 3 ms, view install 6 ms, firewall sync 480 ms
 ```
 
-**Impact:** Every caller waits for the turn in progress, so status, commands and deploy steps on that node wait up to the turn's length. The view itself stays correct: the steps keep their order, and the journal lists every view that may be exposed before the kernel sees it.
+The 0.2.0 candidate soaks that carried the line named the journal write: 1,574 of a 1,575 ms `consumer_sync/journal` turn after a restart, and up to 6 s on a node whose disk the jobs tier throttles. So from 0.2.1 a step waits for its write only until the turn's 500 ms runtime budget runs out. A write still going then carries on in a task, the step's remainder (`consumer_sync/install`, or `consumer_sync/landed` when there is nothing to install) waits for it, and the loop serves other turns meanwhile. Such a write leaves its own line when it lands:
 
-**Recovery:** Automatic; the next turn runs normally. The view's size isn't the cost: a thousand services, first published and then with every backend moved, take each turn well within the budget less its journal write (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`), and the soak runs a handful. Which await held the soak's turns is still open in #890. The next soak's log line will say.
+```
+bun: a discovery journal write took 1574 ms; the agent loop went on meanwhile
+```
+
+**Impact:** Status, commands and deploy steps on that node no longer wait for a slow consumer write. A command that itself journals something waits for the write in flight first, as it would for its own. The view stays correct: the steps keep their order, the kernel sees a view only after the write that records it has landed, and readers meanwhile see the journal as it is on disk, plus the view under way for `own_view_names`. A write that fails off the loop fences discovery as an inline failure does (`discovery:journal` degraded, reopened on the next tick) and the leader hears the error.
+
+**Recovery:** Automatic. The view's size isn't the cost: a thousand services, first published and then with every backend moved, take each turn well within the budget less its journal write (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`), and the soak runs a handful. Only consumer steps leave a write in flight; deploys, retirements and releases still wait for theirs inline (#890).
+
+### 7.13 Task Attempt Fails to Launch
+
+**What happens:** A task attempt fails before its command is authorised to run: an image pull fails (a registry answering 503 during a Pickle leader change, a rate limit, a reset connection), a runc call or network setup fails, the disk fills while unpacking or preparing capture, or a reusable slot's previous executor hasn't retired. The command never ran. Or the spec can't run here at all: an image reference that doesn't parse, an image whose config is invalid, a missing or unusable executable, a runtime or network policy the node can't provide, revoked namespace credentials.
+
+**Detection:** The fresh path classifies its typed launch error (`LaunchError::outcome` in `src/bun/task_runtime.rs`); the reusable pools use `ExecutorError::is_transient`, and `helper_spawn_outcome` for the helper's `exec` errno. `GrillError::refuses_spec` is the one place that decides a runtime error is the spec's fault: `ImagePull` with `InvalidReference` or `InvalidConfig`, and any `LaunchRefused` (a missing or unexecutable binary, no command, or an image under `--runtime process`; #881, #905, #914). Errors that could be either (runc, disk, network setup) count as transient, because the command provably didn't run and the retry is bounded.
+
+**Impact:** A transient failure is `AttemptOutcome::LaunchFailed`: the task pool retries it with the ordinary backoff, under cancellation, counted against `max_attempts` and as a `launch` retry cause. A singleton without `replay_unknown` retries it too, since nothing ran. A permanent one is `AttemptOutcome::Refused` and fails the task at once. The reason is the attempt's output, kept for a failed task, and Bun logs `batch B task I attempt A/M: …` on stderr, at most 20 lines per run per minute plus a count of the rest (#889).
+
+**Recovery:** Automatic for transient failures, within the attempt budget. A refusal needs the spec fixed and the job resubmitted.
 
 ---
 
@@ -1721,7 +1765,7 @@ The default seccomp profile blocks the following syscall families (identical for
 
 **10,000 nodes:** Bun itself is not affected by cluster size. The reporting tree ensures that each Bun instance communicates only with its parent (a council member), not with all other nodes. The Onion service map on each node contains entries for all workloads in the cluster (~5M at max density), which fits comfortably in kernel memory (~80 bytes per entry = ~400 MB, well within typical server memory).
 
-**Port allocation at density:** The default port range of 10000-60000 provides 50,000 ports. At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum = 2% utilisation. Port exhaustion is not a concern.
+**Port allocation at density:** The default port range of 10000..32767 provides about 22,700 ports, all below Linux's ephemeral range (32768-60999). At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum, about 4% utilisation. Port exhaustion is not a concern.
 
 ### 9.3 Memory Budget
 

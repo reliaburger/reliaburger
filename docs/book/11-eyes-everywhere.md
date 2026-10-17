@@ -131,22 +131,27 @@ The reporting tree already sends `StateReport` messages from workers to council 
 pub enum ReportingMessage {
     Report(StateReport),
     Ack { node_id: NodeId },
-    AggregatedReport { reports: HashMap<NodeId, StateReport> },
     MetricsRollup(NodeRollup),   // new
 }
 ```
 
-The `ReportAggregator` on each council member already handles `Report` and `AggregatedReport`. We add a case for `MetricsRollup`:
+The `ReportAggregator` already handles `Report`. We add a case for `MetricsRollup`:
 
 ```rust
-Some((_, ReportingMessage::MetricsRollup(rollup))) => {
-    if let Some(ref store) = self.rollup_store {
+Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
+    if Self::report_identity_ok(&peer, &rollup.node_id)
+        && let Some(ref store) = self.rollup_store
+    {
         store.write().await.ingest(&rollup);
     }
 }
 ```
 
-That's it. One match arm. The existing transport handles framing, serialisation, and delivery. The existing assignment logic routes rollups to the right council member. No new transport layer needed.
+`peer` is the node id the connection's mTLS certificate proves, and `report_identity_ok` refuses a rollup that claims to be from anyone else. Without that check node X could send a rollup for node Y, poisoning Y's metrics and pre-claiming Y's dedup keys so Y's real rollups were dropped as duplicates.
+
+The enum used to have one more variant, `AggregatedReport { reports: HashMap<NodeId, StateReport> }`, for a council member forwarding its workers' reports to the leader. It carried many nodes' reports, so it couldn't be bound to one certificate, and the aggregator stored every report in it unchecked. Production never sent it (every worker reports straight to the leader), but any authenticated peer could, and keep a dead node "fresh" or inject endpoints for it. We deleted it in 0.2.1. If the two-level tree is ever built, the forwarding message comes back with council-peer authentication rather than trust.
+
+So the rollup path is one match arm. The existing transport handles framing, serialisation, and delivery, and the existing assignment logic routes rollups to the aggregator (today, the leader). No new transport layer needed.
 
 ## The RollupWorker
 
@@ -772,6 +777,8 @@ crate::sesame::auth::authenticate_off_lock(&form.token, tokens)
 ```
 
 Two tests pin both halves. With every permit held (a test-only `hold_all_verify_permits` calls `acquire_many` on the semaphore), a login of `nope` still comes back `401` inside the timeout, so it never went near Argon2. A well-shaped login under the same conditions is still pending after 200 ms, and finishes with a redirect once we drop the permits. A bound only works if every path to the expensive thing goes through it. Two copies of the same check is one too many.
+
+In 0.2.1 the expensive thing went away. Tokens are now stored as SHA-256 digests (Chapter 4 explains why Argon2 was the wrong hash for random tokens), so verifying one costs microseconds and the semaphore was removed with it. The lesson about a single path stayed: the login handler and the bearer middleware both call `sesame::auth::authenticate`, which does the shape check itself. The permit test went too, and `a_malformed_login_is_refused_promptly` is what's left.
 
 ### Node detail page
 

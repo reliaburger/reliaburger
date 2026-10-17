@@ -3,6 +3,7 @@
 use crate::bun::capabilities::Capability;
 use crate::relish::client::LogOptions;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -29,14 +30,12 @@ async fn job_runs_to_completion_and_reports_exit(ctx: TestContext) -> Result<(),
 async fn scheduled_job_fires_on_its_schedule(ctx: TestContext) -> Result<(), String> {
     let job = "cron";
     // Every minute (the finest cron granularity). The default per-case timeout
-    // gives it two windows to fire.
+    // gives it two windows to fire. A host job, like the case's requirement
+    // says: an image job needs a container runtime, and a cluster with none
+    // refuses it at admission (#788).
     let spec = format!(
-        "[job.{job}]\n\
-         image = \"proc-grill:image-ignored\"\n\
-         command = [\"/bin/sh\", \"-c\", \"echo tick\"]\n\
-         schedule = \"* * * * *\"\n\
-         namespace = \"{ns}\"\n",
-        ns = ctx.namespace,
+        "{}schedule = \"* * * * *\"\n",
+        ctx.process_job_spec(job, &["/bin/sh", "-c", "echo tick"])
     );
     ctx.apply(&spec).await?;
     // A fired schedule leaves at least one run behind.
@@ -85,18 +84,21 @@ pub fn cases() -> Vec<TestCase> {
             name: "job_runs_to_completion_and_reports_exit",
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(job_runs_to_completion_and_reports_exit),
         },
         TestCase {
             name: "scheduled_job_fires_on_its_schedule",
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(scheduled_job_fires_on_its_schedule),
         },
         TestCase {
             name: "job_logs_are_retrievable_after_completion",
             group: TestGroup::Jobs,
             requires: &[Capability::Logs, Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(job_logs_are_retrievable_after_completion),
         },
     ]
@@ -117,7 +119,7 @@ mod tests {
             axum::Json(serde_json::json!({
                 "jobs": [{
                     "node": "cluster", "name": name, "namespace": namespace,
-                    "instance_id": "run-7", "image": "proc-grill:image-ignored",
+                    "instance_id": "run-7", "image": "app:v1",
                     "state": state, "restart_count": 0, "age_seconds": 1,
                 }],
                 "warnings": [],

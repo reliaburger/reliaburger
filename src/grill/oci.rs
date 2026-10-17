@@ -14,6 +14,25 @@ use crate::config::job::JobSpec;
 use crate::config::types::{EnvValue, ResourceRange};
 use crate::grill::cgroup;
 
+/// The root a host workload (`exec` or `script`) runs in: the node's own
+/// filesystem, not an image. An init container of a host app inherits it.
+pub const HOST_ROOT: &str = "proc-grill:host";
+
+/// The `oom_score_adj` every workload process starts with: apps, init
+/// containers, jobs, task executors and the tasks they run.
+///
+/// The kernel's global OOM killer picks the process with the highest
+/// score, roughly its share of memory in thousandths plus this value
+/// (-1000 to 1000). The systemd units we ship run Bun at -900, and a child
+/// inherits its parent's value, so without this every workload ran at -900
+/// too and Bun was no safer than the workloads it supervises. At +500 a
+/// workload goes before Bun, before the node's own daemons (which run at 0
+/// or below) and before Lima's guest agent (-500), however small it is.
+/// Losing a task or one replica costs far less than losing the node agent.
+/// A workload's own cgroup `memory.max` still decides a cgroup OOM; this
+/// only orders the node-wide one.
+pub const WORKLOAD_OOM_SCORE_ADJ: i32 = 500;
+
 /// A simplified OCI runtime specification.
 ///
 /// Contains the fields Reliaburger actually uses. Additional fields
@@ -26,6 +45,11 @@ pub struct OciSpec {
     /// Trusted execution discriminator generated from exec/script, never an image name.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_process: bool,
+    /// An init container ([`generate_init_oci_spec`]): it mounts the app's
+    /// volumes but leaves their ownership with the app's user, so a runtime
+    /// that hands a managed volume to its container's user skips it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub initialiser: bool,
     pub root: OciRoot,
     pub process: OciProcess,
     pub mounts: Vec<OciMount>,
@@ -95,6 +119,15 @@ pub struct OciProcess {
     /// Linux capability sets. `None` gives the process no capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<OciCapabilities>,
+    /// The process's `oom_score_adj` (the OCI `oomScoreAdj` field, which runc
+    /// applies). Workloads carry [`WORKLOAD_OOM_SCORE_ADJ`]. `None` keeps the
+    /// score the process inherits, which suits Bun's own runtime commands.
+    #[serde(
+        rename = "oomScoreAdj",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub oom_score_adj: Option<i32>,
     /// What the workload asked for before its image config fills the gaps.
     ///
     /// Not part of the OCI runtime spec. `Some` means `args`, `env`, `cwd`
@@ -184,6 +217,12 @@ impl OciLinux {
     /// Relative, root, non-canonical and legacy host-prefixed paths refuse:
     /// none gives Reliaburger an unambiguous workload identity.
     pub fn host_cgroup_path(&self) -> Option<PathBuf> {
+        self.cgroup_path_under(Path::new("/sys/fs/cgroup"))
+    }
+
+    /// [`Self::host_cgroup_path`] under a cgroup v2 mount other than
+    /// `/sys/fs/cgroup`, so tests can stand a directory in for it.
+    pub fn cgroup_path_under(&self, mount: &Path) -> Option<PathBuf> {
         let path = self.cgroups_path.as_deref()?;
         let relative = path.strip_prefix('/')?;
         if relative.is_empty()
@@ -194,13 +233,14 @@ impl OciLinux {
         {
             return None;
         }
-        Some(Path::new("/sys/fs/cgroup").join(relative))
+        Some(mount.join(relative))
     }
 }
 
-// The generators receive the host path Bun uses for policy and resource files;
-// OCI instead resolves an absolute cgroupsPath from the cgroup mount point.
-fn hierarchy_cgroup_path(host_path: &str) -> String {
+/// The OCI `cgroupsPath` for a host cgroup directory. The generators receive
+/// the host path Bun uses for policy and resource files, while OCI resolves
+/// an absolute path from the cgroup mount point.
+pub fn hierarchy_cgroup_path(host_path: &str) -> String {
     match host_path.strip_prefix("/sys/fs/cgroup/") {
         Some(relative) => format!("/{relative}"),
         None => host_path.to_owned(),
@@ -342,12 +382,13 @@ pub fn generate_oci_spec_with_decryptor(
     Ok(OciSpec {
         reusable_executor: false,
         host_process: spec.exec.is_some() || spec.script.is_some(),
+        initialiser: false,
         root: OciRoot {
             // Process workloads (exec/script) use the host root filesystem.
             // Container workloads use the image reference (Apple Container)
             // or resolved rootfs path (runc).
             path: if spec.exec.is_some() || spec.script.is_some() {
-                "proc-grill:host".to_string()
+                HOST_ROOT.to_string()
             } else {
                 spec.image.clone().unwrap_or_else(|| {
                     format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
@@ -372,6 +413,7 @@ pub fn generate_oci_spec_with_decryptor(
                 gid: spec.run_as_group.unwrap_or(65534),
             },
             capabilities: None,
+            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
             overrides: app_overrides(spec),
         },
         mounts,
@@ -430,8 +472,8 @@ pub fn build_env_with_decryptor(
 /// Build the process arguments from an app spec.
 ///
 /// Returns the app's `command` followed by its `args`. When both are
-/// empty, ProcessGrill falls back to `sleep 86400`; runc resolves the
-/// image's `Entrypoint` and `Cmd` from [`OciProcess::overrides`] instead.
+/// empty, runc resolves the image's `Entrypoint` and `Cmd` from
+/// [`OciProcess::overrides`]. ProcessGrill runs no images (#914).
 fn build_args(app_name: &str, spec: &AppSpec) -> Vec<String> {
     let _ = app_name;
 
@@ -468,6 +510,48 @@ fn app_overrides(spec: &AppSpec) -> Option<ProcessOverrides> {
     })
 }
 
+/// Where an instance's inline config files live on the node:
+/// `{volumes_dir}/.config/{namespace}/{app}/{instance_id}`. Bun removes the
+/// directory when it retires the instance.
+pub fn inline_config_dir(
+    volumes_dir: &Path,
+    namespace: &str,
+    app_name: &str,
+    instance_id: &str,
+) -> PathBuf {
+    volumes_dir
+        .join(".config")
+        .join(namespace)
+        .join(app_name)
+        .join(instance_id)
+}
+
+/// The host file name for the inline config file mounted at `container_path`:
+/// a hash of the whole path, so files with the same basename stay apart and
+/// no container path can name anything outside the instance's directory.
+fn inline_config_file_name(container_path: &Path) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(container_path.as_os_str().as_encoded_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// Write `content` to `path` by renaming a fresh file over it, so an entry
+/// already at `path` (a symlink, say) is replaced rather than written through.
+fn write_inline_config(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(format!(".{}.tmp", std::process::id()));
+    let staged = PathBuf::from(staged);
+    let _ = std::fs::remove_file(&staged);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+    file.write_all(content.as_bytes())?;
+    drop(file);
+    std::fs::rename(&staged, path)
+}
+
 fn build_mounts(
     spec: &AppSpec,
     _host_port: Option<u16>,
@@ -481,23 +565,21 @@ fn build_mounts(
     // Config files: read-only bind mounts.
     // Inline content is written to a file under volumes_dir so it can be
     // bind-mounted into the container. Source paths are used directly.
+    // Each instance gets its own copy, named after its container path, so
+    // two files with one basename can't collide and a rollout never
+    // rewrites the file under a running instance (#701).
     for cf in &spec.config_file {
         let source = if let Some(ref source_path) = cf.source {
             Some(PathBuf::from(source_path))
         } else if let Some(ref content) = cf.content {
-            // Resolve inline content to a temp file path
             let base = volumes_dir
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"));
-            let config_dir = base.join(".config").join(namespace).join(app_name);
-            let filename = cf
-                .path
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("config"));
-            let host_path = config_dir.join(filename);
+            let config_dir = inline_config_dir(&base, namespace, app_name, instance_id);
+            let host_path = config_dir.join(inline_config_file_name(&cf.path));
             if let Err(e) = std::fs::create_dir_all(&config_dir) {
                 eprintln!("failed to create config dir {}: {e}", config_dir.display());
-            } else if let Err(e) = std::fs::write(&host_path, content.as_bytes()) {
+            } else if let Err(e) = write_inline_config(&host_path, content) {
                 eprintln!("failed to write inline config {}: {e}", host_path.display());
             }
             Some(host_path)
@@ -724,9 +806,10 @@ pub fn generate_job_oci_spec(
     OciSpec {
         reusable_executor: false,
         host_process: spec.is_host(),
+        initialiser: false,
         root: OciRoot {
             path: if spec.is_host() {
-                "proc-grill:host".to_string()
+                HOST_ROOT.to_string()
             } else {
                 spec.image.clone().unwrap_or_else(|| {
                     format!("/var/lib/reliaburger/images/{namespace}/{job_name}/rootfs")
@@ -744,6 +827,7 @@ pub fn generate_job_oci_spec(
                 gid: 65534,
             },
             capabilities: None,
+            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
             overrides: (spec.image.is_some() && spec.exec.is_none() && spec.script.is_none()).then(
                 || ProcessOverrides {
                     command: spec.command.clone().unwrap_or_default(),
@@ -764,50 +848,52 @@ pub fn generate_job_oci_spec(
     }
 }
 
-/// Generate a minimal OCI spec for an init container.
+/// Generate the OCI spec for an init container of an app whose own spec is
+/// `app`.
 ///
-/// Init containers run a single command to completion before the main
-/// app starts. No ports, no health checks, no volumes. The `image`
-/// parameter is typically inherited from the parent app's image.
+/// The init runs `init.command` in its own image, or the app's when it names
+/// none, with the app's environment (secrets already decrypted), the app's
+/// mounts (volumes, config files and identity, host paths already approved)
+/// and the app's cgroup. It takes nothing from the app's process settings and
+/// publishes no port. Building on the app's finished spec rather than its
+/// config means the init can't drift from what the app itself got.
 pub fn generate_init_oci_spec(
-    command: &[String],
-    namespace: &str,
-    app_name: &str,
-    image: Option<&str>,
-    cgroup_path: &str,
-    netns_path: Option<&str>,
+    init: &crate::config::app::InitContainerSpec,
+    app: &OciSpec,
 ) -> OciSpec {
+    let root = init.image.clone().unwrap_or_else(|| app.root.path.clone());
+    // An image's config fills in what the init doesn't set, as it does for
+    // the app; a bare root filesystem has no config to read.
+    let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
         reusable_executor: false,
         host_process: false,
+        initialiser: true,
         root: OciRoot {
-            path: image.map(String::from).unwrap_or_else(|| {
-                format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
-            }),
+            path: root,
             readonly: false,
         },
         process: OciProcess {
             rlimits: Vec::new(),
-            args: command.to_vec(),
-            env: Vec::new(),
+            args: init.command.clone(),
+            env: app.process.env.clone(),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,
                 gid: 65534,
             },
             capabilities: None,
-            // An init container is its own container: it takes nothing from
-            // the app's process settings, only its own command.
-            overrides: image.map(|_| ProcessOverrides {
-                command: command.to_vec(),
+            oom_score_adj: Some(WORKLOAD_OOM_SCORE_ADJ),
+            overrides: from_image.then(|| ProcessOverrides {
+                command: init.command.clone(),
                 ..ProcessOverrides::default()
             }),
         },
-        mounts: standard_mounts(),
+        mounts: app.mounts.clone(),
         linux: OciLinux {
-            namespaces: standard_namespaces(netns_path),
+            namespaces: standard_namespaces(None),
             resources: None,
-            cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
+            cgroups_path: app.linux.cgroups_path.clone(),
             uid_mappings: None,
             gid_mappings: None,
         },
@@ -823,6 +909,183 @@ mod tests {
 
     fn minimal_app() -> AppSpec {
         toml::from_str(r#"image = "test:v1""#).unwrap()
+    }
+
+    fn init_container(
+        image: Option<&str>,
+        command: &[&str],
+    ) -> crate::config::app::InitContainerSpec {
+        crate::config::app::InitContainerSpec {
+            image: image.map(String::from),
+            command: command.iter().map(|part| part.to_string()).collect(),
+        }
+    }
+
+    /// The spec Bun would generate for instance `default__web-0` of `app`.
+    fn app_oci(app: &AppSpec) -> OciSpec {
+        generate_oci_spec(
+            "web",
+            "default",
+            app,
+            "default__web-0",
+            None,
+            "/cg",
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn init_spec_uses_its_own_image() {
+        // #701: `[[app.api.init]] image = "migrate:v2"` used to run its
+        // command in the app's image.
+        let app: AppSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
+        let app = app_oci(&app);
+        let init = generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+        assert_eq!(init.root.path, "migrate:v2");
+        assert_eq!(init.process.args, vec!["migrate".to_string()]);
+        assert_eq!(
+            init.process.overrides.unwrap().command,
+            vec!["migrate".to_string()]
+        );
+
+        // Without an image of its own it inherits the app's.
+        let inherited = generate_init_oci_spec(&init_container(None, &["true"]), &app);
+        assert_eq!(inherited.root.path, "myapp:v1");
+    }
+
+    #[test]
+    fn init_spec_gets_app_env_and_volume_mounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "myapp:v1"
+            env = { DATABASE_URL = "postgres://db/app" }
+
+            [[volumes]]
+            path = "/data"
+
+            [[config_file]]
+            path = "/etc/myapp/app.conf"
+            content = "key = value"
+            "#,
+        )
+        .unwrap();
+        let app = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(tmp.path()),
+            None,
+        );
+        let init = generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+
+        assert_eq!(init.process.env, app.process.env);
+        assert!(
+            init.process
+                .env
+                .contains(&"DATABASE_URL=postgres://db/app".to_string()),
+            "{:?}",
+            init.process.env
+        );
+        for destination in ["/data", "/etc/myapp/app.conf"] {
+            let app_mount = app
+                .mounts
+                .iter()
+                .find(|m| m.destination == Path::new(destination))
+                .unwrap();
+            assert!(
+                init.mounts.contains(app_mount),
+                "init is missing the app's {destination} mount: {:?}",
+                init.mounts
+            );
+        }
+        assert_eq!(init.linux.cgroups_path, app.linux.cgroups_path);
+        // The app owns its volumes; an init borrowing them must not take
+        // their ownership away from the app's user.
+        assert!(init.initialiser && !app.initialiser);
+        assert_eq!(init.port_mapping, None);
+    }
+
+    #[test]
+    fn inline_config_files_with_same_basename_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "myapp:v1"
+
+            [[config_file]]
+            path = "/etc/a/config.yaml"
+            content = "a"
+
+            [[config_file]]
+            path = "/etc/b/config.yaml"
+            content = "b"
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(tmp.path()),
+            None,
+        );
+        let content = |destination: &str| {
+            let mount = oci
+                .mounts
+                .iter()
+                .find(|m| m.destination == Path::new(destination))
+                .unwrap();
+            std::fs::read_to_string(mount.source.as_ref().unwrap()).unwrap()
+        };
+        assert_eq!(content("/etc/a/config.yaml"), "a");
+        assert_eq!(content("/etc/b/config.yaml"), "b");
+    }
+
+    #[test]
+    fn inline_config_files_are_kept_per_instance() {
+        // A rollout writes the new content for the new instance only: the
+        // old instance keeps reading the file it started with (#701).
+        let tmp = tempfile::tempdir().unwrap();
+        let app = |content: &str| -> AppSpec {
+            toml::from_str(&format!(
+                "image = \"myapp:v1\"\n[[config_file]]\npath = \"/etc/app.conf\"\ncontent = {content:?}\n"
+            ))
+            .unwrap()
+        };
+        let source = |instance: &str, content: &str| {
+            let oci = generate_oci_spec(
+                "web",
+                "default",
+                &app(content),
+                instance,
+                None,
+                "/cg",
+                Some(tmp.path()),
+                None,
+            );
+            oci.mounts
+                .iter()
+                .find(|m| m.destination == Path::new("/etc/app.conf"))
+                .and_then(|m| m.source.clone())
+                .unwrap()
+        };
+        let old = source("default__web-0", "old");
+        let new = source("default__web-g1-0", "new");
+        assert_ne!(old, new);
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "new");
+        assert_eq!(
+            old.parent().unwrap(),
+            inline_config_dir(tmp.path(), "default", "web", "default__web-0")
+        );
     }
 
     #[test]
@@ -975,14 +1238,8 @@ mod tests {
 
     #[test]
     fn init_containers_and_jobs_resolve_against_their_image_too() {
-        let init = generate_init_oci_spec(
-            &["migrate".to_string()],
-            "default",
-            "web",
-            Some("web:v1"),
-            "/cg",
-            None,
-        );
+        let app: AppSpec = toml::from_str(r#"image = "web:v1""#).unwrap();
+        let init = generate_init_oci_spec(&init_container(None, &["migrate"]), &app_oci(&app));
         assert_eq!(
             init.process.overrides.unwrap().command,
             vec!["migrate".to_string()]
@@ -1622,6 +1879,55 @@ mod tests {
         assert!(oci.linux.resources.is_none());
     }
 
+    // -- OOM score (#984) -----------------------------------------------------
+
+    #[test]
+    fn workloads_are_the_oom_killers_first_choice_before_bun() {
+        // Bun's units ask for -900; every workload must sit well above it,
+        // and above zero, so a global OOM takes a workload or a task first.
+        const _: () = assert!(WORKLOAD_OOM_SCORE_ADJ > 0);
+        const _: () = assert!(WORKLOAD_OOM_SCORE_ADJ <= 1000);
+        let app = app_oci(&minimal_app());
+        let host_app: AppSpec = toml::from_str(r#"exec = "/bin/true""#).unwrap();
+        let host_app = app_oci(&host_app);
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &app);
+        let job = generate_job_oci_spec("migrate", "default", &minimal_job(), "/cg", None);
+        let host_job: JobSpec = toml::from_str(r#"script = "true""#).unwrap();
+        let host_job = generate_job_oci_spec("tidy", "default", &host_job, "/cg", None);
+        for (what, spec) in [
+            ("app", &app),
+            ("host app", &host_app),
+            ("init container", &init),
+            ("job", &job),
+            ("host job", &host_job),
+        ] {
+            assert_eq!(
+                spec.process.oom_score_adj,
+                Some(WORKLOAD_OOM_SCORE_ADJ),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn oom_score_is_written_as_the_oci_process_field() {
+        // runc reads `process.oomScoreAdj` from config.json.
+        let job = generate_job_oci_spec("migrate", "default", &minimal_job(), "/cg", None);
+        let json = serde_json::to_value(&job).unwrap();
+        assert_eq!(
+            json["process"]["oomScoreAdj"],
+            serde_json::json!(WORKLOAD_OOM_SCORE_ADJ)
+        );
+        // A spec without one (an internal runtime command) leaves the field
+        // out, so the process keeps the score it inherits.
+        let mut inherited = job.clone();
+        inherited.process.oom_score_adj = None;
+        let json = serde_json::to_value(&inherited).unwrap();
+        assert!(json["process"].get("oomScoreAdj").is_none(), "{json}");
+        let back: OciSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.process.oom_score_adj, None);
+    }
+
     #[test]
     fn generate_job_has_standard_mounts() {
         let spec = minimal_job();
@@ -1840,7 +2146,19 @@ mod tests {
                 None,
             ),
             generate_job_oci_spec("web", "test", &minimal_job(), path, None),
-            generate_init_oci_spec(&["true".into()], "test", "web", None, path, None),
+            generate_init_oci_spec(
+                &init_container(None, &["true"]),
+                &generate_oci_spec(
+                    "web",
+                    "test",
+                    &minimal_app(),
+                    "test__web-3",
+                    None,
+                    path,
+                    None,
+                    None,
+                ),
+            ),
         ];
         for specification in specifications {
             assert_eq!(
@@ -1856,7 +2174,8 @@ mod tests {
 
     #[test]
     fn recovered_cgroup_paths_refuse_ambiguous_or_legacy_identity() {
-        let mut specification = generate_init_oci_spec(&[], "test", "web", None, "/unused", None);
+        let mut specification =
+            generate_init_oci_spec(&init_container(None, &[]), &app_oci(&minimal_app()));
         for invalid in [
             "",
             "/",

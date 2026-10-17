@@ -329,8 +329,9 @@ pub struct PlacementSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploySpec {
-    /// Strategy: "rolling" or "blue-green".
-    pub strategy: Option<String>,
+    /// Strategy: `"rolling"` or `"blue-green"`. Anything else is refused
+    /// when the config is parsed, rather than quietly rolling.
+    pub strategy: Option<crate::meat::deploy_types::DeployStrategy>,
     /// Max instances above target during rollout.
     pub max_surge: Option<u32>,
     /// Max instances below target during rollout.
@@ -800,7 +801,10 @@ mod tests {
         "#,
         );
         let d = app.deploy.unwrap();
-        assert_eq!(d.strategy.as_deref(), Some("rolling"));
+        assert_eq!(
+            d.strategy,
+            Some(crate::meat::deploy_types::DeployStrategy::Rolling)
+        );
         assert_eq!(d.max_surge, Some(1));
         assert_eq!(d.auto_rollback, Some(true));
     }

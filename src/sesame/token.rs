@@ -1,13 +1,18 @@
 //! API token generation, hashing, and validation.
 //!
-//! Tokens are 256-bit random values, hashed with Argon2id before storage.
-//! Each token has a role (Admin, Deployer, ReadOnly) and optional scope.
+//! Tokens are 256-bit random values. Only the SHA-256 digest of the full
+//! plaintext is stored, and a bearer is checked by hashing it once and
+//! comparing digests in constant time. Each token has a role (Admin,
+//! Deployer, ReadOnly) and optional scope.
+//!
+//! A fast hash is safe here, and a password hash such as Argon2id would be
+//! wasted, because the secret is not a password: nobody can guess 256
+//! random bits, so slowing each guess down buys nothing. That only holds
+//! while every stored secret really is long and random, so
+//! [`hash_secret`] refuses anything else.
 
 use std::time::{Duration, SystemTime};
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{self, Output, ParamsString, PasswordHash, Salt, SaltString};
-use argon2::{Algorithm, Argon2, Block, Params, Version};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use super::types::{ApiRole, ApiToken, PreviousSecret, TokenRotation, TokenScope};
@@ -17,8 +22,8 @@ use super::types::{ApiRole, ApiToken, PreviousSecret, TokenRotation, TokenScope}
 pub enum TokenError {
     #[error("failed to generate token: {0}")]
     GenerationFailed(String),
-    #[error("failed to hash token: {0}")]
-    HashFailed(String),
+    #[error("token secret is not 256 random bits in the rbrg_ format")]
+    WeakSecret,
     #[error("token validation failed")]
     ValidationFailed,
     #[error("token has expired")]
@@ -41,50 +46,56 @@ pub struct CreatedToken {
     pub token: ApiToken,
 }
 
-/// A freshly minted secret: the plaintext for the caller, and the hash and
-/// salt for Raft.
+/// How many random bytes a token secret carries: 256 bits, far beyond any
+/// brute-force search, which is what lets us store it under a fast hash.
+pub const TOKEN_SECRET_BYTES: usize = 32;
+
+// A shorter secret would make the fast hash unsafe, so refuse to compile one.
+// `const _: () = assert!(..)` runs the assertion at compile time.
+const _: () = assert!(TOKEN_SECRET_BYTES >= 32);
+
+/// A freshly minted secret: the plaintext for the caller, and its hash for
+/// Raft.
 struct MintedSecret {
     plaintext: String,
     token_hash: Vec<u8>,
-    token_salt: Vec<u8>,
 }
 
-/// Mint a random `rbrg_` secret and hash it with Argon2id.
+/// Mint a random `rbrg_` secret and hash it for storage.
 fn mint_secret() -> Result<MintedSecret, TokenError> {
     let rng = SystemRandom::new();
-    let mut token_bytes = [0u8; 32];
+    let mut token_bytes = [0u8; TOKEN_SECRET_BYTES];
     rng.fill(&mut token_bytes)
         .map_err(|_| TokenError::GenerationFailed("RNG failed".to_string()))?;
 
     let plaintext = format!("rbrg_{}", hex::encode(token_bytes));
-
-    // The hash is the `argon2` crate's default (Argon2id, version 0x13,
-    // 19 MiB, two passes, one lane), written in the PHC string format its
-    // `hash_password` writes. Only the working memory differs: it comes from
-    // a [`WorkingMemory`] mapping, not the heap.
-    let salt = SaltString::generate(&mut OsRng);
-    let hasher = Argon2::default();
-    let failed = |error: password_hash::Error| TokenError::HashFailed(error.to_string());
-    let mut salt_bytes = [0u8; Salt::MAX_LENGTH];
-    let salt_bytes = salt.decode_b64(&mut salt_bytes).map_err(failed)?;
-    let output_len = hasher
-        .params()
-        .output_len()
-        .unwrap_or(Params::DEFAULT_OUTPUT_LEN);
-    let output = hash_off_heap(&hasher, plaintext.as_bytes(), salt_bytes, output_len)?;
-    let password_hash = PasswordHash {
-        algorithm: Algorithm::default().ident(),
-        version: Some(Version::default().into()),
-        params: ParamsString::try_from(hasher.params()).map_err(failed)?,
-        salt: Some(salt.as_salt()),
-        hash: Some(output),
-    };
-
+    let token_hash = hash_secret(&plaintext)?;
     Ok(MintedSecret {
         plaintext,
-        token_hash: password_hash.to_string().into_bytes(),
-        token_salt: salt.as_str().as_bytes().to_vec(),
+        token_hash,
     })
+}
+
+/// The stored form of a token secret: the SHA-256 digest of the whole
+/// plaintext, prefix included.
+///
+/// Refuses a secret that isn't `rbrg_` plus [`TOKEN_SECRET_BYTES`] of hex,
+/// because the fast hash is only safe for a secret nobody can guess. Every
+/// secret we mint passes; the check stops a future caller from storing a
+/// short or human-chosen one.
+pub(crate) fn hash_secret(plaintext: &str) -> Result<Vec<u8>, TokenError> {
+    if !looks_like_token(plaintext) {
+        return Err(TokenError::WeakSecret);
+    }
+    Ok(digest(plaintext).to_vec())
+}
+
+/// SHA-256 of a candidate secret, in the form [`hash_secret`] stores.
+fn digest(plaintext: &str) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, plaintext.as_bytes());
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(digest.as_ref());
+    bytes
 }
 
 /// Generate a new API token.
@@ -108,7 +119,6 @@ pub fn create_token(
     let token = ApiToken {
         name: name.to_string(),
         token_hash: secret.token_hash,
-        token_salt: secret.token_salt,
         role,
         scope,
         expires_at,
@@ -160,7 +170,6 @@ pub fn rotate_token(
         rotation: TokenRotation {
             name: stored.name.clone(),
             token_hash: secret.token_hash,
-            token_salt: secret.token_salt,
             rotated_at: now,
             expires_at,
             previous_valid_until,
@@ -178,12 +187,10 @@ pub fn apply_rotation(token: &mut ApiToken, rotation: &TokenRotation) {
     // `std::mem::replace` puts the new hash in and hands back the old one,
     // so the old bytes move into the previous secret instead of being copied.
     let old_hash = std::mem::replace(&mut token.token_hash, rotation.token_hash.clone());
-    let old_salt = std::mem::replace(&mut token.token_salt, rotation.token_salt.clone());
     token.previous_secret = rotation
         .previous_valid_until
         .map(|valid_until| PreviousSecret {
             token_hash: old_hash,
-            token_salt: old_salt,
             valid_until,
         });
     token.created_at = rotation.rotated_at;
@@ -250,17 +257,28 @@ pub fn validate_token(plaintext: &str, stored: &ApiToken) -> Result<MatchedSecre
 
 /// Validate a plaintext token against a stored `ApiToken` at `now`.
 ///
-/// Checks the Argon2id hash of the current secret, then of the previous
-/// one, and then whether the secret that matched still works: the token's
-/// expiry for the current secret, the end of the grace period for the
-/// previous one. Does not check scope — that's the caller's responsibility
-/// based on the specific operation.
+/// Compares the SHA-256 digest of `plaintext` with the current secret's
+/// stored digest, then with the previous one's, and then checks whether the
+/// secret that matched still works: the token's expiry for the current
+/// secret, the end of the grace period for the previous one. Does not check
+/// scope — that's the caller's responsibility based on the specific
+/// operation.
 pub fn validate_token_at(
     plaintext: &str,
     stored: &ApiToken,
     now: SystemTime,
 ) -> Result<MatchedSecret, TokenError> {
-    if hash_matches(plaintext, &stored.token_hash) {
+    validate_digest_at(&digest(plaintext), stored, now)
+}
+
+/// [`validate_token_at`] for a bearer that's already been hashed, so a scan
+/// of the whole store hashes the bearer once rather than once per token.
+fn validate_digest_at(
+    candidate: &[u8; 32],
+    stored: &ApiToken,
+    now: SystemTime,
+) -> Result<MatchedSecret, TokenError> {
+    if digests_equal(candidate, &stored.token_hash) {
         if stored.expires_at.is_some_and(|at| now > at) {
             return Err(TokenError::Expired);
         }
@@ -269,7 +287,7 @@ pub fn validate_token_at(
     let Some(previous) = &stored.previous_secret else {
         return Err(TokenError::ValidationFailed);
     };
-    if !hash_matches(plaintext, &previous.token_hash) {
+    if !digests_equal(candidate, &previous.token_hash) {
         return Err(TokenError::ValidationFailed);
     }
     if now >= previous.valid_until {
@@ -278,113 +296,15 @@ pub fn validate_token_at(
     Ok(MatchedSecret::Previous)
 }
 
-/// Whether `plaintext` is the secret behind the stored Argon2id `hash`.
+/// Whether a candidate's digest is the stored one, compared in constant
+/// time.
 ///
-/// The variant, version, cost and salt all come from the stored hash, as the
-/// `argon2` crate's own `verify_password` takes them. The difference is where
-/// the working memory comes from: see [`WorkingMemory`].
-fn hash_matches(plaintext: &str, hash: &[u8]) -> bool {
-    let Ok(hash_str) = std::str::from_utf8(hash) else {
-        return false;
-    };
-    let Ok(stored) = PasswordHash::new(hash_str) else {
-        return false;
-    };
-    let Some(expected) = stored.hash else {
-        return false;
-    };
-    let Ok(algorithm) = Algorithm::try_from(stored.algorithm) else {
-        return false;
-    };
-    let version = match stored.version.map(Version::try_from) {
-        None => Version::default(),
-        Some(Ok(version)) => version,
-        Some(Err(_)) => return false,
-    };
-    let Ok(params) = Params::try_from(&stored) else {
-        return false;
-    };
-    let mut salt_bytes = [0u8; Salt::MAX_LENGTH];
-    let Some(Ok(salt)) = stored.salt.map(|salt| salt.decode_b64(&mut salt_bytes)) else {
-        return false;
-    };
-    let hasher = Argon2::new(algorithm, version, params);
-    match hash_off_heap(&hasher, plaintext.as_bytes(), salt, expected.len()) {
-        // `Output`'s `==` compares in constant time.
-        Ok(computed) => computed == expected,
-        Err(_) => false,
-    }
-}
-
-/// Argon2's working memory: a private anonymous mapping, never the heap.
-///
-/// At the default cost one hash fills 19 MiB, and every API request with a
-/// bearer token runs at least one. The `argon2` crate allocates that with
-/// `vec!`, so it came from glibc's heap. glibc serves a request that size
-/// from the arena of whichever thread asked, and keeps it there once it's
-/// freed: the hashes ran on Tokio's blocking pool, whose threads come and go
-/// across all of glibc's arenas (eight per CPU), so the API node ended up
-/// holding a 19 MiB block or more in most of them. In the 0.2.0 soak that
-/// was most of the gigabyte its Bun held on a 2 GiB VM (#945).
-///
-/// A mapping of our own goes back to the kernel the moment it's dropped, so
-/// a hash borrows 19 MiB for as long as it runs and no longer. The
-/// process-wide permit pool in `sesame::auth` bounds how many run at once.
-struct WorkingMemory {
-    map: memmap2::MmapMut,
-    blocks: usize,
-}
-
-// `blocks` reinterprets the mapping's bytes as `Block`s, so a `Block` must be
-// exactly `Block::SIZE` bytes and need no more alignment than a page gives.
-const _: () = assert!(std::mem::size_of::<Block>() == Block::SIZE);
-const _: () = assert!(std::mem::align_of::<Block>() <= 4096);
-
-impl WorkingMemory {
-    /// Map `blocks` zeroed Argon2 blocks.
-    fn new(blocks: usize) -> std::io::Result<Self> {
-        let bytes = blocks.checked_mul(Block::SIZE).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Argon2 memory cost overflows",
-            )
-        })?;
-        let map = memmap2::MmapOptions::new().len(bytes).map_anon()?;
-        Ok(Self { map, blocks })
-    }
-
-    /// The mapping as Argon2 blocks, for `hash_password_into_with_memory`.
-    fn blocks(&mut self) -> &mut [Block] {
-        // SAFETY: the mapping is `blocks * Block::SIZE` bytes long (checked in
-        // `new`), page-aligned, and `Block` is that size with an alignment no
-        // larger than a page (the `const` asserts above). A `Block` is 128
-        // `u64`s, so the mapping's zero bytes are a valid `Block` (they are
-        // `Block::new()`), and so is any bit pattern Argon2 writes. The slice
-        // borrows `self` mutably, so it can't outlive the mapping or alias it.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.map.as_mut_ptr().cast::<Block>(), self.blocks)
-        }
-    }
-}
-
-/// Hash `password` with `hasher`'s parameters into an output of
-/// `output_len` bytes, with the working memory in a [`WorkingMemory`].
-fn hash_off_heap(
-    hasher: &Argon2<'_>,
-    password: &[u8],
-    salt: &[u8],
-    output_len: usize,
-) -> Result<Output, TokenError> {
-    let failed = |error: &dyn std::fmt::Display| TokenError::HashFailed(error.to_string());
-    let mut memory = WorkingMemory::new(hasher.params().block_count()).map_err(|e| failed(&e))?;
-    let mut output = [0u8; Output::MAX_LENGTH];
-    let output = output
-        .get_mut(..output_len)
-        .ok_or_else(|| failed(&format!("Argon2 output length {output_len} is too long")))?;
-    hasher
-        .hash_password_into_with_memory(password, salt, output, memory.blocks())
-        .map_err(|e| failed(&e))?;
-    Output::new(output).map_err(|e| failed(&e))
+/// A plain `==` stops at the first differing byte, so its timing would tell
+/// an attacker how many leading bytes of the stored digest their guess
+/// matched. Learning a digest doesn't reveal the token (SHA-256 can't be run
+/// backwards), so this is defence in depth, but it costs nothing.
+fn digests_equal(candidate: &[u8; 32], stored: &[u8]) -> bool {
+    super::ca::constant_time_eq(candidate, stored)
 }
 
 /// Check that a token's role is sufficient for a required role.
@@ -417,8 +337,10 @@ pub fn find_valid_token<'a>(
     plaintext: &str,
     tokens: &'a [ApiToken],
 ) -> Result<(&'a ApiToken, MatchedSecret), TokenError> {
+    let candidate = digest(plaintext);
+    let now = SystemTime::now();
     for token in tokens {
-        match validate_token(plaintext, token) {
+        match validate_digest_at(&candidate, token, now) {
             Ok(matched) => return Ok((token, matched)),
             Err(TokenError::ValidationFailed) => continue,
             Err(error) => return Err(error),
@@ -493,15 +415,14 @@ fn unix_millis(at: SystemTime) -> u64 {
 }
 
 /// Length of the hex body of a well-formed token (`rbrg_` + 64 hex chars).
-const TOKEN_HEX_LEN: usize = 64;
+const TOKEN_HEX_LEN: usize = 2 * TOKEN_SECRET_BYTES;
 
 /// Cheap, non-secret shape check on a bearer before we hash it.
 ///
 /// Every token we mint is `rbrg_` followed by 64 lower-case hex characters
 /// (see [`create_token`]). A bearer that doesn't fit that shape can't match
-/// any stored hash, so we can reject it without running Argon2 even once.
-/// This is the short-circuit "index" for AUTH5: a burst of junk bearers is
-/// turned away by a string check, not by an Argon2 hash per stored token.
+/// any stored hash, so we can reject it without hashing it at all, and
+/// [`hash_secret`] uses the same check to refuse a weak secret.
 ///
 /// The check reads only the untrusted input's shape, never a secret, so it
 /// leaks nothing an attacker doesn't already control.
@@ -534,7 +455,6 @@ pub fn derive_service_token(ikm: &[u8; 32]) -> Result<String, TokenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 
     #[test]
     fn service_token_is_deterministic_for_the_same_ikm() {
@@ -582,68 +502,30 @@ mod tests {
         assert!(t2.plaintext.starts_with("rbrg_"));
     }
 
+    /// The SHA-256 digest of `bytes`, computed independently of the code
+    /// under test.
+    fn sha256(bytes: &[u8]) -> Vec<u8> {
+        ring::digest::digest(&ring::digest::SHA256, bytes)
+            .as_ref()
+            .to_vec()
+    }
+
     #[test]
-    fn argon2_hash_verify_round_trip() {
+    fn the_correct_token_validates_against_its_stored_hash() {
         let created = create_token("test", ApiRole::Deployer, TokenScope::default(), None).unwrap();
-        validate_token(&created.plaintext, &created.token).unwrap();
-    }
-
-    /// A stored token whose hash the `argon2` crate made itself, with
-    /// `hasher`'s parameters.
-    fn hashed_by_the_crate(hasher: &Argon2<'_>, secret: &str) -> ApiToken {
-        let salt = SaltString::generate(&mut OsRng);
-        let hash = hasher.hash_password(secret.as_bytes(), &salt).unwrap();
-        let mut token = create_token("crate", ApiRole::Admin, TokenScope::default(), None)
-            .unwrap()
-            .token;
-        token.token_hash = hash.to_string().into_bytes();
-        token
+        assert_eq!(
+            validate_token(&created.plaintext, &created.token).unwrap(),
+            MatchedSecret::Current
+        );
     }
 
     #[test]
-    fn a_hash_the_argon2_crate_made_verifies() {
-        let secret = format!("rbrg_{}", "a".repeat(64));
-        let stored = hashed_by_the_crate(&Argon2::default(), &secret);
-        validate_token(&secret, &stored).unwrap();
-        assert!(validate_token(&format!("rbrg_{}", "b".repeat(64)), &stored).is_err());
-    }
-
-    #[test]
-    fn a_minted_hash_verifies_with_the_argon2_crate() {
-        let created = create_token("t", ApiRole::Admin, TokenScope::default(), None).unwrap();
-        let hash = std::str::from_utf8(&created.token.token_hash).unwrap();
-        let parsed = PasswordHash::new(hash).unwrap();
-        assert_eq!(parsed.algorithm, argon2::Algorithm::Argon2id.ident());
-        Argon2::default()
-            .verify_password(created.plaintext.as_bytes(), &parsed)
-            .unwrap();
-    }
-
-    #[test]
-    fn a_hash_with_other_argon2_parameters_verifies_with_its_own() {
-        // The memory, passes, lanes, variant and version all come from the
-        // stored hash, not from our defaults.
-        let params = argon2::Params::new(2048, 3, 2, None).unwrap();
-        let hasher = Argon2::new(argon2::Algorithm::Argon2i, argon2::Version::V0x10, params);
-        let secret = format!("rbrg_{}", "c".repeat(64));
-        let stored = hashed_by_the_crate(&hasher, &secret);
-        validate_token(&secret, &stored).unwrap();
-        assert!(validate_token(&format!("rbrg_{}", "d".repeat(64)), &stored).is_err());
-    }
-
-    #[test]
-    fn a_stored_hash_that_is_not_argon2_never_matches() {
-        let secret = format!("rbrg_{}", "e".repeat(64));
-        let mut stored = hashed_by_the_crate(&Argon2::default(), &secret);
-        for junk in [
-            "",
-            "not a hash",
-            "$scrypt$ln=16,r=8,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaA",
-            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ",
-        ] {
-            stored.token_hash = junk.as_bytes().to_vec();
-            assert!(validate_token(&secret, &stored).is_err(), "{junk:?}");
-        }
+    fn a_token_is_stored_as_the_sha256_of_its_full_plaintext() {
+        let created = create_token("test", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        assert_eq!(
+            created.token.token_hash,
+            sha256(created.plaintext.as_bytes())
+        );
     }
 
     #[test]
@@ -651,6 +533,131 @@ mod tests {
         let created = create_token("test", ApiRole::Admin, TokenScope::default(), None).unwrap();
         let result = validate_token("rbrg_wrong_token_value", &created.token);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_well_shaped_but_wrong_token_fails_validation() {
+        let created = create_token("test", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let other = create_token("other", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        assert!(matches!(
+            validate_token(&other.plaintext, &created.token),
+            Err(TokenError::ValidationFailed)
+        ));
+    }
+
+    #[test]
+    fn a_token_of_the_wrong_length_fails_validation() {
+        let created = create_token("test", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let plaintext = &created.plaintext;
+        let truncated = &plaintext[..plaintext.len() - 1];
+        let extended = format!("{plaintext}0");
+        let doubled = format!("{plaintext}{}", &plaintext["rbrg_".len()..]);
+        for candidate in [truncated, extended.as_str(), doubled.as_str()] {
+            assert!(
+                matches!(
+                    validate_token(candidate, &created.token),
+                    Err(TokenError::ValidationFailed)
+                ),
+                "{candidate} validated"
+            );
+        }
+    }
+
+    #[test]
+    fn a_revoked_token_no_longer_validates() {
+        let kept = create_token("kept", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let revoked =
+            create_token("revoked", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let mut store = vec![kept.token.clone(), revoked.token.clone()];
+        assert!(find_valid_token(&revoked.plaintext, &store).is_ok());
+
+        // Revocation removes the token from the store (RevokeApiToken).
+        store.retain(|token| token.name != "revoked");
+        assert!(matches!(
+            find_valid_token(&revoked.plaintext, &store),
+            Err(TokenError::ValidationFailed)
+        ));
+        assert!(find_valid_token(&kept.plaintext, &store).is_ok());
+    }
+
+    #[test]
+    fn a_secret_without_256_random_bits_is_refused_for_storage() {
+        // A fast hash is only safe for a long random secret: anything
+        // shorter could be brute-forced from a stolen hash.
+        for weak in [
+            "",
+            "rbrg_",
+            "rbrg_abc",
+            "hunter2",
+            &format!("rbrg_{}", "a".repeat(63)),
+            &format!("rbrg_{}", "z".repeat(64)),
+            &"a".repeat(64),
+        ] {
+            assert!(
+                matches!(hash_secret(weak), Err(TokenError::WeakSecret)),
+                "{weak:?} was accepted"
+            );
+        }
+        let strong = format!("rbrg_{}", "a".repeat(64));
+        assert_eq!(hash_secret(&strong).unwrap(), sha256(strong.as_bytes()));
+    }
+
+    #[test]
+    fn a_token_secret_carries_at_least_256_random_bits() {
+        // `TOKEN_SECRET_BYTES >= 32` is asserted at compile time; this checks
+        // that minted tokens actually carry that many bytes.
+        let created = create_token("t", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        assert_eq!(
+            created.plaintext.len(),
+            "rbrg_".len() + 2 * TOKEN_SECRET_BYTES
+        );
+    }
+
+    #[test]
+    fn validating_a_token_costs_microseconds_not_a_password_hash() {
+        // Argon2id took tens of milliseconds per stored token, so a thousand
+        // checks against ten tokens took minutes. SHA-256 takes well under a
+        // second even in a debug build.
+        let created: Vec<CreatedToken> = (0..10)
+            .map(|i| {
+                create_token(
+                    &format!("t{i}"),
+                    ApiRole::ReadOnly,
+                    TokenScope::default(),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let store: Vec<ApiToken> = created.iter().map(|c| c.token.clone()).collect();
+        let last = &created[9].plaintext;
+        let start = std::time::Instant::now();
+        for _ in 0..1_000 {
+            find_valid_token(last, &store).unwrap();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "1000 verifications took {:?}",
+            start.elapsed()
+        );
+    }
+
+    proptest::proptest! {
+        /// Changing any one character of a real token, in any position,
+        /// never yields a token that validates.
+        #[test]
+        fn no_single_character_change_to_a_token_validates(
+            position in 0usize..69,
+            replacement in proptest::sample::select(b"0123456789abcdefABCDEF_xr".to_vec()),
+        ) {
+            let created =
+                create_token("t", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+            let mut bytes = created.plaintext.clone().into_bytes();
+            proptest::prop_assume!(bytes[position] != replacement);
+            bytes[position] = replacement;
+            let candidate = String::from_utf8(bytes).unwrap();
+            proptest::prop_assert!(validate_token(&candidate, &created.token).is_err());
+        }
     }
 
     #[test]
@@ -727,7 +734,6 @@ mod tests {
         ApiToken {
             name: name.to_string(),
             token_hash: name.as_bytes().to_vec(),
-            token_salt: Vec::new(),
             role,
             scope: TokenScope::default(),
             expires_at: expires_ms.map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms)),
@@ -845,6 +851,41 @@ mod tests {
             validate_token_at(&created.plaintext, &token, after),
             Err(TokenError::Rotated)
         ));
+    }
+
+    #[test]
+    fn rotation_stores_both_secrets_as_sha256_and_keeps_the_grace_period() {
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let now = SystemTime::now();
+        let rotation = rotate_token(&created.token, now, HOUR).unwrap();
+        assert_eq!(
+            rotation.rotation.token_hash,
+            sha256(rotation.plaintext.as_bytes())
+        );
+        let mut token = created.token.clone();
+        apply_rotation(&mut token, &rotation.rotation);
+        let previous = token.previous_secret.clone().unwrap();
+        assert_eq!(previous.token_hash, sha256(created.plaintext.as_bytes()));
+
+        // Inside the grace both secrets work, each as itself; after it only
+        // the new one does.
+        let inside = now + HOUR - Duration::from_secs(1);
+        assert_eq!(
+            validate_token_at(&created.plaintext, &token, inside).unwrap(),
+            MatchedSecret::Previous
+        );
+        assert_eq!(
+            validate_token_at(&rotation.plaintext, &token, inside).unwrap(),
+            MatchedSecret::Current
+        );
+        assert!(matches!(
+            validate_token_at(&created.plaintext, &token, now + HOUR),
+            Err(TokenError::Rotated)
+        ));
+        assert_eq!(
+            validate_token_at(&rotation.plaintext, &token, now + HOUR).unwrap(),
+            MatchedSecret::Current
+        );
     }
 
     #[test]

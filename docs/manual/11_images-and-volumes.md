@@ -47,6 +47,13 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+Once a node has pulled and unpacked a digest-pinned image, it doesn't ask any
+registry about it again. Bun keeps the index, manifest and config it verified
+and checks each against its digest before reusing it, so a burst of
+containers or job executors from that image can't trip a registry's rate
+limit. A tag reference, or a pin whose local copy is missing or no longer
+matches its digest, goes to the registry as usual.
+
 ## Tags bind to digests at apply
 
 A tag moves. `nginx:1.27` today needn't be `nginx:1.27` next week, so the
@@ -82,9 +89,18 @@ mirror, `mirrors` now covers every image you apply.
   a bound image isn't drift; the tag re-resolves when the app changes in Git.
 
 Binding happens only where the leader's own runtime pulls images (runc, or
-Apple containers on a Mac). Under the process runtime an app's `image` is a
-placeholder nobody pulls, so it's stored as written. A cluster runs one
-runtime kind, so the leader's speaks for every node.
+Apple containers on a Mac). A cluster runs one runtime kind, so the leader's
+speaks for every node.
+
+An app that names an `image` needs a container runtime. The process runtime
+(`bun --runtime process`) runs host workloads only, `exec` and `script` apps,
+so it refuses an image app: `relish apply`, `relish status` and `relish wtf`
+say it `needs a container runtime to run image ...`. It doesn't run the app's
+`command` on the host instead, or start a placeholder. In a cluster, the
+scheduler places an image app only on nodes that run containers, and reports
+it unschedulable (`no ready node has a container runtime to run its image`)
+when none does. An init container that names its own image needs one too;
+one that names none runs where its app does.
 
 ## Storage ceiling
 
@@ -101,6 +117,91 @@ additional disk capacity. This cap measures payload bytes, not filesystem
 block allocation. Reusing an existing verified blob does not charge its bytes
 twice, but uploading another physical copy needs room for that temporary copy
 until completion.
+
+## Image durability and cleanup
+
+Pickle keeps each image's layers on `[images] redundancy` nodes (2 by
+default). A push lands on the node you pushed to, and the council leader's
+heal loop copies it to more nodes, rarest images first, about once a minute.
+Until that first copy is made the image lives on one node, so there's a short
+unprotected window after every push. On a single node there's nowhere to copy
+to, and `redundancy` greater than one can't be met.
+
+Heal counts only live copies: a node gossip reports alive or suspect. When a
+node dies, every image it held drops a copy, and the next heal pass makes a new
+one from a node that still holds it. Each chosen node copies the layers
+straight from a holder; the leader takes a copy itself only when no other node
+can. `relish decommission-node` also removes the node from every image's holder
+list for good.
+
+```toml
+[images]
+redundancy = 2          # copies of every layer, the pushing node's included
+gc_retain_days = 7      # how long an untagged image is kept
+gc_interval_hours = 1   # how often expiry and GC run
+```
+
+### Deleting a tag
+
+Pushing a tag again moves it to the new image and leaves the old one untagged.
+You can also delete a tag yourself:
+
+```sh
+relish images delete team/web:v1     # or: relish image delete team/web:v1
+```
+
+This is the OCI `DELETE /v2/<name>/manifests/<tag>`, so any client that speaks
+it works too, and it needs the same repository write permission as a push.
+Deleting by digest isn't supported (`405 UNSUPPORTED`): an image leaves by
+losing its tags.
+
+An untagged image stays pullable by digest for `gc_retain_days`, counted from
+the moment it lost its last tag. Then it expires and its layers are garbage
+collected on every node. An image that an app or job pins
+(`web:v1@sha256:…`, which is how an apply stores it) never expires, however
+long ago its tag moved. Expiry is what keeps disk use bounded: without it,
+a CI job pushing `:latest` a few times a day would fill `max_storage` until
+every push and pull got a 413.
+
+### Lost images
+
+An image is *lost* when some layer it needs has no live copy left, for
+example when the only node that held it died before heal copied it. Pickle
+can't rebuild it. `relish status` prints a line naming each lost image,
+`relish wtf` reports it as an error, and a deploy that needs it fails with
+`image … is lost: … re-push it`. Push it again, or bring the node that held it
+back.
+
+### The cluster registry needs mTLS
+
+Everything above, from pushes and heal to expiry and cleanup, goes through the
+council leader. Nodes send their registry proposals and queries to the leader,
+and the leader takes them only from a node that shows its cluster certificate.
+That's how it knows which node is asking, so one node can't claim another's
+copies. There's no token-only way in.
+
+A plaintext cluster (`[security] require_mtls = false`, which only
+`relish init --development-plaintext` or a hand-written config sets up) has no
+certificates, so it has no cluster registry.
+Pushes, `relish build`, `relish images`, and pulls of images Pickle would
+resolve (Docker Hub names such as `web:v1` or `nginx:1.27`) fail with:
+
+```text
+the registry needs mTLS: its leader accepts replication and forwarded queries
+only from nodes with a cluster certificate, and this cluster runs plaintext
+transports; start the cluster with TLS (`relish init`, then `relish join` on
+each node)
+```
+
+Each node logs it once at start-up and once from its cleanup loop, not every
+second. `relish status` prints `registry: needs mTLS`, and `relish wtf` warns
+`registry-needs-mtls`, naming the nodes. An image with an explicit registry
+host (`ghcr.io/org/app:v1`) still pulls straight from that registry. A short
+name never falls back to a direct Docker Hub pull: Pickle is the only way to
+Docker Hub, so short-name images need mTLS. To use Pickle, start the cluster
+with TLS, which is the default: `relish init`, `relish setup --quickstart` and
+`relish dev create` all do. A standalone node (no `--cluster`) keeps its own
+loopback registry and needs none of this.
 
 ## Building images
 
@@ -155,22 +256,32 @@ from outside the cluster, and that includes a build step trying to reach the
 node's API or registry. Add `--network=none` to `RUN` steps that don't need
 the network.
 
-## Pushing with docker or crane
+## Pushing with docker, podman, skopeo or crane
 
-Pickle speaks the standard registry API, so `docker push`, `crane` and other
-OCI clients work against a cluster whose nodes have mTLS identities (every
-`relish init` cluster and the quickstart). Log in with an API token of role
-`deployer` or above as the password; the username is ignored:
+Pickle speaks the standard registry API, so stock OCI clients push to and
+pull from a cluster whose nodes have mTLS identities (every `relish init`
+cluster and the quickstart). Log in with an API token of role `deployer` or
+above as the password; the username is ignored. A `read-only` token pulls.
 
 ```sh
 TOKEN="$(relish token create --name laptop-push --role deployer)"
-crane auth login NODE:5050 -u push -p "$TOKEN"
-crane push app.tar NODE:5050/api:v1
+docker login NODE:5050 -u push --password-stdin <<<"$TOKEN"
+docker push NODE:5050/api:v1
+docker pull NODE:5050/api:v1
 ```
 
-`docker login NODE:5050 -u push --password-stdin <<<"$TOKEN"` then
-`docker push NODE:5050/api:v1` works the same way. Apps refer to the image
-by its bare name, `api:v1`.
+podman takes the same `login`, `push` and `pull`. skopeo takes the token as
+`--creds push:"$TOKEN"` (or `--src-creds` and `--dest-creds` on a `copy`),
+and crane as `crane auth login NODE:5050 -u push -p "$TOKEN"`. Apps refer to
+the image by its bare name, `api:v1`.
+
+CI runs all four against a Pickle TLS listener:
+docker, podman and skopeo as the Ubuntu runner image ships them, and a pinned
+crane. Each one logs in with a token, verifies the cluster CA, pushes a
+two-layer image, pulls every layer back and checks the digests. Each is also
+refused with a wrong token, with another cluster's CA, and when a scoped token
+pushes outside its namespace. oras and buildah speak the same API but nothing
+tests them.
 
 A token made with `--apps` or `--namespaces` is held to repositories named
 `<namespace>/<app>`, for pushes and pulls alike: the first path segment is the
@@ -183,20 +294,42 @@ token pulls only its own namespaces' images (a loopback registry serves reads
 to anyone on the node, token or not), and `relish images` lists only those.
 Unscoped tokens push and pull anything, as before.
 
+### Trusting the cluster CA
+
 The registry serves the node's certificate, which names the node rather than
-its address, so `NODE` has to be the node's name (`relish status` lists them)
-and your machine has to resolve it and trust the cluster's root CA. For the
-quickstart: add `127.0.0.1 NODE-1-NAME` to `/etc/hosts`, use port `15050`, and
-trust `~/.reliaburger/clusters/NAME/security/identity/root-ca.crt` (for docker,
-copy it to `/etc/docker/certs.d/NODE-1-NAME:15050/ca.crt`; on macOS, add it to
-the keychain for crane).
+its address, so `NODE` has to be the node's name (`relish status` lists them),
+your machine has to resolve it, and the client has to trust the cluster's root
+CA: `~/.reliaburger/clusters/NAME/security/identity/root-ca.crt`. Put it where
+your client looks, under the registry's `host:port`:
+
+| Client | Where the CA goes |
+|---|---|
+| docker on Linux | `/etc/docker/certs.d/NODE:5050/ca.crt` |
+| Docker Desktop (macOS, Windows) | `~/.docker/certs.d/NODE:5050/ca.crt`, then restart Docker Desktop |
+| podman on Linux | `/etc/containers/certs.d/NODE:5050/ca.crt`, or `~/.config/containers/certs.d/NODE:5050/ca.crt` for rootless podman |
+| podman machine (macOS, Windows) | inside the VM: `podman machine ssh`, then the Linux path |
+| skopeo | any directory holding `ca.crt`, passed as `--cert-dir` (`--src-cert-dir` and `--dest-cert-dir` on a `copy`) |
+| crane | `SSL_CERT_FILE=root-ca.crt` on Linux; the system keychain on macOS, where Go ignores `SSL_CERT_FILE` |
+
+Only the Linux rows are tested. Docker Desktop and podman machine run their
+engine in a VM, so `NODE` must also resolve inside that VM, and to an address
+the VM can reach.
+
+Don't point `NODE` at `127.0.0.1` for docker on Linux. docker treats any
+registry on `127.0.0.0/8` as insecure: it skips the certificate check and
+falls back to plaintext, which Pickle refuses for a token. Use an address of
+the machine instead. For the quickstart, add `<this machine's LAN address>
+NODE-1-NAME` to `/etc/hosts` and use port `15050`.
 
 Pickle only takes these credentials over TLS. A plaintext registry, which is
 what a node without an identity serves, refuses them even with a good token,
 because the password is your API token. There, use `relish build`, or push
 anonymously to a standalone node's loopback registry before its first API
-token exists. Pickle has no Docker token service, and it doesn't support
-deleting images through the registry API.
+token exists. On a plaintext cluster neither works (see
+[The cluster registry needs mTLS](#the-cluster-registry-needs-mtls)). Pickle
+has no Docker token service. It removes images by tag
+(see [Deleting a tag](#deleting-a-tag)); it doesn't mount layers across
+repositories, so a client offering a mount gets an ordinary upload instead.
 
 ## Multi-platform images
 
@@ -256,6 +389,14 @@ starts elsewhere on a new, empty volume (restore a snapshot into it if you have
 one). A bigger `cpu` or `memory` request doesn't move it, even when its node is
 now short of room. A host-path volume is never chowned: make it readable (or writable) by
 the container's mapped user yourself.
+
+`size` is a hard limit. A node running as root enforces it with a Btrfs quota
+when the volumes directory is on Btrfs, or a loop-mounted ext4 file elsewhere.
+A node that can do neither (rootless, or macOS) refuses a sized volume and
+fails the deploy, rather than run it unbounded; leave `size` out there. The
+size is fixed when the volume is created: a deploy that changes it on an
+existing volume is refused, with a message naming the volume, because
+resizing isn't supported yet.
 
 ### Host paths
 
@@ -339,6 +480,16 @@ right copy into place and delete the `<volume>.restore.json` journal.
 `relish snapshot list` reports an error, rather than a shorter list, when
 snapshot metadata can't be read.
 
+Taking a snapshot is two steps: Btrfs makes the read-only copy, then Bun
+writes its metadata. A power cut between the two used to leave a copy nobody
+could see, list, upload or prune, holding disk forever. Now Bun writes a
+`<name>.pending` file before the copy and removes it after the metadata. When
+it starts, and at the start of every scheduled sweep, it deletes any copy that
+still has a `.pending` file and no metadata: nothing ever reported it as
+taken. A copy with neither (made by hand, or left by Reliaburger 0.2.0 or
+earlier) isn't Bun's to delete, so the sweep logs it each time instead. Look
+at it, then remove it with `btrfs subvolume delete` if nothing needs it.
+
 `--volume` must be one of the app's own managed volumes, named by its
 container mount path. A custom `--name` is 1 to 128 characters from
 `A-Z a-z 0-9 . _ -` and can't start with a dot. Anything else is refused with
@@ -361,7 +512,10 @@ upload_timeout_secs = 3600            # deadline for archiving, then for uploadi
 ```
 
 Object-storage credentials come from each backend's standard environment
-variables.
+variables in Bun's environment: `AWS_*` (including `AWS_REGION` and
+`AWS_ENDPOINT`) for S3, `GOOGLE_SERVICE_ACCOUNT` or
+`GOOGLE_APPLICATION_CREDENTIALS` for GCS (see "Backing up the council" in
+`operations` for the full list).
 
 Each sweep takes new snapshots, uploads every snapshot the destination hasn't
 confirmed, then prunes past `retain`. A snapshot that hasn't reached the

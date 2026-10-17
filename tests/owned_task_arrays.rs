@@ -8,6 +8,8 @@ use reliaburger::grill::{ContainerState, Grill, ImageStore};
 use std::path::Path;
 use std::time::Duration;
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
 
@@ -328,6 +330,166 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
         .filter(|launch| launch.instance_id.0.contains("__executor-"))
         .map(|launch| launch.instance_id)
         .collect::<Vec<_>>();
+    for id in &executors {
+        assert_retired(&runtime, id).await;
+    }
+}
+
+/// A loopback stand-in for a registry that counts every connection. It
+/// forwards to `upstream` until `throttled` is set, then answers each one
+/// `429 Too Many Requests`, as an anonymous registry does under a burst.
+async fn counting_registry_proxy(
+    upstream: String,
+    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    throttled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            connections.fetch_add(1, Ordering::SeqCst);
+            let upstream = upstream.clone();
+            let throttled = throttled.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                if throttled {
+                    let mut request = [0u8; 4096];
+                    let _ = client.read(&mut request).await;
+                    let body =
+                        r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"rate limited"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = client.write_all(response.as_bytes()).await;
+                    return;
+                }
+                if let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    address
+}
+
+/// Cold shared-runc executors for a digest-pinned image that is already
+/// unpacked read nothing from the registry: not in the pool's pull, not in
+/// runc's create. So a burst of them can't trip a rate limit (#790).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root, runc, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
+    use reliaburger::bun::execution_budget::ExecutionBudget;
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
+    use reliaburger::bun::task_runtime::OwnedRunner;
+    use reliaburger::grill::ImageMirrors;
+    use reliaburger::grill::image::ImageReference;
+    use reliaburger::meat::Resources;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+    const BURST: usize = 4;
+    assert!(nix::unistd::geteuid().is_root());
+    let mirror_env = reliaburger::testkit::pinned_images::TEST_IMAGE_MIRROR_ENV;
+    let mirror = std::env::var(mirror_env).unwrap_or_else(|_| {
+        panic!("{mirror_env} is unset: run with make test-linux, which serves the pinned images")
+    });
+    let connections = Arc::new(AtomicUsize::new(0));
+    let throttled = Arc::new(AtomicBool::new(false));
+    let proxy =
+        counting_registry_proxy(mirror, Arc::clone(&connections), Arc::clone(&throttled)).await;
+    let root = tempfile::Builder::new()
+        .prefix("rb-790-warm-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    // Declared before the runtime, so it drops after it: a failed assertion
+    // still releases the executors' namespaces for the next runc test.
+    let _residue = ExecutorResidue { root: root.clone() };
+    let node = root.join("node-0");
+    std::fs::create_dir_all(&node).unwrap();
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let registry = ImageReference::parse(image).unwrap().registry;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(ImageMirrors::new([(registry, proxy)].into()).unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    assert!(
+        connections.load(Ordering::SeqCst) > 0,
+        "the warm-up pull bypassed the counting registry"
+    );
+    // From here the registry refuses everything, and every request counts.
+    throttled.store(true, Ordering::SeqCst);
+    connections.store(0, Ordering::SeqCst);
+    let runtime = RuncGrill::new(
+        root.join("bundles"),
+        images,
+        false,
+        root.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let budget = ExecutionBudget::new(Resources::new(1000, 512 << 20, 0));
+    // A data directory, so the residue guard can name this runner's executors.
+    let runner = OwnedRunner::for_data_dir(runtime.clone(), &node)
+        .unwrap()
+        .with_budget(budget.clone());
+    let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+        "image='{image}'\nnamespace='rbtest-warm-pin'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+    ))
+    .unwrap();
+    let tasks: Vec<TaskInvocation> = (0..BURST as u32)
+        .map(|index| TaskInvocation {
+            template: Some(Box::new(template.clone())),
+            index,
+            attempt: 1,
+            program: "/unused".into(),
+            // Overlapping commands keep every slot busy, so each one
+            // cold-starts its own executor.
+            args: vec!["/bin/sh".into(), "-c".into(), "sleep 1; printf ran".into()],
+            env: vec![],
+            run: None,
+        })
+        .collect();
+    let cancel = CancellationToken::new();
+    let attempts = futures_util::future::join_all(
+        tasks
+            .iter()
+            .map(|task| runner.run(task, Duration::from_secs(60), &cancel)),
+    )
+    .await;
+    for attempt in &attempts {
+        assert_eq!(
+            attempt.outcome,
+            AttemptOutcome::Exited { code: 0 },
+            "{attempt:?}"
+        );
+        assert_eq!(attempt.output.head, b"ran", "{attempt:?}");
+    }
+    let executors = runtime
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .filter(|launch| launch.instance_id.0.contains("__executor-"))
+        .map(|launch| launch.instance_id)
+        .collect::<Vec<_>>();
+    assert_eq!(executors.len(), BURST, "every slot cold-started");
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "warm pinned cold starts asked the registry"
+    );
+    // Idle executors retire and hand back everything they held.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while budget.available() != budget.capacity() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("idle executors never retired");
     for id in &executors {
         assert_retired(&runtime, id).await;
     }
@@ -1574,7 +1736,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
     };
     let progress = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let progress = node.sync(&request).await.arrays.remove(0);
+            let progress = node.sync(&request).await.unwrap().arrays.remove(0);
             if !progress.finished.is_empty() {
                 break progress;
             }
@@ -1602,7 +1764,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
     })
     .await;
     assert_eq!(
-        node.sync(&request).await.arrays[0].slots,
+        node.sync(&request).await.unwrap().arrays[0].slots,
         0,
         "warm capacity must yield to a queued owner"
     );
@@ -2522,7 +2684,12 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
     // Wait until both executors are busy and the other callers are queued.
     let progress = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let progress = node.sync(&assignment(false)).await.arrays.remove(0);
+            let progress = node
+                .sync(&assignment(false))
+                .await
+                .unwrap()
+                .arrays
+                .remove(0);
             if progress.counters.active_commands == Some(2) && progress.counters.running > 2 {
                 break progress;
             }
@@ -2538,7 +2705,7 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
         progress.counters.running
     );
     tokio::time::timeout(Duration::from_secs(60), async {
-        while node.sync(&assignment(true)).await.arrays[0]
+        while node.sync(&assignment(true)).await.unwrap().arrays[0]
             .finished
             .is_empty()
         {
@@ -2873,7 +3040,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     let mut last = None;
     let found = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            last = Some(node.sync(&request(false)).await);
+            last = Some(node.sync(&request(false)).await.unwrap());
             let targets = telemetry.usage_targets();
             if targets.get(&labels).is_some_and(|(_, targets)| {
                 targets
@@ -2897,7 +3064,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     collector.refresh();
     telemetry.sample_usage(&collector, &mut cgroups, "node-a");
     tokio::time::sleep(Duration::from_secs(1)).await;
-    node.sync(&request(false)).await;
+    node.sync(&request(false)).await.unwrap();
     collector.refresh();
     let samples = telemetry.sample_usage(&collector, &mut cgroups, "node-a");
     let value = |name: &str| {
@@ -2914,7 +3081,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
     assert!(usage.running >= 1, "{usage:?}");
 
     tokio::time::timeout(Duration::from_secs(60), async {
-        while node.sync(&request(true)).await.arrays[0]
+        while node.sync(&request(true)).await.unwrap().arrays[0]
             .finished
             .is_empty()
         {
@@ -2927,6 +3094,8 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
 
 /// Each task fails its first attempt when its index ends in 07, so the
 /// accepted retry count is exact and every retry has a known cause.
+/// Ports each leader-loss node takes: gossip, then Raft, reporting and API.
+const LEADER_LOSS_PORTS_PER_NODE: u16 = 4;
 const LEADER_LOSS_SCRIPT: &str = "sleep 0.05; [ \"$RELIABURGER_TASK_ATTEMPT\" -gt 1 ] || [ $((RELIABURGER_TASK_INDEX % 100)) -ne 7 ]";
 const LEADER_LOSS_TASKS: u64 = 3000;
 
@@ -3079,7 +3248,7 @@ fn remove_cgroup_tree(path: &std::path::Path) {
 /// handover while its executor keeps running. Those commands may finish,
 /// but no report of theirs can ever be accepted: the new leader must take
 /// back exactly the chunks it held and count every task once.
-async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
+async fn leader_loss_mid_array(template: serde_json::Value) {
     use reliaburger::bun::task_array_leader::TaskArrayService;
     use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
     use reliaburger::bun::task_ledger::GroupCommit;
@@ -3092,9 +3261,9 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
     use tokio_util::sync::CancellationToken;
     assert!(nix::unistd::geteuid().is_root());
     if template["runtime"] != "process" {
-        // Every cold executor reads the image's manifest. Straight from the
-        // public registry, dozens of them trip its anonymous rate limit and
-        // fail tasks that leader loss never touched (#786).
+        // Cold executors of the warmed pin read nothing from the registry
+        // (#790), but the warm-up pull does, and the public registry's
+        // anonymous rate limit must not decide whether this test runs (#786).
         let mirror = reliaburger::testkit::pinned_images::TEST_IMAGE_MIRROR_ENV;
         assert!(
             std::env::var_os(mirror).is_some(),
@@ -3132,6 +3301,11 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         template["image"] = json!(image);
     }
 
+    // Leased for the whole test, so neither another test on the host nor
+    // another worktree's run binds them (#852). Node `n` takes four ports
+    // from `base + 4n`: gossip, Raft, reporting and API.
+    let ports = bun_process::reserve_port_block_lease(3 * LEADER_LOSS_PORTS_PER_NODE);
+    let gossip_port = |index: usize| ports.base + index as u16 * LEADER_LOSS_PORTS_PER_NODE;
     let shutdown = CancellationToken::new();
     let mut nodes = Vec::new();
     let mut services = Vec::new();
@@ -3163,16 +3337,17 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         nodes.push(
             cluster_support::start_wired_node(cluster_support::WiredNodeOptions {
                 name: format!("loss{index}"),
-                gossip_port: base_port + index as u16 * 10,
+                gossip_port: gossip_port(index),
                 seeds: if index == 0 {
                     vec![]
                 } else {
-                    vec![cluster_support::local(base_port)]
+                    vec![cluster_support::local(gossip_port(0))]
                 },
                 shutdown: shutdown.child_token(),
                 data_dir_prefix: "rb-leader-loss",
-                data_root: None,
+                data_root: Some(root.clone()),
                 stale_report_timeout_secs: 10,
+                stale_node_grace: None,
                 metrics_rollup: None,
                 scheduler: None,
                 lease_reaper: false,
@@ -3184,6 +3359,7 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
                 keep_data_dir: false,
                 task_arrays: Some(service),
                 task_arrays_on_agent_budget: None,
+                process_only: false,
             })
             .await,
         );
@@ -3274,6 +3450,11 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // A chunk the leader finished and had accepted before the kill is a
+    // legitimate acceptance; only one accepted after the takeover isn't.
+    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    let accepted_before_kill =
+        cluster_support::chunks_accepted_from(&nodes[leader], batch_id, &lost).await;
     nodes[leader].shutdown.cancel();
 
     let until = deadline(30);
@@ -3290,7 +3471,22 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         assert!(tokio::time::Instant::now() < until, "no new leader");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    // Once the new leader applies an entry of its own term, everything the
+    // old leader wrote while it led is applied here too.
+    let until = deadline(30);
+    while !cluster_support::applied_own_term(&nodes[new_leader]) {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the new leader never applied its own term"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let accepted_under_old_leader =
+        cluster_support::chunks_accepted_from(&nodes[new_leader], batch_id, &lost).await;
+    assert!(
+        accepted_before_kill.is_subset(&accepted_under_old_leader),
+        "chunks {accepted_before_kill:?} accepted from {lost} at the kill are missing at takeover: {accepted_under_old_leader:?}"
+    );
     let held_at_loss = nodes[new_leader]
         .council
         .desired_state()
@@ -3365,11 +3561,20 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
             .expect("every chunk has one accepted grant");
         let attempt = grant.attempt;
         // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
-        assert_ne!(
-            grant.owner,
-            Some(lost.clone()),
-            "chunk {chunk} was accepted from the lost leader"
-        );
+        // The lost leader's own chunks count only if they were accepted in
+        // its term: its executor keeps running, and no report it finishes
+        // after the takeover may count.
+        if grant.owner.as_ref() == Some(&lost) {
+            assert!(
+                accepted_under_old_leader.contains(&chunk),
+                "chunk {chunk} was accepted from the lost leader after the takeover \
+                 (accepted at kill {accepted_before_kill:?}, at takeover {accepted_under_old_leader:?})"
+            );
+            assert_eq!(
+                attempt, 1,
+                "chunk {chunk} was accepted from the lost leader at a later attempt"
+            );
+        }
         if attempt > 1 {
             replayed += 1;
             assert!(
@@ -3380,8 +3585,10 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
     }
     assert!(replayed <= held_at_loss.len());
     eprintln!(
-        "leader loss with {}: {} chunks held at loss, {replayed} replayed",
+        "leader loss with {}: {} chunks accepted from it at the kill, {} by the takeover, {} held at loss, {replayed} replayed",
         template["runtime"],
+        accepted_before_kill.len(),
+        accepted_under_old_leader.len(),
         held_at_loss.len()
     );
     // Every executor must retire and be forgotten while its node still
@@ -3442,22 +3649,20 @@ async fn leader_loss_mid_array(template: serde_json::Value, base_port: u16) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     drop(residue);
-    std::fs::remove_dir_all(root).unwrap();
+    // The nodes' data lives here too, volumes and all.
+    cluster_support::clear_fixture_dir(&root).unwrap();
 }
 
 /// The leader loses its control plane while shared-runc chunks run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires root, runc, cgroup v2 and the pinned test image; run with make test-linux"]
 async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors() {
-    leader_loss_mid_array(
-        serde_json::json!({
-            "runtime": "shared-runc",
-            "command": ["/bin/sh", "-c", LEADER_LOSS_SCRIPT],
-            "cpu": "100m",
-            "memory": "32Mi",
-        }),
-        24510,
-    )
+    leader_loss_mid_array(serde_json::json!({
+        "runtime": "shared-runc",
+        "command": ["/bin/sh", "-c", LEADER_LOSS_SCRIPT],
+        "cpu": "100m",
+        "memory": "32Mi",
+    }))
     .await;
 }
 
@@ -3465,15 +3670,12 @@ async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_exe
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires root, runc, cgroup v2 and the pinned test image; run with make test-linux"]
 async fn leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors() {
-    leader_loss_mid_array(
-        serde_json::json!({
-            "runtime": "process",
-            "exec": "/bin/sh",
-            "command": ["-c", LEADER_LOSS_SCRIPT],
-            "cpu": "100m",
-            "memory": "32Mi",
-        }),
-        24610,
-    )
+    leader_loss_mid_array(serde_json::json!({
+        "runtime": "process",
+        "exec": "/bin/sh",
+        "command": ["-c", LEADER_LOSS_SCRIPT],
+        "cpu": "100m",
+        "memory": "32Mi",
+    }))
     .await;
 }

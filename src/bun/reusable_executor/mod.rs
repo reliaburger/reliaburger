@@ -148,6 +148,20 @@ impl ExecutorKey {
         let encoded = serde_json::to_vec(&compatible)?;
         Ok(Self(Sha256::digest(encoded).into()))
     }
+
+    /// This key for the tasks of one job. An executor's task cgroup answers
+    /// to one job's run identity, which another namespace's `allow_from` may
+    /// name (#737), so jobs with the same template never share an executor.
+    pub(crate) fn for_job(self, job: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        let Some(job) = job else {
+            return self;
+        };
+        let mut digest = Sha256::new();
+        digest.update(self.0);
+        digest.update(job.as_bytes());
+        Self(digest.finalize().into())
+    }
 }
 impl ExecutorProfile {
     pub(crate) fn new(template: &JobSpec) -> Result<Self, ExecutorError> {
@@ -333,6 +347,18 @@ mod tests {
         assert_ne!(ExecutorKey::new(&first).unwrap(), key);
         first.image = Some("unexpected-image".into());
         assert!(ExecutorKey::new(&first).is_err());
+    }
+    #[test]
+    fn tasks_of_different_jobs_never_share_an_executor() {
+        // An executor's task cgroup carries one job's source identity, which
+        // another app's `allow_from` may name, so two jobs with the same
+        // template still get executors of their own.
+        let key = ExecutorKey::new(&template()).unwrap();
+        let report = key.for_job(Some("report"));
+        assert_eq!(report, key.for_job(Some("report")));
+        assert_ne!(report, key.for_job(Some("render")));
+        assert_ne!(report, key.for_job(None));
+        assert_eq!(key.for_job(None), key.for_job(None));
     }
     #[test]
     fn compatible_commands_share_a_slot_but_trust_and_profiles_do_not() {

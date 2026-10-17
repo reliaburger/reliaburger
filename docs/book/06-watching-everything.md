@@ -1285,7 +1285,9 @@ Upstream had fixed it in Parquet 60, but DataFusion 55 still needs 59. So we for
 parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
 ```
 
-`[patch.crates-io]` replaces a crates.io package everywhere in the build, so DataFusion picks up the fixed decoder too. We patch all fifteen arrow-rs crates to the same revision: patching only `parquet` would build a second copy of the Arrow crates, and Rust treats a type from one copy as unrelated to the "same" type from the other. The block goes once DataFusion moves to a fixed Parquet. The lesson: a test only proves something on the platform where it ran.
+`[patch.crates-io]` replaces a crates.io package everywhere in the build, so DataFusion picks up the fixed decoder too. We patch all fifteen arrow-rs crates to the same revision: patching only `parquet` would build a second copy of the Arrow crates, and Rust treats a type from one copy as unrelated to the "same" type from the other.
+
+A fork is a debt: every arrow-rs fix after 59.3.0 passes you by until you redo the patch. So we also asked upstream to backport the fix to the 59 line (apache/arrow-rs#11186), and they released Parquet 59.3.1 with it. In 0.2.1 we deleted the whole `[patch.crates-io]` block, and `Cargo.lock` now takes every arrow-rs crate from crates.io at 59.3.1 (#975). The regression tests didn't change, and they still run on Linux in CI, where the abort happened. The lesson: a test only proves something on the platform where it ran.
 
 ### Server-rendered HTML with meta refresh beats React
 

@@ -55,6 +55,7 @@ impl TestScenario {
                         pid: Some(1000 + app_index as u32 * 2 + replica),
                         runtime_unknown: false,
                         status_age_ms: None,
+                        reason: None,
                     },
                 });
             }
@@ -97,7 +98,7 @@ impl TestScenario {
                     name: "migrate".into(),
                     namespace: "default".into(),
                     instance_id: "migrate-0".into(),
-                    image: "proc-grill:image-ignored".into(),
+                    image: "app:v1".into(),
                     state: "stopped".into(),
                     restart_count: 0,
                     age_seconds: 60,

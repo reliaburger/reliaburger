@@ -61,6 +61,9 @@ pub struct WorkloadInstance {
     /// Path to the host directory where identity files are written.
     /// Bind-mounted into the container at `/run/reliaburger/identity/`.
     pub identity_mount: Option<std::path::PathBuf>,
+    /// Why the runtime refused to launch this instance (#881), shown by
+    /// `relish status` and `relish wtf`. Set only on a `Failed` instance.
+    pub launch_failure: Option<String>,
 }
 
 impl WorkloadInstance {
@@ -222,6 +225,27 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// Return the DNS capability bound to this runtime.
     pub fn dns_capability(&self) -> crate::onion::dns::DnsCapability {
         self.capabilities.dns
+    }
+
+    /// The host process workloads this node runs, as `admit_app` judges
+    /// them: the runtime must run host processes, mount isolation must be
+    /// off (#714), and only the allowlisted binaries run. The leader
+    /// places `exec` and `script` apps on this (#702).
+    pub fn process_capability(&self) -> crate::meat::cluster_state::ProcessWorkloadCapability {
+        let config = self.process_manager.config();
+        crate::meat::cluster_state::ProcessWorkloadCapability {
+            enabled: self
+                .grill
+                .supports_runtime(crate::grill::records::RuntimeKind::Process)
+                && !config.mount_isolation,
+            allowed_binaries: config.allowed_binaries.clone(),
+        }
+    }
+
+    /// Whether this node's runtime runs containers, which an image app
+    /// needs (#914). The leader places image apps only where it does.
+    pub fn runs_containers(&self) -> bool {
+        self.grill.runs_containers()
     }
 
     /// Replace the process-workloads policy (host-exec/script allowlist,
@@ -408,31 +432,21 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a GPU-requesting workload the node can't back (D15): either
-    /// `gpu_enabled = false` or the detector found no GPU. Makes
-    /// `gpu_enabled` effective instead of a silent lie.
+    /// Refuse every GPU-requesting workload (D41). Nothing passes a device
+    /// into the container yet and nothing counts which card a workload holds,
+    /// so admitting one would start it without its GPU. `relish apply`
+    /// refuses the request first; this is the node's second line, whatever
+    /// its `gpu_enabled` setting or detected cards say.
     fn admit_gpu(&self, app_name: &str, requested: u32) -> Result<(), BunError> {
         if requested == 0 {
             return Ok(());
         }
-        if !self.capabilities.gpu_enabled {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: "workload requests a GPU but GPU support is disabled on this node \
-                         ([resources] gpu_enabled = false)"
-                    .to_string(),
-            });
-        }
-        if self.capabilities.gpu_count < requested {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "workload requests {requested} gpu(s) but this node has {} available",
-                    self.capabilities.gpu_count
-                ),
-            });
-        }
-        Ok(())
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!(
+                "workload requests {requested} gpu(s), but GPU workloads aren't supported yet (#359)"
+            ),
+        })
     }
 
     /// Refuse a limit-requiring workload the node can't enforce (M22).
@@ -526,18 +540,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(instance_ids)
     }
 
-    /// Add `count` Pending replicas to an app that already runs, beside its
-    /// existing ones, for a deploy that only raises the replica count. They
-    /// take the assigned ordinals no owned instance uses, or on a standalone
-    /// node the lowest unused ones.
-    pub async fn add_app_replicas(
-        &mut self,
+    /// The ordinals [`WorkloadSupervisor::add_app_replicas`] gives `count` replicas
+    /// added to an app: the assigned ordinals no owned instance uses, or on
+    /// a standalone node the lowest unused ones.
+    pub fn ordinals_to_add(
+        &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
         count: u32,
-        now: Instant,
-    ) -> Result<Vec<InstanceId>, BunError> {
+    ) -> Vec<u32> {
         // An ordinal is in use whatever generation its instance is in: after
         // a rolling deploy the replicas are `{app}-g{gen}-{ordinal}`.
         let used: std::collections::HashSet<u32> = self
@@ -553,11 +565,26 @@ impl<G: Grill> WorkloadSupervisor<G> {
             Some(ordinals) => ordinals.clone(),
             None => (0..used.len() as u32 + count).collect(),
         };
-        let indices: Vec<u32> = candidates
+        candidates
             .into_iter()
             .filter(|index| !used.contains(index))
             .take(count as usize)
-            .collect();
+            .collect()
+    }
+
+    /// Add `count` Pending replicas to an app that already runs, beside its
+    /// existing ones, for a deploy that only raises the replica count. They
+    /// take the assigned ordinals no owned instance uses, or on a standalone
+    /// node the lowest unused ones.
+    pub async fn add_app_replicas(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        count: u32,
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        let indices = self.ordinals_to_add(app_name, namespace, spec, count);
         let added = self
             .create_app_instances(app_name, namespace, spec, &indices, now)
             .await?;
@@ -635,22 +662,17 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 None
             };
 
-            let health_config = if let Some(ref health_spec) = spec.health {
-                let app_port = match spec.port {
-                    Some(port) => port,
-                    None => {
-                        for port in &allocated_ports {
-                            let _ = self.port_allocator.release(*port).await;
-                        }
-                        return Err(BunError::NoPortForHealthCheck {
-                            app_name: app_name.to_string(),
-                        });
-                    }
-                };
-                Some(HealthCheckConfig::from_spec(health_spec, app_port))
-            } else {
-                None
-            };
+            // `health.port` is enough; only a health check with no port at
+            // all (which validation refuses) can't be probed.
+            let health_config = HealthCheckConfig::for_app(spec);
+            if spec.health.is_some() && health_config.is_none() {
+                for port in &allocated_ports {
+                    let _ = self.port_allocator.release(*port).await;
+                }
+                return Err(BunError::NoPortForHealthCheck {
+                    app_name: app_name.to_string(),
+                });
+            }
 
             prepared.push(WorkloadInstance {
                 id: instance_id,
@@ -670,6 +692,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
+                launch_failure: None,
             });
         }
 
@@ -1779,7 +1802,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gpu_workload_runs_when_gpu_available() {
+    async fn gpu_workload_refused_even_where_a_gpu_is_detected() {
+        // D41: without device passthrough a `gpu = 1` workload would start
+        // with no device, and two of them would share one card on paper.
+        // Validation refuses it first; this is the agent's second line.
         let mut sup = test_supervisor();
         sup.set_capabilities(PlatformCapabilities {
             gpu_count: 2,
@@ -1790,11 +1816,11 @@ mod tests {
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
-        let ids = sup
+        let err = sup
             .deploy_app("trainer", "default", &spec, Instant::now())
             .await
-            .expect("a GPU workload should run where a device exists");
-        assert_eq!(ids.len(), 1);
+            .unwrap_err();
+        assert!(err.to_string().contains("#359"), "{err}");
     }
 
     #[tokio::test]
@@ -1989,5 +2015,30 @@ mod tests {
         host.exec = None;
         host.image = Some("fixture:v1".into());
         sup.admit_app("image", &host).unwrap();
+    }
+
+    /// #914: the leader places image apps only on nodes that say they run
+    /// containers. A process runtime doesn't; runc, Apple Container and the
+    /// mixed runtime do.
+    #[test]
+    fn a_node_runs_containers_only_when_its_runtime_does() {
+        let root = tempfile::tempdir().unwrap();
+        let process = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        assert!(!process.runs_containers());
+
+        let runc = MockGrill::new();
+        runc.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runc = WorkloadSupervisor::new(runc, PortAllocator::new(30000, 31000));
+        assert!(runc.runs_containers());
+
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let mixed = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mixed = WorkloadSupervisor::new(mixed, PortAllocator::new(30000, 31000));
+        assert!(mixed.runs_containers());
     }
 }

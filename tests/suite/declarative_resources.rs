@@ -191,7 +191,7 @@ async fn manual_apply_and_gitops_converge_identically() {
     };
     spawn_gitops_sync(
         Arc::clone(&gitops),
-        gitops_config,
+        Some(gitops_config),
         webhook_rx,
         data_dir.path().to_path_buf(),
         shutdown.clone(),

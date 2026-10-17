@@ -11,10 +11,11 @@ use super::super::types::OnionError;
 /// Every map the loaded `onion_connect.bpf.o` object must define. A
 /// missing map used to surface as a panic at first use, deep inside the
 /// agent (NET8); now the load fails up front with the full list.
-pub const REQUIRED_MAPS: [&str; 11] = [
+pub const REQUIRED_MAPS: [&str; 12] = [
     "backend_map",
     "firewall_map",
     "cgroup_namespace_map",
+    "cgroup_source_map",
     "destination_map",
     "egress_map",
     "egress6_map",
@@ -116,14 +117,22 @@ impl OnionEbpf {
         Self::attach(bpf, cgroup_path)
     }
 
+    /// The `onion_connect.bpf.o` bytes this build compiled and embedded.
+    /// [`OnionEbpf::load_embedded`] loads exactly these bytes.
+    #[cfg(feature = "ebpf")]
+    pub fn embedded_object() -> &'static [u8] {
+        aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o"))
+    }
+
     /// Load the version-matched object embedded in this executable.
     /// No build tree or installed `.bpf.o` files are needed at runtime.
     #[cfg(feature = "ebpf")]
     pub fn load_embedded(cgroup_path: &Path) -> Result<Self, OnionError> {
         check_prerequisites()?;
-        let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o"));
-        let bpf = aya::Ebpf::load(bytes).map_err(|error| OnionError::EbpfLoadFailed {
-            reason: format!("failed to load embedded eBPF program: {error}"),
+        let bpf = aya::Ebpf::load(Self::embedded_object()).map_err(|error| {
+            OnionError::EbpfLoadFailed {
+                reason: format!("failed to load embedded eBPF program: {error}"),
+            }
         })?;
         Self::attach(bpf, cgroup_path)
     }

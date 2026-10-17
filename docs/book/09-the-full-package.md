@@ -240,6 +240,8 @@ The first wired autoscaler had four subtle bugs the review caught, and each one 
 
 **Clear an override the moment its baseline moves.** An override is a runtime adjustment *relative to a baseline*. Redeploy the app with a different replica count, or delete it entirely, and the old override is meaningless — worse than meaningless, because a stale "scale to 7" left sitting in Raft would quietly resize a freshly redeployed app. So the state machine clears the override in the same apply that changes the baseline: on `AppDelete`, and on an `AppSpec` whose replica count differs from the stored one. An image-only redeploy (same replica baseline) leaves the override alone — you don't want a routine version bump throwing away a legitimate scale-up.
 
+The baseline isn't the only thing an override leans on. It also lives inside the `[autoscale]` bounds, and the 0.2.1 audit found both edges unguarded (#701). Remove the `[autoscale]` block from an app scaled to 8 and the autoscaler stops looking at it, but the scheduler kept applying the override, so the app stayed at 8 with nothing left that could ever change it. Narrow `max` from 10 to 5 and the 8 stayed too. Now `apply_app_spec` drops the override when `autoscale` becomes `None` and clamps it into the new `[min, max]` otherwise, and applying an `AutoscaleOverride` refuses an app without the block and clamps into its bounds. The second guard matters because the autoscaler reads desired state, decides, then writes: a deploy that removes the block can commit in between. Both checks run in the Raft apply, so every council member reaches the same answer from the same log.
+
 **`min > max` is an error, not a clamp.** The old code fed `min` and `max` straight into `.clamp()`, which silently swaps them if they're out of order — so `min = 10, max = 3` quietly became "always 3", hiding an obvious operator typo. Now the `[autoscale]` block is validated at config time: `min > max`, a zero `max` or `min`, an unparseable or zero window, an out-of-range threshold — every one fails the deploy loudly with a message naming the field. A validation error the operator reads beats a clamp the operator never sees.
 
 **Use the window the operator configured.** The rollup query was hardcoded to average the last five minutes regardless of what `evaluation_window` said. Now the configured window drives the query, as it always should have. And while we were in the numeric code, we made the resource parsers use checked arithmetic: a memory string like `99999999999999999999Gi` now returns a validation error instead of silently overflowing 64 bits into some small wrong number (a whole class of bug the review labelled DEP9).
@@ -439,8 +441,12 @@ The sync loop:
 2. **Git fetch.** A new commit if there is one, otherwise the current HEAD. Every tick reconciles, so manual drift is repaired even when Git hasn't moved (Chapter 7 tells that story)
 3. **Signature verification.** If required (global, or auto-enforced when the parsed `script` values differ from the last applied tree)
 4. **Configuration tree.** Read the verified commit under the configured watch root. Resolve `_defaults.toml` inheritance and directory namespaces through the same resolver as CLI compilation. A malformed or ambiguous tree refuses the whole sync
-5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware
-6. **Selective apply.** Only changed resources written to Raft
+5. **Diff.** Field-by-field comparison against current Raft state. Autoscaler-aware, and removals only for resources Lettuce itself wrote
+6. **Selective apply.** Only changed resources written to Raft, each with its ownership record in the same entry
+
+### Owning only what it wrote
+
+A GitOps engine that treats the repository as the whole truth deletes everything the repository doesn't mention. That's a fine rule for a cluster GitOps built from scratch and a terrible one for a cluster that already has workloads deployed by hand. Lettuce keeps an ownership set in Raft, `DesiredState.gitops_owned`, with the apps, namespaces and permissions it wrote. Each write goes in a `RaftRequest::GitOpsWrite` that applies the change and updates the set in one entry, so the two can't disagree after a crash. The diff removes only owned resources; a resource that already matches git is adopted on the first sync that sees it. So turning GitOps on next to `relish apply` leaves the manual resources alone, a manual apply of a GitOps-owned resource warns that the next sync reverts it, and `relish delete` or `relish rollback` of one needs `--force`. A running test's `rbtest-*` namespace is never in the diff at all. The configuration itself lives in Raft too, with its credentials sealed under the cluster master key, so a failover keeps syncing the same repository. Chapter 7 tells the whole story, including how a sync refuses to write in a Raft term other than the one it read the cluster in.
 
 ### Coordinator election
 
@@ -639,6 +645,16 @@ k8s-openapi = { version = "0.22", default-features = false, features = ["latest"
 ```
 
 We disable `default-features` on k8s-openapi because we only need the type definitions, not the API client operations. That shaves off a chunk of compile time.
+
+### Reading the YAML
+
+k8s-openapi gives us types, not a parser. For that we started with `serde_yaml`, the crate everyone reached for, and it did the job: a `Deserializer` iterates over the documents in a stream (so a Helm `# Source:` comment or a `---` inside a PEM block doesn't split anything), each document becomes a generic `Value`, and we pick the k8s-openapi type from its `kind`.
+
+Then its author archived it. `serde_yaml` 0.9 ships as `0.9.34+deprecated`, and it sits on `unsafe-libyaml`, the C libyaml machine-translated into unsafe Rust, archived along with it. RustSec lists that one as unmaintained (RUSTSEC-2024-0449), and in October 2026 our weekly audit, which denies every warning it hasn't been told about, went red. Nothing was exploitable. But we'd have been parsing other people's manifests with unsafe code that nobody fixes any more.
+
+We could have added an audit exception and moved on. We did, for a few days. The real fix turned out to be smaller: the YAML organization forked both crates and maintains them as `yaml_serde` and `libyaml-rs`. It's still the same translated libyaml underneath (so still `unsafe`), but now somebody answers the bug reports. The API is unchanged, so the swap was one line in `Cargo.toml` and `serde_yaml::` becoming `yaml_serde::` in twelve files; every call site (`to_string`, `from_value`, `Deserializer::from_str`) compiles as it was. A test in `src/relish/output.rs` pins the exact YAML layout (quoting, block scalars, enum tags) and passed before and after the swap, so `--output yaml` didn't move by a byte. Another reads `Cargo.lock` and fails if `unsafe-libyaml` ever creeps back in.
+
+Why not a pure-Rust parser such as `serde-saphyr`? It would remove the `unsafe` entirely, but it's a different implementation with its own error messages and edge cases, and we wanted the smallest behaviour change that clears the advisory. That's a trade worth revisiting if YAML parsing ever moves off the operator's own machine.
 
 ### The field mapping
 
@@ -1158,7 +1174,7 @@ more. Reading Lima 2.1.0's source showed why: `limactl start` checks whether
 `_config/user` exists, and only afterwards takes a lock and runs `ssh-keygen`.
 It never checks again under the lock, so two first starts both generate a key
 and the second overwrites the first. Lima's `user-v2` network daemon has the
-same check-then-lock shape.
+same check-then-lock shape. When we moved to Lima 2.2.1 we read `DefaultPubKeys` again: it still checks before the lock and never after, so the workaround stays.
 
 So we remove the race instead of serialising around it. Before any VM starts,
 `Lima::ensure_user_key` runs the same `ssh-keygen -t ed25519 -N "" -C lima`
@@ -1386,7 +1402,7 @@ quickly, and a cross-architecture chroot would need `qemu-user-static` to
 emulate every package script. A native chroot needs neither, and the aarch64
 build takes about two minutes.
 
-What format do we ship? Lima 2.1.0 turns a qcow2 image into the raw disk
+What format do we ship? Lima (2.1.0, and still 2.2.1) turns a qcow2 image into the raw disk
 Apple's Virtualization.framework needs, but it reads only zlib-compressed
 qcow2 clusters, not zstd ones. It can decompress a `.zst` file too, but by
 running a `zstd` command, and macOS doesn't have one. So we ship exactly what
@@ -1523,7 +1539,7 @@ SyncTime: system time synchronized with host (drift was ~140ms)
 systemd-resolved: Clock change detected. Flushing caches.
 ```
 
-Two programs owned the guest's clock. Lima 2.1's host agent sends the Mac's
+Two programs owned the guest's clock. Lima's host agent sends the Mac's
 time to its guest agent every 10 s, and the guest agent sets the wall clock to
 it whenever the two differ by more than 100 ms. Ubuntu also runs
 systemd-timesyncd, which asks an NTP server and nudges the clock's frequency
@@ -1587,6 +1603,62 @@ build script disables the unit before it seals the image. On real VMs, the
 soak's guest report now prints whether timesyncd is active, which fails the
 check outright, and counts the `SyncTime` steps the guest agent logged since
 the last report. The record lists the total per node.
+
+### Pin a Lima that doesn't leak
+
+The 0.2.0 jobs soak found the next Lima bug the hard way. Node 1's guest
+agent grew to 1 GiB in six hours, until the kernel killed Bun
+([#982](https://github.com/reliaburger/reliaburger/issues/982)). Every
+connection the host made to a forwarded port went through Lima's default gRPC
+forwarder, and Lima 2.1 never closed the guest agent's side of it
+([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210), fixed by
+[#5216](https://github.com/lima-vm/lima/pull/5216) in 2.2.0). The soak
+harness worked around it for 0.2.0 by forwarding over SSH instead
+(`LIMA_SSH_PORT_FORWARDER=true`), which had a failure mode of its own: Lima
+sets each port up with one `ssh -O forward` and never retries a failed one,
+so a node could drop off the host after a reboot while the cluster stayed
+healthy inside. And 2.1.0 had a security hole too: before 2.1.3, any user in
+a QEMU guest could reach the guest agent's socket and tunnel to root-owned
+sockets ([CVE-2026-53657](https://nvd.nist.gov/vuln/detail/cve-2026-53657)).
+
+So the quickstart pins [Lima 2.2.1](https://github.com/lima-vm/lima/releases/tag/v2.2.1),
+and the soak runs Lima's default forwarder again, the one quickstart users
+get. The pin is one constant now, where it used to be a version string copied
+into four places:
+
+```rust
+pub const LIMA_VERSION: &str = "2.2.1";
+
+pub fn managed_limactl(root: &Path) -> PathBuf {
+    root.join("tools")
+        .join(format!("lima-{LIMA_VERSION}"))
+        .join("bin/limactl")
+}
+```
+
+The archive URL, the install directory, the `limactl --version` check and the
+progress line all derive from it, so the next bump changes the constant and
+the four checksums, and nothing else. The checksums come from the release's
+own `SHA256SUMS`. A test pins all four, and another reads
+`qualify-sustained.sh` with `include_str!` (a macro that compiles the file's
+text into the test binary) to check the soak harness looks for the same
+`lima-<version>` directory the CLI installs. The harness also unsets
+`LIMA_SSH_PORT_FORWARDER` before it starts anything, so a shell left over
+from a 0.2.0 soak can't quietly switch the forwarder back.
+
+Did it fix the leak? We booted a quickstart cluster on Lima 2.2.1 and sent
+20,000 health requests through node 1's forwarded API port, each on a fresh
+TLS connection, 16 at a time. All 20,000 answered 200, and the guest agent
+held 5 sockets before and 5 after. Then we restarted the same VM under Lima
+2.1.0 and sent the same load. After 3,596 successful requests the forwarder
+stopped working (every later connection was cut during the TLS handshake),
+and the guest agent held 3,635 sockets that never went away.
+
+We also re-read the workarounds that depend on Lima's internals. The shared
+SSH key race above is still there in 2.2.1, and so is the missing zstd
+decompressor for qcow2 (Lima's `master` has added one since). The host agent
+still steps the guest clock every 10 s past 100 ms of drift. The workarounds
+stay.
 
 ### Status from any node
 

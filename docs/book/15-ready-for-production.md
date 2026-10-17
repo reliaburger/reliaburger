@@ -213,7 +213,8 @@ Not everything in the slow list was a timeout. Most of the API authorisation tes
 their time in Argon2id, which is slow by design and much slower again without optimisation. Cargo lets one
 crate be optimised inside an otherwise debug build, and we already did that for SHA-256, so
 `argon2` and `blake2` joined it. The slowest of those tests fell from nearly nine seconds to
-a third of a second. One test unpacked 65,537 empty files to prove the entry cap; the cap
+a third of a second. (In 0.2.1 tokens moved to SHA-256 and the `argon2` crate left the
+build altogether, override and all: see Chapter 4.) One test unpacked 65,537 empty files to prove the entry cap; the cap
 counts entries, not files, so the same directory repeated 65,537 times proves the same limit
 without half a minute of file creation.
 
@@ -613,21 +614,21 @@ book chapters sets `code` to false and runs no Rust at all, unless it touches ch
 the READMEs or the manual. Those count as code, because `documentation_first_run` checks
 their snippets and the manual is compiled into `relish`. A pull request stacked on another
 branch skips the acceptance suites unless someone labels it `full-ci`; it gets them when it
-targets `main`, or a release's merge-train branch: from 0.1.4 on, each release collects its
-pull requests on one `release-*` branch, and those are the release's changes, so they get the
-whole of CI. Benchmarks run on `main`, nightly, and on changes to the code they measure.
+targets `main`. From 0.1.4 on, each release collects its pull requests on one `release-*`
+merge-train branch, and from 0.2.1 those pull requests get a lighter set, for reasons the next
+section explains. Benchmarks run on `main`, nightly, and on changes to the code they measure.
 The gossip numbers gate nothing. The task-array benchmarks gate on a regression, measured
-against the baseline the last `main` run saved. Why not Criterion's own few per cent? Because
-a hosted runner is a different machine every night, and a gate that trips on the runner's mood
+against the baseline the last `main` run saved. Why not Criterion's own few per cent? Because a
+hosted runner is a different machine every night, and a gate that trips on the runner's mood
 is just another flake.
 
 At first the gate was absolute: fail when any benchmark is more than twice as slow as the
 baseline. That held until the night of 12 October 2026, when five runs in a row failed it,
 on `main` and on the 0.2.1 train alike, and then blocked the 0.2.0 candidate build three
 times. Every benchmark was 1.4 to 2.1 times slower, including `index_set/insert_sequential_1m`,
-at 2.07 in each run, and nobody had touched that code. The runner was slow, not our code, and
-a gate that fails every run blocks every merge and every release on a cloud provider's bad
-night.
+at 2.07 in each run, and nobody had touched that code. The runner was slow, not our code. Once
+the merge queue requires the final gate, that's every merge and every release blocked by a
+cloud provider's bad night.
 
 So now each run measures its own runner. `bench_baseline.py` takes each benchmark's ratio to
 the baseline, then divides it by the median ratio of the *other* benchmarks in the same run. A
@@ -635,6 +636,39 @@ uniformly slower machine cancels out, and a benchmark fails only when it's more 
 slow as the rest of its run. We kept the real numbers from those five runs as a test fixture:
 the worst of them, a 0.1 ms JSON encode at 2.93 times the baseline, comes out at 1.86 against
 the rest, and passes.
+
+It passes, but only just. At a tenth of a millisecond, timer resolution and one unlucky
+context switch move that benchmark more than any change to the encoder would, and 1.86 is
+uncomfortably close to two. So `state/json_encode_1m` became `state/json_encode_1m_x64`: each
+iteration encodes the same finished 1M-task state 64 times, which puts the mean at a few
+milliseconds. It still measures one thing, JSON encoding of task-array state, and the
+throughput still counts encodes, so its per-encode figure stays comparable by eye:
+
+```rust
+const JSON_ENCODES: usize = 64;
+group.throughput(Throughput::Elements(JSON_ENCODES as u64));
+group.bench_function("json_encode_1m_x64", |b| {
+    b.iter(|| {
+        (0..JSON_ENCODES)
+            .map(|_| serde_json::to_vec(&finished).map_or(0, |bytes| bytes.len()))
+            .sum::<usize>()
+    })
+});
+```
+
+The closure returns the total bytes rather than nothing, so the compiler can't decide the
+encodes are unused and optimise them away; Criterion's `iter` feeds the return value through
+`black_box` for exactly that reason. `map_or(0, ...)` turns each `Result` into a length, with
+0 for an error that never happens here, and `sum::<usize>()` uses the turbofish to say what
+type the sum is.
+
+Why rename it, rather than keep the name? Because the gate matches benchmarks by name. Under
+its old name, the first run after the change would have compared a 64-encode workload with
+`main`'s one-encode baseline, seen a ratio of about 64, and failed. A new name has no baseline,
+so `bench_baseline.py` reports it as "new" and gates nothing; the old name is simply absent,
+which isn't a regression either. The first `main` run after the merge records the new
+baseline, and every run after that is gated as usual. `make test-ci-scripts` pins both halves
+of that against the 12 October runs.
 
 Two details came from the same data. First, a fast runner never tightens the bound: the median
 counts as at least 1. Two earlier runs that day had fast CPUs and a slow disk, with the median
@@ -645,11 +679,34 @@ second one. So the run also fails when its median ratio is above two. That's the
 gate, asked of the median rather than of every benchmark, so the new gate passes everything the
 old one did.
 
+The median takes care of a slow machine. It can't take care of a slow minute. On 13 October,
+`storage/ledger_and_index_64k` failed twice in one day, once at 2.89 times its baseline, on pull
+requests that never touched storage, and passed on each re-run. That benchmark writes a ledger
+and a result index for 64k tasks to a temporary directory, so it's at the mercy of the hosted
+runner's disk, and a disk that stalls for a few seconds during one benchmark slows that benchmark
+alone. The rest of the run is fine, so the median can't see it.
+
+A real regression is repeatable. A stall isn't. So when a benchmark is over the limit, the
+gate measures it once more, on its own, and fails only when it's over the limit both times:
+
+```python
+def criterion_filter(names):
+    return "^(" + "|".join(re.escape(name) for name in sorted(names)) + ")$"
+```
+
+Criterion runs every benchmark whose name its filter matches *anywhere*, so the filter is
+anchored at both ends: `executor/process_true_256/1` mustn't drag in a `/16` sibling. The
+re-run costs a minute or so, against an hour of re-queuing a merge train. The run's median
+isn't re-measured: re-running the whole suite would double the job, and a whole-run slowdown
+is exactly what a disk stall *doesn't* cause. The step summary shows both measurements of
+anything it re-measured, so a benchmark that passed on its second try is still visible to
+anyone reading the trend.
+
 Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
 alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
 slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
 which kind of loop we picked, and on that one loop's own noise. A new workload would also have
-no history to test against, and no entry in `main`'s baseline until the change landed.
+no history to test against, and no entry in `main`'s baseline until the train landed.
 
 Speed is only half of it. A flaky suite teaches everyone to press "re-run" without reading,
 and then a real race looks exactly like noise. Our retries stay at zero, so a failure that
@@ -666,6 +723,83 @@ its flakes: either the row says Fixed (with a loop that used to fail and now pas
 links a successor. Re-running those loops for the register paid for itself straight away:
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
+
+### Light checks on the train, everything in the queue
+
+By 0.2.1 the waiting was back. Every pull request into a train got the whole of CI, and a
+release had a dozen of them in flight. We timed twelve runs: 45 to 55 minutes of wall time.
+Runner queueing was mostly under ten minutes, so the runners weren't the problem. Portable
+macOS was the critical path in almost every run, at 35 to 49 minutes, then acceptance at about
+34. Everything else finished in about 15. Inside the macOS job, compiling the test binaries
+took 27 minutes; running all 6,288 tests took seven.
+
+So we asked what a pull request into a train actually needs to prove. That it compiles, lints
+clean on stable and on the minimum compiler, and passes the portable suite with the coverage
+floor. Portable Linux does all of that in about 15 minutes. macOS, the privileged and cluster
+suites, upgrades and benchmarks still have to pass, but on what lands, not on every draft of
+it. `select-jobs.sh` now gives a pull request into `release-*` a fourth output, `macos=false`,
+along with `heavy=false`. The full set runs in GitHub's merge queue, on the batch merged onto
+the train before any of it lands, and again on the push to the train. A `full-ci` label still
+buys the whole set on the pull request, and the gate PR into `main` (its head is a train) gets
+it too.
+
+Two things had to stay true. First, the evidence gate mustn't get weaker. It used to need only
+the evidence owners, so a failed `lint` job wouldn't have stopped it, and the merge queue can
+require exactly one check. `ignored-test evidence` now waits for every other job,
+fails when any of them failed or was cancelled, and still runs the owner checks. The
+aggregator accepts a light selection only when the run's own event is `pull_request`. A push,
+a merge-queue group or a manual run must show every owner, whatever select jobs said. In the
+queue, evidence binds to the temporary commit the queue built
+(`github.event.merge_group.head_sha`), exactly as a push binds to its own commit.
+
+Second, macOS had to get quicker, because the queue now waits for it. We split it into three
+jobs with nextest's `--partition hash:K/3`. Why hash and not `count`? `count` deals each
+binary's tests out in turn, so adding one test moves every later test to a different shard. A
+hash keeps a test where it is, so "it failed in shard 2" stays true tomorrow and reproduces
+locally. The cost is a slightly uneven split, and with seven minutes of tests between three
+shards that's seconds.
+
+Three jobs means three envelopes, and that opened a new way to cheat: two shards that both
+skip the same test would each look complete. The merge closes it. A partitioned
+`nextest list` still names every test, marking the ones it left to other shards as a
+mismatch with reason `partition`, so each shard's list carries the whole suite. The gate
+checks that the three lists name the same tests, that no test ran in two shards, that every
+test ran in one, and that the required cases add up. Each shard's seal names its shard, so one
+envelope can't be uploaded under another's name. A shard re-run on its own after a failure
+keeps the attempt number GitHub gave it, so the check that one job's owners share an attempt
+treats each shard as its own job.
+
+Did splitting pay? Less than we hoped. The first full run with shards ran 2,094 tests in
+under three minutes per shard instead of seven, but each shard still compiled the whole suite
+for 38 minutes, so a shard took 42 to 44 minutes against the 45 before. That's level with
+acceptance, so macOS is no longer the only critical path, and no further. Three macOS jobs
+also wait longer for runners: one shard queued for 28 minutes behind other pull requests.
+The real win is the light set. A pull request into a train no longer touches macOS at all,
+and hears back in 15 to 20 minutes instead of about 50. Making macOS itself faster means
+compiling once, not testing in parallel.
+
+It turned out each shard wasn't even compiling once. It compiled twice. `make test` first runs
+`make warm-executables` (the #722 step in chapter 14), and that ran `cargo build --bins`. A
+plain build resolves features without the dev-dependencies, and one of them turns on
+`proc-macro2`'s `span-locations`. So when nextest's `cargo test --no-run` came next, it saw
+different features and rebuilt `proc-macro2`, `syn`, every proc macro, the library and all
+three binaries. That's 8 to 10 minutes on a 3-vCPU `macos-15` runner, and the rebuild also
+replaced the binaries the step had just warmed. The fix is one line: the warm step now runs
+`cargo test --no-run` itself, and nextest finds everything fresh
+([#846](https://github.com/reliaburger/reliaburger/issues/846)). Across nine full runs before
+the fix, shard jobs took 23.6 to 46.1 minutes, and the slowest shard in a run had a median of
+about 41.6. On the first full run with the fix, the shards took 31.0, 34.3 and 35.8 minutes,
+and the step that builds and runs the tests took 29 to 35. That's one run, not a median, but
+the slowest shard came in about six minutes under the old median. macOS is still the longest
+job in the set, a few minutes longer than acceptance's 26.5 to 32.6, and what's left is the
+compile itself.
+
+The `full-ci` label turned out to be the leak. Most train pull requests touch privileged
+Linux, the cluster or acceptance, so most of them wore it, and each one then asked for three
+macOS runners that queued for over an hour. So on a pull request into a train, `full-ci` now
+means every heavy job except macOS: select jobs says `heavy=true, macos=false`, and the
+aggregator calls that selection `train-full`, accepted, like the light set, only when the
+event is `pull_request`. The queue and the push to the train still demand all three shards.
 
 ## Dependencies are code too
 
@@ -1029,6 +1163,7 @@ TestCase {
     name: "schedule_fixed_replicas_across_nodes",
     group: TestGroup::Scheduling,
     requires: &[Capability::Cluster, Capability::MultiNode],
+    lease: LeaseScope::Applications,
     run: testkit_case!(schedule_fixed_replicas_across_nodes),
 }
 ```
@@ -1037,6 +1172,15 @@ TestCase {
 final form: the runner compares it against `/v1/capabilities` *before* running
 the body, so an unsupported case is skipped without side effects rather than
 failing halfway through setup.
+
+`lease` says what kind of server-owned lease the case's resources live under
+(more on leases below). An application lease refuses jobs, so a case that
+applies one says `LeaseScope::NodeJobs`. That used to be implied by the group:
+the runner gave a job lease to the `jobs` group and an application lease to
+everything else. The `process-workloads` group has two job cases too, so they
+failed at their very first apply, before any job ran (#742). A group is where
+a case is *reported*; what it owns is a separate fact, so now each case says
+it, and a unit test pins which cases take a job lease.
 
 ### A prefix as a safety net
 
@@ -1247,8 +1391,11 @@ named, the `match` is exhaustive, and there's no magic integer floating around
 that a reader has to decode.
 
 Two smaller choices round out the command. Selection: `--filter
-scheduling,firewall` parses to a list of groups and picks those; no filter runs
-everything. And the human report renders as plain aligned text with word labels
+scheduling,firewall` picks those groups, and an entry that names an exact case,
+such as `process_job_with_exit_zero_succeeds`, picks just that case; no filter
+runs everything. Case names came later, when a qualification test had to run a
+group's two job cases without its app case, which needs a `bun` the fixture
+doesn't install and spent its whole budget waiting for it (#742). And the human report renders as plain aligned text with word labels
 rather than colour:
 
 ```
@@ -2954,6 +3101,13 @@ still be fenced. So `recent_observation` only offers a snapshot younger than
 four stale windows (two minutes by default). After that the worker goes
 quiet and the leader does what it did before.
 
+What it did before changed in 0.2.1 (#702). A stale node used to keep its
+fixed replicas for good while losing its daemon copies at once. Now both hold
+for `[reporting_tree] stale_node_grace_secs`, five minutes by default, and
+then move, so a node whose worker wedged for good doesn't keep its replicas
+off the cluster forever, and one that stalls for a minute moves nothing.
+Chapter 2 has the details.
+
 `recent_observation` returns `Option<&ObservedSnapshot>`, a reference into the
 worker's own field. The `&` means the caller borrows the snapshot rather than
 taking it. The report builder consumes its snapshot by value, so the call
@@ -3778,6 +3932,48 @@ change it failed after five seconds with `command-… is Prepared`, the same
 words a Lima loop of the rootless test printed three times in 29 rounds. With
 it, Bun logs `cancelled runtime command …` and carries on; the same loop
 passed every round, and caught the cancellation doing its job twice.
+
+Short commands weren't the only thing an exec could catch halfway (#778).
+A rootless container also has a long-lived network helper, `slirp4netns`,
+and Bun replaces it when it dies. Replacing it takes the same steps as a short
+command, with one more in the middle: prepare the new helper, bind it in the
+generation's intent as the current helper, then start it. Two refusals were
+still immediate. An exec between binding and starting left the new helper
+bound and `Prepared`, and the next Bun's adoption failed with "prepared
+rootless helper requires retirement", every time, because nothing would ever
+start it. And replacing a helper whose owner still reported it running (it
+can, for a moment, while it reaps the process) refused with "runtime network
+helper is still running".
+
+Both now get the treatment short commands got. Supervision asks
+`settle_network_helper` instead of reading the helper's state: it cancels a
+bound helper that nobody is starting, with the same `cancel_unstarted` fence,
+and gives one whose owner holds the lock up to five seconds to come up.
+Replacement waits up to the same five seconds for an earlier helper to retire:
+
+```rust
+CommandState::Running { .. } if tokio::time::Instant::now() < deadline => {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+CommandState::Running { pid } => {
+    return Err(io::Error::other(format!(
+        "runtime network helper {} is still running (pid {pid})",
+        id.as_str()
+    )));
+}
+```
+
+It's the match guard from Chapter 5 again: a running helper matches the
+first arm only before the deadline, and after it falls through to the second,
+which refuses.
+A helper that keeps running is a live owner, and starting a second one would
+put two `slirp4netns` processes on one container, so the bound matters as
+much as the wait. Three tests in `tests/runc_roles.rs` cover it: one binds a
+prepared helper by hand and drops the claim the way an exec would (it failed
+with `Prepared` before the change), one releases a helper 300 ms after its
+replacement is asked for (it failed with "still running"), and one checks
+that a helper which never exits still refuses its replacement and keeps
+running.
 
 #### The tick reads in parallel
 
@@ -4970,6 +5166,131 @@ a lock, or a runtime thread that didn't get to the loop. The new line
 separates them: it shows which timed part took the time, and if none of them
 did, then it was something the line doesn't time.
 
+#### Letting the write go on without the loop
+
+The line paid for itself on the first soak that carried it. About 11 s after
+the soak killed node 3's Bun, its journal said:
+
+```
+08:20:54 bun: agent loop turn took 1575 ms in follow_up (consumer_sync/journal): journal write 1574 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 0 ms
+08:20:55 bun: agent loop turn took 883 ms in follow_up (consumer_sync/activate): journal write 883 ms
+```
+
+1,574 of 1,575 ms was the fsync. Not the lock, not the view, not a starved
+runtime thread (that would have shown turn time no timed part explains).
+That host turned out to be overloaded by builds running beside the soak, and
+the next candidate's slow turns, up to 6 s, came only on a node whose disk
+the jobs tier throttles to 20 IOPS on purpose. Both are the harness's doing,
+not the product's. But both say the same thing about the product: a consumer
+step holds the loop for as long as one write takes, and nothing bounds that.
+Commands, status and ticks wait the whole time. One write a turn (#505) and
+one slow await a turn (#603) cap how many writes a turn waits for. Neither
+caps the write.
+
+What can't change is the order. The journal records a view before the kernel
+sees it, so that after a crash, recovery knows everything that may be
+exposed. Taking the write off the loop mustn't let the install overtake it.
+
+So a step waits for its write the way retirement waits for its disk work
+([Start it now, collect it later](#start-it-now-collect-it-later)): until the
+turn's runtime budget runs out, and no longer. The persist now runs in a
+task of its own, and the step hands the turn's deadline to
+`tokio::time::timeout_at`. A healthy disk lands the write well inside the
+500 ms, and the step carries on exactly as before. A stalled one doesn't, and
+then the step stops there and leaves its remainder behind as a new step:
+
+```rust
+enum AfterWrite {
+    Then(Box<ConsumerStep>),
+    Install(ConsumerPublication),
+    Done,
+}
+
+enum ConsumerStep {
+    // ...
+    Landed(AfterWrite),
+}
+```
+
+`Box<ConsumerStep>` is how an enum holds a value of its own type. A
+`ConsumerStep` that contained a `ConsumerStep` directly would have no finite
+size, and Rust lays every enum out at a size known at compile time. A `Box`
+is one pointer to a heap allocation, so the outer step's size stays fixed
+however deep the nesting goes. (Go would use a pointer, and C a pointer to a
+struct; Rust just makes you say so.)
+
+While the write is in flight the journal itself is inside the task, because
+`DiscoveryJournal::persist` takes `self` by value and gives it back when it
+lands. That's ownership doing a job: nothing on the loop can write to a
+journal it doesn't hold. The agent keeps a new variant meanwhile,
+`DiscoveryOwnership::Writing`, with the task's `JoinHandle` and a copy of the
+inventory as it was before the write. Readers between turns see that copy,
+the state that's on disk now. They might as well, since commands already ran
+between steps before this change, and a reader saw the state before the next
+step then too. The one view that isn't on disk yet still counts where it
+must: `own_view_names` asks the step under way, so a local address the new
+view names can't be released while its write is in flight.
+
+Anything that wants to *change* the journal waits for the write first.
+`update_discovery_inventory` settles a write in flight before it reads the
+inventory it will change, so two writes never race and none is built from a
+stale copy. A command that journals something still waits for a disk, as it
+always did, but only when it actually needs that disk.
+
+The loop learns that the write has landed through one more `select!` branch:
+
+```rust
+outcome = Self::discovery_write_done(&mut self.discovery_ownership),
+    if self.discovery_write_in_flight() => {
+    let turn = self.begin_consumer_sync_turn();
+    self.land_discovery_write(outcome).await;
+    self.continue_consumer_sync().await;
+    turn
+}
+```
+
+`discovery_write_done` awaits `&mut write.task`. A `JoinHandle` is a future
+that yields the task's result, and awaiting a mutable reference to it rather
+than the handle itself leaves the handle where it is, so the branch can be
+built afresh every time round the loop without consuming anything. With no
+write in flight it awaits `std::future::pending()`, which never finishes,
+and the `if` guard keeps the branch from being polled at all. Both step
+branches gain the opposite guard: no step runs while a write is in flight.
+
+The turn that lands a write takes the remainder in the same turn. For
+`Install`, that's the kernel, DNS and Wrapper, which is exactly what the
+single turn used to do after its write. A write that failed fences discovery
+the way an inline failure always has (ownership goes `Uncertain`, readiness
+reports `discovery:journal` degraded, and the next tick reopens the journal),
+and the `Landed` step hands the failure to the leader instead of installing
+anything. The slow write still gets a log line of its own:
+
+```
+bun: a discovery journal write took 1574 ms; the agent loop went on meanwhile
+```
+
+Three tests in the loop harness pin it down, at the soak's 1.6 s a write.
+`status_answers_while_a_consumer_journal_write_outlasts_the_turn` runs the
+real loop through a changed view, three writes, and a status queued mid-write
+must answer within the budget, as must the worst turn.
+`a_consumer_view_is_installed_only_after_its_journal_write_lands` drives the
+same sync by hand: the `journal` turn ends inside the budget with the old
+view still installed, landing the write installs nothing by itself, and only
+the next turn, `consumer_sync/install`, moves the backend.
+`a_journal_write_that_fails_off_the_turn_fences_discovery_and_installs_nothing`
+fails the write after the turn has moved on and checks that ownership is
+uncertain, readiness says so, the leader hears an error and the old view
+stays.
+
+What we didn't do: hand every journal write to a task. Deploys, retirements
+and releases write the journal too, and they decide what to do next from
+what they read, sometimes synchronously. Making all of them tolerate a write
+in flight would have touched every one of those decisions to fix a stall
+that, in every soak so far, came from a consumer step. The consumer's writes
+change only its own ownership, so the services and runtime holds everyone
+else reads are the same either side of one. That's what makes them safe to
+leave in flight.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`
@@ -5664,8 +5985,58 @@ pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), objec
 a Go interface value), and the `Box` puts it on the heap, because the compiler
 can't know how big an unknown type is. That's why we can hand back either the
 `parse_url` result or our own `LocalFileSystem`: both fit behind the same
-pointer. Cloud schemes pass through untouched, because S3 and GCS don't
+pointer. Cloud schemes passed through untouched, because S3 and GCS don't
 acknowledge a write until they've stored it.
+
+"Untouched" turned out to be the next bug (#695). `parse_url` builds an S3
+store with `AmazonS3Builder::new()`, and `new()` reads nothing from the
+environment; that's what `from_env()` is for. So `AWS_REGION`,
+`AWS_ACCESS_KEY_ID` and the rest, which the manual told you to set, did
+nothing. S3 fell back to the instance metadata service in `us-east-1`, which
+works on exactly one kind of machine in exactly one region, and no test
+noticed, because no test could talk to S3. Now `open` builds the cloud stores
+itself:
+
+```rust
+pub(crate) fn open(url: &url::Url) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error> {
+    open_with_env(url, std::env::vars())
+}
+
+pub(crate) fn open_with_env<I>(url: &url::Url, env: I) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let (scheme, prefix) = ObjectStoreScheme::parse(url)?;
+    let store: Box<dyn ObjectStore> = match scheme {
+        ObjectStoreScheme::Local => Box::new(LocalFileSystem::new().with_fsync(true)),
+        ObjectStoreScheme::AmazonS3 => Box::new(s3_builder(url, env).build()?),
+        ObjectStoreScheme::GoogleCloudStorage => Box::new(gcs_builder(url, env).build()?),
+        _ => return object_store::parse_url(url),
+    };
+    Ok((store, prefix))
+}
+```
+
+Why not just call `from_env()`? Because then the only way to test it is
+`std::env::set_var`, and in Rust 2024 that function is `unsafe`. Setting an
+environment variable while another thread reads the environment is undefined
+behaviour in C's `setenv`, and the test runner runs tests on many threads.
+Taking the environment as an argument sidesteps the whole question: the real
+call passes `std::env::vars()`, the tests pass a `Vec` of pairs, and the
+builders' `get_config_value` shows what they picked up. `s3_builder` keeps
+only `AWS_*` variables and `gcs_builder` only `GOOGLE_*` (plus the bare
+`SERVICE_ACCOUNT` the crate's own `from_env` honours), so an S3 store never
+reads a Google setting that happens to share a lowercase name.
+
+`I: IntoIterator<Item = (String, String)>` is a generic bound: `env` can be
+any type that turns into an iterator of string pairs. `std::env::vars()`
+returns an iterator, a `Vec<(String, String)>` can become one, and the
+compiler generates a copy of `open_with_env` for each. It's the closest thing
+Rust has to Python's duck typing, checked at compile time.
+
+The unit tests never talk to a cloud. `make test-s3` does: with real
+credentials and `RELIABURGER_TEST_S3_URL`, it exports logs to the bucket and
+round-trips a council backup through it, put, list, prune and restore.
 
 The regression tests are less satisfying than we'd like. Nothing a unit test
 can observe changes when an `fsync` is missing, so each caller's test checks
@@ -5687,6 +6058,22 @@ record was a fortnight older than the change that rerouted every file lock in th
 programme. Nothing had broken, as it turned out: the [rerun](../qualification/2026-10-11-power-cut-reboot.md)
 passed 25 power cuts per lane. But a check that only runs when someone remembers
 it isn't a gate. Now it's a numbered step of the release runbook.
+
+A numbered step done by hand is still easy to get subtly wrong, though. For
+0.2.0 it meant a hand-written VM template, a hand-made checkout of the
+candidate and a scratch loop, and any of those could quietly undermine the
+result: a writable mount lets a build change what's under test, a checkout at
+the wrong commit tests the wrong code, and a VM without swap loses the linker
+to the OOM killer before a single power cut. So
+`scripts/release/qualify-power-cut-reboot.sh` does the whole step. It makes a
+clean detached checkout of the candidate, creates a VM from a checked-in
+template, `power-cut-vm.yaml`, with that checkout as its only mount, and
+then distrusts its own work: before any lane it asks the guest how much swap
+it has, whether it can write to the checkout and what else is mounted. What
+Lima was asked for isn't proof of what the guest got. Then it runs the five
+lanes in order, stops at the first failure, writes the record and deletes the
+VM. Its tests run it against a fake `limactl` that logs every call, and one
+of them checks that the development VM's name never appears in that log.
 
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces
@@ -5965,6 +6352,28 @@ keeps the successful producer outputs and their payload hashes. Aggregation
 uses those trusted outputs to verify the reports. A late artifact can't invent
 its own parent or decide that a missing job was optional. Archive users also
 verify the successful current builder's archive and executable identity.
+
+Our first version said "current" and meant "this attempt". That broke the
+cheapest retry GitHub offers. When one job fails, "Re-run failed jobs" runs just
+that job (and the jobs after it) as attempt 2. The jobs that passed aren't run
+again, so their outputs and artifacts still say attempt 1. The evidence job,
+re-run as attempt 2, compared every seal with its own attempt and refused the
+set: "wrong current sealed owner". A re-run cluster job fared no better, because
+the archive it downloaded was built in attempt 1. The only way through was a new
+commit and another 40 to 60 minutes of CI.
+
+What does the attempt actually protect? The commit and the run do the real work:
+evidence from another commit or another run must never count. Within one run,
+the trusted job outputs already decide which seal counts, and GitHub reports
+each job's latest attempt. So a seal now keeps the attempt that produced it.
+Aggregation accepts anything from attempt 1 up to its own, as long as the
+commit, run and host match exactly and all the owners of one job agree on an
+attempt. A later attempt, attempt 0 or a malformed one is still refused. An
+archived suite takes its builder's attempt from the archive runtime file, which
+the build job's digest already vouches for. The tests in
+`scripts/ci/test_workflow_adapter.py` replay the exact re-run shape (macOS at
+attempt 3, the rest at attempt 2) and the forgeries next to it: an earlier
+attempt from another run, commit or host.
 
 Coverage gets the same treatment. Its owner wraps the existing `make coverage`
 recipe once, keeping the clean, instrumented nextest run, reports and unchanged

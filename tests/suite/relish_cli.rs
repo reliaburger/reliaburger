@@ -43,8 +43,7 @@ fn apply_dry_run_succeeds_without_an_agent() {
         &config,
         r#"
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["true"]
+script = "exec true"
 "#,
     )
     .unwrap();
@@ -237,6 +236,78 @@ async fn cancel_deploy_waits_for_terminal_evidence_and_refuses_unknown_success()
         assert_eq!(record["outcome"], outcome);
         assert_eq!(record["phase"], "finished");
     }
+}
+
+/// #697: `relish image delete repo:tag` finds the registry through the
+/// agent's capabilities and sends the OCI tag deletion there.
+#[tokio::test]
+async fn image_delete_parses_repo_and_tag() {
+    use axum::{
+        Json, Router,
+        extract::{OriginalUri, State},
+        routing::{delete, get},
+    };
+    use std::sync::{Arc, Mutex};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut capabilities = reliaburger::bun::capabilities::ClusterCapabilities::default();
+    capabilities.service_endpoints.registry = Some(endpoint.clone());
+    let deleted: Arc<Mutex<Vec<String>>> = Arc::default();
+    let app =
+        Router::new()
+            .route(
+                "/v1/capabilities",
+                get(move || async move { Json(capabilities) }),
+            )
+            .route(
+                "/v2/{*rest}",
+                delete(
+                    |State(deleted): State<Arc<Mutex<Vec<String>>>>,
+                     OriginalUri(uri): OriginalUri| async move {
+                        deleted.lock().unwrap().push(uri.path().to_string());
+                        axum::http::StatusCode::ACCEPTED
+                    },
+                ),
+            )
+            .with_state(deleted.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(["image", "delete", "localhost:5050/team/web:v1"])
+            .env("RELIABURGER_ENDPOINT", &endpoint)
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        *deleted.lock().unwrap(),
+        vec!["/v2/team/web/manifests/v1".to_string()]
+    );
+    // A bare name is refused before anything is sent.
+    let refused = run(&[
+        "--endpoint",
+        "http://127.0.0.1:1",
+        "images",
+        "delete",
+        "web",
+    ]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("repository:tag"));
 }
 
 #[test]

@@ -32,12 +32,20 @@ fn standalone_first_run_reaches_a_running_workload() {
     enable_phase_diagnostics();
     let _test_phase = fixture_phase("standalone-first-run");
     let root = tempfile::tempdir().unwrap();
+    // The documented node config allows `target/debug/testapp`, the binary
+    // the example runs as a host `exec` app (#914). Append it to the
+    // portable config, pointing at the testapp this test was built against.
+    let node_example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/node/process-runtime.toml");
+    let process_workloads = std::fs::read_to_string(&node_example)
+        .unwrap()
+        .replace("target/debug/testapp", env!("CARGO_BIN_EXE_testapp"));
     let (mut bun, address) = spawn_bun_with_port_retry(false, || {
-        (
-            write_portable_node_config(root.path()),
-            reserve_address(),
-            root.path().join("bun.log"),
-        )
+        let config = write_portable_node_config(root.path());
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&process_workloads);
+        std::fs::write(&config, text).unwrap();
+        (config, reserve_address(), root.path().join("bun.log"))
     });
     let endpoint = format!("http://{address}");
 
@@ -161,6 +169,10 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
     // portable fixture runs the process runtime, which has neither.
     node.ebpf.enabled = false;
     node.dns.enabled = false;
+    // The process runtime runs host apps only (#914): allow the testapp
+    // binary the clustered app runs.
+    node.process_workloads.allowed_binaries = vec![env!("CARGO_BIN_EXE_testapp").into()];
+    node.process_workloads.mount_isolation = false;
 
     let (mut bun, address) = spawn_bun_with_port_retry(true, || {
         let [gossip_port, raft_port, reporting_port] = reserve_ports();
@@ -223,8 +235,8 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
         format!(
             r#"
 [app.cluster-hello]
-image = "proc-grill:image-ignored"
-command = [{testapp:?}, "--port", "0"]
+exec = {testapp:?}
+command = ["--port", "0"]
 "#,
             testapp = env!("CARGO_BIN_EXE_testapp"),
         ),
@@ -296,6 +308,10 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     // portable fixture runs the process runtime, which has neither.
     node.ebpf.enabled = false;
     node.dns.enabled = false;
+    // The process runtime runs host apps only (#914): allow the testapp
+    // binary the clustered app runs.
+    node.process_workloads.allowed_binaries = vec![env!("CARGO_BIN_EXE_testapp").into()];
+    node.process_workloads.mount_isolation = false;
 
     let (mut bun, address) = spawn_bun_with_port_retry(true, || {
         let [gossip_port, raft_port, reporting_port] = reserve_ports();
@@ -722,8 +738,7 @@ fn published_apply_and_join_shapes_reach_their_handlers() {
         &app,
         r#"
 [app.hello]
-image = "proc-grill:image-ignored"
-command = ["true"]
+script = "exec true"
 "#,
     )
     .unwrap();

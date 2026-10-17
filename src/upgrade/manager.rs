@@ -234,7 +234,7 @@ impl UpgradeManager {
     /// the entry symlink exec'd, and [`BinaryStore::stage`] refuses to put
     /// different bytes under an existing version). A plain install with no
     /// store file yet falls back to the executable itself. Hashing a whole
-    /// Bun binary is CPU work, so it runs on the blocking pool, once.
+    /// Bun binary is CPU work, so it runs once, on its own thread.
     /// `bun` starts that work at boot with
     /// [`UpgradeManager::spawn_running_binary_hash`]; a caller that arrives
     /// while it is still running waits for the same result.
@@ -252,7 +252,8 @@ impl UpgradeManager {
     /// A debug Bun is over 500 MB. Hashed on demand, the first request
     /// waited seconds for it, longer than a joiner's deadline on a loaded
     /// host (#765). The handle resolves once the cache is filled, or once
-    /// hashing has failed and the next caller will retry.
+    /// hashing has failed and the next caller will retry. An unfinished
+    /// hash never delays a start-up error's exit (#816).
     pub fn spawn_running_binary_hash(&self) -> tokio::task::JoinHandle<()> {
         let cell = std::sync::Arc::clone(&self.running_sha256);
         let stored = self.store.binary_path(&self.running_version);
@@ -993,25 +994,40 @@ impl UpgradeManager {
     }
 }
 
-/// Hash the running binary: the store's copy if present, else the
-/// executable this process was started from.
 /// Fill `cell` with the running binary's digest unless it already holds one.
 ///
 /// `OnceCell::get_or_try_init` runs the closure for the first caller only;
 /// a concurrent caller awaits that same attempt rather than hashing again.
 async fn hash_once(cell: &tokio::sync::OnceCell<String>, stored: PathBuf) -> Option<String> {
-    cell.get_or_try_init(|| async move {
-        tokio::task::spawn_blocking(move || hash_running_binary(&stored))
-            .await
-            .ok()
-            .flatten()
-            .ok_or(())
-    })
-    .await
-    .ok()
-    .cloned()
+    cell.get_or_try_init(|| async move { hash_on_detached_thread(stored).await.ok_or(()) })
+        .await
+        .ok()
+        .cloned()
 }
 
+/// Hash the running binary on a plain thread that nothing joins.
+///
+/// Not `spawn_blocking`: dropping a Tokio runtime waits for its blocking
+/// pool, so a start-up error raised while the boot-time hash was still
+/// reading a large debug binary exited only once the hash finished, up to
+/// 17 s later (#816). A detached thread doesn't hold up the runtime's drop,
+/// and it dies with the process when `main` returns. The digest comes back
+/// on a oneshot channel. If the thread can't be spawned there is no digest,
+/// just as when the file can't be read, and the next caller tries again.
+async fn hash_on_detached_thread(stored: PathBuf) -> Option<String> {
+    let (digest_tx, digest_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("binary-hash".to_string())
+        .spawn(move || {
+            // The receiver is gone only if the caller was cancelled.
+            let _ = digest_tx.send(hash_running_binary(&stored));
+        })
+        .ok()?;
+    digest_rx.await.ok().flatten()
+}
+
+/// Hash the running binary: the store's copy if present, else the
+/// executable this process was started from.
 fn hash_running_binary(stored: &Path) -> Option<String> {
     match signing::sha256_file(stored) {
         Ok(digest) => Some(digest),
@@ -1349,6 +1365,63 @@ mod tests {
         assert_eq!(
             fixture.manager.running_binary_sha256().await.as_deref(),
             Some(sha256_hex(b"old binary").as_str())
+        );
+    }
+
+    // A plain `#[test]` with its own runtime, because the behaviour under
+    // test is what dropping that runtime does.
+    #[test]
+    fn dropping_the_runtime_does_not_wait_for_an_unfinished_boot_time_hash() {
+        // #816: a start-up error drops Bun's runtime, and a runtime waits for
+        // its blocking-pool tasks when dropped. A hash still reading a large
+        // binary held the error exit back for seconds.
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let fixture = fixture();
+        // A FIFO in place of the stored binary: the hash reads it until we
+        // close the write end, so it is "slow" for exactly as long as we say.
+        let stored = fixture.manager.store().binary_path(&v("0.1.0"));
+        std::fs::remove_file(&stored).unwrap();
+        nix::unistd::mkfifo(&stored, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _hash = runtime.enter();
+        drop(fixture.manager.spawn_running_binary_hash());
+
+        // A non-blocking open for writing fails until a reader has the FIFO
+        // open, so once it succeeds the hash is running and blocked in read.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let writer = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&stored)
+            {
+                Ok(writer) => break writer,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("the boot-time hash never opened the binary: {error}"),
+            }
+        };
+        drop(_hash);
+
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            let _ = dropped_tx.send(());
+        });
+        let dropped = dropped_rx.recv_timeout(std::time::Duration::from_secs(5));
+
+        // Let the hash finish either way, so no thread outlives the test blocked.
+        drop(writer);
+        assert!(
+            dropped.is_ok(),
+            "dropping the runtime waited for the boot-time hash"
         );
     }
 

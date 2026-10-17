@@ -239,6 +239,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/upgrade/abort", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/upgrade/cluster-rollback", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/cluster/elect", Admin, Cluster(ADMIN)),
+    // GitOps: anyone may read the status (it never carries credentials);
+    // changing the cluster's configuration is an Admin operation (#693).
+    route(Get, "/v1/gitops", AnyToken),
+    gated(Post, "/v1/gitops/config", Admin, Cluster(ADMIN)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),
@@ -321,6 +325,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // with no credentials at all (development) also answers without one.
     route(Get, "/v1/placements/{node_id}", System),
     route(Post, "/v1/test/leases/retired", System),
+    // A node's reconciler reports a failed rollout to the leader (#692).
+    route(Post, "/v1/rollouts/failed", System),
     gated(Post, "/v1/nodes/decommission", Admin, Cluster(ADMIN)),
     route(Get, "/v1/images", AnyToken),
     // Batch + build. `track`/`sign` are node-to-node (System).

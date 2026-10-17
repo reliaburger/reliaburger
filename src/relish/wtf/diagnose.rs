@@ -41,11 +41,13 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_registry(inputs, &mut report);
         check_tokens(inputs, &mut report);
         check_isolation(inputs, &mut report);
+        check_gitops(inputs, &mut report);
     }
     record_application_unknowns(&inputs.applications, inputs.app.as_deref(), &mut report);
     check_crashloops(inputs, &mut report);
     check_services(inputs, &mut report);
     check_replicas(inputs, &mut report);
+    check_rollouts(inputs, &mut report);
     check_deploys(inputs, &mut report);
     check_alerts(inputs, &mut report);
     check_cpu_throttling(inputs, &mut report);
@@ -84,6 +86,7 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("registry", &evidence.registry, "cluster", report);
     record_unknown("tokens", &evidence.tokens, "cluster", report);
     record_unknown("isolation", &evidence.isolation, "cluster", report);
+    record_unknown("gitops", &evidence.gitops, "cluster", report);
 }
 
 fn record_application_unknowns(
@@ -369,16 +372,62 @@ fn check_council_split(council: &CouncilObservation, report: &mut WtfReport) -> 
     }
     let summary = crate::relish::council_view::summarise(&council.nodes);
     let mut healthy = true;
-    if !summary.fenced.is_empty() {
+    let (split, replaced): (Vec<_>, Vec<_>) = summary
+        .fenced
+        .iter()
+        .partition(|node| node.split_with.is_some());
+    if !split.is_empty() {
+        healthy = false;
+        report.critical.push(WtfFinding {
+            id: "council-recovery-split".to_string(),
+            title: "two recoveries landed on the same epoch: both councils fenced themselves"
+                .to_string(),
+            details: split
+                .iter()
+                .map(|node| {
+                    format!(
+                        "{}: recovery epoch {}, but another recovery ({}) claims it too; it \
+                         serves no Raft and refuses writes",
+                        node.node_id,
+                        node.epoch,
+                        node.split_with.as_deref().unwrap_or("unknown")
+                    )
+                })
+                .collect(),
+            suggestion: "pick the council to keep, stop one of its nodes and run `relish council \
+                         recover --force --data-dir <its data directory>` (it lands on a newer \
+                         epoch); then stop the other side's nodes and `relish council re-enrol` \
+                         each one"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    if !summary.fence_unpersisted.is_empty() {
+        report.warnings.push(WtfFinding {
+            id: "council-fence-unpersisted".to_string(),
+            title: "a recovery fence could not be written to disk".to_string(),
+            details: summary
+                .fence_unpersisted
+                .iter()
+                .map(|(node, error)| format!("{node}: {error}; retrying"))
+                .collect(),
+            suggestion: "free space or fix the data directory on each node named; until the \
+                         write lands, restarting that node would bring it back unfenced"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
+    if !replaced.is_empty() {
         healthy = false;
         report.critical.push(WtfFinding {
             id: "council-fenced".to_string(),
             title: format!(
                 "{} node(s) fenced out of a council that `relish council recover` replaced",
-                summary.fenced.len()
+                replaced.len()
             ),
-            details: summary
-                .fenced
+            details: replaced
                 .iter()
                 .map(|node| {
                     format!(
@@ -640,6 +689,33 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             continue;
         }
         found = true;
+        // #881: waiting won't start these. The runtime refused the launch,
+        // and only installing the binary or fixing the spec changes that.
+        if let Some(first) = app.launch_failures.first() {
+            report.critical.push(WtfFinding {
+                id: "launch-failed".to_string(),
+                title: format!(
+                    "app {}/{} cannot start: {}",
+                    app.app, app.namespace, first.reason
+                ),
+                details: app
+                    .launch_failures
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "{} on {}: {}",
+                            failure.instance, failure.node, failure.reason
+                        )
+                    })
+                    .collect(),
+                suggestion: "install the binary on the node, or fix the app's `exec` or \
+                             `command` and apply it again"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
+            continue;
+        }
         // The scheduler isn't failing to find room: the namespace quota
         // forbids it, and only the operator can change that.
         if let Some(reason) = &app.blocked {
@@ -666,6 +742,25 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             report
                 .critical
                 .push(volume_home_away_finding(app, home, running));
+            continue;
+        }
+        // #702: the scheduler placed what fits and recorded why the rest
+        // has no node. That's the finding, with the reason it gave.
+        if let Some(reason) = &app.unschedulable {
+            report.warnings.push(WtfFinding {
+                id: "unschedulable".to_string(),
+                title: format!(
+                    "app {}/{} is unschedulable: {running} of {} replicas running",
+                    app.app, app.namespace, app.desired_replicas
+                ),
+                details: vec![reason.clone()],
+                suggestion: "add nodes or free room on the ones there, relax the app's \
+                             required labels, or allow its binary in [process_workloads]; \
+                             the scheduler places the rest as soon as a node can take them"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
             continue;
         }
         let replicas = |count: u32| {
@@ -723,6 +818,39 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
         report.ok.push(WtfOk {
             id: "replicas".to_string(),
             description: "every app runs its desired replicas".to_string(),
+        });
+    }
+}
+
+/// #692: an app whose current spec failed to roll out on a node. The
+/// leader holds the other nodes on the previous spec and won't try the
+/// failed one again, so nothing changes until the operator applies a
+/// different spec: a warning that says so, and how.
+fn check_rollouts(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(apps) = inputs.applications.replicas.value() else {
+        return;
+    };
+    for app in apps
+        .iter()
+        .filter(|app| app_matches(inputs.app.as_deref(), &app.app))
+    {
+        let Some(failure) = &app.rollout_failed else {
+            continue;
+        };
+        report.warnings.push(WtfFinding {
+            id: "rollout-failed".to_string(),
+            title: format!(
+                "app {}/{}'s rollout failed on {}; its other nodes stay on the previous spec",
+                app.app, app.namespace, failure.node
+            ),
+            details: vec![failure.reason.clone()],
+            suggestion: format!(
+                "fix the spec and apply it, or `relish rollback {}`; applying the same spec \
+                 again does not retry it",
+                app.app
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: app_resource(&app.app, &app.namespace),
         });
     }
 }
@@ -1157,7 +1285,58 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(registries) = inputs.cluster.registry.value() else {
         return;
     };
-    let mut found = false;
+    // Every node computes Lost from the same catalogue, so report the union
+    // once rather than once per node.
+    let lost: std::collections::BTreeSet<&str> = registries
+        .iter()
+        .flat_map(|registry| registry.lost_images.iter().map(String::as_str))
+        .collect();
+    let lost_count = registries
+        .iter()
+        .map(|registry| registry.lost_image_count)
+        .max()
+        .unwrap_or(0)
+        .max(lost.len());
+    let mut found = lost_count > 0;
+    if found {
+        let mut details: Vec<String> = lost.iter().map(|image| image.to_string()).collect();
+        if lost_count > lost.len() {
+            details.push(format!("… and {} more", lost_count - lost.len()));
+        }
+        report.critical.push(WtfFinding {
+            id: "registry-lost-images".to_string(),
+            title: format!("{lost_count} image(s) are lost: no live node holds all their layers"),
+            details,
+            suggestion: "re-push each lost image (it cannot be pulled or deployed until then), \
+                         and bring back the node that held it if you still can"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "registry".to_string(),
+        });
+    }
+    // A plaintext cluster is plaintext on every node, so name the fix once
+    // and list the nodes it holds back (#792).
+    let plaintext: Vec<String> = registries
+        .iter()
+        .filter(|registry| registry.needs_mtls)
+        .map(|registry| registry.node_id.clone())
+        .collect();
+    if !plaintext.is_empty() {
+        found = true;
+        report.warnings.push(WtfFinding {
+            id: "registry-needs-mtls".to_string(),
+            title: "the registry needs mTLS: on this plaintext cluster it can't replicate \
+                    or reach its leader, so pushes and image reads fail"
+                .to_string(),
+            details: plaintext,
+            suggestion: "start the cluster with TLS (`relish init`, then `relish join` on each \
+                         node); a plaintext cluster from `relish init --development-plaintext` has no \
+                         cluster registry"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "registry".to_string(),
+        });
+    }
     for registry in registries.iter().filter(|registry| {
         !registry.ready
             || (registry.clustered && !registry.peer_reachable)
@@ -1230,6 +1409,70 @@ fn check_isolation(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// GitOps findings (#693): plaintext secrets in git (D8), and nodes whose
+/// own `[gitops]` the cluster ignores or that can't read the cluster's.
+fn check_gitops(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(gitops) = inputs.cluster.gitops.value() else {
+        return;
+    };
+    if !gitops.configured {
+        return;
+    }
+    for warning in &gitops.warnings {
+        report.warnings.push(WtfFinding {
+            id: "gitops-plaintext-secret".to_string(),
+            title: "a secret-looking value is plaintext in the GitOps repository".to_string(),
+            details: vec![warning.clone()],
+            suggestion: "encrypt it with `relish secret encrypt` and commit the ENC[AGE:...] \
+                         value; GitOps applies it as it is meanwhile"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "gitops".to_string(),
+        });
+    }
+    for node in &gitops.differing_nodes {
+        report.warnings.push(WtfFinding {
+            id: "gitops-local-config".to_string(),
+            title: format!(
+                "node {}'s [gitops] differs from the cluster's and is ignored",
+                node.node_id
+            ),
+            details: vec![format!("differing settings: {}", node.fields.join(", "))],
+            suggestion: "the cluster's configuration in Raft is the one that runs: change it \
+                         with `relish gitops set`, or make the node's [gitops] match (or remove it)"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", node.node_id),
+        });
+    }
+    for node in &gitops.unreadable_nodes {
+        report.warnings.push(WtfFinding {
+            id: "gitops-config-unreadable".to_string(),
+            title: format!(
+                "node {} can't read the cluster's GitOps configuration",
+                node.node_id
+            ),
+            details: vec![node.reason.clone()],
+            suggestion: "give the node the cluster master key ([security] master_key_path); \
+                         as leader it couldn't sync"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", node.node_id),
+        });
+    }
+    if gitops.warnings.is_empty()
+        && gitops.differing_nodes.is_empty()
+        && gitops.unreadable_nodes.is_empty()
+    {
+        report.ok.push(WtfOk {
+            id: "gitops".to_string(),
+            description: "no plaintext secrets in git, and every node follows the cluster's \
+                          GitOps configuration"
+                .to_string(),
+        });
+    }
+}
+
 fn app_matches(scope: Option<&str>, app: &str) -> bool {
     scope.is_none_or(|scope| scope == app)
 }
@@ -1254,7 +1497,8 @@ mod tests {
     use super::*;
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
-        DeployObservation, DiskObservation, FaultObservation, IsolationObservation, LogObservation,
+        DeployObservation, DiskObservation, FaultObservation, GitOpsObservation,
+        IsolationObservation, LaunchFailureObservation, LogObservation, NodeGitOpsDifference,
         NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
         RestartObservation, ServiceObservation, TokenObservation,
     };
@@ -1311,6 +1555,9 @@ mod tests {
                     peer_reachable: true,
                     redundancy_possible: true,
                     under_replicated_layers: 0,
+                    lost_images: Vec::new(),
+                    lost_image_count: 0,
+                    needs_mtls: false,
                 }]),
                 tokens: available(vec![
                     token("admin", "admin", NOW - 10 * DAY, None),
@@ -1323,6 +1570,7 @@ mod tests {
                         enforced: false,
                     }],
                 }),
+                gitops: available(GitOpsObservation::default()),
             },
             applications: ApplicationEvidence {
                 restarts: available(Vec::new()),
@@ -1343,6 +1591,9 @@ mod tests {
                     unanswered: Vec::new(),
                     blocked: None,
                     volume_home_away: None,
+                    unschedulable: None,
+                    rollout_failed: None,
+                    launch_failures: Vec::new(),
                 }]),
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
@@ -1606,6 +1857,8 @@ mod tests {
             role,
             recovery_epoch: Some(epoch),
             fenced_by,
+            split_with: None,
+            fence_persist_error: None,
             leader: leader.map(str::to_string),
             term: 3,
             last_applied: Some(10),
@@ -1664,6 +1917,41 @@ mod tests {
                 .any(|item| item.id == "council-epoch-split")
         );
         assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    /// #694: two recoveries on one epoch fence both halves. That is its own
+    /// critical finding, with a different way out than a replaced council.
+    #[test]
+    fn a_recovery_split_is_critical_and_names_both_halves() {
+        use crate::bun::agent::CouncilRole;
+        let mut a = council_node("node-1", CouncilRole::Fenced, 1, Some(1), None);
+        a.split_with = Some("bb".repeat(16));
+        let mut b = council_node("node-2", CouncilRole::Fenced, 1, Some(1), None);
+        b.split_with = Some("aa".repeat(16));
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = council_with_nodes(vec![a, b]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|item| item.id == "council-recovery-split")
+            .unwrap();
+        assert_eq!(finding.details.len(), 2);
+        assert!(finding.details[0].contains(&"bb".repeat(16)));
+        assert!(
+            finding
+                .suggestion
+                .contains("relish council recover --force")
+        );
+        assert!(
+            !report
+                .critical
+                .iter()
+                .any(|item| item.id == "council-fenced"),
+            "a split is not a replaced council"
+        );
     }
 
     /// #480: a voter whose Raft core stopped still answers its API, so the
@@ -1877,6 +2165,42 @@ mod tests {
     }
 
     #[test]
+    fn warns_about_plaintext_secrets_in_git_and_ignored_local_gitops_config() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.gitops = available(GitOpsObservation {
+            configured: true,
+            warnings: vec!["app default/web: env DB_PASSWORD looks like a secret".to_string()],
+            differing_nodes: vec![NodeGitOpsDifference {
+                node_id: "node-2".to_string(),
+                fields: vec!["repo".to_string()],
+            }],
+            unreadable_nodes: Vec::new(),
+        });
+        let report = diagnose(&inputs);
+        let gitops: Vec<_> = warning_ids(&report)
+            .into_iter()
+            .filter(|(id, _)| id.starts_with("gitops"))
+            .collect();
+        assert_eq!(
+            gitops,
+            vec![
+                ("gitops-local-config", "node.node-2"),
+                ("gitops-plaintext-secret", "gitops")
+            ]
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "gitops"));
+
+        // A clean GitOps setup is an OK; no GitOps at all says nothing.
+        inputs.cluster.gitops = available(GitOpsObservation {
+            configured: true,
+            ..Default::default()
+        });
+        assert!(diagnose(&inputs).ok.iter().any(|ok| ok.id == "gitops"));
+        inputs.cluster.gitops = available(GitOpsObservation::default());
+        assert!(!diagnose(&inputs).ok.iter().any(|ok| ok.id == "gitops"));
+    }
+
+    #[test]
     fn warns_when_namespaces_exist_but_a_node_cannot_enforce_isolation() {
         let mut inputs = healthy_inputs();
         let isolation = |enforced: [bool; 2]| IsolationObservation {
@@ -1964,6 +2288,9 @@ mod tests {
             peer_reachable: false,
             redundancy_possible: false,
             under_replicated_layers: 2,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
+            needs_mtls: false,
         }]);
 
         let report = diagnose(&inputs);
@@ -1978,6 +2305,45 @@ mod tests {
         ] {
             assert!(report.warnings.iter().any(|item| item.id == id), "{id}");
         }
+    }
+
+    /// #792: a plaintext cluster's registry can't forward or replicate.
+    /// Every node says so, but the operator reads it once, with the fix.
+    #[test]
+    fn a_plaintext_cluster_registry_is_one_warning_naming_the_mtls_fix() {
+        let mut inputs = healthy_inputs();
+        let node = |node_id: &str| RegistryObservation {
+            node_id: node_id.to_string(),
+            clustered: true,
+            ready: true,
+            peer_reachable: true,
+            redundancy_possible: true,
+            under_replicated_layers: 0,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
+            needs_mtls: true,
+        };
+        inputs.cluster.registry = available(vec![node("node-1"), node("node-2")]);
+
+        let report = diagnose(&inputs);
+
+        let findings: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|item| item.id == "registry-needs-mtls")
+            .collect();
+        assert_eq!(findings.len(), 1, "{:?}", report.warnings);
+        assert!(findings[0].title.contains("mTLS"), "{}", findings[0].title);
+        assert!(
+            findings[0].suggestion.contains("relish init"),
+            "{}",
+            findings[0].suggestion
+        );
+        assert_eq!(
+            findings[0].details,
+            vec!["node-1".to_string(), "node-2".to_string()]
+        );
+        assert!(!report.ok.iter().any(|item| item.id == "registry"));
     }
 
     #[test]
@@ -2014,6 +2380,42 @@ mod tests {
         assert!(report.warnings.iter().any(|item| item.title == "api alert"));
     }
 
+    /// #697 (D17): a Lost image is gone until someone re-pushes it, so it
+    /// is an error finding that names each image, reported once however
+    /// many nodes saw it.
+    #[test]
+    fn lost_image_is_an_error_finding() {
+        let mut inputs = healthy_inputs();
+        let lost = |node: &str| RegistryObservation {
+            node_id: node.to_string(),
+            clustered: true,
+            ready: true,
+            peer_reachable: true,
+            redundancy_possible: true,
+            under_replicated_layers: 0,
+            lost_images: vec!["web:v1".to_string(), "api:v2".to_string()],
+            lost_image_count: 2,
+            needs_mtls: false,
+        };
+        inputs.cluster.registry = available(vec![lost("node-1"), lost("node-2")]);
+
+        let report = diagnose(&inputs);
+
+        let findings: Vec<_> = report
+            .critical
+            .iter()
+            .filter(|finding| finding.id == "registry-lost-images")
+            .collect();
+        assert_eq!(findings.len(), 1, "{:?}", report.critical);
+        let details = findings[0].details.join("\n");
+        assert!(
+            details.contains("web:v1") && details.contains("api:v2"),
+            "{details}"
+        );
+        assert!(findings[0].suggestion.contains("re-push"));
+        assert!(!report.ok.iter().any(|ok| ok.id == "registry"));
+    }
+
     #[test]
     fn standalone_registry_does_not_require_peer_reachability() {
         let mut inputs = healthy_inputs();
@@ -2024,6 +2426,9 @@ mod tests {
             peer_reachable: false,
             redundancy_possible: false,
             under_replicated_layers: 0,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
+            needs_mtls: false,
         }]);
 
         let report = diagnose(&inputs);
@@ -2092,6 +2497,54 @@ mod tests {
         assert!(report.unknown.iter().any(|item| item.source == "restarts"));
     }
 
+    /// #881: an instance whose binary the node can't run will never start
+    /// by waiting. That's critical, and it names the binary and the node.
+    #[test]
+    fn a_refused_launch_is_critical_and_names_the_binary() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "ghost".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::new(),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: vec![LaunchFailureObservation {
+                node: "node-1".to_string(),
+                instance: "default__ghost-0".to_string(),
+                reason: "binary not found: /opt/ghost/server".to_string(),
+            }],
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|finding| finding.id == "launch-failed")
+            .expect("a refused launch is critical");
+        assert_eq!(
+            finding.title,
+            "app ghost/default cannot start: binary not found: /opt/ghost/server"
+        );
+        assert_eq!(
+            finding.details,
+            ["default__ghost-0 on node-1: binary not found: /opt/ghost/server"]
+        );
+        assert_eq!(finding.affected_resource, "app.ghost/default");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "under-replicated"),
+            "the launch failure is the finding, not a generic shortfall"
+        );
+    }
+
     /// Z6.7: with one of three frontends gone, `wtf` said every service had a
     /// healthy backend. Under-replication is its own finding, and it names
     /// the nodes whose placements aren't running.
@@ -2111,6 +2564,9 @@ mod tests {
             unanswered: vec!["node-3".to_string()],
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2139,6 +2595,9 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -2165,6 +2624,9 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         let finding = report
@@ -2175,6 +2637,48 @@ mod tests {
         assert_eq!(
             finding.details,
             ["1 replica placed on node-3 is not running (node-3 is not a live member)"]
+        );
+    }
+
+    /// #702: an app the scheduler placed only in part is its own finding,
+    /// saying how much is placed and why the rest has no node.
+    #[test]
+    fn an_unschedulable_app_says_why_its_replicas_have_no_node() {
+        let mut inputs = healthy_inputs();
+        let reason = "placed 1 of 3 replicas: no ready node has its required labels";
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "web".to_string(),
+            namespace: "prod".to_string(),
+            desired_replicas: 3,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::from([("node-1".to_string(), 1)]),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+            unschedulable: Some(reason.to_string()),
+            rollout_failed: None,
+            launch_failures: Vec::new(),
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "unschedulable")
+            .expect("a short app is a warning");
+        assert_eq!(
+            finding.title,
+            "app web/prod is unschedulable: 1 of 3 replicas running"
+        );
+        assert_eq!(finding.details, [reason]);
+        assert_eq!(finding.affected_resource, "app.web/prod");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "under-replicated"),
+            "the unschedulable finding replaces the generic one"
         );
     }
 
@@ -2193,6 +2697,9 @@ mod tests {
             unanswered: Vec::new(),
             blocked: Some(reason.to_string()),
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2219,6 +2726,46 @@ mod tests {
         assert!(!report.ok.iter().any(|ok| ok.id == "replicas"));
     }
 
+    /// #692: a failed rollout is a warning naming the node, the reason and
+    /// the way out, and it doesn't hide the app's other findings.
+    #[test]
+    fn a_failed_rollout_is_a_warning_that_says_how_to_clear_it() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "api".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::from([("node-1".to_string(), 1)]),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: Some(crate::meat::deploy_types::RolloutFailure {
+                fingerprint: "abc".to_string(),
+                node: "node-1".to_string(),
+                reason: "api-g1-0 failed its health check".to_string(),
+                at_unix_ms: 1,
+            }),
+            launch_failures: Vec::new(),
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "rollout-failed")
+            .expect("a failed rollout is a warning");
+        assert_eq!(
+            finding.title,
+            "app api/default's rollout failed on node-1; its other nodes stay on the previous spec"
+        );
+        assert_eq!(finding.details, ["api-g1-0 failed its health check"]);
+        assert!(finding.suggestion.contains("relish rollback api"));
+        assert!(report.ok.iter().any(|ok| ok.id == "replicas"));
+    }
+
     /// #423: a volume app waiting for its home node is an outage, so it is
     /// critical, and it names the node and both ways out.
     #[test]
@@ -2233,6 +2780,9 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: Some("node-2".to_string()),
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
 
         let report = diagnose(&inputs);
@@ -2274,6 +2824,9 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         assert!(report.critical.is_empty(), "{:?}", report.critical);
@@ -2292,6 +2845,9 @@ mod tests {
             unanswered: Vec::new(),
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
         assert!(report.warnings.is_empty());

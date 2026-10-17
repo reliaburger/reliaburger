@@ -3,7 +3,6 @@
 /// A `StateReport` is sent by each worker node to its assigned council
 /// member at the configured reporting interval. It contains all runtime
 /// state: running apps, resource usage, and recent events.
-use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +25,11 @@ pub struct StateReport {
     pub running_apps: Vec<RunningApp>,
     /// Cached desired-state specs this node was last assigned.
     pub cached_specs: Vec<CachedSpec>,
+    /// The version of each app this node's placement reconciler last
+    /// finished deploying. The leader reads rollout progress from these
+    /// (#692), so a new leader carries on where the old one stopped.
+    #[serde(default)]
+    pub rollouts: Vec<RolloutReport>,
     /// Current resource usage.
     pub resource_usage: ResourceUsage,
     /// Capacity task attempts and reusable executors hold in this node's
@@ -144,6 +148,18 @@ pub enum ReportHealthStatus {
     Unknown,
 }
 
+/// One app version a node has finished deploying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutReport {
+    /// Name of the app.
+    pub app_name: String,
+    /// Namespace the app belongs to.
+    pub namespace: String,
+    /// [`crate::meat::deploy_types::rollout_fingerprint`] of the spec the
+    /// node's share converged on.
+    pub fingerprint: String,
+}
+
 /// Cached desired-state spec on a worker node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedSpec {
@@ -191,6 +207,12 @@ pub struct CapacityRefusal {
     pub app_name: String,
     /// Namespace the app belongs to.
     pub namespace: String,
+    /// The replica ordinals the node couldn't start, in ascending order. A
+    /// refused scale-up names only the replicas it tried to add, so the
+    /// leader moves those and leaves the running ones where they are
+    /// (#971). A refused fresh deploy or rolling replacement names every
+    /// ordinal of the node's share: none of them can run the new spec here.
+    pub ordinals: Vec<u32>,
 }
 
 /// Per-instance resource usage.
@@ -231,10 +253,6 @@ pub enum ReportingMessage {
     Report(StateReport),
     /// Acknowledgement from the council member.
     Ack { node_id: NodeId },
-    /// Aggregated reports forwarded from council member to leader.
-    AggregatedReport {
-        reports: HashMap<NodeId, StateReport>,
-    },
     /// Pre-aggregated metrics rollup from worker to council aggregator.
     MetricsRollup(NodeRollup),
     /// Live scheduling capabilities and per-workload security evidence.
@@ -272,6 +290,7 @@ mod tests {
                 },
             }],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: ResourceUsage {
                 cpu_used_millicores: 500,
                 memory_used_mb: 1024,
@@ -328,6 +347,11 @@ mod tests {
                     ipv6: false,
                     workload_reachable: true,
                 },
+                process: crate::meat::cluster_state::ProcessWorkloadCapability {
+                    enabled: true,
+                    allowed_binaries: vec!["/usr/bin/python3".into()],
+                },
+                containers: true,
             },
             egress_enforcement: vec![EgressEnforcementEvidence {
                 app_name: "web".to_string(),

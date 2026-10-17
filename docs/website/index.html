@@ -124,7 +124,7 @@
         </div>
         <div class="tour">
           <p class="tour-note">Install, then put the cluster through its paces: a real
-            Kubernetes app, an app of your own, a thousand jobs, a network fault, a killed
+            Kubernetes app, an app of your own, a batch of jobs, a network fault, a killed
             replica and a lost node. Same prerequisites as the install line.</p>
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
@@ -194,7 +194,7 @@
                 <pre><code data-tour>relish batch submit burger/jobs.toml</code>
 <code data-tour>relish batch watch 1</code>
 <code data-tour>relish jobs</code></pre>
-                <p>Then a thousand jobs beside it: 1,000 small and 64 larger hashing tasks from
+                <p>Then ten jobs beside it: 8 small and 2 larger hashing tasks from
                   the same image, in two resource profiles. Each profile is stored as a template
                   and a count, not a record per task, and its tasks are packed around the apps
                   already running. <code>watch</code> takes the number <code>submit</code>
@@ -533,7 +533,8 @@
             <p>Hacking on Reliaburger itself? Start with a local process. No container
               runtime required.</p>
             <p>You’ll need Rust and the build tools for your platform. This example runs
-              <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
+              <code>hello</code> as a host process under the built-in process runtime, which
+              runs the binaries the node config allows and no images; it doesn’t create
               an isolated container or a multi-node cluster.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
               quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.0.</p>
@@ -545,7 +546,8 @@
 git clone https://github.com/reliaburger/reliaburger
 cd reliaburger
 cargo build --bins
-target/debug/bun --runtime process
+target/debug/bun --runtime process \
+  --config examples/node/process-runtime.toml
 
 <span class="comment"># Terminal 2 · from the same checkout</span>
 target/debug/relish apply \

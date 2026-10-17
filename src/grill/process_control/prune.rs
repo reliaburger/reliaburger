@@ -69,9 +69,15 @@ impl ProcessControl {
     /// The caller must already exclude other lifecycle operations on `id`, as
     /// an executor pool does for a slot it is retiring. A later `prepare`
     /// publishes a fresh generation, exactly as on a new node. A generation
-    /// that may still own a process is refused and kept.
-    pub(crate) async fn forget_retired(&self, id: &InstanceId) -> io::Result<()> {
-        self.run(id, |this, id| {
+    /// that may still own a process is refused and kept, and so is any but
+    /// `generation`, when the caller names the one it means (#850).
+    pub(crate) async fn forget_retired(
+        &self,
+        id: &InstanceId,
+        generation: Option<&super::super::RuntimeGeneration>,
+    ) -> io::Result<()> {
+        let generation = generation.cloned();
+        self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
             let garbage = this
                 .root
@@ -93,6 +99,13 @@ impl ProcessControl {
             let record = this.load(&id)?;
             if !terminal(&record.phase) {
                 return Err(io::Error::other("process generation has not retired"));
+            }
+            if generation.is_some_and(|generation| {
+                generation != super::super::RuntimeGeneration::process(&record.nonce)
+            }) {
+                return Err(io::Error::other(
+                    "a successor process generation owns the identity",
+                ));
             }
             create_directory(&garbage)?;
             let destination = garbage.join(format!("{}-{}", id.0, record.nonce));

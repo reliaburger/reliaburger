@@ -22,6 +22,16 @@ pub enum ApplyEvent {
         created: usize,
         instances: Vec<String>,
     },
+    /// A rollout over running instances failed part-way and was cleaned
+    /// up. `rolled_back` says whether every instance runs the previous spec
+    /// again (`false`: the rollout halted with both specs running). The
+    /// `Error` that ends the stream follows it. The placement reconciler
+    /// reports it to the leader, which marks the spec `RolloutFailed`.
+    RolloutAborted {
+        app: String,
+        rolled_back: bool,
+        reason: String,
+    },
     /// The deploy failed.
     Error { message: String },
 }
@@ -97,6 +107,12 @@ pub enum AgentCommand {
         namespace: String,
         spec: Box<AppSpec>,
         response: oneshot::Sender<bool>,
+    },
+    /// The placement reconciler's record of the app versions it last
+    /// finished deploying here, for the state report (#692). Replaces the
+    /// previous record.
+    RecordConvergedRollouts {
+        rollouts: Vec<crate::reporting::types::RolloutReport>,
     },
     /// Get the local desired application specs for standalone diagnostics.
     DesiredApps {
@@ -362,6 +378,7 @@ impl AgentCommand {
             AgentCommand::RetireTestResources { .. } => "retire_test_resources",
             AgentCommand::Status { .. } => "status",
             AgentCommand::AdoptedPlacementMatches { .. } => "adopted_placement_matches",
+            AgentCommand::RecordConvergedRollouts { .. } => "record_converged_rollouts",
             AgentCommand::DesiredApps { .. } => "desired_apps",
             AgentCommand::ScrapeTargets { .. } => "scrape_targets",
             AgentCommand::CurrentResources { .. } => "current_resources",
@@ -534,6 +551,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 let _ = response.send(self.adopted_instances_match(&app_name, &namespace, &spec));
             }
+            AgentCommand::RecordConvergedRollouts { rollouts } => {
+                self.converged_rollouts = rollouts;
+            }
             AgentCommand::DesiredApps { response } => {
                 let mut apps = self
                     .deployed_specs
@@ -560,6 +580,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             service_port: spec.port,
                             blocked: None,
                             volume_home_away: None,
+                            unschedulable: None,
+                            rollout_failed: None,
                             volume_homes: Vec::new(),
                         },
                     )

@@ -23,6 +23,12 @@ use crate::file_lock::{FileLock, FileLockError};
 pub(crate) mod exec;
 
 const RECORD_LIMIT: u64 = 1024 * 1024;
+/// How long the owner waits for the execution gate to say whether its
+/// `exec` worked. The gate only reads the record and joins a cgroup first,
+/// so this bounds a stalled gate, not a normal one.
+const GATE_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Largest gate report the owner reads.
+const GATE_REPORT_LIMIT: u64 = 16 * 1024;
 
 /// Durable evidence for one foreground execution generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +73,56 @@ pub struct OwnerRecord {
     pub phase: OwnerPhase,
     /// Runtime intent, persisted before starting any owner helper.
     pub launch: ProcessLaunch,
+    /// What the execution gate reported about its `exec`, once the owner
+    /// has heard (#905). Absent until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateReport>,
+}
+
+/// What the execution gate told its owner about handing over to the
+/// workload's command (#905).
+///
+/// The gate holds a close-on-exec copy of the channel its owner activates
+/// it on. A successful `exec` closes that copy without a word, so silence
+/// means the command is running. A gate that can't run the command writes
+/// why before it exits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GateReport {
+    /// The channel closed with nothing on it: `exec` replaced the gate with
+    /// the command, or the gate died without saying why.
+    Closed,
+    /// No answer within the owner's wait. The command may still be running.
+    Unanswered,
+    /// The gate failed before or at `exec`.
+    Failed {
+        /// The OS error from `exec` itself; `None` for a failure before it.
+        errno: Option<i32>,
+        /// What failed, for diagnostics.
+        reason: String,
+    },
+}
+
+impl GateReport {
+    /// Why `program` can never run as the spec stands, if that's what the
+    /// gate's `exec` said. ENOENT and ENOTDIR mean no file at the path or on
+    /// `PATH`; EACCES means one that can't be executed.
+    pub fn launch_problem(&self, program: &str) -> Option<super::LaunchProblem> {
+        let GateReport::Failed {
+            errno: Some(errno), ..
+        } = self
+        else {
+            return None;
+        };
+        let path = PathBuf::from(program);
+        match *errno {
+            nix::libc::ENOENT | nix::libc::ENOTDIR => {
+                Some(super::LaunchProblem::BinaryNotFound(path))
+            }
+            nix::libc::EACCES => Some(super::LaunchProblem::BinaryNotExecutable(path)),
+            _ => None,
+        }
+    }
 }
 
 /// Workload identity and complete runtime input for discovery before adoption.
@@ -288,11 +344,14 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(directory.join(format!("output.{suffix}")))
     };
+    // The gate's stdin is one end of a socket pair, not a pipe, so the gate
+    // can answer on it: activation goes one way, its report the other.
+    let (mut channel, gate_end) = UnixStream::pair()?;
     let child = Command::new(owner_executable()?)
         .args(["__process-exec-gate", "--directory"])
         .arg(directory)
         .process_group(0)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(gate_end)))
         .stdout(log("stdout")?)
         .stderr(log("stderr")?)
         .spawn()?;
@@ -306,13 +365,9 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
     persist(directory, record)?;
     // Spawn returns after the gate executable starts, before the user's code.
     // Its private stdin closes without activation if this owner dies here.
-    let mut activation = owned
-        .child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("execution gate has no activation pipe"))?;
-    activation.write_all(b"activate\n")?;
-    drop(activation);
+    channel.write_all(b"activate\n")?;
+    record.gate = Some(await_gate_report(channel));
+    persist(directory, record)?;
 
     let mut exit_code = None;
     let mut executions = Vec::new();
@@ -351,6 +406,25 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Wait for the execution gate to say whether its `exec` worked: silence
+/// until the channel closes means it did. Never fails: a report the owner
+/// can't read is recorded as unanswered, the old assumption that the
+/// command runs.
+fn await_gate_report(channel: UnixStream) -> GateReport {
+    let mut bytes = Vec::new();
+    let read = channel
+        .set_read_timeout(Some(GATE_REPORT_TIMEOUT))
+        .and_then(|()| (&channel).take(GATE_REPORT_LIMIT).read_to_end(&mut bytes));
+    match read {
+        Ok(_) if bytes.is_empty() => GateReport::Closed,
+        Ok(_) => serde_json::from_slice(&bytes).unwrap_or_else(|error| GateReport::Failed {
+            errno: None,
+            reason: format!("unreadable execution gate report: {error}"),
+        }),
+        Err(_) => GateReport::Unanswered,
     }
 }
 
@@ -439,11 +513,74 @@ fn enter_workload_cgroup(spec: &super::oci::OciSpec) -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("cannot join workload cgroup: {error}")))
 }
 
+/// Raise the calling process's `oom_score_adj` to the one its spec asks for,
+/// before user code runs, so the workload outranks Bun for the kernel's
+/// OOM killer (#984). The gate inherits Bun's own score (-900 under the
+/// units we ship), so without this a host workload was as protected as Bun.
+///
+/// Only ever raises: a lower score than the inherited one would need
+/// privilege and would protect a workload, which no spec should do. runc
+/// applies the same field to container workloads itself. Linux only.
+fn raise_oom_score(spec: &super::oci::OciSpec) -> io::Result<()> {
+    let Some(wanted) = spec.process.oom_score_adj else {
+        return Ok(());
+    };
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let path = Path::new("/proc/self/oom_score_adj");
+    let current: i32 = std::fs::read_to_string(path)?
+        .trim()
+        .parse()
+        .map_err(|error| io::Error::other(format!("unreadable oom_score_adj: {error}")))?;
+    if wanted <= current {
+        return Ok(());
+    }
+    std::fs::write(path, wanted.to_string())
+        .map_err(|error| io::Error::other(format!("cannot raise oom_score_adj: {error}")))
+}
+
 /// Run the child's internal gate and replace it with the foreground command.
 ///
 /// EOF, malformed activation or a mismatched durable child identity refuses
 /// before user code. The gate PID remains the workload PID across `exec`.
 pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    // A close-on-exec copy of the owner's channel. A successful `exec`
+    // closes it silently; a failure is written on it below (#905).
+    let report = io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(UnixStream::from)
+        .ok();
+    let (error, errno) = match activate_execution(directory) {
+        Ok(record) => {
+            let error = Command::new(&record.command[0])
+                .args(&record.command[1..])
+                .env_clear()
+                .envs(&record.environment)
+                .stdin(Stdio::null())
+                .exec();
+            let errno = error.raw_os_error();
+            (error, errno)
+        }
+        Err(error) => (error, None),
+    };
+    if let Some(mut report) = report {
+        // The owner may already be gone; the error below still reaches the log.
+        let failure = GateReport::Failed {
+            errno,
+            reason: error.to_string(),
+        };
+        let _ = serde_json::to_writer(&mut report, &failure);
+    }
+    Err(error)
+}
+
+/// Wait for activation and check it against the durable record, joining the
+/// workload's cgroup and taking the workload's OOM score. Returns the record
+/// whose command the gate runs.
+fn activate_execution(directory: &Path) -> io::Result<OwnerRecord> {
     let mut activation = [0u8; 9];
     io::stdin()
         .read_exact(&mut activation)
@@ -458,13 +595,8 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
         ));
     }
     enter_workload_cgroup(&record.launch.spec)?;
-    let error = Command::new(&record.command[0])
-        .args(&record.command[1..])
-        .env_clear()
-        .envs(&record.environment)
-        .stdin(Stdio::null())
-        .exec();
-    Err(error)
+    raise_oom_score(&record.launch.spec)?;
+    Ok(record)
 }
 
 struct OwnedChild {
@@ -791,11 +923,13 @@ mod tests {
             command: vec!["true".into()],
             environment: BTreeMap::new(),
             phase: OwnerPhase::Prepared,
+            gate: None,
             launch: ProcessLaunch {
                 instance_id: super::super::InstanceId("default__web-0".into()),
                 spec: OciSpec {
                     reusable_executor: false,
                     host_process: false,
+                    initialiser: false,
                     root: OciRoot {
                         path: "/".into(),
                         readonly: false,
@@ -807,6 +941,7 @@ mod tests {
                         cwd: "/".into(),
                         user: OciUser { uid: 0, gid: 0 },
                         capabilities: None,
+                        oom_score_adj: None,
                         overrides: None,
                     },
                     mounts: vec![],

@@ -7,7 +7,7 @@
 //! doesn't grant the route's action.
 //!
 //! The principals are injected as [`AuthContext`]s by a small test layer, so
-//! a single router can play every caller without paying Argon2 per request.
+//! a single router can play every caller without minting a token for each.
 //! The contexts are the same shapes the auth middleware builds: a bearer
 //! token, a read-only browser session (cookie), the internal system
 //! principal. `bearer_and_cookie_identities_hit_the_same_log_and_metric_gates`
@@ -475,6 +475,7 @@ fn instance(app: &str) -> InstanceStatus {
         pid: Some(4242),
         runtime_unknown: false,
         status_age_ms: None,
+        reason: None,
     }
 }
 
@@ -1421,6 +1422,9 @@ fn principal_body(path: &str) -> Option<&'static str> {
         "/v1/logs/export" => r#"{"destination":"/nonexistent/reliaburger-export"}"#,
         "/v1/nodes/decommission" => r#"{"node_id":"","workloads_stopped":true,"reason":"test"}"#,
         "/v1/batch/run" => r#"{"batch_id":1,"callback_base_url":null,"jobs":[]}"#,
+        "/v1/rollouts/failed" => {
+            r#"{"app_name":"web","namespace":"default","node":"node-1","fingerprint":"0","reason":"test"}"#
+        }
         "/v1/batch/{id}/report" => {
             r#"{"job_name":"job","namespace":"default","exit_code":0,"status":"completed"}"#
         }

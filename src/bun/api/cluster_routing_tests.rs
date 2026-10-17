@@ -41,6 +41,7 @@ impl FakeCluster {
             node_id: crate::meat::NodeId::new(name),
             address,
             api_advertised: true,
+            jobs: None,
         });
     }
 
@@ -77,6 +78,7 @@ fn instance(id: &str, app: &str, state: &str) -> InstanceStatus {
         pid: Some(4242),
         runtime_unknown: false,
         status_age_ms: None,
+        reason: None,
     }
 }
 
@@ -270,6 +272,7 @@ async fn start_cluster_with_desired(
             node_id: crate::meat::NodeId::new(*name),
             address: listener.local_addr().unwrap(),
             api_advertised: true,
+            jobs: None,
         });
         listeners.push(listener);
     }
@@ -829,6 +832,7 @@ fn known_member(name: &str, port: u16) -> NodeMembershipInfo {
         node_id: crate::meat::NodeId::new(name),
         address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         api_advertised: true,
+        jobs: None,
     }
 }
 
@@ -1081,6 +1085,8 @@ fn volume_app(homes: &[&str]) -> crate::bun::diagnostics::DesiredAppEvidence {
         service_port: None,
         blocked: None,
         volume_home_away: None,
+        unschedulable: None,
+        rollout_failed: None,
         volume_homes: homes.iter().map(ToString::to_string).collect(),
     }
 }

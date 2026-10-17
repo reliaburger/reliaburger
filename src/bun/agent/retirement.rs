@@ -36,6 +36,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for id in instances {
             // LOOP-INLINE: in-memory lock, no I/O
             self.supervisor.retire_instance(&id).await;
+            self.forget_runtime_metadata(&id);
         }
         self.deployed_specs
             .remove(&(app_name.to_string(), namespace.to_string()));
@@ -163,6 +164,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await?;
         }
         let identity_dir = self.instance_identity_dir(instance_id);
+        // The instance's own copies of its inline config files (#701).
+        let config_dir = self.supervisor.get_instance(instance_id).map(|instance| {
+            crate::grill::oci::inline_config_dir(
+                &self.volumes_dir,
+                &instance.namespace,
+                &instance.app_name,
+                &instance_id.0,
+            )
+        });
         let records_dir = self.records_dir.clone();
         let id = instance_id.0.clone();
         #[cfg(test)]
@@ -172,6 +182,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             stalls.hold(LoopStall::ArtifactCleanup).await;
             tokio::task::spawn_blocking(move || {
                 crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+                if let Some(directory) = config_dir {
+                    match std::fs::remove_dir_all(&directory) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(directory) = records_dir {
                     crate::grill::records::remove_record(&directory, &id)?;
                 }
@@ -220,6 +238,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Retire an instance's artifacts outside the loop (startup adoption),
     /// where nothing else is waiting, so a slow disk is simply waited out.
+    /// Nothing adopts the instance afterwards, so its runtime metadata goes
+    /// too.
     pub(super) async fn retire_instance_artifacts_fully(
         &mut self,
         instance_id: &InstanceId,
@@ -227,9 +247,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         loop {
             match self.retire_instance_artifacts(instance_id).await {
                 Err(BunError::StillRunning { .. }) => continue,
-                result => return result,
+                Ok(()) => {
+                    self.forget_runtime_metadata(instance_id);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Ask the runtime to forget an instance whose retirement is proven and
+    /// that nothing owns any more: its ownership journal, its route and their
+    /// lock files (#738). Without this, every app instance ever deleted,
+    /// scaled away or replaced left them behind.
+    ///
+    /// Call it only once the supervisor has let the instance go, or startup
+    /// has decided not to adopt it. A stopped replica that `relish stop`
+    /// keeps owned must keep its metadata, since a later apply rolls over it.
+    ///
+    /// Its init containers go too (#850), each by the generation it
+    /// launched: an immediate redeploy can reuse an initialiser's identity,
+    /// and its own init container's exit code must survive a forget that
+    /// lands late. One a live or pending parent has registered again is
+    /// left alone.
+    ///
+    /// The deletion runs in a task, so no turn waits on its fsyncs. The
+    /// runtime refuses, and keeps everything, while the identity may still
+    /// own a process or an address, including when a successor generation
+    /// of the same identity has started since. What a refusal or a crash
+    /// leaves is retired and forgotten again by the next start's adoption.
+    pub(super) fn forget_runtime_metadata(&mut self, instance_id: &InstanceId) {
+        let initialisers: Vec<_> = self
+            .initialiser_generations
+            .remove(instance_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(initialiser, _)| {
+                !self
+                    .initialisers
+                    .values()
+                    .any(|children| children.contains(initialiser))
+            })
+            .collect();
+        let grill = self.supervisor.grill().clone();
+        let id = instance_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = grill.forget_retired(&id).await {
+                eprintln!("bun: {id}: runtime metadata kept: {error}");
+            }
+            for (initialiser, generation) in initialisers {
+                if let Err(error) = grill
+                    .forget_retired_generation(&initialiser, &generation)
+                    .await
+                {
+                    eprintln!("bun: {initialiser}: runtime metadata kept: {error}");
+                }
+            }
+        });
     }
 
     /// Force-kill `id` and confirm its exit from a task, as `key`'s work
@@ -326,6 +400,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.retire_instance_artifacts(old_id).await?;
         // LOOP-INLINE: in-memory lock, no I/O
         self.supervisor.retire_instance(old_id).await;
+        self.forget_runtime_metadata(old_id);
         self.sync_firewall_ebpf().await;
         self.rebuild_routing_table().await;
         Ok(())

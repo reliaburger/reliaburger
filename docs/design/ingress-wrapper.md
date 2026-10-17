@@ -3,8 +3,8 @@
 > **Current v1 contract (2026-07-22):** Wrapper supports plain HTTP,
 > `tls = "cluster"` using the Sesame Ingress CA, and `tls = "explicit"`
 > using the certificate/key configured on the node. Omitting `tls` means
-> plain HTTP. `auto` and `acme` are deferred and rejected during route
-> rebuild. Sections labelled *deferred design* preserve the original ACME
+> plain HTTP. `auto` and `acme` are deferred: `relish apply` and
+> `relish lint` refuse them, and a route rebuild skips any that slip through. Sections labelled *deferred design* preserve the original ACME
 > proposal; they don't describe a command or capability that works today.
 
 ## 1. Overview
@@ -127,8 +127,9 @@ Wrapper manages TLS certificates per ingress route. Each route specifies a TLS m
 | `"explicit"` | Certificate and key paths from the node's `[ingress]` configuration | Public services where the operator already has a trusted certificate |
 | omitted, `"none"`, `"off"`, or `"disabled"` | No certificate | Deliberately plain-HTTP routes |
 
-`auto`, `acme`, and unknown values are configuration errors. Wrapper refuses
-the route rather than guessing or falling back to plaintext.
+`auto`, `acme`, and unknown values are configuration errors, refused at
+`relish apply` and `relish lint`. A route that reaches a node anyway is
+skipped rather than guessed at or served in plaintext.
 
 **Cluster CA flow (current):**
 
@@ -587,7 +588,9 @@ Wrapper doesn't inspect or modify WebSocket frames. It operates as a transparent
 
 ### 5.7 Rate Limiting
 
-Rate limiting uses a per-client-IP token bucket algorithm:
+Rate limiting uses a per-client-IP token bucket algorithm. Each node keeps its
+own buckets, so the limit is per node, per client IP: behind an L4 balancer that
+spreads one client over N nodes, that client gets up to N times the rate.
 
 ```rust
 fn check_rate_limit(
@@ -653,6 +656,8 @@ Backend instance starts/stops/fails health check on some node
   → Wrapper rebuilds affected BackendPool entries
   → New routing table is swapped in under the RwLock write lock
 ```
+
+**Publication failure handling:** A rebuild installs every valid route and reports the invalid ones (unsupported TLS mode, a zero rate or burst, a rate whose default burst overflows) with their namespace and app. Every caller treats that report as a warning: the route is skipped and logged, and the rest of the table, along with the catalogue generation it came with, is published. Before 0.2.1 the two cluster publication paths treated it as fatal and refused the whole catalogue generation, so one bad app froze discovery and ingress cluster-wide (#700).
 
 End-to-end latency for a routing table update: typically 1-3 seconds, dominated by the reporting tree aggregation interval. During this window, Wrapper may still route to a backend that has just become unhealthy. The active health probe (5-second interval) provides a secondary safety net.
 
@@ -735,7 +740,8 @@ drain_timeout = "30s"
 Wrapper validates ingress configuration at deploy time:
 
 - **Duplicate host/path:** If two apps declare the same `(host, path)` combination, the deploy is rejected with a clear error message.
-- **Unsupported TLS mode:** `auto`, `acme`, and unknown values reject the routing-table rebuild. Supported values are `cluster`, `explicit`, and the plain-HTTP aliases.
+- **Unsupported TLS mode:** `relish apply` and `relish lint` refuse `auto`, `acme`, and unknown values (`validate_app` calls `wrapper::routing::validate_ingress`, the same check the rebuild runs). Supported values are `cluster`, `explicit`, and the plain-HTTP aliases.
+- **Rate limit:** `rate_limit_rps = 0`, `rate_limit_burst = 0`, and a rate too large to double into the default burst are refused the same way.
 - **Invalid hostname:** Hostnames are validated against RFC 952 (alphanumeric, hyphens, dots, no wildcards in v1).
 - **Path format:** Paths must start with `/` and not contain query strings or fragments.
 
@@ -745,7 +751,7 @@ Wrapper validates ingress configuration at deploy time:
 
 | Failure | Detection | Impact | Recovery |
 |---|---|---|---|
-| **Unsupported TLS mode** | Routing-table rebuild parses `auto`, `acme`, or an unknown value | The new routing table is rejected; the previous table remains active. | Choose `cluster`, `explicit`, or a plain-HTTP alias. |
+| **Invalid route** | Refused at apply and lint; a spec that predates the check is caught when a routing-table rebuild parses its TLS mode or rate limit | That one route is skipped and logged with its namespace and app; every other route and the catalogue generation install normally. | Reapply the app with `cluster`, `explicit`, or a plain-HTTP alias and a positive rate. |
 | **Backend pool empty** | All backends removed from the service map, or marked locally unhealthy by Wrapper's active probe | Route returns 502 Bad Gateway for all requests. | Automatic: backends re-appear when the service map marks them healthy or new instances are scheduled. Wrapper re-adds them within seconds. |
 | **Certificate expiry** | Currently detected by clients, not by Wrapper | Clients reject the connection. | Restart before a cluster-issued leaf expires, or rotate the configured operator files and restart. Automatic detection, telemetry and hot rotation are required follow-up work. |
 | **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. On expiry Wrapper fires the drain's terminate token: new requests to that backend get `503`, in-flight HTTP responses stop mid-stream and close, and WebSockets are closed without a Close-1001 frame (§5.5). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |

@@ -46,15 +46,12 @@ pub(super) async fn ui_session_handler(
             None,
         ))
     } else {
-        // Snapshot the tokens under the lock, then verify through the same
-        // bounded path as a bearer (B12): a malformed token is refused by a
-        // string check before any hashing, and a well-shaped one waits for a
-        // permit from the process-wide Argon2 semaphore. This route is
-        // unauthenticated, so calling Argon2 directly here would let anyone on
-        // the network pin every core and exhaust memory with junk logins.
-        let tokens = auth.tokens.read().await.clone();
-        crate::sesame::auth::authenticate_off_lock(&form.token, tokens.clone())
-            .await
+        // Verify through the same path as a bearer (B12): a malformed token
+        // is refused by a string check before any hashing, and a well-shaped
+        // one costs a single SHA-256 (#912), so junk logins on this
+        // unauthenticated route can't pin the CPU or memory.
+        let tokens = auth.tokens.read().await;
+        crate::sesame::auth::authenticate(&form.token, &tokens)
             .ok()
             .map(|ctx| {
                 // A session opened with a rotated-out secret lives no longer

@@ -208,6 +208,13 @@ fn verify_snapshot_checksum(
     Ok(())
 }
 
+/// `replicas` held inside an `[autoscale]` block's `[min, max]`. A `min`
+/// above `max` can't reach the log (validation refuses it), but the clamp
+/// mustn't panic on one.
+fn clamp_to_bounds(replicas: u32, autoscale: &crate::config::app::AutoscaleSpec) -> u32 {
+    replicas.max(autoscale.min).min(autoscale.max)
+}
+
 /// Whether `keypair` is the age key `relish init` sealed the root CA backup
 /// to: the cluster-wide key of generation 0. Nothing else seals to it, so
 /// finalising a rotation keeps it, read-only.
@@ -544,31 +551,20 @@ impl StateMachineInner {
                 self.state.stopped_apps.insert(app_id.clone());
             }
             RaftRequest::AppDelete { app_id } => {
-                if self
-                    .state
-                    .task_arrays
-                    .deployment_owner(&app_id.name, &app_id.namespace)
-                    .is_some()
-                {
+                // A live lease's apps leave only through its cleanup, which
+                // carries the lease (#693): GitOps or a stray delete can't
+                // take a running test's workload out from under it.
+                if self.namespace_is_leased(&app_id.namespace) {
                     return Some(CouncilResponse::Refused {
-                        reason: "an outstanding job operation owns this app".into(),
+                        reason: format!(
+                            "app {app_id} belongs to a test lease; only the lease's cleanup \
+                             deletes it"
+                        ),
                     });
                 }
-                self.state.apps.remove(app_id);
-                self.state.stopped_apps.remove(app_id);
-                self.state.scheduling.remove(app_id);
-                self.state.last_placed_nodes.remove(app_id);
-                self.state.quota_blocked.remove(app_id);
-                // A deleted app leaves no baseline for an override to sit
-                // above; drop it so a re-created app of the same name starts
-                // from its own spec, not a ghost override (DEP8).
-                let key = app_id.to_string();
-                self.state.autoscale_overrides.retain(|(k, _)| k != &key);
-                let prefix = format!("{app_id}/");
-                self.state
-                    .security_state
-                    .secret_seals
-                    .retain(|key, _| !key.starts_with(&prefix));
+                if let Some(refused) = self.remove_app(app_id) {
+                    return Some(refused);
+                }
             }
             RaftRequest::SchedulingDecision(_) => {
                 return Some(CouncilResponse::Refused {
@@ -748,11 +744,37 @@ impl StateMachineInner {
             RaftRequest::DeleteTag(delete) => {
                 self.state.manifest_catalog.apply_delete_tag(delete);
             }
+            RaftRequest::ExpireManifest(expire) => {
+                // Recheck at apply time: a push, tag or deploy may have
+                // landed between the leader's plan and this entry.
+                let pinned = self.state.pinned_image_digests();
+                if let Err(reason) = self
+                    .state
+                    .manifest_catalog
+                    .apply_expire_manifest(expire, &pinned)
+                {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
             RaftRequest::AutoscaleOverride {
                 app_id,
                 replicas,
                 reason: _,
             } => {
+                // The autoscaler read a spec, decided, then wrote: a deploy
+                // that removed `[autoscale]` or narrowed it may have
+                // committed in between (#701).
+                let Some(autoscale) = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .and_then(|spec| spec.autoscale.as_ref())
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("app {app_id} doesn't autoscale"),
+                    });
+                };
+                let replicas = clamp_to_bounds(*replicas, autoscale);
                 let key = app_id.to_string();
                 if let Some((_, existing)) = self
                     .state
@@ -760,9 +782,9 @@ impl StateMachineInner {
                     .iter_mut()
                     .find(|(k, _)| k == &key)
                 {
-                    *existing = *replicas;
+                    *existing = replicas;
                 } else {
-                    self.state.autoscale_overrides.push((key, *replicas));
+                    self.state.autoscale_overrides.push((key, replicas));
                 }
             }
             RaftRequest::GitOpsCoordinatorElection(election) => {
@@ -1140,10 +1162,61 @@ impl StateMachineInner {
                 self.state.security_state.crl.updated_at = logical_now;
             }
             RaftRequest::Noop => {}
+            RaftRequest::RolloutFailed { app_id, failure } => {
+                let current = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .map(crate::meat::deploy_types::rollout_fingerprint);
+                if current.as_deref() != Some(failure.fingerprint.as_str()) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "the failed rollout is not of {app_id}'s current spec; nothing to mark"
+                        ),
+                    });
+                }
+                let rollouts = self.state.rollouts.entry(app_id.clone()).or_default();
+                // The first failure is the one that explains it. Another
+                // node's report of the same spec adds nothing.
+                if rollouts.failed_for(&failure.fingerprint).is_none() {
+                    let mut failure = failure.clone();
+                    failure.reason = failure.reason.chars().take(512).collect();
+                    rollouts.failed = Some(failure);
+                }
+            }
+            RaftRequest::RolloutReleased { app_id, spec } => {
+                let fingerprint = crate::meat::deploy_types::rollout_fingerprint(spec);
+                let current = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .map(crate::meat::deploy_types::rollout_fingerprint);
+                if current.as_deref() != Some(fingerprint.as_str()) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "the released spec is not {app_id}'s current spec; not a rollback target"
+                        ),
+                    });
+                }
+                let rollouts = self.state.rollouts.entry(app_id.clone()).or_default();
+                // Running healthy everywhere is the answer to a failure report.
+                if rollouts.failed_for(&fingerprint).is_some() {
+                    rollouts.failed = None;
+                }
+                rollouts.release(spec);
+            }
             RaftRequest::QuotaBlocked { blocked } => {
                 // Only apps still in desired state: a delete committed after
                 // the leader planned must not leave a ghost reason behind.
                 self.state.quota_blocked = blocked
+                    .iter()
+                    .filter(|(app_id, _)| self.state.apps.contains_key(app_id))
+                    .cloned()
+                    .collect();
+            }
+            RaftRequest::Unschedulable { apps } => {
+                // As for `QuotaBlocked`: no reason outlives its app.
+                self.state.unschedulable = apps
                     .iter()
                     .filter(|(app_id, _)| self.state.apps.contains_key(app_id))
                     .cloned()
@@ -1331,13 +1404,23 @@ impl StateMachineInner {
                 self.state.namespaces.insert(name.clone(), *spec.clone());
             }
             RaftRequest::NamespaceDelete { name } => {
+                if self.namespace_is_leased(name) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "namespace {name} belongs to a test lease; only the lease's \
+                             cleanup deletes it"
+                        ),
+                    });
+                }
                 self.state.namespaces.remove(name);
+                self.state.gitops_owned.namespaces.remove(name);
             }
             RaftRequest::PermissionSpec { name, spec } => {
                 self.state.permissions.insert(name.clone(), *spec.clone());
             }
             RaftRequest::PermissionDelete { name } => {
                 self.state.permissions.remove(name);
+                self.state.gitops_owned.permissions.remove(name);
             }
             RaftRequest::RegisterEndpointConsumer { node_id } => {
                 if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
@@ -2042,6 +2125,11 @@ impl StateMachineInner {
                 for placements in self.state.scheduling.values_mut() {
                     placements.retain(|placement| placement.node_id.0 != *node_id);
                 }
+                // Its image copies will never serve again: heal must see
+                // every image it held as under-replicated (#697).
+                self.state
+                    .manifest_catalog
+                    .remove_node_holdings(registry_node_id);
                 self.state.endpoint_catalog = catalog;
                 self.state.endpoint_withdrawals = withdrawals;
                 let released_node_fault = self
@@ -2300,7 +2388,158 @@ impl StateMachineInner {
                     last_error: Some(reason.chars().take(512).collect()),
                 };
             }
+            RaftRequest::GitOpsWrite { term, change } => {
+                return self.apply_gitops_write(*term, change, position);
+            }
+            RaftRequest::GitOpsConfigSet { config, seed } => {
+                if *seed && self.state.gitops_config.is_some() {
+                    return Some(CouncilResponse::Refused {
+                        reason: "the cluster already has a GitOps configuration".into(),
+                    });
+                }
+                self.state.gitops_config = config.as_deref().cloned();
+            }
+            RaftRequest::TestLeaseAppDelete { lease_id, app_id } => {
+                if !self
+                    .state
+                    .test_leases
+                    .get(lease_id)
+                    .is_some_and(|lease| lease.namespace == app_id.namespace)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "app is not in this lease's namespace".into(),
+                    });
+                }
+                if let Some(refused) = self.remove_app(app_id) {
+                    return Some(refused);
+                }
+            }
+            RaftRequest::TestLeaseNamespaceDelete { lease_id, name } => {
+                if !self
+                    .state
+                    .test_leases
+                    .get(lease_id)
+                    .is_some_and(|lease| &lease.namespace == name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "namespace does not belong to this lease".into(),
+                    });
+                }
+                self.state.namespaces.remove(name);
+                self.state.gitops_owned.namespaces.remove(name);
+            }
         }
+        None
+    }
+
+    /// Apply a Lettuce write and record what GitOps owns, in one entry (#693).
+    ///
+    /// Refused when the entry wasn't proposed in the term the sync read its
+    /// snapshot in (finding 7), when the change isn't a declarative spec or
+    /// delete, and when it deletes a resource GitOps didn't write (D9).
+    fn apply_gitops_write(
+        &mut self,
+        term: u64,
+        change: &RaftRequest,
+        position: ApplyEntryPosition,
+    ) -> Option<CouncilResponse> {
+        let entry_term = position.current_log_id.map(|id| id.leader_id.get_term());
+        if entry_term != Some(term) {
+            return Some(CouncilResponse::Refused {
+                reason: format!(
+                    "the GitOps sync read desired state in term {term} but wrote in term \
+                     {}; leadership changed, so the sync is abandoned",
+                    entry_term.map_or_else(|| "unknown".to_string(), |t| t.to_string())
+                ),
+            });
+        }
+        let owned = &self.state.gitops_owned;
+        let unowned = match change {
+            RaftRequest::AppSpec { .. }
+            | RaftRequest::NamespaceSpec { .. }
+            | RaftRequest::PermissionSpec { .. } => None,
+            RaftRequest::AppDelete { app_id } => {
+                (!owned.apps.contains(app_id)).then(|| format!("app {app_id}"))
+            }
+            RaftRequest::NamespaceDelete { name } => {
+                (!owned.namespaces.contains(name)).then(|| format!("namespace {name}"))
+            }
+            RaftRequest::PermissionDelete { name } => {
+                (!owned.permissions.contains(name)).then(|| format!("permission {name}"))
+            }
+            _ => {
+                return Some(CouncilResponse::Refused {
+                    reason: "a GitOps write carries only app, namespace and permission changes"
+                        .into(),
+                });
+            }
+        };
+        if let Some(resource) = unowned {
+            return Some(CouncilResponse::Refused {
+                reason: format!("GitOps didn't write {resource}, so it won't delete it"),
+            });
+        }
+        let response = self.apply_request_at(change, position);
+        if matches!(response, Some(CouncilResponse::Refused { .. })) {
+            return response;
+        }
+        // Deletes forget ownership in their own handlers, as a manual
+        // delete does; a spec is GitOps-owned from this write on.
+        let owned = &mut self.state.gitops_owned;
+        match change {
+            RaftRequest::AppSpec { app_id, .. } => {
+                owned.apps.insert(app_id.clone());
+            }
+            RaftRequest::NamespaceSpec { name, .. } => {
+                owned.namespaces.insert(name.clone());
+            }
+            RaftRequest::PermissionSpec { name, .. } => {
+                owned.permissions.insert(name.clone());
+            }
+            _ => {}
+        }
+        response
+    }
+
+    /// Whether a live test lease owns `namespace`.
+    fn namespace_is_leased(&self, namespace: &str) -> bool {
+        self.state
+            .test_leases
+            .values()
+            .any(|lease| lease.namespace == namespace)
+    }
+
+    /// Remove an app and everything desired state keeps for it, unless an
+    /// outstanding job deployment owns it.
+    fn remove_app(&mut self, app_id: &crate::meat::types::AppId) -> Option<CouncilResponse> {
+        if self
+            .state
+            .task_arrays
+            .deployment_owner(&app_id.name, &app_id.namespace)
+            .is_some()
+        {
+            return Some(CouncilResponse::Refused {
+                reason: "an outstanding job operation owns this app".into(),
+            });
+        }
+        self.state.apps.remove(app_id);
+        self.state.stopped_apps.remove(app_id);
+        self.state.rollouts.remove(app_id);
+        self.state.scheduling.remove(app_id);
+        self.state.last_placed_nodes.remove(app_id);
+        self.state.quota_blocked.remove(app_id);
+        self.state.unschedulable.remove(app_id);
+        self.state.gitops_owned.apps.remove(app_id);
+        // A deleted app leaves no baseline for an override to sit
+        // above; drop it so a re-created app of the same name starts
+        // from its own spec, not a ghost override (DEP8).
+        let key = app_id.to_string();
+        self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+        let prefix = format!("{app_id}/");
+        self.state
+            .security_state
+            .secret_seals
+            .retain(|key, _| !key.starts_with(&prefix));
         None
     }
 
@@ -2316,11 +2555,37 @@ impl StateMachineInner {
             .apps
             .get(app_id)
             .is_some_and(|old| old.replicas != spec.replicas);
+        let key = app_id.to_string();
         if baseline_changed {
-            let key = app_id.to_string();
             self.state.autoscale_overrides.retain(|(k, _)| k != &key);
         }
+        // An override lives inside the `[autoscale]` bounds. Removing the
+        // block leaves nothing that could ever move it again, so it goes;
+        // narrowing the bounds clamps it (#701).
+        match &spec.autoscale {
+            None => self.state.autoscale_overrides.retain(|(k, _)| k != &key),
+            Some(autoscale) => {
+                for (_, replicas) in self
+                    .state
+                    .autoscale_overrides
+                    .iter_mut()
+                    .filter(|(k, _)| k == &key)
+                {
+                    *replicas = clamp_to_bounds(*replicas, autoscale);
+                }
+            }
+        }
+        // A different spec is the operator's answer to a failed rollout
+        // (#692, D11-B). The same spec again, a GitOps re-sync say, isn't:
+        // it would only fail the same way. "Different" means any change,
+        // a scale change included (#929): the version's fingerprint sets
+        // replicas aside, but an operator who changed the spec expects a
+        // new rollout, not the old failure.
+        let identical = self.state.apps.get(app_id) == Some(spec);
         self.state.apps.insert(app_id.clone(), spec.clone());
+        if !identical && let Some(rollouts) = self.state.rollouts.get_mut(app_id) {
+            rollouts.failed = None;
+        }
         // Applying an app is how it starts again after `relish stop`.
         self.state.stopped_apps.remove(app_id);
         // Applying a spec is when encrypted values were re-sealed.
@@ -2655,7 +2920,7 @@ impl CouncilStateMachine {
         // A recovered node re-bootstraps its own Raft: the old log id and
         // membership belong to the cluster that died, so we drop them and let
         // `initialize` establish a fresh term line and voter set.
-        state.enter_recovery_epoch();
+        state.enter_recovery_epoch(0);
 
         let inner = StateMachineInner {
             state,
@@ -2668,10 +2933,12 @@ impl CouncilStateMachine {
     }
 
     /// Offline disaster recovery (12b.2 D21/CP12): stamp a restored
-    /// `DesiredState` into the durable snapshot store at `snapshot_db`,
-    /// bumping the recovery epoch and clearing the dead cluster's log id and
-    /// membership. The next node start loads this snapshot via
-    /// [`CouncilStateMachine::with_store`] and re-bootstraps a fresh Raft.
+    /// `DesiredState` into the durable snapshot store at `snapshot_db`. The
+    /// caller has already entered the new recovery epoch
+    /// ([`DesiredState::enter_recovery_epoch`]), which needs the recovering
+    /// node's fence record as its floor (#694). The next node start loads
+    /// this snapshot via [`CouncilStateMachine::with_store`] and
+    /// re-bootstraps a fresh Raft.
     ///
     /// The write uses the same enveloped format (version + checksum) as a
     /// normal snapshot, so nothing downstream can tell a recovered snapshot
@@ -2680,9 +2947,8 @@ impl CouncilStateMachine {
     #[allow(clippy::result_large_err)]
     pub fn persist_recovered_snapshot(
         snapshot_db: &Database,
-        mut state: DesiredState,
+        state: DesiredState,
     ) -> Result<(), redb::Error> {
-        state.enter_recovery_epoch();
         // Serialisation of a plain struct with only owned data is infallible in
         // practice; map any error into a redb error rather than panicking.
         let data = serde_json::to_vec(&state)
@@ -2956,6 +3222,163 @@ mod tests {
         toml::from_str(r#"image = "test:v1""#).unwrap()
     }
 
+    fn web_spec(image: &str) -> Box<AppSpec> {
+        Box::new(toml::from_str(&format!("image = {image:?}\nreplicas = 3\n")).unwrap())
+    }
+
+    fn failure_of(spec: &AppSpec) -> crate::meat::deploy_types::RolloutFailure {
+        crate::meat::deploy_types::RolloutFailure {
+            fingerprint: crate::meat::deploy_types::rollout_fingerprint(spec),
+            node: "node-2".into(),
+            reason: "web-g1-0 failed its health check".into(),
+            at_unix_ms: 1,
+        }
+    }
+
+    /// An app whose rollout of `image` failed on a node.
+    fn failed_rollout(image: &str) -> (StateMachineInner, AppId) {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        let spec = web_spec(image);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: spec.clone(),
+        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::RolloutFailed {
+                app_id: app_id.clone(),
+                failure: failure_of(&spec),
+            }),
+            None
+        );
+        (inner, app_id)
+    }
+
+    #[test]
+    fn identical_spec_reapply_keeps_rollout_failed() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        // A GitOps re-sync applies the very same spec again.
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v2"),
+        });
+        let failed = inner.state.rollouts[&app_id].failed.clone();
+        assert_eq!(failed, Some(failure_of(&web_spec("web:v2"))));
+    }
+
+    /// #929: a scale change keeps the version, so the mark used to stay,
+    /// and the operator's new apply changed nothing they could see. Any
+    /// change to the spec answers the failure and starts a new rollout.
+    #[test]
+    fn scale_change_clears_rollout_failed() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        let mut scaled = web_spec("web:v2");
+        scaled.replicas = crate::config::Replicas::Fixed(5);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: scaled,
+        });
+        assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    /// #929: once a scale change has cleared the mark, the same version
+    /// can fail again, and is marked again.
+    #[test]
+    fn a_version_that_fails_again_after_a_scale_change_is_marked_again() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        let mut scaled = web_spec("web:v2");
+        scaled.replicas = crate::config::Replicas::Fixed(5);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: scaled.clone(),
+        });
+        let again = crate::meat::deploy_types::RolloutFailure {
+            at_unix_ms: 2,
+            ..failure_of(&scaled)
+        };
+        assert_eq!(
+            inner.apply_request(&RaftRequest::RolloutFailed {
+                app_id: app_id.clone(),
+                failure: again.clone(),
+            }),
+            None
+        );
+        assert_eq!(inner.state.rollouts[&app_id].failed, Some(again));
+    }
+
+    #[test]
+    fn new_spec_clears_rollout_failed() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v3"),
+        });
+        assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    #[test]
+    fn a_failure_of_a_spec_the_operator_replaced_is_refused() {
+        let (mut inner, app_id) = failed_rollout("web:v2");
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v3"),
+        });
+        // A late report from another node of v2's rollout.
+        let late = inner.apply_request(&RaftRequest::RolloutFailed {
+            app_id: app_id.clone(),
+            failure: failure_of(&web_spec("web:v2")),
+        });
+        assert!(matches!(late, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    #[test]
+    fn rollback_targets_are_capped_at_ten_per_app() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        for version in 0..15 {
+            let spec = web_spec(&format!("web:v{version}"));
+            inner.apply_request(&RaftRequest::AppSpec {
+                app_id: app_id.clone(),
+                spec: spec.clone(),
+            });
+            assert_eq!(
+                inner.apply_request(&RaftRequest::RolloutReleased {
+                    app_id: app_id.clone(),
+                    spec,
+                }),
+                None
+            );
+        }
+        // v14 again, released a second time, doesn't take two slots.
+        inner.apply_request(&RaftRequest::RolloutReleased {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v14"),
+        });
+        let images: Vec<String> = inner.state.rollouts[&app_id]
+            .released
+            .iter()
+            .filter_map(|spec| spec.image.clone())
+            .collect();
+        assert_eq!(
+            images,
+            (5..15).map(|v| format!("web:v{v}")).collect::<Vec<_>>()
+        );
+        // Releasing a spec that is no longer current is refused.
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::RolloutReleased {
+                app_id: app_id.clone(),
+                spec: web_spec("web:v3"),
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        // A deleted app takes its rollout record with it.
+        inner.apply_request(&RaftRequest::AppDelete {
+            app_id: app_id.clone(),
+        });
+        assert!(!inner.state.rollouts.contains_key(&app_id));
+    }
+
     fn log_id(term: u64, index: u64) -> LogId<u64> {
         LogId::new(openraft::CommittedLeaderId::new(term, 0), index)
     }
@@ -2975,7 +3398,9 @@ mod tests {
     async fn only_an_offline_recovery_snapshot_is_a_pending_bootstrap() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::create(dir.path().join("snapshot.redb")).unwrap());
-        CouncilStateMachine::persist_recovered_snapshot(&db, DesiredState::default()).unwrap();
+        let mut state = DesiredState::default();
+        state.enter_recovery_epoch(0);
+        CouncilStateMachine::persist_recovered_snapshot(&db, state).unwrap();
         let mut recovered = CouncilStateMachine::with_store(db).unwrap();
         assert!(recovered.recovered_bootstrap_pending().await);
         assert!(
@@ -3833,7 +4258,7 @@ mod tests {
         let app_id = AppId::new("web", "prod");
         let spec = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         sm.apply_fixture(vec![
             normal_entry(
@@ -3877,11 +4302,11 @@ mod tests {
         let app_id = AppId::new("web", "prod");
         let spec2 = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         let spec4 = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(4),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         sm.apply_fixture(vec![
             normal_entry(
@@ -3931,12 +4356,12 @@ mod tests {
         let spec = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
             image: Some("web:v1".to_string()),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         let spec_new_image = AppSpec {
             replicas: crate::config::types::Replicas::Fixed(2),
             image: Some("web:v2".to_string()),
-            ..default_spec()
+            ..autoscaled_spec(1, 10)
         };
         sm.apply_fixture(vec![
             normal_entry(
@@ -3974,6 +4399,101 @@ mod tests {
             vec![("prod/web".to_string(), 5)],
             "an image-only redeploy must keep the override"
         );
+    }
+
+    /// An app with two fixed replicas that autoscales between `min` and `max`.
+    fn autoscaled_spec(min: u32, max: u32) -> AppSpec {
+        toml::from_str(&format!(
+            "image = \"test:v1\"\nreplicas = 2\n\
+             [autoscale]\nmetric = \"cpu\"\ntarget = \"70%\"\nmin = {min}\nmax = {max}\n"
+        ))
+        .unwrap()
+    }
+
+    /// Apply `spec`, then an override to `replicas`, then each of `then` in
+    /// turn, and return the override the app is left with.
+    async fn override_after(
+        spec: AppSpec,
+        replicas: u32,
+        then: Vec<AppSpec>,
+    ) -> (Vec<CouncilResponse>, Vec<(String, u32)>) {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let mut entries = vec![
+            normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec),
+                },
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::AutoscaleOverride {
+                    app_id: app_id.clone(),
+                    replicas,
+                    reason: "load".to_string(),
+                },
+            ),
+        ];
+        for (offset, next) in then.into_iter().enumerate() {
+            entries.push(normal_entry(
+                1,
+                3 + offset as u64,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(next),
+                },
+            ));
+        }
+        let responses = sm.apply_fixture(entries).await.unwrap();
+        (responses, sm.desired_state().await.autoscale_overrides)
+    }
+
+    #[tokio::test]
+    async fn removing_autoscale_clears_the_override() {
+        // #701: the autoscaler skips an app without `[autoscale]`, but the
+        // scheduler kept applying its last override, pinning it at 8.
+        let without = AppSpec {
+            replicas: crate::config::types::Replicas::Fixed(2),
+            ..default_spec()
+        };
+        let (_, overrides) = override_after(autoscaled_spec(1, 10), 8, vec![without]).await;
+        assert!(
+            overrides.is_empty(),
+            "removing [autoscale] must clear the override: {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn narrowing_autoscale_bounds_clamps_the_override() {
+        let (_, overrides) =
+            override_after(autoscaled_spec(1, 10), 8, vec![autoscaled_spec(1, 5)]).await;
+        assert_eq!(overrides, vec![("prod/web".to_string(), 5)]);
+
+        let (_, overrides) =
+            override_after(autoscaled_spec(1, 10), 2, vec![autoscaled_spec(4, 10)]).await;
+        assert_eq!(overrides, vec![("prod/web".to_string(), 4)]);
+    }
+
+    #[tokio::test]
+    async fn an_override_for_an_app_without_autoscale_is_refused() {
+        // The autoscaler read a spec with `[autoscale]`; a deploy removing
+        // it committed first. The late override must not pin the app.
+        let (responses, overrides) = override_after(default_spec(), 8, Vec::new()).await;
+        assert!(
+            matches!(responses[1], CouncilResponse::Refused { .. }),
+            "{responses:?}"
+        );
+        assert!(overrides.is_empty(), "{overrides:?}");
+    }
+
+    #[tokio::test]
+    async fn an_override_outside_the_bounds_is_clamped() {
+        let (_, overrides) = override_after(autoscaled_spec(1, 5), 9, Vec::new()).await;
+        assert_eq!(overrides, vec![("prod/web".to_string(), 5)]);
     }
 
     #[tokio::test]
@@ -5349,12 +5869,20 @@ mod tests {
                 RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
                     repository: "team-copy/app".into(),
                     tag: "latest".into(),
+                    deleted_at_unix_ms: 1,
                 }),
             )])
             .await
             .unwrap();
         let state = restored.desired_state().await;
-        assert_eq!(state.manifest_catalog.manifests.len(), 1);
+        // Deleting the tag untags only the copy; expiry removes it later.
+        assert_eq!(state.manifest_catalog.manifests.len(), 2);
+        assert!(
+            state
+                .manifest_catalog
+                .get_manifest_by_tag("team-copy/app", "latest")
+                .is_none()
+        );
         let retained = state
             .manifest_catalog
             .get_manifest_by_tag("myapp", "latest")
@@ -5458,7 +5986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_delete_tag_removes_manifest() {
+    async fn apply_delete_tag_untags_the_manifest() {
         let mut sm = CouncilStateMachine::new();
 
         // Push a manifest with tag "latest"
@@ -5475,6 +6003,7 @@ mod tests {
         let delete = crate::pickle::types::DeleteTag {
             repository: "myapp".to_string(),
             tag: "latest".to_string(),
+            deleted_at_unix_ms: 42,
         };
         sm.apply_fixture(vec![normal_entry(1, 2, RaftRequest::DeleteTag(delete))])
             .await
@@ -5487,6 +6016,177 @@ mod tests {
                 .get_manifest_by_tag("myapp", "latest")
                 .is_none()
         );
+        let digest = test_manifest_commit().manifest.digest;
+        assert_eq!(
+            state.manifest_catalog.untagged_since("myapp", &digest),
+            Some(42)
+        );
+    }
+
+    /// #697: the leader's ExpireManifest removes an untagged manifest whose
+    /// untagging it observed, and nothing else.
+    #[test]
+    fn expire_manifest_removes_an_untagged_unpinned_manifest() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        let digest = commit.manifest.digest.clone();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+        inner.apply_request(&RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 42,
+        }));
+
+        let response = inner.apply_request(&RaftRequest::ExpireManifest(
+            crate::pickle::types::ExpireManifest {
+                repository: "myapp".into(),
+                digest: digest.clone(),
+                untagged_at_unix_ms: 42,
+            },
+        ));
+
+        assert!(response.is_none(), "{response:?}");
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest("myapp", digest.as_str())
+                .is_none()
+        );
+    }
+
+    /// #697: an app in desired state that pins the digest keeps the
+    /// manifest, however long it has been untagged.
+    #[test]
+    fn expire_manifest_refuses_a_digest_an_app_pins() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        let digest = commit.manifest.digest.clone();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+        inner.apply_request(&RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 42,
+        }));
+        inner.state.apps.insert(
+            AppId::new("web", "prod"),
+            AppSpec {
+                image: Some(format!("myapp:latest@{}", digest.as_str())),
+                ..default_spec()
+            },
+        );
+
+        let response = inner.apply_request(&RaftRequest::ExpireManifest(
+            crate::pickle::types::ExpireManifest {
+                repository: "myapp".into(),
+                digest: digest.clone(),
+                untagged_at_unix_ms: 42,
+            },
+        ));
+
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest("myapp", digest.as_str())
+                .is_some()
+        );
+    }
+
+    /// #692: a rollback target keeps its image, even once the app has moved
+    /// on to another version: `relish rollback` must still be able to pull it.
+    #[test]
+    fn expire_manifest_refuses_a_digest_a_rollback_target_pins() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        let digest = commit.manifest.digest.clone();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+        inner.apply_request(&RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+            repository: "myapp".into(),
+            tag: "latest".into(),
+            deleted_at_unix_ms: 42,
+        }));
+        let app_id = AppId::new("web", "prod");
+        let old = AppSpec {
+            image: Some(format!("myapp:latest@{}", digest.as_str())),
+            ..default_spec()
+        };
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: Box::new(old.clone()),
+        });
+        inner.apply_request(&RaftRequest::RolloutReleased {
+            app_id: app_id.clone(),
+            spec: Box::new(old),
+        });
+        // The app now runs something else; only the rollback target names
+        // the old digest.
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id,
+            spec: Box::new(default_spec()),
+        });
+
+        let response = inner.apply_request(&RaftRequest::ExpireManifest(
+            crate::pickle::types::ExpireManifest {
+                repository: "myapp".into(),
+                digest: digest.clone(),
+                untagged_at_unix_ms: 42,
+            },
+        ));
+
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "{response:?}"
+        );
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest("myapp", digest.as_str())
+                .is_some()
+        );
+    }
+
+    /// #697: a decommissioned node's copies never serve again, so it leaves
+    /// every holder set and heal sees the image as under-replicated.
+    #[test]
+    fn decommission_prunes_the_node_from_registry_holder_sets() {
+        let mut inner = StateMachineInner::default();
+        let node = "gone-for-good";
+        let mut commit = test_manifest_commit();
+        commit.holder_nodes = std::collections::BTreeSet::from([
+            1,
+            crate::cluster::identity::raft_id_from_name(node),
+        ]);
+        let digests: Vec<_> = commit
+            .manifest
+            .referenced_digests()
+            .into_iter()
+            .cloned()
+            .collect();
+        inner.apply_request(&RaftRequest::ManifestCommit(commit));
+
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: node.into(),
+                retired_by: "operator".into(),
+                reason: "disk died".into(),
+                retired_at_unix_ms: 20,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+
+        for digest in digests {
+            assert_eq!(
+                inner.state.manifest_catalog.layer_holders(digest.as_str()),
+                std::collections::BTreeSet::from([1])
+            );
+        }
     }
 
     // --- SecurityState Raft tests ---
@@ -5515,7 +6215,6 @@ mod tests {
             api_tokens: vec![crate::sesame::types::ApiToken {
                 name: "admin".to_string(),
                 token_hash: vec![1],
-                token_salt: vec![2],
                 role: crate::sesame::types::ApiRole::Admin,
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
@@ -6413,6 +7112,47 @@ mod tests {
         assert_eq!(restored.quota_blocked.get(&web), Some(&cpu_block("prod")));
     }
 
+    fn short_of_room(placed: u32) -> crate::meat::types::Unschedulable {
+        crate::meat::types::Unschedulable {
+            placed,
+            wanted: 3,
+            reason: crate::meat::types::UnplacedReason::NoRoom,
+        }
+    }
+
+    /// #702: the leader replaces the set of short apps, which survives a
+    /// snapshot, keeps no ghost and goes with its app.
+    #[test]
+    fn unschedulable_replaces_the_set_and_goes_with_its_app() {
+        let mut inner = StateMachineInner::default();
+        apply_app(&mut inner, "web", "prod");
+        apply_app(&mut inner, "api", "prod");
+        let web = crate::meat::types::AppId::new("web", "prod");
+        let api = crate::meat::types::AppId::new("api", "prod");
+        let ghost = crate::meat::types::AppId::new("ghost", "prod");
+
+        inner.apply_request(&RaftRequest::Unschedulable {
+            apps: vec![
+                (web.clone(), short_of_room(2)),
+                (ghost.clone(), short_of_room(1)),
+            ],
+        });
+        assert_eq!(inner.state.unschedulable.get(&web), Some(&short_of_room(2)));
+        assert!(!inner.state.unschedulable.contains_key(&ghost));
+
+        let json = serde_json::to_vec(&inner.state).unwrap();
+        let restored: DesiredState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.unschedulable.get(&web), Some(&short_of_room(2)));
+
+        inner.apply_request(&RaftRequest::Unschedulable {
+            apps: vec![(api.clone(), short_of_room(0))],
+        });
+        assert!(!inner.state.unschedulable.contains_key(&web));
+
+        inner.apply_request(&RaftRequest::AppDelete { app_id: api });
+        assert!(inner.state.unschedulable.is_empty());
+    }
+
     #[test]
     fn apply_create_join_token() {
         let mut inner = StateMachineInner::default();
@@ -6518,7 +7258,6 @@ mod tests {
         let token = crate::sesame::types::ApiToken {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: crate::sesame::types::ApiRole::Deployer,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
@@ -6536,7 +7275,6 @@ mod tests {
         let token = crate::sesame::types::ApiToken {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: crate::sesame::types::ApiRole::Deployer,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
@@ -6560,7 +7298,6 @@ mod tests {
         crate::sesame::types::ApiToken {
             name: name.to_string(),
             token_hash: name.as_bytes().to_vec(),
-            token_salt: vec![4, 5, 6],
             role,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: expires_unix_ms
@@ -6700,7 +7437,6 @@ mod tests {
         let api_token = |name: &str, role: ApiRole| ApiToken {
             name: name.to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role,
             scope: TokenScope::default(),
             expires_at: None,
@@ -6771,7 +7507,6 @@ mod tests {
         crate::sesame::types::TokenRotation {
             name: name.to_string(),
             token_hash: vec![hash; 3],
-            token_salt: vec![hash; 3],
             rotated_at: now,
             expires_at: None,
             previous_valid_until: Some(now + std::time::Duration::from_secs(3_600)),
@@ -6789,7 +7524,6 @@ mod tests {
         inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: ApiRole::Deployer,
             scope: scope.clone(),
             expires_at: None,
@@ -6818,7 +7552,6 @@ mod tests {
         inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
             name: "root".to_string(),
             token_hash: vec![1, 2, 3],
-            token_salt: vec![4, 5, 6],
             role: ApiRole::Admin,
             scope: TokenScope::default(),
             expires_at: None,
@@ -7667,7 +8400,7 @@ mod tests {
             allocated: crate::meat::Resources::default(),
             labels: Default::default(),
             ready: true,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 0,
             cached_images: Default::default(),
@@ -7851,7 +8584,6 @@ mod tests {
         crate::sesame::types::ApiToken {
             name: "rbtest-run1-scope".into(),
             token_hash: vec![1; 32],
-            token_salt: vec![2; 16],
             role: crate::sesame::types::ApiRole::Deployer,
             scope: crate::sesame::types::TokenScope {
                 apps: None,
@@ -8214,7 +8946,8 @@ mod tests {
             inner.apply_request(&ready),
             Some(CouncilResponse::Refused { .. })
         ));
-        inner.apply_request(&RaftRequest::AppDelete {
+        inner.apply_request(&RaftRequest::TestLeaseAppDelete {
+            lease_id: "run1".into(),
             app_id: app_id.clone(),
         });
         assert!(matches!(
@@ -8884,7 +9617,8 @@ mod tests {
         requests.push(RaftRequest::TestLeaseBeginCleanup {
             lease_id: "run1".into(),
         });
-        requests.push(RaftRequest::AppDelete {
+        requests.push(RaftRequest::TestLeaseAppDelete {
+            lease_id: "run1".into(),
             app_id: AppId::new("web", "rbtest-run1"),
         });
         for (index, request) in requests.into_iter().enumerate() {
@@ -8989,7 +9723,8 @@ mod tests {
             RaftRequest::TestLeaseBeginCleanup {
                 lease_id: "run1".into(),
             },
-            RaftRequest::AppDelete {
+            RaftRequest::TestLeaseAppDelete {
+                lease_id: "run1".into(),
                 app_id: app_id.clone(),
             },
         ];
@@ -9188,7 +9923,8 @@ mod tests {
         sm.apply_fixture(vec![normal_entry(
             1,
             5,
-            RaftRequest::AppDelete {
+            RaftRequest::TestLeaseAppDelete {
+                lease_id: "run1".into(),
                 app_id: app_id.clone(),
             },
         )])
@@ -9499,5 +10235,341 @@ mod tests {
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(inner.state.gitops_sync_state.unwrap(), before);
+    }
+
+    fn gitops_write(term: u64, change: RaftRequest) -> RaftRequest {
+        RaftRequest::GitOpsWrite {
+            term,
+            change: Box::new(change),
+        }
+    }
+
+    fn namespace_spec() -> Box<crate::config::NamespaceSpec> {
+        Box::new(toml::from_str(r#"cpu = "1000m""#).unwrap())
+    }
+
+    /// #693: a GitOps write records the resource it wrote in the same
+    /// entry, and a manual write of another resource is not recorded.
+    #[tokio::test]
+    async fn gitops_write_records_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "prod");
+        let manual = AppId::new("manual", "prod");
+        let responses = sm
+            .apply_fixture(vec![
+                normal_entry(
+                    3,
+                    1,
+                    gitops_write(
+                        3,
+                        RaftRequest::NamespaceSpec {
+                            name: "prod".into(),
+                            spec: namespace_spec(),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    2,
+                    gitops_write(
+                        3,
+                        RaftRequest::PermissionSpec {
+                            name: "deployers".into(),
+                            spec: Box::new(crate::config::PermissionSpec {
+                                actions: vec!["deploy".into()],
+                                apps: vec![],
+                                namespaces: None,
+                            }),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    3,
+                    gitops_write(
+                        3,
+                        RaftRequest::AppSpec {
+                            app_id: web.clone(),
+                            spec: Box::new(default_spec()),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    3,
+                    4,
+                    RaftRequest::AppSpec {
+                        app_id: manual.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            responses
+                .iter()
+                .all(|r| !matches!(r, CouncilResponse::Refused { .. })),
+            "{responses:?}"
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&web));
+        assert!(state.gitops_owned.apps.contains(&web));
+        assert!(!state.gitops_owned.apps.contains(&manual));
+        assert!(state.gitops_owned.namespaces.contains("prod"));
+        assert!(state.gitops_owned.permissions.contains("deployers"));
+    }
+
+    /// #693: pruning a GitOps resource removes it from the ownership set,
+    /// and GitOps may never delete a resource it didn't write.
+    #[tokio::test]
+    async fn prune_clears_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        let manual = AppId::new("manual", "default");
+        let responses = sm
+            .apply_fixture(vec![
+                normal_entry(
+                    2,
+                    1,
+                    gitops_write(
+                        2,
+                        RaftRequest::AppSpec {
+                            app_id: web.clone(),
+                            spec: Box::new(default_spec()),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    2,
+                    2,
+                    RaftRequest::AppSpec {
+                        app_id: manual.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+                normal_entry(
+                    2,
+                    3,
+                    gitops_write(
+                        2,
+                        RaftRequest::AppDelete {
+                            app_id: manual.clone(),
+                        },
+                    ),
+                ),
+                normal_entry(
+                    2,
+                    4,
+                    gitops_write(
+                        2,
+                        RaftRequest::AppDelete {
+                            app_id: web.clone(),
+                        },
+                    ),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&responses[2], CouncilResponse::Refused { reason } if reason.contains("GitOps")),
+            "{:?}",
+            responses[2]
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&manual), "manual app survives");
+        assert!(!state.apps.contains_key(&web));
+        assert!(state.gitops_owned.apps.is_empty());
+    }
+
+    /// #693 (finding 7): a GitOps write proposed in a different term from
+    /// the one its sync read its snapshot in is refused, so an A→B→A
+    /// leadership flap can't apply a stale diff.
+    #[tokio::test]
+    async fn a_gitops_write_from_an_earlier_term_is_refused() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        let responses = sm
+            .apply_fixture(vec![normal_entry(
+                5,
+                1,
+                gitops_write(
+                    3,
+                    RaftRequest::AppSpec {
+                        app_id: web.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&responses[0], CouncilResponse::Refused { reason } if reason.contains("term")),
+            "{responses:?}"
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.is_empty());
+        assert!(state.gitops_owned.apps.is_empty());
+    }
+
+    /// Only declarative writes travel inside a GitOps write.
+    #[tokio::test]
+    async fn a_gitops_write_carries_only_declarative_changes() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply_fixture(vec![normal_entry(
+                1,
+                1,
+                gitops_write(
+                    1,
+                    RaftRequest::ConfigSet {
+                        key: "k".into(),
+                        value: "v".into(),
+                    },
+                ),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(&responses[0], CouncilResponse::Refused { .. }));
+    }
+
+    /// A manual delete of a GitOps resource (`relish delete --force`)
+    /// leaves the ownership set describing only resources that exist.
+    #[tokio::test]
+    async fn a_manual_delete_forgets_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let web = AppId::new("web", "default");
+        sm.apply_fixture(vec![
+            normal_entry(
+                1,
+                1,
+                gitops_write(
+                    1,
+                    RaftRequest::AppSpec {
+                        app_id: web.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::AppDelete {
+                    app_id: web.clone(),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+        assert!(sm.desired_state().await.gitops_owned.apps.is_empty());
+    }
+
+    /// #693 (finding 2): a plain delete can't remove an app or namespace a
+    /// live test lease owns; only a delete carrying that lease can.
+    #[test]
+    fn app_delete_in_a_leased_namespace_needs_the_lease() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let app_id = AppId::new("web", "rbtest-run1");
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseNamespaceSpec {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    name: "rbtest-run1".into(),
+                    spec: namespace_spec(),
+                })
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseAppSpec {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    app_id: app_id.clone(),
+                    spec: Box::new(default_spec()),
+                })
+                .is_none()
+        );
+
+        for refused in [
+            RaftRequest::AppDelete {
+                app_id: app_id.clone(),
+            },
+            RaftRequest::NamespaceDelete {
+                name: "rbtest-run1".into(),
+            },
+            RaftRequest::TestLeaseAppDelete {
+                lease_id: "other".into(),
+                app_id: app_id.clone(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    inner.apply_request(&refused),
+                    Some(CouncilResponse::Refused { .. })
+                ),
+                "{refused:?}"
+            );
+        }
+        assert!(inner.state.apps.contains_key(&app_id));
+        assert!(inner.state.namespaces.contains_key("rbtest-run1"));
+
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseAppDelete {
+                    lease_id: "run1".into(),
+                    app_id: app_id.clone(),
+                })
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseNamespaceDelete {
+                    lease_id: "run1".into(),
+                    name: "rbtest-run1".into(),
+                })
+                .is_none()
+        );
+        assert!(!inner.state.apps.contains_key(&app_id));
+        assert!(!inner.state.namespaces.contains_key("rbtest-run1"));
+    }
+
+    /// #693: a node's `[gitops]` seeds the cluster's configuration only
+    /// when there is none; an explicit set replaces it, and clears it.
+    #[test]
+    fn a_seed_never_replaces_the_cluster_gitops_config() {
+        let stored = |repo: &str| {
+            Some(Box::new(crate::lettuce::types::StoredGitOpsConfig {
+                config: toml::from_str(&format!("repo = '{repo}'")).unwrap(),
+                sealed_credentials: None,
+            }))
+        };
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: stored("first"),
+            seed: true,
+        });
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: stored("second"),
+            seed: true,
+        });
+        let repo = |inner: &StateMachineInner| {
+            inner
+                .state
+                .gitops_config
+                .as_ref()
+                .map(|stored| stored.config.repo.clone())
+        };
+        assert_eq!(repo(&inner).as_deref(), Some("first"));
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: stored("third"),
+            seed: false,
+        });
+        assert_eq!(repo(&inner).as_deref(), Some("third"));
+        inner.apply_request(&RaftRequest::GitOpsConfigSet {
+            config: None,
+            seed: false,
+        });
+        assert_eq!(repo(&inner), None);
     }
 }

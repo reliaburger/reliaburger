@@ -269,6 +269,10 @@ enum Command {
         /// Namespace the app lives in. Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Delete an app GitOps manages. The next sync recreates it while
+        /// the repository declares it.
+        #[arg(long)]
+        force: bool,
     },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init {
@@ -380,6 +384,10 @@ enum Command {
         /// directory). Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Roll back an app GitOps manages. The next sync puts back what
+        /// the repository declares.
+        #[arg(long)]
+        force: bool,
     },
     /// Validate a config file without deploying.
     Lint {
@@ -427,8 +435,12 @@ enum Command {
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
     },
-    /// List images in the local Pickle registry.
-    Images,
+    /// List images in the Pickle registry, or delete a tag.
+    #[command(visible_alias = "image")]
+    Images {
+        #[command(subcommand)]
+        action: Option<ImagesAction>,
+    },
     /// Build an OCI image and push to Pickle.
     Build {
         /// Path to a TOML config file with [build.*] sections.
@@ -549,6 +561,11 @@ enum Command {
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+    /// Show or change the cluster's GitOps configuration.
+    Gitops {
+        #[command(subcommand)]
+        action: GitopsAction,
     },
     /// Back up the cluster's root CA, check the backup, and rotate intermediates.
     Ca {
@@ -675,7 +692,7 @@ enum Command {
     },
     /// Run the built-in integration test suite against the cluster.
     Test {
-        /// Comma-separated groups, or exact scenario names with --chaos. Omit for all.
+        /// Comma-separated groups or exact case names (scenario names with --chaos). Omit for all.
         #[arg(long)]
         filter: Option<String>,
         /// Maximum concurrently running tests.
@@ -772,19 +789,42 @@ enum CouncilCommand {
         data_dir: std::path::PathBuf,
         /// Restore from a sealed backup at this object-store URL
         /// (`file://`, `s3://`, `gs://`). Omit to restore from the node's own
-        /// snapshot and committed Raft log under `data_dir`.
+        /// snapshot and committed Raft log under `data_dir`. Credentials and
+        /// region come from the backend's standard environment variables
+        /// (`AWS_*`, `GOOGLE_*`). Without `--backup`, the newest backup
+        /// that unseals is restored; unusable ones are skipped and logged.
         #[arg(long)]
         from: Option<String>,
+        /// Restore exactly this backup object (a name from `relish council
+        /// backups`) instead of the newest usable one.
+        #[arg(long, requires = "from")]
+        backup: Option<String>,
         /// Path to the cluster master key file (32-byte hex), needed to
         /// unseal a backup or read an encrypted Raft log. Defaults to
         /// `/etc/reliaburger/master.key`.
         #[arg(long)]
         master_key: Option<std::path::PathBuf>,
-        /// Skip the "is a council still alive?" safety check. Only pass this
-        /// when you are certain every voter is gone; recovering a live cluster
-        /// splits the brain.
+        /// The API port the cluster's nodes listen on. Before recovering,
+        /// relish asks every voter the restored state names, on this port,
+        /// whether it still serves a council.
+        #[arg(long, default_value_t = 9117)]
+        api_port: u16,
+        /// Skip the safety checks: the probe of the old voters, and the
+        /// refusal to recover a data directory another recovery already
+        /// fenced. Only pass this when you are certain every voter is gone;
+        /// recovering a live cluster splits the brain.
         #[arg(long)]
         force: bool,
+    },
+    /// List the sealed council backups at an object-store URL.
+    ///
+    /// Newest first, in the order `council recover --from` tries them:
+    /// by recovery epoch, then Raft term, then log index. The names are
+    /// what `council recover --backup` takes. Needs no master key.
+    Backups {
+        /// The backup destination (`file://`, `s3://`, `gs://`).
+        #[arg(long)]
+        from: String,
     },
     /// Re-enrol a voter fenced out by `council recover`.
     ///
@@ -1036,6 +1076,23 @@ enum BatchAction {
 }
 
 #[derive(Subcommand)]
+enum GitopsAction {
+    /// Show the cluster's GitOps configuration, sync status and what GitOps
+    /// owns. Credentials are never shown.
+    Status,
+    /// Replace the cluster's GitOps configuration from a TOML file holding
+    /// a `[gitops]` section (admin only; audited). Credentials in it are
+    /// sealed with the cluster master key before they reach Raft.
+    Set {
+        /// TOML file with a `[gitops]` section, such as a node's `node.toml`.
+        path: PathBuf,
+    },
+    /// Turn GitOps off for the whole cluster (admin only; audited). What
+    /// GitOps wrote stays in place.
+    Disable,
+}
+
+#[derive(Subcommand)]
 enum SecretAction {
     /// Print the cluster's age public key (for `relish secret encrypt`).
     ///
@@ -1176,6 +1233,17 @@ enum LocalAction {
     Start,
     Stop,
     Destroy,
+}
+
+#[derive(Subcommand)]
+enum ImagesAction {
+    /// Delete a tag (`repository:tag`). The image stays pullable by digest
+    /// until it has been untagged for `[images] gc_retain_days`; then it
+    /// expires, unless an app or job pins it, and GC reclaims its layers.
+    Delete {
+        /// The tag to delete, as `repository:tag` (e.g. `team/web:v1`).
+        reference: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1396,7 +1464,7 @@ enum FaultAction {
         #[command(flatten)]
         targeting: reliaburger::relish::fault::FaultTargeting,
     },
-    /// Throttle bandwidth to a service.
+    /// Throttle bandwidth to a service (not implemented yet: Bun refuses it, #366).
     Bandwidth {
         /// Target service name.
         target: String,
@@ -1688,7 +1756,8 @@ async fn main() -> ExitCode {
         Command::Delete {
             ref app,
             ref namespace,
-        } => commands::delete(app, namespace).await,
+            force,
+        } => commands::delete(app, namespace, force).await,
         Command::Init {
             ref dir,
             ref cluster_name,
@@ -1715,14 +1784,26 @@ async fn main() -> ExitCode {
             Some(CouncilCommand::ReEnrol { data_dir, force }) => {
                 commands::council_reenrol(data_dir, *force)
             }
+            Some(CouncilCommand::Backups { from }) => {
+                commands::council_backups(from, cli.output).await
+            }
             Some(CouncilCommand::Recover {
                 data_dir,
                 from,
+                backup,
                 master_key,
+                api_port,
                 force,
             }) => {
-                commands::council_recover(data_dir, from.as_deref(), master_key.as_deref(), *force)
-                    .await
+                commands::council_recover(
+                    data_dir,
+                    from.as_deref(),
+                    backup.as_deref(),
+                    master_key.as_deref(),
+                    *api_port,
+                    *force,
+                )
+                .await
             }
         },
         Command::Join {
@@ -1986,7 +2067,8 @@ async fn main() -> ExitCode {
         Command::Rollback {
             ref app,
             ref namespace,
-        } => commands::rollback(app, namespace).await,
+            force,
+        } => commands::rollback(app, namespace, force).await,
         Command::Lint { ref path } => commands::lint(path),
         Command::Compile { ref path } => commands::compile(path),
         Command::Diff {
@@ -1998,7 +2080,10 @@ async fn main() -> ExitCode {
         Command::Import { ref files, strict } => commands::import_k8s(files, strict),
         #[cfg(feature = "kubernetes")]
         Command::Export { ref file } => commands::export_k8s(file),
-        Command::Images => commands::images(cli.output).await,
+        Command::Images { action: None } => commands::images(cli.output).await,
+        Command::Images {
+            action: Some(ImagesAction::Delete { reference }),
+        } => commands::image_delete(&reference).await,
         Command::Build {
             ref path,
             registry_port,
@@ -2104,6 +2189,11 @@ async fn main() -> ExitCode {
                 finalize,
                 namespace,
             } => commands::secret_rotate(*finalize, namespace.as_deref()).await,
+        },
+        Command::Gitops { action } => match &action {
+            GitopsAction::Status => commands::gitops_status(cli.output).await,
+            GitopsAction::Set { path } => commands::gitops_set(path).await,
+            GitopsAction::Disable => commands::gitops_disable().await,
         },
         Command::Ca { action } => match &action {
             CaAction::Backup {
@@ -3404,7 +3494,32 @@ mod tests {
         let cli = parse(&["relish", "delete", "web", "--namespace", "team-a"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Delete { ref app, ref namespace } if app == "web" && namespace == "team-a"
+            Command::Delete { ref app, ref namespace, force: false } if app == "web" && namespace == "team-a"
+        ));
+    }
+
+    /// #693: `--force` deletes or rolls back an app that GitOps manages.
+    #[test]
+    fn delete_and_rollback_take_force() {
+        let cli = parse(&["relish", "delete", "web", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Delete { force: true, .. }));
+        let cli = parse(&["relish", "rollback", "web", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Rollback { force: true, .. }));
+    }
+
+    #[test]
+    fn gitops_subcommands_parse() {
+        let cli = parse(&["relish", "gitops", "set", "node.toml"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gitops { action: GitopsAction::Set { ref path } } if path == std::path::Path::new("node.toml")
+        ));
+        let cli = parse(&["relish", "gitops", "disable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gitops {
+                action: GitopsAction::Disable
+            }
         ));
     }
 
@@ -3584,6 +3699,53 @@ mod tests {
                 action: Some(CouncilCommand::Recover { force: true, .. })
             }
         ));
+    }
+
+    #[test]
+    fn parse_council_recover_of_a_named_backup_needs_its_destination() {
+        let cli = parse(&[
+            "relish",
+            "council",
+            "recover",
+            "--data-dir",
+            "/var/lib/reliaburger/data",
+            "--from",
+            "s3://backups/council",
+            "--backup",
+            "council-e1.backup",
+        ])
+        .unwrap();
+        let Command::Council {
+            action: Some(CouncilCommand::Recover { backup, .. }),
+        } = cli.command
+        else {
+            panic!("expected council recover");
+        };
+        assert_eq!(backup.as_deref(), Some("council-e1.backup"));
+        assert!(
+            parse(&[
+                "relish",
+                "council",
+                "recover",
+                "--data-dir",
+                "/d",
+                "--backup",
+                "council-e1.backup",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_council_backups_command() {
+        let cli = parse(&["relish", "council", "backups", "--from", "gs://b/council"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Council {
+                action: Some(CouncilCommand::Backups { .. })
+            }
+        ));
+        assert!(parse(&["relish", "council", "backups"]).is_err());
     }
 
     #[test]
@@ -3857,7 +4019,21 @@ mod tests {
     #[test]
     fn parse_images_command() {
         let cli = parse(&["relish", "images"]).unwrap();
-        assert!(matches!(cli.command, Command::Images));
+        assert!(matches!(cli.command, Command::Images { action: None }));
+    }
+
+    /// #697: `relish images delete` and its `relish image delete` alias.
+    #[test]
+    fn parse_image_delete_under_either_spelling() {
+        for spelling in ["images", "image"] {
+            let cli = parse(&["relish", spelling, "delete", "team/web:v1"]).unwrap();
+            match cli.command {
+                Command::Images {
+                    action: Some(ImagesAction::Delete { reference }),
+                } => assert_eq!(reference, "team/web:v1"),
+                _ => panic!("expected images delete for {spelling}"),
+            }
+        }
     }
 
     #[test]

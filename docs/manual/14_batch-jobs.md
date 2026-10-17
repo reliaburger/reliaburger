@@ -199,8 +199,8 @@ relish manual batch
 
 Use the actual parent ID returned by submission in place of `1`. Watch shows
 child array IDs; use the small profile's ID in place of `2` for task detail.
-The example has 1,000 small tasks requesting 100m CPU and 32 MiB each, and 64
-large tasks requesting 1 CPU and 128 MiB each. The node packs actual attempts
+The example has 8 small tasks requesting 100m CPU and 32 MiB each, and
+2 large tasks requesting 1 CPU and 128 MiB each, so it finishes in seconds. The node packs actual attempts
 beside the web service, respecting both resource dimensions. Submission commits
 all profiles atomically; cancelling the parent cancels all profiles.
 
@@ -412,11 +412,15 @@ outcomes and their result index are durable. Standalone admission reserves spars
 accepting work. Storage failure cancels local work
 and refuses further grants until the node is repaired and restarted.
 
-A worker holds at most 50 bytes of disk per accepted task while the cluster
-lists the run: a 22-byte ledger record and a 24-byte result-index slot. A
-million tasks measured 22.4 bytes of ledger and 25.0 bytes of index per task,
-about 45 MiB in all (`make bench-task-arrays` fails above the bound). Kept failure output adds at most 16
-tasks' head and tail per chunk. All of it goes when the run retires. Task data,
+While a run is active, a worker holds at most 50 bytes of disk per accepted
+task: a 22-byte ledger record and a 24-byte result-index slot. A million tasks
+measured about 47 bytes per task, about 45 MiB in all. Once the run finishes,
+the worker compacts it into one 14-byte result per task and deletes the ledger
+and index, so a finished run the cluster still lists holds at most 16 bytes per
+task: a million tasks measured about 14, about 13.5 MiB (`make
+bench-task-arrays` fails above either bound). `relish batch results` and
+`relish batch logs` answer the same before and after. Kept failure output adds
+at most 16 tasks' head and tail per chunk. All of it goes when the run retires. Task data,
 together with the node's audit log, counts toward disk pressure: past a quarter of the filesystem, or with less
 than 1 GiB free, a worker finishes the chunks it holds but advertises no
 free slots, so it takes no new grants until retention frees space.
@@ -463,14 +467,31 @@ mount_isolation = false
 
 Forget it and the cluster says so straight away. A standalone node refuses the
 submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
-and the reason. In a cluster the run is admitted, because some other node might
-take it, and the leader fails it within a sync or two once every node it can
-reach has refused it. `relish batch-status` and `relish jobs` then show
-`Failed`, every task not run, and a `refused:` line quoting the nodes' reason;
-the JSON summary carries it as `unrunnable_reason`. The same rule catches any
-refusal that comes from a node's own configuration, such as a binary missing
-from every node's `allowed_binaries`. A run that only some nodes refuse keeps
-going on the others.
+and the reason. So does a cluster: every node advertises over gossip what
+kinds of job it runs (host commands, containers, limits it can enforce,
+`mount_isolation`, whether its `allowed_binaries` names anything), and the
+leader refuses a run that every live node says it can't take, with HTTP 422
+and a reason such as:
+
+```text
+no node can run job default/hello: host jobs don't run under
+[process_workloads] mount_isolation yet (on by default on Linux); ...
+```
+
+The leader refuses only when it's sure. It checks the binary against each
+node's `allowed_binaries` from that node's capability report; until a node
+has reported, it only knows whether the allowlist names anything. If a node
+hasn't advertised yet, or might allow the binary, the run is admitted, and
+the leader fails it
+within a sync or two once every node it can reach has refused it. The same
+happens when a node leaves or changes its configuration after admission.
+`relish batch-status` and `relish jobs` then show `Failed`, every task not
+run, and a `refused:` line quoting the nodes' reason; the JSON summary
+carries it as `unrunnable_reason`. Either way the reason reads the same. The
+rule catches any refusal that comes from a node's own configuration, such as
+a container job on nodes without the rootful Linux runtime, or a binary
+missing from every node's `allowed_binaries`. A run that only some nodes
+refuse keeps going on the others.
 
 For example, after allowing `/usr/bin/printf` on a process-enabled node:
 
@@ -637,7 +658,15 @@ so `allow_from` names the apps in other namespaces that may reach the task's
 own container address. Both need a container task on rootful Linux runc with
 eBPF: nodes that can't enforce them refuse the array, and `runtime =
 "process"` refuses both. Without eBPF, namespace network enforcement is
-unavailable, as it is for ordinary apps. The worker caches at most 256
+unavailable, as it is for ordinary apps.
+
+It works the other way round too: an app's (or another job's) `allow_from`
+can name a job as `namespace/job`. Each task's cgroup is bound to its job
+before its command runs, and the grant names the job rather than a running
+task, so it already holds for tasks that haven't started. Other jobs in the
+same namespace stay refused. Reused
+executors serve one job each, so a grant never reaches another job's
+commands. The worker caches at most 256
 namespace bindings, evicts only idle bindings, and journals them for cleanup
 after old executors retire at startup. Losing the source binding stops its
 original runtime owner.
@@ -652,7 +681,7 @@ rollout headroom when planning a mixed cluster.
 bursts, retries, average task duration and the tightest CPU/memory dimension;
 container startup, images, output, storage and network cost also matter. This
 feature does not qualify that target by itself. A simulator benchmark and this
-short demo are not the 12-hour throughput and reliability qualification.
+short demo are not the 8-hour job final soak, the throughput and reliability qualification.
 
 Apps without explicit resource requests reserve zero, matching the existing
 app scheduler. Set requests for services sharing a node with batch work, and
@@ -1066,7 +1095,7 @@ high-water mark was 258.1 MiB. All 117 bounded
 storage scans were incomplete, so they don't establish a global storage bound.
 No inventory timeout appeared across the fixture lifetime. The
 [raw hour, resource observations and positive cleanup proofs](../qualification/2026-10-09-host-job-executors/README.md)
-retain these limits. This completed hour does not qualify 100m/day; 12-hour,
+retain these limits. This completed hour does not qualify 100m/day; the job final,
 fault and historical namespace/profile/cardinality work remains in #668.
 
 ### Historical one-hour host run

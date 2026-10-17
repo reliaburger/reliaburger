@@ -110,6 +110,36 @@ and leaves anything else under `~/.reliaburger`.
 
 Use returned IDs; physical executor slots can be reused.
 
+## App fields
+
+An `[app.NAME]` table takes these fields. Unknown fields are refused, and so
+is a field the node can't honour; nothing is silently dropped.
+
+| Field | Meaning |
+|-------|---------|
+| `image` | OCI image. Not with `exec` or `script` |
+| `exec`, `script` | Host binary or inline script: a process workload (needs the node's `[process_workloads]` allowlist) |
+| `command`, `args` | Replace the image's entrypoint and its default arguments (`args` only with an image) |
+| `working_dir` | Absolute working directory inside the container; image apps only |
+| `run_as_user`, `run_as_group` | Container uid and gid, inside its user namespace; refused on `exec` and `script` apps |
+| `replicas` | A count, or `"*"` for one per node. Default 1 |
+| `port` | Port the app listens on; published on the node and in service discovery |
+| `cpu`, `memory` | Request–limit ranges, such as `"250m-1000m"` and `"256Mi-512Mi"` |
+| `gpu` | Refused above 0 until GPU support lands ([#359](https://github.com/reliaburger/reliaburger/issues/359)) |
+| `env` | Environment variables, plain or encrypted |
+| `namespace` | Namespace; `default` when omitted |
+| `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s, at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros |
+| `[[init]]` | `image` (default: the app's) and `command`; runs before the app with its env and mounts |
+| `[[config_file]]` | `path` and exactly one of `content` (a per-instance read-only copy) or `source` (a node file, allowlisted); not on `exec` or `script` apps |
+| `[[volumes]]` | `path`, and `source` (a node directory, allowlisted) or a managed volume with optional `size`; not on `exec` or `script` apps. A `size` needs root, and can't change once the volume exists |
+| `placement` | `required` and `preferred` node labels, `key=value` |
+| `deploy` | `strategy` (`rolling` or `blue-green`), `max_surge`, `max_unavailable`, `drain_timeout`, `health_timeout`, `auto_rollback` |
+| `autoscale` | `metric` (`cpu` or `memory`), `target`, `min` (at least 1), `max`, `evaluation_window`, `cooldown`, `scale_down_threshold`. Removing it returns the app to `replicas` |
+| `ingress` | `host`, `path`, `tls` (`cluster`, `explicit` or `none`), `websocket`, `rate_limit_rps`, `rate_limit_burst` |
+| `firewall` | `allow_from`: apps (or `namespace/app`) allowed to connect |
+| `egress` | `allow`: outside destinations the app may reach. `allow_franchise` is refused |
+| `metrics` | `port` (default: the app's) and `path` (default `/metrics`) to scrape |
+
 ## Job fields
 
 A `[job.NAME]` table takes these fields. Unknown fields are refused.
@@ -177,14 +207,15 @@ startup instead of being ignored.
 | `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
 | `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
-| `[network]` | `advertise_address`, host `port_range` |
-| `[security]` | master key, bootstrap and identity paths, `require_mtls`, `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
-| `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`) |
+| `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |
+| `[security]` | master key, bootstrap and identity paths, `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
+| `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
 | `[images]` | registry, pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart; see `images-and-volumes`) |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
 | `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |
-| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none); host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
+| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
+| `[reporting_tree]` | `report_interval_secs` (5), `stale_report_timeout_secs` (30), `stale_node_grace_secs` (300: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
 | `[runtime]` | `stop_confirmation_timeout_secs` |
 
 ### Shorter certificates for soak runs

@@ -294,7 +294,10 @@ impl RuncGrill {
                 .map_err(GrillError::ImagePull)?;
             let lower = pulled.rootfs;
             self.apply_image_config(instance, &mut spec, &pulled.config, &lower)?;
-            if !self.rootless {
+            // An init container borrows the app's volumes: handing them to
+            // its user would take them from the app's (#701). Root in the
+            // container's user namespace can write them as they are.
+            if !self.rootless && !spec.initialiser {
                 prepare_volumes(instance, &spec).await?;
             }
 
@@ -574,7 +577,32 @@ impl super::Grill for RuncGrill {
     }
 
     async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        self.owned_forget_retired(instance)
+        self.owned_forget_retired(instance, None)
+            .await
+            .map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })
+    }
+
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &super::RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        self.owned_forget_retired(instance, Some(generation))
+            .await
+            .map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::RuntimeGeneration>, GrillError> {
+        self.owned_launch_generation(instance)
             .await
             .map_err(|error| GrillError::StateUnavailable {
                 instance: instance.clone(),
@@ -826,6 +854,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "invalid.example/reliaburger/no-pull:latest".to_string(),
@@ -838,6 +867,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
@@ -888,6 +918,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "./rootfs".into(),
@@ -900,6 +931,7 @@ mod tests {
                 cwd: "/".into(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
@@ -953,6 +985,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 // Use a path (not an image ref) to skip the image pull step
@@ -966,6 +999,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
@@ -1028,7 +1062,7 @@ mod tests {
         let responder =
             crate::onion::dns::BoundDnsResponder::bind_freebind(crate::onion::dns::DnsConfig {
                 listen_addr: std::net::SocketAddr::new(nameserver.into(), 53),
-                upstream: "192.0.2.1:53".parse().unwrap(),
+                upstreams: vec!["192.0.2.1:53".parse().unwrap()],
                 source_namespaces: grill.dns_source_namespaces(),
                 ..Default::default()
             })
@@ -1047,6 +1081,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1072,6 +1107,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
@@ -1207,6 +1243,7 @@ mod tests {
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
                 reusable_executor: false,
                 host_process: false,
+                initialiser: false,
                 port_mapping: None,
                 root: crate::grill::oci::OciRoot {
                     path: ALPINE_IMAGE.to_string(),
@@ -1226,6 +1263,7 @@ mod tests {
                     cwd: "/".to_string(),
                     user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                     capabilities: None,
+                    oom_score_adj: None,
                     overrides: None,
                 },
                 mounts: crate::grill::oci::standard_mounts(),
@@ -1373,6 +1411,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1385,6 +1424,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
@@ -1433,6 +1473,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: ALPINE_IMAGE.to_string(),
@@ -1449,6 +1490,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
@@ -1627,6 +1669,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             reusable_executor: false,
             host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
@@ -1639,6 +1682,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: crate::grill::oci::standard_mounts(),
@@ -1874,6 +1918,77 @@ mod tests {
         grill.start(id).await.unwrap();
         wait_for_log(&grill, id, "Ready to accept connections").await;
         grill
+    }
+
+    /// #701: an init container runs its own image with the app's env and
+    /// writes the app's managed volume, without taking the volume from the
+    /// app's user.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_init_container_runs_its_own_image_with_app_env() {
+        use std::os::unix::fs::MetadataExt;
+
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let app_id = InstanceId("default__init-image-0".to_string());
+        let init_id = InstanceId("default__init-image-0__init-0".to_string());
+        for id in [&app_id, &init_id] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![app_id.clone(), init_id.clone()]);
+        let volume = crate::grill::volume::VolumeManager::new(tmp.path().join("volumes"))
+            .create_managed_volume("default", "init-image", std::path::Path::new("/data"), None)
+            .unwrap();
+
+        // Bun creates the app first, which hands the volume to its user.
+        let (grill, app) = image_app(
+            tmp.path(),
+            &app_id,
+            &format!(
+                "image = \"{REDIS_IMAGE}\"\nrun_as_user = 999\nrun_as_group = 999\n\
+                 env = {{ GREETING = \"hello\" }}\n[[volumes]]\npath = \"/data\"\n"
+            ),
+        );
+        grill.create(&app_id, &app).await.unwrap();
+        let init = crate::grill::oci::generate_init_oci_spec(
+            &crate::config::app::InitContainerSpec {
+                image: Some(ALPINE_IMAGE.to_string()),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo \"$GREETING|$(. /etc/os-release; echo $ID)\" > /data/marker".to_string(),
+                ],
+            },
+            &app,
+        );
+        grill.create(&init_id, &init).await.unwrap();
+        grill.start(&init_id).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while grill.state(&init_id).await.unwrap() != ContainerState::Stopped {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the init container never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let exit = grill.exit_code(&init_id).await.unwrap();
+        let logs = grill.logs(&init_id).await.unwrap_or_default();
+        grill.kill(&init_id).await.unwrap();
+        grill.kill(&app_id).await.unwrap();
+
+        assert_eq!(exit, Some(0), "init failed: {logs}");
+        assert_eq!(
+            std::fs::read_to_string(volume.join("marker")).unwrap(),
+            "hello|alpine\n",
+            "the init ran in its own image (alpine) with the app's env"
+        );
+        let redis_host_uid = crate::grill::userns::host_id(999).unwrap();
+        assert_eq!(
+            std::fs::metadata(&volume).unwrap().uid(),
+            redis_host_uid,
+            "the volume still belongs to the app's user"
+        );
     }
 
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {

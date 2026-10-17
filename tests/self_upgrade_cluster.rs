@@ -1,16 +1,18 @@
 //! Cluster rolling-upgrade integration tests (Phase 14).
 //!
-//! Four REAL bun processes form a gossip+Raft cluster on localhost; the
+//! Three REAL bun processes form a gossip+Raft cluster on localhost; the
 //! test plays systemd for each of them and drives upgrades through the
 //! same HTTP API relish uses. These are the slowest tests in the repo
 //! (a couple of minutes each) — they earn it by proving the rolling walk,
 //! leader-last in-place upgrade, pause/resume, and cluster rollback
 //! against real processes exec'ing themselves.
 //!
-//! Note on roles: with four nodes the council reconciler makes ALL of
-//! them Raft voters (the cap is seven), and the harness waits until it
-//! has before any test starts, so every upgrade walk takes real voters
-//! down one at a time against a four-voter quorum. "Worker" here is a
+//! Note on roles: with three nodes the council reconciler makes ALL of
+//! them Raft voters (the council holds the largest odd number of voters
+//! the live nodes allow, D12), and the harness waits until it has before
+//! any test starts, so every upgrade walk takes real voters down one at a
+//! time against a three-voter quorum. (Four nodes would leave one as a
+//! plain worker.) "Worker" here is a
 //! label in the upgrade plan, not a Raft status: the leader corrects it
 //! to `Council`. The ordering mechanics the tests assert (council one at
 //! a time, leader last, in place) are exactly the mechanics under test.
@@ -26,7 +28,7 @@ use reliaburger::upgrade::signing::{self, encode_public_key};
 #[path = "support/bun_process.rs"]
 mod bun_process;
 
-/// Cluster operations are slow: convergence, four swaps, verification.
+/// Cluster operations are slow: convergence, three swaps, verification.
 const WAIT: Duration = Duration::from_secs(180);
 
 /// Four real bun processes per test, minutes each — far past the default
@@ -233,6 +235,8 @@ advertise_address = "127.0.0.1"
 
 [security]
 master_key_path = "{master_key}"
+# A loopback upgrade fixture with no node certificates: plaintext on purpose.
+require_mtls = false
 
 [storage]
 data = "{node_root}/data"
@@ -342,10 +346,17 @@ retain_versions = 3
         .await;
         // The reconciler promotes one node per tick after a few seconds of
         // stable gossip, so a leader alone proves nothing about the council.
-        // Wait for every node to hold a vote: the rolling walk must take real
-        // voters down one at a time, not learners that Raft can do without.
-        wait_for("every node a council voter", WAIT, || async {
-            harness.voters().await.len() == harness.nodes.len()
+        // Wait for the full council: the rolling walk must take real voters
+        // down one at a time, not learners that Raft can do without. The
+        // council holds the largest odd number of voters the nodes allow
+        // (D12), so two nodes keep one voter and three or four keep three.
+        let council_size = match harness.nodes.len() {
+            0 | 1 => 1,
+            n if n % 2 == 1 => n,
+            n => n - 1,
+        };
+        wait_for("the full council of voters", WAIT, || async {
+            harness.voters().await.len() == council_size
         })
         .await;
         harness
@@ -606,9 +617,17 @@ retain_versions = 3
     /// Poll the cluster upgrade until it completes (or a pause, if
     /// `allow_pause`), recording when each node first reports Healthy.
     /// Returns (first_healthy_order, final_phase).
+    ///
+    /// The deadline is [`WAIT`] without progress, not [`WAIT`] for the whole
+    /// walk. A walk takes one swap per node, and on a loaded host each swap
+    /// took 45 to 55 s (the directive alone waits out the node's fetch,
+    /// verification and format check), so three nodes came within seconds of
+    /// a fixed 180 s and the leader, last, missed it (#908). A walk that
+    /// stops moving still fails after [`WAIT`].
     async fn watch_upgrade(&self, upgrade_id: &str, allow_pause: bool) -> (Vec<String>, String) {
         let mut healthy_order: Vec<String> = Vec::new();
-        let deadline = tokio::time::Instant::now() + WAIT;
+        let mut deadline = tokio::time::Instant::now() + WAIT;
+        let mut last_progress = String::new();
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let state = self.cluster_state().await;
@@ -659,6 +678,11 @@ retain_versions = 3
                 }
             };
 
+            let progress = walk_progress(&phase, &nodes_json);
+            if progress != last_progress {
+                last_progress = progress;
+                deadline = tokio::time::Instant::now() + WAIT;
+            }
             for node in nodes_json.as_array().into_iter().flatten() {
                 note_healthy(&mut healthy_order, node);
             }
@@ -772,6 +796,25 @@ retain_versions = 3
     }
 }
 
+/// What counts as the walk moving: its phase, each node's phase, and each
+/// re-sent directive. Two polls with the same answer made no progress.
+fn walk_progress(phase: &str, nodes: &serde_json::Value) -> String {
+    let nodes: Vec<String> = nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|node| {
+            format!(
+                "{}={}/{}",
+                node["node_id"].as_str().unwrap_or("?"),
+                phase_label(&node["phase"]),
+                node["directive_retry"]["attempts"]
+            )
+        })
+        .collect();
+    format!("{phase} {}", nodes.join(" "))
+}
+
 fn note_healthy(order: &mut Vec<String>, node: &serde_json::Value) {
     if node["phase"] == "Healthy"
         && let Some(name) = node["node_id"].as_str()
@@ -809,7 +852,7 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     // This test owns the rolling *order* and clean convergence. Workload
     // survival across a node's in-place exec is a node-level invariant,
@@ -908,7 +951,7 @@ async fn relish_pushes_through_a_forward_while_nodes_fetch_from_the_cluster_addr
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let leader_node = harness.node(&leader);
 
@@ -1022,7 +1065,7 @@ async fn version_form_rolls_the_nodes_platform_build_countersigned_by_relish() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let leader_node = harness.node(&leader);
     let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
@@ -1105,7 +1148,7 @@ async fn upgrade_start_sent_to_a_node_that_is_not_the_leader_reaches_the_leader(
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let other = harness
         .nodes
@@ -1135,7 +1178,7 @@ async fn start_refuses_same_version_other_bytes_and_unrequested_downgrades() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
     let leader_node = harness.node(&leader);
     let client = harness.relish_client(leader_node);
@@ -1191,7 +1234,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     let (upgrade_id, _, worker) = {
         // Poison ONLY the worker's v0.2.0 binary: it crash-loops, reverts
@@ -1259,7 +1302,7 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     let (upgrade_id, _, _) = harness.start_upgrade().await;
     let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
@@ -1438,7 +1481,7 @@ async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
 
     // Poison the worker's v0.2.0 so the first swap reverts and the run
     // pauses with every node still on v0.1.0.
@@ -1512,37 +1555,55 @@ async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
     harness.shutdown().await;
 }
 
-/// A TCP proxy to `upstream` that hangs up on every connection for the
-/// first `outage`, the way a registry looks while its bun restarts. Returns
-/// its address and how many connections it hung up on.
-async fn registry_with_outage(
-    upstream: String,
-    outage: Duration,
-) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let hangups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = hangups.clone();
-    let back_at = tokio::time::Instant::now() + outage;
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut inbound, _)) = listener.accept().await else {
-                return;
-            };
-            if tokio::time::Instant::now() < back_at {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                drop(inbound);
-                continue;
-            }
-            let upstream = upstream.clone();
-            tokio::spawn(async move {
-                if let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await {
-                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+/// A TCP proxy in front of a registry that hangs up on every connection,
+/// the way a registry looks while its bun restarts, until it is reopened.
+struct RegistryOutage {
+    address: String,
+    /// Connections it hung up on.
+    hangups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    reopen: watch::Sender<bool>,
+}
+
+impl RegistryOutage {
+    /// Start the proxy to `upstream`, down.
+    async fn start(upstream: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let hangups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hangups.clone();
+        let (reopen, reopened) = watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                if !*reopened.borrow() {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(inbound);
+                    continue;
                 }
-            });
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        Self {
+            address,
+            hangups,
+            reopen,
         }
-    });
-    (address, hangups)
+    }
+
+    fn hangups(&self) -> usize {
+        self.hangups.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn end(&self) {
+        let _ = self.reopen.send(true);
+    }
 }
 
 /// V02 soak: a leader bun was SIGKILLed mid-walk, came back, and directed
@@ -1557,22 +1618,34 @@ async fn a_registry_outage_at_directive_time_does_not_pause_the_upgrade() {
         "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
     );
     let _serial = SERIAL.lock().await;
-    let harness = ClusterHarness::start(4).await;
+    let harness = ClusterHarness::start(3).await;
     let leader = harness.wait_for_idle_leader().await;
 
-    // Longer than a node's own fetch budget (10 s), so the node answers
-    // the first directive 503 and the orchestrator has to re-send it.
-    let (proxy, hangups) = registry_with_outage(
-        harness.node(&leader).registry.clone(),
-        Duration::from_secs(25),
-    )
+    // The registry stays down until a directive has failed on it, so the
+    // node answered 503 and the orchestrator must re-send. A fixed 25 s
+    // outage timed from here was over before the first directive on a
+    // loaded host, where the push and the start took up to 45 s, and the
+    // test then proved nothing (#908).
+    let outage = RegistryOutage::start(harness.node(&leader).registry.clone()).await;
+    let (upgrade_id, _, _) = harness
+        .start_upgrade_fetching_from(Some(outage.address.clone()), None)
+        .await;
+    wait_for("a directive to fail on the outage", WAIT, || async {
+        harness.cluster_state().await.is_some_and(|state| {
+            state["active"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|node| node["directive_retry"]["attempts"].as_u64() >= Some(1))
+        })
+    })
     .await;
-    let (upgrade_id, _, _) = harness.start_upgrade_fetching_from(Some(proxy), None).await;
+    outage.end();
     let (_, phase) = harness.watch_upgrade(&upgrade_id, true).await;
 
     assert_eq!(phase, "Completed", "the outage paused the upgrade");
     assert!(
-        hangups.load(std::sync::atomic::Ordering::SeqCst) > 1,
+        outage.hangups() > 1,
         "no fetch hit the outage, so the test proved nothing"
     );
     harness.wait_for_versions("v0.2.0").await;

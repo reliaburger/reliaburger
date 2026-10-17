@@ -4,17 +4,35 @@ Cross-cutting design for Reliaburger's deployment system: rolling deploys with z
 
 This subsystem is cross-cutting. It doesn't live in a single component; it coordinates across Meat (scheduling), Bun (container lifecycle), Wrapper (connection draining and routing pool updates), Onion (service map backend updates), and Ketchup (deploy event logging). The deploy orchestration loop itself runs on the leader node as part of the Meat scheduler.
 
-> **Implementation status (2026-07-22).** The detailed `DeployState` below is
+> **Implementation status (0.2.1, #692).** The detailed `DeployState` below is
 > the library state machine and Raft schema, not the path the current binary
 > persists for cluster rollouts. The shipped cluster path commits desired
 > `AppSpec`s, schedules placements and lets each Bun reconcile its local share;
-> Bun performs the actual local rolling replacement. We now expose that real
-> work through a separate `DeployOperation`: a stable ID, target set, current
-> phase/target, timestamps and explicit terminal outcome. It is node-local and
-> bounded to fifty terminal records. `/v1/deploys/active` and
-> `/v1/deploys/operations` serve it. Per-app spec history still backs rollback.
-> Claims later in this document about every transition living in Raft describe
-> the intended converged design, not current production behaviour.
+> Bun performs the actual local rolling replacement, bounded by the app's
+> `[deploy]` table *per node*.
+>
+> The leader releases a spec change one node at a time (decision D10-C): its
+> `/v1/placements/{node}` answer hands the new spec to the first node, by node
+> id, that hasn't converged on it, and holds every later node on the app's last
+> fully rolled-out spec (`held = true`) until that node reports its share
+> healthy on the new one. Progress comes from the nodes' state reports (each
+> reconciler's converged version, `StateReport::rollouts`, plus instance
+> health), never from leader-held state, so a new leader resumes where the old
+> one stopped. The council holds only `DesiredState::rollouts`: per app, the
+> last ten distinct specs that rolled out healthy everywhere
+> (`RolloutReleased`) and the spec whose rollout failed (`RolloutFailed`,
+> decision D11-B). A node whose rollout aborts posts `/v1/rollouts/failed` to
+> the leader; the leader stops releasing that spec until a different one is
+> applied. Full leader-coordinated rollouts, with one cluster-wide surge and
+> unavailable budget, remain the target described below.
+>
+> We expose each node's real work through a separate `DeployOperation`: a
+> stable ID, target set, current phase/target, timestamps and explicit terminal
+> outcome. It is node-local and bounded to fifty terminal records.
+> `/v1/deploys/active` and `/v1/deploys/operations` serve it. Each node also
+> keeps its last fifty `DeployHistoryEntry` records per app. Claims later in
+> this document about every transition living in Raft describe the intended
+> converged design, not current production behaviour.
 
 ---
 
@@ -665,6 +683,8 @@ The operator can inspect the situation via `relish status`, which clearly shows 
 
 When a new instance fails its health check, the system automatically reverts all already-upgraded instances back to the previous version. The revert uses the same rolling mechanism (start old version, health check, swap routing, drain new version, stop new version) but in reverse. After revert completes, the entire app is back on the old version with no manual intervention required.
 
+**Shipped (0.2.1, #692):** each node reverts its own share. If no old instance had retired yet, the node stops the replacements and the old instances carry on. If some had, it starts previous-spec instances for the ordinals no old instance holds, under the same `max_surge`/`max_unavailable` budget, and retires a healthy replacement only once one of them is healthy. It never ends below `min(healthy new + remaining old, replicas)`: if the previous spec can't come back, the healthy replacements keep serving and the result is `Halted` with the reason. Before #692 the abort killed healthy replacements and never restarted retired old instances, so a stop-first volume app with one replica could end with none. In a cluster, the node then reports the failure to the leader, which commits `RolloutFailed` for that spec (D11-B). The leader doesn't revert the desired spec in Raft, because GitOps would only apply it again; it stops releasing the failed spec to further nodes, and `relish status`, `relish wtf` and the desired-apps API show where and why. Re-applying the identical spec keeps the mark, and `relish apply` warns that it isn't retried; any other spec clears it, a scale change included (#929).
+
 ```
 Failure detected at step 2 (auto_rollback = true):
   State: web-4 (v2, healthy), web-5 (v2, FAILED health check), web-3 (v1, healthy)
@@ -683,12 +703,15 @@ Result: web-1' (v1, Node A), web-2' (v1, Node B), web-3 (v1, Node C)
 
 ### 5.3 Deploy History Tracking
 
-There are two shipped histories. Bun's `DeployOperation` store describes the
+There are three shipped histories. Bun's `DeployOperation` store describes the
 worker which really ran: it stays visible after the SSE consumer disconnects
 and records `unknown` if that worker disappears without a terminal event. The
-per-app `DeployHistoryEntry` list describes completed versions/specs and backs
-rollback. Neither should be confused with the Raft-backed design below, which
-remains the target architecture.
+per-app `DeployHistoryEntry` list on each node describes deploys, retries and
+aborts with their specs, capped at fifty per app and lost on restart. The
+council's `AppRollouts::released` list holds the last ten distinct specs that
+rolled out healthy on every node; cluster rollback reads it, so `relish
+rollback` survives every node restarting. None of them should be confused with
+the Raft-backed design below, which remains the target architecture.
 
 Every deploy is recorded in the per-app deploy history stored in Raft. The history includes:
 
@@ -900,8 +923,10 @@ health_timeout = "60s"
 
 **Behaviour:** The failed instance is stopped immediately (it never entered the routing pool, so no drain is needed). The deploy transitions based on `auto_rollback`:
 
-- `false` (default): Deploy enters `Halted` state. Already-upgraded instances continue serving on the new version. Remaining instances stay on the old version. `relish status` shows the partial state. The operator must intervene.
-- `true`: Deploy enters `Reverting` state. The system starts rolling back already-upgraded instances to the previous version using the same rolling mechanism. After revert completes, the deploy enters `RolledBack` state.
+- `true` (default): Deploy enters `Reverting` state. The system starts rolling back already-upgraded instances to the previous version using the same rolling mechanism. After revert completes, the deploy enters `RolledBack` state. If the previous version can't be restored, the healthy upgraded instances keep serving and the deploy enters `Halted`.
+- `false`: Deploy enters `Halted` state. Already-upgraded instances continue serving on the new version. Remaining instances stay on the old version. `relish status` shows the partial state. The operator must intervene.
+
+In a cluster either outcome marks the app `RolloutFailed` (Section 5.2), so the leader stops releasing the spec to further nodes.
 
 **Detection:** Bun on the target node performs the health check (HTTP GET to the configured health endpoint). If the endpoint returns a non-2xx status or the connection times out for the entire `health_timeout` duration, the instance is considered unhealthy. Bun reports this to the leader via the reporting tree.
 
@@ -915,7 +940,9 @@ health_timeout = "60s"
 - **RoutingUpdate / Draining:** The old instance was already removed from the routing pool. The new instance may or may not be healthy. The leader checks whether the new instance was added to the routing pool before the node failed. If yes, the routing entry is stale (points to a dead node) and must be removed. The leader reschedules the app instance to a surviving node.
 - **Any phase:** If the failed node was running already-completed steps (instances from earlier steps that are now on the new version), those instances are lost and must be rescheduled to surviving nodes. This is handled by the normal Meat rescheduling logic, independent of the deploy system.
 
-**Mitigation:** Deploy state is persisted in Raft after every phase transition. If the leader itself fails, the new leader reads the deploy state from Raft and resumes from the last committed phase. The chaos test "kill leader mid-deploy, verify deploy completes after election" validates this path.
+**Mitigation:** Deploy state is persisted in Raft after every phase transition. If the leader itself fails, the new leader reads the deploy state from Raft and resumes from the last committed phase.
+
+**Shipped (0.2.1):** there is no leader-held deploy state to persist. A node's own rollout carries on whatever happens to the leader, and a new leader reads each node's converged version and health from its reports and releases the next node from there (`new_leader_resumes_node_by_node_release_from_reports`).
 
 ### 7.3 Drain Timeout Exceeded
 
@@ -1069,12 +1096,7 @@ Two integration tests cover rollback:
 3. Verify that the deploy detects the failure, reverts all instances, and the app is fully on the previous version.
 4. Verify that the deploy history records the rollback with the correct reason.
 
-**Chaos test: "kill leader mid-deploy, verify deploy completes after election":**
-
-1. Start a rolling deploy.
-2. Kill the leader node mid-deploy (after at least one step has completed).
-3. Verify that a new leader is elected, picks up the deploy state from Raft, and completes the remaining steps.
-4. Verify zero downtime throughout (continuous health probe).
+The shipped tests: `auto_rollback_after_a_retirement_restores_old_capacity`, `auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance` and `abort_keeps_healthy_new_instances_when_old_capacity_cannot_return` (agent unit tests), the node-by-node planner's unit tests in `src/cluster/rollout.rs`, and, under `make test-cluster`, `three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy`, `bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying` and `rollback_works_after_every_node_restarts` in `tests/placement.rs`. There is no "kill the leader mid-deploy" chaos test: with no leader-held deploy state, the planner's resume-from-reports unit test covers that path.
 
 ### 10.3 Dependency Ordering Verification
 

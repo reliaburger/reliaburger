@@ -117,6 +117,29 @@ mod tests {
         }
     }
 
+    /// An Applications lease refuses jobs, so every case that applies one
+    /// takes a job lease, whatever group it reports under (#742).
+    #[test]
+    fn only_the_cases_that_apply_jobs_take_job_leases() {
+        use super::super::lease::LeaseScope;
+        let applies_jobs = [
+            "process_job_with_exit_zero_succeeds",
+            "failing_job_retries_then_fails",
+            "job_runs_to_completion_and_reports_exit",
+            "scheduled_job_fires_on_its_schedule",
+            "job_logs_are_retrievable_after_completion",
+        ];
+        for case in all() {
+            assert_eq!(
+                case.lease == LeaseScope::NodeJobs,
+                applies_jobs.contains(&case.name),
+                "{} takes a {:?} lease",
+                case.name,
+                case.lease
+            );
+        }
+    }
+
     #[test]
     fn the_catalogue_is_the_expected_size() {
         // All thirteen groups, three cases each.

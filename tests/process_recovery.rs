@@ -14,12 +14,14 @@ fn runtime(directory: &Path) -> ProcessGrill {
     ProcessGrill::with_owner(directory.to_path_buf(), env!("CARGO_BIN_EXE_bun").into())
 }
 
+/// A host workload: the only kind the process runtime runs (#914).
 fn spec(script: &str) -> OciSpec {
     OciSpec {
         reusable_executor: false,
-        host_process: false,
+        host_process: true,
+        initialiser: false,
         root: OciRoot {
-            path: "/".into(),
+            path: reliaburger::grill::oci::HOST_ROOT.into(),
             readonly: false,
         },
         process: OciProcess {
@@ -29,6 +31,7 @@ fn spec(script: &str) -> OciSpec {
             cwd: "/".into(),
             user: OciUser { uid: 0, gid: 0 },
             capabilities: None,
+            oom_score_adj: None,
             overrides: None,
         },
         mounts: vec![],
@@ -759,13 +762,10 @@ async fn agent_retires_launches_that_have_no_adoption_record() {
     let result = recovery_agent(directory.path())
         .adopt_recorded_instances()
         .await;
-    let live_state = grill.state(&live).await;
-    let prepared_state = grill.state(&prepared).await;
-    grill.kill(&live).await.unwrap();
-    stopped(&grill, &live).await;
+    // The runtime forgets only a generation that has retired, so the
+    // journals going is the proof that neither launch can still run (#738).
+    owners_forgotten(directory.path(), &[&live.0, &prepared.0]).await;
     assert_eq!(result.unwrap(), 0);
-    assert_eq!(live_state.unwrap(), ContainerState::Stopped);
-    assert_eq!(prepared_state.unwrap(), ContainerState::Stopped);
 }
 
 #[tokio::test]
@@ -1300,6 +1300,331 @@ async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
         "{private} leaked: {env}"
     );
     assert_eq!(resolved.unwrap(), "found");
+}
+
+/// An agent with a durable process runtime and records under `directory`,
+/// its loop running, and the sender that commands it.
+/// A running agent over the owned process runtime that allows `script`
+/// apps (`/bin/sh`) and `exec` apps of `binaries`.
+fn running_agent(
+    directory: &Path,
+    binaries: &[&Path],
+) -> (
+    tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let mut agent = reliaburger::bun::agent::BunAgent::new(
+        runtime(directory),
+        reliaburger::grill::PortAllocator::new(30000, 30100),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(directory.to_path_buf());
+    agent.set_volumes_dir(directory.join("volumes"));
+    agent.set_perimeter_enabled(false);
+    let mut allowed_binaries = vec![std::path::PathBuf::from("/bin/sh")];
+    allowed_binaries.extend(binaries.iter().map(|binary| binary.to_path_buf()));
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries,
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
+    let task = tokio::spawn(async move { agent.run().await });
+    (sender, shutdown, task)
+}
+
+async fn deploy(
+    sender: &tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+    toml: &str,
+) {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
+    let (events, mut received) = tokio::sync::mpsc::channel(64);
+    sender
+        .send(AgentCommand::Deploy {
+            config: reliaburger::config::Config::parse(toml).unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+    let mut last = None;
+    while let Some(event) = received.recv().await {
+        last = Some(event);
+    }
+    assert!(
+        matches!(last, Some(ApplyEvent::Complete { .. })),
+        "deploy failed: {last:?}"
+    );
+}
+
+/// The process runtime's ownership journal for `id`.
+fn owner_directory(directory: &Path, id: &str) -> std::path::PathBuf {
+    directory.join("process-owners").join(id)
+}
+
+/// Wait until the ownership journals of every one of `ids` are gone.
+async fn owners_forgotten(directory: &Path, ids: &[&str]) {
+    let gone = tokio::time::timeout(Duration::from_secs(15), async {
+        while ids.iter().any(|id| owner_directory(directory, id).exists()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let kept: Vec<_> = ids
+        .iter()
+        .filter(|id| owner_directory(directory, id).exists())
+        .collect();
+    assert!(
+        gone.is_ok(),
+        "ownership journals outlived retirement: {kept:?}"
+    );
+}
+
+const SLEEPER: &str = "script = 'sleep 60'\n";
+
+#[tokio::test]
+async fn deleting_an_app_removes_the_ownership_journal_of_every_instance() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 2\n")).await;
+    let ids = ["default__web-0", "default__web-1"];
+    assert!(
+        ids.iter()
+            .all(|id| owner_directory(directory.path(), id).is_dir())
+    );
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    owners_forgotten(directory.path(), &ids).await;
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn deleting_an_app_removes_its_init_containers_journals_and_a_redeploy_runs_its_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
+    let app =
+        format!("[app.web]\n{SLEEPER}[[app.web.init]]\ncommand = ['/bin/sh', '-c', 'exit 0']\n");
+    deploy(&sender, &app).await;
+    let init = "default__web-0__init-0";
+    assert!(owner_directory(directory.path(), init).is_dir());
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    // The redeploy reuses the initialiser's identity straight away and
+    // must still read its own exit code (#850).
+    deploy(&sender, &app).await;
+    assert!(
+        owner_directory(directory.path(), init).is_dir(),
+        "the redeploy's initialiser lost its journal"
+    );
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    owners_forgotten(directory.path(), &["default__web-0", init]).await;
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 3\n")).await;
+    let before = ["default__web-0", "default__web-1", "default__web-2"];
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 1\n")).await;
+    owners_forgotten(directory.path(), &before).await;
+    let kept = std::fs::read_dir(directory.path().join("process-owners"))
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter(|name| name.starts_with("default__web"))
+        .count();
+    assert_eq!(kept, 1, "the remaining replica keeps its journal");
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_adoption_keeps_a_live_instances_journal_and_forgets_a_dead_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, _shutdown, task) = running_agent(directory.path(), &[]);
+    deploy(
+        &sender,
+        &format!("[app.live]\n{SLEEPER}[app.dead]\n{SLEEPER}"),
+    )
+    .await;
+    // The previous bun process goes away without stopping its workloads.
+    task.abort();
+    let _ = task.await;
+    let grill = runtime(directory.path());
+    let dead = InstanceId("default__dead-0".into());
+    grill.kill(&dead).await.unwrap();
+    stopped(&grill, &dead).await;
+
+    let mut restarted = recovery_agent(directory.path());
+    let adopted = restarted.adopt_recorded_instances().await;
+    owners_forgotten(directory.path(), &[&dead.0]).await;
+    // Give a wrong forget of the adopted instance the chance to land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let live = InstanceId("default__live-0".into());
+    let live_journal = owner_directory(directory.path(), &live.0).is_dir();
+    let live_state = grill.state(&live).await;
+    grill.kill(&live).await.unwrap();
+    stopped(&grill, &live).await;
+    assert_eq!(adopted.unwrap(), 1);
+    assert!(live_journal, "the adopted instance lost its journal");
+    assert_eq!(live_state.unwrap(), ContainerState::Running);
+}
+
+/// An executable script that exits at once, for a test to remove or make
+/// unexecutable between `create` and `start` (#905).
+fn installed_tool(directory: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tool = directory.join("vanishing-tool");
+    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tool
+}
+
+/// Why the runtime refused a launch, or a panic naming what it did instead.
+fn refused(error: reliaburger::grill::GrillError) -> reliaburger::grill::LaunchProblem {
+    match error.launch_problem() {
+        Some(problem) => problem.clone(),
+        None => panic!("expected a refused launch, got {error:?}"),
+    }
+}
+
+/// #905: the binary passes `create`'s check, then disappears before the
+/// owner gate's `exec`. The gate's ENOENT comes back through the owner's
+/// record, so `start` reports "binary not found" and the generation retires.
+#[tokio::test]
+async fn an_owned_start_refuses_a_binary_deleted_before_exec_as_binary_not_found() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = installed_tool(directory.path());
+    let id = InstanceId("default__vanishing-0".into());
+    let grill = runtime(directory.path());
+    let mut launch = spec("unused");
+    launch.process.args = vec![tool.display().to_string()];
+    grill.create(&id, &launch).await.unwrap();
+    std::fs::remove_file(&tool).unwrap();
+
+    let problem = refused(grill.start(&id).await.unwrap_err());
+    assert_eq!(
+        problem.to_string(),
+        format!("binary not found: {}", tool.display())
+    );
+    stopped(&grill, &id).await;
+}
+
+/// #905: a binary that loses its execute bit before the gate's `exec` is
+/// refused as "binary not executable".
+#[tokio::test]
+async fn an_owned_start_refuses_a_binary_made_unexecutable_before_exec() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let tool = installed_tool(directory.path());
+    let id = InstanceId("default__unexecutable-0".into());
+    let grill = runtime(directory.path());
+    let mut launch = spec("unused");
+    launch.process.args = vec![tool.display().to_string()];
+    grill.create(&id, &launch).await.unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let problem = refused(grill.start(&id).await.unwrap_err());
+    assert_eq!(
+        problem.to_string(),
+        format!("binary not executable: {}", tool.display())
+    );
+    stopped(&grill, &id).await;
+}
+
+/// #905: a running app whose binary is deleted, and which then exits, fails
+/// its restart at once with "binary not found" instead of spending its
+/// restart budget and ending `Failed` without a reason.
+#[tokio::test]
+async fn a_restart_after_the_binary_vanished_ends_failed_with_binary_not_found() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let tool = directory.path().join("self-deleting-tool");
+    // It runs long enough for the deploy to see it start, then removes
+    // its own file and exits, so the restart finds no binary.
+    std::fs::write(&tool, "#!/bin/sh\nsleep 1\nrm -f \"$0\"\nexit 1\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[&tool]);
+    deploy(
+        &sender,
+        &format!("[app.ghost]\nexec = {:?}\n", tool.display().to_string()),
+    )
+    .await;
+
+    let reason = format!("binary not found: {}", tool.display());
+    let failed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .send(reliaburger::bun::agent::AgentCommand::Status { response })
+                .await
+                .unwrap();
+            let instances = result.await.unwrap();
+            if let Some(ghost) = instances
+                .into_iter()
+                .find(|instance| instance.app_name == "ghost" && instance.state == "failed")
+            {
+                break ghost;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the restart never failed");
+    shutdown.cancel();
+    task.await.unwrap();
+    assert_eq!(failed.reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(failed.restart_count, 1, "one attempt, not the whole budget");
 }
 
 /// An executor pool forgets each retired executor as it goes idle, so

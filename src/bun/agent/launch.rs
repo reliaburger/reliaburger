@@ -221,14 +221,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// its own registry, on this node, before the deploy began.
     pub(super) async fn enforce_image_signature(
         &self,
-        spec: &AppSpec,
-    ) -> Result<Option<String>, String> {
-        self.enforce_image_reference_signature(spec.image.as_deref())
-            .await
-    }
-
-    pub(super) async fn enforce_image_reference_signature(
-        &self,
         image: Option<&str>,
     ) -> Result<Option<String>, String> {
         self.enforce_upstream_rules(image).await?;
@@ -488,6 +480,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
+    /// The runtime refused to launch `instance_id` because its binary can't
+    /// run here (#881). Launching it again fails the same way, so the
+    /// instance is `Failed` at once, keeping the reason for `relish status`
+    /// and `relish wtf`, instead of waiting in `Starting`.
+    pub(super) async fn record_launch_failure(&mut self, instance_id: &InstanceId, reason: String) {
+        let Some(instance) = self.supervisor.get_instance_mut(instance_id) else {
+            return;
+        };
+        if let Ok(failed) = instance.state.transition_to(ContainerState::Failed) {
+            instance.state = failed;
+        }
+        instance.retry_pending = false;
+        instance.launch_failure = Some(reason.clone());
+        let app = instance.app_name.clone();
+        let namespace = instance.namespace.clone();
+        self.record_event(
+            crate::bun::events::EventKind::Deploy,
+            crate::bun::events::EventSeverity::Warning,
+            Some(app),
+            Some(namespace),
+            format!("instance {instance_id} cannot launch: {reason}"),
+        )
+        .await;
+    }
+
     /// Post-start bookkeeping for a fresh instance (the loop side of the tail
     /// of `drive_instance_startup`): record the container IP, transition to
     /// HealthWait (→Running if no health checks), register its service-map
@@ -601,6 +618,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
+                launch_failure: None,
             },
         );
         self.supervisor
@@ -761,11 +779,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         for new_id in new_ids {
             let host_port = new_ports.get(new_id).copied().flatten();
-            let health_config = spec
-                .health
-                .as_ref()
-                .zip(spec.port)
-                .map(|(hs, port)| crate::bun::health::HealthCheckConfig::from_spec(hs, port));
+            let health_config = crate::bun::health::HealthCheckConfig::for_app(spec);
             if let Some(ref cfg) = health_config {
                 self.supervisor
                     .register_health(new_id.clone(), cfg.clone(), now);
@@ -795,6 +809,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     oci_spec: new_specs.remove(new_id),
                     identity,
                     identity_mount,
+                    launch_failure: None,
                 },
             );
         }
@@ -847,7 +862,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             steps_total: new_ids.len(),
             spec: Some(Box::new(spec.clone())),
         };
-        self.deploy_history.write().await.push(entry);
+        super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
         Ok(())
     }
 

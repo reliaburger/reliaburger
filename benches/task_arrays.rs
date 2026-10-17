@@ -4,7 +4,8 @@
 /// predict the headline before any VM exists:
 /// - range-set operations the leader does per chunk;
 /// - the leader's whole control-plane cost for a 1M-task array (no
-///   processes), with 3 and 200 nodes, and the JSON snapshot of it;
+///   processes), with 3 and 200 nodes, and the JSON snapshot of it,
+///   encoded 64 times an iteration;
 /// - one leader tick (plan every array's writes, batch them, apply the
 ///   entry) with 64 concurrent arrays on 3 nodes, and with one array of
 ///   one-task chunks on 10 nodes, the shape that splits state the most;
@@ -14,6 +15,8 @@
 ///   real process runner at concurrency 1, 4 and 16;
 /// - a worker's disk cost per task: 1M outcomes through the real ledger and
 ///   result index, broken down per file, failing above
+///   `ACTIVE_STORAGE_BYTES_PER_TASK` while the run is active, then the
+///   compacted results of the finished run, failing above
 ///   `STORAGE_BYTES_PER_TASK`.
 ///
 /// Every benchmark reports tasks (or elements) per second.
@@ -25,13 +28,15 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use reliaburger::bun::task_array_leader::{TickInputs, plan_tick, tick_entries};
 use reliaburger::bun::task_array_node::{
-    ArrayProgress, NodeArrayCounters, NodeSyncResponse, STORAGE_BYTES_PER_TASK,
+    ACTIVE_STORAGE_BYTES_PER_TASK, ArrayProgress, NodeArrayCounters, NodeSyncResponse,
+    STORAGE_BYTES_PER_TASK,
 };
 use reliaburger::bun::task_executor::{
     AttemptOutcome, ChunkWork, FakeRunner, PoolConfig, ProcessRunner, TaskFinal, TaskPool,
     TaskRecord, TaskRunner,
 };
 use reliaburger::bun::task_ledger::Ledger;
+use reliaburger::bun::task_result_index;
 use reliaburger::meat::NodeId;
 use reliaburger::meat::index_set::IndexRangeSet;
 use reliaburger::meat::task_array::{ChunkId, TaskArraySpec};
@@ -125,10 +130,21 @@ fn bench_leader(c: &mut Criterion) {
             |b, &nodes| b.iter(|| simulate_leader(nodes)),
         );
     }
+    // One encode of the finished state takes about 0.1 ms, close enough to
+    // timer and scheduling noise that it was the noisiest benchmark in the
+    // gate (#872). So each iteration encodes it `JSON_ENCODES` times, and the
+    // throughput still reports encodes per second. The name carries the
+    // count: a different workload must not be compared with main's baseline
+    // for the old one.
+    const JSON_ENCODES: usize = 64;
     let finished = simulate_leader(3);
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("json_encode_1m", |b| {
-        b.iter(|| serde_json::to_vec(&finished).map(|bytes| bytes.len()))
+    group.throughput(Throughput::Elements(JSON_ENCODES as u64));
+    group.bench_function("json_encode_1m_x64", |b| {
+        b.iter(|| {
+            (0..JSON_ENCODES)
+                .map(|_| serde_json::to_vec(&finished).map_or(0, |bytes| bytes.len()))
+                .sum::<usize>()
+        })
     });
     group.finish();
 }
@@ -368,15 +384,33 @@ fn bench_storage(c: &mut Criterion) {
     let (ledger, index) = write_outcomes(directory.path(), MILLION);
     let per_task = (ledger + index) as f64 / f64::from(MILLION);
     eprintln!(
-        "storage per 1M tasks: ledger {:.1} MiB ({:.1} B/task), result index {:.1} MiB ({:.1} B/task), total {per_task:.1} B/task",
+        "storage per 1M tasks while the run is active: ledger {:.1} MiB ({:.1} B/task), result index {:.1} MiB ({:.1} B/task), total {per_task:.1} B/task",
         ledger as f64 / 1048576.0,
         ledger as f64 / f64::from(MILLION),
         index as f64 / 1048576.0,
         index as f64 / f64::from(MILLION),
     );
     assert!(
-        ledger + index <= u64::from(MILLION) * STORAGE_BYTES_PER_TASK,
-        "{per_task:.1} bytes per task is over the {STORAGE_BYTES_PER_TASK}-byte bound"
+        ledger + index <= u64::from(MILLION) * ACTIVE_STORAGE_BYTES_PER_TASK,
+        "{per_task:.1} bytes per task is over the {ACTIVE_STORAGE_BYTES_PER_TASK}-byte bound"
+    );
+    // The run finishes: the node compacts both files into its results.
+    let results = directory.path().join(task_result_index::RESULTS_FILE);
+    task_result_index::compact(&directory.path().join("ledger"), &results)
+        .unwrap()
+        .unwrap();
+    let kept = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&results).unwrap().blocks() * 512
+    };
+    let per_task = kept as f64 / f64::from(MILLION);
+    eprintln!(
+        "storage per 1M tasks once the run finishes: results {:.1} MiB ({per_task:.1} B/task)",
+        kept as f64 / 1048576.0,
+    );
+    assert!(
+        kept <= u64::from(MILLION) * STORAGE_BYTES_PER_TASK,
+        "{per_task:.1} bytes per finished task is over the {STORAGE_BYTES_PER_TASK}-byte bound"
     );
 
     let mut group = c.benchmark_group("storage");

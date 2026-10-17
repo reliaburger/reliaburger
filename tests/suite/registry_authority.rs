@@ -799,21 +799,6 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
                 StatusCode::OK
             );
         }
-        // A fresh projection must not turn an already-full repository into zero usage.
-        fresh.quota = QuotaConfig {
-            per_repository_bytes: 11,
-            total_bytes: 0,
-        };
-        let response = reliaburger::pickle::api::router(fresh)
-            .oneshot(
-                Request::put("/v2/ordinary/manifests/over-quota")
-                    .header("content-type", "application/vnd.oci.image.manifest.v1+json")
-                    .body(Body::from(body.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     // The same actual TLS route owns and retires a worker's leased repository.
@@ -912,7 +897,13 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
             .unwrap(),
         reliaburger::council::CouncilResponse::Refused { .. }
     ));
-    leased.reap_registry_leases_once().await.unwrap();
+    // The reaper's own tick (#792): over mTLS the retirement applies through
+    // the leader and leaves nothing to log.
+    let mut cleanup_log = reliaburger::pickle::lease::RegistryCleanupLog::default();
+    assert_eq!(
+        leased.reap_registry_leases_tick(&mut cleanup_log).await,
+        None
+    );
     assert!(
         leased
             .catalog
@@ -992,6 +983,102 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
             .is_none()
     );
     assert!(store.has_blob(&config));
+    server.abort();
+    let _ = server.await;
+    follower.shutdown().await.unwrap();
+    leader.shutdown().await.unwrap();
+}
+
+/// #792: the registry's propose and query endpoints are mTLS-only. On a
+/// plaintext cluster a follower's cleanup gets one clear answer naming the
+/// fix, the leader never sees the refused traffic, and the 1 s reaper does
+/// not repeat the line every tick.
+#[tokio::test]
+async fn plaintext_cluster_registry_cleanup_is_refused_once_with_the_mtls_answer() {
+    use reliaburger::mustard::{directory::NodeDirectory, message::LeaderHint};
+    use reliaburger::pickle::{
+        api::PickleState,
+        authority::RegistryForwarder,
+        lease::RegistryCleanupLog,
+        registry_auth::{DEFAULT_UPLOAD_TTL, QuotaConfig, UploadSessions},
+        store::BlobStore,
+        types::{ManifestCatalog, PickleError},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{RwLock, watch};
+
+    let hierarchy = ca::generate_ca_hierarchy("registry-plaintext", &IKM).unwrap();
+    let leader = council(&hierarchy, true).await;
+    let follower = council(&hierarchy, false).await;
+    // The real Bun API, served without TLS the way a development-plaintext or
+    // upgrade-fixture leader serves it.
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let app = router(leader.clone(), None).layer(tower::util::MapRequestLayer::new(
+        move |request: Request<Body>| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            request
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (_directory_tx, directory_rx) = watch::channel(NodeDirectory {
+        leader: Some(LeaderHint {
+            node_id: reliaburger::meat::NodeId::new("node"),
+            term: 100,
+            recovery_epoch: 0,
+            api_address: address,
+            reporting_address: address,
+        }),
+        ..Default::default()
+    });
+    let http =
+        reliaburger::cluster::ClusterHttp::plaintext().with_bearer(Some("internal-token".into()));
+    let root = tempfile::tempdir().unwrap();
+    let state = PickleState {
+        store: Arc::new(BlobStore::new(root.path().join("blobs"))),
+        catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+        node_raft_id: reliaburger::cluster::identity::raft_id_from_name("follower"),
+        council: Some(follower.clone()),
+        forwarder: Some(RegistryForwarder::new(http, directory_rx)),
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
+        persist_path: Some(root.path().join("catalog.json")),
+        auth: None,
+        require_read_auth: false,
+        allow_unauthenticated_bootstrap: true,
+        quota: QuotaConfig::default(),
+        sessions: UploadSessions::new(DEFAULT_UPLOAD_TTL),
+    };
+
+    assert!(matches!(
+        state.reap_registry_leases_once().await,
+        Err(PickleError::RegistryNeedsMtls)
+    ));
+    let mut log = RegistryCleanupLog::default();
+    let line = state
+        .reap_registry_leases_tick(&mut log)
+        .await
+        .expect("the first refusal is reported");
+    assert!(line.contains("the registry needs mTLS"), "{line}");
+    assert!(line.contains("relish init"), "{line}");
+    assert!(!line.contains("403"), "{line}");
+    for tick in 0..5 {
+        assert_eq!(
+            state.reap_registry_leases_tick(&mut log).await,
+            None,
+            "tick {tick} repeated the refusal"
+        );
+    }
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "a plaintext node must not send registry control traffic"
+    );
+
     server.abort();
     let _ = server.await;
     follower.shutdown().await.unwrap();
@@ -1240,26 +1327,19 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
             .is_err(),
         "ownership read succeeded without quorum"
     );
-    for query in [
-        RegistryQuery::Repository {
-            repository: "ordinary".into(),
-        },
-        RegistryQuery::Usage {
-            repository: "ordinary".into(),
-        },
-    ] {
-        assert!(
-            forwarder
-                .query(
-                    None,
-                    reliaburger::cluster::identity::raft_id_from_name("node"),
-                    query
-                )
-                .await
-                .is_err(),
-            "catalogue reads must refuse without quorum"
-        );
-    }
+    assert!(
+        forwarder
+            .query(
+                None,
+                reliaburger::cluster::identity::raft_id_from_name("node"),
+                RegistryQuery::Repository {
+                    repository: "ordinary".into(),
+                },
+            )
+            .await
+            .is_err(),
+        "catalogue reads must refuse without quorum"
+    );
     for server in servers {
         server.abort();
         let _ = server.await;

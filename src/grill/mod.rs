@@ -47,6 +47,7 @@ pub mod userns;
 pub mod volume;
 
 use std::fmt;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
@@ -242,6 +243,15 @@ pub enum GrillError {
         reason: String,
     },
 
+    /// The workload's executable can't run on this node (#881). Launching it
+    /// again fails the same way until someone installs the binary or fixes
+    /// the spec, so callers fail the instance instead of retrying.
+    #[error("instance {instance} cannot launch: {problem}")]
+    LaunchRefused {
+        instance: InstanceId,
+        problem: LaunchProblem,
+    },
+
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
 
@@ -249,10 +259,46 @@ pub enum GrillError {
     ImagePull(#[from] image::ImageError),
 }
 
+/// Why a workload's executable can't run, found before launching it.
+///
+/// Its message is the reason `relish status` and `relish wtf` show.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaunchProblem {
+    /// No file at the path, or no match on the workload's `PATH`.
+    #[error("binary not found: {}", .0.display())]
+    BinaryNotFound(PathBuf),
+    /// The path names a directory, or a file without execute permission.
+    #[error("binary not executable: {}", .0.display())]
+    BinaryNotExecutable(PathBuf),
+    /// The workload is a container, and this node's runtime runs only host
+    /// processes (`--runtime process`, #914). An image needs a container
+    /// runtime: the process runtime never pulls one, and running the app's
+    /// `command` on the host instead would only pretend to run it.
+    ///
+    /// It carries the image: an app's or an init container's own (or, for
+    /// an app with only a `command`, the root filesystem it would run in).
+    #[error("needs a container runtime to run image {0}, and this node's runtime is process")]
+    NeedsContainerRuntime(String),
+    /// The spec names nothing to execute.
+    #[error("no command to run")]
+    NoCommand,
+}
+
 impl GrillError {
+    /// Why this launch can never succeed as it stands, if that's what failed.
+    pub fn launch_problem(&self) -> Option<&LaunchProblem> {
+        match self {
+            GrillError::LaunchRefused { problem, .. } => Some(problem),
+            _ => None,
+        }
+    }
+
     /// Whether this error says the workload's spec can't run as written,
-    /// so another launch would fail the same way: an image reference that
-    /// doesn't parse, or an image whose digest-verified config is invalid.
+    /// so another launch would fail the same way: a launch the runtime
+    /// refused (a missing or unexecutable binary, nothing to run, or an image
+    /// on a node whose runtime runs only host processes), an image reference
+    /// that doesn't parse, or an image whose digest-verified config is
+    /// invalid.
     ///
     /// Every other error is the runtime, the host or a registry failing
     /// (a pull, a runc call, disk, network setup), which a later attempt
@@ -262,9 +308,11 @@ impl GrillError {
     pub fn refuses_spec(&self) -> bool {
         matches!(
             self,
-            Self::ImagePull(
-                image::ImageError::InvalidReference(_) | image::ImageError::InvalidConfig { .. }
-            )
+            Self::LaunchRefused { .. }
+                | Self::ImagePull(
+                    image::ImageError::InvalidReference(_)
+                        | image::ImageError::InvalidConfig { .. }
+                )
         )
     }
 }
@@ -436,6 +484,32 @@ pub trait Grill: Send + Sync {
         std::future::ready(Ok(()))
     }
 
+    /// [`Grill::forget_retired`], for one known generation of a reused
+    /// identity: it also refuses while the identity's current generation is
+    /// any other, so a late request can't forget a successor's launch, such
+    /// as an init container whose exit code a redeploy still has to read
+    /// (#850).
+    fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &RuntimeGeneration,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send {
+        let _ = (instance, generation);
+        std::future::ready(Ok(()))
+    }
+
+    /// The generation of the instance's current launch, for a later
+    /// [`Grill::forget_retired_generation`]. `None` when this runtime keeps
+    /// no launch for it, or keeps no per-instance metadata at all.
+    fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<RuntimeGeneration>, GrillError>> + Send
+    {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
     /// Identities this runtime keeps metadata for although no backend has a
     /// launch for them, so nothing they record can still run. Candidates for
     /// [`Grill::forget_retired`] at startup; most runtimes have none.
@@ -494,6 +568,11 @@ pub trait Grill: Send + Sync {
     /// Whether recovery can route an original backend without a fallback.
     fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
         self.runtime_kind() == kind
+    }
+    /// Whether this runtime runs containers, which an image app needs
+    /// (#914). The process runtime runs host workloads only.
+    fn runs_containers(&self) -> bool {
+        self.runtime_kind_for_host(false) != records::RuntimeKind::Process
     }
     /// Per-workload enforcement: whether this workload's process will run in
     /// the cgroup its spec names, so the agent can bind policy to it first.
@@ -850,6 +929,37 @@ impl Grill for AnyGrill {
         }
     }
 
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.forget_retired_generation(instance, generation).await,
+        }
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<RuntimeGeneration>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.launch_generation(instance).await,
+        }
+    }
+
     async fn unlaunched_metadata(&self) -> Result<Vec<InstanceId>, GrillError> {
         match self {
             #[cfg(target_os = "linux")]
@@ -1114,15 +1224,25 @@ async fn which_exists(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_an_unusable_image_spec_refuses_a_launch() {
+    fn only_an_unusable_spec_refuses_a_launch() {
         use super::image::ImageError;
         let instance = InstanceId("default__job-0".into());
+        let refused = |problem| GrillError::LaunchRefused {
+            instance: instance.clone(),
+            problem,
+        };
         let refusals = [
             GrillError::ImagePull(ImageError::InvalidReference("no tag".into())),
             GrillError::ImagePull(ImageError::InvalidConfig {
                 digest: "sha256:00".into(),
                 reason: "not JSON".into(),
             }),
+            // The runtime's own launch refusals (#881, #914) are the spec's
+            // fault too, so a task is refused rather than retried (#889).
+            refused(LaunchProblem::BinaryNotFound("/missing".into())),
+            refused(LaunchProblem::BinaryNotExecutable("/etc".into())),
+            refused(LaunchProblem::NeedsContainerRuntime("busybox:1.36".into())),
+            refused(LaunchProblem::NoCommand),
         ];
         for error in &refusals {
             assert!(error.refuses_spec(), "{error}");

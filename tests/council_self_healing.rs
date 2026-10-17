@@ -328,3 +328,96 @@ async fn flapping_node_inside_window_causes_no_churn() {
         );
     }
 }
+
+/// D12 (#694): a two-node cluster forms a one-voter council, not two
+/// voters that would each be needed for quorum. Losing the node that isn't
+/// the voter costs nothing: the voter keeps leading and committing alone.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn two_node_cluster_survives_losing_the_non_voter() {
+    use reliaburger::council::log_store::MemLogStore;
+    use reliaburger::council::network::InMemoryRaftNetworkFactory;
+    use reliaburger::council::state_machine::CouncilStateMachine;
+
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+
+    // Two council nodes on the in-memory router; node-1 bootstraps alone,
+    // as the first node of a fresh cluster does.
+    let router = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    for index in 0..2 {
+        let node = CouncilNode::new(
+            rid(index),
+            cluster_support::fast_council_config(),
+            InMemoryRaftNetworkFactory::new(rid(index), router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(rid(index), node.raft().clone()).await;
+        nodes.push(Arc::new(node));
+    }
+    nodes[0]
+        .initialize(std::collections::BTreeMap::from([(rid(0), node_info(0))]))
+        .await
+        .unwrap();
+
+    // Gossip sees both nodes, warm, for the whole settle period.
+    let now = Instant::now();
+    let (membership_tx, membership_rx) = watch::channel(vec![member(0, now), member(1, now)]);
+    let shutdown = CancellationToken::new();
+    for (index, node) in nodes.iter().enumerate() {
+        spawn_council_reconciler_with_config(
+            Arc::clone(node),
+            membership_rx.clone(),
+            1,
+            rid(index),
+            node_info(index),
+            heal_reconciler_config(),
+            shutdown.clone(),
+        );
+    }
+
+    // Many reconciler ticks later, the council is still the one voter.
+    let voters = |node: &CouncilNode| -> BTreeSet<u64> {
+        node.metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    };
+    let start = tokio::time::Instant::now();
+    while tokio::time::Instant::now() < start + Duration::from_secs(3) {
+        assert_eq!(
+            voters(&nodes[0]),
+            BTreeSet::from([rid(0)]),
+            "a two-node cluster grew an even council"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The non-voter dies: its Raft stops and gossip drops it.
+    nodes[1].shutdown().await.unwrap();
+    membership_tx.send(vec![member(0, Instant::now())]).unwrap();
+
+    // The voter still commits, alone.
+    for index in 0..5 {
+        let write = nodes[0].write(RaftRequest::ConfigSet {
+            key: format!("after-loss-{index}"),
+            value: "ok".to_string(),
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), write).await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "the voter stopped committing once the other node died: {result:?}"
+        );
+    }
+    assert_eq!(nodes[0].current_leader().await, Some(rid(0)));
+    shutdown.cancel();
+}

@@ -98,6 +98,7 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         "test_lease.retired",
         Operation,
     ),
+    audited(Post, "/v1/rollouts/failed", "rollout.failed", Operation),
     audited(Post, "/v1/upgrade/apply", "upgrade.applied", Operation),
     audited(
         Post,
@@ -115,6 +116,7 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         Operation,
     ),
     audited(Post, "/v1/cluster/elect", "council.elect", Operation),
+    audited(Post, "/v1/gitops/config", "gitops.configured", Operation),
     audited(
         Post,
         "/v1/nodes/decommission",

@@ -14,13 +14,18 @@
 //! Gated behind `RELIABURGER_CLUSTER_TESTS=1` like the other multi-node
 //! suites. Run via `make test-cluster`, or
 //! `RELIABURGER_CLUSTER_TESTS=1 cargo test --test cluster_task_arrays -- --ignored`.
+//!
+//! Every node leases its four-port block with `reserve_port_block_lease` and
+//! keeps its data under the test's own temporary directory, so the tests
+//! here can run beside each other, beside the other cluster suites and
+//! beside another worktree's run of this binary (#744).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reliaburger::bun::task_array_leader::TaskArrayService;
+use reliaburger::bun::task_array_leader::{CronClock, TaskArrayService};
 use reliaburger::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
 use reliaburger::bun::task_executor::{AttemptOutcome, FakeRunner};
 use reliaburger::bun::task_ledger::GroupCommit;
@@ -34,11 +39,13 @@ mod bun_process;
 mod cluster_support;
 use bun_process::{PortBlockReservation, reserve_port_block_lease};
 use cluster_support::{
-    MembershipSource, WiredNode, WiredNodeOptions, cluster_tests_enabled, local, start_wired_node,
+    MembershipSource, WiredNode, WiredNodeOptions, applied_own_term, chunks_accepted_from,
+    cluster_tests_enabled, local, start_wired_node,
 };
 
 const SERVICE_TOKEN: &str = "cluster-test-task-arrays-service";
-const BASE_PORT: u16 = 23510;
+/// Ports per node: gossip, +1 Raft, +2 reporting, +3 API.
+const PORTS_PER_NODE: u16 = 4;
 const BINARY: &str = "/usr/local/bin/rb-task";
 const TASKS: u32 = 100_000;
 
@@ -74,8 +81,18 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
     ))
 }
 
+/// One leased port block per node, held until the test ends so no other
+/// fixture on the host (another test here, another suite, another
+/// worktree's run) binds these ports while the cluster runs, including a
+/// killed node's ports while it is down (#744).
+fn lease_node_ports(nodes: usize) -> Vec<PortBlockReservation> {
+    (0..nodes)
+        .map(|_| reserve_port_block_lease(PORTS_PER_NODE))
+        .collect()
+}
+
 async fn start_node(
-    base: u16,
+    ports: &PortBlockReservation,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
@@ -83,12 +100,13 @@ async fn start_node(
 ) -> WiredNode {
     start_wired_node(WiredNodeOptions {
         name: format!("ta{index}"),
-        gossip_port: base + (index as u16) * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-task-arrays",
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         stale_report_timeout_secs: 10,
+        stale_node_grace: None,
         metrics_rollup: None,
         scheduler: None,
         lease_reaper: false,
@@ -100,6 +118,7 @@ async fn start_node(
         keep_data_dir: false,
         task_arrays: Some(service(data)),
         task_arrays_on_agent_budget: None,
+        process_only: false,
     })
     .await
 }
@@ -161,18 +180,11 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_node(BASE_PORT, 0, vec![], &root, data[0].path()).await];
+    let ports = lease_node_ports(3);
+    let seed = local(ports[0].base);
+    let mut nodes = vec![start_node(&ports[0], 0, vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(
-            start_node(
-                BASE_PORT,
-                index,
-                vec![local(BASE_PORT)],
-                &root,
-                directory.path(),
-            )
-            .await,
-        );
+        nodes.push(start_node(&ports[index], index, vec![seed], &root, directory.path()).await);
     }
     // Killing a node before the voter set settles could leave the others
     // on a joint configuration that still needs it.
@@ -333,9 +345,6 @@ async fn a_task_array_survives_losing_a_node_mid_run() {
     root.cancel();
 }
 
-/// Ports for the leader-loss test, clear of the other tests' blocks.
-const LEADER_LOSS_BASE_PORT: u16 = BASE_PORT + 200;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run() {
@@ -345,18 +354,11 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = vec![start_node(LEADER_LOSS_BASE_PORT, 0, vec![], &root, data[0].path()).await];
+    let ports = lease_node_ports(3);
+    let seed = local(ports[0].base);
+    let mut nodes = vec![start_node(&ports[0], 0, vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
-        nodes.push(
-            start_node(
-                LEADER_LOSS_BASE_PORT,
-                index,
-                vec![local(LEADER_LOSS_BASE_PORT)],
-                &root,
-                directory.path(),
-            )
-            .await,
-        );
+        nodes.push(start_node(&ports[index], index, vec![seed], &root, directory.path()).await);
     }
     wait_until(
         "three settled voters",
@@ -406,27 +408,34 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
         .as_u64()
         .unwrap_or_else(|| panic!("{answer}"));
 
-    // The leader is a worker too: kill it once it is running its own share.
+    // The leader is a worker too. Kill it once one of its own chunks has
+    // been accepted while it still holds others: a report accepted before
+    // the kill must count, and the chunks it still holds must not (#1007).
     let leader_name = format!("ta{leader}");
+    let lost = reliaburger::meat::NodeId::new(&leader_name);
     wait_until(
-        "the leader holds work",
+        "the leader has a chunk accepted and still holds work",
         Duration::from_secs(60),
         async || {
-            status(&http, &nodes[leader], batch_id)
+            let holds = nodes[leader]
+                .council
+                .desired_state()
                 .await
-                .is_some_and(|summary| {
-                    summary["nodes"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|node| {
-                            node["node"] == leader_name.as_str()
-                                && node["counters"]["succeeded"].as_u64().unwrap_or(0) > 0
-                        })
-                })
+                .task_arrays
+                .get(batch_id)
+                .and_then(|record| record.state.held_by(&lost).map(|held| !held.is_empty()))
+                .unwrap_or(false);
+            holds
+                && !chunks_accepted_from(&nodes[leader], batch_id, &lost)
+                    .await
+                    .is_empty()
         },
     )
     .await;
+    // Record what the leader had applied at the kill, so the end can tell
+    // an acceptance from its term apart from a late one.
+    let accepted_before_kill = chunks_accepted_from(&nodes[leader], batch_id, &lost).await;
+    let applied_at_kill = nodes[leader].metrics_rx.borrow().last_applied;
     nodes[leader].shutdown.cancel();
 
     // The new leader starts its silence clock at its election, so for the
@@ -442,7 +451,22 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     })
     .await;
     let new_leader = new_leader.unwrap();
-    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    // Once the new leader has applied an entry of its own term, every entry
+    // the old leader wrote while it led is applied too (a Tick it appended
+    // just before the kill commits only now). Anything accepted from the
+    // dead leader after this point would be a late acceptance.
+    wait_until(
+        "the new leader applies its own term",
+        Duration::from_secs(30),
+        async || applied_own_term(&nodes[new_leader]),
+    )
+    .await;
+    let takeover = nodes[new_leader].metrics_rx.borrow().last_applied;
+    let accepted_under_old_leader = chunks_accepted_from(&nodes[new_leader], batch_id, &lost).await;
+    assert!(
+        accepted_before_kill.is_subset(&accepted_under_old_leader),
+        "chunks {accepted_before_kill:?} accepted from {lost} at the kill are missing at takeover: {accepted_under_old_leader:?}"
+    );
     let held_at_loss = nodes[new_leader]
         .council
         .desired_state()
@@ -472,7 +496,8 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     )
     .await;
     // Nothing lost, nothing counted twice: the dead leader's commands may
-    // have finished, but no report of theirs can be accepted any more.
+    // have finished, but no report of theirs can be accepted once the new
+    // leader has taken over.
     assert_eq!(last["status"], "Succeeded", "{last}");
     assert_eq!(last["succeeded"], TASKS, "{last}");
     assert_eq!(last["failed"], 0, "{last}");
@@ -504,11 +529,20 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
             .expect("every chunk has one accepted grant");
         let attempt = grant.attempt;
         // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
-        assert_ne!(
-            grant.owner,
-            Some(lost.clone()),
-            "chunk {chunk} was accepted from the dead leader"
-        );
+        // The dead leader's own chunks count only if they were accepted in
+        // its term, before the new leader took over.
+        if grant.owner.as_ref() == Some(&lost) {
+            assert!(
+                accepted_under_old_leader.contains(&chunk),
+                "chunk {chunk} was accepted from the dead leader after the takeover \
+                 (applied at kill {applied_at_kill:?}, takeover {takeover:?}, \
+                 accepted at kill {accepted_before_kill:?}, at takeover {accepted_under_old_leader:?})"
+            );
+            assert_eq!(
+                attempt, 1,
+                "chunk {chunk} was accepted from the dead leader at a later attempt"
+            );
+        }
         if attempt > 1 {
             replayed += 1;
             assert!(
@@ -529,20 +563,31 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
         .unwrap_or(0)
         - raft_before;
     eprintln!(
-        "cluster_task_arrays: leader lost mid-run; {} chunks held at loss, {replayed} replayed, {entries} Raft entries afterwards",
+        "cluster_task_arrays: leader lost mid-run; {} chunks accepted from it at the kill (applied {applied_at_kill:?}), {} by the takeover (applied {takeover:?}), {} held at loss, {replayed} replayed, {entries} Raft entries afterwards",
+        accepted_before_kill.len(),
+        accepted_under_old_leader.len(),
         held_at_loss.len()
     );
     root.cancel();
 }
 
+/// How a common cluster's nodes treat jobs: how long each fake task takes,
+/// and the clock the leader fires cron schedules at.
+struct CommonJobs {
+    delay: Duration,
+    cron_clock: CronClock,
+}
+
 async fn start_common_node(
+    ports: &PortBlockReservation,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
     data: &std::path::Path,
-    delay: Duration,
+    jobs: &CommonJobs,
     operator: &reliaburger::sesame::types::ApiToken,
 ) -> WiredNode {
+    let delay = jobs.delay;
     let executor = TaskArrayNode::new(
         TaskArrayNodeConfig {
             root: data.join("task-arrays"),
@@ -562,12 +607,13 @@ async fn start_common_node(
     );
     start_wired_node(WiredNodeOptions {
         name: format!("common{index}"),
-        gossip_port: BASE_PORT + 100 + index as u16 * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-common-jobs",
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         stale_report_timeout_secs: 10,
+        stale_node_grace: None,
         metrics_rollup: None,
         scheduler: None,
         lease_reaper: false,
@@ -577,12 +623,16 @@ async fn start_common_node(
         fault_injection: false,
         labels: Default::default(),
         keep_data_dir: false,
-        task_arrays: Some(Arc::new(TaskArrayService::with_timings(
-            Some(Arc::new(executor)),
-            Duration::from_millis(100),
-            Duration::from_secs(3),
-        ))),
+        task_arrays: Some(Arc::new(
+            TaskArrayService::with_timings(
+                Some(Arc::new(executor)),
+                Duration::from_millis(100),
+                Duration::from_secs(3),
+            )
+            .with_cron_clock(jobs.cron_clock.clone()),
+        )),
         task_arrays_on_agent_budget: None,
+        process_only: false,
     })
     .await
 }
@@ -592,6 +642,22 @@ async fn common_cluster(
 ) -> (
     CancellationToken,
     Vec<tempfile::TempDir>,
+    Vec<PortBlockReservation>,
+    Vec<WiredNode>,
+    String,
+) {
+    common_cluster_with_cron_clock(delay, CronClock::System).await
+}
+
+/// A common cluster whose nodes all fire cron schedules at `cron_clock`'s
+/// time, whichever of them leads.
+async fn common_cluster_with_cron_clock(
+    delay: Duration,
+    cron_clock: CronClock,
+) -> (
+    CancellationToken,
+    Vec<tempfile::TempDir>,
+    Vec<PortBlockReservation>,
     Vec<WiredNode>,
     String,
 ) {
@@ -604,19 +670,22 @@ async fn common_cluster(
     .unwrap();
     let root = CancellationToken::new();
     let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ports = lease_node_ports(3);
+    let jobs = CommonJobs { delay, cron_clock };
     let mut nodes = Vec::new();
     for (index, directory) in data.iter().enumerate() {
         nodes.push(
             start_common_node(
+                &ports[index],
                 index,
                 if index == 0 {
                     vec![]
                 } else {
-                    vec![local(BASE_PORT + 100)]
+                    vec![local(ports[0].base)]
                 },
                 &root,
                 directory.path(),
-                delay,
+                &jobs,
                 &operator.token,
             )
             .await,
@@ -641,7 +710,7 @@ async fn common_cluster(
         },
     )
     .await;
-    (root, data, nodes, operator.plaintext)
+    (root, data, ports, nodes, operator.plaintext)
 }
 
 /// Move Raft leadership off `leader` and return the index of the node that
@@ -702,7 +771,7 @@ async fn hand_over_leadership(nodes: &[WiredNode], leader: usize) -> usize {
 #[ignore = "requires a real multi-node cluster; run with make test-cluster"]
 async fn a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change() {
     assert!(cluster_tests_enabled());
-    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(2)).await;
+    let (root, _data, _ports, nodes, token) = common_cluster(Duration::from_secs(2)).await;
     let leader = nodes
         .iter()
         .position(|node| *node.thinks_leader.borrow())
@@ -828,8 +897,14 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
         MAX_ACTIVE_ARRAYS, MAX_ACTIVE_RUNS_PER_NAMESPACE, RESERVED_TRIGGERED_RUNS,
     };
     assert!(cluster_tests_enabled());
+    // The cron clock stands still until every bulk slot is full, so the
+    // occurrence can't come round early and take one of their slots, however
+    // slow the machine is (#748). Every node shares it, whichever leads.
+    let start = reliaburger::meat::batch_ids::epoch_now_secs() / 60 * 60;
+    let clock = CronClock::manual(start);
     // Every task takes far longer than the test, so every array stays active.
-    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(600)).await;
+    let (root, _data, _ports, nodes, token) =
+        common_cluster_with_cron_clock(Duration::from_secs(600), clock.clone()).await;
     let leader = nodes
         .iter()
         .position(|node| *node.thinks_leader.borrow())
@@ -838,11 +913,10 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
     let http = reqwest::Client::new();
     let api = |index: usize| format!("http://127.0.0.1:{}", nodes[index].api_port);
 
-    // The bulk submissions below take a few seconds and must all land before
-    // the occurrence fires, or it takes one of their slots. Skip to the minute
-    // after next when the next one is less than 30 seconds away.
-    let now = time::OffsetDateTime::now_utc();
-    let next = now + time::Duration::minutes(if now.second() >= 30 { 2 } else { 1 });
+    // Well past the wall-clock minute registration lands in, which a schedule
+    // never fires in.
+    let occurrence = start + 30 * 60;
+    let next = time::OffsetDateTime::from_unix_timestamp(occurrence as i64).unwrap();
     let expression = format!(
         "{} {} {} {} *",
         next.minute(),
@@ -887,10 +961,22 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
         .unwrap_or_default()
         .to_string();
     assert!(reason.contains("cron fires and deployments"), "{reason}");
+    assert!(
+        !nodes[leader]
+            .council
+            .desired_state()
+            .await
+            .task_arrays
+            .jobs()
+            .runs()
+            .any(|(_, run)| run.name == "nightly"),
+        "the occurrence fired before the cron clock reached it"
+    );
 
+    clock.set(occurrence);
     wait_until(
         "the cron occurrence admitted into the reserved headroom",
-        Duration::from_secs(135),
+        Duration::from_secs(30),
         async || {
             nodes[leader]
                 .council
@@ -913,7 +999,7 @@ async fn cron_in_one_namespace_fires_while_another_fills_the_bulk_cap() {
 #[ignore = "requires a real multi-node cluster; run with make test-cluster"]
 async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another_attempt() {
     assert!(cluster_tests_enabled());
-    let (root, _data, nodes, token) = common_cluster(Duration::from_secs(10)).await;
+    let (root, _data, _ports, nodes, token) = common_cluster(Duration::from_secs(10)).await;
     let leader = nodes
         .iter()
         .position(|node| *node.thinks_leader.borrow())
@@ -1052,7 +1138,6 @@ async fn losing_a_singleton_worker_requires_exact_operator_replay_before_another
 }
 
 /// Ports one wired node binds: gossip, Raft, reporting and the API.
-const HUNG_PORTS_PER_NODE: u16 = 4;
 const HUNG_ARRAYS: usize = 16;
 // 16 arrays of 4,000 tasks at 20 ms each on 3 × 16 slots take at least
 // 27 s however fast the host is: three times the ~9 s from submitting them
@@ -1095,8 +1180,9 @@ async fn start_hung_node(
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-hung-worker",
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         stale_report_timeout_secs: 10,
+        stale_node_grace: None,
         metrics_rollup: None,
         scheduler: None,
         lease_reaper: false,
@@ -1112,14 +1198,15 @@ async fn start_hung_node(
             Duration::from_secs(3),
         ))),
         task_arrays_on_agent_budget: None,
+        process_only: false,
     })
     .await
 }
 
 /// Hang a worker's sync API without stopping its gossip: swap its control
 /// fence file for a FIFO with no writer, so its next sync blocks reading it
-/// (as on a stuck disk). Retries if a sync in flight renames a fresh fence
-/// over the FIFO.
+/// (as on a stuck disk). Retries if a sync in flight found no fence in the
+/// gap and renamed a fresh one over the FIFO.
 async fn hang_sync(control: &std::path::Path) {
     use std::os::unix::fs::FileTypeExt;
     for _ in 0..50 {
@@ -1133,9 +1220,10 @@ async fn hang_sync(control: &std::path::Path) {
     panic!("the worker kept replacing its fence file");
 }
 
-/// Release every hung sync. The leader gives up on a sync after its 3 s
-/// timeout and sends another, so by now two or more of the worker's syncs
-/// can be blocked on the FIFO, each holding a blocking thread.
+/// Release the hung sync. The leader gives up on a sync after its 3 s
+/// timeout and sends another, but the worker refuses it as busy while the
+/// first one's read is still blocked (#770), so one blocking thread waits
+/// on the FIFO. Before that fix each retry added another.
 ///
 /// First move the FIFO aside, so the next sync finds no fence file and
 /// carries on. Then open and close its write end until no reader holds it.
@@ -1198,11 +1286,7 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
     );
     let root = CancellationToken::new();
     let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    // Leased blocks, held until the test ends, so no other fixture on the
-    // host binds these ports while the cluster runs.
-    let ports: Vec<PortBlockReservation> = (0..3)
-        .map(|_| reserve_port_block_lease(HUNG_PORTS_PER_NODE))
-        .collect();
+    let ports = lease_node_ports(3);
     let seed = local(ports[0].base);
     let mut nodes = vec![start_hung_node(0, &ports[0], vec![], &root, data[0].path()).await];
     for (index, directory) in data.iter().enumerate().skip(1) {
@@ -1299,7 +1383,7 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
         "{entries} Raft entries in {ticks} ticks for {HUNG_ARRAYS} arrays"
     );
 
-    let control = data[victim].path().join("task-arrays/control.json");
+    let control = data[victim].path().join("task-arrays/control.fence");
     hang_sync(&control).await;
 
     // While the victim's API hangs, the leader still hears from the healthy
@@ -1328,8 +1412,8 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
     );
     // Waiting on the hung node's 3 s sync timeout every tick would allow at
     // most two fresh readings in 4 s. The healthy node's own syncs can be
-    // slow on a busy host (each fsyncs its control fence), so don't demand
-    // all twenty ticks.
+    // slow on a busy host (each flushes its moved control fence, and its
+    // grants and ledger), so don't demand all twenty ticks.
     assert!(
         seen.len() >= 5,
         "the healthy node was heard {} times in 4 s",
@@ -1362,6 +1446,7 @@ async fn hung_worker_api_does_not_stall_other_nodes_arrays() {
 /// Bun wires it. `executor: false` leaves the node without one, so arrays
 /// run only on the nodes that have it.
 async fn shared_budget_node(
+    ports: &PortBlockReservation,
     index: usize,
     seeds: Vec<std::net::SocketAddr>,
     root: &CancellationToken,
@@ -1399,11 +1484,12 @@ async fn shared_budget_node(
     });
     start_wired_node(WiredNodeOptions {
         name: format!("shared{index}"),
-        gossip_port: BASE_PORT + 200 + index as u16 * 10,
+        gossip_port: ports.base,
         seeds,
         shutdown: root.child_token(),
         data_dir_prefix: "rb-shared-budget",
         stale_report_timeout_secs: 10,
+        stale_node_grace: None,
         metrics_rollup: None,
         scheduler: Some(reliaburger::config::node::ReconstructionSection {
             report_threshold_percent: 95,
@@ -1418,13 +1504,14 @@ async fn shared_budget_node(
         fault_injection: false,
         labels: Default::default(),
         keep_data_dir: false,
-        data_root: None,
+        data_root: Some(data.to_path_buf()),
         task_arrays: Some(Arc::new(TaskArrayService::with_timings(
             None,
             Duration::from_millis(100),
             Duration::from_secs(10),
         ))),
         task_arrays_on_agent_budget: build,
+        process_only: false,
     })
     .await
 }
@@ -1439,14 +1526,25 @@ async fn app_replica_lands_on_the_idle_node_while_another_runs_an_array() {
     assert!(cluster_tests_enabled());
     let root = CancellationToken::new();
     let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ports = lease_node_ports(3);
     let mut nodes = Vec::new();
     for (index, directory) in data.iter().enumerate() {
         let seeds = if index == 0 {
             vec![]
         } else {
-            vec![local(BASE_PORT + 200)]
+            vec![local(ports[0].base)]
         };
-        nodes.push(shared_budget_node(index, seeds, &root, directory.path(), index == 0).await);
+        nodes.push(
+            shared_budget_node(
+                &ports[index],
+                index,
+                seeds,
+                &root,
+                directory.path(),
+                index == 0,
+            )
+            .await,
+        );
     }
     wait_until(
         "three settled voters",
@@ -1511,10 +1609,7 @@ async fn app_replica_lands_on_the_idle_node_while_another_runs_an_array() {
         .write(reliaburger::council::RaftRequest::AppSpec {
             app_id: app.clone(),
             spec: Box::new(
-                toml::from_str(
-                    "image = 'proc-grill:image-ignored'\ncommand = ['sleep', '600']\ncpu = '1000m'\nreplicas = 3",
-                )
-                .unwrap(),
+                toml::from_str("script = 'exec sleep 600'\ncpu = '1000m'\nreplicas = 3").unwrap(),
             ),
         })
         .await

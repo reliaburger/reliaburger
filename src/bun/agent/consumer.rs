@@ -1,5 +1,6 @@
 //! Durable consumer publication, complete view withdrawal and receipt permissions.
 
+use super::discovery_ownership::Landing;
 use super::{BunAgent, BunError, DiscoveryOwnership, Grill};
 use crate::bun::consumer_owners::{
     ConsumerIdentity, ConsumerOwnership, ConsumerPhase, ConsumerPublication, ConsumerReceipt,
@@ -52,6 +53,11 @@ pub(super) struct ConsumerAnswer {
 /// (#505); after a restart, the inventory read and the first write held
 /// one turn for 1.1 s (#603). The steps keep the order the single-turn
 /// version had.
+///
+/// A step waits for its write only until the turn's runtime budget runs
+/// out. A write still going then (1.6 s after a restart in the 0.2.0
+/// soaks, #890) carries on off the loop, and the step's remainder becomes
+/// [`ConsumerStep::Landed`], which runs once the write has landed.
 enum ConsumerStep {
     /// Record the answer's withdrawal obligations, and journal its view's
     /// first change, unless it is the view already published.
@@ -71,6 +77,35 @@ enum ConsumerStep {
     /// Forget replaced views whose requests have released, and mark the
     /// receipts no remaining view contradicts.
     Compact,
+    /// What a step does after its journal write, once that write has landed.
+    Landed(AfterWrite),
+}
+
+/// The rest of a step whose journal write outlasted its turn.
+enum AfterWrite {
+    /// Nothing but the next step.
+    Then(Box<ConsumerStep>),
+    /// Install the view the write recorded, then activate it.
+    Install(ConsumerPublication),
+    /// The synchronisation is complete.
+    Done,
+}
+
+impl ConsumerStep {
+    /// The view this step, or what it finishes, has yet to publish.
+    fn publication(&self) -> Option<&ConsumerPublication> {
+        match self {
+            ConsumerStep::Journal { publication, .. }
+            | ConsumerStep::Withdraw(publication)
+            | ConsumerStep::ProveReceipts(publication)
+            | ConsumerStep::Publish(publication)
+            | ConsumerStep::Landed(AfterWrite::Install(publication)) => Some(publication),
+            ConsumerStep::Landed(AfterWrite::Then(step)) => step.publication(),
+            ConsumerStep::Activate
+            | ConsumerStep::Compact
+            | ConsumerStep::Landed(AfterWrite::Done) => None,
+        }
+    }
 }
 
 /// Where a synchronisation stands after a step.
@@ -94,6 +129,8 @@ pub(super) struct ConsumerSyncs {
     stepped_now: bool,
     /// Whether the last turn took a step, so a queued command goes next.
     stepped_last: bool,
+    /// How the write a [`ConsumerStep::Landed`] waits for ended, once it has.
+    landed: Option<Result<(), BunError>>,
 }
 
 impl ConsumerSyncs {
@@ -106,6 +143,11 @@ impl ConsumerSyncs {
     /// take turns, so neither waits for all of the other.
     pub(super) fn step_first(&self) -> bool {
         !self.is_idle() && !self.stepped_last
+    }
+
+    /// Keep how the write a [`ConsumerStep::Landed`] waits for ended.
+    pub(super) fn write_landed(&mut self, result: Result<(), BunError>) {
+        self.landed = Some(result);
     }
 
     /// Close the turn; true if it took a step.
@@ -128,19 +170,15 @@ impl ConsumerSyncs {
             ConsumerStep::Publish(_) => "consumer_sync/publish",
             ConsumerStep::Activate => "consumer_sync/activate",
             ConsumerStep::Compact => "consumer_sync/compact",
+            ConsumerStep::Landed(AfterWrite::Install(_)) => "consumer_sync/install",
+            ConsumerStep::Landed(_) => "consumer_sync/landed",
         }
     }
 
     /// The view the synchronisation under way will publish, while the
     /// journal doesn't yet list it as the only one.
     fn pending_publication(&self) -> Option<&ConsumerPublication> {
-        match &self.current.as_ref()?.next {
-            ConsumerStep::Journal { publication, .. }
-            | ConsumerStep::Withdraw(publication)
-            | ConsumerStep::ProveReceipts(publication)
-            | ConsumerStep::Publish(publication) => Some(publication),
-            ConsumerStep::Activate | ConsumerStep::Compact => None,
-        }
+        self.current.as_ref()?.next.publication()
     }
 
     /// Test-only: a synchronisation that has withdrawn the old view and
@@ -155,13 +193,11 @@ impl ConsumerSyncs {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// The consumer's durable ownership. While a step's write is in flight
+    /// this is the ownership before it; the view that write records counts
+    /// through the step under way ([`Self::own_view_names`]).
     pub(super) fn consumer_owner(&self) -> Option<&ConsumerOwnership> {
-        match &self.discovery_ownership {
-            DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal) => {
-                journal.inventory().consumer.as_ref()
-            }
-            _ => None,
-        }
+        self.discovery_ownership.durable()?.consumer.as_ref()
     }
 
     pub(super) fn consumer_controls_views(&self) -> bool {
@@ -170,13 +206,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 && matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain))
     }
 
+    /// Journal `next` and wait for it to land.
     async fn save_consumer(&mut self, next: ConsumerOwnership) -> Result<(), BunError> {
+        self.write_consumer(next, None).await.map(|_| ())
+    }
+
+    /// Journal `next` for a consumer step: wait for it until the turn's
+    /// runtime budget runs out, then let it go on off the loop (#890).
+    async fn journal_consumer(&mut self, next: ConsumerOwnership) -> Result<Landing, BunError> {
+        let deadline = self.turn_deadline();
+        self.write_consumer(next, Some(deadline)).await
+    }
+
+    async fn write_consumer(
+        &mut self,
+        next: ConsumerOwnership,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Landing, BunError> {
+        // `next` was built from the journal as it is: no write in flight.
+        if self.discovery_write_in_flight() {
+            return Err(failure("a consumer journal write is still in flight"));
+        }
         next.validate().map_err(failure)?;
         crate::bun::consumer_owners::validate_transition(self.consumer_owner(), Some(&next))
             .map_err(failure)?;
-        self.update_discovery_inventory(&ServiceId::new("system", "discovery"), |inventory| {
-            inventory.consumer = Some(next)
-        })
+        self.write_discovery_inventory(
+            &ServiceId::new("system", "discovery"),
+            |inventory| inventory.consumer = Some(next),
+            deadline,
+        )
         .await
     }
 
@@ -570,15 +628,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 owner.publications.push(publication.clone());
             }
             owner.phase = ConsumerPhase::Withdrawing;
-            self.save_consumer(owner).await?;
-            return Ok(Progress::Next(ConsumerStep::Withdraw(publication)));
+            let landing = self.journal_consumer(owner).await?;
+            return Ok(then(landing, ConsumerStep::Withdraw(publication)));
         }
         if owner.publications.last() != Some(&publication) {
             // Journalled before the kernel sees it, so after a crash from
             // here on, recovery knows everything that may be exposed.
             owner.publications.push(publication.clone());
             owner.phase = ConsumerPhase::Publishing;
-            self.save_consumer(owner).await?;
+            if self.journal_consumer(owner).await? == Landing::InFlight {
+                return Ok(Progress::Next(ConsumerStep::Landed(AfterWrite::Install(
+                    publication,
+                ))));
+            }
             self.apply_consumer_publication(&publication).await?;
             return Ok(Progress::Next(ConsumerStep::Activate));
         }
@@ -589,29 +651,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         if Some(&owner) != self.consumer_owner() {
             // New withdrawal obligations, nothing else.
-            self.save_consumer(owner).await?;
-            return Ok(Progress::Next(ConsumerStep::Compact));
+            let landing = self.journal_consumer(owner).await?;
+            return Ok(then(landing, ConsumerStep::Compact));
         }
-        self.compact_consumer_publications().await?;
-        Ok(Progress::Done(self.consumer_update(true)))
+        self.compact_step().await
     }
 
     /// Take one more step of a synchronisation [`Self::first_consumer_step`]
     /// started. Each step journals at most one discovery write, and reads
     /// the ownership afresh, so a receipt confirmed between turns stays gone.
     async fn consumer_step(&mut self, step: ConsumerStep) -> Result<Progress, BunError> {
+        // The loop takes a step only once any write has landed; a caller
+        // finishing a synchronisation inline waits for it here.
+        self.settle_discovery_write().await;
         match step {
             ConsumerStep::Journal {
                 publication,
                 withdrawals,
             } => self.journal_consumer_answer(publication, withdrawals).await,
             ConsumerStep::Withdraw(publication) => {
-                if !self.withdraw_consumer_view().await? {
+                let deadline = self.turn_deadline();
+                let Some(landing) = self.withdraw_consumer_view_within(Some(deadline)).await?
+                else {
                     // Requests still hold earlier backends. The journal says
                     // Withdrawing, so the next answer starts over from here.
                     return Ok(Progress::Done(self.consumer_update(false)));
-                }
-                Ok(Progress::Next(ConsumerStep::ProveReceipts(publication)))
+                };
+                Ok(then(landing, ConsumerStep::ProveReceipts(publication)))
             }
             ConsumerStep::ProveReceipts(publication) => {
                 // The journal says Withdrawn: nothing earlier is exposed, so
@@ -629,8 +695,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         ));
                     }
                 }
-                self.save_consumer(owner).await?;
-                Ok(Progress::Next(ConsumerStep::Publish(publication)))
+                let landing = self.journal_consumer(owner).await?;
+                Ok(then(landing, ConsumerStep::Publish(publication)))
             }
             ConsumerStep::Publish(publication) => {
                 let mut owner = self
@@ -639,7 +705,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .ok_or_else(|| failure("consumer ownership is missing"))?;
                 owner.publications = vec![publication.clone()];
                 owner.phase = ConsumerPhase::Publishing;
-                self.save_consumer(owner).await?;
+                if self.journal_consumer(owner).await? == Landing::InFlight {
+                    return Ok(Progress::Next(ConsumerStep::Landed(AfterWrite::Install(
+                        publication,
+                    ))));
+                }
                 self.apply_consumer_publication(&publication).await?;
                 Ok(Progress::Next(ConsumerStep::Activate))
             }
@@ -651,7 +721,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 match owner.phase {
                     ConsumerPhase::Publishing => {
                         owner.phase = ConsumerPhase::Active;
-                        self.save_consumer(owner).await?;
+                        let landing = self.journal_consumer(owner).await?;
+                        return Ok(then(landing, ConsumerStep::Compact));
                     }
                     ConsumerPhase::Active => {}
                     ConsumerPhase::Withdrawing | ConsumerPhase::Withdrawn => {
@@ -662,10 +733,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Ok(Progress::Next(ConsumerStep::Compact))
             }
-            ConsumerStep::Compact => {
-                self.compact_consumer_publications().await?;
-                Ok(Progress::Done(self.consumer_update(true)))
+            ConsumerStep::Compact => self.compact_step().await,
+            ConsumerStep::Landed(after) => {
+                // A failed write fenced discovery; nothing it would have
+                // recorded may reach the kernel.
+                self.consumer_syncs
+                    .landed
+                    .take()
+                    .unwrap_or_else(|| Err(failure("a consumer journal write was lost")))?;
+                match after {
+                    AfterWrite::Then(step) => Ok(Progress::Next(*step)),
+                    AfterWrite::Install(publication) => {
+                        self.apply_consumer_publication(&publication).await?;
+                        Ok(Progress::Next(ConsumerStep::Activate))
+                    }
+                    AfterWrite::Done => Ok(Progress::Done(self.consumer_update(true))),
+                }
             }
+        }
+    }
+
+    /// Compact the published views, and finish the synchronisation once
+    /// that has landed.
+    async fn compact_step(&mut self) -> Result<Progress, BunError> {
+        let deadline = self.turn_deadline();
+        match self.compact_consumer_publications(Some(deadline)).await? {
+            Landing::Landed => Ok(Progress::Done(self.consumer_update(true))),
+            Landing::InFlight => Ok(Progress::Next(ConsumerStep::Landed(AfterWrite::Done))),
         }
     }
 
@@ -835,7 +929,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .collect();
         let mut table = crate::wrapper::routing::RoutingTable::new();
-        table.rebuild(&map, &routes).map_err(failure)?;
+        // Skip, never refuse: one app's invalid route must not hold back the
+        // view every other app's discovery and ingress depend on (#700).
+        if let Err(error) = table.rebuild(&map, &routes) {
+            eprintln!("wrapper: consumer view skipped invalid routes: {error}");
+        }
         for entry in services {
             self.publish_backend_kernel(&ServiceId::new(&entry.namespace, &entry.app_name), &map)
                 .await?;
@@ -850,15 +948,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Forget earlier views once requests that captured their removed backends
     /// have released, then mark receipts no remaining view contradicts.
-    async fn compact_consumer_publications(&mut self) -> Result<(), BunError> {
+    /// Waits for the write until `deadline` at most, as a step does.
+    async fn compact_consumer_publications(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Landing, BunError> {
         let Some(mut owner) = self.consumer_owner().cloned() else {
-            return Ok(());
+            return Ok(Landing::Landed);
         };
         let Some(current) = owner.publications.last().cloned() else {
-            return Ok(());
+            return Ok(Landing::Landed);
         };
         if owner.phase != ConsumerPhase::Active {
-            return Ok(());
+            return Ok(Landing::Landed);
         }
         let published: std::collections::HashSet<&str> = current
             .effective_services
@@ -892,7 +994,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         // LOOP-INLINE: in-memory lock, no I/O
         if !self.drains.drain_all(&retiring).await {
-            return Ok(());
+            return Ok(Landing::Landed);
         }
         owner.publications = vec![current];
         for receipt in owner.receipts.values_mut() {
@@ -900,10 +1002,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 receipt.phase = ReceiptPhase::Ready;
             }
         }
-        if Some(&owner) != self.consumer_owner() {
-            self.save_consumer(owner).await?;
+        if Some(&owner) == self.consumer_owner() {
+            return Ok(Landing::Landed);
         }
-        Ok(())
+        self.write_consumer(owner, deadline).await
     }
 
     /// Rebuild the published view from the last committed catalogue after a
@@ -1003,6 +1105,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         generation: u64,
     ) -> Result<(), BunError> {
+        // Change the ownership as it is on disk, after any write in flight.
+        self.settle_discovery_write().await;
         let mut owner = self
             .consumer_owner()
             .cloned()
@@ -1036,7 +1140,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.lapsed_view = None;
     }
 
+    /// Withdraw every view this node may still expose, then journal it
+    /// Withdrawn. False while captured requests still hold earlier backends.
     pub(super) async fn withdraw_consumer_view(&mut self) -> Result<bool, BunError> {
+        Ok(self.withdraw_consumer_view_within(None).await?.is_some())
+    }
+
+    /// [`Self::withdraw_consumer_view`] for a step: `None` while requests
+    /// still hold earlier backends, otherwise how its write went, waited for
+    /// until `deadline` at most.
+    async fn withdraw_consumer_view_within(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<Landing>, BunError> {
         let owner = self
             .consumer_owner()
             .cloned()
@@ -1052,16 +1168,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         // Local journals may contain publication attempts made after the last
         // catalogue poll. They remain owned even if that poll never completed.
-        if let DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal) =
-            &self.discovery_ownership
-        {
-            entries.extend(
-                journal
-                    .inventory()
-                    .services
-                    .iter()
-                    .map(|owner| owner.entry.clone()),
-            );
+        if let Some(inventory) = self.discovery_ownership.durable() {
+            entries.extend(inventory.services.iter().map(|owner| owner.entry.clone()));
         }
         for entry in &entries {
             self.withdraw_discovery_entry(entry).await?;
@@ -1082,20 +1190,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             for backend in &entry.backends {
                 // LOOP-INLINE: in-memory lock, no I/O
                 if self.drains.is_draining(&backend.instance_id).await {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
         }
         let mut owner = owner;
         owner.phase = ConsumerPhase::Withdrawn;
-        self.save_consumer(owner).await?;
-        Ok(true)
+        self.write_consumer(owner, deadline).await.map(Some)
     }
 }
 
 /// Matches the default deploy drain: long enough for ordinary requests to
 /// finish, short enough that withdrawal receipts still make progress.
 const CONSUMER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Go on to `next`, now if the write landed, or once it has.
+fn then(landing: Landing, next: ConsumerStep) -> Progress {
+    match landing {
+        Landing::Landed => Progress::Next(next),
+        Landing::InFlight => Progress::Next(ConsumerStep::Landed(AfterWrite::Then(Box::new(next)))),
+    }
+}
 
 fn failure(error: impl std::fmt::Display) -> BunError {
     BunError::ClusterPublication(error.to_string())

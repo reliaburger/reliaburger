@@ -172,9 +172,8 @@ registry_port = 0
     .unwrap();
     let release = root.path().join("release");
     let _release = ReleaseJob(release.clone());
-    let mut config = Config::parse("[app.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    let mut config = Config::parse("[app.work]\nexec = '/bin/sh'\n").unwrap();
     config.app.get_mut("work").unwrap().command = vec![
-        "/bin/sh".into(),
         "-c".into(),
         format!(
             "n=0; while [ ! -f '{}' ] && [ $n -lt 2400 ]; do sleep 0.05; n=$((n+1)); done",
@@ -291,8 +290,7 @@ registry_port = 0
     let successor = root.path().join("second-init-runs");
     let main = root.path().join("main-runs");
     let _release = ReleaseJob(release.clone());
-    let mut config =
-        Config::parse("[app.init-crash]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    let mut config = Config::parse("[app.init-crash]\nexec = '/bin/sh'\n").unwrap();
     let app = config.app.get_mut("init-crash").unwrap();
     app.init = vec![
         InitContainerSpec {
@@ -307,7 +305,6 @@ registry_port = 0
         },
     ];
     app.command = vec![
-        "/bin/sh".into(),
         "-c".into(),
         "printf 'main\\n' >> \"$1\"; exec sleep 60".into(),
         "main".into(),
@@ -363,7 +360,15 @@ registry_port = 0
     let stopped = recovered.client.stop("init-crash", "default").await;
     recovered.crash().await;
     assert!(original_process.is_some());
-    assert_eq!(retired.unwrap(), ContainerState::Stopped);
+    // Recovery retires the unadopted initialiser and then forgets its
+    // journal (#738), which the runtime does only for a retired generation.
+    assert!(
+        matches!(
+            retired,
+            Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })
+        ),
+        "{retired:?}"
+    );
     assert!(
         original_gone,
         "the interrupted initialiser survived recovery"
@@ -402,7 +407,7 @@ fn cron_registration_and_retirement_survive_bun_sigkill() {
     let endpoint = format!("http://{address}");
     wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
     let config = root.path().join("jobs.toml");
-    std::fs::write(&config, "[job.keep]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n[job.remove]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n").unwrap();
+    std::fs::write(&config, "[job.keep]\nimage = 'app:v1'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n[job.remove]\nimage = 'app:v1'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n").unwrap();
     assert_success(
         &run_relish(&["--endpoint", &endpoint, "apply", config.to_str().unwrap()]),
         "register cron jobs",

@@ -83,6 +83,7 @@ impl Harness {
                         timestamp: std::time::SystemTime::UNIX_EPOCH,
                         running_apps: vec![],
                         cached_specs: vec![],
+                        rollouts: Vec::new(),
                         resource_usage: Default::default(),
                         event_log: vec![],
                         has_buildah: true,
@@ -647,11 +648,13 @@ async fn builder_failure_retries_on_another_builder() {
                 node_id: reliaburger::meat::NodeId("bad-builder".to_string()),
                 address: bad_addr,
                 api_advertised: true,
+                jobs: None,
             },
             NodeMembershipInfo {
                 node_id: reliaburger::meat::NodeId("good-builder".to_string()),
                 address: good_addr,
                 api_advertised: true,
+                jobs: None,
             },
         ]),
         builder_nodes: vec!["bad-builder".to_string(), "good-builder".to_string()],
@@ -1582,6 +1585,7 @@ async fn a_build_on_a_follower_is_signed_by_the_leader() {
             node_id: reliaburger::meat::NodeId::new(&leader_name),
             address: leader_address,
             api_advertised: true,
+            jobs: None,
         }]),
         ..Default::default()
     })

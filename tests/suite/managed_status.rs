@@ -2,7 +2,7 @@
 #![cfg(unix)]
 
 use reliaburger::relish::quickstart::{
-    security,
+    artifacts, security,
     state::{ClusterSpec, Operation},
 };
 use std::os::unix::fs::PermissionsExt;
@@ -87,7 +87,7 @@ async fn managed_status_fails_for_missing_stopped_and_unreachable_nodes() {
         drop(operation);
         // Holding a listener without accepting proves that a running VM with
         // an unresponsive TLS API must not succeed either.
-        let lima = root.path().join("tools/lima-2.1.0/bin/limactl");
+        let lima = artifacts::managed_limactl(root.path());
         std::fs::create_dir_all(lima.parent().unwrap()).unwrap();
         let lima_ready = lima.parent().unwrap().join("ready");
         let output = status

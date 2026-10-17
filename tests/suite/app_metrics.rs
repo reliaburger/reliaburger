@@ -34,6 +34,12 @@ fn relish_metrics_shows_samples_scraped_from_each_instance() {
         // Scrape every second so the test needn't wait ten.
         let mut text = std::fs::read_to_string(&config).unwrap();
         text.push_str("\n[metrics]\napp_scrape_interval_secs = 1\n");
+        // The app runs testapp as a host `exec` app, which the process
+        // runtime runs only when the node allows it (#914).
+        text.push_str(&format!(
+            "\n[process_workloads]\nallowed_binaries = [{:?}]\nmount_isolation = false\n",
+            env!("CARGO_BIN_EXE_testapp")
+        ));
         std::fs::write(&config, text).unwrap();
         (config, reserve_address(), root.path().join("bun.log"))
     });
@@ -47,8 +53,8 @@ fn relish_metrics_shows_samples_scraped_from_each_instance() {
         format!(
             r#"
 [app.web]
-image = "proc-grill:image-ignored"
-command = [{testapp:?}, "--port", "{port}"]
+exec = {testapp:?}
+command = ["--port", "{port}"]
 port = {port}
 metrics = {{}}
 "#,

@@ -84,6 +84,12 @@
     "test": "grill::runc::tests::runc_redis_persists_to_a_managed_volume_across_restarts"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_init_container_runs_its_own_image_with_app_env",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_init_container_runs_its_own_image_with_app_env"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",
@@ -106,6 +112,12 @@
     "function": "btrfs_restore_keeps_the_volume_quota",
     "binary": "reliaburger",
     "test": "grill::snapshot::tests::btrfs_restore_keeps_the_volume_quota"
+  },
+  {
+    "source": "src/grill/snapshot.rs",
+    "function": "btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+    "binary": "reliaburger",
+    "test": "grill::snapshot::tests::btrfs_interrupted_snapshot_is_cleaned_up_on_restart"
   },
   {
     "source": "src/grill/snapshot.rs",
@@ -168,6 +180,30 @@
     "test": "smoker::resource::tests::cgroup_disk_io_throttle_applies_and_removes"
   },
   {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "cpu_fault_round_trip_restores_cpu_max",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::cpu_fault_round_trip_restores_cpu_max"
+  },
+  {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "memory_fault_round_trip_restores_memory_high",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::memory_fault_round_trip_restores_memory_high"
+  },
+  {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "cpu_fault_is_reverted_after_bun_is_killed",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::cpu_fault_is_reverted_after_bun_is_killed"
+  },
+  {
+    "source": "src/bun/agent/tests/cgroup_faults.rs",
+    "function": "paused_instance_resumes_after_bun_is_killed",
+    "binary": "reliaburger",
+    "test": "bun::agent::tests::cgroup_faults::paused_instance_resumes_after_bun_is_killed"
+  },
+  {
     "source": "tests/autoscale_memory.rs",
     "function": "runc_autoscaler_scales_up_on_real_memory_growth",
     "binary": "reliaburger::autoscale_memory",
@@ -205,6 +241,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+    "binary": "reliaburger::cluster_failover",
+    "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "lease_retirement_waits_for_paused_worker_across_leader_change",
     "binary": "reliaburger::cluster_failover",
     "test": "lease_retirement_waits_for_paused_worker_across_leader_change"
@@ -220,6 +262,12 @@
     "function": "three_nodes_join_by_address_and_converge",
     "binary": "reliaburger::cluster_gossip",
     "test": "three_nodes_join_by_address_and_converge"
+  },
+  {
+    "source": "tests/cluster_gossip.rs",
+    "function": "nodes_with_maximal_labels_stay_alive_during_churn",
+    "binary": "reliaburger::cluster_gossip",
+    "test": "nodes_with_maximal_labels_stay_alive_during_churn"
   },
   {
     "source": "tests/cluster_gossip.rs",
@@ -265,15 +313,21 @@
   },
   {
     "source": "tests/council_disaster_recovery.rs",
-    "function": "trigger_elect_advances_term_and_can_move_leadership",
+    "function": "trigger_elect_advances_the_term_and_leadership_settles",
     "binary": "reliaburger::council_disaster_recovery",
-    "test": "trigger_elect_advances_term_and_can_move_leadership"
+    "test": "trigger_elect_advances_the_term_and_leadership_settles"
   },
   {
     "source": "tests/council_disaster_recovery.rs",
     "function": "pressured_leader_resigns_and_leadership_moves",
     "binary": "reliaburger::council_disaster_recovery",
     "test": "pressured_leader_resigns_and_leadership_moves"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "leadership_moves_off_the_leader_every_time_under_write_load",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "leadership_moves_off_the_leader_every_time_under_write_load"
   },
   {
     "source": "tests/council_disaster_recovery.rs",
@@ -300,6 +354,18 @@
     "test": "recovered_council_regrows_onto_a_fresh_node"
   },
   {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "recovering_two_survivors_independently_fences_one",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "recovering_two_survivors_independently_fences_one"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "slow_gossip_restart_never_acknowledges_on_the_old_epoch"
+  },
+  {
     "source": "tests/council_self_healing.rs",
     "function": "killed_voter_is_replaced_by_healthy_spare",
     "binary": "reliaburger::council_self_healing",
@@ -316,6 +382,12 @@
     "function": "flapping_node_inside_window_causes_no_churn",
     "binary": "reliaburger::council_self_healing",
     "test": "flapping_node_inside_window_causes_no_churn"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "two_node_cluster_survives_losing_the_non_voter",
+    "binary": "reliaburger::council_self_healing",
+    "test": "two_node_cluster_survives_losing_the_non_voter"
   },
   {
     "source": "tests/ebpf.rs",
@@ -457,6 +529,12 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "allow_from_can_name_a_delegated_job_as_its_source",
+    "binary": "reliaburger::ebpf",
+    "test": "allow_from_can_name_a_delegated_job_as_its_source"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "dns_responder_resolves_internal_name",
     "binary": "reliaburger::ebpf",
     "test": "dns_responder_resolves_internal_name"
@@ -544,6 +622,12 @@
     "function": "persistent_policy_refuses_conflicting_owners_and_retired_state",
     "binary": "reliaburger::ebpf",
     "test": "persistent_policy_refuses_conflicting_owners_and_retired_state"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "owned_loader_clears_stale_fault_connect_entries",
+    "binary": "reliaburger::ebpf",
+    "test": "owned_loader_clears_stale_fault_connect_entries"
   },
   {
     "source": "tests/ebpf.rs",
@@ -954,6 +1038,30 @@
     "test": "managed_guest_startup_establishes_bpffs_before_bun"
   },
   {
+    "source": "tests/oci_crash.rs",
+    "function": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+    "binary": "reliaburger::oci_crash",
+    "test": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root"
+  },
+  {
+    "source": "tests/oci_crash.rs",
+    "function": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+    "binary": "reliaburger::oci_crash",
+    "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+    "binary": "reliaburger::owned_runc",
+    "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+    "binary": "reliaburger::owned_runc",
+    "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds"
+  },
+  {
     "source": "tests/owned_network.rs",
     "function": "owned_network_setup_and_forwarding_retire_through_the_generation",
     "binary": "reliaburger::owned_network",
@@ -1134,6 +1242,12 @@
     "test": "runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor"
   },
   {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests"
+  },
+  {
     "source": "tests/placement.rs",
     "function": "apply_on_any_node_places_across_the_cluster",
     "binary": "reliaburger::placement",
@@ -1144,6 +1258,12 @@
     "function": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
     "binary": "reliaburger::placement",
     "test": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "an_image_app_is_never_placed_on_a_process_only_node",
+    "binary": "reliaburger::placement",
+    "test": "an_image_app_is_never_placed_on_a_process_only_node"
   },
   {
     "source": "tests/placement.rs",
@@ -1270,6 +1390,24 @@
     "function": "rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale",
     "binary": "reliaburger::placement",
     "test": "rolling_back_through_a_node_that_never_ran_the_app_keeps_its_scale"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+    "binary": "reliaburger::placement",
+    "test": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+    "binary": "reliaburger::placement",
+    "test": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "rollback_works_after_every_node_restarts",
+    "binary": "reliaburger::placement",
+    "test": "rollback_works_after_every_node_restarts"
   },
   {
     "source": "tests/relish_test_catalogue.rs",
@@ -1402,12 +1540,6 @@
     "function": "a_registry_outage_at_directive_time_does_not_pause_the_upgrade",
     "binary": "reliaburger::self_upgrade_cluster",
     "test": "a_registry_outage_at_directive_time_does_not_pause_the_upgrade"
-  },
-  {
-    "source": "tests/suite/registry_standard_clients.rs",
-    "function": "crane_logs_in_pushes_and_pulls_over_tls",
-    "binary": "reliaburger::suite",
-    "test": "registry_standard_clients::crane_logs_in_pushes_and_pulls_over_tls"
   },
   {
     "source": "tests/test_storage.rs",
@@ -1624,5 +1756,53 @@
     "function": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors",
     "binary": "reliaburger::owned_task_arrays",
     "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors"
+  },
+  {
+    "source": "tests/registry_durability.rs",
+    "function": "image_survives_loss_of_the_pushing_node",
+    "binary": "reliaburger::registry_durability",
+    "test": "image_survives_loss_of_the_pushing_node"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::docker_logs_in_pushes_and_pulls_layers_over_verified_tls"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "docker_refuses_a_registry_signed_by_another_ca",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::docker_refuses_a_registry_signed_by_another_ca"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::docker_push_with_a_scoped_token_outside_its_namespace_is_denied"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::podman_logs_in_pushes_and_pulls_layers_over_verified_tls"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "skopeo_copies_between_repositories_over_verified_tls",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::skopeo_copies_between_repositories_over_verified_tls"
+  },
+  {
+    "source": "tests/suite/registry_standard_clients.rs",
+    "function": "crane_pulls_layers_back_with_ca_verification",
+    "binary": "reliaburger::suite",
+    "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+    "binary": "reliaburger::placement",
+    "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace"
   }
 ]

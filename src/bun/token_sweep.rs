@@ -145,7 +145,6 @@ mod tests {
         ApiToken {
             name: name.to_string(),
             token_hash: name.as_bytes().to_vec(),
-            token_salt: Vec::new(),
             role,
             scope: TokenScope::default(),
             expires_at,

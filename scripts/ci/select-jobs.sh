@@ -1,35 +1,47 @@
 #!/usr/bin/env bash
 # Decide which CI job groups a run needs and write them to $GITHUB_OUTPUT.
 #
-#   code    - anything the build or the tests read changed
+#   code         - anything the build or the tests read changed
 #   gossip       - the gossip protocol or its benchmarks changed
 #   heavy        - run the acceptance suites (cluster, upgrade, privileged Linux)
 #   task_arrays  - the task-array leader, node pool, executor or their
 #                  benchmarks changed, or the script that gates on them
+#   macos        - run the portable suite on macOS (three shards)
 #
-# Pushes, schedules and manual runs get everything. Pull requests are judged
-# by the files they change against their base. A PR into main or into a
-# release's merge-train branch (`release-*`) gets the heavy suites; other
-# stacked PRs skip them unless labelled full-ci, and run in full once the PR
-# targets main. Retargeting a PR (GitHub does it when the branch under
-# it merges) reruns this through ci-retarget.yml, so the heavy suites don't
-# wait for the next push.
+# Pushes, merge-queue groups, schedules and manual runs get everything. Pull
+# requests are judged by the files they change against their base:
+#
+#   - into a release's merge train (`release-*`): the light set. Lint, MSRV,
+#     portable Linux, the demo app and the optimized contract boundaries
+#     answer in about 15 minutes; macOS, the heavy suites and the benchmarks
+#     wait for the merge queue and the push to the train, which run
+#     everything on the merged result. A `full-ci` label adds the heavy suites
+#     and the benchmarks but still not macOS: three macOS runners per PR
+#     queued for over an hour. A head that is itself a train gets everything.
+#   - into main, or from a train: everything the change touches.
+#   The evidence gate names the full-ci train selection `train-full`
+#   (scripts/ci/workflow_assembly.py) and accepts it on pull requests only.
+#   - other stacked PRs: macOS but not the heavy suites, unless labelled
+#     full-ci; they run in full once the PR targets main.
+#
+# Retargeting a PR (GitHub does it when the branch under it merges) reruns
+# this through ci-retarget.yml, so the new base's rules apply at once.
 #
 # Fixtures: scripts/ci/test_select_jobs.py.
 #
-# Inputs (environment): EVENT, BASE_REF, BASE_SHA, FULL_CI ("true"/"false"),
-# and optionally HEAD_SHA (defaults to HEAD).
+# Inputs (environment): EVENT, BASE_REF, HEAD_REF, BASE_SHA, FULL_CI
+# ("true"/"false"), and optionally HEAD_SHA (defaults to HEAD).
 set -euo pipefail
 
 output="${GITHUB_OUTPUT:-/dev/stdout}"
 
 emit() {
-    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\n' "$1" "$2" "$3" "$4" >>"$output"
-    printf 'code=%s gossip=%s heavy=%s task_arrays=%s\n' "$1" "$2" "$3" "$4" >&2
+    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\nmacos=%s\n' "$1" "$2" "$3" "$4" "$5" >>"$output"
+    printf 'code=%s gossip=%s heavy=%s task_arrays=%s macos=%s\n' "$1" "$2" "$3" "$4" "$5" >&2
 }
 
 if [ "${EVENT}" != "pull_request" ]; then
-    emit true true true true
+    emit true true true true true
     exit 0
 fi
 
@@ -75,13 +87,32 @@ while IFS= read -r file; do
     esac
 done <<<"$changed"
 
-heavy=false
-case "${BASE_REF}" in
-    main | release-*) targets_a_release=true ;;
-    *) targets_a_release=false ;;
+case "${HEAD_REF:-}" in
+    release-*) from_a_train=true ;;
+    *) from_a_train=false ;;
 esac
-if [ "$code" = true ] && { [ "$targets_a_release" = true ] || [ "${FULL_CI}" = true ]; }; then
-    heavy=true
+case "${BASE_REF}" in
+    release-*) into_a_train=true ;;
+    *) into_a_train=false ;;
+esac
+
+if [ "$code" = false ]; then
+    emit false "$gossip" false "$task_arrays" false
+    exit 0
 fi
 
-emit "$code" "$gossip" "$heavy" "$task_arrays"
+if [ "$into_a_train" = true ] && [ "$from_a_train" = false ] && [ "${FULL_CI}" != true ]; then
+    emit true false false false false
+    exit 0
+fi
+
+if [ "$into_a_train" = true ] && [ "$from_a_train" = false ]; then
+    emit true "$gossip" true "$task_arrays" false
+    exit 0
+fi
+
+heavy=false
+if [ "${BASE_REF}" = main ] || [ "$into_a_train" = true ] || [ "$from_a_train" = true ] || [ "${FULL_CI}" = true ]; then
+    heavy=true
+fi
+emit true "$gossip" "$heavy" "$task_arrays" true

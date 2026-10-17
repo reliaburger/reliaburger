@@ -17,7 +17,7 @@ What 0.2.0 doesn't promise yet is the daily number. The whitepaper's target is
 100 million accepted successes a day, and the
 [timed-scenario record](../qualification/2026-10-09-timed-job-scenarios/README.md)
 projects past that from one-minute windows. A projection isn't a qualification:
-the 12-hour run at that rate, with bounded storage
+a final soak at that rate, with bounded storage
 ([#668](https://github.com/reliaburger/reliaburger/issues/668)) is the evidence
 that will, and until it passes we don't claim it. The end of the chapter lists
 the other gaps still open.
@@ -149,7 +149,7 @@ let run = match arrays.entry(assignment.batch_id) {
 
 `entry` returns a handle to the slot, full or empty, and holding it keeps the map borrowed, so nothing else can change the map between the check and the insert.
 
-On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 100,000 fake tasks through a real single-node council: the whole array cost 51 Raft entries.
+On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 20,000 fake tasks through a real single-node council and allows three Raft entries per thousand tasks; a run usually costs about ten. It used to push 100,000, and the whole array cost 51 entries, but that was 4.4 seconds of CPU in a debug build, and on a laptop shared with other test runs it crept up to the 60-second test timeout. Entries follow chunks and leader ticks, not tasks, so a fifth of the work shows the same ratio (#896).
 
 What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
 
@@ -172,7 +172,7 @@ The first derived index was a redb database with a 1 MiB cache per profile, rath
 
 The default view is a summary, not a task list. Watch, JSON status and the dashboard show counts and rates. Histograms merge before p50/p95/p99 are read; those are bucket upper bounds for final attempts, not end-to-end latency. Detail pages inspect at most 4,096 indexes, return at most 1,000 rows and contact at most eight workers, with a cursor even for an empty failure page. Retention starts at terminal acceptance and groups a parent with its profiles. Worker loss can lose detail without changing replicated accepted counts.
 
-The manual's burger manifest runs 1,000 small and 64 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. This demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md) records that gate.
+The manual's burger manifest runs 8 small and 2 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. It used to run 1,000 small and 64 larger ones, but fresh containers start at about 12.7 a second on the quickstart VM ([throughput record](../qualification/2026-10-17-v0.2.0-job-throughput/README.md)), so most of the tour's recording was `relish batch watch` waiting. Ten tasks in two profiles still show both cohorts in `relish jobs` and finish in seconds; the [throughput demo](https://reliaburger.com/#job-throughput) has its own scenarios for showing rate. The tour demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md) records that gate.
 
 
 Control reports carry exact failed counts and a capped preview of 256 index
@@ -315,7 +315,8 @@ favours the longest log, so the old leader won it a second later and the test
 waited 30 seconds for a handover that never came. Now the helper switches off
 the old leader's elections (openraft's `runtime_config().elect(false)`) and has
 the most up-to-date other voter campaign every 3 seconds until one of them
-leads. The test also registers its schedule early in a minute: the minute a
+leads. Production deposition had the same flaw, and 0.2.1 gave it the same fix
+(chapter 2, "Deposed is not replaced"). The test also registers its schedule early in a minute: the minute a
 schedule lands in counts as already seen, so a request sent at 59 seconds could
 miss the occurrence it was waiting for.
 
@@ -500,6 +501,61 @@ The agent's kernel reconciliation has to know about all of this, or its sweep wo
 
 A node that can't enforce either refuses the whole array at admission instead of failing every attempt, and `runtime = "process"` refuses both: a host task shares the node's network and runs as root, so an allowlist or a grant there would promise a boundary the task can step out of. `job_egress_allowlist_is_enforced` runs a task lease in the Lima VM.
 
+### A job as the source
+
+That gave a job a way to be reached. It didn't give it a way to be *named*. Say the `vault` namespace runs a secrets service, and the nightly report job in `reports` needs it. You'd write `allow_from = ["reports/nightly"]` on the service, and the kernel would refuse the job anyway (#737).
+
+Here's why. `firewall_map` keys a grant on `(source cgroup, destination)`, and the agent fills in the source half from the cgroups of running app instances. A task isn't an app instance. It runs in a cgroup of its own under `/reliaburger/reports/`, and gets its namespace from that ancestor's binding, so the hook knows it belongs to `reports`. But the agent has no idea which job owns the cgroup, and there's nothing to key a grant on. Worse, tasks come and go thousands of times a minute. A grant that waited for the agent's next tick to notice each new task would race every short task's first `connect()`, and lose.
+
+So we turned it round: grant the job, then tell the kernel which cgroups belong to it. A new map, `cgroup_source_map`, binds a task's cgroup to its *run identity*, a hash of `namespace/job`. The task's `NamespaceLease` writes it with `bind_source`, after `runc create` and before `start`, right next to the egress allowlist. On the agent side, `resolve_job_source_rules` writes one grant per cross-namespace name in every `allow_from`, keyed on the identity instead of a cgroup:
+
+```rust
+pub fn resolve_job_source_rules(
+    destinations: &[IsolatedDestination<'_>],
+) -> Vec<ResolvedFirewallRule> {
+    let mut rules = Vec::new();
+    for destination in destinations {
+        for source in destination.allow_from.unwrap_or_default() {
+            let Some((namespace, job)) = source.split_once('/') else {
+                continue;
+            };
+            if namespace == destination.namespace {
+                continue;
+            }
+            rules.push(ResolvedFirewallRule {
+                src_cgroup_id: job_source_key(namespace, job),
+                dst_app_id: destination.app_id,
+                action: FIREWALL_ALLOW,
+            });
+        }
+    }
+    rules
+}
+```
+
+`allow_from` is an `Option<&[String]>`, and `unwrap_or_default()` turns `None` into an empty slice (a `&[T]` has a `Default`, the empty one), so a destination without `allow_from` just loops zero times. The let-else (Chapter 2) skips a bare name: one with no `/` lives in the destination's own namespace, which isolation never refuses, so it needs no grant.
+
+The grant doesn't care whether any task of the job exists. It's sitting in the map before the first one starts, and a task only has to be bound to match it. Nobody waits for a tick.
+
+The key needs care, because the identity and real cgroup ids share one `u64` field. Kernel cgroup ids never reach bit 63, so `job_source_key` sets it: `1 << 63 | identity`. In the hook, the change is one extra lookup, taken only when the exact grant misses:
+
+```c
+struct firewall_value *fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
+if (!fw) {
+    __u32 *identity = bpf_map_lookup_elem(&cgroup_source_map, &cg);
+    if (identity) {
+        fw_key.src_cgroup_id = SOURCE_IDENTITY_TAG | (__u64)*identity;
+        fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
+    }
+}
+```
+
+None of this widens what an app may receive. The binding only adds grants: a task's namespace still comes from its ancestor, and only the task runtime ever binds a cgroup, so no app cgroup can match an identity key. Startup clears the whole map, because a stale binding can only refuse traffic, never open it.
+
+Reusable executors needed one more change. An executor's commands all land in its `task` cgroup, and executors with the same template were shared between jobs. Bind that cgroup to one job and the next job's commands would borrow its grants. So `ExecutorKey::for_job` folds the job's name into the key, and two jobs never share an executor. `tasks_of_different_jobs_never_share_an_executor` pins it. The forward-path table needed nothing new: a task's address now answers to its job's name there too, so a source the hooks admit isn't then dropped between veths.
+
+`allow_from_can_name_a_delegated_job_as_its_source` runs it in the VM: two task cgroups in one namespace, one bound to the named job and one to another, plus an app cgroup in the same namespace. Only the named job's task gets through.
+
 ### Where the bytes went
 
 The October qualification rig lost about 82 bytes of free disk for every task it accepted, five times the plan's budget, and got none of it back between runs. At the target rate that's several gigabytes a day, and when a worker's storage fails it stops taking work until someone repairs it. So "a million jobs" quietly meant "a million jobs, then a full disk". Nobody had broken the number down, so that's where we started: a unit test that pushes a million outcomes through the real ledger and its index and prints each file's allocated size.
@@ -519,6 +575,26 @@ self.file.write_all_at(&slot(raw), offset)?;
 A million tasks now cost 22.4 bytes of ledger and 25.0 of index on APFS, about 45 MiB. That still isn't the plan's 16 MiB per million (the ledger alone is over it), so we recorded the measured bound instead, 50 bytes a task (some headroom for filesystem block rounding), and `make bench-task-arrays` fails above it.
 
 That headroom isn't decoration, as the unit test found out a day later. It had also asserted at most 23 allocated bytes a task for the ledger, and it failed about one run in twenty on a Mac (#717). Nothing in the file had changed. Its logical length was 22,079,408 bytes every single time: the 8-byte magic, 245 block headers and a million 22-byte records. What changed was the allocation. APFS keeps up to about 1 MiB allocated past the end of a file that grows by fsynced appends, and how much it keeps varies from run to run, from 8 KiB to 1,000 KiB in forty runs of the same test. Write the same records as one big block and the slack disappears, which is why the test keeps production-sized 4,096-record blocks: a worker's disk pays that slack too. So the test now checks the two things it can know exactly, the logical length of each file to the byte, and leaves allocated bytes to the one bound that allows for the filesystem's choices, 50 a task for the pair. The worst of those forty runs was 47.6.
+
+### What a finished run still needs
+
+Fifty bytes a task was an honest number, but it wasn't the plan's sixteen, and it bugged us (#739). So we asked a different question: what does a run need once it's *over*?
+
+While a run is active the ledger earns every byte. It's how a restarted worker knows which tasks already finished, and its group commit is what lets a chunk report only durable results. The live index beside it gets rewritten in place, so it carries a check to catch a slot torn by a crash. Once the leader marks the run terminal, none of that applies. No chunk will ever start again, so nothing replays the ledger, and nothing writes the index. What readers still ask for is `relish batch results` (outcome, attempts, exit code, run time) and `relish batch logs`, which finds a failure's output by its task index and grant attempt. The leader also merges rows from several workers by grant attempt, so that has to stay.
+
+So a worker now *compacts* a finished run. It writes those fields into a third file, `results`, with one 14-byte slot per task:
+
+```text
+slot = outcome: u8, attempts: u8, exit_code: i32, run_ms: u32, grant_attempt: u32
+```
+
+The slot leaves out three things the live slot carries. The task index goes, because the slot's position already says it. The check goes, because this file is written once, fsynced and renamed into place, so no crash can leave half a slot in it. And the grant attempt shrinks from 64 bits to 32. A chunk's attempt only goes up when a node loss puts it back in the queue, and four billion requeues of one chunk would take a while. If it ever happens anyway, compaction refuses, keeps the ledger and says why, rather than quietly writing the wrong number. Once `results` is durable, the worker deletes the ledger, the live index and the launch fences (`grants.fence` and the `started-*` markers), which only guard a run that can still start chunks. Failure output stays.
+
+The order is what makes it safe to crash at any point. The temporary file is thrown away if the worker dies while writing it, and the ledger is still there to start again from. Once the rename lands, `results` is complete, and the next try only deletes what's left over. The ledger is the source, not the live index: a crash between the ledger's fsync and the index's can leave a record in one and not the other, and compaction mustn't lose it.
+
+Two details took a second look. First, *when* is "finished"? The leader's sync lists every array it keeps, and among them the ones still running. An array that's kept but not running is terminal, and terminal is final in the Raft state. The worker cancels the run, but its chunks may still be writing their last records, so it waits for the ledger's group-commit writer to close. The writer closes only when every `LedgerHandle` is gone, the run's and every chunk's, and `JoinHandle::is_finished` asks without waiting, so a sync never blocks on a slow chunk. Second, a reader racing compaction mustn't re-create what it deleted. The live index used to open with `create(true)`; the read path now opens files read-only. A reader that opened the old index just before the unlink keeps reading it: on Unix an unlinked file lives on until its last descriptor closes.
+
+A million finished tasks now cost 14.0 to 14.4 bytes each on APFS, about 13.5 MiB, under the plan's 16 MiB per million. The unit test asserts the logical length to the byte, `tasks * 14`, and the allocated size against `STORAGE_BYTES_PER_TASK`, now 16. An active run still pays about 47, and `ACTIVE_STORAGE_BYTES_PER_TASK` keeps the old bound of 50. We didn't shrink the ledger itself. It's the price of crash-safe, group-committed progress, and a worker pays it only for runs in flight.
 
 Bytes per task only matter if they eventually go away. Workers already deleted a run's directory once the leader stopped listing it, but the leader only forgot a finished run when someone *submitted* something: pruning lived in the registration path. An idle cluster, or one running the same long array all day, kept everything. The fix is a new replicated write:
 
@@ -591,6 +667,185 @@ outcome getting lost. So the wait changed instead. Job tests now share
 on a miss the harness names the state the job was stuck in. A job that never
 runs (one on a disk with less than a gibibyte free, say) still fails. Under
 the same load, 128 of 128 runs passed, the slowest whole run in 13.3 s.
+
+### A fence that moves every tick
+
+"An idle tick now flushes nothing" was true, and it was the wrong case to fix.
+A busy tick isn't idle. The control fence holds the newest control version the
+node has acted on: the recovery epoch, the leader's term and the council's
+applied log index. Every tick that changes anything commits one Raft entry, so
+under load the index moves on every tick and the fence changes on nearly every
+sync. The hung-worker test (above, in "Dispatch at scale") had already had its
+bar lowered because the healthy node's syncs were slow on a busy Mac (#745).
+
+Each change replaced the file the usual safe way: write `control.tmp`,
+flush it, rename it over `control.json`, flush the directory. That's two
+`F_FULLFSYNC`s, plus a create and a rename that, as the previous section found,
+queue behind every other process's flushes. We measured it with a throwaway
+test that syncs one node 200 times, the index one higher each time, on the
+same 10-core Mac. Idle, a sync took 10 to 13 ms at the median. With 40 busy
+loops and four loops each writing 1 MiB and calling `F_FULLFSYNC` (load
+average 90 to 200, sibling builds included), the median was 50 to 61 ms, the
+99th percentile 90 to 124 ms, and one sync took 1.08 s.
+
+Could the node skip the flush? The fence is there so that a delayed sync built
+from an older snapshot can't undo something the node already did. The worst
+case is deletion: a sync's list of known arrays tells the node which array
+directories to delete, and an older list doesn't name newer arrays. That has
+to hold across a restart too, which is what
+`task_array_recovery::stale_control_cannot_delete_ledgers_after_a_restart`
+checks. Keeping the index in memory and persisting only epoch and term changes
+would probably be safe, because the leader waits for each node's answer, or
+gives up on it, before calling that node again. But "probably", resting on how another component happens to behave
+today, is exactly the kind of argument a fence exists to avoid. So every new
+version still reaches stable storage before the node acts on it. What changed
+is how it gets there.
+
+`control.fence` is a file with two slots, one at offset 0 and one at 512, so
+each sits in its own disk sector. A slot is a magic number, a generation that
+counts the writes, the payload's length, the payload (here the three `u64`s)
+and a CRC32 of the rest. A new version overwrites, in place, the slot that
+*doesn't* hold the current one, and flushes once. This is `rewrite_slot` in
+`src/bun/fence_file.rs`, which the control fence shares with the grant fences
+we'll meet in a moment:
+
+```rust
+file.seek(SeekFrom::Start((1 - current.slot) * current.stride))?;
+file.write_all(slot)?;
+file.sync_data()
+```
+
+No create, no rename and no directory flush, because the file's size and its
+directory entry don't change. `sync_data` is `fdatasync` on Linux, which skips
+the timestamps, and `F_FULLFSYNC` on macOS, just like `sync_all`.
+
+Why is that still safe? A crash during the write can tear the slot being
+written, and the CRC then rejects it. The other slot still holds the previous
+version, which was flushed before the node acted on it. The torn one was never
+acted on: the sync carries on only after `sync_data` returns. Reading takes
+the valid slot with the higher generation, and the next write goes into whichever slot
+isn't current, so a torn slot is the first to be overwritten. The file only
+appears through the old write, flush and rename dance, once, when it's
+created, so there's never a half-written fence file. And a fence with *no*
+valid slot is an error, not "no fence": reading it as version zero would let
+any delayed sync through. The node refuses every sync until someone looks at
+the disk, exactly as it did with an unreadable `control.json`.
+
+Reading a slot is a nice small example of `Option` and `?` together:
+
+```rust
+fn decode<'a>(magic: &[u8; 4], slot: &'a [u8]) -> Option<(u64, &'a [u8])> {
+    let generation = u64::from_le_bytes(slot.get(4..12)?.try_into().ok()?);
+    let length = u32::from_le_bytes(slot.get(12..HEADER_LEN)?.try_into().ok()?);
+    let end = HEADER_LEN.checked_add(usize::try_from(length).ok()?)?;
+    let crc = u32::from_le_bytes(slot.get(end..end + CHECK_LEN)?.try_into().ok()?);
+    if slot.get(..4)? != magic || crc32fast::hash(slot.get(..end)?) != crc {
+        return None;
+    }
+    Some((generation, slot.get(HEADER_LEN..end)?))
+}
+```
+
+`slot.get(range)` returns an `Option<&[u8]>` instead of panicking when the
+range runs off the end, and `?` on an `Option` returns `None` from the
+enclosing function. `try_into()` turns a slice into a fixed-size array
+(`[u8; 8]`), which is what `u64::from_le_bytes` takes; it fails only when the
+lengths differ, and `.ok()` turns that `Result` into an `Option` so `?` can
+use it. A torn length can't send the read off the end either: the payload's
+end comes from `checked_add`, and `get` refuses a range past the slot. No
+`unwrap`, and no way for a damaged slot to panic. The `'a` says the payload
+handed back borrows from `slot`, the caller's bytes, so decoding copies
+nothing; the caller copies the one payload it keeps.
+
+One detail came from the hung-worker test. It hangs a worker by swapping the
+fence for a FIFO with no writer. A sync that read the real fence just before
+the swap would now open the path to write, and opening a FIFO for writing
+blocks until a reader turns up, which in that test is never. So the write
+opens with `O_NONBLOCK` (through `custom_flags`, from the `OpenOptionsExt`
+trait we met in Chapter 10). For a regular file that flag does nothing; for a
+FIFO the open fails at once with `ENXIO` and the sync answers with a refusal.
+`writing_a_fence_swapped_for_a_fifo_fails_instead_of_blocking` pins it.
+
+The tests pin the rest. `a_sync_flushes_the_disk_only_when_the_fence_changes`
+now counts three flushes for a new fence file, none to repeat a version and
+one for the next. `a_moving_fence_is_rewritten_in_place_without_a_rename`
+advances the fence 49 times and checks that the file's inode never changes
+(no rename) and that it cost exactly 49 flushes, then restarts the node and
+checks that it refuses version 49 and accepts 50.
+`a_torn_fence_slot_falls_back_to_the_last_acknowledged_version` damages the
+newest slot by hand and checks that the node falls back to the previous
+version, still refuses anything older, and overwrites the torn slot rather
+than the good one. `a_fence_with_no_valid_slot_refuses_every_sync` damages
+both.
+
+Under the same load, the same 200 syncs took 15 to 19 ms at the median, 26
+to 62 ms at the 99th percentile, and at most 100 ms. That's about a third of
+the time, and the second-long outlier is gone. Idle, nothing changed (about
+12 ms): one `F_FULLFSYNC` is the floor for a fence that moves, and we've kept
+it on purpose.
+
+#### Grants too
+
+The control fence wasn't the only file that moved every tick. Each array's
+directory holds a grant fence: the highest attempt the node has accepted for
+each chunk it was granted. When the leader takes a chunk back and grants it
+again, the attempt goes up, and the fence makes sure that a delayed sync
+naming the older attempt can't start that one again, across a restart too.
+It changes on every new grant, and under load the leader hands out chunks
+every tick. It was `grants.json`, written by the same replace-and-rename
+routine the control fence had just stopped using: two `F_FULLFSYNC`s, a
+create and a rename per grant (#902).
+
+The control fence's file couldn't simply be copied. Its payload is always 24
+bytes; the grant fence is a map that grows by one entry per chunk, 12 bytes
+each (a `u32` chunk and a `u64` attempt). So we pulled the two-slot logic out
+into `src/bun/fence_file.rs`, which knows nothing about what it stores, and
+left two small wrappers: `control_fence.rs` encodes a `ControlVersion`,
+`grant_fence.rs` the map. That's where the generation came from. The control
+fence could pick the newer slot by comparing versions, but two grant maps
+have no natural order, so every slot now carries a write counter and the
+higher one wins.
+
+A growing payload needs room. Each file has a stride, a power of two of at
+least 512 bytes: slot 0 sits at offset 0, slot 1 at the stride, and the file
+is two strides long. When a payload no longer fits, the write falls back to
+the safe route once: a new file whose slots have at least twice the room the
+slot needs (rounded up to a power of two), written beside the old one, flushed, renamed into place, its directory
+flushed. That's two flushes per doubling, so a node granted 200 chunks of one
+array pays it at the first grant and at the 42nd and 170th, and one flush for
+each of the other 197. The rename keeps the old guarantee: the old file stays
+whole until the new one replaces it.
+
+The node keeps the slot position in memory, in the run's `grant_fence` field,
+next to the map it mirrors. It reads the file once, when it opens the run,
+and from then on each new grant writes the other slot and stores the new
+position. A write that fails marks the run failed for good, as before, so a
+stale position is never written through. Compaction (#739) deletes
+`grants.fence` (and a leftover `grants.tmp`) with the other launch fences, and
+`a_finished_run_keeps_only_its_compact_results` still checks that only
+`output` and `results` remain.
+
+Tests first, as always. `a_new_grant_rewrites_the_grant_fence_in_place_with_one_flush`
+grants 30 chunks one sync at a time and checks the file's inode and size never
+change and that the 29 grants after the first cost exactly 29 flushes (the
+first costs two, the file and its directory, counted by the new
+`TaskArrayNode::grant_syncs`). Then it restarts the node and sends a stale
+attempt, which the node raises to the newest one. `a_torn_grant_fence_slot_falls_back_to_the_last_acknowledged_grants`
+tears the newest slot, restarts, and checks that the node falls back to the
+previous attempt rather than forgetting the chunk, and that the next grant
+overwrites the torn slot. `a_grant_fence_with_no_valid_slot_refuses_its_run`
+damages both slots: the run is refused and starts nothing.
+`fence_file`'s own tests cover a payload outgrowing its slot (a new file, two
+flushes, then in place again), a fence of the wrong kind, and the FIFO.
+
+The same throwaway measurement, rewritten for grants: one node, 200 syncs,
+each granting one more chunk of one array whose tasks never finish (so the
+ledger stays quiet and the grant fence is the only flush). With the 40 busy
+loops and four flushing loops (load average 50 to 80), interleaving old and
+new builds four times each, the old code took 38 to 39 ms per sync at the
+median, 52 to 60 ms at the 99th percentile and at most 68 ms. The new code
+took 15 to 16 ms at the median, 25 to 29 ms at the 99th percentile and at most
+53 ms. That's 203 flushes for 200 grants instead of 400.
 
 ### Fair shares: one tenant can't starve the rest
 
@@ -701,6 +956,40 @@ every active run, a cron fire uses the reserved headroom, a refused one is
 recorded as skipped, daily named arrays keep working past the definition cap,
 and on a real three-node cluster a cron job fires while other tenants fill
 every bulk slot.
+
+That last test first raced the wall clock. Its 96 bulk submissions had to land
+before the occurrence's minute came round, or the cron run took one of their
+slots, which is correct behaviour and a failed test. So it scheduled the
+occurrence for the next minute, or the one after when fewer than 30 seconds
+were left, and then waited for real time to pass: up to about 110 seconds
+against nextest's 120-second kill (#748). Giving it more slack would only move
+the cliff. Instead the leader now reads cron time from a `CronClock` on the
+task-array service:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub enum CronClock {
+    #[default]
+    System,
+    Manual(Arc<std::sync::atomic::AtomicU64>),
+}
+```
+
+Production never touches it, so `#[default]` makes `System` what
+`TaskArrayService` starts with. The test gives all three nodes clones of one
+`Manual` clock, which hold the same `Arc` and so the same counter, whichever
+node leads. It pins the clock to the current minute, schedules the occurrence
+half an hour later, fills the bulk slots, checks nothing has fired, and only
+then calls `set`. `set` takes `&self`, not `&mut self`, because the atomic
+gives us interior mutability: the leader loop reads the clock through its own
+`Arc` while the test moves it. The `Release` store pairs with the leader's
+`Acquire` load, so a leader that sees the new time also sees everything the
+test did before setting it. The wait went from up to two minutes to about
+seventeen seconds, most of it starting the cluster, and twelve runs in a row
+under eight busy loops all took the same time. Only the cron loop reads this
+clock. Registration, retention and the run timestamps stay on the wall clock,
+which is why the occurrence sits half an hour out: a schedule never fires in
+the wall-clock minute it was registered in.
 
 ### Watching a million jobs
 
@@ -916,6 +1205,69 @@ opening and closing the write end until opening without blocking fails with
 from 6,000 tasks to 4,000. Twenty milliseconds a task on 48 slots still takes at
 least 27 seconds, three times longer than the hung window needs work running.
 
+Those two stuck threads were a bug in their own right (issue #770). Dropping the
+handler releases the worker's lock on its arrays, so the next sync walks
+straight in and starts another read on the same stuck disk. The leader retries
+every few seconds, so a disk that hangs for an hour leaks about a thousand
+threads. Tokio's blocking pool stops at 512, and once it's full every
+`spawn_blocking` in Bun queues behind threads that will never come back,
+including work that has nothing to do with task arrays. Timing out the read
+itself isn't an option: a `read` blocked on a hung device can't be interrupted,
+not even by a signal, so the thread is gone until the disk answers.
+
+What we can bound is how many threads go in after it. A worker now allows one
+sync on its disk at a time, and the permit for it has to outlive a dropped
+handler. Chapter 3 tied a proxy's connection slots to `OwnedSemaphorePermit`
+values; this is the same trick with one more twist:
+
+```rust
+#[derive(Clone)]
+struct SyncClaim {
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+fn spawn_blocking<T, F>(&self, work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let claim = self.clone();
+    tokio::task::spawn_blocking(move || {
+        let _claim = claim;
+        work()
+    })
+}
+```
+
+A semaphore with one permit makes the gate. `sync` takes the permit with
+`try_acquire_owned`, which fails at once rather than queueing, and wraps it in
+an `Arc`. Every blocking call the sync makes goes through
+`SyncClaim::spawn_blocking`, and the `move` closure takes its own clone of that
+`Arc` onto the blocking thread. The permit goes back only when the last clone
+drops: when the sync returns normally, or, if the leader gave up on it, when
+the stuck read finally does. The leading underscore in `_permit` tells the
+compiler we keep the field for its `Drop`, not to read it. A sync that finds
+the permit taken returns `TaskArrayNodeError::SyncBusy`, which the API answers
+with `503 Service Unavailable`.
+
+The leader has to see that as a failure, not as an answer. A busy worker that
+counted as "heard from" would never reach the 30-second silence timeout, so its
+chunks would never move to a healthy node, however long the disk stayed stuck.
+So the busy reply lands where the timeout used to: the node is marked failing,
+and silence takes its course. The change only costs the worker one thread
+instead of one per retry.
+
+`syncs_the_leader_gives_up_on_a_stuck_disk_hold_one_blocking_thread` needs no
+FIFO. The node has a test-only `fence_probe`, a closure the fence check calls
+first, and the test's closure counts its callers and then waits on a
+`Condvar` latch, like a read from a dead disk. The test drops the first sync
+after 20 ms, as the leader's deadline would, and then sends 50 more. Each is
+refused as busy within 20 ms, and the probe still counts exactly one blocked
+thread. Then it opens the latch, the stuck read returns, the claim frees itself,
+and the next sync runs normally. A small `Drop` guard opens the latch if an
+assertion fails first, so a failing run can't hang the runtime at shutdown the
+way the FIFO test did.
+
 The third cost was copying. `desired_state()` clones the whole replicated
 state, apps and all, and the leader called it four times a tick. The tick now
 reads through `read_control`, which runs a closure against the state under its
@@ -1038,9 +1390,93 @@ common admission path, `admit_definition`, asks the node's executor the same
 `admit` question about host work before writing anything, and a refusal comes
 back as HTTP 422 with the reason. We kept it to host work, the case #777 is
 about; a container run on a node without a container runtime still goes
-through the tick, a second later. A council could do the same if every node
-advertised what it can run, but that's another piece of gossiped state to keep honest.
-A second of delay in a cluster is a fair price for not having it.
+through the tick, a second later.
+
+A cluster had no such shortcut at first. The leader admitted the run, wrote
+it to Raft, and failed it on the next tick. You got a `202 Accepted` and, a
+second later, a `Failed`. That's honest, but it's a strange way to say no.
+The fix (#788) was the piece of gossiped state we'd been putting off: every
+node now tells the others what kinds of job it runs.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCapabilities {
+    pub host: bool,
+    pub host_limits: bool,
+    pub containers: bool,
+    pub singleton_images: bool,
+    pub singleton_image_limits: bool,
+    pub encrypted_env: bool,
+    pub network_policy: bool,
+    pub mount_isolation: bool,
+    pub binaries: bool,
+}
+```
+
+Nine flags, one for each question `admit` asks of the node's runtime and
+`[process_workloads]` policy. `Copy` is new here: it tells the compiler that a
+`JobCapabilities` is plain bits, so assigning one copies it and the original
+stays usable, the way an `int` or a C struct of `bool`s behaves. Without it,
+`let b = a;` would *move* `a`, and touching `a` afterwards wouldn't compile.
+Rust only lets you derive `Copy` when every field is `Copy` too, so a struct
+holding a `String` can't have it.
+
+The summary rides the gossip directory extension, beside the node's labels
+and endpoints, on every probe. Since #696 a probe fills a fixed byte budget,
+and whatever the extension costs is room a membership update can't use. So
+the summary is small on purpose: bincode writes a `bool` as one byte, which
+makes the whole thing ten bytes with its `Option` tag. A test stamps the
+biggest extension a node can send (63-byte names, IPv6 endpoints, sixteen
+labels using the whole label budget, a leader hint, a recovery claim and
+every job flag) and checks the probe still carries a membership update.
+
+What the summary can't carry is the allowlist itself. Paths are long, and a
+node can name dozens. So `binaries` only says whether the allowlist names
+anything at all, since an empty one refuses every host job. The full list
+already reaches the leader another way: since #702 each node's capability
+report on the reporting tree carries its `allowed_binaries`, so the scheduler
+can place `exec` apps. Admission reuses it rather than gossiping a second
+copy. Where the leader holds a node's report, it checks the run's binary
+against the list; where it doesn't, it falls back to the gossiped flag.
+
+The harder problem was keeping the summary honest. If the leader decided from
+the flags with its own logic, the two would drift, and admission would refuse
+runs the nodes would take, or quote a different reason from the tick. So
+there's only one copy of the logic. `capability_refusal` takes the flags, the
+assignment and whether the binary is allowed, and returns the first refusal.
+The node's `admit` now calls it with its *own* flags:
+
+```rust
+let binary_allowed = self.config.policy.is_binary_allowed(&assignment.program);
+if let Some(reason) = capability_refusal(&self.job_capabilities(), assignment, binary_allowed)
+{
+    return Err(reason);
+}
+```
+
+The leader calls the same function with each live member's gossiped flags. A
+test runs a matrix of runs (host arrays, limits, singleton images, image
+arrays, `shared-runc`, egress) against owned, process and fake runners under
+four policies, and checks the advertised verdict matches `admit` word for
+word.
+
+The leader refuses only when it's sure. Every live member has to have
+advertised a summary, and every one of them has to refuse. A member it hasn't
+heard from yet might take the run, so the run is admitted and left to the
+nodes. Without a node's report, the leader assumes a non-empty allowlist
+might allow the binary. In each of those cases the tick from #777 stays the backstop, as it does
+for the races: a node that leaves, or changes its configuration, after
+admission. When admission does refuse, it quotes the reasons through the same
+`quote_reasons` helper the tick uses, so `relish run` prints `no node can run
+job default/render: host jobs don't run under [process_workloads]
+mount_isolation yet …` whether the leader caught it at the door or a tick
+later.
+
+The node publishes its summary through a `tokio::sync::watch` channel, because
+gossip starts long before the task executor exists. Gossip reads the latest
+value whenever it builds a probe, and lists the node in its own directory too:
+the leader is a member like any other, and its own extension never comes back
+to it over the wire.
 
 One more thing was quietly wrong. A node's capability report said it ran
 process workloads whenever its allowlist wasn't empty, even with
@@ -1193,10 +1629,10 @@ and nothing would stop a later edit from indexing before the check.
 
 Everything else still gets no route, so recovery refuses it as before. An
 instance both backends claim is conflicting ownership, not a runtime switch.
-An image app that `--runtime process` ran as a host process doesn't fit
-either: the mixed runtime would run it in a container, so it can't adopt that
-execution, and switching such a node from `process` to `mixed` still stops
-Bun (#827). An instance that already has a route keeps it, so running the step
+An image app that `--runtime process` ran as a host process wouldn't fit
+either: the mixed runtime would run it in a container, so it couldn't adopt
+that execution (#827). That case is gone in 0.2.1: the process runtime refuses
+image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists. An instance that already has a route keeps it, so running the step
 on every start changes nothing after the first.
 
 The fix shipped, and the next soak failed at the same step (#839), this time
@@ -1334,6 +1770,10 @@ was really forgotten, failed four runs in twenty-nine on exactly that.
 Each fix leans on the same fact: a forget unpublishes with one `rename`, and
 publication is atomic too, so a published entry is never half there. A name
 that was listed and is now absent has left, and the snapshot leaves it out.
+(The 0.2.1 train had already met the runc and host halves of this race from
+the other side, an app instance forgotten during startup adoption, and fixed
+them the same way: chapter 1 tells that story, #877. When the two lines of
+work met, the train's version of those two reads stayed.)
 The mixed adapter needs one more step, because its two halves live in
 different places. A forget removes the backend's launch before the route, so
 a missing route means the backend no longer lists the launch, which has just
@@ -1433,7 +1873,37 @@ was the one killed. The soak now uses Lima's SSH forwarder, the quickstart
 will move to a fixed Lima (#983), and Bun should stop being the kernel's
 first choice when memory runs out (#984). A soak that only watched Bun's own
 memory would have called this a Bun leak. Asking the kernel what it killed,
-and what was holding the memory, settled it in a minute.
+and what was holding the memory, settled it in a minute, once someone thought
+to log in to the live VM and ask. The soak asks now (#985). Every heavy check
+and every failure bundle keeps each node's `/proc/meminfo`, its biggest
+processes by RSS, the guest agent's RSS and open files, and any OOM report
+from the kernel log, cut from "invoked oom-killer" to "Killed process" so the
+per-process table comes with it. The same triage found a quieter gap. Bun had
+restarted three times without a harness kill, but only the first became a
+failure: the checker bundles one failure per check and node every half hour,
+and the next two looked like repeats of it. A restart count that rises again
+is a new restart, so each rise is now a failure of its own.
+
+The SSH forwarder had a flaw of its own. It sets up each port with one
+`ssh -O forward`, and if that fails just after a boot, it logs the error and
+never tries again. In the 12-hour jobs final it cut node 3 off from the Mac
+after an upgrade walk, and node 1 after a power-off. Inside, the cluster was
+fine. Outside, the harness saw settles time out, podinfo answer `000`, a
+`version ?` from the upgrade walk and a pulse fail: twelve failures that all
+looked like ours. The evidence that would have said otherwise, Lima's
+host-agent log, had been truncated by the next time those VMs started. Any
+forwarder can lose a port, so the harness now checks for exactly that
+(#987). Every check asks each forwarded port for a real HTTP answer from the
+host. A TCP connect isn't enough, because Lima's default gRPC forwarder
+accepts every connection on the host whether or not anything is behind it.
+When the host gets no answer, the harness asks the same port from inside the
+guest over `limactl shell`, which goes through SSH rather than the forwarder.
+Served inside but not outside, for more than a minute, is one `host-forward`
+failure for the whole incident, and the podinfo and registry checks that went
+through that port stop counting against the product. The harness also keeps
+each VM's host-agent log before every stop. And the job controller now counts
+which node missed a request and which node answered it instead, because the
+`leak-rss` on node 2 in that run was node 2 serving node 1's share of the API.
 
 A mixed node also has to describe itself honestly. It reported its runtime as
 `runc+process`, which the capability classifier didn't recognise, so the
@@ -1809,6 +2279,60 @@ and the pool left that empty. A failed shared-runc task showed no reason in
 the fresh-launch path always did. The unit test
 `a_command_that_never_starts_says_why_in_its_output` asks the pool for more
 than its node can hold and checks that the refusal is the task's output.
+
+The mirror only hid the rate limit, though. At a million jobs the same burst
+happens in production, against whatever registry a customer's images live in,
+and no mirror stands in front of it. So in 0.2.1 we fixed the pull itself
+(#790). Think about what the two manifest reads were for. A digest names exact
+bytes. If the node already holds bytes that hash to that digest, and has
+already unpacked the layers they name, what could the registry possibly tell
+it? Nothing. It can only be slow, or say no.
+
+Now a pull that verifies a digest-pinned image also keeps the raw bytes it
+verified, each under the digest that names it, in `metadata/sha256/` beside
+the layer blobs: the index the pin names (if it names one), the platform
+manifest and the config. The next pull of that pin starts with
+`pinned_image_from_local`. It reads the pinned root and hashes it, picks the
+platform entry exactly as a registry pull does, reads that manifest and
+checks its hash and size, then does the same for the config. If the rootfs
+generation those layer digests name has its `.complete` marker, that's the
+image: no request leaves the node. Any miss (a file that's absent, a byte
+that's changed, a generation that never finished unpacking) returns `None`,
+and the pull goes to the registry as before and rewrites the files it
+verified. The pool's pull and runc's create both call `pull_and_unpack`, so
+both get it for free. A cold executor for a warm pin costs zero registry
+requests instead of two.
+
+We kept two rules from the registry path. First, local bytes are trusted only
+because their hash matches the digest the job asked for, never because of a
+file name or a tag. `metadata_path` refuses anything but a well-formed sha256
+digest, so a hostile descriptor can't steer it outside the directory either.
+Second, a tag reference never takes this path. `nginx:1.29` today may be a
+different image from `nginx:1.29` yesterday, and only the registry knows
+which. This is one more reason the job API insists on digest pins.
+
+`Option` makes the fallback easy to read. Every step of the local lookup can
+miss, so it returns `Option<PulledImage>` and uses `?` on each one. In a
+function that returns `Option`, `?` on a `None` returns `None` straight away,
+and `.ok()?` turns a `Result` into an `Option` first, dropping its error. It's
+the same early return that `?` does for errors, without inventing an error
+type for "not here, ask the registry".
+
+The tests use the image store's counting fake registry, which now counts
+every request. `a_warm_digest_pinned_pull_makes_no_registry_requests` pulls a
+pin once, then pulls it again through a second store over the same directory
+(what runc's create sees after the pool's pull) and expects zero requests,
+for a pinned manifest and a pinned index.
+`warm_pinned_cold_starts_survive_a_registry_that_rate_limits_every_request`
+switches the registry to `429` for everything after the warm-up and runs 32
+pulls at once: all succeed, with no request. Before the fix they waited out
+the client's retries and failed. Two more tests pin down the security side:
+tampered local metadata is ignored, refetched and verified, and a tag always
+asks the registry. On Linux,
+`runc_warm_pinned_executor_cold_starts_make_no_registry_requests` puts a
+counting proxy in front of the test mirror, warms the image, makes the proxy
+answer `429` to everything and cold-starts four shared-runc executors at
+once. Every task runs, and the proxy sees no connection at all.
 
 The failed run also left executor network namespaces behind. A test that
 panics drops its nodes without retiring their executors, and the next runc
@@ -2412,8 +2936,8 @@ so waiting for a slot can't leak into execution time.
 A fast command completing a million times tells us little about what happens
 when Bun dies halfway through owning it. The release soak already kills agents,
 powers off nodes and loses quorum while data-bearing apps run. It now drives
-all three job runtimes through the same faults, within the existing 90-minute
-fast and eight-hour final tiers.
+all three job runtimes through the same faults, within the existing fast and
+final tiers (90 minutes and eight hours then; an hour and eight hours now).
 
 The [extension plan](../plans/2026-10-10-plan-release-job-soak.md) describes a
 bounded controller with two resource profiles per runtime. It persists each
@@ -2591,10 +3115,33 @@ on its own recovery. The final verdict still fails on it, because
 the refused summary body under `jobs/refused/` beside the error, so the next
 refusal won't need inferring (#968).
 
+The first 12-hour jobs final to get that far ran out of runs. The controller
+admitted at most 256, a number picked when the longest tier was eight hours,
+and it prepares about 25 an hour. At 10.5 hours `prepare` raised "retained run
+budget exhausted", and because it raised out of the whole step, the
+controller never reached the polling below it. Every progress counter froze.
+An hour and a half later the drain asked to cancel runs it hadn't looked at
+since, and Bun answered 404: it had pruned them, as it does an hour after a
+run finishes (sooner when newer runs push it out). The drain retried those
+cancels until its deadline. The budget was bounding the wrong thing. It
+counted runs ever admitted, while the cost it guards against is runs held:
+the controller's state and the candidate's run store. Now a run counts from
+admission until an hour after the controller sees it drain, when the
+candidate would have pruned it anyway. A 12-hour run holds about 31 at its
+busiest, and `--plan` prints the expected count and that peak beside the
+limit, refusing a schedule that wouldn't fit. When the budget is full, the
+controller records it once and keeps polling, so the runs it has still drain
+and free their slots. A 404 is now a `Gone` error (a subclass of
+`InvalidEvidence`, so code that catches the parent still sees it), and the run
+leaves the campaign either way. Whether it drained is a separate question. If
+the controller's last look showed it drained, it did. Anything else, including
+a run last seen nearly finished, is an unknown outcome and fails the record.
+"Probably finished" is exactly the guess the soak exists to refuse (#989).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
-the hourly saturation measurements and #668's retained-storage and 12-hour work
-answer different questions. No extrapolated daily rate determines a soak pass.
+the hourly saturation measurements and #668's retained-storage work answer
+different questions. No extrapolated daily rate determines a soak pass.
 
 ### The exit gate: half a day of faults
 
@@ -2622,7 +3169,26 @@ a peer, a disk filled to its last 64 MiB, or Bun's own writes throttled to 20
 IOPS with a systemd property. And every run writes a `.jobs.json` beside its
 record with the accepted rates and the M8 measurements. `--plan` prints the
 schedule without touching a cluster, which is how the CI tests check that the
-90-minute fast tier puts every fault kind on every node.
+fast tier's first four cycles carry every fault kind and every special.
+
+Twelve hours didn't last past 0.2.0. Its release gate ran two final soaks back
+to back: the 8-hour V02 final, then the 12-hour job final, which is the same
+soak with the jobs and node faults added. The second checks everything the
+first does, so running both bought nothing but a day. For 0.2.1 the
+maintainer set one 8-hour slot for all the final soaks (17 October 2026,
+[#991](https://github.com/reliaburger/reliaburger/issues/991)): the job final
+runs 8 hours and replaces the V02 final in the gate, and
+`qualify-sustained.sh --tier final` stays for running the V02 soak alone. The
+fast tiers, which the fix-and-rerun loop runs again and again, went from 90
+minutes to one hour. That fits because the compressed schedule already put
+every fault kind and every special in its first four ten-minute cycles, which
+the harness always finishes however far the slots overrun. The node faults
+needed one change. They used to visit a node three cycles in a row (delay,
+disk, fsync on node 1, then the same on node 2), so in six cycles node 3 never
+got one. Now each round of three puts one kind on each node and the next round
+shifts them along by one, which reaches every node in the first three cycles
+and every kind on every node in nine. The 8-hour final's eight node faults
+cover eight of those nine pairs.
 
 Why node-level faults only? `relish fault kill` against a job is refused by the
 same replica rail that protects apps, and an array's attempts inside a shared
@@ -2688,6 +3254,36 @@ Two Linux versions of the same test use real shared-runc and host executors.
 There the old leader's executor keeps running after its control plane stops,
 which is the nastier case: its commands finish, and none of their reports may
 ever count.
+
+"None" turned out to be one word too strong. In CI the test once failed with
+"chunk 0 was accepted from the dead leader", on an array that had otherwise
+finished perfectly ([#1007](https://github.com/reliaburger/reliaburger/issues/1007)).
+The test killed the leader as soon as its view showed a succeeded task, and the
+leader writes a tick's accepted chunks a moment after it records that view. If
+the leader's own chunk 0 landed in that tick and the tick committed first, the
+leader had accepted its own report while it was still the leader. That's
+correct, and the old assertion failed it anyway. The same goes for a tick the
+old leader appended just before it died: the new leader commits it as part of
+its election, because Raft never drops an entry a majority already holds.
+
+So the question the test asks is *when* a report was accepted, not whose it
+was. Raft gives us a clean line. A new leader commits a blank entry in its own
+term straight after its election, and once it has applied an entry of its own
+term, every entry the old leader wrote is applied too. The test records the
+chunks accepted from the leader just before the kill, waits for
+`applied_own_term` (the applied log id's term equals the current term), records
+them again, and checks that the first set is inside the second. At the end, any
+chunk still owned by the dead leader must be in that takeover set, at attempt 1.
+A report accepted after the takeover, which is what the test exists to rule out,
+still fails it. `leader_id.get_term()` is openraft's accessor for the term half
+of a log id; the leader id is a struct rather than a bare number, so it's a
+method call and not a field.
+
+To make sure the legitimate case is always exercised, the kill now waits until
+the leader has had at least one chunk of its own accepted *and* still holds
+more. With the old assertion put back, that version failed five runs out of
+five with the CI message; with the new one it passed a hundred runs in a row on
+a busy laptop, each with two of the leader's chunks accepted before the kill.
 
 Finally, a regression guard. `relish bench --scenario` and `--compare` used to
 be mutually exclusive, so the throughput we were proudest of had none.
@@ -2802,6 +3398,16 @@ time. Everything else (a manifest or layer pull, a digest mismatch, a full
 disk while unpacking, a runc call, network setup) is the runtime or the host,
 and a later attempt may get past it.
 
+0.2.1 gave the runtime refusals of its own, found before anything is pulled
+or started: a binary that's missing or not executable (#881, #905), a spec
+with nothing to run, and an image on a node started with `--runtime process`,
+which runs only host processes (#914). They come back as
+`GrillError::LaunchRefused`, carrying a `LaunchProblem` that says which. Each
+is the spec's fault as surely as a bad image reference, so `refuses_spec`
+gained a third arm, `Self::LaunchRefused { .. }`. Without it, a job whose
+image can't run on a process-only node would have been launched
+`max_attempts` times, refused for the same reason each time.
+
 What about errors that could be either? A runc failure might be a bug in the
 spec or a busy host. A full disk might clear in a minute. We picked "retry"
 as the default, for two reasons. Every one of these errors happens before the
@@ -2872,6 +3478,101 @@ retry's backoff starts no further attempt, and a singleton without
 outcome there's nothing for an operator to decide. The portable suite runs the
 same through the API, Raft and the leader's chunk check:
 `a_launch_failure_is_retried_with_its_cause_and_a_refusal_fails_once`.
+
+### Who the OOM killer takes
+
+Six hours into run 1 of 0.2.0's jobs final, node 1 ran out of memory and the
+kernel killed Bun. Three times. Bun wasn't the culprit: it sat at 150 to 380
+MiB. Lima's guest agent held a gigabyte and was leaking a socket for every
+forwarded connection
+([record](../qualification/2026-10-16-v0.2.0-release-closure.md)). So why did
+the kernel pick Bun?
+
+When memory runs out across the whole machine, the kernel's OOM killer scores
+every process and kills the highest. The score is roughly the process's share
+of memory in thousandths, plus its `oom_score_adj`, a number from -1000 to
+1000 in `/proc/<pid>/oom_score_adj`. The guest agent runs at -500. Bun ran at
+0 in 0.2.0, which made a 300 MiB Bun a better target than a 1 GiB guest agent.
+
+0.2.1's units already set `OOMScoreAdjust=-900` (#700). That's half the fix,
+and on its own it backfires quietly: a child inherits its parent's score, and
+everything on the node is Bun's child. runc, the process owner, the reusable
+executor's helper and every task it forks would all run at -900, as protected
+as Bun itself. Under pressure the kernel would go for sshd or journald first.
+
+So the other half is a positive score for workloads
+([#984](https://github.com/reliaburger/reliaburger/issues/984)). The OCI
+runtime spec already has the field, `process.oomScoreAdj`, and runc applies it
+before the container's first instruction. `OciProcess` gains it:
+
+```rust
+#[serde(
+    rename = "oomScoreAdj",
+    default,
+    skip_serializing_if = "Option::is_none"
+)]
+pub oom_score_adj: Option<i32>,
+```
+
+`rename` gives the JSON key the spec's camel case; `default` lets an older
+record without the key still load as `None`; `skip_serializing_if` leaves the
+key out when there's nothing to say, so Bun's internal runtime commands keep
+the score they inherit. Every generator that builds a workload's spec (apps,
+init containers and jobs, which also covers each executor's helper and the
+fresh-container tasks) sets it to one constant, `WORKLOAD_OOM_SCORE_ADJ`, at
++500. That's above anything the node itself runs, so the smallest workload
+goes before the guest agent, the daemons and Bun. A task is the cheapest thing
+on a node to lose: it retries.
+
+Host workloads have no runc to apply the field, so the process owner's
+execution gate does it, right after joining the workload's cgroup and before
+it `exec`s the user's command:
+
+```rust
+fn raise_oom_score(spec: &super::oci::OciSpec) -> io::Result<()> {
+    let Some(wanted) = spec.process.oom_score_adj else {
+        return Ok(());
+    };
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let path = Path::new("/proc/self/oom_score_adj");
+    let current: i32 = std::fs::read_to_string(path)?
+        .trim()
+        .parse()
+        .map_err(|error| io::Error::other(format!("unreadable oom_score_adj: {error}")))?;
+    if wanted <= current {
+        return Ok(());
+    }
+    std::fs::write(path, wanted.to_string())
+        .map_err(|error| io::Error::other(format!("cannot raise oom_score_adj: {error}")))
+}
+```
+
+`cfg!(target_os = "linux")` is the expression form of `#[cfg]`: the code
+still compiles on macOS, where there's no `/proc`, but the branch is a
+constant there and the function returns early. `.parse()` picks its target
+type from the annotation on `current`, here `i32`. The gate only raises the
+score. Lowering it needs `CAP_SYS_RESOURCE`, and a spec asking for a lower
+score is asking to be protected, which no workload should get. If the write
+fails, the gate refuses to run the command, the same as a cgroup it can't
+join.
+
+The dev cluster launches Bun with `nohup`, not a unit, so its shell writes -900
+to its own `oom_score_adj` first and Bun inherits it. The job benchmark passes
+`--property=OOMScoreAdjust=-900` to `systemd-run`.
+
+The tests come in three layers. `workloads_are_the_oom_killers_first_choice_before_bun`
+checks every spec generator carries the score, and
+`oom_score_is_written_as_the_oci_process_field` checks the JSON key runc reads.
+On Linux the portable suite runs a real owner: a workload that asks for a
+higher score than the test's reads it back from `/proc/self/oom_score_adj`,
+one without a score reads its parent's, and one that asks for -1000 doesn't
+get it. The first version asked for +500 and failed in CI, because GitHub's
+runner already starts every job process at 500. Nothing was raised, so the
+test couldn't tell a working gate from a missing one, and its guard caught
+that. Now it asks for halfway between its own score and the maximum. The unit
+test in `provision.rs` from #700 still pins the unit's -900.
 
 ## One budget, two schedulers
 
@@ -2968,10 +3669,13 @@ stays put learns one more reason to say no:
 if keeps_volume_home(placement, spec, self.retired) {
     return true;
 }
-if cache.capacity_refused(&placement.node_id, app_id) {
+if cache.capacity_refused(&placement.node_id, app_id, placement.ordinal) {
     return false;
 }
 ```
+
+(The `ordinal` argument came later, in 0.2.1. We'll get to why at the end of
+this section.)
 
 The order matters. An app with a managed volume still waits for the node that
 holds its data, refusal or not: moving it would start it on an empty volume,
@@ -3006,7 +3710,8 @@ minute, but the node's deploy retries back off to five minutes, so for four
 minutes in every five the leader saw no refusal and kept the placement. We
 could have raised the limit to the longest backoff plus a margin, but any
 fixed limit is a guess about another module's constant. Instead
-`capacity_refusals` became a `HashSet<(String, String)>`, and an entry lasts
+`capacity_refusals` became a `HashSet<(String, String)>` (a map to the refused
+ordinals since #971, below), and an entry lasts
 until something actually changes: an admission of that app succeeds here, or
 the app is stopped or retired here, which is what happens when the leader
 moves it away. Clearing it on retirement matters. A refusal left behind after
@@ -3017,6 +3722,82 @@ The candidate 7 error message also read `gpus=4294967295`. That's
 `u32::MAX`, which the node's budget holds as its GPU capacity because GPUs are
 admitted by a separate check. It looked like a corrupt counter, so the message
 now leaves GPUs out unless the app asks for some.
+
+Fixing #967 turned up two side effects of the fix itself (#971). Neither lost
+a replica: when no other node had room, the leader left the committed
+placements where they were. But both did more work than the refusal asked for.
+
+The first was in `keeps`. A refusal named an app, not a replica, so the leader
+moved every placement of that app off the node, including the two `frontend`
+replicas that were running happily there. One refused scale-up restarted the
+healthy replicas beside it. Now the refusal carries the replicas the node
+couldn't start, as `CapacityRefusal::ordinals` in the state report, and the
+cache keeps a set of them per node and app:
+
+```rust
+pub fn record_capacity_refusal(&mut self, node_id: &NodeId, app_id: &AppId, ordinals: &[u32]) {
+    self.capacity_refusals
+        .entry((node_id.clone(), app_id.clone()))
+        .or_default()
+        .extend(ordinals.iter().copied());
+}
+```
+
+`entry` looks a key up once and hands back a slot you can fill or change,
+`or_default` puts an empty `BTreeSet` in the slot if the key wasn't there, and
+`extend` adds every ordinal. `copied` turns the iterator's `&u32` references
+into plain `u32` values, which is what the set holds; it only works for types
+that are `Copy`, like integers. In Go you'd write the same thing as a map
+lookup, a nil check and a loop.
+
+Which ordinals does a node name? It depends on how far the admission got. A
+scale-up names only the replicas it tried to add: the leader moves those, and
+the running ones stay. A fresh deploy names its whole share, because nothing
+of it runs. A rolling or blue-green replacement names its whole share too, even
+though the old replicas still run: a rollout that can't start one replacement
+rolls back, so none of the new spec's replicas can run on that node. Those
+move, as they did before.
+
+The second side effect was on the node. A deploy stores the new spec before it
+starts anything, and the add-replicas path decides whether it applies by
+comparing the stored spec with the wanted one. After a refused scale-up from
+two replicas to three, the stored spec already said three, so the retry saw
+no change in the count and rolled the app instead. A rolling deploy needs room
+for each new replica beside the old one, so the retry asked for more capacity
+than the scale-up that had just been refused. Now `add_replicas_in_place`
+stores the previous spec again when the admission fails. Nothing started, so
+the previous spec is still what the node runs, and the retry adds the same
+replica in place.
+
+That opened one more door. Once the leader moves the refused replica away, the
+node's share is two replicas again, the very spec it now records, and an
+identical spec has always meant "roll it". So `replicas_to_add_in_place` makes
+one exception: the spec this node already runs, sent again while its refusal
+stands, adds zero replicas and rolls nothing:
+
+```rust
+let (running, added) = match (replicas_added(previous, spec), spec.replicas) {
+    (Some(grown), _) => grown,
+    (None, Replicas::Fixed(count))
+        if previous == spec && self.capacity_refusals.contains_key(&key) =>
+    {
+        (count, 0)
+    }
+    (None, _) => return None,
+};
+```
+
+Matching on a tuple lets one `match` look at two values at once, and the `if`
+after the second pattern is a match guard: that arm only matches when the
+condition holds too. The zero-replica admission succeeds, which clears the
+refusal, so it can't push a replica off this node the next time the leader
+puts one here. Any other identical redeploy still rolls, as before.
+
+The issue also said the leader logged `cannot place` on every pass while a
+refusal stood with nowhere to go. That was the 0.2.0 scheduler. In 0.2.1 the
+leader already records why an app is short in council state and logs only
+when that changes (#702), and a test now checks that a standing refusal is
+news once.
 
 ### Retiring the batch engine from Chapter 12
 
@@ -3071,6 +3852,15 @@ can't find. Cleanup cancels any unsettled deployment that owns a leased job and
 forgets its definition, then waits until the leader has settled the cancelled
 deployment before it removes the lease record. Standalone nodes keep the lease
 in their own store and do the same through the node's task arrays.
+
+An application lease, meanwhile, refuses jobs outright, and that caught out
+the test runner itself. It chose the lease kind by group, so the two job cases
+in the `process-workloads` group asked for an application lease and failed at
+apply before a job ever ran (#742). Each catalogue case now declares its
+`lease` (Chapter 15), and a qualification test runs the `process-workloads`
+group against a real secure node, checking that both job cases pass and
+confirm their cleanup. The refusal stays: a case that applies a job under the
+wrong lease fails loudly rather than slipping through.
 
 ### Lessons
 

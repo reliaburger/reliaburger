@@ -144,6 +144,8 @@ When `auto_rollback = true` (the default) and a step fails, the orchestrator rev
 
 The same `DeployDriver` methods, called in reverse order. The rollback itself can fail (if the old image is also broken), in which case the deploy enters the `Failed` state and the operator must intervene.
 
+That's the model. The wired path on a node got this wrong for a long time, in a way the model never could: see "A rollback must not cost capacity" at the end of the chapter.
+
 There was a leak here worth calling out. Rollback reverts the steps that *completed*, but a step can fail partway: `start_instance` succeeds, then `await_healthy` times out. That leaves a new instance running — started, unhealthy, recorded — that the rollback loop skipped, because it only walks completed steps, not the failed one. So every failed deploy orphaned a container and leaked its port. The fix is three lines in the failure branch: when a step fails, stop *its own* new instance before rolling back the earlier ones. The regression test starts two replicas, fails the second's health check, and asserts the second's new instance appears in the driver's stopped set — the assertion the original tests never made.
 
 ## Dependency ordering
@@ -215,6 +217,8 @@ So what's actually wired:
 
 Deploy state is committed to Raft at every phase transition. If the leader dies mid-deploy, the new leader reads the last known state and can resume. This is why the phase is an enum we write down rather than a position in the code: a value survives a process death, a stack frame doesn't.
 
+That's the model again. The wired cluster path keeps no deploy state in Raft at all: each node rolls its own share, and the leader reads progress from the nodes' reports (more on that at the end of the chapter). What it does keep in Raft is small: the last ten specs of each app that rolled out everywhere, and the spec whose rollout failed.
+
 Finished deploys move into a per-app history so `relish history` and the API can show what shipped when. We don't keep it forever — an app that deploys fifty times a day would grow the Raft log without bound. The state machine caps it:
 
 ```rust
@@ -227,6 +231,8 @@ if history.len() > 50 {
 ```
 
 `entry(app_key).or_default()` is the Rust idiom for "get the vector for this app, creating an empty one if it's the first deploy". It's `HashMap`'s answer to Python's `dict.setdefault([])` or Go's check-then-insert dance, in one call. `remove(0)` drops the oldest entry once we pass fifty, so history is a sliding window of the last fifty deploys per app. A unit test (`deploy_history_capped_at_50`) deploys fifty-one times and asserts the length stays at fifty.
+
+For a long time that cap lived only in the model. The agent's real history was a plain `Vec` that every deploy, retry and abort pushed a whole `AppSpec` onto, and nothing ever trimmed. A bad version that the reconciler retried every five minutes added an entry every five minutes, forever, and a restart threw the lot away, so `relish rollback` answered 404 after an upgrade. Now `record_deploy_history` keeps the newest fifty per app on each node, and the rollback source moved to the council (see the end of the chapter).
 
 ## Under the hood: key patterns
 
@@ -328,7 +334,9 @@ One subtlety in the failure arm: when we transition into a terminal failure stat
 
 ### `relish deploy`, `history`, and `rollback`
 
-The CLI is a thin client over the agent's HTTP API. `relish deploy` streams rollout progress to your terminal as each step changes phase, so you watch the deploy march through `Starting → HealthChecking → RoutingUpdate → Draining` per instance. `relish history <app>` prints the sliding window of past deploys. And `relish lint` validates an app's config (including the deploy section) before you ever ship it, catching a bad `drain_timeout` string or an unknown strategy at author time rather than mid-rollout.
+The CLI is a thin client over the agent's HTTP API. On a single node, `relish deploy` streams the agent's progress lines to your terminal as the rollout goes ("starting new instance", "healthy ✓", "stopping old instance"). On a cluster it can't: the API returns as soon as the council has recorded the spec, and each node rolls its share later, so you get one line and watch the rest with `relish status`. `relish history <app>` prints the sliding window of past deploys. And `relish lint` validates an app's config, including the deploy section, before you ship it.
+
+That last claim used to be half true. `strategy` was a free string, and anything but `"blue-green"` meant rolling, so `"bluegreen"` rolled without a word. A `drain_timeout` of `"1m30s"` or `"500ms"` failed to parse and quietly became the 30-second default. Neither reached `relish lint`. Now `strategy` deserialises into the `DeployStrategy` enum, with `#[serde(rename_all = "kebab-case")]` mapping `BlueGreen` to `"blue-green"`, so an unknown value fails to parse at all; and `DeployConfig::parse` refuses a duration that doesn't parse, the same "refuse, don't clamp" rule `[autoscale]` follows. `unknown_deploy_strategy_is_rejected` and `unparseable_drain_timeout_is_rejected` pin both.
 
 `relish rollback <app>` deserves its own paragraph, because for a long time it was a lie. The command read the last successful entry from history and *printed* the image name, followed by "(use `relish apply` with the previous config to rollback)". It rolled nothing back; it told you to. Worse, it couldn't have worked even if it tried: the deploy history stored the image string but not the *spec*, so there was nothing to re-apply. And the fresh-deploy path — the very first deploy of an app — recorded no history at all, so a two-deploy app only had one entry.
 
@@ -872,6 +880,8 @@ async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Res
 
 `Result<usize, String>` is Rust's answer to error handling — a value that's *either* an `Ok` carrying the count, *or* an `Err` carrying the id of the change that failed. There's no exception to forget to catch and no error code to ignore; the caller can't get at the count without acknowledging the failure case. The `let Some(x) = … else { continue }` is a *let-else*: bind `x` if the pattern matches, otherwise run the `else` (which must diverge — here, `continue` to the next change). It's the clean way to say "skip the ones that don't map to a write" without nesting.
 
+(Stopping at the first failure turned out to be too strict: one bad app blocked every change behind it. "GitOps owns what it wrote" below shows how `apply_changes` now tries every change and reports each refusal, while keeping the rule that follows.)
+
 The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the commit untouched and moves on; the next tick sees an unapplied commit and re-runs the whole set. That only works because the writes are idempotent — applying a `NamespaceSpec` that's already there is an upsert, a harmless no-op — so re-running a partially-applied sync converges instead of double-counting. Idempotence is what buys you "just retry the whole thing," which is the simplest correct recovery there is.
 
 The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
@@ -1105,6 +1115,78 @@ let fetched = repo.fetch().and_then(|new_commit| match new_commit {
 Reconciling every tick raises a cost question the old skip was hiding: if every poll ends in `record_success`, every poll writes a `GitOpsSyncUpdate` to Raft, and the log grows by one entry every thirty seconds forever. We already fixed that once (the fetch that never advanced its local ref, earlier in this chapter), so the runner is explicit about when it writes. A tick on the commit it already applied, with no changes and no error to clear, writes nothing. A tick that repaired drift writes a history entry and says so in the log (`gitops: repaired drift with 2 change(s) from …`). The applied commit doesn't move, because Git didn't.
 
 Then there's what *isn't* drift. An autoscaler that has scaled `worker` to five replicas hasn't disagreed with Git, and neither has an operator who ran `relish stop`. Both live outside the app spec: the override in `autoscale_overrides`, the stop in `stopped_apps`. GitOps writes app specs, and only when the spec differs, so a matching spec leaves both alone. The integration test does the whole thing through Raft on a single-node council: sync a repo with three apps, write a rogue image for one, delete another and write an autoscale override for the third, then wait. The polls, on the same SHA, put `web:v1` and `api` back; the override survives, and `last_applied_commit` still names the original commit. Before the fix the test timed out waiting for the image.
+
+## GitOps owns what it wrote, and nothing else
+
+Reconciling on every tick made one old assumption much louder. The diff treated the repository as the whole truth: anything in Raft that git didn't mention was a `Remove`. That's fine in a cluster GitOps built from nothing. Now turn GitOps on in a cluster that's been running for a month on `relish apply`. The first sync reads a repository with three apps in it, compares it with a cluster running thirty, and deletes twenty-seven. Commit an empty tree by mistake and it deletes everything. The design doc promised that GitOps and manual apply coexist. The code had no way to tell the two apart, so they didn't.
+
+The audit (#693) found two more ways to lose things. A running test's `rbtest-*` namespace sits in desired state like any other, so GitOps pruned the apps of a test in progress. And the `[gitops]` section came from each node's own `node.toml`, so after a failover the new leader could follow a different repository, or none at all, and prune whatever the old one had written.
+
+### An ownership set, written with the resource
+
+The maintainer's decision (D9) was an ownership marker: Raft records which resources Lettuce wrote, and Lettuce prunes only those. The interesting part is *where* the record gets written. If the runner wrote the app and then, in a second entry, marked it owned, a crash or leader change between the two would leave an app GitOps wrote but doesn't know it owns. It would never be pruned. So the ownership change rides in the same Raft entry as the write:
+
+```rust
+GitOpsWrite {
+    term: u64,
+    change: Box<RaftRequest>,
+},
+```
+
+That's an enum variant holding a boxed value of its own enum. In C you'd reach for a pointer to a struct of the same type; in Rust the `Box` is what makes it legal at all. An enum is laid out inline, as big as its largest variant, so a variant that contained a `RaftRequest` directly would need infinite size. `Box` puts the inner request on the heap and leaves a pointer-sized field behind. Serde and bincode follow the box without noticing it's there.
+
+The state machine unwraps it, checks the inner change is one of the six declarative writes (an app, namespace or permission, spec or delete), applies it through the ordinary handler, and then updates `gitops_owned`:
+
+```rust
+let response = self.apply_request_at(change, position);
+if matches!(response, Some(CouncilResponse::Refused { .. })) {
+    return response;
+}
+let owned = &mut self.state.gitops_owned;
+match change {
+    RaftRequest::AppSpec { app_id, .. } => {
+        owned.apps.insert(app_id.clone());
+    }
+    // namespaces and permissions likewise
+    _ => {}
+}
+```
+
+A delete goes the other way: it's refused outright when GitOps doesn't own the resource, and the delete handler forgets the ownership (as a manual delete does, so the set only ever describes things that exist). Two `&mut` borrows of `self.state` can't overlap, which is why `owned` is taken only after `apply_request_at` has finished with `self`. The borrow checker would refuse the other order, and it'd be right to.
+
+The diff then only removes what's in the set. A resource that's in git *and* already in the cluster, with the same spec, but that GitOps didn't write, gets a new kind of change, `ResourceChange::Adopt`, carrying the spec the cluster already runs. Writing it changes nothing (the bound image digest is kept, so no re-pull) except the ownership. From then on, deleting it from git deletes it from the cluster. Everything in an `rbtest-*` namespace is filtered out of both sides of the diff, and the state machine now refuses a plain `AppDelete` or `NamespaceDelete` in a namespace a live lease owns. The lease's cleanup carries the lease (`TestLeaseAppDelete`), so it's the only thing that can remove a running test's workload.
+
+What about the person at the keyboard? `relish apply` of a GitOps-owned resource goes ahead and prints `warning: app 'web' in namespace 'default' is managed by GitOps; manual changes are reverted on the next sync`. `relish delete` and `relish rollback` of one are refused with a `409` unless you pass `--force`, because the next sync would undo them anyway. Refusing the pointless change is kinder than letting it quietly bounce back thirty seconds later.
+
+### Every change gets its go
+
+The earlier section made "applied" mean "all of it applied", and the first version of that rule stopped at the first failure. That's correct for the commit pointer and wrong for everything else. One app whose image won't bind blocked every change behind it, removals included, forever, because the commit never advanced and the next tick stopped at the same app. `apply_changes` now tries every change and returns a report instead of a `Result`:
+
+```rust
+pub struct ApplyReport {
+    pub applied: usize,
+    pub refused: Vec<String>,
+    pub abandoned: Option<String>,
+}
+```
+
+A sync with refusals is recorded as `SyncResult::PartialSuccess { errors }`, naming each offender in the sync status. The D12 rule survives: `last_applied_commit` moves only when `refused` is empty, so the next tick retries, and the idempotent writes make retrying cheap. The diff's order matters more now that partial syncs are normal: adds and updates go namespaces, permissions, apps (the order manual apply already used), and removals go apps, permissions, namespaces, so a namespace is never pulled out from under apps still being written into it.
+
+### One configuration, held by the cluster
+
+The `[gitops]` section moved into Raft as `DesiredState.gitops_config`. Every cluster node runs the sync loop; a follower only compares its own section with the cluster's and publishes the result, and the leader syncs whatever Raft holds. A node's `node.toml` seeds Raft once, through `GitOpsConfigSet { seed: true }`, which the state machine ignores when a configuration is already there. After that the cluster's copy wins. A node whose section differs says so in its log and in `relish wtf`, and is ignored. `relish gitops set` changes it, behind an Admin token and the audit log.
+
+The awkward bit is credentials. A private repository means a token in the URL, and webhooks mean a shared secret, and neither belongs in a Raft log that every council member replicates and every snapshot copies. So `StoredGitOpsConfig::seal` lifts them out before the write and seals them with HKDF and AES-256-GCM under a key derived from the cluster master key, the same wrapping the CA keys get. No master key, no credentials: the seal refuses rather than storing them in clear.
+
+### A sync that knows which term it's in
+
+A sync reads desired state, then spends seconds (or minutes, on a slow remote) in `git`. If leadership moves to B and back to A meanwhile, A's diff is stale: B may have changed things A's snapshot never saw. The fix costs one `u64`. The runner reads the Raft term *before* the snapshot and stamps it on every `GitOpsWrite`. The state machine compares it with the term of the log entry carrying the write, which openraft gives us for free in the entry's `LogId`, and refuses a mismatch. Because the check happens as the entry applies, every replica refuses the same writes. The runner also checks the term before each write and abandons the sync on the first sign it moved; the new leader's sync takes over.
+
+### Warning, not refusing, about plaintext secrets
+
+Last, a smaller decision (D8). A repository with `DB_PASSWORD = "hunter2"` in it works, and always has. Refusing it would turn a bad habit into an outage with no migration path. So the sync applies it and warns: any env key containing `PASSWORD`, `SECRET`, `TOKEN` or `CREDENTIAL`, or ending in `_KEY`, whose value isn't `ENC[AGE:...]`, produces a warning naming the app and the key, never the value. It lands in the log (once, when the set of warnings changes), in `SyncState.warnings` and in `relish wtf`.
+
+The tests follow the findings. In `diff.rs`, `diff_never_removes_resources_gitops_did_not_write`, `diff_skips_test_lease_namespaces` and `diff_orders_namespaces_before_apps_and_removes_in_reverse`. In the state machine, `gitops_write_records_ownership`, `prune_clears_ownership`, `a_gitops_write_from_an_earlier_term_is_refused` and `app_delete_in_a_leased_namespace_needs_the_lease`. In the runner, `one_refused_change_does_not_block_the_others`, `partial_sync_names_every_offender` and `sync_is_abandoned_when_the_term_changed`. And end to end on a real council in `tests/suite/gitops.rs`: `enabling_gitops_keeps_manually_applied_apps` (the thirty-apps scenario, in miniature), `manual_apply_of_a_gitops_app_warns`, `delete_of_a_gitops_app_refuses_without_force`, `gitops_config_in_raft_survives_a_leader_without_local_config` and `differing_local_gitops_config_is_reported_not_used`.
 
 ## Stopping the work, not just the wait
 
@@ -1634,3 +1716,98 @@ update. An offline preview states that its creates assume no live comparison.
 A failed live lookup returns an error instead of manufacturing an empty cluster.
 Tests exercise the client-to-router-to-agent path and same-image changes, along
 with quotas, permissions, namespace separation and incomplete evidence.
+
+## A rollback must not cost capacity
+
+Here's a three-replica app on one node, with the default `max_surge = 1` and `auto_rollback = true`. The rollout starts `web-g1-0` on the new version; it goes healthy; an old instance retires to make room. Then `web-g1-1` fails its health check. What should the node do?
+
+What it did was tear down every replacement, healthy ones included, and stop. Only the case with nothing retired produced `RolledBack`; anything else was recorded as `Halted`. So the app ended on two replicas, the two old ones that hadn't retired yet. Now picture an app with a managed volume. It always rolls stop-first, because two processes must never write the same directory, so the only old instance retires *before* its replacement starts. A bad image then fails the replacement, the abort kills it, and the app runs nothing at all. That's auto-rollback turning a bad deploy into an outage.
+
+The fix starts from the right invariant: an abort never ends below `min(healthy new + remaining old, replicas)`. When nothing has retired, killing the replacements is fine, and that's still what happens. When something has, `restore_previous_capacity` rolls *backwards*. It starts previous-spec instances for the ordinals no remaining old instance holds, and only retires a healthy replacement once one of them is healthy. It reuses `plan_rolling_step`, the same pure planner the forward rollout uses, with the healthy replacements in the "old" seat:
+
+```rust
+let step = crate::meat::deploy_types::plan_rolling_step(
+    ordinals.len() as u32,          // the replicas the restoration must cover
+    restored.healthy.len() as u32,  // previous-spec instances up and healthy
+    0,
+    to_retire.len() as u32,         // healthy replacements still serving
+    rollout.config.max_surge,
+    rollout.config.max_unavailable,
+);
+```
+
+So the budget the operator set holds in both directions, and the volume app rolls back stop-first like it rolled forward. If the previous spec won't start either, the healthy replacements stay and the result is `Halted`, with the reason.
+
+The node needs the previous spec to do that, and it didn't keep it: `StoreDeployedSpec` overwrote it. The op now answers the spec it replaced (`HashMap::insert` already returns the old value, as an `Option`), and a rolled-back node stores it back, so its reports and the next rollout see what really runs.
+
+The abort's inputs grew to nine, so they travel as one struct:
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AbortedRollout<'a> {
+    pub(super) app_name: &'a str,
+    pub(super) spec: &'a AppSpec,
+    pub(super) previous: Option<&'a AppSpec>,
+    pub(super) started: &'a Replacements,
+    pub(super) remaining_old: &'a [InstanceId],
+    // ...
+}
+```
+
+`<'a>` is a *lifetime parameter*. Every field borrows from the caller's stack frame, and `'a` names how long those borrows last, so the compiler can check that no `AbortedRollout` outlives the vectors it points into. In C you'd pass the pointers and hope; in Go the garbage collector would keep them alive. And because every field is a reference or a number, the struct can derive `Copy`: passing it around copies a handful of pointers, never the data behind them.
+
+## One node at a time
+
+The second problem was bigger. Every node's placement reconciler polls the leader for its assignments, and when an app's spec changed every node got the new one on the same poll and rolled its share at once. `max_surge` and `max_unavailable` bounded each node's share, not the app. An app with one replica per node was therefore fully down on every redeploy, and a version that started fine but served garbage reached every node before anyone noticed.
+
+We looked at three answers (decision D10 in #674). Full leader-coordinated rollouts, with the rollout's progress in Raft and one surge budget across the cluster, are what the whitepaper always described, and they're a lot of machinery. Documenting the per-node behaviour is honest and fixes nothing. The middle road is what shipped: the leader releases a spec change to one node at a time and waits for that node's share to be healthy before the next.
+
+The interesting part is where the progress lives: nowhere new. Each node's reconciler already records the spec it last finished deploying (the `Applied` fingerprint in its checkpoint). It now tells the agent, the agent puts it in its state report, and the leader reads it from there. A new leader gets the same reports, so it carries on where the old one stopped, without a line of rollout state in Raft. The decision itself is a pure function in `src/cluster/rollout.rs`:
+
+```rust
+pub enum Release<'a> {
+    Desired,
+    Hold(&'a AppSpec),
+}
+
+pub fn plan_release<'a>(
+    desired: &AppSpec,
+    rollouts: Option<&'a AppRollouts>,
+    shares: &BTreeMap<NodeId, NodeShare>,
+) -> BTreeMap<NodeId, Release<'a>>
+```
+
+`Hold` borrows the last fully rolled-out spec straight out of the council's record, and the `'a` on the return type says so: the plan can't outlive the `AppRollouts` it borrowed from. The `BTreeMap` isn't an accident either. It iterates in key order, so "nodes in node-id order" falls out of the type rather than a sort someone might forget.
+
+Versions are compared by `rollout_fingerprint`, a SHA-256 of the spec with `replicas` and `ordinals` set aside. The leader holds the whole app and each node runs its share under its own count and ordinals, so those two fields always differ between the two views of the same version. Setting them aside also means a scale change is never mistaken for a rollout.
+
+A held node keeps whatever it runs. It starts the held spec only for a first placement, and follows a scale change only of the version it already runs. That matters after a failover: a new leader whose reports haven't arrived yet sees every node as unsettled and may hold a node that already finished. Holding means "don't touch", so the worst a stale view costs is time.
+
+## Stop retrying a bad version
+
+With `auto_rollback` on, a failed node rolled back locally, the reconciler saw a failed deploy, and retried the same spec with backoff, up to every five minutes, forever. Each retry made a new generation, a new failing container and a new history entry. Meanwhile the client had been told "deploy started".
+
+Decision D11 picked `RolloutFailed` over reverting the desired spec. Reverting sounds tidier, but with GitOps on it fights: Lettuce would apply the bad spec again on its next sync. So the node reports the abort (the agent now sends a `RolloutAborted` event after the error that caused it, and the reconciler posts it to the leader's `/v1/rollouts/failed`), and the leader commits `RolloutFailed` with the fingerprint, the node and the reason. From then on the planner hands that fingerprint to nobody who isn't already running it. The state machine clears the mark when a *different* spec arrives and keeps it for the same one, so a GitOps re-sync doesn't restart the failure loop. `relish status` prints it, `relish wtf` raises a warning that says how to clear it, and the desired-apps API carries it.
+
+The first version of that rule had a hole, and the end-to-end run for #870 fell into it (#929). The state machine decided "different" by comparing fingerprints, and a fingerprint sets `replicas` aside. That's right for the planner, which must not mistake a scale change for a new version. It's wrong for the mark. An operator who saw `RolloutFailed`, changed `replicas` and applied again got a commit, new instances, and the same old `RolloutFailed`. Nothing they could do short of changing the image moved it on. Now `apply_app_spec` compares the whole spec with the one it replaces:
+
+```rust
+let identical = self.state.apps.get(app_id) == Some(spec);
+self.state.apps.insert(app_id.clone(), spec.clone());
+if !identical && let Some(rollouts) = self.state.rollouts.get_mut(app_id) {
+    rollouts.failed = None;
+}
+```
+
+`AppSpec` derives `PartialEq`, so `==` compares every field, the way Go's `reflect.DeepEqual` would but checked at compile time: a type without `PartialEq` wouldn't compile here. `get` returns an `Option<&AppSpec>` and `spec` is already a `&AppSpec`, so `Some(spec)` builds the same type and the comparison needs no cloning. The `if !identical && let Some(..) = ..` is the let chain from Chapter 1, here mixing a plain boolean with a pattern. Any change now clears the mark, and with it gone the planner releases the spec node by node again. A scale change of a version that's still broken fails on the first node and is marked again, which is what "retry" should mean. An identical apply still keeps the mark, as D11-B decided, but it no longer passes in silence: after the commit, the leader's apply stream checks whether the app's current spec is still `RolloutFailed`, and if it is, `relish apply` prints a warning naming the node and the reason and saying the same spec isn't retried.
+
+The leader also commits `RolloutReleased` once every node an app is placed on runs its current spec healthy. That gives the council the last ten distinct specs that rolled out everywhere, which is both what held nodes fall back on and where `relish rollback` now looks first, so a rollback still works after every node has restarted.
+
+### Tests
+
+The agent tests drive the real deploy worker against a `MockGrill` with a state override that makes one named replacement fail its health wait: `auto_rollback_after_a_retirement_restores_old_capacity` (three replicas, scenario A above), `auto_rollback_of_a_stop_first_volume_app_restarts_the_old_instance` (scenario B) and `abort_keeps_healthy_new_instances_when_old_capacity_cannot_return`. The planner tests in `src/cluster/rollout.rs` cover one-node-at-a-time release, waiting on an unhealthy share, resuming from reports, ungated first placements and scale changes, and a failed spec that nobody new receives. The state machine tests cover the `RolloutFailed` mark surviving an identical re-apply, clearing on a new spec and on a scale change (`scale_change_clears_rollout_failed`), being set again when the same version fails again, refusing a stale report, and the ten-target cap. Two tests in the portable suite (`tests/suite/rollout_failed.rs`) apply through the real API against a one-node council: an identical re-apply keeps the mark and prints the warning, and a scale change clears it without one. The cluster tests in `tests/placement.rs` (`make test-cluster`) run three real nodes: a one-replica-per-node app keeps two replicas serving through a redeploy, a bad version becomes `RolloutFailed` and stops retrying, a scale change starts a new rollout that fails and is marked again, and `relish rollback` works after every node restarts.
+
+### What we learned
+
+The bug in the abort wasn't in a tricky line. Each step was locally reasonable: tear down what you started, keep what you didn't touch. The mistake was not writing down the invariant the whole function had to keep, "never end below the capacity you started with", and testing for it. Once it was written down, the fix was mostly reuse.
+

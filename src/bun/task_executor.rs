@@ -69,6 +69,16 @@ pub struct RunIdentity {
     pub job_name: Option<String>,
 }
 
+/// The job an assignment's tasks run for: the leader appends
+/// `RELIABURGER_JOB_NAME` after the template's own variables, so the last
+/// one wins.
+pub fn job_name(env: &[(String, String)]) -> Option<&str> {
+    env.iter()
+        .rev()
+        .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
+        .map(|(_, value)| value.as_str())
+}
+
 impl RunIdentity {
     /// A single-task run, whose output and logs are kept as the job's own.
     pub fn is_singleton(&self) -> bool {
@@ -1078,12 +1088,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value)),
         );
-        let job_name = work
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
-            .map(|(_, value)| value.clone());
+        let job_name = job_name(&work.env).map(str::to_string);
         TaskInvocation {
             template: work.template.clone(),
             index,

@@ -387,11 +387,9 @@ pub struct ApiToken {
     /// Human-readable name for the token (e.g., "ci-deploy").
     pub name: String,
 
-    /// Argon2id hash of the token secret.
+    /// SHA-256 digest of the full token secret (`rbrg_` + 64 hex
+    /// characters). No salt: see "Why SHA-256, not Argon2id" in §5.4.
     pub token_hash: Vec<u8>,
-
-    /// Salt used for hashing.
-    pub token_salt: Vec<u8>,
 
     /// The role granted to this token.
     pub role: ApiRole,
@@ -532,7 +530,11 @@ pub struct CrlEntry {
 > and `allow_from` names `app` or `namespace/app` sources from other
 > namespaces. Apps and jobs both take `[firewall] allow_from`; a job's
 > destination identity is `0x8000_0000 | hash(namespace/name)`, a service's
-> its VIP. Isolation covers real destinations as well as VIPs through
+> its VIP. A job can also be the source `allow_from` names (#737): each task
+> cgroup is bound in `cgroup_source_map` to its run identity
+> (`hash(namespace/job)`), and the grant keys `firewall_map` on
+> `1 << 63 | identity` instead of a cgroup, so it holds before the job's
+> first task starts. Isolation covers real destinations as well as VIPs through
 > `destination_map` (see the Onion design, §4), and the
 > `reliaburger_isolation` nftables table repeats the check on the forward
 > path between local containers, for traffic that never meets a socket hook.
@@ -784,12 +786,24 @@ The master key and security-bootstrap files are both written with mode `0600`.
 Bun enforces that at load time, so a generated bootstrap never relies on a
 world-readable interval or asks the operator to repair permissions manually.
 
-This is the normal path. Explicit development generators are the exception:
-`relish init --development-plaintext` and `relish dev create` write
-`require_mtls = false`, embed a development-only warning in the file and print
-the same warning; Bun repeats it at every cluster start. The Lima dev cluster
-keeps this temporary limitation because its provisioning path doesn't enrol a
-separate node identity in each VM yet. Don't reuse those configs elsewhere.
+This is the normal path, and since 0.2.1 it's also the default: `[security]
+require_mtls` defaults to `true`, so a node config that omits it, or omits the
+whole section, fails closed. `bun --cluster` with no identity on disk refuses to
+start with the command that fixes it, `relish init` on a bootstrap node or
+`relish join` on a joiner. Single-node `bun` without `--cluster` doesn't read
+the setting. `relish dev create` builds an mTLS cluster the way
+`relish setup --quickstart` does, from the same bootstrap code: it generates the
+CA, master key and first identity on the host, then enrols every other Lima VM
+with a join token and `relish join`.
+
+Plaintext is an explicit opt-in, and there are only two: `relish init
+--development-plaintext`, and test fixtures that write `require_mtls = false`.
+The generated file embeds a development-only warning, the command prints it,
+and Bun repeats it at every cluster start. Don't reuse such a config elsewhere.
+A plaintext cluster has no cluster registry, because the registry needs mTLS
+(#792), so it can't pull Docker Hub short names such as `nginx:1.27`. That's
+deliberate: Pickle stays the only path to Docker Hub, and no node ever falls
+back to a direct pull that skips the cluster's cache and policy (#870).
 
 The transport contract has one deliberate split. Raft and reporting require a
 valid, unrevoked node certificate at the TLS handshake. The agent API also
@@ -887,11 +901,47 @@ $ relish token create --name ci-deploy --role deployer \
     --apps "web,api" --namespaces "production" --ttl-days 30
 ```
 
-1. Generate a 256-bit cryptographically random token secret.
-2. Hash the secret with Argon2id (salt generated per-token).
-3. Store the hash, salt, role, scope, and expiry in Raft.
+1. Generate a 256-bit cryptographically random token secret
+   (`sesame::token::TOKEN_SECRET_BYTES`, asserted at compile time to be at
+   least 32 bytes).
+2. Hash the whole plaintext, `rbrg_` prefix included, with SHA-256
+   (`sesame::token::hash_secret`). The function refuses any secret that
+   isn't `rbrg_` plus 64 hex characters, so nothing short or human-chosen
+   can end up behind the fast hash.
+3. Store the digest, role, scope, and expiry in Raft.
 4. Return the plaintext token to the user, with its expiry. It is never stored
    in plaintext.
+
+**Verification.** `sesame::auth::authenticate` turns away a bearer that
+doesn't have the token shape with a string check. Otherwise it hashes the
+bearer once and compares the digest with every stored secret (each token's
+current one, and its previous one during a rotation's grace period) using a
+constant-time comparison (`sesame::ca::constant_time_eq`, the one join
+tokens use). The whole check takes a few microseconds, so it runs inline on
+the request's async task: no semaphore, no blocking thread and no
+verified-token cache.
+
+**Why SHA-256, not Argon2id (0.2.1, #912).** Until 0.2.1 the stored hash was
+Argon2id with a per-token salt. Argon2id is a *password* hash. It's slow and
+memory-hungry on purpose, so that an attacker who steals the hashes can't
+try billions of guesses at short, human-chosen passwords. Our secrets aren't
+passwords: they're 256 random bits, and nobody can enumerate 2^256 guesses
+however fast each one is. The slowness bought nothing, and every request
+paid for it. One verification used about 19 MiB and tens of milliseconds
+per stored token, so up to four ran at a time behind a process-wide
+semaphore. In the V02 soak the API node served thousands of job-controller
+requests an hour, and glibc kept part of that freed memory resident (#892).
+Measured on the same machine, verifying a bearer against a ten-token store
+went from 177 ms to under 7 µs, and a burst of 40 verifications on four
+threads stopped adding 57 MiB to peak RSS. A salt is pointless for the same
+reason: it defends against precomputed tables of likely passwords, and there
+are no likely 256-bit secrets. The trade only holds while every stored
+secret is long and random, which is why issuing refuses anything else. A
+stolen digest still doesn't reveal the token, because SHA-256 can't be run
+backwards.
+
+The change alters the stored format, so 0.2.1 starts a fresh cluster (state
+`69`, see `src/compatibility.rs`) and tokens must be reissued.
 
 **Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
 ReadOnly token expires after the answering node's `[security.tokens]
@@ -995,7 +1045,7 @@ $ relish token rotate ci-deploy [--grace-hours 24]
 1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
    new secret and hash, and reads the clock once.
 2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
-   hash and salt, `rotated_at`, the new expiry (the token's previous lifetime
+   SHA-256 digest, `rotated_at`, the new expiry (the token's previous lifetime
    length from now, or none) and `previous_valid_until` (now plus the grace,
    24 hours by default, capped at the old expiry; `None` for a zero grace).
 3. The state machine (`sesame::token::apply_rotation`) moves the old hash into
@@ -1014,7 +1064,7 @@ $ relish token rotate ci-deploy [--grace-hours 24]
 
 **Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
 
-**Verification cost (#945):** every bearer request runs Argon2id against the stored hashes in turn, on the blocking pool, at most four at once (`sesame::auth::VERIFY_PERMITS`). One hash at the default cost needs 19 MiB of working memory. That memory comes from a private anonymous mapping (`sesame::token::WorkingMemory`), unmapped when the hash finishes, never from the heap: from glibc's heap, the blocks stayed in its per-thread arenas after they were freed, and the API node of the 0.2.0 candidate 4 soak held about 1 GB on a 2 GiB VM in 19 MiB steps. Minting a token uses the same path. So Argon2 costs at most 76 MiB while four hashes run and nothing after them. `tests/auth_memory.rs` holds a check, a refusal and a mint under a 1 MiB heap ceiling.
+**Verification cost in 0.2.0 (#945):** 0.2.0 ran Argon2id against the stored hashes on every bearer request, on the blocking pool, at most four at once. One hash at the default cost needs 19 MiB of working memory, and from glibc's heap those blocks stayed in its per-thread arenas after they were freed: the API node of the 0.2.0 candidate 4 soak held about 1 GB on a 2 GiB VM in 19 MiB steps. 0.2.0 fixed that by hashing into a private anonymous mapping, unmapped when the hash finished. 0.2.1 verifies with SHA-256 instead (see "Why SHA-256, not Argon2id" above), which needs no working memory, so the mapping, the permits and the 0.2.0 counting-allocator test (`tests/auth_memory.rs`) went with Argon2.
 
 **Expiry sweep (shipped, F05 I2):** every hour (`bun::token_sweep::TOKEN_SWEEP_INTERVAL`) the leader proposes `RaftRequest::SweepExpiredApiTokens { now_unix_ms }`, but only when its own copy of the store has something due, so a quiet cluster writes nothing. The state machine decides what to remove from the entry's `now_unix_ms` alone (`sesame::token::tokens_to_sweep`), so every replica removes the same tokens: those whose `expires_at` plus a 24-hour grace (`EXPIRED_TOKEN_GRACE`) is past. Two rules override that, because an empty store is the bootstrap window in `auth_middleware`: the last Admin is never removed (if every Admin is due, the one that expired most recently stays, ties to the greater name), and the store is never emptied (with no Admin, the most recently expired token stays). The reply, `CouncilResponse::ApiTokensSwept { removed }`, lets the leader record one `token.expired_swept` audit event per token with principal `system`. A store whose every token has expired is not empty, so it still refuses anonymous requests (tested).
 
@@ -1857,11 +1907,10 @@ Reliaburger's age-based secret encryption is much simpler than Vault but covers 
 |-------|---------|-------|
 | **rustls** | TLS implementation for all inter-node mTLS and API TLS. | Pure Rust, no OpenSSL dependency. Supports certificate verification callbacks for CRL checking. |
 | **rcgen** | X.509 certificate generation and CSR creation. | Used by `relish init` for CA generation and by Bun for creating workload CSRs. |
-| **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing. | The core crypto library. No unsafe code, constant-time operations. |
+| **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing (including API and join token digests). | The core crypto library. No unsafe code, constant-time operations. |
 | **age** | Asymmetric encryption for secrets (`ENC[AGE:...]` values). | Rust implementation of the age encryption format. Used for secret encryption/decryption and root CA key sealing. |
 | **x509-parser** | Parsing and validating X.509 certificates and CRLs. | Used for certificate chain validation, CRL parsing, and `relish ca status` output. |
 | **pem** | PEM encoding/decoding for certificates and keys. | Used for writing certificate files to workload identity mounts. |
-| **argon2** | Password hashing for API token storage. | Argon2id variant. Used for hashing API token secrets before Raft storage. |
 
 ---
 
