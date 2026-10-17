@@ -540,18 +540,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(instance_ids)
     }
 
-    /// Add `count` Pending replicas to an app that already runs, beside its
-    /// existing ones, for a deploy that only raises the replica count. They
-    /// take the assigned ordinals no owned instance uses, or on a standalone
-    /// node the lowest unused ones.
-    pub async fn add_app_replicas(
-        &mut self,
+    /// The ordinals [`WorkloadSupervisor::add_app_replicas`] gives `count` replicas
+    /// added to an app: the assigned ordinals no owned instance uses, or on
+    /// a standalone node the lowest unused ones.
+    pub fn ordinals_to_add(
+        &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
         count: u32,
-        now: Instant,
-    ) -> Result<Vec<InstanceId>, BunError> {
+    ) -> Vec<u32> {
         // An ordinal is in use whatever generation its instance is in: after
         // a rolling deploy the replicas are `{app}-g{gen}-{ordinal}`.
         let used: std::collections::HashSet<u32> = self
@@ -567,11 +565,26 @@ impl<G: Grill> WorkloadSupervisor<G> {
             Some(ordinals) => ordinals.clone(),
             None => (0..used.len() as u32 + count).collect(),
         };
-        let indices: Vec<u32> = candidates
+        candidates
             .into_iter()
             .filter(|index| !used.contains(index))
             .take(count as usize)
-            .collect();
+            .collect()
+    }
+
+    /// Add `count` Pending replicas to an app that already runs, beside its
+    /// existing ones, for a deploy that only raises the replica count. They
+    /// take the assigned ordinals no owned instance uses, or on a standalone
+    /// node the lowest unused ones.
+    pub async fn add_app_replicas(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        count: u32,
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        let indices = self.ordinals_to_add(app_name, namespace, spec, count);
         let added = self
             .create_app_instances(app_name, namespace, spec, &indices, now)
             .await?;

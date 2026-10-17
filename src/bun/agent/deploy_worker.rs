@@ -257,7 +257,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             if let Some(count) = in_place.filter(|_| !existing.is_empty()) {
                 if self
-                    .add_replicas_in_place(app_name, namespace, spec, count, &events)
+                    .add_replicas_in_place(
+                        app_name,
+                        namespace,
+                        spec,
+                        previous.as_ref(),
+                        count,
+                        &events,
+                    )
                     .await
                     .is_break()
                 {
@@ -674,22 +681,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     /// Start `count` more replicas beside the ones an app already runs, the
     /// way a fresh deploy starts its replicas. The running ones aren't
     /// touched. Returns `Break` when the caller must stop the whole deploy.
+    ///
+    /// An admission refused here (no room, say) starts nothing, so the node
+    /// still runs `previous`, and that's the spec it records again. The
+    /// retry then adds the same replicas in place, rather than seeing its
+    /// own spec already stored and rolling every replica, which would need
+    /// room for all of them twice over (#971).
     pub(super) async fn add_replicas_in_place(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        previous: Option<&AppSpec>,
         count: u32,
         events: &mpsc::Sender<ApplyEvent>,
     ) -> std::ops::ControlFlow<()> {
-        let _ = events
-            .send(ApplyEvent::Progress {
-                message: format!(
-                    "adding {count} replica(s) of {app_name} beside the running ones (replicas: {})",
-                    spec.replicas
-                ),
-            })
-            .await;
+        let message = if count == 0 {
+            format!(
+                "{app_name} already runs its replicas (replicas: {})",
+                spec.replicas
+            )
+        } else {
+            format!(
+                "adding {count} replica(s) of {app_name} beside the running ones (replicas: {})",
+                spec.replicas
+            )
+        };
+        let _ = events.send(ApplyEvent::Progress { message }).await;
         let ids = match self
             .ops
             .add_app_replicas(app_name, namespace, spec, count)
@@ -697,6 +715,16 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         {
             Ok(ids) => ids,
             Err(error) => {
+                if let Some(previous) = previous
+                    && let Err(restore) = self
+                        .ops
+                        .store_deployed_spec(app_name, namespace, previous)
+                        .await
+                {
+                    eprintln!(
+                        "deploy: could not record {namespace}/{app_name}'s previous spec: {restore}"
+                    );
+                }
                 let _ = events
                     .send(ApplyEvent::Error {
                         message: error.to_string(),
