@@ -171,7 +171,7 @@ record goes in [`qualification/`](qualification):
 | `make test-apple` | Apple silicon with Apple Container | The maintainer, before any release that touches the Apple Container runtime (`src/grill/apple.rs`) |
 | `make test-gpu` | An NVIDIA GPU and `nvidia-smi` | The maintainer, before any release that touches GPU detection (`src/bun/gpu.rs`) |
 | `make test-s3` | AWS credentials and `RELIABURGER_TEST_S3_URL=s3://bucket/prefix` | The maintainer, before any release that touches log export, council backups or the S3 object-store client (`src/ketchup/export.rs`, `src/council/backup.rs`, `src/object_storage.rs`). It exports logs to the bucket and round-trips a council backup through it (put, list, prune, restore), with credentials and region from the standard `AWS_*` variables |
-| `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh`, `qualify-storage-power-cut.sh` | A disposable VM that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
+| `qualify-power-cut-reboot.sh`, which runs `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh` and `qualify-storage-power-cut.sh` | A disposable VM, which it creates and deletes that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
 
 ### Benchmarks in CI
 
@@ -398,12 +398,27 @@ check that everything acknowledged is still there.
 
 | Fixture | Driver | Record |
 |---|---|---|
-| Log and metrics exporters, council backups, lease stores | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-11](qualification/2026-10-11-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md)) |
+| Log and metrics exporters, council backups, lease stores | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-16](qualification/2026-10-16-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md)) |
 | Container and network ownership across a reboot | [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh) | same |
 
 The first run of these found two real data-loss bugs, both now fixed. They need
 a VM that can lose power, so no workflow runs them; they are step 5 of the
-[release gate](releasing.md#staging-a-candidate) instead.
+[release gate](releasing.md#staging-a-candidate) instead. One command runs all
+five lanes on a fresh VM and records them:
+
+```sh
+scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations 10 \
+  --record-dir docs/qualification/DATE-power-cut-reboot
+```
+
+[`qualify-power-cut-reboot.sh`](../scripts/release/qualify-power-cut-reboot.sh)
+makes a clean checkout of `SHA`, creates `rb-pcut-<short sha>` from
+[`power-cut-vm.yaml`](../scripts/release/power-cut-vm.yaml) with only that
+checkout mounted, read-only, checks the swap and the mount from inside the
+guest, runs each lane `N` times, stops at the first failure, writes the records
+and a rule-of-three summary, and deletes the VM. It never touches
+`reliaburger-test`. [`test_power_cut_reboot.py`](../scripts/release/test_power_cut_reboot.py)
+(in `make test-ci-scripts`) checks its decisions against a fake `limactl`.
 
 ## Before a release
 
@@ -413,9 +428,9 @@ a user would install it. The runbook is [`releasing.md`](releasing.md).
 | Gate | What it does | Where |
 |---|---|---|
 | Staged install | `curl \| sh` against the exact signed candidate, from empty caches, then the homepage tour and a full teardown | [`qualify-staged-install.sh`](../scripts/release/qualify-staged-install.sh), [records](qualification/) |
-| Sustained soak, fast tier | About 90 minutes on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml) ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
-| Sustained soak, final tier | 8 hours on the hourly schedule, once per final candidate, for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run passes V02 | [`qualify-sustained.sh --tier final`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md) |
-| Job qualification (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. Fast: 90 minutes compressed. Final: 12 hours on the full schedule, the #668 run (12 rather than #668's 24 hours is the maintainer's decision for 0.2.0, as a reasonable approximation). Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)) | [`qualify-jobs-sustained.sh --tier fast\|final`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c), [runbook](releasing.md#staging-a-candidate) |
+| Sustained soak, fast tier | About an hour on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml) ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
+| Job qualification, fast tier (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. About an hour compressed; every job mode overlaps every fault kind | [`qualify-jobs-sustained.sh --tier fast`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c) |
+| Final soak | 8 hours on the hourly schedule, once per final candidate: the job soak above on the full schedule, so it checks everything the V02 final does as well as the jobs, and it's the only final soak the gate runs (maintainer decision, 17 October 2026, [#991](https://github.com/reliaburger/reliaburger/issues/991)). It's there for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run passes V02. Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). `qualify-sustained.sh --tier final` still runs the V02 final alone, outside the gate | [`qualify-jobs-sustained.sh --tier final`](../scripts/release/qualify-jobs-sustained.sh), [plans](plans/2026-09-25-v02-sustained.md), [runbook](releasing.md#staging-a-candidate) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
 
 ## When a test flakes
@@ -437,8 +452,10 @@ building it.
 cover lost admission replies, resumption with the same request ID, monotonic
 accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
-For the job qualification tiers they also parse `--plan` output (every node
-fault kind on every node in the fast tier, a day of them in the final one),
+For the job qualification tiers they also parse `--plan` output (an hour-long
+fast tier whose first four cycles carry every fault kind and every special,
+node faults on every node, an 8-hour final whose cycles and run budget fit
+together),
 the target-load bodies and rate gate, retry-cause accounting (the harness's
 cause list must match the fields of the product's `RetryCauses`, and an
 unknown cause is refused by name), the retained-run limit (an 8- or 12-hour final
@@ -446,7 +463,17 @@ fits, a schedule that wouldn't is refused before it starts, a drained run
 frees its slot an hour later, a full budget still polls and drains its runs,
 and a run the candidate has pruned counts as drained only if the controller
 saw it drain), CPU sampling
-across restarts and the `.jobs.json` report beside the record.
+across restarts and the `.jobs.json` report beside the record. The
+host-forward probes (#987) are tested against local servers and a fake
+`limactl`: a port refused on the host while the guest serves it is one
+`host-forward` failure with no settle timeouts, a forward that hangs up the
+way Lima's gRPC forwarder does is caught too, a node down inside its guest is
+left to the other checks, host-agent logs are kept before Lima truncates
+them, and the controller's per-node API fallbacks reach the record. The
+guest memory report (#985) runs against stub `ps`, `systemctl` and
+`journalctl` and a fake `/proc`: it keeps meminfo, the top RSS, the guest
+agent's RSS and fds and only the OOM report from the kernel log, and each
+rise in unexplained Bun restarts is a failure of its own.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
 fixtures with:

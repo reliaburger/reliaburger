@@ -656,6 +656,7 @@ async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
         vec![crate::reporting::types::CapacityRefusal {
             app_name: "web".into(),
             namespace: "default".into(),
+            ordinals: vec![0],
         }]
     );
 
@@ -670,8 +671,9 @@ async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
     assert_eq!(snapshot.job_reservations, Default::default());
 }
 
-/// The apps the agent's next state report says it refused for capacity.
-async fn reported_refusals(agent: &mut TestAgent) -> Vec<(String, String)> {
+/// The apps the agent's next state report says it refused for capacity,
+/// with the replica ordinals it couldn't start.
+async fn reported_refusals(agent: &mut TestAgent) -> Vec<(String, String, Vec<u32>)> {
     let (tx, rx) = oneshot::channel();
     agent
         .handle_snapshot_request(CollectSnapshotRequest { response: tx })
@@ -680,7 +682,7 @@ async fn reported_refusals(agent: &mut TestAgent) -> Vec<(String, String)> {
         .unwrap()
         .capacity_refusals
         .into_iter()
-        .map(|refusal| (refusal.app_name, refusal.namespace))
+        .map(|refusal| (refusal.app_name, refusal.namespace, refusal.ordinals))
         .collect()
 }
 
@@ -735,13 +737,15 @@ fn budgeted_web(image: &str, replicas: u32) -> Config {
     .unwrap()
 }
 
-fn web_refused() -> Vec<(String, String)> {
-    vec![("web".to_string(), "default".to_string())]
+/// `web`'s refusal, naming the replica ordinals it couldn't start.
+fn web_refused(ordinals: &[u32]) -> Vec<(String, String, Vec<u32>)> {
+    vec![("web".to_string(), "default".to_string(), ordinals.to_vec())]
 }
 
 /// #967: a replica added beside running ones leases from the same budget as
 /// a fresh deploy. When job leases fill it, the leader must hear about the
-/// refusal, or it keeps the replica on a node that can never start it.
+/// refusal, or it keeps the replica on a node that can never start it. The
+/// refusal names only the replica the scale-up tried to add (#971).
 #[tokio::test]
 async fn capacity_refusal_while_adding_replicas_reaches_the_state_snapshot() {
     let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
@@ -756,15 +760,58 @@ async fn capacity_refusal_while_adding_replicas_reaches_the_state_snapshot() {
         matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("capacity")),
         "{events:?}"
     );
-    assert_eq!(reported_refusals(&mut agent).await, web_refused());
-
-    // The refused attempt already stored the two-replica spec, so the retry
-    // rolls the app, which needs room for both new replicas beside the old.
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
     drop(job);
-    agent
-        .execution_budget()
-        .set_capacity(crate::meat::Resources::new(1500, 1 << 30, 0));
-    expect_complete(&drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await);
+}
+
+/// #971: the refused scale-up started nothing, so its retry adds the same
+/// replica in place again. It used to find its own spec already stored and
+/// roll the app instead, which needs room for both new replicas beside the
+/// old one: more than the scale-up ever asked for.
+#[tokio::test]
+async fn a_refused_scale_up_retries_in_place_with_the_room_it_needed() {
+    let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
+    let before = live_web_ids(&agent);
+    drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
+
+    // Room for the one added replica, and no more.
+    drop(job);
+    let events = drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
+
+    expect_complete(&events);
+    assert!(
+        events.iter().any(|event| matches!(event,
+            ApplyEvent::Progress { message } if message.contains("beside the running ones"))),
+        "the retry must add in place, not roll: {events:?}"
+    );
+    let after = live_web_ids(&agent);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(
+        after.contains(&before[0]),
+        "the serving replica was replaced"
+    );
+    assert!(reported_refusals(&mut agent).await.is_empty());
+}
+
+/// #971: once the leader moves the replica this node refused, the node's
+/// share is what it already runs. That deploy changes nothing, so it must
+/// not roll the healthy replica, and the refusal it answered goes away.
+#[tokio::test]
+async fn the_share_left_after_a_refused_replica_moves_is_not_rolled() {
+    let (mut agent, _grill, _job) = agent_with_web_beside_a_job_lease().await;
+    let before = live_web_ids(&agent);
+    drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
+
+    let events = drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await;
+
+    expect_complete(&events);
+    assert_eq!(
+        live_web_ids(&agent),
+        before,
+        "the serving replica was replaced"
+    );
     assert!(reported_refusals(&mut agent).await.is_empty());
 }
 
@@ -780,7 +827,7 @@ async fn capacity_refusal_while_reserving_a_rolling_replacement_reaches_the_stat
             ApplyEvent::Error { message } if message.contains("capacity"))),
         "{events:?}"
     );
-    assert_eq!(reported_refusals(&mut agent).await, web_refused());
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
 
     drop(job);
     expect_complete(&drain_deploy(&mut agent, budgeted_web("web:v2", 1)).await);
@@ -794,7 +841,7 @@ async fn capacity_refusal_while_reserving_a_rolling_replacement_reaches_the_stat
 async fn capacity_refusal_stays_reported_while_the_deploy_backs_off() {
     let (mut agent, _grill, _job) = agent_with_a_full_budget().await;
     drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await;
-    assert_eq!(reported_refusals(&mut agent).await, web_refused());
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
 
     tokio::time::pause();
     tokio::time::advance(
@@ -803,7 +850,7 @@ async fn capacity_refusal_stays_reported_while_the_deploy_backs_off() {
     .await;
     tokio::time::resume();
 
-    assert_eq!(reported_refusals(&mut agent).await, web_refused());
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
 }
 
 /// #967: once the leader moves the app off this node, the node retires it,
@@ -813,7 +860,7 @@ async fn capacity_refusal_stays_reported_while_the_deploy_backs_off() {
 async fn retiring_a_refused_app_withdraws_its_capacity_refusal() {
     let (mut agent, _grill, _job) = agent_with_a_full_budget().await;
     drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await;
-    assert_eq!(reported_refusals(&mut agent).await, web_refused());
+    assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
 
     let (response, _answer) = oneshot::channel();
     agent
@@ -9058,6 +9105,7 @@ fn adoption_record(
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],

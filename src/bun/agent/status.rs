@@ -428,9 +428,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .capacity_refusals
                 .iter()
                 .map(
-                    |(app_name, namespace)| crate::reporting::types::CapacityRefusal {
+                    |((app_name, namespace), ordinals)| crate::reporting::types::CapacityRefusal {
                         app_name: app_name.clone(),
                         namespace: namespace.clone(),
+                        ordinals: ordinals.clone(),
                     },
                 )
                 .collect(),

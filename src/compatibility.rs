@@ -134,6 +134,10 @@ pub struct Compatibility {
 /// about its `exec`, and the gate's stdin is now a socket pair (#905).
 /// The capability report's `NodeCapabilities::containers`, and the
 /// `no_container_runtime` unschedulable reason in council state (#914).
+/// Workload OCI specs carry `process.oomScoreAdj`, including the ones in
+/// process owner and runc adoption records (#984).
+/// The state report's `CapacityRefusal::ordinals`, the replicas a node
+/// couldn't start, so a refused scale-up moves only those (#971).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 52,
     state: 69,

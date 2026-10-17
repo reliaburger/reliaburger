@@ -17,6 +17,10 @@ use openraft::raft::{
 use openraft::{Raft, RaftNetwork, RaftNetworkFactory};
 use tokio::sync::Mutex;
 
+use super::connection_pool::{
+    PeerKey, RaftConnection, RaftConnectionPool, ReuseCheck, SERVER_CONNECTION_MAX_AGE,
+    SERVER_IDLE_TIMEOUT,
+};
 use super::fence::{Admission, RecoveryFence};
 use super::types::{CouncilNodeInfo, TypeConfig};
 use super::types::{RecoveryClaim, RecoveryId};
@@ -207,10 +211,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Maximum Raft RPC payload size (64 MiB — snapshots can be large).
 const MAX_RAFT_RPC_SIZE: usize = 64 * 1024 * 1024;
 
-/// How long the accept side waits for a peer to finish its mTLS handshake and
-/// deliver a complete frame before dropping the connection (CP11). A peer that
-/// connects and stalls (half-open handshake, partial length prefix) must not
-/// pin the task forever.
+/// How long the accept side waits for a peer to finish its mTLS handshake,
+/// and how long it may spend serving one request, before dropping the
+/// connection (CP11). A peer that connects and stalls (half-open handshake)
+/// must not pin the task forever. Waiting for the next request on an open
+/// connection is bounded separately, by `SERVER_IDLE_TIMEOUT` (#928).
 const RAFT_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How much of a frame we read (and therefore allocate) at a time.
@@ -323,12 +328,12 @@ async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
 
 /// Write a length-prefixed frame to any byte stream (plain TCP or TLS).
 async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Result<(), String> {
-    let len_bytes = (data.len() as u32).to_be_bytes();
-    stream
-        .write_all(&len_bytes)
-        .await
-        .map_err(|e| e.to_string())?;
-    stream.write_all(data).await.map_err(|e| e.to_string())?;
+    // One write for prefix and payload: two small writes on a reused
+    // connection can become two TLS records and two TCP segments (#928).
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    frame.extend_from_slice(data);
+    stream.write_all(&frame).await.map_err(|e| e.to_string())?;
     // TLS buffers until flushed; a plain TCP stream flushes on write.
     stream.flush().await.map_err(|e| e.to_string())?;
     Ok(())
@@ -336,10 +341,12 @@ async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Resu
 
 /// Serve Raft RPCs over TCP, optionally wrapped in mTLS.
 ///
-/// Accepts connections on `listener`, reads one RPC per connection,
-/// dispatches to the local `raft` instance, and writes the response.
+/// Accepts connections on `listener` and serves requests on each one in
+/// turn, dispatching each to the local `raft` instance and writing its
+/// response, until the peer closes the connection, leaves it idle for
+/// `SERVER_IDLE_TIMEOUT` or it reaches `SERVER_CONNECTION_MAX_AGE` (#928).
 /// When `tls` is `Some`, every connection must complete an mTLS handshake
-/// (the peer presents a client certificate) before its frame is read.
+/// (the peer presents a client certificate) before its first frame is read.
 /// Runs until `shutdown` is cancelled.
 pub async fn serve_raft_rpc(
     listener: tokio::net::TcpListener,
@@ -356,11 +363,17 @@ pub async fn serve_raft_rpc(
         fence,
         MAX_RAFT_CONNECTIONS,
         crate::smoker::node_fault::NodeTransportGate::new(),
+        None,
     )
     .await
 }
 
 /// Serve Raft RPCs while observing the reversible node-level fault gate.
+///
+/// `crl` is the live CRL the TLS acceptor checks at the handshake. With it,
+/// each request on an open connection re-checks the peer's certificate, so
+/// a revocation takes effect at the peer's next RPC rather than when its
+/// connection closes.
 pub async fn serve_raft_rpc_with_node_gate(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,
@@ -368,6 +381,7 @@ pub async fn serve_raft_rpc_with_node_gate(
     tls: Option<tokio_rustls::TlsAcceptor>,
     fence: RecoveryFence,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
+    crl: Option<crate::sesame::mtls::CrlHandle>,
 ) {
     serve_raft_rpc_with_limit_and_node_gate(
         listener,
@@ -377,6 +391,7 @@ pub async fn serve_raft_rpc_with_node_gate(
         fence,
         MAX_RAFT_CONNECTIONS,
         node_gate,
+        crl,
     )
     .await
 }
@@ -399,11 +414,14 @@ pub async fn serve_raft_rpc_with_limit(
         fence,
         max_connections,
         crate::smoker::node_fault::NodeTransportGate::new(),
+        None,
     )
     .await
 }
 
-/// Connection-limited Raft server with a shared node-level fault gate.
+/// Connection-limited Raft server with a shared node-level fault gate and an
+/// optional live CRL (see [`serve_raft_rpc_with_node_gate`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_raft_rpc_with_limit_and_node_gate(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,
@@ -412,11 +430,15 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
     fence: RecoveryFence,
     max_connections: usize,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
+    crl: Option<crate::sesame::mtls::CrlHandle>,
 ) {
     // O6: hold a permit for the whole lifetime of a connection. Acquiring
     // *before* accepting means excess peers queue in the kernel's backlog
-    // instead of each costing a task and a buffer. Every permit is released
-    // within RAFT_ACCEPT_DEADLINE, so a stalled peer can't hold one forever.
+    // instead of each costing a task and a buffer. A connection now serves
+    // many requests (#928), but every permit is still released in bounded
+    // time: the handshake and each request have RAFT_ACCEPT_DEADLINE, the
+    // wait between requests has SERVER_IDLE_TIMEOUT, and no connection
+    // outlives SERVER_CONNECTION_MAX_AGE by more than one request.
     let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
     loop {
         let permit = tokio::select! {
@@ -435,40 +457,59 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                         if node_gate.is_quiesced() {
                             continue;
                         }
+                        // Requests and responses are small and waited on:
+                        // send each at once instead of letting Nagle's
+                        // algorithm hold it for an earlier segment's ACK.
+                        // Failing to set it only costs latency.
+                        let _ = stream.set_nodelay(true);
                         let raft = raft.clone();
                         let fence = fence.clone();
                         let connection_gate = node_gate.clone();
                         match tls.clone() {
                             Some(acceptor) => {
+                                let crl = crl.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     // A failed handshake (no/invalid/revoked
                                     // client cert) is dropped silently — a
-                                    // rejected peer must not learn why. The
-                                    // whole handshake + frame exchange is under
-                                    // one deadline so a stalled peer can't pin
-                                    // the task (CP11).
-                                    let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
-                                        if let Ok(tls_stream) = acceptor.accept(stream).await
-                                            && !connection_gate.is_quiesced()
-                                        {
-                                            handle_raft_rpc(tls_stream, raft, fence)
-                                                .await;
-                                        }
-                                    })
+                                    // rejected peer must not learn why. A
+                                    // stalled handshake can't pin the task
+                                    // (CP11).
+                                    let Ok(Ok(tls_stream)) =
+                                        tokio::time::timeout(RAFT_ACCEPT_DEADLINE, acceptor.accept(stream))
+                                            .await
+                                    else {
+                                        return;
+                                    };
+                                    // The handshake checked the peer's chain
+                                    // against the CRL once; re-check it
+                                    // before every later request (#928).
+                                    let still_admitted =
+                                        |stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>| {
+                                            match &crl {
+                                                Some(crl) => stream
+                                                    .get_ref()
+                                                    .1
+                                                    .peer_certificates()
+                                                    .is_some_and(|chain| crl.admits(chain)),
+                                                None => true,
+                                            }
+                                        };
+                                    serve_connection(
+                                        tls_stream,
+                                        raft,
+                                        fence,
+                                        connection_gate,
+                                        still_admitted,
+                                    )
                                     .await;
                                 });
                             }
                             None => {
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    if !connection_gate.is_quiesced() {
-                                        let _ = tokio::time::timeout(
-                                            RAFT_ACCEPT_DEADLINE,
-                                            handle_raft_rpc(stream, raft, fence),
-                                        )
+                                    serve_connection(stream, raft, fence, connection_gate, |_| true)
                                         .await;
-                                    }
                                 });
                             }
                         }
@@ -482,15 +523,57 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
     }
 }
 
-/// Handle a single Raft RPC connection over any byte stream.
-async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(
+/// Serve requests on one connection until it should close (#928).
+///
+/// The connection closes when the peer closes it, sends nothing for
+/// `SERVER_IDLE_TIMEOUT`, sends something this side can't serve, is no
+/// longer `admitted` (its certificate was revoked), or has been open for
+/// `SERVER_CONNECTION_MAX_AGE`. The node fault gate is checked per request,
+/// so quiescing a node cuts its open connections too.
+///
+/// `admitted` is a closure: `F: Fn(&S) -> bool` means any function or
+/// closure that borrows the stream and returns a `bool`. The TLS path passes
+/// one that reads the peer's certificates out of the TLS session; the plain
+/// path passes `|_| true`.
+async fn serve_connection<S, F>(
     mut stream: S,
     raft: Raft<TypeConfig>,
     fence: RecoveryFence,
-) {
-    let Some(payload) = read_frame(&mut stream).await else {
-        return;
-    };
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
+    admitted: F,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Fn(&S) -> bool,
+{
+    let opened = tokio::time::Instant::now();
+    loop {
+        let Ok(Some(payload)) =
+            tokio::time::timeout(SERVER_IDLE_TIMEOUT, read_frame(&mut stream)).await
+        else {
+            return;
+        };
+        if node_gate.is_quiesced() || !admitted(&stream) {
+            return;
+        }
+        let served = tokio::time::timeout(
+            RAFT_ACCEPT_DEADLINE,
+            handle_raft_frame(&mut stream, &payload, &raft, &fence),
+        )
+        .await;
+        if !matches!(served, Ok(true)) || opened.elapsed() >= SERVER_CONNECTION_MAX_AGE {
+            return;
+        }
+    }
+}
+
+/// Serve one request frame and write its response. Returns whether the
+/// connection may carry another request.
+async fn handle_raft_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    payload: &[u8],
+    raft: &Raft<TypeConfig>,
+    fence: &RecoveryFence,
+) -> bool {
     // JSON, not bincode: AppendEntries carries log entries whose
     // `AppSpec` payload uses `deserialize_any` config types (see
     // durable_log). bincode is not self-describing and corrupts them,
@@ -499,8 +582,8 @@ async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(
     //
     // The frame is a `RaftRpcEnvelope`; the recovery fence (C5, #424) decides
     // whether it reaches Raft at all.
-    let Some((admission, rpc)) = decode_and_admit(&payload, &fence) else {
-        return;
+    let Some((admission, rpc)) = decode_and_admit(payload, fence) else {
+        return false;
     };
     match admission {
         Admission::Serve => {}
@@ -510,47 +593,50 @@ async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(
             // nothing with Raft state on disk.
             if let Err(error) = fence.persist().await {
                 eprintln!("raft: could not persist the adopted recovery epoch: {error}");
-                return;
+                return false;
             }
         }
         Admission::Refuse { newest } => {
+            // Answer, then close: a fenced peer has nothing more to say here.
             write_response(
-                &mut stream,
+                stream,
                 RaftRpcResponse::Fenced {
                     recovery_epoch: newest.epoch,
                     recovery_id: newest.id,
                 },
             )
             .await;
-            return;
+            return false;
         }
     }
 
     let response = match rpc {
         RaftRpc::AppendEntries(req) => match raft.append_entries(req).await {
             Ok(resp) => RaftRpcResponse::AppendEntries(resp),
-            Err(_) => return,
+            Err(_) => return false,
         },
         RaftRpc::Vote(req) => match raft.vote(req).await {
             Ok(resp) => RaftRpcResponse::Vote(resp),
-            Err(_) => return,
+            Err(_) => return false,
         },
         RaftRpc::InstallSnapshot(req) => match raft.install_snapshot(req).await {
             Ok(resp) => RaftRpcResponse::InstallSnapshot(resp),
-            Err(_) => return,
+            Err(_) => return false,
         },
     };
 
-    write_response(&mut stream, response).await;
+    write_response(stream, response).await
 }
 
-/// Write one enveloped response frame; a failed write only loses this RPC.
-async fn write_response<S: AsyncWrite + Unpin>(stream: &mut S, response: RaftRpcResponse) {
-    if let Ok(bytes) = serde_json::to_vec(&RaftResponseEnvelope {
+/// Write one enveloped response frame. Returns whether it was written; a
+/// failed write only loses this RPC and closes the connection.
+async fn write_response<S: AsyncWrite + Unpin>(stream: &mut S, response: RaftRpcResponse) -> bool {
+    match serde_json::to_vec(&RaftResponseEnvelope {
         compatibility: crate::compatibility::CURRENT,
         response,
     }) {
-        let _ = write_frame(stream, &bytes).await;
+        Ok(bytes) => write_frame(stream, &bytes).await.is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -603,6 +689,9 @@ pub struct TcpRaftNetworkFactory {
     /// This node's recovery fence: the epoch stamped on every outgoing RPC,
     /// and whether this node may send Raft RPCs at all (C5, #424).
     fence: RecoveryFence,
+    /// Established connections to peers, shared by every client this
+    /// factory hands out (#928).
+    pool: RaftConnectionPool,
 }
 
 impl fmt::Debug for TcpRaftNetworkFactory {
@@ -628,6 +717,7 @@ impl TcpRaftNetworkFactory {
             tls: None,
             tls_material: None,
             fence: RecoveryFence::serving(0),
+            pool: RaftConnectionPool::default(),
         }
     }
 
@@ -643,6 +733,7 @@ impl TcpRaftNetworkFactory {
             tls: Some(connector),
             tls_material: None,
             fence: RecoveryFence::serving(0),
+            pool: RaftConnectionPool::default(),
         }
     }
 
@@ -658,6 +749,7 @@ impl TcpRaftNetworkFactory {
             tls: None,
             tls_material: Some(material),
             fence: RecoveryFence::serving(0),
+            pool: RaftConnectionPool::default(),
         }
     }
 
@@ -698,22 +790,45 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
         };
         TcpRaftNetwork {
             target_addr: node.addr,
+            peer: PeerKey {
+                address: node.addr,
+                node_name: node.name.clone(),
+            },
             blocklist: std::sync::Arc::clone(&self.blocklist),
             node_gate: self.node_gate.clone(),
             tls,
+            identity: self
+                .tls_material
+                .as_ref()
+                .map(|material| material.identity.clone()),
+            crl: self
+                .tls_material
+                .as_ref()
+                .map(|material| material.crl.clone()),
             fence: self.fence.clone(),
+            pool: self.pool.clone(),
         }
     }
 }
 
-/// A single connection to a Raft peer (plain TCP or mTLS).
+/// A client for one Raft peer (plain TCP or mTLS). It sends each RPC over a
+/// pooled connection when one is fit for reuse, and dials otherwise (#928).
 pub struct TcpRaftNetwork {
     target_addr: SocketAddr,
+    peer: PeerKey,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
     tls: Option<tokio_rustls::TlsConnector>,
+    /// This node's live identity, when dialling with one: a pooled connection
+    /// made under an older identity is retired.
+    identity: Option<crate::sesame::credentials::LiveNodeIdentity>,
+    /// The live CRL, when dialling with one: a pooled connection to a peer
+    /// whose certificate is now revoked is retired.
+    crl: Option<crate::sesame::mtls::CrlHandle>,
     /// This node's recovery fence (C5, #424).
     fence: RecoveryFence,
+    /// The factory's connection pool.
+    pool: RaftConnectionPool,
 }
 
 impl fmt::Debug for TcpRaftNetwork {
@@ -727,8 +842,10 @@ impl fmt::Debug for TcpRaftNetwork {
 impl TcpRaftNetwork {
     /// Send an RPC and read the response.
     ///
-    /// The entire operation (connect + write + read) is wrapped in a
-    /// 10-second timeout to prevent hangs from slow or stalled peers.
+    /// The entire operation (any connect and handshake, write and read) is
+    /// wrapped in a 10-second timeout to prevent hangs from slow or stalled
+    /// peers. openraft also drops this future at its own, shorter deadlines;
+    /// that is safe, because the connection in use is dropped with it.
     async fn rpc(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
         if self.node_gate.is_quiesced() {
             return Err(Unreachable::new(&RouterError(
@@ -780,14 +897,19 @@ impl TcpRaftNetwork {
     }
 
     /// Inner RPC implementation (called within a timeout).
+    ///
+    /// Tries a pooled connection first. If that fails (most often because
+    /// the peer closed it while it sat idle), the RPC is sent once more on a
+    /// freshly dialled connection. Sending a Raft RPC twice is safe: append,
+    /// vote and snapshot requests are all idempotent at the receiver.
     async fn rpc_inner(
         &self,
         rpc: RaftRpc,
         claim: RecoveryClaim,
     ) -> Result<RaftRpcResponse, Unreachable> {
-        // JSON to match handle_raft_rpc (self-describing; see there). The RPC is
-        // wrapped in a `RaftRpcEnvelope` stamped with this node's recovery epoch
-        // (C5) so the accept side can fence off a different-epoch peer.
+        // JSON to match handle_raft_frame (self-describing; see there). The RPC
+        // is wrapped in a `RaftRpcEnvelope` stamped with this node's recovery
+        // epoch (C5) so the accept side can fence off a different-epoch peer.
         let envelope = RaftRpcEnvelope {
             compatibility: crate::compatibility::CURRENT,
             sender_recovery_epoch: claim.epoch,
@@ -797,9 +919,46 @@ impl TcpRaftNetwork {
         let payload = serde_json::to_vec(&envelope)
             .map_err(|e| Unreachable::new(&RouterError(format!("serialize: {e}"))))?;
 
+        let check = ReuseCheck {
+            current_identity: self.identity.as_ref().map(|identity| identity.snapshot()),
+            crl: self.crl.as_ref(),
+        };
+        if let Some(mut connection) = self.pool.take(&self.peer, &check).await
+            && let Ok(response) = Self::exchange(&mut connection.stream, &payload).await
+        {
+            self.release(connection, &response).await;
+            return Ok(response);
+        }
+        // No usable pooled connection, or it broke: it was dropped (and so
+        // closed) above. Dial a new one.
+        let mut connection = self.dial().await?;
+        let response = Self::exchange(&mut connection.stream, &payload).await?;
+        self.release(connection, &response).await;
+        Ok(response)
+    }
+
+    /// Put a connection back after a complete request and response. A
+    /// fenced peer closes the connection after refusing, so that one isn't
+    /// kept.
+    async fn release(&self, connection: RaftConnection, response: &RaftRpcResponse) {
+        if !matches!(response, RaftRpcResponse::Fenced { .. }) {
+            self.pool.put(&self.peer, connection).await;
+        }
+    }
+
+    /// Open a new connection to the peer, with an mTLS handshake when the
+    /// transport has a connector.
+    async fn dial(&self) -> Result<RaftConnection, Unreachable> {
+        // Note the identity before the handshake. If it rotates mid-handshake
+        // the connection is marked with the old one and retired at its next
+        // use, never kept with a certificate older than the mark.
+        let presented = self.identity.as_ref().map(|identity| identity.snapshot());
         let tcp = tokio::net::TcpStream::connect(self.target_addr)
             .await
             .map_err(|e| Unreachable::new(&RouterError(format!("connect: {e}"))))?;
+        // Small, latency-bound frames: don't let Nagle's algorithm hold one
+        // back. Failing to set it only costs latency.
+        let _ = tcp.set_nodelay(true);
 
         match &self.tls {
             Some(connector) => {
@@ -811,22 +970,31 @@ impl TcpRaftNetwork {
                     .connect(server_name, tcp)
                     .await
                     .map_err(|e| Unreachable::new(&RouterError(format!("tls: {e}"))))?;
-                Self::exchange(stream, &payload).await
+                let peer_chain = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .map(|chain| chain.to_vec())
+                    .unwrap_or_default();
+                Ok(RaftConnection::new(Box::new(stream), presented, peer_chain))
             }
-            None => Self::exchange(tcp, &payload).await,
+            None => Ok(RaftConnection::new(Box::new(tcp), presented, Vec::new())),
         }
     }
 
     /// Write one frame and read the response over an established stream.
+    ///
+    /// The stream is borrowed (`&mut S`), not consumed, so the caller keeps
+    /// the connection for its next RPC.
     async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
-        mut stream: S,
+        stream: &mut S,
         payload: &[u8],
     ) -> Result<RaftRpcResponse, Unreachable> {
-        write_frame(&mut stream, payload)
+        write_frame(stream, payload)
             .await
             .map_err(|e| Unreachable::new(&RouterError(format!("write: {e}"))))?;
 
-        let resp_payload = read_frame(&mut stream)
+        let resp_payload = read_frame(stream)
             .await
             .ok_or_else(|| Unreachable::new(&RouterError("read response failed".into())))?;
 
@@ -931,15 +1099,10 @@ mod tests {
     #[tokio::test]
     async fn node_transport_gate_refuses_outbound_raft_rpc() {
         let gate = crate::smoker::node_fault::NodeTransportGate::new();
-        let network = TcpRaftNetwork {
-            target_addr: "127.0.0.1:9".parse().unwrap(),
-            blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashSet::new(),
-            )),
-            node_gate: gate.clone(),
-            tls: None,
-            fence: RecoveryFence::serving(0),
-        };
+        let network = TcpRaftNetworkFactory::new(1)
+            .with_node_gate(gate.clone())
+            .new_client(2, &peer_info("127.0.0.1:9".parse().unwrap()))
+            .await;
         gate.quiesce();
         let request = VoteRequest::new(openraft::Vote::new(1, 7), None);
 
@@ -1123,15 +1286,10 @@ mod tests {
         });
 
         let caller = RecoveryFence::serving(0);
-        let network = TcpRaftNetwork {
-            target_addr: address,
-            blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashSet::new(),
-            )),
-            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
-            tls: None,
-            fence: caller.clone(),
-        };
+        let network = TcpRaftNetworkFactory::new(1)
+            .with_fence(caller.clone())
+            .new_client(2, &peer_info(address))
+            .await;
         let request = VoteRequest::new(openraft::Vote::new(1, 7), None);
         assert!(network.rpc(RaftRpc::Vote(request)).await.is_err());
         refusal.await.unwrap();
@@ -1159,5 +1317,297 @@ mod tests {
     #[test]
     fn decode_and_admit_rejects_a_malformed_frame() {
         assert!(decode_and_admit(b"not json", &RecoveryFence::serving(0)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection reuse (#928)
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    use crate::sesame::ca::{self, CaHierarchy};
+    use crate::sesame::credentials::LiveNodeIdentity;
+    use crate::sesame::identity_store::{self, NodeIdentity};
+    use crate::sesame::mtls::CrlHandle;
+    use crate::sesame::types::SerialNumber;
+
+    fn node_identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> NodeIdentity {
+        let (certificate_der, private_key_der, serial) = ca::issue_node_cert(
+            node_id,
+            SerialNumber(serial),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        NodeIdentity {
+            node_id: node_id.to_string(),
+            certificate_der,
+            private_key_der,
+            serial,
+            ca_generation: 0,
+            trust: crate::sesame::trust::TrustSet::single(
+                hierarchy.node.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
+            node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+            root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+            not_before: now - Duration::from_secs(60),
+            not_after: now + Duration::from_secs(24 * 3600),
+        }
+    }
+
+    fn live_identity(
+        hierarchy: &CaHierarchy,
+        node_id: &str,
+        serial: u64,
+    ) -> (tempfile::TempDir, LiveNodeIdentity) {
+        let directory = tempfile::tempdir().unwrap();
+        identity_store::save(directory.path(), &node_identity(hierarchy, node_id, serial)).unwrap();
+        let live = LiveNodeIdentity::load(directory.path()).unwrap();
+        (directory, live)
+    }
+
+    /// A stand-in Raft peer that grants every vote and records what it saw.
+    struct StubPeer {
+        address: SocketAddr,
+        /// Connections accepted (and, over mTLS, handshakes completed).
+        connections: Arc<AtomicUsize>,
+        /// The serial of the client certificate each mTLS handshake presented.
+        client_serials: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    /// How the stub treats each connection after accepting it.
+    #[derive(Clone, Copy)]
+    enum StubBehaviour {
+        /// Answer every request until the client closes the connection.
+        KeepOpen,
+        /// Answer one request, then close the connection.
+        OneRequestPerConnection,
+        /// On the first connection only, answer the first request late.
+        FirstAnswerLate(Duration),
+    }
+
+    async fn answer_votes<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        behaviour: StubBehaviour,
+        first_connection: bool,
+    ) {
+        while let Some(payload) = read_frame(&mut stream).await {
+            let (_, rpc) = decode_and_admit(&payload, &RecoveryFence::serving(0)).unwrap();
+            let RaftRpc::Vote(request) = rpc else {
+                panic!("the stub only answers votes");
+            };
+            if let (StubBehaviour::FirstAnswerLate(delay), true) = (behaviour, first_connection) {
+                tokio::time::sleep(delay).await;
+            }
+            let response = VoteResponse::new(request.vote, None, true);
+            write_response(&mut stream, RaftRpcResponse::Vote(response)).await;
+            if matches!(behaviour, StubBehaviour::OneRequestPerConnection) {
+                return;
+            }
+        }
+    }
+
+    async fn stub_peer(
+        behaviour: StubBehaviour,
+        tls: Option<(LiveNodeIdentity, CrlHandle)>,
+    ) -> StubPeer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let client_serials = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let acceptor = tls.map(|(identity, crl)| {
+            tokio_rustls::TlsAcceptor::from(
+                crate::sesame::mtls::build_live_mtls_server_config(&identity, crl).unwrap(),
+            )
+        });
+        let accepted = Arc::clone(&connections);
+        let serials = Arc::clone(&client_serials);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let accepted = Arc::clone(&accepted);
+                let serials = Arc::clone(&serials);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor {
+                        Some(acceptor) => {
+                            let Ok(stream) = acceptor.accept(stream).await else {
+                                return;
+                            };
+                            let leaf = stream.get_ref().1.peer_certificates().unwrap()[0].clone();
+                            serials
+                                .lock()
+                                .unwrap()
+                                .push(crate::sesame::cert::serial_from_der(&leaf).unwrap().0);
+                            let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                            answer_votes(stream, behaviour, first).await;
+                        }
+                        None => {
+                            let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                            answer_votes(stream, behaviour, first).await;
+                        }
+                    }
+                });
+            }
+        });
+        StubPeer {
+            address,
+            connections,
+            client_serials,
+        }
+    }
+
+    fn peer_info(address: SocketAddr) -> CouncilNodeInfo {
+        CouncilNodeInfo {
+            addr: address,
+            name: "n2".into(),
+        }
+    }
+
+    async fn vote(network: &mut TcpRaftNetwork) -> bool {
+        let request = VoteRequest::new(openraft::Vote::new(1, 1), None);
+        network
+            .vote(request, RPCOption::new(Duration::from_secs(5)))
+            .await
+            .map(|response| response.vote_granted)
+            .unwrap_or(false)
+    }
+
+    /// The #928 done-when: heartbeats and appends to one peer reuse one
+    /// connection instead of paying a TCP and mTLS handshake each, and so
+    /// does every client the factory hands out (openraft asks for a new one
+    /// per replication stream and per vote).
+    #[tokio::test]
+    async fn many_rpcs_to_one_peer_make_one_handshake() {
+        let hierarchy = ca::generate_ca_hierarchy("raft-reuse", b"ikm").unwrap();
+        let (_server_dir, server) = live_identity(&hierarchy, "n2", 20);
+        let (_client_dir, client) = live_identity(&hierarchy, "n1", 10);
+        let peer = stub_peer(
+            StubBehaviour::KeepOpen,
+            Some((server, CrlHandle::default())),
+        )
+        .await;
+        let mut factory = TcpRaftNetworkFactory::new_tls_bound(
+            1,
+            RaftTlsMaterial::new(client, CrlHandle::default()),
+        );
+
+        let mut network = factory.new_client(2, &peer_info(peer.address)).await;
+        for _ in 0..20 {
+            assert!(vote(&mut network).await);
+        }
+        let mut another = factory.new_client(2, &peer_info(peer.address)).await;
+        assert!(vote(&mut another).await);
+
+        assert_eq!(peer.connections.load(Ordering::SeqCst), 1);
+    }
+
+    /// The other #928 done-when: a renewed certificate is presented on the
+    /// next connection, and the pool doesn't keep using one authenticated
+    /// with the old certificate.
+    #[tokio::test]
+    async fn a_reconnect_after_rotation_presents_the_new_certificate() {
+        let hierarchy = ca::generate_ca_hierarchy("raft-rotate", b"ikm").unwrap();
+        let (_server_dir, server) = live_identity(&hierarchy, "n2", 20);
+        let (_client_dir, client) = live_identity(&hierarchy, "n1", 10);
+        let peer = stub_peer(
+            StubBehaviour::KeepOpen,
+            Some((server, CrlHandle::default())),
+        )
+        .await;
+        let mut factory = TcpRaftNetworkFactory::new_tls_bound(
+            1,
+            RaftTlsMaterial::new(client.clone(), CrlHandle::default()),
+        );
+        let mut network = factory.new_client(2, &peer_info(peer.address)).await;
+        assert!(vote(&mut network).await);
+        assert!(vote(&mut network).await);
+
+        let renewed = node_identity(&hierarchy, "n1", 11);
+        let trust = renewed.trust.clone();
+        client.replace(renewed, &trust).await.unwrap();
+        assert!(vote(&mut network).await);
+        assert!(vote(&mut network).await);
+
+        assert_eq!(*peer.client_serials.lock().unwrap(), vec![10, 11]);
+    }
+
+    /// Revocation still takes effect at the next RPC: a pooled connection to
+    /// a peer whose certificate is now on the CRL is not reused, and the new
+    /// handshake refuses the peer.
+    #[tokio::test]
+    async fn a_pooled_connection_to_a_revoked_peer_is_not_reused() {
+        let hierarchy = ca::generate_ca_hierarchy("raft-revoke", b"ikm").unwrap();
+        let (_server_dir, server) = live_identity(&hierarchy, "n2", 20);
+        let (_client_dir, client) = live_identity(&hierarchy, "n1", 10);
+        let peer = stub_peer(
+            StubBehaviour::KeepOpen,
+            Some((server, CrlHandle::default())),
+        )
+        .await;
+        let crl = CrlHandle::default();
+        let mut factory =
+            TcpRaftNetworkFactory::new_tls_bound(1, RaftTlsMaterial::new(client, crl.clone()));
+        let mut network = factory.new_client(2, &peer_info(peer.address)).await;
+        assert!(vote(&mut network).await);
+
+        crl.update(crate::sesame::types::Crl {
+            retired_nodes: Default::default(),
+            entries: vec![crate::sesame::types::CrlEntry {
+                serial: SerialNumber(20),
+                issuer: crate::sesame::types::CaRole::Node,
+                revoked_at: SystemTime::now(),
+                reason: "test".to_string(),
+                expires_at: None,
+            }],
+            version: 1,
+            updated_at: SystemTime::now(),
+        });
+        assert!(
+            !vote(&mut network).await,
+            "a revoked peer must not be reached"
+        );
+        assert_eq!(peer.connections.load(Ordering::SeqCst), 1);
+    }
+
+    /// A pooled connection the peer has since closed costs a reconnect, not
+    /// a failed RPC.
+    #[tokio::test]
+    async fn a_connection_the_peer_closed_is_replaced_transparently() {
+        let peer = stub_peer(StubBehaviour::OneRequestPerConnection, None).await;
+        let mut factory = TcpRaftNetworkFactory::new(1);
+        let mut network = factory.new_client(2, &peer_info(peer.address)).await;
+        for _ in 0..3 {
+            assert!(vote(&mut network).await);
+        }
+        assert_eq!(peer.connections.load(Ordering::SeqCst), 3);
+    }
+
+    /// Cancellation safety: an RPC dropped while its request is in flight
+    /// (openraft does this at its own deadline) must not hand that
+    /// connection to the next RPC, which would then read the late answer
+    /// meant for the cancelled one.
+    #[tokio::test]
+    async fn a_cancelled_rpc_does_not_return_its_connection_to_the_pool() {
+        let peer = stub_peer(
+            StubBehaviour::FirstAnswerLate(Duration::from_millis(300)),
+            None,
+        )
+        .await;
+        let mut factory = TcpRaftNetworkFactory::new(1);
+        let mut network = factory.new_client(2, &peer_info(peer.address)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), vote(&mut network))
+                .await
+                .is_err(),
+            "the first answer is late, so the first RPC is cancelled"
+        );
+        assert!(vote(&mut network).await);
+        assert_eq!(peer.connections.load(Ordering::SeqCst), 2);
     }
 }

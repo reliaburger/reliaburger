@@ -21,9 +21,10 @@
 #                           to a copy (OpenSSL 3 needed); each walk upgrades to
 #                           it and rolls back to the version the candidate's
 #                           nodes report; without it the upgrade slots are skipped
-#   --tier T                fast (compressed schedule, 90m: the iteration loop
+#   --tier T                fast (compressed schedule, 60m: the iteration loop
 #                           after each round of fixes) or final (full schedule,
-#                           8h: the acceptance run on the final candidate)
+#                           8h); the release gate's final soak is the job
+#                           final, qualify-jobs-sustained.sh --tier final
 #   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
 #   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
 #                           default: the tier's, or full
@@ -69,6 +70,7 @@ repository=$(cd "$(dirname "$0")/../.." && pwd)
 checker=$repository/scripts/release/sustained_check.py
 job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
+guest_memory=$repository/scripts/release/sustained/guest-memory.sh
 jobs_pid=
 workloads_template=$repository/scripts/release/sustained/soak-workloads.toml
 podinfo=$repository/examples/kubernetes/podinfo.yaml
@@ -130,7 +132,7 @@ case $job_load in
 esac
 # The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
 case $tier in
-    fast) : "${schedule:=compressed}" "${duration_text:=90m}" ;;
+    fast) : "${schedule:=compressed}" "${duration_text:=60m}" ;;
     final) : "${schedule:=full}" "${duration_text:=8h}" ;;
     ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
     *) fail '--tier must be fast or final' ;;
@@ -143,13 +145,12 @@ case $duration_text in
     *) fail '--duration must look like 40m, 24h or 2d' ;;
 esac
 # Every port the harness reaches (API, ingress, registry) goes through Lima's
-# port forwarder. Lima 2.1's gRPC forwarder, its default, leaks a guest-agent
-# socket per forwarded connection (lima-vm/lima#5210, fixed in 2.2.0), and
-# the API node's guest agent reached 1 GiB in six hours of the job soak until
-# the kernel killed Bun (#982). The SSH forwarder doesn't use the guest agent.
-# limactl reads this when relish starts a VM, so the bootstrap and every
-# power-on inherit it.
-export LIMA_SSH_PORT_FORWARDER=true
+# port forwarder. The soak exercises the default gRPC forwarder quickstart
+# users run, so a caller's LIMA_SSH_PORT_FORWARDER (the 0.2.0 workaround for
+# the guest-agent leak fixed by Lima 2.2, #982, #983) must not switch it.
+# limactl reads it when relish starts a VM, so unsetting it here covers the
+# bootstrap and every power-on.
+unset LIMA_SSH_PORT_FORWARDER
 # Schedule parameters: cycle length, power-off hold, TLS rotation period, how
 # often the catalogue pulse, offline export and registry push run, and how many
 # chaos kinds each chaos slot runs. Two a slot lets an 8-hour full run (four
@@ -327,7 +328,7 @@ discover() {
     export RELIABURGER_HOME=$home RELIABURGER_NO_MODIFY_PATH=1
     export LIMA_HOME=$home/lima
     relish=$home/bin/relish
-    limactl=$home/tools/lima-2.1.0/bin/limactl
+    limactl=$home/tools/lima-2.2.1/bin/limactl
     if [ ! -x "$relish" ] || [ ! -x "$limactl" ]; then fail "no relish or limactl in $home"; fi
     local state=$home/clusters/laptop/state.json index name ip
     read -r api_port ingress_port registry_port < <(python3 -c '
@@ -881,6 +882,11 @@ done
 GUEST
 }
 
+# Guest memory, the guest agent and kernel OOM reports (#985). Heavy checks
+# read the kernel messages since the last heavy check; failure bundles the
+# last half hour.
+memory_report() { gsh_in "$1" "$2" < "$guest_memory" 2>/dev/null; }
+
 split_report() {
     local directory=$1 name=$2
     awk -v directory="$directory" -v name="$name" '
@@ -913,8 +919,35 @@ collect_light() {
     fi
     curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --max-time 5 -H 'Host: podinfo.localhost' \
         "http://127.0.0.1:$ingress_port/" > "$directory/http.txt" 2>/dev/null || true
+    probe_forwards "$directory"
     rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
     rel logs soak-redis-client --tail 20 > "$directory/redis-log.txt" 2>&1 || true
+}
+
+# Every forwarded port (each node's API, node 1's ingress and registry),
+# asked from the host, and from inside the guest when the host gets no
+# answer. Every check runs it, so it follows each reboot, power-off, upgrade
+# exec and Bun restart. A port the guest serves but the host can't reach is
+# one `host-forward` failure, and the checks through it are excused rather
+# than timing out settle after settle (#987).
+probe_forwards() {
+    local directory=$1 node down_nodes=()
+    for node in 1 2 3; do [ "${down[node]}" = 0 ] || down_nodes+=(--down "$node"); done
+    check forwards "$directory" --limactl "$limactl" --api-port "$api_port" --ingress-port "$ingress_port" \
+        --registry-port "$registry_port" --node "${vm[1]}" --node "${vm[2]}" --node "${vm[3]}" \
+        ${down_nodes[@]+"${down_nodes[@]}"} 2>> "$evidence/harness-errors.log" || true
+}
+
+# Lima truncates a VM's host-agent log (ha.stderr.log, where forwarding
+# errors land) when the VM starts again, so keep a copy before every stop
+# and at the end (#987).
+keep_host_logs() {
+    local reason=$1; shift
+    [ -n "${LIMA_HOME:-}" ] || return 0
+    local node names=()
+    for node in "$@"; do names+=("${vm[node]}"); done
+    check keep-host-logs "$evidence" --lima-home "$LIMA_HOME" --reason "$reason" "${names[@]}" \
+        2>> "$evidence/harness-errors.log" || true
 }
 
 # settle: what recovery needs; heavy: everything.
@@ -934,6 +967,7 @@ collect() {
         if [ "$kind" = heavy ]; then
             api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
             guest_report | gsh_in "$node" 2>/dev/null | split_report "$directory" "${vm[node]}" || true
+            memory_report "$node" cursor > "$directory/memory-${vm[node]}.txt" || true
             rel_on "$node" exec soak-identity cat /run/reliaburger/identity/cert.pem 2>/dev/null \
                 | openssl x509 -noout -serial -enddate > "$directory/identity-${vm[node]}.txt" 2>/dev/null || true
         else
@@ -980,6 +1014,7 @@ PY
         [ "${down[node]}" = 0 ] || continue
         gsh "$node" 'journalctl -u reliaburger --since "-15min" --no-pager' > "$directory/journal-${vm[node]}.txt" 2>&1 || true
         api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
+        memory_report "$node" recent > "$directory/memory-${vm[node]}.txt" || true
     done
     rel --output json status > "$directory/status.json" 2>&1 || true
     rel --output json wtf > "$directory/wtf.json" 2>&1 || true
@@ -1101,6 +1136,7 @@ power_offs=0
 power_off() {
     local node=$1
     job_mark_fault "$node" "${current_slot:-power-off}"
+    keep_host_logs power-off "$node"
     down[node]=1
     check power-cut "$evidence"
     "$limactl" stop --force "${vm[node]}" > "$evidence/snapshots/power-off-$node-$(date +%s).log" 2>&1 || true
@@ -1136,6 +1172,10 @@ slot_power_off() {
 # throttles Bun's own writes (Raft log, ledgers) to 20 IOPS and 1 MiB/s.
 node_fault_index=0
 node_fault_kind() { local kinds=(delay disk-full slow-fsync); echo "${kinds[$1 % 3]}"; }
+# Every three cycles each node gets one kind, and each kind moves on a node, so
+# the hour-long fast tier reaches every node and puts each kind on two of them,
+# and every nine cycles put each kind on every node (the leader among them).
+node_fault_node() { echo $(( ($1 + $1 / 3) % 3 + 1 )); }
 node_fault_script() {
     case $1:$2 in
         delay:start) printf '%s\n' 'dev=$(ip -o route get "$PEER" | sed -n "s/.* dev \([^ ]*\).*/\1/p"); [ -n "$dev" ] && tc qdisc replace dev "$dev" root netem delay 200ms 50ms && echo "$dev" > /run/soak-delay-dev' ;;
@@ -1149,8 +1189,7 @@ node_fault_script() {
 slot_node_fault() {
     local kind node peer hold result=0 log
     kind=$(node_fault_kind "$node_fault_index")
-    # Each kind visits every node (the leader among them) every nine cycles.
-    node=$(( (node_fault_index / 3) % 3 + 1 ))
+    node=$(node_fault_node "$node_fault_index")
     node_fault_index=$(( node_fault_index + 1 ))
     [ "${down[node]}" = 0 ] || node=1
     peer=$(( node % 3 + 1 ))
@@ -1263,6 +1302,7 @@ offline_export() {
 special_graceful() {
     say 'special: graceful whole-cluster stop and start'
     open_window graceful-stop 3
+    keep_host_logs graceful-stop 1 2 3
     down=(0 1 1 1)
     "$relish" local stop > "$evidence/snapshots/graceful-stop.log" 2>&1 || true
     event --phase special:graceful-stop
@@ -1368,15 +1408,25 @@ wait_upgrade_idle() {
     done
 }
 
-# The version each node's API reports, one line per node, "?" for a node
-# that doesn't answer.
+# The version each node's API reports, one line per node. A node the host
+# can't reach is asked from inside its guest, so a cut host forward (#987)
+# doesn't fail the walk; one that answers neither way is "?(why)".
 node_versions() {
-    local node
+    local node reply code reason
     for node in 1 2 3; do
-        curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
-            "https://${vm[node]}:9117/v1/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo '?'
+        code=0
+        reply=$(curl -fsS --max-time 5 --cacert "$ca" --connect-to "${vm[node]}:9117:127.0.0.1:$(( api_port + node - 1 ))" \
+            "https://${vm[node]}:9117/v1/version" 2>/dev/null) || code=$?
+        if [ "$code" -eq 0 ] && version_of "$reply"; then continue; fi
+        if [ "$code" -eq 0 ]; then reason='bad reply'; else reason=$(check curl-reason "$code"); fi
+        if [ "${down[node]}" = 1 ]; then echo "?(host: $reason; powered off)"; continue; fi
+        code=0
+        reply=$(gsh "$node" 'curl -fsSk --max-time 5 https://127.0.0.1:9117/v1/version' 2>/dev/null) || code=$?
+        if [ "$code" -eq 0 ] && version_of "$reply"; then continue; fi
+        echo "?(host: $reason; guest: $(if [ "$code" -eq 0 ]; then echo 'bad reply'; else check curl-reason "$code"; fi))"
     done
 }
+version_of() { python3 -c 'import json,sys; print(json.loads(sys.argv[1])["version"])' "$1" 2>/dev/null; }
 
 wait_versions() {
     local want=$1 budget=$2 started=$3 label=$4 version versions
@@ -1521,6 +1571,7 @@ finish() {
     [ -z "${background_pid:-}" ] || kill "$background_pid" 2>/dev/null || true
     [ -f "$evidence/metadata.json" ] || { printf 'sustained: stopped before the soak started\n' >&2; exit "$result"; }
     meta finished_at "json:$(date +%s)"
+    [ -z "${vm[3]:-}" ] || keep_host_logs end 1 2 3
     if [ "$keep" = true ]; then
         teardown="kept: RELIABURGER_HOME=${home:-none}"
     elif ! teardown_cluster; then
@@ -1561,7 +1612,6 @@ start_run() {
     meta job_load "$job_load"
     [ -z "$target_rate" ] || meta target_rate "$target_rate"
     meta node_faults "json:$node_faults"
-    meta deviations+ 'Lima forwards ports over SSH (`LIMA_SSH_PORT_FORWARDER=true`), not its default gRPC forwarder, which leaks a guest-agent socket per forwarded connection in Lima 2.1 (lima-vm/lima#5210, #982)'
     meta ingress_rotation_secs "json:$rotation"
     [ -z "$base_url" ] || meta base_url "<$base_url>"
     meta candidate_digest "\`${qualified_digest:-not checked}\`"
@@ -1585,7 +1635,8 @@ if [ "$plan" = true ]; then
         case $1 in
             special_for_cycle) "$@" ;;
             slot_bun_kill) printf 'plan: cycle %s %s-kill\n' "$index" "$2" ;;
-            slot_node_fault) printf 'plan: cycle %s node-fault %s\n' "$index" "$(node_fault_kind "$node_fault_index")"
+            slot_node_fault) printf 'plan: cycle %s node-fault %s node %s\n' "$index" "$(node_fault_kind "$node_fault_index")" \
+                                 "$(node_fault_node "$node_fault_index")"
                              node_fault_index=$(( node_fault_index + 1 )) ;;
             *) printf 'plan: cycle %s %s\n' "$index" "$(printf '%s' "${1#slot_}" | tr _ -)" ;;
         esac
@@ -1596,9 +1647,8 @@ if [ "$plan" = true ]; then
     special_quorum_loss() { printf 'plan: cycle %s special quorum-loss\n' "$index"; }
     # shellcheck disable=SC2329
     special_all_off() { printf 'plan: cycle %s special all-off\n' "$index"; }
-    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s port-forwarder %s\n' \
-        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults" \
-        "$([ "$LIMA_SSH_PORT_FORWARDER" = true ] && echo ssh || echo grpc)"
+    printf 'plan: tier %s schedule %s duration %s cycle %s job-load %s target-rate %s node-faults %s\n' \
+        "$tier" "$schedule" "$duration" "$cycle" "$job_load" "${target_rate:-none}" "$node_faults"
     plan_cycles=$(( (duration + cycle - 1) / cycle ))
     [ "$plan_cycles" -ge "$min_cycles" ] || plan_cycles=$min_cycles
     printf 'plan: %s\n' "$job_runs"

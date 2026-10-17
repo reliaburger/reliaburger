@@ -132,9 +132,13 @@ opt-level = 3
 A `[profile.<name>.package.<crate>]` table overrides settings for one
 dependency only, so `ring` is optimised while our own code keeps fast debug
 builds. We'd already done the same for the SHA-256 and Argon2 crates. Release
-builds, which `relish setup --quickstart` uses, were never affected. Reusing
-Raft connections would remove the cause rather than this symptom, but that's a
-bigger change for another day.
+builds, which `relish setup --quickstart` uses, were never affected. That
+treated the symptom. The cause went later, in
+[#928](https://github.com/reliaburger/reliaburger/issues/928): the Raft
+transport now keeps a small pool of open connections per peer, so a heartbeat
+no longer pays for a handshake at all. Chapter 2's "Keeping Raft connections
+open" explains the pool. We kept the `ring` override, since debug builds still
+handshake whenever a pooled connection is retired.
 
 The generated master key and security-bootstrap JSON both land as `0600`.
 That second file used to land as `0644`, while Bun's loader quite reasonably
@@ -480,6 +484,8 @@ let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
 ```
 
 A peer that stalls is dropped when the deadline fires, and the task is freed. `tokio::time::timeout` wraps any future and races it against a timer, returning `Err` if the timer wins — a much better tool than trusting TCP's own timeouts, which are measured in minutes and aren't really yours to set. The outbound side already had a connect timeout; this closes the same gap on the way in.
+
+When the Raft transport later started keeping connections open ([#928](https://github.com/reliaburger/reliaburger/issues/928), Chapter 2's "Keeping Raft connections open"), one deadline per connection no longer fit, because a healthy connection now carries many requests. So the clock split in three. The handshake keeps `RAFT_ACCEPT_DEADLINE`, so does each request, and the wait for the *next* request gets its own idle timeout. A stalled peer still pins a task for a bounded time; the bound is just counted per request now.
 
 ### A number is a promise, not a fact
 

@@ -122,6 +122,7 @@ mod tests {
                     gid: 65534,
                 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![

@@ -868,6 +868,7 @@ mod tests {
         let refusal = CapacityRefusal {
             app_name: "api".to_string(),
             namespace: "default".to_string(),
+            ordinals: vec![0, 2],
         };
 
         let report = worker.build_report(AgentSnapshot {

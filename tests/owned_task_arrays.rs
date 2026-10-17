@@ -3450,6 +3450,11 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // A chunk the leader finished and had accepted before the kill is a
+    // legitimate acceptance; only one accepted after the takeover isn't.
+    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    let accepted_before_kill =
+        cluster_support::chunks_accepted_from(&nodes[leader], batch_id, &lost).await;
     nodes[leader].shutdown.cancel();
 
     let until = deadline(30);
@@ -3466,7 +3471,22 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
         assert!(tokio::time::Instant::now() < until, "no new leader");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    // Once the new leader applies an entry of its own term, everything the
+    // old leader wrote while it led is applied here too.
+    let until = deadline(30);
+    while !cluster_support::applied_own_term(&nodes[new_leader]) {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the new leader never applied its own term"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let accepted_under_old_leader =
+        cluster_support::chunks_accepted_from(&nodes[new_leader], batch_id, &lost).await;
+    assert!(
+        accepted_before_kill.is_subset(&accepted_under_old_leader),
+        "chunks {accepted_before_kill:?} accepted from {lost} at the kill are missing at takeover: {accepted_under_old_leader:?}"
+    );
     let held_at_loss = nodes[new_leader]
         .council
         .desired_state()
@@ -3541,11 +3561,20 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
             .expect("every chunk has one accepted grant");
         let attempt = grant.attempt;
         // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
-        assert_ne!(
-            grant.owner,
-            Some(lost.clone()),
-            "chunk {chunk} was accepted from the lost leader"
-        );
+        // The lost leader's own chunks count only if they were accepted in
+        // its term: its executor keeps running, and no report it finishes
+        // after the takeover may count.
+        if grant.owner.as_ref() == Some(&lost) {
+            assert!(
+                accepted_under_old_leader.contains(&chunk),
+                "chunk {chunk} was accepted from the lost leader after the takeover \
+                 (accepted at kill {accepted_before_kill:?}, at takeover {accepted_under_old_leader:?})"
+            );
+            assert_eq!(
+                attempt, 1,
+                "chunk {chunk} was accepted from the lost leader at a later attempt"
+            );
+        }
         if attempt > 1 {
             replayed += 1;
             assert!(
@@ -3556,8 +3585,10 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
     }
     assert!(replayed <= held_at_loss.len());
     eprintln!(
-        "leader loss with {}: {} chunks held at loss, {replayed} replayed",
+        "leader loss with {}: {} chunks accepted from it at the kill, {} by the takeover, {} held at loss, {replayed} replayed",
         template["runtime"],
+        accepted_before_kill.len(),
+        accepted_under_old_leader.len(),
         held_at_loss.len()
     );
     // Every executor must retire and be forgotten while its node still

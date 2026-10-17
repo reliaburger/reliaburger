@@ -36,7 +36,7 @@ class Gate(unittest.TestCase):
             with self.assertRaises(inventory.InvalidInventory): inventory.validate(value,100)
     def test_job_work_does_not_extend_existing_tier_or_fault_budgets(self):
         script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
-        self.assertIn("duration_text:=90m",script)
+        self.assertIn("duration_text:=60m",script)
         self.assertIn("duration_text:=8h",script)
         self.assertIn("end - 120",script)
         self.assertNotIn("sleep 120",script)
@@ -270,25 +270,73 @@ class JobQualification(unittest.TestCase):
                               env=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1"))
         return result.returncode,[line.split()[1:] for line in result.stdout.splitlines() if line.startswith("plan: ")],result.stderr
 
-    def test_fast_tier_plans_every_node_fault_on_every_node_within_ninety_minutes(self):
+    def test_fast_tier_plans_every_fault_kind_and_special_within_an_hour(self):
+        # #991: the fast tiers went from 90 minutes to one hour (maintainer, 17 October 2026).
         code,lines,_=self.plan("--tier","fast")
         self.assertEqual(code,0)
         header=dict(zip(lines[0][::2],lines[0][1::2]))
-        self.assertEqual((header["tier"],header["schedule"],header["duration"]),("fast","compressed","5400"))
+        self.assertEqual((header["tier"],header["schedule"],header["duration"]),("fast","compressed","3600"))
         self.assertEqual((header["job-load"],header["target-rate"],header["node-faults"]),("target","1390","true"))
-        faults=[line[3] for line in lines[1:] if line[2]=="node-fault"]
-        self.assertEqual(faults,["delay","disk-full","slow-fsync"]*3)
-        slots={line[2] for line in lines[1:]}
-        self.assertTrue({"follower-kill","leader-kill","power-off","chaos","node-fault"}<=slots)
-        specials={line[3] for line in lines[1:] if line[2]=="special"}
+        cycles=[line for line in lines[1:] if line[0]=="cycle"]
+        self.assertEqual(len({line[1] for line in cycles})*int(header["cycle"]),3600)
+        # The guaranteed cycles (0-3) carry every kind and every special, so
+        # overrunning slots can't push one past the hour.
+        early=[line for line in cycles if int(line[1])<4]
+        faults=[line[3] for line in early if line[2]=="node-fault"]
+        self.assertEqual(set(faults),{"delay","disk-full","slow-fsync"})
+        slots={line[2] for line in early}
+        self.assertTrue({"follower-kill","leader-kill","deploy-kill","power-off","chaos","node-fault"}<=slots)
+        specials={line[3] for line in early if line[2]=="special"}
         self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
 
-    def test_final_tier_runs_twelve_hours_on_the_full_schedule_at_the_requested_rate(self):
+    def test_node_faults_reach_every_node_within_the_fast_hour(self):
+        code,lines,_=self.plan("--tier","fast")
+        self.assertEqual(code,0)
+        placed=[(line[3],line[5]) for line in lines[1:] if line[2]=="node-fault"]
+        self.assertEqual([kind for kind,_ in placed],["delay","disk-full","slow-fsync"]*2)
+        # The first three put one kind on each node; the next three move each kind on.
+        self.assertEqual({node for _,node in placed[:3]},{"1","2","3"})
+        for kind in ("delay","disk-full","slow-fsync"):
+            self.assertEqual(len({node for k,node in placed if k==kind}),2,kind)
+        # Nine cycles still put every kind on every node.
+        import subprocess
+        result=subprocess.run([str(self.release/"qualify-sustained.sh"),"--node-faults","--schedule","compressed","--duration","90m","--plan"],
+                              stdout=subprocess.PIPE,text=True,timeout=60,env=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1"))
+        nine={tuple(line.split()[4:7:2]) for line in result.stdout.splitlines() if " node-fault " in line}
+        self.assertEqual(len(nine),9)
+
+    def test_final_tier_runs_eight_hours_on_the_full_schedule_at_the_requested_rate(self):
+        # #991: one 8-hour job final replaces the separate V02 final.
         code,lines,_=self.plan("--tier","final","--target-rate","2000")
         self.assertEqual(code,0)
         header=dict(zip(lines[0][::2],lines[0][1::2]))
-        self.assertEqual((header["schedule"],header["duration"],header["target-rate"]),("full","43200","2000"))
-        self.assertEqual(sum(1 for line in lines[1:] if line[2]=="node-fault"),12)
+        self.assertEqual((header["tier"],header["schedule"],header["duration"],header["target-rate"]),("final","full","28800","2000"))
+        self.assertEqual(sum(1 for line in lines[1:] if line[2]=="node-fault"),8)
+        specials=[line[3] for line in lines[1:] if line[2]=="special"]
+        self.assertEqual(sorted(set(specials)),["all-off","graceful-stop","quorum-loss"])
+
+    def test_the_final_plans_cycles_and_run_budget_fit_together(self):
+        code,lines,_=self.plan("--tier","final")
+        self.assertEqual(code,0)
+        header=dict(zip(lines[0][::2],lines[0][1::2]))
+        budget=next(line for line in lines if line[0]=="job-runs")[1:]
+        budget=dict(zip(budget[::2],budget[1::2]))
+        cycles=len({line[1] for line in lines if line[0]=="cycle"})
+        # The campaign is sized for the whole schedule the plan prints...
+        self.assertEqual(cycles*int(header["cycle"]),int(header["duration"]))
+        plan=jobs.run_budget(cycles*int(header["cycle"]))
+        self.assertEqual((int(budget["expected"]),int(budget["retained-peak"])),(plan["expected_runs"],plan["peak_retained"]))
+        # ...and what it holds at once fits its limit.
+        self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
+
+    def test_the_release_soak_fast_tier_is_an_hour_too(self):
+        import subprocess
+        result=subprocess.run([str(self.release/"qualify-sustained.sh"),"--tier","fast","--plan"],stdout=subprocess.PIPE,
+                              text=True,timeout=60,env=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1"))
+        self.assertEqual(result.returncode,0)
+        self.assertIn("plan: tier fast schedule compressed duration 3600 ",result.stdout)
+        specials={line.split()[4] for line in result.stdout.splitlines() if " special " in line}
+        self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
 
     def test_job_tiers_refuse_a_rate_below_a_hundred_million_a_day_or_a_changed_schedule(self):
         code,_,error=self.plan("--tier","fast","--target-rate","1000")
@@ -307,19 +355,21 @@ class JobQualification(unittest.TestCase):
         self.assertIn("job-load calibration target-rate none node-faults false",result.stdout)
         self.assertNotIn("node-fault ",result.stdout)
 
-    def test_every_soak_forwards_ports_over_ssh_whatever_the_caller_set(self):
-        # Lima 2.1's gRPC forwarder leaks a guest-agent socket per forwarded
-        # connection, so the API node ran out of memory (lima-vm/lima#5210).
-        import subprocess
-        for caller in ("", "false", "true"):
-            environment=dict(__import__("os").environ,RELIABURGER_SOAK_CAFFEINATED="1",LIMA_SSH_PORT_FORWARDER=caller)
-            for script in ("qualify-sustained.sh","qualify-jobs-sustained.sh"):
-                result=subprocess.run([str(self.release/script),"--tier","fast","--plan"],stdout=subprocess.PIPE,
-                                      text=True,timeout=60,env=environment)
-                with self.subTest(script=script,caller=caller):
-                    self.assertEqual(result.returncode,0)
-                    header=result.stdout.splitlines()[0].split()[1:]
-                    self.assertEqual(dict(zip(header[::2],header[1::2]))["port-forwarder"],"ssh")
+    def test_every_soak_uses_limas_default_port_forwarder_whatever_the_caller_set(self):
+        # The soak tests the gRPC forwarder quickstart users run. 0.2.0's soaks
+        # forced the SSH forwarder around Lima 2.1's guest-agent socket leak
+        # (#982); Lima 2.2.1 fixes the leak (#983), so a caller's leftover
+        # LIMA_SSH_PORT_FORWARDER must not switch it back. The plan reports
+        # nothing about Lima, so read the script: it unsets the variable before
+        # anything starts a VM and never sets it, and the jobs tier runs it.
+        import re
+        script=(self.release/"qualify-sustained.sh").read_text()
+        code=[line for line in script.splitlines() if not line.lstrip().startswith("#")]
+        self.assertFalse([line for line in code if re.search(r"LIMA_SSH_PORT_FORWARDER=",line)])
+        unset=code.index("unset LIMA_SSH_PORT_FORWARDER")
+        first_vm=min(index for index,line in enumerate(code) if re.search(r"\$relish |\"\$relish\"|\$limactl|\"\$limactl\"",line))
+        self.assertLess(unset,first_vm)
+        self.assertIn("qualify-sustained.sh",(self.release/"qualify-jobs-sustained.sh").read_text())
 
     def test_cpu_samples_count_forward_only_within_one_process_and_helper(self):
         state={}
@@ -654,3 +704,206 @@ class RunBudget(unittest.TestCase):
             with patch("job_soak.subprocess.run",side_effect=refused):
                 with self.assertRaises(jobs.InvalidEvidence) as caught: api.request("GET","/v1/batch/7")
                 self.assertNotIsInstance(caught.exception,jobs.Gone)
+
+
+class HostForward(unittest.TestCase):
+    """#987: in 0.2.0's jobs final a node was cut off from the host twice
+    while the cluster stayed healthy, and the harness reported a dozen
+    product-looking failures instead of one forwarding failure."""
+
+    NODES=["rb-a-1","rb-a-2","rb-a-3"]
+
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        self.evidence=self.root/"evidence"; self.evidence.mkdir()
+        checker.save_state(self.evidence,{"nodes":self.NODES})
+        self.count=0
+
+    def serve(self, handler=None):
+        """A local HTTP server on a free port, standing in for a forward that works."""
+        import http.server,threading
+        class Answer(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.send_header("Content-Length","2"); self.end_headers(); self.wfile.write(b"ok")
+            def log_message(self,*arguments): pass
+        server=http.server.HTTPServer(("127.0.0.1",0),handler or Answer)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def closed_port(self, count=1):
+        """The first of `count` consecutive ports nothing listens on."""
+        import socket
+        while True:
+            with socket.socket() as first:
+                first.bind(("127.0.0.1",0)); port=first.getsockname()[1]
+                try:
+                    others=[socket.socket() for _ in range(count-1)]
+                    for offset,other in enumerate(others,1): other.bind(("127.0.0.1",port+offset))
+                except OSError:
+                    continue
+                finally:
+                    for other in others: other.close()
+                return port
+
+    def fake_limactl(self, code="200", exit_code=0):
+        """`limactl shell VM sudo curl …` answering from inside the guest."""
+        path=self.root/"limactl"
+        path.write_text(f"#!/bin/sh\nprintf '%s' '{code}'\nexit {exit_code}\n")
+        path.chmod(0o755)
+        return path
+
+    def snapshot(self, ts, kind="settle", **files):
+        self.count+=1
+        directory=self.evidence/"snapshots"/str(self.count); directory.mkdir(parents=True)
+        (directory/"meta.json").write_text(json.dumps({"ts":ts,"kind":kind}))
+        for name,content in files.items():
+            (directory/name).write_text(content if isinstance(content,str) else json.dumps(content))
+        return directory
+
+    def healthy(self, **extra):
+        nodes=[{"node_id":n,"state":"alive","is_council":True,"is_leader":n=="rb-a-1"} for n in self.NODES]
+        report={"critical":[],"warnings":[],"ok":[{"id":"replicas","description":"replicas"}]}
+        return {"wtf.json":report,"nodes.json":nodes,"status.json":[],"http.txt":"200 0.01\n",**extra}
+
+    def evaluate(self, directory):
+        import contextlib,io
+        with contextlib.redirect_stdout(io.StringIO()):
+            code=checker.evaluate(self.evidence,directory)
+        return code,json.loads((directory/"verdict.json").read_text())
+
+    def cut(self, node="rb-a-2", name="api", port=29118, host="refused"):
+        return [dict(node=node,name=name,port=port,host=host,guest="ok")]
+
+    def test_a_host_probe_names_why_a_forward_failed(self):
+        self.assertIsNone(checker.http_probe(self.serve(),"http","/"))
+        self.assertEqual(checker.http_probe(self.closed_port(),"http","/"),"refused")
+        import http.server
+        class Hangup(http.server.BaseHTTPRequestHandler):
+            # Lima's gRPC forwarder accepts on the host and hangs up when
+            # the guest side is gone.
+            def do_GET(self): self.close_connection=True
+            def log_message(self,*arguments): pass
+        self.assertIn(checker.http_probe(self.serve(Hangup),"http","/"),("empty reply","reset"))
+
+    def test_curl_exit_codes_name_the_error(self):
+        self.assertEqual(checker.curl_reason(7),"refused")
+        self.assertEqual(checker.curl_reason(28),"timeout")
+        self.assertEqual(checker.curl_reason(35),"TLS")
+        self.assertEqual(checker.curl_reason(52),"empty reply")
+        self.assertEqual(checker.curl_reason(56),"reset")
+        self.assertEqual(checker.curl_reason(99),"curl exit 99")
+        import contextlib,io
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out): self.assertEqual(checker.main(["curl-reason","7"]),0)
+        self.assertEqual(out.getvalue().strip(),"refused")
+
+    def test_a_refused_forward_on_a_node_healthy_inside_is_recorded_with_both_sides(self):
+        snapshot=self.snapshot(1000,kind="light")
+        ingress=self.serve(); api=self.closed_port(2)
+        code=checker.main(["forwards",str(snapshot),"--limactl",str(self.fake_limactl()),
+                           "--api-port",str(api),"--ingress-port",str(ingress),"--registry-port",str(self.closed_port()),
+                           "--node","rb-a-1","--node","rb-a-2","--node","rb-a-3","--down","3"])
+        self.assertEqual(code,0)
+        rows=json.loads((snapshot/"forwards.json").read_text())
+        by={(row["node"],row["name"]):row for row in rows}
+        self.assertEqual(by[("rb-a-2","api")],dict(node="rb-a-2",name="api",port=api+1,host="refused",guest="ok"))
+        self.assertEqual(by[("rb-a-1","registry")]["host"],"refused")
+        self.assertEqual(by[("rb-a-1","ingress")]["host"],"ok")
+        self.assertIsNone(by[("rb-a-1","ingress")]["guest"])
+        self.assertNotIn("rb-a-3",{row["node"] for row in rows})
+
+    def test_a_forward_down_inside_the_guest_too_is_not_a_host_forward(self):
+        snapshot=self.snapshot(1000,kind="light")
+        api=self.closed_port(2)
+        checker.main(["forwards",str(snapshot),"--limactl",str(self.fake_limactl("000",7)),
+                      "--api-port",str(api-1),"--ingress-port",str(self.serve()),"--registry-port",str(self.serve()),
+                      "--node","rb-a-1","--node","rb-a-2","--node","rb-a-3","--down","1","--down","3"])
+        rows=json.loads((snapshot/"forwards.json").read_text())
+        self.assertEqual(rows,[dict(node="rb-a-2",name="api",port=api,host="refused",guest="refused")])
+        code,verdict=self.evaluate(self.snapshot(1000,**self.healthy(**{"forwards.json":rows})))
+        self.assertNotIn("host-forward",[item["check"] for item in verdict["findings"]])
+
+    def test_a_cut_forward_is_one_failure_and_no_settle_timeouts(self):
+        # Node 1's ingress forward is cut; the node answers inside, so the
+        # podinfo probe's 000 is the forward's, not the product's.
+        rows=self.cut("rb-a-1","ingress",28080)
+        verdicts=[self.evaluate(self.snapshot(ts,**self.healthy(**{"forwards.json":rows,"http.txt":"000 0.00\n"})))
+                  for ts in (1000,1030,1090,1120,1900,4000)]
+        for code,verdict in verdicts:
+            self.assertEqual(code,0 if verdict is not verdicts[2][1] else 1)
+            self.assertTrue(verdict["settle_clean"])
+            self.assertNotIn("ingress-http",[item["check"] for item in verdict["findings"] if item["severity"]=="fail"])
+        failures=[item for _,verdict in verdicts for item in verdict["findings"]
+                  if item["check"]=="host-forward" and item["severity"]=="fail"]
+        self.assertEqual(len(failures),1)
+        self.assertEqual(failures[0]["target"],"rb-a-1 28080")
+        self.assertIn("refused",failures[0]["detail"])
+
+    def test_a_forward_that_comes_back_and_breaks_again_fails_again(self):
+        rows=self.cut()
+        for ts in (1000,1070): self.evaluate(self.snapshot(ts,**self.healthy(**{"forwards.json":rows})))
+        self.evaluate(self.snapshot(1100,**self.healthy(**{"forwards.json":[]})))
+        self.evaluate(self.snapshot(5000,**self.healthy(**{"forwards.json":rows})))
+        code,verdict=self.evaluate(self.snapshot(5070,**self.healthy(**{"forwards.json":rows})))
+        self.assertEqual(code,1)
+        self.assertEqual([item["check"] for item in verdict["findings"] if item["severity"]=="fail"],["host-forward"])
+
+    def test_a_cut_registry_forward_excuses_the_registry_check(self):
+        rows=self.cut("rb-a-1","registry",25050)
+        registry=dict(problems=["push failed: connection refused"],unavailable=[])
+        _,verdict=self.evaluate(self.snapshot(1000,**self.healthy(**{"forwards.json":rows,"registry.json":registry})))
+        self.assertNotIn("registry",[item["check"] for item in verdict["findings"] if item["severity"]=="fail"])
+
+    def test_host_agent_logs_are_kept_before_lima_truncates_them(self):
+        import gzip
+        lima=self.root/"lima"; (lima/"rb-a-1").mkdir(parents=True); (lima/"rb-a-2").mkdir()
+        (lima/"rb-a-1/ha.stderr.log").write_text("failed to set up forwarding\n")
+        self.assertEqual(checker.main(["keep-host-logs",str(self.evidence),"--lima-home",str(lima),"--reason","power-off","rb-a-1","rb-a-2"]),0)
+        (lima/"rb-a-1/ha.stderr.log").write_text("second boot\n")
+        self.assertEqual(checker.main(["keep-host-logs",str(self.evidence),"--lima-home",str(lima),"--reason","end","rb-a-1"]),0)
+        kept={path.name.split("-",1)[1]:gzip.decompress(path.read_bytes()).decode()
+              for path in (self.evidence/"lima").glob("rb-a-1/*.ha.stderr.log.gz")}
+        self.assertEqual(kept,{"power-off.ha.stderr.log.gz":"failed to set up forwarding\n","end.ha.stderr.log.gz":"second boot\n"})
+        self.assertEqual(list((self.evidence/"lima").glob("rb-a-2/*")),[])
+
+
+class ControllerFallback(unittest.TestCase):
+    """#987: the controller moved silently to the next node when node 1
+    didn't answer, so a leak-rss on the node that took the load had no
+    visible cause."""
+
+    def api(self, failing):
+        from unittest.mock import patch
+        import subprocess
+        folder=tempfile.TemporaryDirectory(); self.addCleanup(folder.cleanup)
+        ca=Path(folder.name)/"ca"; ca.write_bytes(b"candidate")
+        api=jobs.API([dict(name="n1"),dict(name="n2"),dict(name="n3")],9117,ca,Path(folder.name)/"header")
+        def answer(command,input=None,stdout=None,stderr=None,timeout=None):
+            target=next(part for part in command if part.startswith("https://"))
+            if any(target.startswith("https://"+name+":") for name in failing): return subprocess.CompletedProcess(command,7)
+            stdout.write(b'{"ok":true}\n200'); return subprocess.CompletedProcess(command,0)
+        patcher=patch("job_soak.subprocess.run",side_effect=answer); patcher.start(); self.addCleanup(patcher.stop)
+        return api
+
+    def test_every_fallback_is_counted_per_node(self):
+        api=self.api({"n1"})
+        for _ in range(3): api.request("GET","/v1/batch/1")
+        self.assertEqual(api.fallbacks,dict(missed=dict(n1=3),answered=dict(n2=3)))
+        api=self.api(set())
+        api.request("GET","/v1/batch/1")
+        self.assertEqual(api.fallbacks,dict(missed={},answered={}))
+
+    def test_fallbacks_reach_the_snapshot_report_and_record(self):
+        api=self.api({"n1","n2"})
+        api.request("GET","/v1/batch/1")
+        with tempfile.TemporaryDirectory() as folder:
+            campaign=jobs.Campaign(Path(folder)/"jobs",api,[],"token")
+            campaign.publish(100)
+            snapshot=json.loads((Path(folder)/"jobs/snapshot.json").read_text())
+        self.assertEqual(snapshot["api_fallbacks"],dict(missed=dict(n1=1,n2=1),answered=dict(n3=1)))
+        report=jobs.report(snapshot)
+        self.assertEqual(report["api_fallbacks"],snapshot["api_fallbacks"])
+        text="\n".join(checker.job_qualification_lines(report))
+        self.assertIn("API fallbacks: n1 missed 1, n2 missed 1; n3 answered 1",text)

@@ -5166,6 +5166,131 @@ a lock, or a runtime thread that didn't get to the loop. The new line
 separates them: it shows which timed part took the time, and if none of them
 did, then it was something the line doesn't time.
 
+#### Letting the write go on without the loop
+
+The line paid for itself on the first soak that carried it. About 11 s after
+the soak killed node 3's Bun, its journal said:
+
+```
+08:20:54 bun: agent loop turn took 1575 ms in follow_up (consumer_sync/journal): journal write 1574 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 0 ms
+08:20:55 bun: agent loop turn took 883 ms in follow_up (consumer_sync/activate): journal write 883 ms
+```
+
+1,574 of 1,575 ms was the fsync. Not the lock, not the view, not a starved
+runtime thread (that would have shown turn time no timed part explains).
+That host turned out to be overloaded by builds running beside the soak, and
+the next candidate's slow turns, up to 6 s, came only on a node whose disk
+the jobs tier throttles to 20 IOPS on purpose. Both are the harness's doing,
+not the product's. But both say the same thing about the product: a consumer
+step holds the loop for as long as one write takes, and nothing bounds that.
+Commands, status and ticks wait the whole time. One write a turn (#505) and
+one slow await a turn (#603) cap how many writes a turn waits for. Neither
+caps the write.
+
+What can't change is the order. The journal records a view before the kernel
+sees it, so that after a crash, recovery knows everything that may be
+exposed. Taking the write off the loop mustn't let the install overtake it.
+
+So a step waits for its write the way retirement waits for its disk work
+([Start it now, collect it later](#start-it-now-collect-it-later)): until the
+turn's runtime budget runs out, and no longer. The persist now runs in a
+task of its own, and the step hands the turn's deadline to
+`tokio::time::timeout_at`. A healthy disk lands the write well inside the
+500 ms, and the step carries on exactly as before. A stalled one doesn't, and
+then the step stops there and leaves its remainder behind as a new step:
+
+```rust
+enum AfterWrite {
+    Then(Box<ConsumerStep>),
+    Install(ConsumerPublication),
+    Done,
+}
+
+enum ConsumerStep {
+    // ...
+    Landed(AfterWrite),
+}
+```
+
+`Box<ConsumerStep>` is how an enum holds a value of its own type. A
+`ConsumerStep` that contained a `ConsumerStep` directly would have no finite
+size, and Rust lays every enum out at a size known at compile time. A `Box`
+is one pointer to a heap allocation, so the outer step's size stays fixed
+however deep the nesting goes. (Go would use a pointer, and C a pointer to a
+struct; Rust just makes you say so.)
+
+While the write is in flight the journal itself is inside the task, because
+`DiscoveryJournal::persist` takes `self` by value and gives it back when it
+lands. That's ownership doing a job: nothing on the loop can write to a
+journal it doesn't hold. The agent keeps a new variant meanwhile,
+`DiscoveryOwnership::Writing`, with the task's `JoinHandle` and a copy of the
+inventory as it was before the write. Readers between turns see that copy,
+the state that's on disk now. They might as well, since commands already ran
+between steps before this change, and a reader saw the state before the next
+step then too. The one view that isn't on disk yet still counts where it
+must: `own_view_names` asks the step under way, so a local address the new
+view names can't be released while its write is in flight.
+
+Anything that wants to *change* the journal waits for the write first.
+`update_discovery_inventory` settles a write in flight before it reads the
+inventory it will change, so two writes never race and none is built from a
+stale copy. A command that journals something still waits for a disk, as it
+always did, but only when it actually needs that disk.
+
+The loop learns that the write has landed through one more `select!` branch:
+
+```rust
+outcome = Self::discovery_write_done(&mut self.discovery_ownership),
+    if self.discovery_write_in_flight() => {
+    let turn = self.begin_consumer_sync_turn();
+    self.land_discovery_write(outcome).await;
+    self.continue_consumer_sync().await;
+    turn
+}
+```
+
+`discovery_write_done` awaits `&mut write.task`. A `JoinHandle` is a future
+that yields the task's result, and awaiting a mutable reference to it rather
+than the handle itself leaves the handle where it is, so the branch can be
+built afresh every time round the loop without consuming anything. With no
+write in flight it awaits `std::future::pending()`, which never finishes,
+and the `if` guard keeps the branch from being polled at all. Both step
+branches gain the opposite guard: no step runs while a write is in flight.
+
+The turn that lands a write takes the remainder in the same turn. For
+`Install`, that's the kernel, DNS and Wrapper, which is exactly what the
+single turn used to do after its write. A write that failed fences discovery
+the way an inline failure always has (ownership goes `Uncertain`, readiness
+reports `discovery:journal` degraded, and the next tick reopens the journal),
+and the `Landed` step hands the failure to the leader instead of installing
+anything. The slow write still gets a log line of its own:
+
+```
+bun: a discovery journal write took 1574 ms; the agent loop went on meanwhile
+```
+
+Three tests in the loop harness pin it down, at the soak's 1.6 s a write.
+`status_answers_while_a_consumer_journal_write_outlasts_the_turn` runs the
+real loop through a changed view, three writes, and a status queued mid-write
+must answer within the budget, as must the worst turn.
+`a_consumer_view_is_installed_only_after_its_journal_write_lands` drives the
+same sync by hand: the `journal` turn ends inside the budget with the old
+view still installed, landing the write installs nothing by itself, and only
+the next turn, `consumer_sync/install`, moves the backend.
+`a_journal_write_that_fails_off_the_turn_fences_discovery_and_installs_nothing`
+fails the write after the turn has moved on and checks that ownership is
+uncertain, readiness says so, the leader hears an error and the old view
+stays.
+
+What we didn't do: hand every journal write to a task. Deploys, retirements
+and releases write the journal too, and they decide what to do next from
+what they read, sometimes synchronously. Making all of them tolerate a write
+in flight would have touched every one of those decisions to fix a stall
+that, in every soak so far, came from a consumer step. The consumer's writes
+change only its own ownership, so the services and runtime holds everyone
+else reads are the same either side of one. That's what makes them safe to
+leave in flight.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`
@@ -5933,6 +6058,22 @@ record was a fortnight older than the change that rerouted every file lock in th
 programme. Nothing had broken, as it turned out: the [rerun](../qualification/2026-10-11-power-cut-reboot.md)
 passed 25 power cuts per lane. But a check that only runs when someone remembers
 it isn't a gate. Now it's a numbered step of the release runbook.
+
+A numbered step done by hand is still easy to get subtly wrong, though. For
+0.2.0 it meant a hand-written VM template, a hand-made checkout of the
+candidate and a scratch loop, and any of those could quietly undermine the
+result: a writable mount lets a build change what's under test, a checkout at
+the wrong commit tests the wrong code, and a VM without swap loses the linker
+to the OOM killer before a single power cut. So
+`scripts/release/qualify-power-cut-reboot.sh` does the whole step. It makes a
+clean detached checkout of the candidate, creates a VM from a checked-in
+template, `power-cut-vm.yaml`, with that checkout as its only mount, and
+then distrusts its own work: before any lane it asks the guest how much swap
+it has, whether it can write to the checkout and what else is mounted. What
+Lima was asked for isn't proof of what the guest got. Then it runs the five
+lanes in order, stops at the first failure, writes the record and deletes the
+VM. Its tests run it against a fake `limactl` that logs every call, and one
+of them checks that the development VM's name never appears in that log.
 
 Could an ordinary test have caught this? Not honestly. Every file was fine
 until the kernel went away, and no amount of killing processes reproduces

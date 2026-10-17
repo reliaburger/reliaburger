@@ -38,7 +38,9 @@
 //! 2. An await that stays inline without the turn's deadline carries a
 //!    `// LOOP-INLINE: <why>` comment on its statement: an in-memory lock,
 //!    an fsync'd persist (allowed, and bounded by the harness's slow-disk
-//!    scenario), or the short sleep before an upgrade's exec.
+//!    scenario), or the short sleep before an upgrade's exec. A consumer
+//!    step's discovery-journal write is the exception: it waits only until
+//!    the turn's deadline, then lands off the loop (#890).
 //! 3. `loop_rule::every_inline_await_on_the_agent_loop_has_a_deadline_or_a_reason`
 //!    walks every method a turn can reach and fails on an await with
 //!    neither. Reviewers read the tags, not the whole call graph.
@@ -671,13 +673,14 @@ pub struct BunAgent<G: Grill> {
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
     /// Apps whose last admission here failed because the execution budget
-    /// had no room (job leases may hold it), keyed by (app_name, namespace).
-    /// Every state report carries them, so the leader places the replicas
-    /// elsewhere instead of holding them. An entry stays until an admission
-    /// of that app succeeds here or the app is stopped or retired here: a
+    /// had no room (job leases may hold it), keyed by (app_name, namespace),
+    /// with the replica ordinals the admission tried to start. Every state
+    /// report carries them, so the leader places those replicas elsewhere
+    /// instead of holding them (#971). An entry stays until an admission of
+    /// that app succeeds here or the app is stopped or retired here: a
     /// deploy backs off for minutes between attempts, and the refusal must
     /// not lapse in between (#967).
-    capacity_refusals: std::collections::HashSet<(String, String)>,
+    capacity_refusals: std::collections::HashMap<(String, String), Vec<u32>>,
     /// The app versions this node's placement reconciler last finished
     /// deploying, as it last told the agent. State reports carry them so the
     /// leader can release a rollout node by node (#692).
@@ -913,7 +916,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashSet::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
@@ -1073,7 +1076,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
-            capacity_refusals: std::collections::HashSet::new(),
+            capacity_refusals: std::collections::HashMap::new(),
             converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
             log_tx: None,
@@ -1581,8 +1584,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // (#505). Its steps take turns with everything below:
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
-                    _ = std::future::ready(()), if self.consumer_syncs.step_first() => {
+                    // No step runs while a step's write is in flight.
+                    _ = std::future::ready(()), if self.consumer_syncs.step_first()
+                        && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
+                        self.continue_consumer_sync().await;
+                        turn
+                    }
+                    // A step's write that outlasted its turn has landed
+                    // (#890): take the step's remainder now.
+                    outcome = Self::discovery_write_done(&mut self.discovery_ownership),
+                        if self.discovery_write_in_flight() => {
+                        let turn = self.begin_consumer_sync_turn();
+                        self.land_discovery_write(outcome).await;
                         self.continue_consumer_sync().await;
                         turn
                     }
@@ -1596,7 +1610,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.handle_command(cmd).await;
                         turn
                     }
-                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle() => {
+                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle()
+                        && !self.discovery_write_in_flight() => {
                         let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
