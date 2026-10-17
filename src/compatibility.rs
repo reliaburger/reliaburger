@@ -138,9 +138,13 @@ pub struct Compatibility {
 /// process owner and runc adoption records (#984).
 /// The state report's `CapacityRefusal::ordinals`, the replicas a node
 /// couldn't start, so a refused scale-up moves only those (#971).
+///
+/// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
+/// train opened. Each 0.2.2 change to the wire or durable state adds its
+/// line below this one, not another bump.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 52,
-    state: 69,
+    protocol: 53,
+    state: 70,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

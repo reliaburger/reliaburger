@@ -545,6 +545,38 @@ that variable at compile time to the path of the `relish` it built for the tests
 check costs nothing extra and runs on every platform `make test` does. It catches the same
 drift a reader would hit after copying an example.
 
+The docs are examples too, and for a long time only the five-minute tour was checked. The
+audit found the manual telling operators to run `relish events` three times (there's no such
+command yet), a whitepaper join transcript missing the `--node-id` that `join-token create`
+requires, and a dozen TOML blocks that failed validation because a sub-table like
+`[app.api.health]` had no app around it. The manual is compiled into `relish`, so those
+mistakes shipped inside the binary. `tests/suite/doc_snippets.rs` now reads every fenced
+block in the manual, both READMEs and the whitepaper. Shell blocks have each `relish`
+invocation run under `RELISH_PARSE_ONLY=1`. TOML blocks go to the type that really reads them:
+`Config` plus `validate()` for workloads, `NodeConfig` for node tables, the scenario loader
+for `[[step]]` files. Inline `` `relish …` `` spans in prose must at least name a real
+subcommand with real flags. Finding the commands means reading a little shell, and slice
+patterns make that short:
+
+```rust
+match rest {
+    [first, tail @ ..] if first == "sudo" || first == "export" || is_assignment(first) => {
+        rest = tail
+    }
+    [limactl, shell, _vm, tail @ ..] if limactl == "limactl" && shell == "shell" => {
+        rest = tail
+    }
+    _ => break,
+}
+```
+
+`tail @ ..` binds the rest of the slice to a name, so peeling `sudo` off the front is a
+pattern, not index arithmetic. A block that can't parse has to say so on the line before its
+fence: `<!-- snippet: fragment -->`, or `planned #N` and `pending #N` naming an open issue.
+A `pending` block is still checked and must still *fail*, so the marker can't outlive the
+issue. Markdown renderers drop HTML comments, and so does `relish manual`, so readers never
+see them.
+
 We apply the same rule to platform promises. The `ebpf` Cargo feature can be selected on
 macOS even though Aya and the kernel hooks exist only on Linux. An Aya-using branch therefore
 needs both conditions:

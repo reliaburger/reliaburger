@@ -143,6 +143,7 @@ needn't be published:
 
 ```toml
 [app.web]
+image = "ghcr.io/example/web:1.0"
 port = 8080
 metrics = {}                     # http://<instance>:8080/metrics
 # metrics = { port = 9797, path = "/prom" }

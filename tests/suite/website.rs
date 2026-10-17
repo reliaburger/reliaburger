@@ -26,11 +26,11 @@ const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh";
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";
 const DEMO_SOURCE: &str = "examples/kubernetes/podinfo.yaml";
 
-fn repository() -> PathBuf {
+pub(crate) fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn read(path: &str) -> String {
+pub(crate) fn read(path: &str) -> String {
     std::fs::read_to_string(repository().join(path)).unwrap()
 }
 

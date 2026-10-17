@@ -87,6 +87,9 @@ the node always could.
 Egress is open unless an app lists what it may reach. Every entry needs a port:
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.egress]
 allow = ["api.stripe.com:443", "10.0.0.0/8:5432", "[2001:db8::1]:443"]
 ```
