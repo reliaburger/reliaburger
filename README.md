@@ -19,7 +19,7 @@ glibc builds; static builds are planned for 0.3.0
 It applies most Kubernetes manifests directly and tells you what it had to
 change or drop (see [what converts](docs/manual/09_kubernetes.md)). The tour below
 takes a laptop to a three-node cluster, runs a real Kubernetes app and a
-thousand jobs on it, breaks it and watches it heal. Five minutes is the target.
+batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
@@ -45,7 +45,7 @@ relish images                        # burger:v1, built for amd64 and arm64
 relish apply burger/burger.toml
 curl http://burger.localhost:18080/order   # calls podinfo's backend by name
 
-# A thousand jobs from the same image, packed around the running apps
+# Ten jobs from the same image, packed around the running apps
 relish batch submit burger/jobs.toml
 relish batch watch 1                 # the number submit printed
 relish jobs                          # the finished run and its rate

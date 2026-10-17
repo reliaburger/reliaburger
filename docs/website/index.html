@@ -124,7 +124,7 @@
         </div>
         <div class="tour">
           <p class="tour-note">Install, then put the cluster through its paces: a real
-            Kubernetes app, an app of your own, a thousand jobs, a network fault, a killed
+            Kubernetes app, an app of your own, a batch of jobs, a network fault, a killed
             replica and a lost node. Same prerequisites as the install line.</p>
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
@@ -194,7 +194,7 @@
                 <pre><code data-tour>relish batch submit burger/jobs.toml</code>
 <code data-tour>relish batch watch 1</code>
 <code data-tour>relish jobs</code></pre>
-                <p>Then a thousand jobs beside it: 1,000 small and 64 larger hashing tasks from
+                <p>Then ten jobs beside it: 8 small and 2 larger hashing tasks from
                   the same image, in two resource profiles. Each profile is stored as a template
                   and a count, not a record per task, and its tasks are packed around the apps
                   already running. <code>watch</code> takes the number <code>submit</code>
