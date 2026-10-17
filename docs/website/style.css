@@ -85,8 +85,8 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .tour var { font-style: normal; color: #f49463; }
 .tour-links { font-size: .875rem; color: var(--muted); margin: 0; }
 .release-pipeline { list-style: none; counter-reset: stage; margin: 22px 0; padding: 0; max-width: 860px; }
-.release-pipeline li { counter-increment: stage; display: grid; grid-template-columns: 2.5rem minmax(0, 1fr); gap: 0 16px; border-top: 1px solid var(--line); padding: 12px 0; color: var(--muted); font-size: .9375rem; }
-.release-pipeline li::before { content: counter(stage, decimal-leading-zero); font: .75rem/2.2 var(--mono); color: var(--accent); }
+.release-pipeline li { counter-increment: stage; position: relative; border-top: 1px solid var(--line); padding: 12px 0 12px calc(2.5rem + 16px); color: var(--muted); font-size: .9375rem; }
+.release-pipeline li::before { content: counter(stage, decimal-leading-zero); position: absolute; left: 0; font: .75rem/2.2 var(--mono); color: var(--accent); }
 .release-pipeline strong { color: var(--ink); }
 /* Soak charts are copies of the qualification records' SVGs. They draw their
    own light surface (and a dark one under a dark colour scheme), so they read
@@ -185,7 +185,7 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 }
 @media (max-width: 600px) {
   .page { padding: 0 22px; }
-  .release-pipeline li { grid-template-columns: 2rem minmax(0, 1fr); gap: 0 10px; }
+  .release-pipeline li { padding-left: calc(2rem + 10px); }
   .masthead { align-items: start; flex-direction: column; gap: 12px; padding: 22px 0 14px; }
   nav { gap: 0 18px; }
   .intro { padding-top: 42px; }
