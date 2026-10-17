@@ -3314,6 +3314,20 @@ these on 15 October 2026 ([#668](https://github.com/reliaburger/reliaburger/issu
 They're still recorded, never gated: a leaking Bun fails the soak through
 `leak-rss` and the wtf report, as before.
 
+A table of first, last and highest samples hides when things happened, and the
+evidence directory with the full series never leaves the release host. So the
+record now draws the series too: `sustained_check.py render` writes SVG charts
+of each node's Bun memory (with the 512 and 384 MiB lines), open fds, CPU and,
+for a job soak, accepted jobs a second against the target, with every fault,
+upgrade walk and special marked along the bottom. It's a few hundred lines of
+Python string formatting rather than a plotting library, because the release
+scripts use only the standard library, and the output is deterministic so a
+re-render shows no diff. The 0.2.0 jobs final shows why it was worth it: the
+jobs chart drops to zero at 10.5 hours, the moment the controller ran out of
+its run budget ([#989](https://github.com/reliaburger/reliaburger/issues/989)),
+while the memory chart beside it stays flat. The table said the same thing, but
+you had to know where to look.
+
 ### A task that failed before it ran
 
 Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of
@@ -3919,6 +3933,16 @@ promotion can't skip the re-record the way 0.1.5 and 0.1.6 did. It caught
 something on its first run, too: the new 0.3.0 card on the homepage said
 `relish netboot`, a command no release has yet.
 
+The payoff came at the promotion. Flipping `install.sh` to `v0.2.0` turned
+every "0.2.0, not in 0.1.6" into an error, because a label naming the release
+before the installed one is stale, and it failed the recording check until the
+tour was re-recorded against the published 0.2.0. So the change that announced
+the release also had to put jobs back into the tour: `relish batch submit
+burger/jobs.toml`, `relish batch watch` and `relish jobs`, beside the burger
+app. The step had sat behind a `--jobs` flag in `scripts/demo/tour.sh` while
+the installer fetched a release without `batch`; now that the published
+release has it, the flag is gone and every recording runs the step.
+
 ## What 0.2.0 doesn't do yet
 
 An audit of the job path before the release
@@ -3929,10 +3953,14 @@ every accepted task used to leave ledger entries, output and executor metadata
 behind with nothing reclaiming them, which is what "Where the bytes went"
 fixed.
 
-What's left isn't code. The job final on at least three nodes
-([#668](https://github.com/reliaburger/reliaburger/issues/668)) runs against
-the release candidate, and until it passes, the hundred-million-a-day figure
-stays a target.
+What was left wasn't code. The 12-hour job qualification on three nodes
+([#668](https://github.com/reliaburger/reliaburger/issues/668)) ran against
+the eighth release candidate and accepted 4,600 jobs a second, four times the
+hundred-million-a-day rate, through every fault
+([record](../qualification/2026-10-17-v0.2.0-job-qualification.md)). It took two runs: the first found a socket leak in
+the VM manager's port forwarder that let the kernel kill Bun, and the second's
+failures were all the harness's own
+([release log](../release-log.md#020-a-million-jobs)).
 
 ## Lessons
 
