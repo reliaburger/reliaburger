@@ -839,6 +839,7 @@ replicas = 1
 [app.hello.health]
 path = "/"
 interval = 1
+timeout = 1
 threshold_healthy = 1
 [app.hello.ingress]
 host = "localhost"
@@ -1127,5 +1128,13 @@ esac
         assert!(app.env.contains_key("PATH"));
         assert_eq!(app.ingress.as_ref().unwrap().host, "localhost");
         assert_eq!(app.health.as_ref().unwrap().path, "/");
+    }
+
+    /// The cluster refuses what validation refuses, so a demo that only
+    /// parses can still stop the quickstart at its last step.
+    #[test]
+    fn demo_passes_the_validation_the_api_applies() {
+        let config = crate::config::Config::parse(&demo_config()).unwrap();
+        config.validate_intrinsic().unwrap();
     }
 }

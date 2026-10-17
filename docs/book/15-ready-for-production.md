@@ -6271,6 +6271,18 @@ an empty client list. Track the pending operation and reconcile it. Healing ever
 fault on the node would remove someone else's experiment too. Exact ownership
 matters most when the happy path has already stopped running.
 
+Our own examples need the same treatment. 0.2.1 started refusing a health
+timeout longer than its interval, since a probe that outlasts the interval
+overlaps the next one. The quickstart's built-in `hello` app set `interval = 1`
+and left the timeout at its default of 5 seconds. Its unit test only parsed the
+manifest, so it stayed green, and the first staged install of the 0.2.1
+candidate stopped at its very last step: "run hello through ingress". Parsing
+proves the TOML is well formed; only validation proves the cluster will take
+it. Now the demo's test runs `validate_intrinsic`, the same checks the API
+applies, and `tests/suite/documented_manifests.rs` runs them on every manifest
+we tell people to apply as written: everything in `examples/`, and the TOML in
+the README, the quickstart, the Linux servers guide and the website.
+
 Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check
 still has a separate gap. Calling all upgrade verification either finished or

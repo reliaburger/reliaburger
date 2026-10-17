@@ -698,6 +698,7 @@ replicas = 3
 [app.hello.health]
 path = "/"
 interval = 2
+timeout = 1
 threshold_healthy = 1
 
 [app.hello.ingress]
