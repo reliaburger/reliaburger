@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Source-linked comparisons of Reliaburger with Kubernetes, k3s, Nomad, Coolify, Uncloud and Docker Compose.">
+  <meta name="theme-color" content="#181b19">
+  <title>Compare container platforms · Reliaburger</title>
+  <link rel="stylesheet" href="../style.css">
+  <link rel="stylesheet" href="../comparisons.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="masthead">
+      <a class="wordmark" href="../" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
+      <nav aria-label="Main navigation"><a href="../#install">Install</a><a href="./index.html">Compare</a><a href="./methodology.html">Evidence</a><a href="https://github.com/reliaburger/reliaburger">GitHub ↗</a></nav>
+    </header>
+    <main id="main" class="comparison-page">
+      <div class="comparison-intro"><div class="eyebrow">A SOURCE-BASED COMPARISON · 15 OCTOBER 2026</div><h1>Deploy and diagnose<br>with one toolchain.</h1><p class="lede">Reliaburger brings scheduling, ingress, image distribution, metrics, logs and fault testing into one platform. See how that changes everyday work alongside six familiar alternatives.</p><p class="evidence">Explore the <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/README.md#whats-in-the-binary">integrated components</a> and <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/07_diagnostics.md">diagnostic workflow</a>.</p></div>
+      <aside class="comparison-note"><p><strong>Which Reliaburger?</strong> The implementation baseline is the unreleased <a href="https://github.com/reliaburger/reliaburger/commit/32effd96e2a349d5a0533aa8a51c22b1054338d0">0.2.1 train at 32effd96</a>. The public installer still selects <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">0.1.6</a>. A feature on the train is not evidence of a shipped or qualified release. Read the <a href="./methodology.html#method">method and version boundaries</a> before treating this as a purchasing decision.</p></aside>
+      <section id="comparisons"><h2>Compare the daily work <a class="permalink" href="#comparisons" aria-label="Link to the comparisons">#</a></h2><div class="reading-list"><article class="reading-item"><span class="filetype">THE PLATFORM API</span><h3><a href="./kubernetes.html">Reliaburger vs Kubernetes <span aria-hidden="true">↗</span></a></h3><p>Pods, controllers, storage and extensibility; installation with kubeadm and the cost of operating the platform.</p></article>
+<article class="reading-item"><span class="filetype">THE WORKLOAD SCHEDULER</span><h3><a href="./nomad.html">Reliaburger vs Nomad <span aria-hidden="true">↗</span></a></h3><p>Jobs, groups, allocations and service discovery; what comes with the scheduler and what you integrate.</p></article>
+<article class="reading-item"><span class="filetype">KUBERNETES, PACKAGED</span><h3><a href="./k3s.html">Reliaburger vs k3s <span aria-hidden="true">↗</span></a></h3><p>What its bundled runtime, networking and ingress simplify, and which Kubernetes concepts remain.</p></article>
+<article class="reading-item"><span class="filetype">THE SINGLE-HOST BASELINE</span><h3><a href="./docker-compose.html">Reliaburger vs Docker Compose <span aria-hidden="true">↗</span></a></h3><p>Services, networks and volumes; where a single Docker host is enough and what changes when you need a cluster.</p></article>
+<article class="reading-item"><span class="filetype">THE APPLICATION PLATFORM</span><h3><a href="./coolify.html">Reliaburger vs Coolify <span aria-hidden="true">↗</span></a></h3><p>Git deployments, preview environments, domains and backups; the difference between deployment to servers and cluster reconciliation.</p></article>
+<article class="reading-item"><span class="filetype">THE SMALL-CLUSTER ALTERNATIVE</span><h3><a href="./uncloud.html">Reliaburger vs Uncloud <span aria-hidden="true">↗</span></a></h3><p>Compose, WireGuard and Caddy; straightforward deployment across machines and the limits of automatic recovery.</p></article></div></section>
+      <section id="evidence"><h2>Choose with the details in view <a class="permalink" href="#evidence" aria-label="Link to comparison evidence">#</a></h2><p>Every comparison maps concepts and shows installation, everyday commands and upgrade operations. It identifies Reliaburger's advantages and the cases where another platform fits better, with sources beside the claims.</p><p><a href="./methodology.html">Evidence, versions and comparison method</a> · <a href="../#install">Try Reliaburger</a></p></section>
+    </main>
+    <footer><span>Reliaburger · by Miko Pawlikowski</span><a href="./methodology.html#method">Evidence and method · 15 October 2026</a><span class="footer-note">Static HTML and CSS. The existing copy script adds command buttons. No tracking or third-party requests.</span></footer>
+  </div>
+  <script src="../assets/copy.js" defer></script>
+</body>
+</html>
