@@ -17,8 +17,9 @@ use reliaburger::relish::commands;
     about = "Reliaburger CLI"
 )]
 struct Cli {
-    /// Output format: human, json, or yaml.
-    #[arg(long, default_value = "human", global = true)]
+    /// Output format: human, json, or yaml. A command that has no machine
+    /// output refuses json and yaml rather than ignoring them.
+    #[arg(short = 'o', long, default_value = "human", global = true)]
     output: OutputFormat,
 
     /// API token for authenticating to the agent. Overrides `RELIABURGER_TOKEN`.
@@ -37,6 +38,11 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+fn parse_severity(value: &str) -> Result<reliaburger::bun::events::EventSeverity, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .map_err(|_| format!("{value:?} isn't a severity: use info, warning or critical"))
 }
 
 fn parse_endpoint(value: &str) -> Result<String, String> {
@@ -95,6 +101,21 @@ struct BenchOptions {
 
 // Its own parser, boxed, like `BenchOptions`: inline fields would grow the
 // generated `Command` parser past the test-thread stack.
+// Filters for `relish events`, boxed for the same reason.
+#[derive(clap::Args)]
+struct EventsOptions {
+    /// Only this app's events.
+    #[arg(long)]
+    app: Option<String>,
+    /// Only events at least this severe: info, warning or critical.
+    #[arg(long, value_parser = parse_severity)]
+    severity: Option<reliaburger::bun::events::EventSeverity>,
+    /// How many of the newest matching events to show (each node keeps its
+    /// newest 1024).
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=10000))]
+    limit: u32,
+}
+
 // Filters for `relish audit`.
 #[derive(clap::Args)]
 struct AuditOptions {
@@ -236,7 +257,8 @@ enum Command {
         #[arg(long, default_value = "15m")]
         since: String,
     },
-    /// Execute a command inside a running container.
+    /// Run a command once inside a running instance and exit with its exit
+    /// code. Not interactive: no stdin and no terminal.
     Exec {
         /// App name.
         app: String,
@@ -339,6 +361,10 @@ enum Command {
     Resolve {
         /// Service name (e.g. "redis").
         name: String,
+        /// The service's namespace. Needed when the name exists in more
+        /// than one.
+        #[arg(long)]
+        namespace: Option<String>,
     },
     /// Show ingress routing table.
     Routes,
@@ -350,6 +376,9 @@ enum Command {
     /// Show who did what: the durable audit log of applies, deletes, execs,
     /// upgrades, faults, tokens and the other changes to the cluster.
     Audit(Box<AuditOptions>),
+    /// Show the cluster's recent events: deploys, restarts, health, faults,
+    /// tokens, secrets and audited operations, newest last.
+    Events(Box<EventsOptions>),
     /// Manage volume snapshots (Btrfs-backed volumes only).
     Snapshot {
         #[command(subcommand)]
@@ -1670,6 +1699,11 @@ async fn main() -> ExitCode {
         Some(command) => command,
         None => return finish(reliaburger::relish::tui::run().await),
     };
+    if let Some(reason) = output_refusal(&command, cli.output) {
+        eprintln!("error: {reason}");
+        // A usage error, like clap's own.
+        return ExitCode::from(2);
+    }
 
     let result = match command {
         Command::Tui => reliaburger::relish::tui::run().await,
@@ -1747,7 +1781,7 @@ async fn main() -> ExitCode {
             ref app,
             ref command,
             ref namespace,
-        } => commands::exec(app, command, namespace).await,
+        } => return finish_outcome(commands::exec(app, command, namespace).await),
         Command::Inspect { ref name } => commands::inspect(name).await,
         Command::Stop {
             ref app,
@@ -1835,7 +1869,10 @@ async fn main() -> ExitCode {
             }
             .await
         }
-        Command::Resolve { ref name } => commands::resolve(name).await,
+        Command::Resolve {
+            ref name,
+            ref namespace,
+        } => commands::resolve(name, namespace.as_deref(), cli.output).await,
         Command::Routes => commands::routes().await,
         Command::Snapshot { ref action } => match action {
             SnapshotAction::Create {
@@ -1881,6 +1918,22 @@ async fn main() -> ExitCode {
                     namespace,
                     limit,
                     cluster,
+                },
+                cli.output,
+            )
+            .await
+        }
+        Command::Events(options) => {
+            let EventsOptions {
+                app,
+                severity,
+                limit,
+            } = *options;
+            reliaburger::relish::events_cmd::events(
+                reliaburger::relish::events_cmd::EventsFilter {
+                    limit: limit as usize,
+                    app,
+                    severity,
                 },
                 cli.output,
             )
@@ -2619,6 +2672,95 @@ fn finish_outcome(
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Why `command` can't honour `output`, when it can't.
+///
+/// `--output` is global, so clap accepts it everywhere. A command that only
+/// prints for people would silently ignore `-o json` and hand a script text
+/// it can't parse, so it refuses instead.
+fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
+    if output == OutputFormat::Human || honours_output(command) {
+        return None;
+    }
+    let format = match output {
+        OutputFormat::Json => "json",
+        OutputFormat::Yaml => "yaml",
+        OutputFormat::Human => "human",
+    };
+    Some(format!(
+        "this command has no {format} output; drop --output (or -o)"
+    ))
+}
+
+/// Whether `command` prints JSON and YAML when asked. Every command is
+/// listed, so a new one has to decide.
+fn honours_output(command: &Command) -> bool {
+    match command {
+        Command::Apply { rerun_jobs, .. } => !rerun_jobs,
+        Command::Council { action } => matches!(
+            action,
+            None | Some(CouncilCommand::Status) | Some(CouncilCommand::Backups { .. })
+        ),
+        Command::Images { action } => action.is_none(),
+        Command::Batch { action, .. } => matches!(
+            action,
+            Some(BatchAction::Submit { .. }) | Some(BatchAction::Results { .. })
+        ),
+        Command::Gitops { action } => matches!(action, GitopsAction::Status),
+        Command::Token { action } => matches!(action, TokenAction::List),
+        Command::Status
+        | Command::Top
+        | Command::Metrics { .. }
+        | Command::Nodes
+        | Command::DecommissionNode { .. }
+        | Command::Resolve { .. }
+        | Command::Audit(_)
+        | Command::Events(_)
+        | Command::Deploy { .. }
+        | Command::CancelDeploy { .. }
+        | Command::History { .. }
+        | Command::Jobs { .. }
+        | Command::BatchStatus { .. }
+        | Command::Test { .. }
+        | Command::Bench(_)
+        | Command::Wtf { .. }
+        | Command::Path { .. } => true,
+        Command::Tui
+        | Command::Dashboard { .. }
+        | Command::Logs { .. }
+        | Command::LogsExport { .. }
+        | Command::LogsSearch { .. }
+        | Command::Exec { .. }
+        | Command::Inspect { .. }
+        | Command::Stop { .. }
+        | Command::Delete { .. }
+        | Command::Init { .. }
+        | Command::Join { .. }
+        | Command::Routes
+        | Command::Fault { .. }
+        | Command::Snapshot { .. }
+        | Command::Rollback { .. }
+        | Command::Lint { .. }
+        | Command::Compile { .. }
+        | Command::Diff { .. }
+        | Command::Fmt { .. }
+        | Command::Build { .. }
+        | Command::Run { .. }
+        | Command::Secret { .. }
+        | Command::Ca { .. }
+        | Command::JoinToken { .. }
+        | Command::Sign { .. }
+        | Command::Dev { .. }
+        | Command::Upgrade { .. }
+        | Command::Manual { .. }
+        | Command::Source { .. }
+        | Command::Uninstall { .. }
+        | Command::Local { .. }
+        | Command::Setup { .. } => false,
+        #[cfg(feature = "kubernetes")]
+        Command::Import { .. } | Command::Export { .. } => false,
     }
 }
 
@@ -3929,11 +4071,12 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Events {
-                app,
-                severity,
-                limit,
-            } => {
+            Command::Events(options) => {
+                let EventsOptions {
+                    app,
+                    severity,
+                    limit,
+                } = *options;
                 assert_eq!(app.as_deref(), Some("web"));
                 assert_eq!(
                     severity,
@@ -3954,7 +4097,9 @@ mod tests {
             &["relish", "-o", "yaml", "logs", "web"],
             &["relish", "-o", "json", "lint", "app.toml"],
             &["relish", "-o", "json", "snapshot", "list", "db"],
-            &["relish", "-o", "json", "token", "create", "ci", "--role", "deployer"],
+            &[
+                "relish", "-o", "json", "token", "create", "--name", "ci", "--role", "deployer",
+            ],
         ] {
             let cli = parse(args).unwrap();
             assert!(

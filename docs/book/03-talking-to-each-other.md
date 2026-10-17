@@ -391,7 +391,7 @@ pub struct BackendInstance {
 
 When Bun deploys an app with a port, it calls `service_map.register(&ServiceId::new("default", "redis"), 6379, None)`. That computes the namespaced VIP and creates an entry with an empty backend list. Every method that mutates or reads a service takes a `&ServiceId`, so the namespace is threaded through the whole path — the compiler won't let a call site forget it. As instances start and reach the Running state, Bun calls `add_backend()` with the real node IP and host port. When health checks fail, `set_backend_health()` flips the flag. When an app is stopped, `unregister()` removes everything and releases the VIP.
 
-There's one deliberate escape hatch. The `relish resolve <name>` CLI and Smoker's fault-injection targeting still take a bare name — a human typing `relish resolve redis` doesn't want to spell out the namespace. Those go through `resolve_by_name()`, which returns the first match in any namespace. Everything on the deploy and routing path uses the namespaced `resolve()`; the bare-name lookup is only for the human-facing edges.
+There's one deliberate escape hatch. Smoker's fault-injection targeting still takes a bare name, and so did `relish resolve <name>` until 0.2.2 — a human typing `relish resolve redis` doesn't want to spell out the namespace. Those go through `resolve_by_name()`, which returns the first match in any namespace (the `relish resolve` section below says why the CLI stopped). Everything on the deploy and routing path uses the namespaced `resolve()`; the bare-name lookup is only for the human-facing edges.
 
 On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in the kernel. On macOS and for ProcessGrill, the map still works — it powers `relish resolve` — but there are no eBPF programs reading it.
 
@@ -436,17 +436,20 @@ You can query the service map from the CLI:
 
 ```
 $ relish resolve redis
-Service:  redis
-VIP:      127.128.0.3
-Port:     6379
-Backends: 2/2 healthy
+Service:   redis
+Namespace: default
+VIP:       127.128.0.3
+Port:      6379
+Backends:  2/2 healthy
 
   INSTANCE             NODE               PORT     HEALTH
   redis-0              10.0.2.2           30891    healthy
   redis-1              10.0.4.2           31022    healthy
 ```
 
-This calls the Bun agent's `/v1/resolve/{name}` endpoint, which reads from the userspace `ServiceMap`. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+This calls the Bun agent's `/v1/resolve` endpoint, which lists the services in the userspace `ServiceMap` that the caller's token may see. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+
+The bare-name escape hatch above had a catch: with `redis` in both `prod` and `staging`, "the first match in any namespace" meant whichever the map's hash order happened to put first, and the output didn't say which. The 0.2.2 CLI review fixed it in the CLI rather than the agent. Relish fetches the whole list and `select_service` filters it: `--namespace` picks one, a unique name needs nothing, and an ambiguous name is refused with every namespace it exists in, so the human chooses instead of the hash function. The output now names the namespace too.
 
 ### Wiring the service map into the agent
 

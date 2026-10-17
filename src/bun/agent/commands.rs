@@ -166,7 +166,7 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         command: Vec<String>,
-        response: oneshot::Sender<Result<String, BunError>>,
+        response: oneshot::Sender<Result<crate::grill::ExecOutput, BunError>>,
     },
     /// Run the fixed Phase 15 connectivity probe from a local workload.
     Trace {

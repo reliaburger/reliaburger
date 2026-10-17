@@ -142,6 +142,8 @@ pub struct Compatibility {
 /// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
 /// train opened. Each 0.2.2 change to the wire or durable state adds its
 /// line below this one, not another bump.
+/// - #522: an exec answer, from `POST /v1/exec` and from a process owner's
+///   exec socket, carries the command's `exit_code` beside its `output`.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 53,
     state: 70,

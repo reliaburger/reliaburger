@@ -10,10 +10,20 @@ relish apply -f https://reliaburger.com/demo/podinfo.yaml
 relish apply -f deploy/podinfo.yaml --dry-run
 ```
 
-A file counts as Kubernetes when it has `apiVersion:` and `kind:` lines;
-anything else is read as Reliaburger TOML. URLs must be `https://` (redirects
-included), answer within 30 seconds and stay under 1 MiB. The migration report
-goes to stderr before anything is applied.
+A file counts as Kubernetes when it has `apiVersion:` and `kind:` lines, or
+is a JSON object with `"apiVersion"` and `"kind"`; anything else is read as
+Reliaburger TOML. URLs must be `https://` (redirects included), answer within
+30 seconds and stay under 1 MiB. The migration report goes to stderr before
+anything is applied.
+
+`relish lint`, `relish deploy`, `relish diff` and `relish compile` read a
+Kubernetes file the same way, so you can check or compare one before you apply
+it:
+
+```sh
+relish lint deploy/podinfo.yaml
+relish diff deploy/podinfo.yaml
+```
 
 ## What converts
 

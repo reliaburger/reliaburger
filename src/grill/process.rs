@@ -1240,7 +1240,11 @@ impl super::Grill for ProcessGrill {
         Ok(logs)
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         // Verify the instance exists and is running
         if let Some(control) = &self.control {
             return control
@@ -1290,7 +1294,11 @@ impl super::Grill for ProcessGrill {
             }
             result.push_str(&stderr);
         }
-        Ok(result)
+        Ok(super::ExecOutput {
+            output: result,
+            // A signal-killed command has no code; report a plain failure.
+            exit_code: output.status.code().unwrap_or(1),
+        })
     }
 
     async fn follow_logs(
@@ -2048,7 +2056,7 @@ mod tests {
         spec.process.env = vec!["JOB=1".into(), format!("PATH={path}")];
         grill.create(&id, &spec).await.unwrap();
         grill.start(&id).await.unwrap();
-        let env = grill.exec(&id, &["env".to_string()]).await.unwrap();
+        let env = grill.exec(&id, &["env".to_string()]).await.unwrap().output;
         let resolved = grill.exec(&id, &["rb-exec-tool".to_string()]).await;
         grill.kill(&id).await.unwrap();
         assert!(env.lines().any(|line| line == "JOB=1"), "{env}");
@@ -2061,7 +2069,7 @@ mod tests {
                 .any(|line| line.starts_with(&format!("{private}="))),
             "{private} leaked: {env}"
         );
-        assert_eq!(resolved.unwrap().trim(), "found");
+        assert_eq!(resolved.unwrap().output.trim(), "found");
     }
 
     #[tokio::test]

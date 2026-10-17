@@ -41,7 +41,6 @@ use super::website::read;
 /// markers naming it fail until their snippets are made real.
 const OPEN_ISSUES: &[(u32, &str)] = &[
     (362, "CA status and revocation"),
-    (522, "CLI review: `relish events`, `-o`"),
     (656, "drain: cordon, drain and uncordon"),
     (711, "Franchise multi-cluster"),
 ];
@@ -49,7 +48,6 @@ const OPEN_ISSUES: &[(u32, &str)] = &[
 /// Inline `relish …` spans in prose for commands an open issue is adding.
 /// Each must still fail the check; when it passes, remove its entry.
 const INLINE_PENDING: &[(&str, u32)] = &[
-    ("relish events", 522),
     ("relish ca status", 362),
     ("relish ca revoke", 362),
     ("relish drain", 656),
@@ -948,7 +946,9 @@ fn inline_spans_check_the_subcommand_and_its_flags_only() {
         "a missing argument is fine in prose"
     );
     assert!(check("relish help COMMAND").is_ok());
-    assert!(check("relish events").is_err());
+    assert!(check("relish events --severity warning").is_ok());
+    assert!(check("relish -o json token list").is_ok());
+    assert!(check("relish drain").is_err());
     assert!(check("relish exec --debug").is_err());
 
     let spans = inline_spans(
@@ -1000,7 +1000,7 @@ fn classifies_node_and_workload_tables() {
 #[test]
 fn ignores_blocks_after_a_fragment_marker() {
     let text = "Intro.\n\n<!-- snippet: fragment -->\n```toml\n[app.web.env]\n```\n\n\
-                <!-- snippet: pending #522 -->\n\n```sh\nrelish events\n```\n\n\
+                <!-- snippet: pending #656 -->\n\n```sh\nrelish drain\n```\n\n\
                 ```toml\n[app.web]\n```\n\n<!-- snippet: planned #711 -->\nProse.\n\n\
                 <!-- snippet: framgent -->\n```sh\nrelish status\n```\n";
     let (snippets, orphans) = extract("test.md", text);
@@ -1009,7 +1009,7 @@ fn ignores_blocks_after_a_fragment_marker() {
         markers,
         vec![
             Some(Marker::Fragment),
-            Some(Marker::Pending(522)),
+            Some(Marker::Pending(656)),
             None,
             Some(Marker::Unknown("framgent".into())),
         ]

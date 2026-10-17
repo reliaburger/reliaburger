@@ -287,12 +287,18 @@ relish apply app.toml            # deploy (or converge) everything in the file
 relish apply app.toml --dry-run  # preview; no-agent output states its offline assumption
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
-relish exec web env              # run a command inside an instance, on whichever node runs it
+relish exec web env              # run a command once inside an instance; exits with its exit code
+relish events --app web          # the cluster's recent events for one app
 relish top                       # every workload on every node, with CPU and memory
 relish inspect web               # every instance on every node, desired vs running
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
+
+`relish exec` runs its command once, with no stdin and no terminal, so
+`relish exec web sh` exits straight away: name the command you want, as in
+`relish exec web ls /data`. Relish prints the output and exits with the
+command's exit code.
 
 `apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 
@@ -326,7 +332,7 @@ standalone node with no cluster numbers its replicas from 0.
 ```sh
 relish compile config/ > all.toml   # merge, apply _defaults.toml, derive namespaces
 relish diff old.toml all.toml       # structural diff between two configs
-relish fmt all.toml --check         # canonical ordering; drop --check to rewrite
+relish fmt all.toml --check         # canonical ordering, comments kept; drop --check to rewrite
 relish apply all.toml
 ```
 

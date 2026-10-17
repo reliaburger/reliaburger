@@ -1124,6 +1124,15 @@ impl BunClient {
             .await
     }
 
+    /// Fetch the newest events across the cluster that match `filter`,
+    /// oldest first, plus a warning per node that didn't answer.
+    pub async fn events_matching(
+        &self,
+        filter: &super::events_cmd::EventsFilter,
+    ) -> Result<crate::bun::cluster_view::ClusterEvents, RelishError> {
+        self.get_typed_json(&filter.path()).await
+    }
+
     /// Fetch the newest `limit` events recorded by the node this client
     /// talks to, and no other.
     pub async fn node_events(
@@ -1867,13 +1876,15 @@ impl BunClient {
         Ok(String::new())
     }
 
-    /// Execute a command inside a running instance.
+    /// Execute a command inside a running instance, once, without stdin or
+    /// a terminal. A command that ran answers with its output and exit
+    /// code, whatever the code.
     pub async fn exec(
         &self,
         app: &str,
         namespace: &str,
         command: &[String],
-    ) -> Result<String, RelishError> {
+    ) -> Result<crate::grill::ExecOutput, RelishError> {
         let url = format!("{}/v1/exec/{}/{}", self.base_url, app, namespace);
         let response = self
             .http()?
@@ -1889,12 +1900,10 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+        response.json().await.map_err(|e| RelishError::ApiError {
             status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-
-        Ok(json["output"].as_str().unwrap_or("").to_string())
+            body: format!("failed to parse exec response: {e}"),
+        })
     }
 
     /// Permanently retire a node after explicit external workload fencing.

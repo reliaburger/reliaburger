@@ -1394,9 +1394,21 @@ So the diagnostic commands return a small enum instead:
 pub enum CommandOutcome {
     Clean,     // ran fine, nothing wrong — exit 0
     Problems,  // ran fine, found failures — exit 1
-    Warnings,  // ran fine, only warnings — exit 2
+    Warnings,  // ran fine, only warnings — exit 3
+    Exited(u8), // `relish exec`: the remote command's own exit code
 }
 ```
+
+`Warnings` exited 2 until the 0.2.2 CLI review (#522) noticed that clap
+already exits 2 for a usage error, so `relish wtf --aap web` (a typo) and a
+degraded cluster looked the same to a script. One of them had to move, and
+clap's 2 is the Unix convention scripts already expect, so warnings took 3.
+`Exited` came in the same review: `relish exec` used to turn every failure into
+an HTTP 404 and every success into exit 0, whatever the command did. Now the
+API answers `{"output", "exit_code"}` and the binary exits with that code,
+through the same `finish_outcome`. A `u8` payload is all a process exit code
+can carry; a code outside 0 to 255 maps to `Problems`, so it can never read as
+success.
 
 `relish test` maps a report rejected by its profile to `Problems` and a clean
 one to `Clean`. That includes assertion failures, unknown evidence, required
@@ -1421,6 +1433,27 @@ everything. Same exit code, two very different events, and the code says which
 is which. This is the sort of thing Rust's enums make pleasant: the states are
 named, the `match` is exhaustive, and there's no magic integer floating around
 that a reader has to decode.
+
+The same review looked at `--output`. It's a *global* flag (`global = true` in
+clap), so clap accepts it after any command, and that's the trap: `relish -o
+json inspect web` parsed, ran, and printed the human table, because `inspect`
+never looked at the flag. A script asking for JSON got text and broke on its
+first parse. So `main` now asks before dispatching:
+
+```rust
+fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
+    if output == OutputFormat::Human || honours_output(command) {
+        return None;
+    }
+    // ... "this command has no json output; drop --output (or -o)"
+}
+```
+
+`honours_output` is one `match` over every `Command` variant, with no `_`
+arm. That's deliberate: add a command and the compiler refuses to build until
+you've said whether it prints JSON. A refusal exits 2, the usage-error code,
+since asking a command for output it doesn't have is a usage error. The flag
+also gained the short form the manual had been documenting all along, `-o`.
 
 Two smaller choices round out the command. Selection: `--filter
 scheduling,firewall` picks those groups, and an entry that names an exact case,
@@ -5697,7 +5730,7 @@ useful to report than a gap in the evidence. Missing evidence still can't
 quietly turn green.
 
 Relish preserves that contract in human, JSON and YAML output. Pass exits 0,
-Fail exits 1, and Unknown and Degraded exit 2, matching `wtf`'s warnings. The JSON schema is versioned
+Fail exits 1, and Unknown and Degraded exit 3, matching `wtf`'s warnings. The JSON schema is versioned
 and rejects unknown top-level fields so automation doesn't silently interpret
 a changed response as the old one.
 

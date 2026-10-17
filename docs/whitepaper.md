@@ -795,7 +795,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish status` | One-line cluster summary | `kubectl cluster-info` + `kubectl get nodes` |
 | `relish compile <path>` | Resolve config to final form | (none — Helm template + kustomize build) |
 | `relish lint <path>` | Validate config files | `kubectl --dry-run=client` (barely) |
-| `relish fmt <path>` | Format and sort TOML files | (none) |
+| `relish fmt <path>` | Format and sort a TOML file, keeping its comments | (none) |
 | `relish plan <path>` *(planned)* | Preview changes before apply | `terraform plan` (K8s has nothing equivalent) |
 | `relish diff <a> <b>` | Structural diff between two configs (not live cluster drift) | `kubectl diff` (limited) |
 | `relish apply <path>` | Apply configuration | `kubectl apply` |
@@ -803,7 +803,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish batch` | Submit, watch, cancel and read results of task arrays and mixed manifests | (none) |
 | `relish jobs` | Job run summaries and rates, or schedule definitions | `kubectl get jobs,cronjobs` |
 | `relish deploy <path>` | Trigger a rolling deploy from a config file | `kubectl set image` |
-| `relish events` *(planned)* | Streaming event log | `kubectl get events` (1h expiry) |
+| `relish events` | Recent cluster-wide events (the TUI streams them) | `kubectl get events` (1h expiry) |
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
 | `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
@@ -811,7 +811,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish metrics <app>` | An app's own Prometheus metrics, scraped by its nodes | (none — requires Prometheus) |
 | `relish dashboard` | Read-only web dashboard through your authenticated CLI | `kubectl proxy` + a dashboard install |
 | `relish wtf` | Automated health check | (none — requires runbooks + Prometheus alerts) |
-| `relish exec` | Run a command inside a running container | `kubectl exec` |
+| `relish exec` | Run a command once inside a running container and exit with its code (interactive exec is planned) | `kubectl exec` |
 | `relish exec --debug` *(planned)* | Debug container (separate identity) | `kubectl debug` |
 | `relish resolve <name>` | Query eBPF service map | `kubectl get endpoints` + `nslookup` |
 | `relish firewall <app>` *(planned)* | Show effective firewall rules | `kubectl get networkpolicy` + CNI tools |

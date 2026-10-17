@@ -9,7 +9,8 @@ a healthy backend, wherever it runs. Services are TCP-only. The hook rewrites
 backend, and published host ports are DNAT'd for TCP alone.
 
 ```sh
-relish resolve web        # VIP and healthy backends for an app
+relish resolve web                    # VIP and healthy backends for an app
+relish resolve web --namespace shop   # needed when two namespaces both run a web
 ```
 
 With rootful runc on Linux you can also enable the `.internal` DNS zone, and

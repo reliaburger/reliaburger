@@ -99,7 +99,10 @@ async fn answering_agent_router(
         while let Some(command) = receiver.recv().await {
             match command {
                 AgentCommand::Exec { response, .. } => {
-                    let _ = response.send(Ok("ok".to_string()));
+                    let _ = response.send(Ok(crate::grill::ExecOutput {
+                        output: "ok".into(),
+                        exit_code: 0,
+                    }));
                 }
                 AgentCommand::Stop { response, .. } => {
                     let _ = response.send(Ok(()));

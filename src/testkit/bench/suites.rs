@@ -355,7 +355,7 @@ async fn discovery_latency(context: &SuiteContext) -> Result<BenchMetric, String
             .exec(source, &context.namespace, &command)
             .await
             .map_err(|error| format!("workload DNS query failed: {error}"))?;
-        let probe = probe::parse_probe(&output)
+        let probe = probe::parse_probe(&output.output)
             .ok_or_else(|| format!("workload DNS probe emitted no status marker: {output:?}"))?;
         if probe.status != 0 {
             return Err(format!(
@@ -428,7 +428,7 @@ async fn network_throughput(context: &SuiteContext) -> Result<BenchMetric, Strin
             .exec(source, &context.namespace, &command)
             .await
             .map_err(|error| format!("service data-plane fetch failed: {error}"))?;
-        let probe = probe::parse_probe(&output).ok_or_else(|| {
+        let probe = probe::parse_probe(&output.output).ok_or_else(|| {
             format!("service data-plane probe emitted no status marker: {output:?}")
         })?;
         if probe.status != 0 {

@@ -1269,7 +1269,10 @@ async fn a_two_platform_build_runs_the_nodes_own_platform_under_runc() {
         .await;
     runtime.kill(&id).await.unwrap();
     assert_eq!(
-        answer.expect("the node's own platform must run").trim(),
+        answer
+            .expect("the node's own platform must run")
+            .output
+            .trim(),
         host,
         "the node must run linux/{host} from the index"
     );

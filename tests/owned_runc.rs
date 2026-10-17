@@ -280,7 +280,8 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
                 &["/bin/busybox".into(), "echo".into(), "adopted".into()]
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .output,
         "adopted\n"
     );
     record.log_stem = Some(root.path().join("older-generation/output"));

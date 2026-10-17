@@ -50,17 +50,22 @@ impl ManifestSource {
 pub enum ManifestFormat {
     /// Reliaburger's own TOML.
     Reliaburger,
-    /// Kubernetes YAML (any document with top-level `apiVersion` and `kind`).
+    /// Kubernetes YAML or JSON (a document with top-level `apiVersion` and `kind`).
     Kubernetes,
 }
 
-/// Tell Kubernetes YAML from Reliaburger TOML by its shape.
+/// Tell Kubernetes YAML or JSON from Reliaburger TOML by its shape.
 ///
 /// A top-level `apiVersion:` line is invalid TOML, so a document with one
 /// (and a `kind:`) can only be Kubernetes.
 pub fn detect_format(content: &str) -> ManifestFormat {
     let top_level = |key: &str| content.lines().any(|line| line.starts_with(key));
-    if top_level("apiVersion:") && top_level("kind:") {
+    // TOML can't open with `{`, so a JSON object naming its apiVersion and
+    // kind is Kubernetes JSON, which the YAML importer reads as it is.
+    let json = content.trim_start().starts_with('{')
+        && content.contains("\"apiVersion\"")
+        && content.contains("\"kind\"");
+    if json || (top_level("apiVersion:") && top_level("kind:")) {
         ManifestFormat::Kubernetes
     } else {
         ManifestFormat::Reliaburger
@@ -83,6 +88,12 @@ pub async fn load(source: &ManifestSource) -> Result<LoadedManifest, RelishError
         ManifestSource::Url(url) => fetch(url).await?,
     };
     parse(&content)
+}
+
+/// Read and parse a local manifest file. `lint`, `deploy`, `diff` and
+/// `compile` use this, so they read what `apply` reads.
+pub fn load_file(path: &Path) -> Result<LoadedManifest, RelishError> {
+    parse(&read_file(path)?)
 }
 
 /// Parse manifest text, importing it first when it's Kubernetes YAML.

@@ -174,6 +174,7 @@ impl TestContext {
                         return client
                             .exec(app, &self.namespace, command)
                             .await
+                            .map(|answer| answer.output)
                             .map_err(|error| {
                                 format!("workload inspection failed on {node}: {error}")
                             });
