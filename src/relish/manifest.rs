@@ -227,6 +227,36 @@ spec:
         assert!(report.contains("Deployment/web"), "{report}");
     }
 
+    const DEPLOYMENT_JSON: &str = r#"{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {"name": "web"},
+  "spec": {"template": {"spec": {"containers": [{"name": "web", "image": "nginx:1"}]}}}
+}"#;
+
+    #[test]
+    fn kubernetes_json_is_told_apart_from_toml() {
+        assert_eq!(detect_format(DEPLOYMENT_JSON), ManifestFormat::Kubernetes);
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn kubernetes_json_imports_like_yaml() {
+        let loaded = parse(DEPLOYMENT_JSON).unwrap();
+        assert_eq!(loaded.config.app["web"].image.as_deref(), Some("nginx:1"));
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn local_files_load_through_the_same_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web.yaml");
+        std::fs::write(&path, DEPLOYMENT).unwrap();
+        let loaded = load_file(&path).unwrap();
+        assert!(loaded.config.app.contains_key("web"));
+        assert!(loaded.migration_report.is_some());
+    }
+
     #[test]
     fn toml_parses_without_a_report() {
         let loaded = parse("[app.web]\nimage = \"nginx:1\"\n").unwrap();

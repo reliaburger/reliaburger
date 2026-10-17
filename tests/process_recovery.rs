@@ -1049,7 +1049,14 @@ async fn exec_returns_output_only_after_retiring_surviving_children() {
     let gone = exec_process_is_gone(pid).await;
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
-    assert_eq!(output.unwrap(), "stdout\nstderr");
+    // D34: the command's own exit code comes back with its output.
+    assert_eq!(
+        output.unwrap(),
+        reliaburger::grill::ExecOutput {
+            output: "stdout\nstderr".into(),
+            exit_code: 7,
+        }
+    );
     assert!(gone, "exec returned while its descendant remained");
 }
 

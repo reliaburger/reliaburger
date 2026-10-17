@@ -1,4 +1,5 @@
 pub mod audit_cmd;
+pub mod events_cmd;
 pub mod bench_cmd;
 pub mod bench_jobs;
 pub mod ca_cmd;

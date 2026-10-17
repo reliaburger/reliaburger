@@ -391,7 +391,9 @@ mod tests {
     fn command_outcome_exit_codes() {
         assert_eq!(CommandOutcome::Clean.exit_code(), 0);
         assert_eq!(CommandOutcome::Problems.exit_code(), 1);
-        assert_eq!(CommandOutcome::Warnings.exit_code(), 2);
+        // 2 is clap's usage error, so warnings take 3.
+        assert_eq!(CommandOutcome::Warnings.exit_code(), 3);
+        assert_eq!(CommandOutcome::Exited(42).exit_code(), 42);
     }
 
     #[tokio::test]

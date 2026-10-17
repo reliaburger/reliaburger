@@ -3891,7 +3891,88 @@ mod tests {
     #[test]
     fn parse_resolve_command() {
         let cli = parse(&["relish", "resolve", "redis"]).unwrap();
-        assert!(matches!(cli.command, Command::Resolve { ref name } if name == "redis"));
+        assert!(matches!(
+            cli.command,
+            Command::Resolve { ref name, namespace: None } if name == "redis"
+        ));
+    }
+
+    #[test]
+    fn resolve_takes_a_namespace() {
+        let cli = parse(&["relish", "resolve", "redis", "--namespace", "prod"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Resolve { ref name, namespace: Some(ref namespace) }
+                if name == "redis" && namespace == "prod"
+        ));
+    }
+
+    #[test]
+    fn short_o_selects_the_output_format() {
+        let cli = parse(&["relish", "-o", "json", "token", "list"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Json);
+        let cli = parse(&["relish", "status", "-o", "yaml"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn events_parses_its_filters() {
+        let cli = parse(&[
+            "relish",
+            "events",
+            "--app",
+            "web",
+            "--severity",
+            "warning",
+            "--limit",
+            "20",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Events {
+                app,
+                severity,
+                limit,
+            } => {
+                assert_eq!(app.as_deref(), Some("web"));
+                assert_eq!(
+                    severity,
+                    Some(reliaburger::bun::events::EventSeverity::Warning)
+                );
+                assert_eq!(limit, 20);
+            }
+            _ => panic!("expected Events command"),
+        }
+        assert!(parse(&["relish", "events"]).is_ok());
+    }
+
+    #[test]
+    fn machine_output_is_refused_where_a_command_ignores_it() {
+        for args in [
+            &["relish", "-o", "json", "inspect", "web"][..],
+            &["relish", "-o", "json", "routes"],
+            &["relish", "-o", "yaml", "logs", "web"],
+            &["relish", "-o", "json", "lint", "app.toml"],
+            &["relish", "-o", "json", "snapshot", "list", "db"],
+            &["relish", "-o", "json", "token", "create", "ci", "--role", "deployer"],
+        ] {
+            let cli = parse(args).unwrap();
+            assert!(
+                output_refusal(&cli.command, cli.output).is_some(),
+                "{args:?} accepted an output format it ignores"
+            );
+        }
+        for args in [
+            &["relish", "-o", "json", "status"][..],
+            &["relish", "-o", "json", "token", "list"],
+            &["relish", "-o", "json", "events"],
+            &["relish", "-o", "json", "resolve", "redis"],
+            &["relish", "-o", "json", "wtf"],
+            &["relish", "inspect", "web"],
+        ] {
+            let cli = parse(args).unwrap();
+            assert_eq!(output_refusal(&cli.command, cli.output), None, "{args:?}");
+        }
     }
 
     #[test]

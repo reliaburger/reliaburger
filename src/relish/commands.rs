@@ -3915,6 +3915,79 @@ mod tests {
         BunClient::new("http://127.0.0.1:1")
     }
 
+    #[cfg(feature = "kubernetes")]
+    const K8S_DEPLOYMENT: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n      - name: web\n        image: nginx:1\n";
+
+    /// `lint`, `diff` and `compile` read Kubernetes YAML the way `apply`
+    /// does, through `manifest::parse`.
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn local_config_commands_accept_kubernetes_yaml() {
+        let file = write_temp_config(K8S_DEPLOYMENT);
+        lint(file.path()).unwrap();
+        diff(file.path(), None).unwrap();
+        compile(file.path()).unwrap();
+        let config = load_config_file(file.path()).unwrap();
+        assert!(config.app.contains_key("web"));
+    }
+
+    fn service(namespace: &str) -> crate::onion::types::ResolveResponse {
+        crate::onion::types::ResolveResponse {
+            app_name: "redis".into(),
+            namespace: namespace.into(),
+            vip: "127.128.0.2".into(),
+            port: 6379,
+            healthy_backends: 1,
+            total_backends: 1,
+            backends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_picks_the_named_namespace() {
+        let services = vec![service("prod"), service("staging")];
+        let found = select_service(services, "redis", Some("staging")).unwrap();
+        assert_eq!(found.namespace, "staging");
+    }
+
+    #[test]
+    fn resolve_refuses_a_name_in_several_namespaces() {
+        let services = vec![service("prod"), service("staging")];
+        let message = select_service(services, "redis", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("prod")
+                && message.contains("staging")
+                && message.contains("--namespace"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn resolve_without_a_namespace_takes_the_only_match() {
+        let found = select_service(vec![service("prod")], "redis", None).unwrap();
+        assert_eq!(found.namespace, "prod");
+        assert!(select_service(vec![service("prod")], "redis", Some("dev")).is_err());
+    }
+
+    #[test]
+    fn resolve_prints_the_namespace() {
+        let shown = ResolvedService(service("prod")).to_string();
+        assert!(shown.contains("Namespace: prod"), "{shown}");
+    }
+
+    #[test]
+    fn exec_passes_the_remote_exit_code_through() {
+        use crate::relish::CommandOutcome;
+        assert_eq!(exec_outcome(0), CommandOutcome::Clean);
+        assert_eq!(exec_outcome(3), CommandOutcome::Exited(3));
+        assert_eq!(exec_outcome(255), CommandOutcome::Exited(255));
+        // Outside a process exit code's range: still a failure, never 0.
+        assert_eq!(exec_outcome(256), CommandOutcome::Problems);
+        assert_eq!(exec_outcome(-1), CommandOutcome::Problems);
+    }
+
     #[test]
     fn secret_pubkey_prints_age_key_from_bootstrap() {
         let dir = tempfile::tempdir().unwrap();

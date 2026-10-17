@@ -3001,6 +3001,32 @@ mod tests {
         );
     }
 
+    /// D34: a command that ran and failed is an answer, not an HTTP error.
+    #[tokio::test]
+    async fn exec_returns_the_remote_exit_code() {
+        let app = axum::Router::new().route(
+            "/v1/exec/web/default",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"output": "boom\n", "exit_code": 3}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let result = client.exec("web", "default", &["false".into()]).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap(),
+            crate::grill::ExecOutput {
+                output: "boom\n".into(),
+                exit_code: 3,
+            }
+        );
+    }
+
     #[test]
     fn explicit_ca_constructor_refuses_invalid_trust_material() {
         assert!(

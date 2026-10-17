@@ -291,6 +291,72 @@ path = "/health"
         assert!(err.to_string().contains("invalid TOML"), "got: {err}");
     }
 
+    /// D35: `relish fmt` used to round-trip through `toml::Value` and drop
+    /// every comment. Full-line comments travel with the key or section they
+    /// sit above, and a trailing comment stays on its line.
+    #[test]
+    fn fmt_keeps_every_comment() {
+        let input = "# The web tier.\n\
+                     [app.web]\n\
+                     # Pinned until the cache fix ships.\n\
+                     image = \"web:v1\"\n\
+                     replicas = 3 # one per zone\n\
+                     \n\
+                     # Runs before every deploy.\n\
+                     [job.migrate]\n\
+                     image = \"web:v1\"\n\
+                     # end of file\n";
+        let formatted = format_toml(input).unwrap();
+        for comment in [
+            "# The web tier.",
+            "# Pinned until the cache fix ships.",
+            "replicas = 3 # one per zone",
+            "# Runs before every deploy.",
+            "# end of file",
+        ] {
+            assert!(formatted.contains(comment), "lost {comment:?}:\n{formatted}");
+        }
+        let section_comment = formatted.find("# Runs before every deploy.").unwrap();
+        assert!(section_comment < formatted.find("[job.migrate]").unwrap());
+        let key_comment = formatted.find("# Pinned").unwrap();
+        assert!(key_comment < formatted.find("image").unwrap());
+    }
+
+    #[test]
+    fn fmt_moves_a_section_with_the_comment_above_it() {
+        let input = "[app.web]\nimage = \"web:v1\"\n\n# Team budget.\n[namespace.team]\ncpu = \"8000m\"\n";
+        let formatted = format_toml(input).unwrap();
+        assert!(
+            formatted.starts_with("# Team budget.\n[namespace.team]\n"),
+            "got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn fmt_normalises_spacing_and_blank_lines() {
+        let input = "[app.web]\n   image=\"web:v1\"\n\n\n   port   =   8080\n[app.api]\nimage = \"api:v1\"\n";
+        let formatted = format_toml(input).unwrap();
+        assert_eq!(
+            formatted,
+            "[app.api]\nimage = \"api:v1\"\n\n[app.web]\nimage = \"web:v1\"\nport = 8080\n"
+        );
+    }
+
+    #[test]
+    fn fmt_with_comments_is_idempotent() {
+        let input = "# top\n[job.a]\nimage = \"a:1\" # pinned\n\n# web\n[app.web]\n# replicas\nreplicas = 2\nimage = \"w:1\"\n";
+        let first = format_toml(input).unwrap();
+        assert_eq!(first, format_toml(&first).unwrap());
+        assert!(is_formatted(&first).unwrap());
+    }
+
+    #[test]
+    fn fmt_keeps_array_of_tables_in_order() {
+        let input = "[[app.web.volume]]\npath = \"/b\"\n\n[[app.web.volume]]\npath = \"/a\"\n";
+        let formatted = format_toml(input).unwrap();
+        assert!(formatted.find("/b").unwrap() < formatted.find("/a").unwrap());
+    }
+
     #[test]
     fn fmt_emits_top_level_scalars_before_sections() {
         // A top-level scalar emitted after a section header would be
