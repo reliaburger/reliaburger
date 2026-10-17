@@ -27,6 +27,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 import contracts as c
+import archive_reuse
 import coverage_contract as k
 from coverage_owner import Handler, request
 import gates
@@ -176,9 +177,13 @@ def child(configuration, arguments, environment, run=subprocess.run):
         discovery_exit = discovered.returncode
         c.require(discovery_exit == 0, 'actual Make discovery failed')
         c.selected(c.read_json(directory / 'discovery.json'))
+        if 'archive_extraction' in expected['entry']:
+            archive_reuse.verify_files(root, expected['entry']['archive_extraction'])
         with (directory / 'execution.log').open('wb') as output:
             completed = run(executed, cwd=root, env=environment, stdout=output, stderr=subprocess.STDOUT)
         status = completed.returncode
+        if 'archive_extraction' in expected['entry']:
+            archive_reuse.verify_files(root, expected['entry']['archive_extraction'])
         if source.is_file():
             shutil.copyfile(source, directory / 'junit.xml')
         if status == 0:
@@ -238,6 +243,15 @@ def execute(root, directory, context, entry, *, tools=None, environment=None, ru
     # The helper base contains the common preapproved profile; Make appends only
     # the original recipe suffix. Archived owners keep their original options.
     archived = entry.get('archive_origin') is not None
+    if archived:
+        c.require('archive_extraction' in entry, 'verified archive extraction required')
+        archive_reuse.validate(entry['archive_extraction'], context, entry['archive_origin'], tools['nextest'])
+        archive_reuse.verify_files(root, entry['archive_extraction'])
+        for name, digest in entry['archive_extraction']['files'].items():
+            c.require(name not in entry['inputs'] or entry['inputs'][name] == digest,
+                      'archive input disagrees with extraction')
+        entry['inputs'].update(entry['archive_extraction']['files'])
+        (directory / archive_reuse.RECEIPT).write_text(json.dumps(entry['archive_extraction'], sort_keys=True, indent=2) + '\n')
     split = entry.get('partition')
     prefix = (w.ARCHIVED_SELECTORS if archived else ['--profile', 'ci']) + (['--partition', split] if split else [])
     suffix, _ = w.make_selection(root, entry['owner_command'][1], archived=archived, partition=split)
@@ -286,6 +300,14 @@ def execute(root, directory, context, entry, *, tools=None, environment=None, ru
 def evidence(expected, directory, required):
     """Require actual Make completion and exact selected successful case IDs."""
     directory = Path(directory)
+    entry = expected['entry']
+    if 'archive_origin' in entry:
+        c.require('archive_extraction' in entry, 'archive owner lacks extraction evidence')
+        extraction = c.read_json(directory / archive_reuse.RECEIPT)
+        c.require(extraction == entry['archive_extraction'], 'sealed archive extraction changed')
+        archive_reuse.validate(extraction, expected['context'], entry['archive_origin'], expected['tools']['nextest'])
+        c.require(all(entry['inputs'].get(name) == digest for name, digest in extraction['files'].items()),
+                  'Make inputs differ from extracted archive')
     owner = c.read_json(directory / 'owner.json')
     c.fields(owner, ('schema_version', 'context', 'nonce', 'command', 'exit_code',
                      'interception_count', 'child_exit', 'control_errors', 'child_sha256', 'expected_sha256'))

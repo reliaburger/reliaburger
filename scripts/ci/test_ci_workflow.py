@@ -70,6 +70,21 @@ class EvidenceTests(unittest.TestCase):
     def setUp(self):
         self.jobs = jobs((WORKFLOWS / "ci.yml").read_text())
 
+    def test_archive_jobs_prepare_once_and_all_owners_use_the_trusted_receipt(self):
+        for job in ('cluster', 'acceptance'):
+            with self.subTest(job=job):
+                blocks = steps(self.jobs[job])
+                prepares = [i for i, step in enumerate(blocks) if 'workflow_adapter.py extract ' in step]
+                self.assertEqual(len(prepares), 1)
+                self.assertIn('id: extract', blocks[prepares[0]])
+                owners = [i for i, step in enumerate(blocks) if 'workflow_adapter.py produce ' in step]
+                self.assertTrue(owners)
+                for index in owners:
+                    self.assertLess(prepares[0], index)
+                    self.assertIn('--archive-extraction-sha256 "$EXTRACTION_SHA256"', blocks[index])
+                    self.assertIn('EXTRACTION_SHA256: ${{ steps.extract.outputs.archive_extraction_sha256 }}', blocks[index])
+                self.assertNotIn('ARCHIVED:', self.jobs[job])
+
     EXPECTED_OWNERS = {
         'portable-linux': ('portable', 'linux'),
         'portable-darwin': ('macos', 'darwin'),

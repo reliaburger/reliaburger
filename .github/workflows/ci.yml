@@ -406,8 +406,6 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -417,12 +415,31 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: nextest-archive
-      - name: Multi-node cluster suites
-        id: cluster_tests
+      - name: Extract the verified archive once
+        id: extract
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py extract --root . --host linux --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+      - name: Retain archive extraction diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-extraction-${{ github.job }}
+          path: |
+            archive-extraction.json
+            archive-extraction.log
+            archive-extraction-binaries.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Multi-node cluster suites
+        id: cluster_tests
+        env:
+          EXTRACTION_SHA256: ${{ steps.extract.outputs.archive_extraction_sha256 }}
+        run: |
+          mkdir -p target
+          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --archive-extraction-sha256 "$EXTRACTION_SHA256" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain cluster-tests current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -445,8 +462,6 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -456,12 +471,31 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: nextest-archive
-      - name: Wall-clock acceptance
-        id: slow_tests
+      - name: Extract the verified archive once
+        id: extract
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py extract --root . --host linux --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+      - name: Retain archive extraction diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-extraction-${{ github.job }}
+          path: |
+            archive-extraction.json
+            archive-extraction.log
+            archive-extraction-binaries.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Wall-clock acceptance
+        id: slow_tests
+        env:
+          EXTRACTION_SHA256: ${{ steps.extract.outputs.archive_extraction_sha256 }}
+        run: |
+          mkdir -p target
+          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --archive-extraction-sha256 "$EXTRACTION_SHA256" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain slow-tests current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -472,11 +506,13 @@ jobs:
           retention-days: 14
       - name: Single-node upgrade
         id: upgrade_node
+        env:
+          EXTRACTION_SHA256: ${{ steps.extract.outputs.archive_extraction_sha256 }}
         if: ${{ !cancelled() }}
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --archive-extraction-sha256 "$EXTRACTION_SHA256" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain upgrade-node current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -487,11 +523,13 @@ jobs:
           retention-days: 14
       - name: Cluster upgrade
         id: upgrade_cluster
+        env:
+          EXTRACTION_SHA256: ${{ steps.extract.outputs.archive_extraction_sha256 }}
         if: ${{ !cancelled() }}
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --archive-extraction-sha256 "$EXTRACTION_SHA256" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain upgrade-cluster current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -521,11 +559,13 @@ jobs:
         run: sudo scripts/standard-clients-host.sh --provision
       - name: Standard registry clients
         id: standard_clients
+        env:
+          EXTRACTION_SHA256: ${{ steps.extract.outputs.archive_extraction_sha256 }}
         if: ${{ !cancelled() }}
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --archive-extraction-sha256 "$EXTRACTION_SHA256" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain standard-clients current execution envelope
         if: always()
         uses: actions/upload-artifact@v4

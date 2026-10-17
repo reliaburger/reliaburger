@@ -299,6 +299,28 @@ Coverage is unaffected: only the Linux portable job measures it.
 
 ## Finite contracts and current evidence
 
+The cluster and acceptance jobs each prepare their downloaded nextest archive
+once, before running any owner. `workflow_adapter.py extract` checks the
+successful builder's archive and runtime receipts, then asks nextest to list
+only binaries while extracting. This preparation runs no test binary. Each
+owner's actual discovery and execution use the extracted Cargo/binary metadata
+and the same remapped target directory, through the original Make recipe.
+
+The preparation receipt inventories the extracted metadata, executables,
+libraries and build-script outputs. Its digest comes from the workflow step;
+each owner checks those files before discovery, between discovery and execution,
+and after execution, then retains the receipt in its sealed envelope. A missing
+or changed payload fails instead of rebuilding or extracting over it. Reports
+and later owner evidence are not immutable build inputs. A rerun prepares a
+fresh extraction for its current attempt, even when its successful builder
+belongs to an earlier attempt of the same run and commit.
+
+[`test_archive_reuse_nextest.py`](../scripts/ci/test_archive_reuse_nextest.py)
+compares archive and extracted-metadata discovery, JUnit and failure status
+using the pinned nextest and a tiny scripted test executable. It compiles no
+Rust and proves tool compatibility; the hosted owners still supply the real
+product execution evidence.
+
 [`tests/contracts/manifest.json`](../tests/contracts/manifest.json) is the finite
 selection contract for the audit fixes and their final lifecycle controls.
 [`ignored-bindings.json`](../tests/contracts/ignored-bindings.json) preserves the

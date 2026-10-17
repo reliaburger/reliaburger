@@ -109,7 +109,10 @@ class WorkflowAssembly(unittest.TestCase):
 
     def test_cluster_suffix_keeps_trailing_filter_space_and_archive_options(self):
         selectors, environment = self.w.make_selection(self.root, 'test-cluster', archived=True)
-        self.assertEqual(selectors, ['--archive-file', 'tests.tar.zst', '--extract-to', '.', '--extract-overwrite', '--workspace-remap', '.', '--profile', 'ci', '--run-ignored=only', '-E', 'binary(cluster_failover) | binary(cluster_gossip) '])
+        self.assertEqual(selectors, ['--cargo-metadata', 'target/nextest/cargo-metadata.json',
+                                    '--binaries-metadata', 'target/nextest/binaries-metadata.json',
+                                    '--target-dir-remap', 'target', '--workspace-remap', '.', '--profile', 'ci',
+                                    '--run-ignored=only', '-E', 'binary(cluster_failover) | binary(cluster_gossip) '])
         self.assertEqual(environment, {'RELIABURGER_CLUSTER_TESTS': '1'})
 
     def test_linux_preserves_ebpf_exclusion_and_image_environment(self):

@@ -19,6 +19,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 import contracts as c
 import gates
+import archive_reuse
 
 
 OWNERS = {
@@ -35,10 +36,7 @@ OWNERS = {
     'standard-clients': ['make', 'test-standard-clients'],
 }
 ARCHIVE_COMMAND = ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst']
-ARCHIVED_SELECTORS = [
-    '--archive-file', 'tests.tar.zst', '--extract-to', '.',
-    '--extract-overwrite', '--workspace-remap', '.', '--profile', 'ci',
-]
+ARCHIVED_SELECTORS = archive_reuse.SELECTORS
 OCI_BUILD_COMMAND = [
     'cargo', 'test', '--features', 'ebpf', '--test', 'owned_runc',
     '--test', 'owned_network', '--test', 'oci_crash',

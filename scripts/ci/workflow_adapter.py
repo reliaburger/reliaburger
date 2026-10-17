@@ -20,6 +20,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 import completion
+import archive_reuse
 import contracts as c
 import coverage_contract as coverage
 import coverage_owner
@@ -258,7 +259,7 @@ def cron_dependencies(root, directory=None, run=subprocess.run, tools=None):
     return observations
 
 
-def produce(root, manifest_path, gate, context, directory, needs=None, shard=None):
+def produce(root, manifest_path, gate, context, directory, needs=None, shard=None, extraction_digest=None):
     root, directory = Path(root).resolve(), Path(directory).resolve()
     manifest = c.inventory(c.read_json(manifest_path), root)
     c.require(gate in JOBS and gate in manifest['gates'], 'unknown required workflow gate')
@@ -289,6 +290,9 @@ def produce(root, manifest_path, gate, context, directory, needs=None, shard=Non
             entry['archive_runtime'] = runtime
         approved = []
         tools = make_owner.capture_tools(dict(os.environ), subprocess.run)
+        if archived:
+            entry['archive_extraction'] = archive_reuse.load(root, extraction_digest, context, origin,
+                                                            tools['nextest'])
         dependencies = cron_dependencies(root, tools=tools) if gate == 'optimized-cron' else None
         status = make_owner.execute(root, directory, context, entry, tools=tools, on_expected=approved.append)
         if status:
@@ -413,14 +417,29 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['produce', 'aggregate', 'archive'])
+    parser.add_argument('operation', choices=['produce', 'aggregate', 'archive', 'extract'])
     for name in ('root', 'commit', 'run-id', 'attempt'):
         parser.add_argument('--' + name, required=True)
     for name in ('manifest', 'gate', 'host', 'directory', 'needs', 'github-output', 'ignored-bindings',
-                 'shard', 'event'):
+                 'shard', 'event', 'archive-extraction-sha256'):
         parser.add_argument('--' + name)
     args = parser.parse_args(argv)
     context = dict(commit=args.commit, run_id=args.run_id, attempt=args.attempt)
+    if args.operation == 'extract':
+        c.require(args.host == 'linux' and args.github_output and args.needs,
+                  'current Linux extraction context and builder outputs required')
+        context['host'] = args.host
+        needs = c.read_json(args.needs)
+        gates.candidate_sources(Path(args.root).resolve(), context['commit'], subprocess.run)
+        runtime = verify_archive_runtime(args.root, context, needs)
+        origin = archive_origin(context, needs, runtime)
+        environment = dict(os.environ)
+        tools = make_owner.capture_tools(environment, subprocess.run)
+        make_owner.tool_bytes(tools)
+        archive_reuse.prepare(args.root, context, origin, tools['nextest'], environment=environment)
+        write_output(args.github_output, 'archive_extraction_sha256',
+                     c.digest(Path(args.root) / archive_reuse.RECEIPT))
+        return 0
     if args.operation == 'archive':
         c.require(args.host == 'linux' and args.github_output, 'current Linux archive outputs required')
         base = dict(os.environ)
@@ -472,7 +491,8 @@ def main(argv=None):
     context['host'] = args.host
     needs = c.read_json(args.needs) if args.needs else None
     shard = parse_shard(args.gate, args.shard)
-    status, digest = produce(args.root, args.manifest, args.gate, context, args.directory, needs, shard)
+    status, digest = produce(args.root, args.manifest, args.gate, context, args.directory, needs, shard,
+                             args.archive_extraction_sha256)
     if status:
         return status
     write_output(args.github_output, output_name(args.gate, shard), digest)

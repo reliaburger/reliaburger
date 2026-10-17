@@ -84,11 +84,15 @@ class MakeOwner(unittest.TestCase):
             return SimpleNamespace(returncode=status)
         if 'list' in command:
             kwargs['stdout'].write(json.dumps(self.discovery).encode())
+            if self.mode == 'mutate-after-list':
+                (self.root / 'target/debug/bun').write_text('changed after discovery')
             return SimpleNamespace(returncode=self.discovery_status)
         if self.mode != 'no-junit':
             report = self.root / self.entry['junit_source']
             report.parent.mkdir(parents=True, exist_ok=True)
             report.write_text(self.report)
+        if self.mode == 'mutate-after-run':
+            (self.root / 'target/debug/bun').write_text('changed during execution')
         return SimpleNamespace(returncode=self.child_status)
 
     def execute(self):
@@ -231,3 +235,62 @@ class MakeOwner(unittest.TestCase):
         self.directory.joinpath('junit.xml').write_text('<testsuites/>')
         with self.assertRaises(c.Invalid):
             self.evidence()
+
+    def archived(self):
+        import archive_reuse
+        self.context['host'] = 'linux'
+        with (self.root / 'Makefile').open('a') as output:
+            output.write('test-cluster:\n\tRELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only\n')
+        (self.root / 'tests.tar.zst').write_text('synthetic archive')
+        builder = dict(schema_version=1, **self.context, command=w.ARCHIVE_COMMAND,
+                       exit_code=0, archive_sha256=c.digest(self.root / 'tests.tar.zst'))
+        (self.root / 'archive-origin.json').write_text(json.dumps(builder))
+        origin = dict(path='archive-origin.json', sha256=c.digest(self.root / 'archive-origin.json'), builder=builder)
+
+        def extract(command, **kwargs):
+            for name in (*archive_reuse.METADATA, 'target/debug/bun'):
+                path = self.root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('synthetic runtime ' + name)
+            return SimpleNamespace(returncode=0)
+
+        row = archive_reuse.prepare(self.root, self.context, origin, self.tools['nextest'], run=extract)
+        selectors, environment = w.make_selection(self.root, 'test-cluster', archived=True)
+        self.entry.update(gate='cluster-tests', host='linux', owner_command=['make', 'test-cluster'],
+                          selectors=selectors, environment=environment, archive_origin=origin, archive_extraction=row)
+        self.entry['inputs']['tests.tar.zst'] = builder['archive_sha256']
+
+    def test_archived_owner_preserves_make_and_seals_reused_metadata(self):
+        self.archived()
+        self.assertEqual(self.execute(), 0)
+        self.assertEqual(self.evidence(), {('reliaburger', 'pickle::tests::bounded')})
+        commands = [cmd for cmd, _ in self.calls if cmd[0] == self.tools['nextest']['path']]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertNotIn('--archive-file', command)
+            self.assertIn('--binaries-metadata', command)
+        # Aggregation does not need the extracted binaries from the producer.
+        (self.root / 'target/debug/bun').unlink()
+        self.assertEqual(self.evidence(), {('reliaburger', 'pickle::tests::bounded')})
+
+    def test_archive_mutation_between_list_and_run_prevents_execution(self):
+        self.archived()
+        self.mode = 'mutate-after-list'
+        self.assertNotEqual(self.execute(), 0)
+        self.assertFalse(any('run' in cmd for cmd, _ in self.calls if cmd[0] == self.tools['nextest']['path']))
+        with self.assertRaises(c.Invalid):
+            self.evidence()
+
+    def test_archive_mutation_during_run_cannot_qualify_passing_junit(self):
+        self.archived()
+        self.mode = 'mutate-after-run'
+        self.assertNotEqual(self.execute(), 0)
+        with self.assertRaises(c.Invalid):
+            self.evidence()
+
+    def test_archive_owner_refuses_missing_preparation_instead_of_building(self):
+        self.archived()
+        del self.entry['archive_extraction']
+        with self.assertRaises(c.Invalid):
+            self.execute()
+        self.assertFalse(any(cmd[0] == 'make' for cmd, _ in self.calls))

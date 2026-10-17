@@ -21,7 +21,7 @@ class FrontdoorEnvironment(unittest.TestCase):
         scriptdir = self.root / 'scripts/ci'
         scriptdir.mkdir(parents=True)
         source = Path(__file__).parent
-        for name in ('contracts', 'gates', 'completion', 'coverage_contract',
+        for name in ('contracts', 'gates', 'archive_reuse', 'completion', 'coverage_contract',
                      'coverage_adapter', 'coverage_owner', 'owner_tools', 'make_owner',
                      'oci_driver', 'workflow_assembly', 'workflow_adapter'):
             shutil.copyfile(source / (name + '.py'), scriptdir / (name + '.py'))
