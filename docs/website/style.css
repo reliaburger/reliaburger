@@ -88,6 +88,17 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .release-pipeline li { counter-increment: stage; display: grid; grid-template-columns: 2.5rem minmax(0, 1fr); gap: 0 16px; border-top: 1px solid var(--line); padding: 12px 0; color: var(--muted); font-size: .9375rem; }
 .release-pipeline li::before { content: counter(stage, decimal-leading-zero); font: .75rem/2.2 var(--mono); color: var(--accent); }
 .release-pipeline strong { color: var(--ink); }
+/* Soak charts are copies of the qualification records' SVGs. They draw their
+   own light surface (and a dark one under a dark colour scheme), so they read
+   on this light page either way. 720 px wide, they shrink with the column. */
+.soak-charts-note { color: var(--muted); font-size: .9375rem; max-width: 720px; }
+.soak-charts { margin: 22px 0 6px; }
+.soak-charts h3 { margin: 0 0 10px; font-size: 1rem; font-weight: 600; }
+.soak-chart { margin: 0 0 18px; max-width: 720px; }
+.soak-chart img { display: block; max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
+.soak-chart a:focus-visible { outline: none; }
+.soak-chart a:focus-visible img { outline: 3px solid var(--accent); outline-offset: 2px; }
+.soak-chart figcaption { margin-top: 6px; color: var(--muted); font-size: .875rem; }
 #release-testing-results ul { margin: 0; padding: 4px 20px 16px 36px; }
 #release-testing-results li { margin: 8px 0; color: var(--muted); }
 #release-testing-results a { color: var(--ink); }

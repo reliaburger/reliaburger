@@ -131,6 +131,36 @@ every promoted release carries the four PDFs, and promotion marks it latest.
 The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
 from `main`; artefacts require GitHub sign-in and have limited retention.
 
+### Soak charts
+
+"How a release is tested" (`#release-testing`) shows the released version's
+soak charts: Bun memory, open fds and CPU from the app soak, and the same plus
+accepted jobs a second from the job soak. They are copies of the SVGs in
+`docs/qualification/<record>-charts/`, kept under the same directory names in
+`assets/soak/`, because the Pages workflow publishes only this directory.
+Each is an `<img>` linked to its own file, so a click opens it full size with
+the `<title>` on every line and mark, and `loading="lazy"` keeps the folded
+results from costing a visitor anything until they open them. The SVGs carry
+their own colours and a light surface; this page is light only
+(`color-scheme: light`), and an SVG drawn as an image follows the page's
+scheme, so the charts stay light here too. At 720 px they're wider than a
+phone and shrink with the column.
+
+At a promotion, replace them with the new release's
+([releasing step 9](../releasing.md#staging-a-candidate)):
+
+```sh
+rm -r docs/website/assets/soak
+mkdir docs/website/assets/soak
+cp -R docs/qualification/<app soak record>-charts docs/qualification/<job soak record>-charts \
+  docs/website/assets/soak/
+```
+
+then point the `<img>` and record links at them. `tests/suite/website.rs`
+fails while a chart differs from its record's copy, comes from another
+release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
+without being shown, and while the section misses any of the seven charts.
+
 ### Commands the installed release doesn't have
 
 The page and the READMEs are written on the development branch, but a visitor

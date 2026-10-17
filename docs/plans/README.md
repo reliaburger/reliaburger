@@ -10,7 +10,6 @@ the detail is in the GitHub milestones and issues.
 
 | Plan | What it is | Still open |
 |---|---|---|
-| [Soak charts](2026-10-17-soak-charts.md) | SVG charts of Bun memory, fds, CPU and accepted jobs a second in every soak record, with faults marked, and a `render-charts` command to backfill them (#979, part 1). | The landing-page embed, after #799 |
 | [Job retirement and record-read races](2026-10-10-job-retirement-read-races.md) | Retain filesystem cleanup across timeouts and validate atomically replaced records with one metadata inspection. | #654: review and GitHub checks |
 | [Jobs in the release soak](2026-10-10-plan-release-job-soak.md) | Exercise all job runtimes alongside apps and existing faults within the current V02 duration, plus the job qualification tiers for the 0.2.0 exit gate (D18-C, #686): the #668 throughput target, node-level faults and the recorded M8 measurements. | Staged fast/final qualification and resource-cap calibration; the 12-hour run is [#668](https://github.com/reliaburger/reliaburger/issues/668) |
 | [Container migration](2026-10-09-plan-container-migration.md) | The delivery plan for moving running workloads: who it's for, decisions, ordered spikes with go/no-go rules, and nine named milestones across 0.4.0, 0.4.1 and 0.5.0 (live moves). The [research](2026-09-28-research-container-migration.md) holds the CRIU findings, continuity contract and design reference; checked against main on 9 October. | [#268](https://github.com/reliaburger/reliaburger/pull/268): feasibility spikes, implementation and qualification |
@@ -56,6 +55,7 @@ and the fleet control plane ([#265](https://github.com/reliaburger/reliaburger/p
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
 is the summary of how that ended.
 
+- [Soak charts](archive/2026-10-17-soak-charts.md): SVG charts in every soak record, and the released version's on the homepage (#979)
 - [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)
 - [A million jobs, the September design](archive/2026-09-28-plan-million-jobs.md): superseded by the October plans; its M8 targets are recorded, not gated, by every job qualification run (D18-C)
 - [Cluster migration prerequisites](archive/2026-10-04-cluster-migration-prerequisites.md): superseded in 0.2.0 when leased applies moved to the common job lifecycle and the prerequisite claims were retired (#681)

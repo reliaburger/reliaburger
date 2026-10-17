@@ -773,9 +773,13 @@ the real `curl … | sh` install against it on every host we advertise.
    [How a release is tested](https://reliaburger.com/#release-testing)
    section (`#release-testing` in `index.html`) to the new release: its
    latest-release paragraph, its headline numbers with links to this
-   release's records, and the soak charts beside them. `tests/suite/website.rs`
+   release's records, and the soak charts beside them. The charts are copies
+   of the final app soak's and the final job soak's `-charts/` directories in
+   `docs/website/assets/soak/`, which holds only this release's
+   ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
    fails while the section names a version older than the installer's
-   default, or the release log's newest entry isn't this release.
+   default, the release log's newest entry isn't this release, or a chart
+   isn't a byte-for-byte copy of this release's record.
 
    Add the release's paragraph to the top of the
    [release log](release-log.md): the promotion date, how long qualifying it
