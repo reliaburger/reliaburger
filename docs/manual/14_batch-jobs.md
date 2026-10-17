@@ -199,8 +199,8 @@ relish manual batch
 
 Use the actual parent ID returned by submission in place of `1`. Watch shows
 child array IDs; use the small profile's ID in place of `2` for task detail.
-The example has 1,000 small tasks requesting 100m CPU and 32 MiB each, and 64
-large tasks requesting 1 CPU and 128 MiB each. The node packs actual attempts
+The example has 8 small tasks requesting 100m CPU and 32 MiB each, and
+2 large tasks requesting 1 CPU and 128 MiB each, so it finishes in seconds. The node packs actual attempts
 beside the web service, respecting both resource dimensions. Submission commits
 all profiles atomically; cancelling the parent cancels all profiles.
 

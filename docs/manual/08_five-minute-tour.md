@@ -2,7 +2,7 @@
 
 The same tour as the homepage's "Try it in five minutes": install, run a real
 Kubernetes app on a three-node laptop cluster, build and run an app of your
-own next to it, run a thousand jobs beside them, walk its network path,
+own next to it, run ten jobs beside them, walk its network path,
 measure it, break it and watch it heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
@@ -88,7 +88,7 @@ service calls `http://backend:9898/` by service name, exactly as it would in a
 Kubernetes pod. Run the `curl` a few times and the cashier changes as the
 ingress takes turns between the two replicas.
 
-## Run a thousand jobs beside it
+## Run ten jobs beside it
 
 ```sh
 relish batch submit burger/jobs.toml
@@ -96,10 +96,11 @@ relish batch watch 1
 relish jobs
 ```
 
-`burger/jobs.toml` asks for 1,064 tasks from the same `burger:v1` image in
-two resource profiles: 1,000 small ones that ask for 100m to 250m of CPU and
-32 to 64 MiB, and 64 larger ones that ask for a whole core and 128 MiB. Each task hashes a block of memory and
-prints a digest. The cluster stores each profile as a task array, a template
+`burger/jobs.toml` asks for 10 tasks from the same `burger:v1` image in
+two resource profiles: 8 small ones that ask for 100m to 250m of CPU and
+32 to 64 MiB, and 2 larger ones that ask for a whole core and 128 MiB. Each
+task hashes a block of memory and prints a digest, so the run takes a few
+seconds. The cluster stores each profile as a task array, a template
 and a count rather than a record per task, and packs the tasks onto the nodes
 around the apps already running there.
 

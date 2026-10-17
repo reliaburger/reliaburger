@@ -433,8 +433,8 @@ while IFS= read -r command <&3; do
             done
             wait "${WATCH_PID}"
             relish --output json batch-status "${BATCH_ID}" >"${BURGER_WORK}/summary.json"
-            python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert s["done"] and s["succeeded"]==1064 and s["failed"]==0 and s["not_run"]==0, s' "${BURGER_WORK}/summary.json"
-            say "All 1,064 tasks succeeded; the burger app kept serving orders."
+            python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert s["done"] and s["succeeded"]==10 and s["failed"]==0 and s["not_run"]==0, s' "${BURGER_WORK}/summary.json"
+            say "All 10 tasks succeeded; the burger app kept serving orders."
             printf '\n'
             sleep 1.5
             ;;
