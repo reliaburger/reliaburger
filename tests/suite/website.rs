@@ -273,9 +273,7 @@ const TOUR_JOBS_MAX: i64 = 16;
 
 /// Each cohort's `count` in the tour's job manifest, by cohort name.
 fn burger_job_counts() -> std::collections::BTreeMap<String, i64> {
-    let manifest: toml::Value = read(&format!("{BURGER_SOURCE}/jobs.toml"))
-        .parse()
-        .unwrap();
+    let manifest: toml::Value = read(&format!("{BURGER_SOURCE}/jobs.toml")).parse().unwrap();
     manifest["cohort"]
         .as_array()
         .unwrap()
@@ -316,13 +314,25 @@ fn the_tour_jobs_step_is_short_and_quotes_the_manifest() {
     let batch_manual = read("docs/manual/14_batch-jobs.md");
     let tour = read("scripts/demo/tour.sh");
     let quotes = [
-        ("homepage", &homepage, format!("{small} small and {large} larger")),
+        (
+            "homepage",
+            &homepage,
+            format!("{small} small and {large} larger"),
+        ),
         ("tour chapter", &manual, format!("asks for {total} tasks")),
         ("tour chapter", &manual, format!("{small} small ones")),
         ("tour chapter", &manual, format!("{large} larger ones")),
         ("book", &book, format!("{small} small and {large} larger")),
-        ("batch chapter", &batch_manual, format!("{small} small tasks")),
-        ("batch chapter", &batch_manual, format!("{large} large tasks")),
+        (
+            "batch chapter",
+            &batch_manual,
+            format!("{small} small tasks"),
+        ),
+        (
+            "batch chapter",
+            &batch_manual,
+            format!("{large} large tasks"),
+        ),
         ("tour.sh", &tour, format!("s[\"succeeded\"]=={total} ")),
         ("tour.sh", &tour, format!("All {total} tasks succeeded")),
     ];
