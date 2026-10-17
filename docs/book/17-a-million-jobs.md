@@ -3255,6 +3255,36 @@ There the old leader's executor keeps running after its control plane stops,
 which is the nastier case: its commands finish, and none of their reports may
 ever count.
 
+"None" turned out to be one word too strong. In CI the test once failed with
+"chunk 0 was accepted from the dead leader", on an array that had otherwise
+finished perfectly ([#1007](https://github.com/reliaburger/reliaburger/issues/1007)).
+The test killed the leader as soon as its view showed a succeeded task, and the
+leader writes a tick's accepted chunks a moment after it records that view. If
+the leader's own chunk 0 landed in that tick and the tick committed first, the
+leader had accepted its own report while it was still the leader. That's
+correct, and the old assertion failed it anyway. The same goes for a tick the
+old leader appended just before it died: the new leader commits it as part of
+its election, because Raft never drops an entry a majority already holds.
+
+So the question the test asks is *when* a report was accepted, not whose it
+was. Raft gives us a clean line. A new leader commits a blank entry in its own
+term straight after its election, and once it has applied an entry of its own
+term, every entry the old leader wrote is applied too. The test records the
+chunks accepted from the leader just before the kill, waits for
+`applied_own_term` (the applied log id's term equals the current term), records
+them again, and checks that the first set is inside the second. At the end, any
+chunk still owned by the dead leader must be in that takeover set, at attempt 1.
+A report accepted after the takeover, which is what the test exists to rule out,
+still fails it. `leader_id.get_term()` is openraft's accessor for the term half
+of a log id; the leader id is a struct rather than a bare number, so it's a
+method call and not a field.
+
+To make sure the legitimate case is always exercised, the kill now waits until
+the leader has had at least one chunk of its own accepted *and* still holds
+more. With the old assertion put back, that version failed five runs out of
+five with the CI message; with the new one it passed a hundred runs in a row on
+a busy laptop, each with two of the leader's chunks accepted before the kill.
+
 Finally, a regression guard. `relish bench --scenario` and `--compare` used to
 be mutually exclusive, so the throughput we were proudest of had none.
 `--compare OLD.json` now checks a scenario against an earlier report of the
