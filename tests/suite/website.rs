@@ -604,14 +604,7 @@ fn every_tour_step_is_one_command_block_then_one_paragraph() {
 
 const RELEASED_CLI: &str = "scripts/release/released-cli.tsv";
 
-/// TODO(#688): the tour was last recorded against the published 0.1.4
-/// install; 0.1.5 and 0.1.6 skipped the re-record. Re-record it against the
-/// published 0.2.0 install when 0.2.0 is promoted (docs/releasing.md, "Update
-/// the docs"), then set this to `None`. The exemption names the installer
-/// version it was granted under, so it lapses the moment the default moves.
-const TOUR_RECORDED_BEHIND: Option<(&str, &str)> = Some(("0.1.4", "v0.1.6"));
-
-/// The tag `install.sh` fetches by default, such as `v0.1.6`.
+/// The tag `install.sh` fetches by default, such as `v0.2.0`.
 fn installer_default() -> String {
     read("docs/website/install.sh")
         .split("${RELIABURGER_VERSION:-")
@@ -851,25 +844,12 @@ fn the_tour_recording_matches_the_installer_version() {
         "tour.sh no longer writes the version into the cast's title"
     );
     let installer = installer_default();
-    match TOUR_RECORDED_BEHIND {
-        None => assert_eq!(
-            format!("v{recorded}"),
-            installer,
-            "the tour was recorded against {recorded}, but install.sh installs {installer}; \
-             re-record it (docs/website/README.md, \"Re-recording the tour\")"
-        ),
-        Some((behind, granted_under)) => {
-            assert_eq!(
-                recorded, behind,
-                "the tour was re-recorded; set TOUR_RECORDED_BEHIND to None"
-            );
-            assert_eq!(
-                installer, granted_under,
-                "install.sh now installs {installer}: re-record the tour against it and set \
-                 TOUR_RECORDED_BEHIND to None"
-            );
-        }
-    }
+    assert_eq!(
+        format!("v{recorded}"),
+        installer,
+        "the tour was recorded against {recorded}, but install.sh installs {installer}; \
+         re-record it (docs/website/README.md, \"Re-recording the tour\")"
+    );
 }
 
 /// Each release in the roadmap's list with the name it gives it
@@ -991,4 +971,213 @@ fn the_demo_assets_come_from_the_installed_release() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&output.stdout), installer_default());
+}
+
+/// The page's `release-testing` section, from its opening tag to its end.
+fn release_testing_section(page: &str) -> &str {
+    let start = page
+        .find("<section id=\"release-testing\"")
+        .expect("the page has no release-testing section");
+    let end = start + page[start..].find("</section>").unwrap();
+    &page[start..end]
+}
+
+/// Every `X.Y.Z` version a text names, as numbers.
+fn versions_named(text: &str) -> Vec<(u64, u64, u64)> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter_map(|word| {
+            let parts: Vec<&str> = word.trim_matches('.').split('.').collect();
+            match parts.as_slice() {
+                [major, minor, patch] => Some((
+                    major.parse().ok()?,
+                    minor.parse().ok()?,
+                    patch.parse().ok()?,
+                )),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// "How a release is tested" follows the jobs section, shows the newest
+/// release's record and names no release older than the one the installer
+/// fetches, so a promotion can't leave it describing the last one (#979).
+#[test]
+fn the_release_testing_section_shows_the_installed_release() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id);
+    assert_eq!(
+        position("release-testing"),
+        position("job-throughput").map(|jobs| jobs + 1),
+        "the release-testing section should come straight after the jobs section"
+    );
+    let section = release_testing_section(&page);
+    let installed = installer_default();
+    let current = versions_named(&installed)[0];
+    let named = versions_named(&strip_tags(section));
+    assert!(
+        named.contains(&current),
+        "the release-testing section doesn't name {installed}"
+    );
+    for version in named {
+        assert!(
+            version >= current,
+            "the release-testing section names {version:?}, older than {installed}; \
+             refresh it (docs/releasing.md, step 9)"
+        );
+    }
+    let log = read("docs/release-log.md");
+    let newest = log
+        .lines()
+        .find(|line| line.starts_with("## "))
+        .expect("the release log has no entries");
+    assert!(
+        newest.starts_with(&format!("## {}:", installed.trim_start_matches('v'))),
+        "the release log's newest entry is {newest:?}, not {installed}"
+    );
+    for link in ["docs/release-log.md", "docs/testing.md#before-a-release"] {
+        assert!(
+            section.contains(link),
+            "the release-testing section doesn't link {link}"
+        );
+    }
+}
+
+/// Every `<img>` tag in `html`, from `<img` to its closing `>`.
+fn img_tags(html: &str) -> Vec<&str> {
+    html.match_indices("<img")
+        .map(|(start, _)| {
+            let end = start + html[start..].find('>').unwrap();
+            &html[start..=end]
+        })
+        .collect()
+}
+
+/// The value of `name="…"` in one tag, if the tag has it.
+fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!(" {name}=\"");
+    let start = tag.find(&marker)? + marker.len();
+    let end = start + tag[start..].find('"')?;
+    Some(&tag[start..end])
+}
+
+/// Where the homepage keeps its copies of the soak records' charts.
+const SOAK_CHARTS: &str = "docs/website/assets/soak";
+
+/// The release-testing section shows the installed release's soak charts:
+/// memory for an app soak and memory plus job rate for a job soak, each a
+/// byte-for-byte copy of a chart in a committed qualification record, each
+/// linked to that record, and nothing left over from an older release
+/// (#979). The Pages workflow publishes only `docs/website/`, so the page
+/// can't point into `docs/qualification/` directly.
+#[test]
+fn the_release_testing_section_shows_the_installed_release_s_soak_charts() {
+    let page = read("docs/website/index.html");
+    let section = release_testing_section(&page);
+    assert!(
+        !section.contains("TODO(#979)"),
+        "the release-testing section still has the charts placeholder"
+    );
+    let installed = installer_default();
+    let mut shown = Vec::new();
+    for tag in img_tags(section) {
+        let source = attribute(tag, "src").expect("a chart has no src");
+        let Some(chart) = source.strip_prefix("assets/soak/") else {
+            continue;
+        };
+        let (directory, file) = chart
+            .split_once('/')
+            .unwrap_or_else(|| panic!("{source} isn't assets/soak/<record>-charts/<chart>.svg"));
+        let record = directory
+            .strip_suffix("-charts")
+            .unwrap_or_else(|| panic!("{source} isn't in a <record>-charts directory"));
+        assert!(
+            record.contains(&format!("-{installed}-")),
+            "{source} comes from another release's record, not {installed}'s; \
+             refresh the charts (docs/releasing.md, step 9)"
+        );
+        let copy = std::fs::read(repository().join("docs/website").join(source))
+            .unwrap_or_else(|error| panic!("{source} isn't in docs/website: {error}"));
+        let original = std::fs::read(
+            repository()
+                .join("docs/qualification")
+                .join(directory)
+                .join(file),
+        )
+        .unwrap_or_else(|error| panic!("{source} has no original in docs/qualification: {error}"));
+        assert!(
+            copy == original,
+            "{source} differs from docs/qualification/{directory}/{file}; copy it again"
+        );
+        assert!(
+            attribute(tag, "alt").is_some_and(|alt| !alt.trim().is_empty()),
+            "{source} has no alt text"
+        );
+        for size in ["width", "height"] {
+            assert!(
+                attribute(tag, size).is_some(),
+                "{source} has no {size}, so the page jumps as it loads"
+            );
+        }
+        assert_eq!(
+            attribute(tag, "loading"),
+            Some("lazy"),
+            "{source} should load only when the results are opened"
+        );
+        assert!(
+            section.contains(&format!("docs/qualification/{record}.md")),
+            "the release-testing section doesn't link {record}.md, the record {source} comes from"
+        );
+        shown.push(format!("{directory}/{file}"));
+    }
+    for (kind, chart) in [("app soak", "sustained"), ("job soak", "job-qualification")] {
+        for file in ["rss.svg", "fds.svg", "cpu.svg"] {
+            assert!(
+                shown.iter().any(|s| s.contains(chart) && s.ends_with(file)),
+                "the release-testing section shows no {file} from the {kind}"
+            );
+        }
+    }
+    assert!(
+        shown
+            .iter()
+            .any(|s| s.contains("job-qualification") && s.ends_with("jobs.svg")),
+        "the release-testing section shows no job-rate chart from the job soak"
+    );
+    let mut on_disk = Vec::new();
+    for directory in std::fs::read_dir(repository().join(SOAK_CHARTS)).unwrap() {
+        let directory = directory.unwrap().path();
+        for file in std::fs::read_dir(&directory).unwrap() {
+            let file = file.unwrap().path();
+            on_disk.push(format!(
+                "{}/{}",
+                directory.file_name().unwrap().to_string_lossy(),
+                file.file_name().unwrap().to_string_lossy()
+            ));
+        }
+    }
+    on_disk.sort();
+    shown.sort();
+    assert_eq!(
+        on_disk, shown,
+        "{SOAK_CHARTS} should hold exactly the charts the page shows; remove the old release's"
+    );
+}
+
+/// The charts are 720 px wide, wider than a phone: they scale down with the
+/// column instead of pushing the page sideways (#979).
+#[test]
+fn soak_charts_shrink_to_fit_a_phone() {
+    let style = read("docs/website/style.css");
+    let rule = style
+        .lines()
+        .find(|line| line.starts_with(".soak-chart img"))
+        .expect("style.css has no .soak-chart img rule");
+    for declaration in ["max-width: 100%", "height: auto"] {
+        assert!(
+            rule.contains(declaration),
+            ".soak-chart img should have {declaration}: {rule}"
+        );
+    }
 }
