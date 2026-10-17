@@ -1181,3 +1181,23 @@ fn soak_charts_shrink_to_fit_a_phone() {
         );
     }
 }
+
+/// A release pipeline step is a bold title, bare text and sometimes `<code>`.
+/// As grid items, each of those took its own cell, so the description fell
+/// into the narrow number column one word to a line. The steps lay out as
+/// blocks, with the number in the left padding.
+#[test]
+fn release_pipeline_steps_flow_as_one_paragraph() {
+    let style = read("docs/website/style.css");
+    let rules: Vec<&str> = style
+        .lines()
+        .filter(|line| line.trim_start().starts_with(".release-pipeline li"))
+        .collect();
+    assert!(!rules.is_empty(), "style.css has no .release-pipeline li rule");
+    for rule in rules {
+        assert!(
+            !rule.contains("grid"),
+            "a grid splits a step's title and text into separate cells: {rule}"
+        );
+    }
+}
