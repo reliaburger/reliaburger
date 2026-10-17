@@ -448,10 +448,7 @@
           drains. A failure gets a root cause before anything else happens. A product fix
           means a new candidate, and every soak starts again.</p>
         <details class="tour-commands" id="release-testing-results">
-          <summary>Show 0.2.0's results <span class="tour-commands-note">headline numbers, each with its record</span></summary>
-          <!-- TODO(#979): the soak charts (Bun memory and fds per node, CPU, accepted jobs a
-               second against the target, faults on the time axis) go here, from
-               sustained_check.py render-charts. -->
+          <summary>Show 0.2.0's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
           <ul>
             <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-15-v0.2.0-sustained-v02-final.md">8-hour soak</a>:
               clean, 8 cycles, 4 upgrade round trips; the API node's agent held 390 MiB steady
@@ -465,6 +462,50 @@
             <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-16-v0.2.0-release-closure.md">Every gate and every candidate</a>:
               eight candidates, seven of them stopped by the soaks.</li>
           </ul>
+          <p class="soak-charts-note">Time runs from the start of each soak. The marks under a
+            chart are its faults and upgrade walks, and the dashed lines its targets. Open a
+            chart to see it full size, with every mark named when you point at it.</p>
+          <div class="soak-charts" role="group" aria-labelledby="soak-charts-v02">
+            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-15-v0.2.0-sustained-v02-final.md">The 8-hour soak</a></h3>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/rss.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/rss.svg" width="720" height="272" loading="lazy"
+                alt="Bun resident memory per node over the 8-hour soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
+              <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/fds.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/fds.svg" width="720" height="272" loading="lazy"
+                alt="Open file descriptors per node over the 8-hour soak, with the faults marked along the time axis"></a>
+              <figcaption>Open file descriptors per node.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/cpu.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/cpu.svg" width="720" height="272" loading="lazy"
+                alt="Bun CPU per node over the 8-hour soak, as a percentage of one core, with the faults marked along the time axis"></a>
+              <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
+            </figure>
+          </div>
+          <div class="soak-charts" role="group" aria-labelledby="soak-charts-jobs">
+            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-17-v0.2.0-job-qualification.md">The 12-hour job soak</a></h3>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
+                alt="Accepted jobs a second in 10-minute windows over the 12-hour job soak, against the target rate, with the faults marked along the time axis"></a>
+              <figcaption>Accepted jobs a second, in 10-minute windows, against the target.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/rss.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
+                alt="Bun resident memory per node over the 12-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
+              <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/fds.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
+                alt="Open file descriptors per node over the 12-hour job soak, with the faults marked along the time axis"></a>
+              <figcaption>Open file descriptors per node.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
+                alt="Bun CPU per node over the 12-hour job soak, as a percentage of one core, with the faults marked along the time axis"></a>
+              <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
+            </figure>
+          </div>
         </details>
         <p><strong>The latest: 0.2.0, 16 October 2026.</strong> Eight candidates over five
           days. The soaks stopped seven of them, on Bun memory, a launch failure that was never

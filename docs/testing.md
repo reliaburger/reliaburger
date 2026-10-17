@@ -334,7 +334,9 @@ Every soak record also gets charts of each node's Bun memory, open fds and CPU,
 and of accepted jobs a second when jobs ran, with the faults marked along the
 time axis. `sustained_check.py render` draws them beside the record, and
 `sustained_check.py render-charts EVIDENCE DIRECTORY` redraws them from a kept
-evidence directory ([plan](plans/2026-10-17-soak-charts.md)).
+evidence directory ([plan](plans/archive/2026-10-17-soak-charts.md)). The
+homepage shows the released version's final soak charts
+([how](website/README.md#soak-charts)).
 
 ## When a test flakes
 
