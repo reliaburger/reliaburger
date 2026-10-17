@@ -17,7 +17,7 @@ fn uninstall(home: &Path, args: &[&str]) -> Output {
 fn installed(home: &Path) {
     let root = home.join(".reliaburger");
     std::fs::create_dir_all(root.join("bin")).unwrap();
-    std::fs::create_dir_all(root.join("tools/lima-2.1.0")).unwrap();
+    std::fs::create_dir_all(root.join("tools/lima-2.2.1")).unwrap();
     std::fs::create_dir_all(root.join("cache")).unwrap();
     std::fs::write(root.join("bin/relish"), "binary").unwrap();
     std::fs::write(root.join("cache/guest.img"), "image").unwrap();

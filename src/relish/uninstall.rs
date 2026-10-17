@@ -328,7 +328,7 @@ mod tests {
         let local_bin = temp.path().join(".local/bin");
         for directory in [
             "bin",
-            "tools/lima-2.1.0/bin",
+            "tools/lima-2.2.1/bin",
             "cache",
             "lima/_config",
             "clusters",
@@ -336,7 +336,7 @@ mod tests {
             std::fs::create_dir_all(root.join(directory)).unwrap();
         }
         std::fs::write(root.join("bin/relish"), "binary").unwrap();
-        std::fs::write(root.join("tools/lima-2.1.0/bin/limactl"), "lima").unwrap();
+        std::fs::write(root.join("tools/lima-2.2.1/bin/limactl"), "lima").unwrap();
         std::fs::write(root.join("cache/ubuntu.img"), "image").unwrap();
         std::fs::write(root.join("setup.lock"), "").unwrap();
         std::fs::create_dir_all(&local_bin).unwrap();
