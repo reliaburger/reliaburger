@@ -2176,6 +2176,39 @@ Two small things also changed. A frame used to go out as two writes (the length 
 
 `examples/raft-heartbeat-rtt.rs` forms a three-voter council over the real transport (TCP, mTLS, live identities, node-bound connectors) on loopback and times `ensure_linearizable` on the leader, which is exactly what a linearizable read pays. The results, before and after, in both build profiles and with and without CPU load, are in the [council design doc](../design/gossip-mustard.md#33-raft-integration). On an M2 Max with an idle host, the median leadership check fell from 2.50 ms to 0.53 ms in a debug build and from 1.43 ms to 0.26 ms in a release build. Under full CPU load the medians fell by similar factors, but the slowest checks barely moved: once every core is busy, the tail is the scheduler's, not the handshake's. No check came near 150 ms on loopback either way, because the debug builds already carried the `ring` fix and loopback has no virtual network in the way. The honest summary is that the pool takes the handshake out of the heartbeat's budget entirely, rather than making a slow cluster fast.
 
+#### One late round isn't a lost leader
+
+The tail still bit, in a merge queue on a saturated CI runner ([#1009](https://github.com/reliaburger/reliaburger/issues/1009)). A test asked the leader for a test lease right after creating it and got a 503 "retry shortly". The leader was settled: the test checked a moment later that it still led. What failed was the single leadership check behind the read. openraft's `ensure_linearizable` sends one heartbeat round and gives each follower one `heartbeat_interval` (150 ms) to answer. If both followers miss it, the leader can't prove a quorum, the check fails, and the route treats the node as "not leader". The node then tries to forward the read, sees that its own metrics name itself as leader, and answers 503 rather than forward to itself. Running the test in three parallel lanes at a load average of about 147, a probe of 3,600 reads against the settled leader got two 503s. That's rare, but every read pays the odds.
+
+The check itself is right: a leader that can't hear a quorum mustn't serve a linearizable read. Giving up after one round is the bug, because the route already had a 3-second budget for it. `CouncilNode::confirm_leadership` spends that budget:
+
+```rust
+pub async fn confirm_leadership(&self, within: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    let retry_pause = std::time::Duration::from_millis(self.raft.config().heartbeat_interval);
+    loop {
+        match tokio::time::timeout_at(deadline, self.is_leader()).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        let believes_it_leads = {
+            let metrics = self.metrics();
+            let metrics = metrics.borrow();
+            metrics.current_leader == Some(metrics.id)
+        };
+        if !believes_it_leads || tokio::time::Instant::now() + retry_pause >= deadline {
+            return false;
+        }
+        tokio::time::sleep(retry_pause).await;
+    }
+}
+```
+
+`timeout_at` is `timeout` with an absolute deadline instead of a duration, so every attempt shares the one budget, however many there are. It returns `Err` when the deadline passes, and `Ok` wrapping the inner future's answer otherwise, which is why the `match` has three arms. The `{ ... }` block that computes `believes_it_leads` is there for the borrow: `borrow()` on a `watch::Receiver` holds a read lock until the guard is dropped, and the guard is dropped at the block's closing brace, before the `sleep`'s `.await`. The retry only runs while the node still believes it leads. A follower knows another voter leads, so it gets "no" straight away and forwards the read, with no added delay.
+
+The unit test models the slow followers with the in-memory router: it holds elections on every voter, cuts the leader off from both followers, checks that one `is_leader` round fails, and heals the partition 300 ms later while `confirm_leadership` is running. With the same probe and load, 102 runs of the test made 30,600 reads and got no 503. The integration test also stopped treating the 503 as fatal: it retries that one documented answer for up to 30 seconds and asserts 200 on whatever comes back.
+
 ### The ClusterHandle
 
 The agent needs to answer questions like "who's in the cluster?" and "who's the leader?" without holding mutable borrows on gossip or Raft. We use watch channels for this.
