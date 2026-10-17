@@ -1193,7 +1193,10 @@ fn release_pipeline_steps_flow_as_one_paragraph() {
         .lines()
         .filter(|line| line.trim_start().starts_with(".release-pipeline li"))
         .collect();
-    assert!(!rules.is_empty(), "style.css has no .release-pipeline li rule");
+    assert!(
+        !rules.is_empty(),
+        "style.css has no .release-pipeline li rule"
+    );
     for rule in rules {
         assert!(
             !rule.contains("grid"),
