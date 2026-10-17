@@ -361,6 +361,9 @@ comes from upstream only once.
 ## Volumes
 
 ```toml
+[app.db]
+image = "postgres:16"
+
 [[app.db.volumes]]
 path = "/var/lib/postgresql/data"   # managed: Bun creates and owns it
 size = "10Gi"                       # optional

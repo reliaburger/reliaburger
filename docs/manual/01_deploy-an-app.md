@@ -68,6 +68,9 @@ listed in `reference`.
 ## Health checks
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.health]
 path = "/healthz"
 port = 8081               # default: the app's `port`
@@ -87,6 +90,9 @@ probes (about ten minutes at the default interval) and restarted.
 ## Init containers
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [[app.api.init]]
 image = "ghcr.io/example/migrate:2.1"   # default: the app's image
 command = ["migrate", "up"]
@@ -104,6 +110,9 @@ as root (most images do) or as the app's user.
 ## Config files
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [[app.api.config_file]]
 path = "/etc/api/config.yaml"
 content = """
@@ -137,6 +146,9 @@ different from the config:
 An `autoscale` block lets the leader move `replicas` between `min` and `max`:
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.autoscale]
 metric = "cpu"            # or "memory" (needs a memory request)
 target = "70%"            # of each replica's request
@@ -358,6 +370,9 @@ one node rolls. A brand-new app, a node getting its first replica and a change
 to `replicas` alone don't wait.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.deploy]
 strategy = "rolling"      # or "blue-green"
 max_surge = 1             # default 1
@@ -449,6 +464,9 @@ shows the health checker restarting an app that goes unhealthy.
 image = "ghcr.io/example/api:1.4.2"
 command = ["./migrate", "up"]
 run_before = ["app.api"]  # finish before the api starts
+
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
 
 [job.report]
 image = "ghcr.io/example/report:2"
