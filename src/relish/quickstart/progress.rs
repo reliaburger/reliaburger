@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn finished_lines_freeze_their_elapsed_time_and_keep_notes() {
         let start = Instant::now();
-        let cached = step("install Lima 2.1.0", Stage::Download, start);
+        let cached = step("install Lima 2.2.1", Stage::Download, start);
         cached.done_with("cached");
         let text = line(&cached, start + Duration::from_secs(60), 200);
         assert!(text.starts_with("[ ok ]"), "{text}");

@@ -254,7 +254,7 @@ pub async fn run(action: Action, name: &str, node: Option<&str>, confirmed: bool
         Ok((operation, bootstrap))
     })
     .await??;
-    let executable = root.join("tools/lima-2.1.0/bin/limactl");
+    let executable = super::artifacts::managed_limactl(&root);
     if !executable.exists() {
         bail!("managed Lima is missing; resume setup to reinstall it");
     }

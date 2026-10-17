@@ -3255,6 +3255,36 @@ There the old leader's executor keeps running after its control plane stops,
 which is the nastier case: its commands finish, and none of their reports may
 ever count.
 
+"None" turned out to be one word too strong. In CI the test once failed with
+"chunk 0 was accepted from the dead leader", on an array that had otherwise
+finished perfectly ([#1007](https://github.com/reliaburger/reliaburger/issues/1007)).
+The test killed the leader as soon as its view showed a succeeded task, and the
+leader writes a tick's accepted chunks a moment after it records that view. If
+the leader's own chunk 0 landed in that tick and the tick committed first, the
+leader had accepted its own report while it was still the leader. That's
+correct, and the old assertion failed it anyway. The same goes for a tick the
+old leader appended just before it died: the new leader commits it as part of
+its election, because Raft never drops an entry a majority already holds.
+
+So the question the test asks is *when* a report was accepted, not whose it
+was. Raft gives us a clean line. A new leader commits a blank entry in its own
+term straight after its election, and once it has applied an entry of its own
+term, every entry the old leader wrote is applied too. The test records the
+chunks accepted from the leader just before the kill, waits for
+`applied_own_term` (the applied log id's term equals the current term), records
+them again, and checks that the first set is inside the second. At the end, any
+chunk still owned by the dead leader must be in that takeover set, at attempt 1.
+A report accepted after the takeover, which is what the test exists to rule out,
+still fails it. `leader_id.get_term()` is openraft's accessor for the term half
+of a log id; the leader id is a struct rather than a bare number, so it's a
+method call and not a field.
+
+To make sure the legitimate case is always exercised, the kill now waits until
+the leader has had at least one chunk of its own accepted *and* still holds
+more. With the old assertion put back, that version failed five runs out of
+five with the CI message; with the new one it passed a hundred runs in a row on
+a busy laptop, each with two of the leader's chunks accepted before the kill.
+
 Finally, a regression guard. `relish bench --scenario` and `--compare` used to
 be mutually exclusive, so the throughput we were proudest of had none.
 `--compare OLD.json` now checks a scenario against an earlier report of the
@@ -3625,10 +3655,13 @@ stays put learns one more reason to say no:
 if keeps_volume_home(placement, spec, self.retired) {
     return true;
 }
-if cache.capacity_refused(&placement.node_id, app_id) {
+if cache.capacity_refused(&placement.node_id, app_id, placement.ordinal) {
     return false;
 }
 ```
+
+(The `ordinal` argument came later, in 0.2.1. We'll get to why at the end of
+this section.)
 
 The order matters. An app with a managed volume still waits for the node that
 holds its data, refusal or not: moving it would start it on an empty volume,
@@ -3663,7 +3696,8 @@ minute, but the node's deploy retries back off to five minutes, so for four
 minutes in every five the leader saw no refusal and kept the placement. We
 could have raised the limit to the longest backoff plus a margin, but any
 fixed limit is a guess about another module's constant. Instead
-`capacity_refusals` became a `HashSet<(String, String)>`, and an entry lasts
+`capacity_refusals` became a `HashSet<(String, String)>` (a map to the refused
+ordinals since #971, below), and an entry lasts
 until something actually changes: an admission of that app succeeds here, or
 the app is stopped or retired here, which is what happens when the leader
 moves it away. Clearing it on retirement matters. A refusal left behind after
@@ -3674,6 +3708,82 @@ The candidate 7 error message also read `gpus=4294967295`. That's
 `u32::MAX`, which the node's budget holds as its GPU capacity because GPUs are
 admitted by a separate check. It looked like a corrupt counter, so the message
 now leaves GPUs out unless the app asks for some.
+
+Fixing #967 turned up two side effects of the fix itself (#971). Neither lost
+a replica: when no other node had room, the leader left the committed
+placements where they were. But both did more work than the refusal asked for.
+
+The first was in `keeps`. A refusal named an app, not a replica, so the leader
+moved every placement of that app off the node, including the two `frontend`
+replicas that were running happily there. One refused scale-up restarted the
+healthy replicas beside it. Now the refusal carries the replicas the node
+couldn't start, as `CapacityRefusal::ordinals` in the state report, and the
+cache keeps a set of them per node and app:
+
+```rust
+pub fn record_capacity_refusal(&mut self, node_id: &NodeId, app_id: &AppId, ordinals: &[u32]) {
+    self.capacity_refusals
+        .entry((node_id.clone(), app_id.clone()))
+        .or_default()
+        .extend(ordinals.iter().copied());
+}
+```
+
+`entry` looks a key up once and hands back a slot you can fill or change,
+`or_default` puts an empty `BTreeSet` in the slot if the key wasn't there, and
+`extend` adds every ordinal. `copied` turns the iterator's `&u32` references
+into plain `u32` values, which is what the set holds; it only works for types
+that are `Copy`, like integers. In Go you'd write the same thing as a map
+lookup, a nil check and a loop.
+
+Which ordinals does a node name? It depends on how far the admission got. A
+scale-up names only the replicas it tried to add: the leader moves those, and
+the running ones stay. A fresh deploy names its whole share, because nothing
+of it runs. A rolling or blue-green replacement names its whole share too, even
+though the old replicas still run: a rollout that can't start one replacement
+rolls back, so none of the new spec's replicas can run on that node. Those
+move, as they did before.
+
+The second side effect was on the node. A deploy stores the new spec before it
+starts anything, and the add-replicas path decides whether it applies by
+comparing the stored spec with the wanted one. After a refused scale-up from
+two replicas to three, the stored spec already said three, so the retry saw
+no change in the count and rolled the app instead. A rolling deploy needs room
+for each new replica beside the old one, so the retry asked for more capacity
+than the scale-up that had just been refused. Now `add_replicas_in_place`
+stores the previous spec again when the admission fails. Nothing started, so
+the previous spec is still what the node runs, and the retry adds the same
+replica in place.
+
+That opened one more door. Once the leader moves the refused replica away, the
+node's share is two replicas again, the very spec it now records, and an
+identical spec has always meant "roll it". So `replicas_to_add_in_place` makes
+one exception: the spec this node already runs, sent again while its refusal
+stands, adds zero replicas and rolls nothing:
+
+```rust
+let (running, added) = match (replicas_added(previous, spec), spec.replicas) {
+    (Some(grown), _) => grown,
+    (None, Replicas::Fixed(count))
+        if previous == spec && self.capacity_refusals.contains_key(&key) =>
+    {
+        (count, 0)
+    }
+    (None, _) => return None,
+};
+```
+
+Matching on a tuple lets one `match` look at two values at once, and the `if`
+after the second pattern is a match guard: that arm only matches when the
+condition holds too. The zero-replica admission succeeds, which clears the
+refusal, so it can't push a replica off this node the next time the leader
+puts one here. Any other identical redeploy still rolls, as before.
+
+The issue also said the leader logged `cannot place` on every pass while a
+refusal stood with nowhere to go. That was the 0.2.0 scheduler. In 0.2.1 the
+leader already records why an app is short in council state and logs only
+when that changes (#702), and a test now checks that a standing refusal is
+news once.
 
 ### Retiring the batch engine from Chapter 12
 

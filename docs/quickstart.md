@@ -54,6 +54,15 @@ image download time also depends on your connection. The VMs don't install
 anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
 `~/.reliaburger/lima`, isolated from your normal Lima configuration.
 
+Relish pins Lima 2.2.1, whatever Lima you have installed yourself. Older Lima
+releases have two problems for the quickstart: before 2.1.3 any user inside a
+QEMU VM could reach the guest agent's socket and become root
+([CVE-2026-53657](https://nvd.nist.gov/vuln/detail/cve-2026-53657)), and
+before 2.2.0 the guest agent leaked a socket for every connection forwarded
+to a host port ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210)),
+so a script polling the API slowly filled the guest's memory. Relish uses
+Lima's default port forwarder; you don't need `LIMA_SSH_PORT_FORWARDER`.
+
 Each VM takes its time from your Mac. Lima's guest agent sets the guest clock
 to the host's whenever the two drift more than 100 ms apart, checking every
 10 s, so the guests catch up within seconds after the laptop wakes from sleep
@@ -175,7 +184,7 @@ For guest diagnostics, use the VM name printed by `relish local status`:
 
 ```sh
 LIMA_HOME="$HOME/.reliaburger/lima" \
-  ~/.reliaburger/tools/lima-2.1.0/bin/limactl shell VM_NAME \
+  ~/.reliaburger/tools/lima-2.2.1/bin/limactl shell VM_NAME \
   sudo journalctl -u reliaburger.service --no-pager -n 100
 ```
 

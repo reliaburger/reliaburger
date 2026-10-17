@@ -1419,7 +1419,7 @@ Key simulation test scenarios:
 - **Autoscaler stability:** Feed a sinusoidal load pattern into the autoscaler and verify it does not flap (the smoothing window and cooldown prevent oscillation).
 - **Rolling deploy with failure:** Start a rolling deploy where the new version fails health checks on the third replica. Verify halt (without auto_rollback) and full revert (with auto_rollback).
 
-The simulator above is the design; what ships today are property tests over random clusters (`meat::scheduler::properties`, with proptest): placement never overcommits a node, spreads no more than `ceil(replicas / eligible nodes)` per node when every node has room, gives the same plan whatever order the nodes were inserted in, and a pass never places more CPU than a namespace's quota. The unit tests in `cluster::orchestrate` drive `plan_pass` directly, including the stale-node grace and short capacity (`scheduler_policy`).
+The simulator above is the design; what ships today are property tests over random clusters (`meat::scheduler::properties`, with proptest): placement never overcommits a node, spreads no more than `ceil(replicas / eligible nodes)` per node when every node has room, gives the same plan whatever order the nodes were inserted in, and a pass never places more CPU than a namespace's quota. The unit tests in `cluster::orchestrate` drive `plan_pass` directly, including the stale-node grace and short capacity (`scheduler_policy`), and a proptest there checks that a capacity refusal moves exactly the replicas it names (`a_refusal_moves_exactly_the_refused_replicas`).
 
 ### 10.2 Integration Tests
 
@@ -1592,10 +1592,23 @@ instance. `build_cluster_cache` adds both into the node's `allocated` total,
 so `reserve_commitments` only reconciles committed app placements and never
 counts an app twice. A placement can still lose the race to attempts that start
 after the pass: `try_acquire` doesn't queue, so the agent records a
-`CapacityRefusal` for that app and the next report carries it. The leader then
-stops treating the placement as held (`Liveness::keeps`) and places the replica
-elsewhere; a managed-volume app still waits for its home node. Refusals lapse
-after a minute or on the app's next successful deploy.
+`CapacityRefusal` for that app and the next report carries it. The refusal
+names the replica ordinals the node couldn't start (#971): a scale-up names
+only the replicas it tried to add, while a fresh deploy and a rolling or
+blue-green replacement name the node's whole share, since none of the new
+spec's replicas can run there. The leader stops treating those placements as
+held (`Liveness::keeps`) and places them elsewhere; the app's other replicas
+on that node stay where they run, and a managed-volume app still waits for its
+home node. With nowhere to go, a refused replica stays committed where it was,
+and the shortfall is logged once, when it starts or changes (§5.1).
+
+A refusal lasts until an admission of that app succeeds on the node, or the
+app is stopped or retired there (#967). A refused scale-up records the spec the
+node ran before again, since it started nothing, so the node's retry adds the
+same replicas in place instead of rolling the app, which would need room for
+every new replica beside the old one. When the leader moves the refused
+replicas away, the node's share is the spec it already runs: that deploy adds
+nothing, rolls nothing, and its successful admission clears the refusal.
 
 Workers persist control provenance (recovery epoch, leadership term, committed
 log index) and highest chunk generation. Task outcomes stream into checksummed

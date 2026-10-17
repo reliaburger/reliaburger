@@ -314,7 +314,10 @@ async fn prepare_artifacts(
         step.record(result)
     };
     let tooling = async {
-        let step = progress.step(Stage::Download, "install Lima 2.1.0");
+        let step = progress.step(
+            Stage::Download,
+            format!("install Lima {}", artifacts::LIMA_VERSION),
+        );
         step.record(artifacts::tooling(root, downloader, &step).await)
     };
     let (lima, image, (bun, relish)) = tokio::try_join!(tooling, image, binaries)?;
