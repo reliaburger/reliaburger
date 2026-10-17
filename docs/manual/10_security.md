@@ -126,8 +126,8 @@ caller and the end of the grace period.
 `relish token list` shows, for each token, its role, when it was created, when
 it expires (`never`, `(in 30d)` or `(expired)`), when it was **last used** and
 its **scope** (`all`, or `apps=… namespaces=…`). New columns are added on the
-right, so a script that cuts the older ones out keeps working; `-o json` gives
-the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
+right, so a script that cuts the older ones out keeps working;
+`relish --output json token list` gives the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
 never) plus a `principal` id that matches the `principal` of that token's audit
 events.
 
@@ -165,6 +165,8 @@ Roles and scopes are coarse. A `[permission.<token-name>]` block narrows one
 token further, to named actions on named apps:
 
 ```toml
+[namespace.shop]
+
 [permission.ci-deploy]
 actions = ["deploy", "logs"]
 apps = ["web"]
@@ -643,7 +645,8 @@ cosign sign --key cosign.key --new-bundle-format=false ghcr.io/acme/web@sha256:�
 Keyless signatures (a Fulcio certificate, as Chainguard and distroless images
 carry) aren't checked: there's no key to trust.
 
-Turn the check on per upstream rule, with the public keys you trust:
+Turn the check on per upstream rule, with the public keys you trust (the
+contents of `cosign.pub`; the key below is an example, so use your own):
 
 ```toml
 [[images.trust_policy.upstream]]
@@ -651,7 +654,8 @@ match = "ghcr.io/acme/*"
 require_signatures = true
 cosign_keys = ["""
 -----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEM2FSvMifnaVs8ixlQa4A/6G/czA9
+mQg4Lf8nqtraD+h85AjbewyGb4rteSrJkIgw1nYFr5kFzOYXzD8zUz4LBg==
 -----END PUBLIC KEY-----
 """]
 ```

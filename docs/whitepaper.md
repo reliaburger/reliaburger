@@ -214,6 +214,9 @@ tls = "cluster"  # certificate from the cluster's Ingress CA; omit for plain HTT
 **Autoscaling:** Apps can declare an autoscale block to adjust replicas based on observed metrics:
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.autoscale]
 min = 2
 max = 10
@@ -228,6 +231,9 @@ target = "70%"
 **Placement constraints:** Nodes carry labels (configured in `node.toml`). Apps can use `required` labels (hard constraints) and `preferred` labels (soft constraints) to control placement.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.placement]
 required = ["region=us-east"]
 preferred = ["ssd=true"]
@@ -244,6 +250,9 @@ A Job is a run-to-completion task, either on-demand or scheduled, replacing Kube
 image = "myapp:v1.4.2"
 command = ["npm", "run", "migrate"]
 run_before = ["app.api"]
+
+[app.api]
+image = "myapp:v1.4.2"
 
 [job.cleanup]
 image = "cleanup:latest"
@@ -286,6 +295,9 @@ resource demand, storage and service quality. See the [job manual](manual/14_bat
 Reliaburger stores secrets encrypted in git using asymmetric encryption (age). The cluster's public key is distributed freely; only the cluster holds the private key. Developers can encrypt secrets offline without cluster access.
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.env]
 DATABASE_URL = "ENC[AGE:YWdlLWVuY3J5cHRpb24...]"
 NODE_ENV = "production"
@@ -302,6 +314,9 @@ NODE_ENV = "production"
 A free-text file injected into a specific path inside the container. Unlike environment variables, ConfigFiles can contain arbitrary content (NGINX configs, application YAML, TLS certificates). Declared inline with `content`, which each instance gets as its own read-only copy (so two files with the same name can't collide, and a rollout never rewrites the file under a running instance), or with `source` naming a host path on the node, which the node bind-mounts. A `source` is gated like a host-path volume (§5.5): the node must list it under `[storage] allowed_host_paths`, and a token with a `[permission]` block needs `host-exec`.
 
 ```toml
+[app.nginx]
+image = "nginx:alpine"
+
 [[app.nginx.config_file]]
 path = "/etc/nginx/nginx.conf"
 content = """
@@ -402,7 +417,7 @@ short-lived token per node against the current leader:
 ```sh
 $ JOIN_TOKEN="$(relish --endpoint https://10.0.1.5:9117 \
     --ca-cert cluster/identity/root-ca.crt \
-    join-token create --ttl 15m)"
+    join-token create --node-id node-02 --ttl 15m)"
 ```
 
 The council stores only its hash and expiry. Relish prints the plaintext once;
@@ -558,6 +573,9 @@ This eliminates a large proportion of Kubernetes debugging pain: encapsulation o
 Wrapper can run on every node and handles TLS termination, host/path-based routing, health-aware load balancing, connection draining during deploys, and WebSocket support. It is opt-in in `node.toml`. The v1 TLS sources are the cluster's Ingress CA and an operator-supplied certificate/key pair. Automatic ACME/Let's Encrypt provisioning is deferred.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.ingress]
 host = "myapp.com"
 tls = "cluster"     # clients must trust the cluster root CA
@@ -638,6 +656,9 @@ Isolation needs the eBPF data path. `relish init` enables it on rootful Linux ru
 **Egress is unrestricted by default.** An app with no `egress` block can reach any external destination. Declaring an `egress` block flips that app to deny-by-default: only the listed destinations are permitted, and everything else is blocked. Use it to contain data exfiltration from compromised containers.
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.egress]
 allow = ["api.stripe.com:443", "hooks.slack.com:443"]
 ```
@@ -679,6 +700,9 @@ Key properties:
 When an App's image changes, each node running it performs a rolling deployment of its own instances: start a new instance, wait for its health check, add it to Wrapper routing, drain the old instance, stop it. Old and new versions coexist on the same node without port conflicts.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.deploy]
 strategy = "rolling"      # default; or "blue-green"
 max_surge = 1             # extra instances during the rollout (default 1)
@@ -941,6 +965,7 @@ Reliaburger clusters are independent by design. Each has its own Raft consensus,
 
 Each cluster is a **franchise location**: independently operated, sharing standards and visibility. Peering is a single command:
 
+<!-- snippet: planned #711 -->
 ```bash
 relish franchise join https://prod-west.example.com --token <peer-token>
 ```
@@ -957,6 +982,7 @@ Onion's eBPF layer resolves a new DNS zone: `name.cluster.franchise` (e.g., `red
 
 Apps opt in explicitly:
 
+<!-- snippet: planned #711 -->
 ```toml
 [app.web.egress]
 allow_franchise = ["redis.prod-west"]
@@ -1114,7 +1140,7 @@ Not the gossip itself: Mustard carries only lightweight, bounded state (membersh
 
 ### Q4: With encrypted-in-git secrets, how do developers encrypt without cluster access?
 
-Reliaburger uses asymmetric encryption (age). The cluster's public key is committed to the git repository and can be distributed freely. Anyone with the public key can encrypt secrets offline, no cluster access needed. Only the cluster holds the private key for decryption. Reusing ciphertext with a replacement cluster currently requires an operator to provision the existing key material out of band; the previously proposed `relish init --import-key` command isn't implemented. Key rotation supports a graceful transition period where both old and new ciphertexts are accepted.
+Reliaburger uses asymmetric encryption (age). The cluster's public key is committed to the git repository and can be distributed freely. Anyone with the public key can encrypt secrets offline, no cluster access needed. Only the cluster holds the private key for decryption. Reusing ciphertext with a replacement cluster currently requires an operator to provision the existing key material out of band; the previously proposed `--import-key` flag for `relish init` isn't implemented. Key rotation supports a graceful transition period where both old and new ciphertexts are accepted.
 
 ### Q5: When a new leader is elected, can it make wrong scheduling decisions from incomplete state?
 
