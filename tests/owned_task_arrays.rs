@@ -775,7 +775,9 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root, runc, eBPF, pinned test image, ip and nft; run with make test-linux"]
 async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs() {
-    use reliaburger::bun::task_executor::{AttemptOutcome, RunIdentity, TaskInvocation, TaskRunner};
+    use reliaburger::bun::task_executor::{
+        AttemptOutcome, RunIdentity, TaskInvocation, TaskRunner,
+    };
     use reliaburger::bun::task_namespace::TaskNamespacePolicy;
     use reliaburger::bun::task_runtime::OwnedRunner;
     use reliaburger::onion::ebpf::loader::OnionEbpf;
@@ -895,15 +897,25 @@ async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs
         let runner = runner.clone();
         let sleeping = invocation("sleep 60 & wait".into());
         let cancel = cancel.clone();
-        tokio::spawn(async move { runner.run(&sleeping, Duration::from_secs(60), &cancel).await })
+        tokio::spawn(async move {
+            runner
+                .run(&sleeping, Duration::from_secs(60), &cancel)
+                .await
+        })
     };
-    let pid = tokio::time::timeout(Duration::from_secs(10), async {
+    // The runtime's pid is its launcher's; the workload's own cgroup is the
+    // one the hooks see.
+    let cgroup = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             for owner in runtime.launch_inventory().await.unwrap().unwrap() {
                 if runtime.state(&owner.instance_id).await.ok() == Some(ContainerState::Running)
-                    && let Some(pid) = runtime.pid(&owner.instance_id).await.ok().flatten()
+                    && let Some(cgroup) = runtime
+                        .workload_cgroup(&owner.instance_id)
+                        .await
+                        .ok()
+                        .flatten()
                 {
-                    return pid;
+                    return cgroup;
                 }
             }
             assert!(!attempt.is_finished(), "task ended before it was inspected");
@@ -911,12 +923,16 @@ async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs
         }
     })
     .await
-    .expect("task never established a running owner");
-    let cgroup = reliaburger::sesame::egress::cgroup_id_of_pid(pid).unwrap();
+    .expect("task never established a running workload");
     assert_eq!(
-        reliaburger::sesame::firewall::read_cgroup_source_entry(&mut kernel.lock().await.bpf, cgroup)
-            .unwrap(),
-        Some(reliaburger::sesame::firewall::job_source_identity(&namespace, job)),
+        reliaburger::sesame::firewall::read_cgroup_source_entry(
+            &mut kernel.lock().await.bpf,
+            cgroup
+        )
+        .unwrap(),
+        Some(reliaburger::sesame::firewall::job_source_identity(
+            &namespace, job
+        )),
         "the running task's cgroup is not bound to its job"
     );
     cancel.cancel();
@@ -927,8 +943,11 @@ async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs
     assert_eq!(retired.outcome, AttemptOutcome::Cancelled, "{retired:?}");
     // Retirement lifts the binding along with the container.
     assert_eq!(
-        reliaburger::sesame::firewall::read_cgroup_source_entry(&mut kernel.lock().await.bpf, cgroup)
-            .unwrap(),
+        reliaburger::sesame::firewall::read_cgroup_source_entry(
+            &mut kernel.lock().await.bpf,
+            cgroup
+        )
+        .unwrap(),
         None
     );
     for owner in runtime.launch_inventory().await.unwrap().unwrap() {

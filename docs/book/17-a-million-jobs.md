@@ -493,7 +493,7 @@ Jobs are the 0.2.0 headline workload, and for most of the release they couldn't 
 
 Programming them was the interesting part, because a job runs in two different places. (There was a third, a job the agent ran directly through the app's create → program → start path, until the old batch engine was retired; see "Retiring the batch engine from Chapter 12" below.)
 
-A fresh task attempt holds a `NamespaceLease` from the delegated runtime. The lease grew two methods: `enforce_egress` programs the task cgroup after `runc create` and before `start`, while runc holds the process, and `publish_address` records that the task's container address belongs to the job's namespace on every port, with its `allow_from`. Both are undone in `retired()`, which only runs once the runtime has proven the attempt gone. A name that doesn't resolve within five seconds refuses the attempt. Apps start deny-all and let the re-resolver fill in the allowlist later; a short task has no later, so refusing is the honest answer.
+A fresh task attempt holds a `NamespaceLease` from the delegated runtime. The lease grew two methods: `enforce_egress` programs the task cgroup after the runtime's `create` and before `start`, before the process exists ("When the cgroup wasn't there", below, has the catch), and `publish_address` records that the task's container address belongs to the job's namespace on every port, with its `allow_from`. Both are undone in `retired()`, which only runs once the runtime has proven the attempt gone. A name that doesn't resolve within five seconds refuses the attempt. Apps start deny-all and let the re-resolver fill in the allowlist later; a short task has no later, so refusing is the honest answer.
 
 A reusable executor is the subtle one. Its commands all land in the executor's `task` cgroup, so the allowlist goes there once, when the executor starts. That only works if every command the executor runs wants the same allowlist, and the executor key already hashes the whole template minus the fields that may vary per command. `egress` and `firewall` aren't on that list, so two templates with different policies get different keys and never share a container. `tasks_with_different_egress_never_share_an_executor` pins it.
 
@@ -507,7 +507,7 @@ That gave a job a way to be reached. It didn't give it a way to be *named*. Say 
 
 Here's why. `firewall_map` keys a grant on `(source cgroup, destination)`, and the agent fills in the source half from the cgroups of running app instances. A task isn't an app instance. It runs in a cgroup of its own under `/reliaburger/reports/`, and gets its namespace from that ancestor's binding, so the hook knows it belongs to `reports`. But the agent has no idea which job owns the cgroup, and there's nothing to key a grant on. Worse, tasks come and go thousands of times a minute. A grant that waited for the agent's next tick to notice each new task would race every short task's first `connect()`, and lose.
 
-So we turned it round: grant the job, then tell the kernel which cgroups belong to it. A new map, `cgroup_source_map`, binds a task's cgroup to its *run identity*, a hash of `namespace/job`. The task's `NamespaceLease` writes it with `bind_source`, after `runc create` and before `start`, right next to the egress allowlist. On the agent side, `resolve_job_source_rules` writes one grant per cross-namespace name in every `allow_from`, keyed on the identity instead of a cgroup:
+So we turned it round: grant the job, then tell the kernel which cgroups belong to it. A new map, `cgroup_source_map`, binds a task's cgroup to its *run identity*, a hash of `namespace/job`. The task's `NamespaceLease` writes it with `bind_source`, after `create` and before `start`, right next to the egress allowlist. On the agent side, `resolve_job_source_rules` writes one grant per cross-namespace name in every `allow_from`, keyed on the identity instead of a cgroup:
 
 ```rust
 pub fn resolve_job_source_rules(
@@ -555,6 +555,28 @@ None of this widens what an app may receive. The binding only adds grants: a tas
 Reusable executors needed one more change. An executor's commands all land in its `task` cgroup, and executors with the same template were shared between jobs. Bind that cgroup to one job and the next job's commands would borrow its grants. So `ExecutorKey::for_job` folds the job's name into the key, and two jobs never share an executor. `tasks_of_different_jobs_never_share_an_executor` pins it. The forward-path table needed nothing new: a task's address now answers to its job's name there too, so a source the hooks admit isn't then dropped between veths.
 
 `allow_from_can_name_a_delegated_job_as_its_source` runs it in the VM: two task cgroups in one namespace, one bound to the named job and one to another, plus an app cgroup in the same namespace. Only the named job's task gets through.
+
+### When the cgroup wasn't there
+
+The 0.2.1 soak stopped at its first step. Every job in a fresh runc container failed to launch, on every node, with `task cgroup identity is unavailable` (#1021). Reused executors and host jobs were fine.
+
+`bind_source` needs the task cgroup's id, which is its directory's inode, so it `stat`s `/sys/fs/cgroup/reliaburger/<namespace>/executor-<prefix>/<slot>`. The directory didn't exist. We'd written "after `runc create`, while runc holds the process", but Reliaburger's runc adapter doesn't call `runc create` at all. Its `create` claims the instance, reserves the network and stages the bundle. The container only comes into being in `start`, which runs `runc run`, and that's when runc makes the cgroup. By then the process is already in it, so there's nothing left to bind *before* it runs.
+
+The egress allowlist had the same lookup, and the same bug, since jobs got egress in 0.2.0. Nobody noticed because `enforce_egress` returns early for an empty allowlist, and no test ran a fresh runc task that had one. `bind_source` runs for every named job, so #737 turned a latent bug into one that stopped every fresh runc job.
+
+Apps hit this long ago, and the fix is the one they use: make the directory before the runtime does. runc joins an existing `cgroupsPath` untouched, so the inode we bind is the one the task's process lands in. The runner now creates the leaf right after `create`, then programs the allowlist and binds the job:
+
+```rust
+tokio::fs::create_dir_all(&cgroup).await.map_err(failed)?;
+lease
+    .enforce_egress(&cgroup, egress_allow(template))
+    .await
+    .map_err(failed)?;
+```
+
+`map_err(failed)` turns the `std::io::Error` into the runtime's `GrillError` with the closure defined just above, and `?` returns it, so a cgroup we can't make refuses the attempt before anything runs. runc removes the cgroup of a container it ran. An attempt that stops before `start` never gets that far, so once it retires the runner removes the leaf itself; `remove_dir` only succeeds on an empty cgroup, which is the only kind we want gone.
+
+`runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs` runs a named job with an allowlist in a fresh runc container: the task reaches the listed host port and is refused the unlisted one, and while a second task sleeps, its cgroup answers to the job's run identity. Before the fix it failed exactly as the soak did. The comment that said "runc holds it at create" described a call our adapter has never made: it has always driven containers with `runc run`. Now a test checks what the comment only claimed.
 
 ### Where the bytes went
 
