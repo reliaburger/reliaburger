@@ -1625,9 +1625,15 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 bun: agent loop turn took 1902 ms in follow_up (consumer_sync/journal): journal write 1400 ms, kernel lock wait 3 ms, view install 6 ms, firewall sync 480 ms
 ```
 
-**Impact:** Every caller waits for the turn in progress, so status, commands and deploy steps on that node wait up to the turn's length. The view itself stays correct: the steps keep their order, and the journal lists every view that may be exposed before the kernel sees it.
+The 0.2.0 candidate soaks that carried the line named the journal write: 1,574 of a 1,575 ms `consumer_sync/journal` turn after a restart, and up to 6 s on a node whose disk the jobs tier throttles. So from 0.2.1 a step waits for its write only until the turn's 500 ms runtime budget runs out. A write still going then carries on in a task, the step's remainder (`consumer_sync/install`, or `consumer_sync/landed` when there is nothing to install) waits for it, and the loop serves other turns meanwhile. Such a write leaves its own line when it lands:
 
-**Recovery:** Automatic; the next turn runs normally. The view's size isn't the cost: a thousand services, first published and then with every backend moved, take each turn well within the budget less its journal write (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`), and the soak runs a handful. Which await held the soak's turns is still open in #890. The next soak's log line will say.
+```
+bun: a discovery journal write took 1574 ms; the agent loop went on meanwhile
+```
+
+**Impact:** Status, commands and deploy steps on that node no longer wait for a slow consumer write. A command that itself journals something waits for the write in flight first, as it would for its own. The view stays correct: the steps keep their order, the kernel sees a view only after the write that records it has landed, and readers meanwhile see the journal as it is on disk, plus the view under way for `own_view_names`. A write that fails off the loop fences discovery as an inline failure does (`discovery:journal` degraded, reopened on the next tick) and the leader hears the error.
+
+**Recovery:** Automatic. The view's size isn't the cost: a thousand services, first published and then with every backend moved, take each turn well within the budget less its journal write (`a_large_consumer_view_change_takes_each_turn_well_within_the_budget`), and the soak runs a handful. Only consumer steps leave a write in flight; deploys, retirements and releases still wait for theirs inline (#890).
 
 ### 7.13 Task Attempt Fails to Launch
 
