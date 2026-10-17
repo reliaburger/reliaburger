@@ -39,7 +39,8 @@ mod bun_process;
 mod cluster_support;
 use bun_process::{PortBlockReservation, reserve_port_block_lease};
 use cluster_support::{
-    MembershipSource, WiredNode, WiredNodeOptions, cluster_tests_enabled, local, start_wired_node,
+    MembershipSource, WiredNode, WiredNodeOptions, applied_own_term, chunks_accepted_from,
+    cluster_tests_enabled, local, start_wired_node,
 };
 
 const SERVICE_TOKEN: &str = "cluster-test-task-arrays-service";
@@ -407,27 +408,34 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
         .as_u64()
         .unwrap_or_else(|| panic!("{answer}"));
 
-    // The leader is a worker too: kill it once it is running its own share.
+    // The leader is a worker too. Kill it once one of its own chunks has
+    // been accepted while it still holds others: a report accepted before
+    // the kill must count, and the chunks it still holds must not (#1007).
     let leader_name = format!("ta{leader}");
+    let lost = reliaburger::meat::NodeId::new(&leader_name);
     wait_until(
-        "the leader holds work",
+        "the leader has a chunk accepted and still holds work",
         Duration::from_secs(60),
         async || {
-            status(&http, &nodes[leader], batch_id)
+            let holds = nodes[leader]
+                .council
+                .desired_state()
                 .await
-                .is_some_and(|summary| {
-                    summary["nodes"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|node| {
-                            node["node"] == leader_name.as_str()
-                                && node["counters"]["succeeded"].as_u64().unwrap_or(0) > 0
-                        })
-                })
+                .task_arrays
+                .get(batch_id)
+                .and_then(|record| record.state.held_by(&lost).map(|held| !held.is_empty()))
+                .unwrap_or(false);
+            holds
+                && !chunks_accepted_from(&nodes[leader], batch_id, &lost)
+                    .await
+                    .is_empty()
         },
     )
     .await;
+    // Record what the leader had applied at the kill, so the end can tell
+    // an acceptance from its term apart from a late one.
+    let accepted_before_kill = chunks_accepted_from(&nodes[leader], batch_id, &lost).await;
+    let applied_at_kill = nodes[leader].metrics_rx.borrow().last_applied;
     nodes[leader].shutdown.cancel();
 
     // The new leader starts its silence clock at its election, so for the
@@ -443,7 +451,22 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     })
     .await;
     let new_leader = new_leader.unwrap();
-    let lost = reliaburger::meat::NodeId::new(&leader_name);
+    // Once the new leader has applied an entry of its own term, every entry
+    // the old leader wrote while it led is applied too (a Tick it appended
+    // just before the kill commits only now). Anything accepted from the
+    // dead leader after this point would be a late acceptance.
+    wait_until(
+        "the new leader applies its own term",
+        Duration::from_secs(30),
+        async || applied_own_term(&nodes[new_leader]),
+    )
+    .await;
+    let takeover = nodes[new_leader].metrics_rx.borrow().last_applied;
+    let accepted_under_old_leader = chunks_accepted_from(&nodes[new_leader], batch_id, &lost).await;
+    assert!(
+        accepted_before_kill.is_subset(&accepted_under_old_leader),
+        "chunks {accepted_before_kill:?} accepted from {lost} at the kill are missing at takeover: {accepted_under_old_leader:?}"
+    );
     let held_at_loss = nodes[new_leader]
         .council
         .desired_state()
@@ -473,7 +496,8 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
     )
     .await;
     // Nothing lost, nothing counted twice: the dead leader's commands may
-    // have finished, but no report of theirs can be accepted any more.
+    // have finished, but no report of theirs can be accepted once the new
+    // leader has taken over.
     assert_eq!(last["status"], "Succeeded", "{last}");
     assert_eq!(last["succeeded"], TASKS, "{last}");
     assert_eq!(last["failed"], 0, "{last}");
@@ -505,11 +529,20 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
             .expect("every chunk has one accepted grant");
         let attempt = grant.attempt;
         // Only a record folded past MAX_ACCEPTED_RANGES drops the owner.
-        assert_ne!(
-            grant.owner,
-            Some(lost.clone()),
-            "chunk {chunk} was accepted from the dead leader"
-        );
+        // The dead leader's own chunks count only if they were accepted in
+        // its term, before the new leader took over.
+        if grant.owner.as_ref() == Some(&lost) {
+            assert!(
+                accepted_under_old_leader.contains(&chunk),
+                "chunk {chunk} was accepted from the dead leader after the takeover \
+                 (applied at kill {applied_at_kill:?}, takeover {takeover:?}, \
+                 accepted at kill {accepted_before_kill:?}, at takeover {accepted_under_old_leader:?})"
+            );
+            assert_eq!(
+                attempt, 1,
+                "chunk {chunk} was accepted from the dead leader at a later attempt"
+            );
+        }
         if attempt > 1 {
             replayed += 1;
             assert!(
@@ -530,7 +563,9 @@ async fn a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run()
         .unwrap_or(0)
         - raft_before;
     eprintln!(
-        "cluster_task_arrays: leader lost mid-run; {} chunks held at loss, {replayed} replayed, {entries} Raft entries afterwards",
+        "cluster_task_arrays: leader lost mid-run; {} chunks accepted from it at the kill (applied {applied_at_kill:?}), {} by the takeover (applied {takeover:?}), {} held at loss, {replayed} replayed, {entries} Raft entries afterwards",
+        accepted_before_kill.len(),
+        accepted_under_old_leader.len(),
         held_at_loss.len()
     );
     root.cancel();

@@ -764,6 +764,39 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     }
 }
 
+/// The chunks of task array `batch_id` whose accepted report came from
+/// `owner`, as `node` has applied them. A chunk whose accepted record was
+/// folded past `MAX_ACCEPTED_RANGES` has no owner and isn't listed.
+pub async fn chunks_accepted_from(
+    node: &WiredNode,
+    batch_id: u64,
+    owner: &NodeId,
+) -> std::collections::BTreeSet<u32> {
+    let desired = node.council.desired_state().await;
+    let Some(record) = desired.task_arrays.get(batch_id) else {
+        return std::collections::BTreeSet::new();
+    };
+    (0..record.state.spec.chunk_count())
+        .filter(|chunk| {
+            record
+                .state
+                .accepted_grant(reliaburger::meat::task_array::ChunkId(*chunk))
+                .is_some_and(|grant| grant.owner.as_ref() == Some(owner))
+        })
+        .collect()
+}
+
+/// Whether `node` has applied an entry of its own current term. A new
+/// leader commits a blank entry at election, so once this holds, every
+/// entry an earlier leader wrote while it led has been applied here too;
+/// a later change can only come from this term.
+pub fn applied_own_term(node: &WiredNode) -> bool {
+    let metrics = node.metrics_rx.borrow();
+    metrics
+        .last_applied
+        .is_some_and(|applied| applied.leader_id.get_term() == metrics.current_term)
+}
+
 /// Keep `table` in step with the alive gossip members (API = gossip + 3),
 /// and `known` with gossip's whole roster.
 fn spawn_gossip_membership_table(
