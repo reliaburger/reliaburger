@@ -498,4 +498,33 @@ mod tests {
         // data loss PKI8 guards against.
         assert!(try_all(&old_secret, &live[..1]).is_none());
     }
+
+    // Values sealed by an age 0.10 build (Reliaburger 0.2.1 and earlier),
+    // checked in as fixtures. App configs carry `ENC[AGE:...]` values and
+    // every node keeps `<cluster>-root-ca.age`, so later age releases have
+    // to keep opening both (#1026).
+    const AGE_0_10_IDENTITY: &str = include_str!("../../tests/fixtures/age/identity.txt");
+
+    fn fixture_identity() -> age::x25519::Identity {
+        AGE_0_10_IDENTITY.trim().parse().unwrap()
+    }
+
+    #[test]
+    fn an_env_secret_sealed_by_age_0_10_still_decrypts() {
+        let sealed = include_str!("../../tests/fixtures/age/secret-env.txt").trim();
+        assert!(is_encrypted(sealed));
+        assert_eq!(
+            decrypt_secret(sealed, &fixture_identity()).unwrap(),
+            "fixture-secret-value"
+        );
+    }
+
+    #[test]
+    fn a_root_key_sealed_by_age_0_10_still_unseals() {
+        let sealed = include_bytes!("../../tests/fixtures/age/sealed-root-key.age");
+        assert_eq!(
+            unseal_with_age(sealed, &fixture_identity()).unwrap(),
+            b"fixture sealed bytes"
+        );
+    }
 }

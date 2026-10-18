@@ -406,6 +406,50 @@ mod tests {
         .unwrap()
     }
 
+    // Backups sealed by an age 0.10 build (Reliaburger 0.2.1 and earlier),
+    // checked in as fixtures. The operator holds these files for years, so
+    // every later age release has to keep opening them (#1026).
+    const AGE_0_10_PASSPHRASE_BACKUP: &[u8] =
+        include_bytes!("../../tests/fixtures/age/root-backup-passphrase.age");
+    const AGE_0_10_RECIPIENT_BACKUP: &[u8] =
+        include_bytes!("../../tests/fixtures/age/root-backup-recipient.age");
+    const AGE_0_10_IDENTITY: &str = include_str!("../../tests/fixtures/age/identity.txt");
+    const AGE_0_10_FINGERPRINT: &str = include_str!("../../tests/fixtures/age/fingerprint.txt");
+
+    fn verify_fixture_backup(opened: &RootBackup) {
+        assert_eq!(opened.cluster, "fixture");
+        assert_eq!(opened.fingerprint, AGE_0_10_FINGERPRINT.trim());
+        // The fixture's root expires one day, so check it the day before.
+        let before_expiry = UNIX_EPOCH + Duration::from_secs(opened.not_after as u64 - 86_400);
+        opened.verify(AGE_0_10_FINGERPRINT, before_expiry).unwrap();
+    }
+
+    #[test]
+    fn a_passphrase_backup_sealed_by_age_0_10_still_opens() {
+        assert_eq!(
+            seal_kind(AGE_0_10_PASSPHRASE_BACKUP).unwrap(),
+            SealKind::Passphrase
+        );
+        let opened = RootBackup::open(
+            AGE_0_10_PASSPHRASE_BACKUP,
+            &BackupOpener::Passphrase(passphrase(PASSPHRASE)),
+        )
+        .unwrap();
+        verify_fixture_backup(&opened);
+    }
+
+    #[test]
+    fn a_recipient_backup_sealed_by_age_0_10_still_opens() {
+        assert_eq!(
+            seal_kind(AGE_0_10_RECIPIENT_BACKUP).unwrap(),
+            SealKind::Recipient
+        );
+        let identity: age::x25519::Identity = AGE_0_10_IDENTITY.trim().parse().unwrap();
+        let opened =
+            RootBackup::open(AGE_0_10_RECIPIENT_BACKUP, &BackupOpener::Identity(identity)).unwrap();
+        verify_fixture_backup(&opened);
+    }
+
     #[test]
     fn a_passphrase_sealed_backup_round_trips_and_verifies() {
         let backup = root_backup("prod");
