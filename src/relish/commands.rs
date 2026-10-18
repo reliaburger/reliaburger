@@ -3826,7 +3826,7 @@ mod tests {
     async fn manifest_loading_defers_namespace_existence_to_live_admission() {
         for manifest in [
             "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://existing/web:v1'\nnamespace = 'existing'\n",
         ] {
             let file = write_temp_config(manifest);
             let loaded = load_manifest(&source(file.path())).await;
@@ -3840,7 +3840,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_loading_defers_build_namespace_existence_to_live_admission() {
         let file = write_temp_config(
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://existing/web:v1'\nnamespace = 'existing'\n",
         );
         let loaded = load_manifest(&source(file.path())).await;
         assert!(
@@ -3854,7 +3854,7 @@ mod tests {
         for manifest in [
             "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
             "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://Existing/web:v1'\nnamespace = 'Existing'\n",
             "[app.web]\nnamespace = 'existing'\n",
         ] {
             let file = write_temp_config(manifest);

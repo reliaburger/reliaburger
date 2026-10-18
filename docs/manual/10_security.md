@@ -195,7 +195,8 @@ Some reads span every app: `/v1/logs/sql`, the raw metric store, the cluster
 metric rollups and alerts. They need the action granted with `apps = ["*"]` and
 no `namespaces` list. So do the admin routes, test leases among them. A build
 whose destination names no namespace (`pickle://web:v1`) could belong to
-anyone, so it needs `deploy` granted the same way. A block that grants `metrics` on
+anyone, so it needs `deploy` granted the same way, and a build that sets
+`namespace` can't use one at all (see `images-and-volumes`). A block that grants `metrics` on
 one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
