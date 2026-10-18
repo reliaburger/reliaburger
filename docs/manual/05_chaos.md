@@ -232,6 +232,8 @@ A step's `fault` is any workload fault: `delay`, `drop`, `dns`, `partition`,
 | `instance` | `--instance` | all but `dns` |
 
 ```toml
+name = "Checkout loses its cache"
+
 [[step]]
 description = "Cut checkout off from the cache"
 fault = "partition"
