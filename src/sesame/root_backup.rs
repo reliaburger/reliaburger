@@ -224,9 +224,8 @@ impl RootBackup {
                     .trim()
                     .parse()
                     .map_err(|e: &str| RootBackupError::InvalidRecipient(e.to_string()))?;
-                age::Encryptor::with_recipients(vec![Box::new(recipient)]).ok_or_else(|| {
-                    RootBackupError::SealFailed("no recipient to seal to".to_string())
-                })?
+                age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                    .map_err(|e| RootBackupError::SealFailed(e.to_string()))?
             }
         };
 
@@ -255,19 +254,21 @@ impl RootBackup {
         let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(sealed))
             .map_err(|e| open_failed(&e))?;
 
-        let mut reader = match (decryptor, with) {
-            (age::Decryptor::Passphrase(d), BackupOpener::Passphrase(passphrase)) => {
-                d.decrypt(passphrase, None).map_err(|e| open_failed(&e))?
+        // Since age 0.11 the decryptor is one type for both seals, and a
+        // passphrase is an identity like any other (`age::scrypt::Identity`).
+        // Checking the seal first keeps the error that says which one to pass.
+        let mut reader = match (decryptor.is_scrypt(), with) {
+            (true, BackupOpener::Passphrase(passphrase)) => {
+                let identity = age::scrypt::Identity::new(passphrase.clone());
+                decryptor
+                    .decrypt(std::iter::once(&identity as &dyn age::Identity))
+                    .map_err(|e| open_failed(&e))?
             }
-            (age::Decryptor::Recipients(d), BackupOpener::Identity(identity)) => d
+            (false, BackupOpener::Identity(identity)) => decryptor
                 .decrypt(std::iter::once(identity as &dyn age::Identity))
                 .map_err(|e| open_failed(&e))?,
-            (age::Decryptor::Passphrase(_), BackupOpener::Identity(_)) => {
-                return Err(RootBackupError::NeedsPassphrase);
-            }
-            (age::Decryptor::Recipients(_), BackupOpener::Passphrase(_)) => {
-                return Err(RootBackupError::NeedsIdentity);
-            }
+            (true, BackupOpener::Identity(_)) => return Err(RootBackupError::NeedsPassphrase),
+            (false, BackupOpener::Passphrase(_)) => return Err(RootBackupError::NeedsIdentity),
         };
 
         let mut plaintext = vec![];
@@ -281,11 +282,12 @@ impl RootBackup {
 /// Read how a sealed backup was sealed, so the CLI knows whether to ask for
 /// a passphrase or an identity.
 pub fn seal_kind(sealed: &[u8]) -> Result<SealKind, RootBackupError> {
-    match age::Decryptor::new(age::armor::ArmoredReader::new(sealed))
-        .map_err(|e| RootBackupError::OpenFailed(e.to_string()))?
-    {
-        age::Decryptor::Passphrase(_) => Ok(SealKind::Passphrase),
-        age::Decryptor::Recipients(_) => Ok(SealKind::Recipient),
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(sealed))
+        .map_err(|e| RootBackupError::OpenFailed(e.to_string()))?;
+    if decryptor.is_scrypt() {
+        Ok(SealKind::Passphrase)
+    } else {
+        Ok(SealKind::Recipient)
     }
 }
 
@@ -392,7 +394,7 @@ mod tests {
     const PASSPHRASE: &str = "correct horse battery staple";
 
     fn passphrase(text: &str) -> SecretString {
-        SecretString::new(text.to_string())
+        SecretString::from(text.to_string())
     }
 
     fn root_backup(cluster: &str) -> RootBackup {

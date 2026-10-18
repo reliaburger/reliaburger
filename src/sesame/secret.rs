@@ -90,7 +90,8 @@ pub fn encrypt_secret(plaintext: &str, public_key: &str) -> Result<String, Secre
         .map_err(|e| SecretError::EncryptFailed(format!("invalid public key: {e}")))?;
 
     let encryptor =
-        age::Encryptor::with_recipients(vec![Box::new(recipient)]).expect("at least one recipient");
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|e| SecretError::EncryptFailed(e.to_string()))?;
 
     let mut encrypted = vec![];
     let mut writer = encryptor
@@ -131,16 +132,13 @@ pub fn decrypt_secret(
         .decode(inner)
         .map_err(|e| SecretError::InvalidFormat(format!("invalid base64: {e}")))?;
 
-    let decryptor = match age::Decryptor::new(age::armor::ArmoredReader::new(&armored_bytes[..]))
-        .map_err(|e| SecretError::DecryptFailed(e.to_string()))?
-    {
-        age::Decryptor::Recipients(d) => d,
-        _ => {
-            return Err(SecretError::DecryptFailed(
-                "expected recipients-based encryption".to_string(),
-            ));
-        }
-    };
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(&armored_bytes[..]))
+        .map_err(|e| SecretError::DecryptFailed(e.to_string()))?;
+    if decryptor.is_scrypt() {
+        return Err(SecretError::DecryptFailed(
+            "expected recipients-based encryption".to_string(),
+        ));
+    }
 
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
@@ -238,7 +236,8 @@ pub fn seal_with_age(data: &[u8], public_key: &str) -> Result<Vec<u8>, SecretErr
         .map_err(|e| SecretError::EncryptFailed(format!("invalid public key: {e}")))?;
 
     let encryptor =
-        age::Encryptor::with_recipients(vec![Box::new(recipient)]).expect("at least one recipient");
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|e| SecretError::EncryptFailed(e.to_string()))?;
 
     let mut output = vec![];
     let mut writer = encryptor
@@ -262,14 +261,12 @@ pub fn unseal_with_age(
     identity: &age::x25519::Identity,
 ) -> Result<Vec<u8>, SecretError> {
     let decryptor =
-        match age::Decryptor::new(sealed).map_err(|e| SecretError::DecryptFailed(e.to_string()))? {
-            age::Decryptor::Recipients(d) => d,
-            _ => {
-                return Err(SecretError::DecryptFailed(
-                    "expected recipients-based encryption".to_string(),
-                ));
-            }
-        };
+        age::Decryptor::new(sealed).map_err(|e| SecretError::DecryptFailed(e.to_string()))?;
+    if decryptor.is_scrypt() {
+        return Err(SecretError::DecryptFailed(
+            "expected recipients-based encryption".to_string(),
+        ));
+    }
 
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
