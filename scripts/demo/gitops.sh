@@ -39,16 +39,31 @@ point_at_demo() {
         "$1" >"$2"
 }
 
-# Whether `relish status` lists app $1 in namespace $2 as running.
+# The STATE column of every instance `relish status` lists for app $1 in
+# namespace $2, one per line. Fails when relish does, so a cluster that
+# doesn't answer never looks like one without the app.
+app_states() {
+    local listing node instance app namespace state rest
+    listing="$("${RELISH}" status)" || return 1
+    while read -r node instance app namespace state rest; do
+        if [[ "${app}" == "$1" && "${namespace}" == "$2" ]]; then
+            echo "${state}"
+        fi
+    done <<<"${listing}"
+}
+
+# Whether app $1 in namespace $2 has a running instance.
 app_runs() {
-    "${RELISH}" status | awk -v app="$1" -v namespace="$2" \
-        '$3 == app && $4 == namespace && $5 == "running" { found = 1 } END { exit !found }'
+    local states
+    states="$(app_states "$1" "$2")" || return 1
+    [[ $'\n'"${states}"$'\n' == *$'\n'running$'\n'* ]]
 }
 
 # Whether `relish status` no longer lists app $1 in namespace $2 at all.
 app_is_gone() {
-    "${RELISH}" status | awk -v app="$1" -v namespace="$2" \
-        '$3 == app && $4 == namespace { found = 1 } END { exit found }'
+    local states
+    states="$(app_states "$1" "$2")" || return 1
+    [[ -z "${states}" ]]
 }
 
 demo_step "Push ${REPOSITORY} to a bare repository"

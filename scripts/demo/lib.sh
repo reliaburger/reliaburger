@@ -54,9 +54,13 @@ demo_run() {
 # Fail the demo with a reason, Bun's last log lines and the cluster status.
 demo_fail() {
     echo "demo failed: $*" >&2
+    if [[ -n "${DEMO_BUN_PID}" ]] && kill -0 "${DEMO_BUN_PID}" 2>/dev/null; then
+        echo "--- relish status ---" >&2
+        "${RELISH}" status >&2 2>&1 || echo "(relish status failed too)" >&2
+    fi
     if [[ -n "${DEMO_WORK}" && -f "${DEMO_WORK}/bun.log" ]]; then
         echo "--- last lines of bun's log ---" >&2
-        tail -n 40 "${DEMO_WORK}/bun.log" >&2
+        tail -n 80 "${DEMO_WORK}/bun.log" >&2
     fi
     exit 1
 }
