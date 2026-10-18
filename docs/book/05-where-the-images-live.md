@@ -1333,7 +1333,7 @@ Pickle is almost entirely testable in-process. A blob store is a directory, the 
 
 ### Unit tests — the registry without the network
 
-The 104 tests in `src/pickle/` cover:
+The tests in `src/pickle/` cover:
 
 - **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
 - **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
@@ -1377,8 +1377,6 @@ cargo test --lib pickle       # the whole registry, in-process
 ```
 
 Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
-
-Phase 5 adds 72 tests, bringing the total to 867.
 
 
 ### Sharing the authentication budget

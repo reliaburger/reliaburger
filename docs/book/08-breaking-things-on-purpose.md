@@ -2092,7 +2092,7 @@ A chaos tool poses an awkward testing question: how do you test something whose 
 
 ### Unit tests — the logic
 
-The 91 tests in `src/smoker/` cover the parts that must never be wrong:
+The tests in `src/smoker/` cover the parts that must never be wrong:
 
 - **Safety rails** — one test per `SafetyViolation` variant, plus the evaluation-order test (quorum reported before leader when both trip). These are the tests that let us promise quorum protection can't be bypassed.
 - **The registry** — expiry via the min-heap, and the property that a `bun` restart leaves it empty.

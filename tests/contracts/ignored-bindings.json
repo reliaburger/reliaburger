@@ -1248,6 +1248,18 @@
     "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests"
   },
   {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_cancelling_an_array_interrupts_a_slow_cold_pull",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_cancelling_an_array_interrupts_a_slow_cold_pull"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_a_deadline_interrupts_a_slow_cold_pull",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_a_deadline_interrupts_a_slow_cold_pull"
+  },
+  {
     "source": "tests/placement.rs",
     "function": "apply_on_any_node_places_across_the_cluster",
     "binary": "reliaburger::placement",
