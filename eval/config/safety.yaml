@@ -1,0 +1,28 @@
+# Safety boundary. The harness checks these before every destructive call
+# (domain destroy/undefine, network destroy, volume delete, docker rm, kind
+# delete) and raises instead of acting on anything outside them.
+libvirt:
+  allowed_domain_prefix: "rbeval-"
+  allowed_network: rbeval
+  allowed_pool: rbeval
+  forbidden_networks: [default]
+docker:
+  allowed_container_prefix: "rbeval-"
+kind:
+  allowed_cluster_prefix: "rbeval-"
+host:
+  # Host loopback ports the laptop quickstart forwards; the harness refuses to
+  # start that scenario if any is already bound by something else.
+  quickstart_ports: [18080, 15050, 19117, 19118, 19119]
+  max_lab_memory_mib: 32768
+  # Extra source address added to the lab bridge only while OPS-004 runs, so
+  # the perimeter can be probed from a host that is neither a member nor in
+  # operator_cidrs. It must sit inside the lab network.
+  perimeter_probe_address: 10.77.0.50
+secrets:
+  # Values matching these are replaced with «redacted» in every log and
+  # evidence file, in addition to secrets registered at runtime.
+  patterns:
+    - 'rbrg_[A-Za-z0-9_\-]{16,}'
+    - 'AGE-SECRET-KEY-[A-Z0-9]+'
+    - '(?i)bearer\s+[A-Za-z0-9._\-]{16,}'

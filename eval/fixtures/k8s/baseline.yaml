@@ -1,0 +1,122 @@
+# Baseline fixture for INT-001, validated on a kind cluster before import.
+# Five kinds in common use: Deployment, Service, Ingress, ConfigMap, Secret.
+# The frontend reads its message from the ConfigMap and a token from the
+# Secret, and forwards POST /echo to the backend by service name.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rbeval-shop
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fixture-config
+  namespace: rbeval-shop
+data:
+  UI_MESSAGE: rbeval-config-7f3a
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fixture-secret
+  namespace: rbeval-shop
+type: Opaque
+stringData:
+  FIXTURE_TOKEN: rbeval-dummy-secret-91c2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: rbeval-shop
+  labels: {app: backend}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: backend}
+  template:
+    metadata:
+      labels: {app: backend}
+    spec:
+      containers:
+      - name: podinfo
+        image: ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da
+        command: ["./podinfo", "--port=9898", "--port-metrics=9797", "--level=info"]
+        ports:
+        - {name: http, containerPort: 9898}
+        readinessProbe:
+          httpGet: {path: /readyz, port: 9898}
+        resources:
+          requests: {cpu: 100m, memory: 32Mi}
+          limits: {cpu: "1", memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: rbeval-shop
+spec:
+  selector: {app: backend}
+  ports:
+  - {name: http, port: 9898, targetPort: 9898}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: rbeval-shop
+  labels: {app: frontend}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: frontend}
+  template:
+    metadata:
+      labels: {app: frontend}
+    spec:
+      containers:
+      - name: podinfo
+        image: ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da
+        command: ["./podinfo", "--port=9898", "--port-metrics=9797", "--level=info",
+                  "--backend-url=http://backend:9898/echo"]
+        ports:
+        - {name: http, containerPort: 9898}
+        env:
+        - name: PODINFO_UI_MESSAGE
+          valueFrom:
+            configMapKeyRef: {name: fixture-config, key: UI_MESSAGE}
+        - name: FIXTURE_TOKEN
+          valueFrom:
+            secretKeyRef: {name: fixture-secret, key: FIXTURE_TOKEN}
+        readinessProbe:
+          httpGet: {path: /readyz, port: 9898}
+        resources:
+          requests: {cpu: 100m, memory: 32Mi}
+          limits: {cpu: "1", memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: rbeval-shop
+spec:
+  selector: {app: frontend}
+  ports:
+  - {name: http, port: 9898, targetPort: 9898}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+  namespace: rbeval-shop
+spec:
+  rules:
+  - host: shop.rbeval.test
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port: {number: 9898}

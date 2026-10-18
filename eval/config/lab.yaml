@@ -1,0 +1,64 @@
+# Disposable lab topology. Everything the harness creates carries the
+# `name_prefix`; config/safety.yaml refuses to touch anything else.
+hypervisor: libvirt
+libvirt_uri: qemu:///system
+name_prefix: rbeval
+
+network:
+  name: rbeval
+  bridge: virbr-rbeval
+  gateway: 10.77.0.1        # the host side of the bridge: operator workstation, probes, collector
+  netmask: 255.255.255.0
+  cidr: 10.77.0.0/24
+
+storage_pool:
+  name: rbeval
+  path: /var/lib/libvirt/images/rbeval
+
+# Same stock image the v0.2.0 guest image is built from
+# (guest-image-metadata.json, source.sha256). linux-servers.md documents
+# Ubuntu 24.04 as a supported node OS.
+image:
+  url: https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img
+  sha256: 612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354
+  cache_name: ubuntu-24.04-server-cloudimg-amd64-20260911.img
+
+# linux-servers.md minimum is 2 CPU, 2 GiB, 10 GiB per node. The lab gives
+# headroom for builds, podinfo and a replica rescheduled from a lost node.
+node_spec:
+  vcpus: 4
+  memory_mib: 6144
+  disk_gib: 30
+
+nodes:
+  - name: node-01
+    ip: 10.77.0.11
+    mac: "52:54:00:77:00:11"
+  - name: node-02
+    ip: 10.77.0.12
+    mac: "52:54:00:77:00:12"
+  - name: node-03
+    ip: 10.77.0.13
+    mac: "52:54:00:77:00:13"
+
+cluster_name: rbeval
+ssh_user: rbeval
+
+# Where run-to-run lab state lives (VM inventory, CA, owner-only token).
+state_dir: .lab
+cache_dir: ~/.cache/reliaburger-eval
+
+# Host-side services used by scenarios.
+collector:
+  container_name: rbeval-otel-collector
+  image: otel/opentelemetry-collector-contrib:0.137.0
+# Host-side test services on the lab gateway, reached by the nodes.
+host_services:
+  alert_receiver_port: 18090
+  git_http_port: 18091
+baseline_k8s:
+  kind_cluster: rbeval-baseline
+  node_image: kindest/node:v1.34.0
+
+# Lifecycle policy after a full run: keep | destroy
+teardown_after_run: destroy

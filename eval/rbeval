@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Entry point: ./rbeval <setup|lab|run|report|claims> ...
+set -eo pipefail
+cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+exec uv run --quiet python -m harness.cli "$@"
