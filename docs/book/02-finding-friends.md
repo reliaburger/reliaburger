@@ -643,7 +643,7 @@ async fn gossip_convergence_five_nodes() {
 
 This looks clean. The `start_paused = true` annotation tells tokio to use a fake clock — time only advances when all tasks are idle. No real seconds pass. `sleep(2s)` completes instantly. Deterministic, right?
 
-Wrong. It passed in isolation but failed randomly when run alongside our other 400 tests. Can you see why?
+Wrong. It passed in isolation but failed randomly when run alongside the rest of the suite. Can you see why?
 
 ### Tokio's paused time: powerful but tricky
 
@@ -651,7 +651,7 @@ Wrong. It passed in isolation but failed randomly when run alongside our other 4
 
 Here's where it falls apart. When we call `tokio::time::sleep(2s)`, tokio auto-advances the clock to the nearest pending timer. But with five spawned tasks all using `tokio::time::interval` and `tokio::time::timeout`, the clock advances can fire timeouts before channel messages have been processed. Node A sends a PING to Node B, but the runtime polls Node A's timeout before it polls Node B's recv. Node A concludes B is dead. Oops.
 
-This is a known issue ([tokio #3709](https://github.com/tokio-rs/tokio/issues/3709)): there's no ordering guarantee between a task that advances time and other tasks whose timers have expired. Under parallel test load (400 other tests competing for CPU), the problem gets worse because the single-threaded runtime gets less scheduling time.
+This is a known issue ([tokio #3709](https://github.com/tokio-rs/tokio/issues/3709)): there's no ordering guarantee between a task that advances time and other tasks whose timers have expired. Under parallel test load (hundreds of other tests competing for CPU), the problem gets worse because the single-threaded runtime gets less scheduling time.
 
 It gets sneakier. Tokio uses a process-wide static flag (`DID_PAUSE_CLOCK`) to track whether any test has ever paused the clock. Once set, it stays set for the entire process lifetime, changing the code path for `Instant::now()` in every subsequent test — even ones that don't use paused time.
 
@@ -1372,7 +1372,7 @@ The test configuration uses aggressive timers (50ms heartbeat, 200-400ms electio
 
 ### What we built
 
-The council module is about 700 lines of Rust across 6 files, plus 38 tests. Here's what each file does:
+The council module is about 700 lines of Rust across 6 files, plus its tests. Here's what each file does:
 
 | File | Lines | Purpose |
 |------|------:|---------|
@@ -1399,7 +1399,7 @@ Council selection is a pure function. It takes a snapshot of the membership tabl
 
 The algorithm evaluates candidates on four things, in priority order.
 
-**Stability.** A node must have been alive for at least `min_node_age` (default: 10 minutes) before it's eligible. A node that joined 30 seconds ago might be flapping — restarting repeatedly, hitting a boot loop, or just barely connecting. We don't want it making quorum decisions. The age check uses `now.duration_since(node.first_seen)`, where `first_seen` is set when the node first appears in the membership table via gossip.
+**Stability.** Older nodes rank first. A node that joined 30 seconds ago might be flapping (restarting repeatedly, hitting a boot loop, or just barely connecting), and we'd rather a node with a track record made quorum decisions. The age is `now.duration_since(node.first_seen)`, where `first_seen` is set when the node first appears in the membership table via gossip. The selection function can also refuse nodes younger than `min_node_age`, and its default is 10 minutes, but the cluster runtime that `bun --cluster` runs sets it to zero: a fresh cluster has to form a council at all before it can be choosy about one. So age orders candidates without blocking them. We'll come back to why in "Trying it yourself" below.
 
 **Resource availability.** A council member runs the Raft engine, stores the log, applies entries to the state machine. That's not free. If a node is already at 95% CPU, adding council duties might push it over the edge. We filter out nodes where CPU usage exceeds 90% of capacity or memory exceeds 85%. These thresholds come from `ResourceSummary`, the compact resource snapshot that nodes piggyback on gossip messages.
 
@@ -1932,7 +1932,7 @@ That's the Meat scheduler's job.
 
 Meat uses a four-phase placement pipeline: Filter → Score → Select → Commit. For each replica, the pipeline runs once. After placing a replica, the cluster state cache is updated before placing the next. This prevents the scheduler from accidentally sending all replicas to the same node.
 
-**Phase 1: Filter.** Eliminate nodes that can't run the workload. A node is filtered out if it's not ready (hasn't reported since the leader election, or is being drained), doesn't match the app's required placement labels, can't enforce what the app needs, or doesn't have enough CPU/memory/GPU capacity.
+**Phase 1: Filter.** Eliminate nodes that can't run the workload. A node is filtered out if it's not ready (it hasn't sent a fresh readiness report since the leader took over, its egress enforcement has degraded, or it's been retired), doesn't match the app's required placement labels, can't enforce what the app needs, or doesn't have enough CPU/memory/GPU capacity.
 
 ```rust
 pub fn filter_nodes(
@@ -2374,7 +2374,7 @@ address — plus the provisioned master-key and identity paths.
 3. **Gossip discovery.** Node 1 receives the PING, learns about Node 2, and piggybacks this on its next outgoing messages. Node 2 receives Node 1's ACK with its membership list. Within one or two gossip periods (200ms each by default), both nodes know about each other.
 4. **No council yet.** Node 2 starts as a non-council worker. It doesn't run Raft.
 5. **Start ReportWorker.** Node 2 computes its parent via `assign_parent()`: with one council member, every worker reports to Node 1. It starts sending `StateReport` messages to Node 1 every 5 seconds.
-6. **Leader notices.** On Node 1, the leader checks whether the council should grow. With `min_council_size = 3`, it wants at least 3 council members. It only has 1 (itself), and Node 2 just appeared. But the selection algorithm requires `min_node_age = 10 minutes` before a node is eligible. So Node 2 waits.
+6. **Leader notices.** On Node 1, the leader checks whether the council should grow. With `min_council_size = 3`, it wants at least 3 council members. It only has 1 (itself), and Node 2 just appeared. The cluster runtime sets `min_node_age` to zero, so Node 2 is eligible straight away, and the reconciler starts walking it in on its next two-second tick.
 
 Two nodes. One is the council, the other is a worker. Apps can be scheduled on both.
 
@@ -2382,7 +2382,7 @@ Two nodes. One is the council, the other is a worker. Apps can be scheduled on b
 
 Same process as Node 2: bind ports, gossip discovery, start as a worker. Now the leader sees 3 total nodes, but still only 1 council member.
 
-After 10 minutes of Node 2 and Node 3 being alive and stable, the leader runs `select_council_candidates()`. Both nodes pass the eligibility filters (alive, old enough, not overloaded). The algorithm scores them for zone diversity (if they have different `zone` labels, that's a bonus) and picks the best candidates. With a target of 3 and only 1 current council member, it needs 2 more.
+The leader runs `select_council_candidates()` again. Both nodes pass the eligibility filters (alive, not overloaded, and old enough, which with a zero `min_node_age` every node is). The algorithm scores them for zone diversity (if they have different `zone` labels, that's a bonus) and picks the best candidates. With a target of 3 and only 1 current council member, it needs 2 more.
 
 The leader promotes them:
 
@@ -2423,7 +2423,7 @@ reliaburger-mycluster-2  192.168.104.3:9443    alive   yes      -
 reliaburger-mycluster-3  192.168.104.4:9443    alive   yes      -
 ```
 
-One thing you'll notice: the council forms in seconds, not the ten minutes the eligibility walk-through above would suggest. That ten-minute `min_node_age` gate belongs to `select_council_candidates()` — the careful, age-and-zone-aware selection meant for a production cluster that's already humming. The cluster *runtime* that `bun --cluster` actually runs sets `min_node_age` to zero, so a fresh node is eligible right away; age still orders candidates, it just doesn't block them. The reconciler then walks members in, one membership action per two-second tick, up to the council size cap. For a dev cluster you want to see form now, that's the right trade-off, and it's the same reconcile loop a production cluster runs.
+One thing you'll notice: the council forms in seconds. That's the zero `min_node_age` at work. The ten-minute default belongs to `select_council_candidates()` as a library function, written for a production cluster that's already humming, but the cluster runtime that `bun --cluster` runs sets it to zero, so a fresh node is eligible right away. Age still orders candidates; it just doesn't block them. The reconciler then walks members in, one membership action per two-second tick, up to the council size cap. For a dev cluster you want to see form now, that's the right trade-off, and it's the same reconcile loop a production cluster runs.
 
 When you're done, `relish dev destroy mycluster` deletes the VMs.
 
@@ -2456,7 +2456,7 @@ If a council member is being *removed* rather than added, the leader first ensur
 
 `select_council_candidates()` is a pure function. No side effects, no I/O. It takes a `MembershipTable` snapshot and returns candidates sorted by desirability:
 
-1. **Filter.** Only `Alive` nodes are eligible. Must not already be on the council. Must have been in the cluster for at least `min_node_age` (10 minutes). Must have reported resource usage, and that usage must be below the CPU/memory thresholds.
+1. **Filter.** Only `Alive` nodes are eligible. Must not already be on the council. Must have been in the cluster for at least `min_node_age` (zero in the cluster runtime, so in practice this never refuses anyone). Must have reported resource usage, and that usage must be below the CPU/memory thresholds.
 2. **Score.** Zone diversity comes first: nodes in zones not yet represented on the council score higher. Then age: older nodes are more stable. Then a deterministic tiebreak by `NodeId` (lexicographic).
 
 The leader calls this function periodically (every gossip cycle, since it's cheap) and acts only when the result differs from the current council composition. Most of the time, nothing changes. When something does change — a member departed, a new zone came online, the cluster grew — the leader reacts within one gossip period.
@@ -3128,7 +3128,7 @@ Workers poll the leader over HTTP (`GET /v1/placements/{node}`) rather than bein
 
 While wiring the scheduler we fixed a bug the review flagged: `schedule_fixed_replicas_places_all` asserted that three replicas produced three placements, but never that they landed on *different* nodes. They didn't. The score weights had bin-packing at 50 and spread at 10, so the bin-packer's preference for the fullest node swamped the spread penalty — every replica stacked onto one machine. An app runs multiple replicas precisely so it survives one node failing; packing them together defeats the entire purpose.
 
-Spread now weighs 60. The reasoning is arithmetic, not taste: spread contributes all-or-nothing (a node either already runs the app or it doesn't), while bin-pack maxes out at 50, so spread's weight has to exceed 50 for an app-free node to always beat a fuller node that already runs the app. Among nodes that are equal on spread — none run the app, or all do — bin-pack still breaks the tie as before. The test now asserts distinctness, so the weight can't silently regress again.
+So we made spread weigh 60. The reasoning was arithmetic, not taste: spread contributes all-or-nothing (a node either already runs the app or it doesn't), while bin-pack maxes out at 50, so spread's weight has to exceed 50 for an app-free node to always beat a fuller node that already runs the app. Among nodes that are equal on spread (none run the app, or all do), bin-pack still broke the tie as before. The test now asserts distinctness, so placement can't silently regress again. That was the first of the two bugs "Phase 2: Score" mentions: 60 points stopped helping once every candidate already ran the app, and spread is a sort key now, not a weight.
 
 ### One bug the wiring flushed out
 

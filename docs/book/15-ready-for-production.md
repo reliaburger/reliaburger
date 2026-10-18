@@ -518,7 +518,7 @@ HTML report. On Linux CI that same run is the test gate, so we don't pay for the
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
 crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
-mid-write: all 4,708 tests passed, then `llvm-profdata` refused the truncated file and failed
+mid-write: every test passed, then `llvm-profdata` refused the truncated file and failed
 the whole report. The report steps now pass `--failure-mode all`, which skips an unreadable
 profile with a warning and only fails when none can be read. Skipping one killed process's
 partial counts can pull coverage down a hair. It can't push it up, so the floor still means
@@ -599,10 +599,10 @@ runner-minutes, and more than half of those minutes went to runs that a newer pu
 already cancelled. Nobody waits half an hour for feedback. They push again, which cancels the
 run, which makes the wait longer. So we measured where the time went before touching anything.
 
-Two-thirds of it was compiling. The portable suite, about 4,150 tests that take five minutes to
+Two-thirds of it was compiling. The portable suite, which takes five minutes to
 run, ran seven times per push: default and no-default features in three jobs, plus macOS. The
 only default feature is `kubernetes`, and nothing in the code depends on it being *off*, so the
-four no-default runs repeated the same 4,110 tests to prove the crate builds without one
+four no-default runs repeated the same tests to prove the crate builds without one
 dependency. A second `clippy --no-default-features` proves that in seconds. The coverage job
 compiled and ran the suite again under instrumentation, beside the uninstrumented run it
 duplicated. The 10,000-member scale test had its own 21-minute release build, because
@@ -806,7 +806,7 @@ release had a dozen of them in flight. We timed twelve runs: 45 to 55 minutes of
 Runner queueing was mostly under ten minutes, so the runners weren't the problem. Portable
 macOS was the critical path in almost every run, at 35 to 49 minutes, then acceptance at about
 34. Everything else finished in about 15. Inside the macOS job, compiling the test binaries
-took 27 minutes; running all 6,288 tests took seven.
+took 27 minutes; running them took seven.
 
 So we asked what a pull request into a train actually needs to prove. That it compiles, lints
 clean on stable and on the minimum compiler, and passes the portable suite with the coverage
@@ -844,8 +844,8 @@ envelope can't be uploaded under another's name. A shard re-run on its own after
 keeps the attempt number GitHub gave it, so the check that one job's owners share an attempt
 treats each shard as its own job.
 
-Did splitting pay? Less than we hoped. The first full run with shards ran 2,094 tests in
-under three minutes per shard instead of seven, but each shard still compiled the whole suite
+Did splitting pay? Less than we hoped. The first full run with shards ran each shard's tests in
+under three minutes instead of seven, but each shard still compiled the whole suite
 for 38 minutes, so a shard took 42 to 44 minutes against the 45 before. That's level with
 acceptance, so macOS is no longer the only critical path, and no further. Three macOS jobs
 also wait longer for runners: one shard queued for 28 minutes behind other pull requests.

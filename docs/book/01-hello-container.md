@@ -682,21 +682,19 @@ fn parse_resource_range_request_exceeds_limit_rejected() {
 
 Read the test name and you know exactly what behaviour it's verifying. `replicas_deserialise_zero_rejected` — replicas of zero should fail. `parse_resource_range_request_exceeds_limit_rejected` — asking for more than your limit is an error.
 
-The full test suite for config parsing has 66 tests. Each one was written before the code it tests. Some of them describe happy paths (minimal app parses, all fields parse, round-trip works). Others describe failure modes (missing image rejected, invalid port rejected, non-absolute path rejected). Every one passed before we moved on.
+Each config parsing test was written before the code it tests. Some of them describe happy paths (minimal app parses, all fields parse, round-trip works). Others describe failure modes (missing image rejected, invalid port rejected, non-absolute path rejected). Every one passed before we moved on.
 
 `cargo test` runs them all in under a second. That's the feedback loop we want: make a change, run the tests, know immediately if something broke.
 
 ```
-running 66 tests
 test config::types::tests::parse_resource_range_cpu_with_range ... ok
 test config::types::tests::replicas_deserialise_star ... ok
 test config::app::tests::parse_app_with_health_check ... ok
 test config::validate::tests::validate_app_missing_image_rejected ... ok
 ...
-test result: ok. 66 passed; 0 failed; 0 ignored
 ```
 
-66 passing tests. No containers yet, no networking, no gossip protocol. Just a solid configuration layer that we can trust completely. Everything we build from here — the container runtime, the health checker, the scheduler — will parse its config through these types. And we know they work.
+All passing. No containers yet, no networking, no gossip protocol. Just a solid configuration layer that we can trust completely. Everything we build from here — the container runtime, the health checker, the scheduler — will parse its config through these types. And we know they work.
 
 ## The container runtime interface
 
@@ -1047,7 +1045,7 @@ pub enum GrillError {
 
 `#[from]` on a variant generates a `From<InvalidTransition> for GrillError` implementation. This means anywhere you have a `Result<_, InvalidTransition>`, you can use `?` to automatically convert it to `Result<_, GrillError>`. No manual error wrapping, no `map_err` calls. The `?` operator does three things: if the result is `Ok`, unwrap the value and continue; if it's `Err`, convert the error using `From` and return early. It's the Rust equivalent of Go's `if err != nil { return err }`, but in three characters instead of three lines.
 
-With the trait defined, Phase 1's implementation focuses on the parts that don't need a real container runtime: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
+With the trait defined, Phase 1's implementation focuses on the parts that don't need a real container runtime: the state machine, port allocator, cgroup computation, and OCI spec generation. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
 
 When we implement the runc integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
 
@@ -1575,7 +1573,7 @@ Now you can test that the scheduler correctly places a workload requiring 2 GPUs
 
 The trait boundary is a seam for testing, not just for polymorphism. Define the trait now, use the stub, swap in the real implementation later without changing any callers. This is dependency inversion in Rust: the same principle as in Go or Java, but with zero runtime cost because the compiler monomorphises generic code.
 
-With the Bun agent core in place, we've added 62 tests (bringing the total to 197) covering the supervisor, health checking, restart backoff, and GPU detection. Every state transition is tested. Every edge case in backoff computation is covered. The priority queue correctly orders, lazily deletes, and reschedules. And the mock-based testing pattern we've established here will scale to every subsystem we build next.
+With the Bun agent core in place, the new tests cover the supervisor, health checking, restart backoff, and GPU detection. Every state transition is tested. Every edge case in backoff computation is covered. The priority queue correctly orders, lazily deletes, and reschedules. And the mock-based testing pattern we've established here will scale to every subsystem we build next.
 
 ## The Relish CLI
 
@@ -1895,7 +1893,7 @@ mod tests {
 
 The command functions themselves are tested through the library. `apply()` gets tested with temporary files (created by the `tempfile` crate), exercising the full pipeline: read file, parse TOML, validate config, generate plan, format output. Commands like `status`, `logs`, and `exec` get tested by pointing them at a bogus agent address and verifying they return the right `AgentUnreachable` error.
 
-With the Relish CLI skeleton, we've added 36 tests (bringing the total to 233). The CLI parses five subcommands with a global `--output` flag. `apply` does real work — it reads, validates, and plans. The other four commands fail gracefully instead of panicking. Three output formats — human, JSON, YAML — work through a single `format_output` function that dispatches on a type-safe enum. And the error handling follows the pattern we'll use everywhere: `thiserror` in the library, manual formatting in the binary.
+With the Relish CLI skeleton in place, the CLI parses five subcommands with a global `--output` flag. `apply` does real work — it reads, validates, and plans. The other four commands fail gracefully instead of panicking. Three output formats — human, JSON, YAML — work through a single `format_output` function that dispatches on a type-safe enum. And the error handling follows the pattern we'll use everywhere: `thiserror` in the library, manual formatting in the binary.
 
 ## A process-based runtime
 
@@ -1993,7 +1991,7 @@ match child.try_wait() {
 
 `try_wait` returns `Ok(None)` if the process is still running, `Ok(Some(status))` if it's exited, and `Err` if something went wrong checking. We map all terminal cases to `Stopped`.
 
-ProcessGrill now has 8 tests covering every lifecycle transition. They run in milliseconds, on any platform, without root privileges. That's the whole point: by abstracting the runtime behind a trait, we can test everything at full speed and add real containers later.
+ProcessGrill's tests cover every lifecycle transition. They run in milliseconds, on any platform, without root privileges. That's the whole point: by abstracting the runtime behind a trait, we can test everything at full speed and add real containers later.
 
 ## Real containers: runc and Apple Container
 
@@ -2992,21 +2990,24 @@ The V02 soak found the same mistake one phase earlier. When a rollout stops an i
 
 An external tester then hit the same message on their own Ubuntu servers (issue #241). The binary on the node turned out to predate the fix, but their report raised a case we'd never tested: a unit without `KillMode=process`. systemd's default, `KillMode=control-group`, sends SIGTERM and then SIGKILL to every process in Bun's cgroup, and that includes the runtime owners Bun started. The container itself lives in its own cgroup, so the question is what the next Bun sees. `restart_after_unit_cgroup_stop_recovers_a_running_generation` and `..._a_retiring_generation` rebuild that stop for real: the test creates a stand-in unit cgroup, starts the fixture inside it, signals every member the way systemd does and writes `1` to `cgroup.kill`. Then a fresh runtime adopts. Both cases start cleanly, retire the generation and keep discovery's address held until the original reference releases it. Put the old adoption check back and the retiring case fails with the exact error from the issue.
 
-**Hold a lock for as long as you act.** A Tokio mutex coordinates tasks inside one Bun. It can't coordinate the Bun that died with the one that replaced it. So each instance has a lock file, and anyone who wants to act on a generation must first *claim* it: take an exclusive lock on that file, then re-read the journal and check that the generation is still the one they expected. The lock lives inside the claim and is released by `Drop`:
+**Hold a lock for as long as you act.** A Tokio mutex coordinates tasks inside one Bun. It can't coordinate the Bun that died with the one that replaced it. So each instance has a lock file, and anyone who wants to act on a generation must first *claim* it: take an exclusive lock on that file, then re-read the journal and check that the generation is still the one they expected. The lock lives inside the claim (`src/grill/runc_intent.rs`) and is released by `Drop`:
 
 ```rust
-// Never unlink or replace a lock file: another process may already hold it.
-#[derive(Debug)]
-struct LifecycleLock(File);
+pub struct IntentClaim {
+    journal: IntentJournal,
+    instance: InstanceId,
+    record: Option<RuntimeIntent>,
+    _lock: FileLock,
+}
 
-impl Drop for LifecycleLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 ```
 
-`Drop` is Rust's destructor trait. The compiler calls `drop` when the value goes out of scope, including when a `?` returns early with an error, so no path out of a function can forget to unlock. Go would need a `defer`; C would need discipline again. We never delete the lock file, because a second process could then lock a fresh file under the same name while the first still holds the old one.
+`Drop` is Rust's destructor trait. The compiler calls `drop` when the value goes out of scope, including when a `?` returns early with an error, so no path out of a function can forget to unlock. Go would need a `defer`; C would need discipline again. Dropping an `IntentClaim` drops each of its fields, so the lock goes with the claim. The leading underscore in `_lock` tells the compiler we keep the field only for its `Drop`, so it doesn't warn that nobody reads it. `FileLock` lives in `src/file_lock.rs`, and every file lock in Bun goes through it: this claim first had a guard type of its own, and Chapter 9's "Resume the operation, don't create a second cluster" tells how eight such guards became one. We never delete the lock file, because a second process could then lock a fresh file under the same name while the first still holds the old one.
 
 The methods that write to the journal take the claim by value and hand it back: `pub async fn retire(mut self, exit_code: Option<i32>) -> io::Result<Self>`. Taking `self` rather than `&self` *moves* the claim into the function, and from there into the `spawn_blocking` worker doing the write. If the async caller is cancelled mid-write, the worker still owns the lock until the write finishes. Ownership, not convention, keeps the lock alive.
 
@@ -3102,7 +3103,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff
 
-339 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, exec command execution, and 21 integration tests that exercise the full stack end to end.
+The tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, exec command execution, and integration tests that exercise the full stack end to end.
 
 ### Two bugs the abstraction hid (post-audit fix)
 

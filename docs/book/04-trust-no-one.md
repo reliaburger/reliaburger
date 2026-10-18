@@ -1153,7 +1153,7 @@ The `ring` crate makes this even stricter. An `aead::LessSafeKey` can't be clone
 
 ## Tests
 
-Cryptography is a dream to unit-test and a nightmare to test any other way. The functions are pure: same input, same output, every time. HKDF is deterministic, AES-GCM round-trips, a tampered ciphertext always fails the tag check. None of it needs a network, a second node, or root. So Phase 4 is almost entirely unit-tested — 119 tests living next to the code in `src/sesame/`.
+Cryptography is a dream to unit-test and a nightmare to test any other way. The functions are pure: same input, same output, every time. HKDF is deterministic, AES-GCM round-trips, a tampered ciphertext always fails the tag check. None of it needs a network, a second node, or root. So Phase 4 is almost entirely unit-tested, with the tests living next to the code in `src/sesame/`.
 
 ### What the unit tests prove
 
@@ -1178,8 +1178,6 @@ cargo test --lib sesame
 ```
 
 The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/suite/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
-
-Phase 4 adds 85 tests to the suite, bringing the total to 795.
 
 ### Private files need private temporary files too
 
