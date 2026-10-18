@@ -27,7 +27,7 @@ class ReleasePackageTests(unittest.TestCase):
         self.trusted = ["ed25519:" + base64.b64encode(public[-32:]).decode()]
         self.assets = self.root / "assets"
         self.assets.mkdir()
-        for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64", "relish-macos-x86_64"):
+        for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64"):
             (self.assets / name).write_bytes(b"test binary: " + name.encode())
         self.pins = json.loads((Path(__file__).with_name("guest-images.json")).read_text())
         for image in self.pins["images"].values():
@@ -482,6 +482,79 @@ esac
         if shutil.which("shellcheck"):
             result = subprocess.run(["shellcheck", "-s", "sh", *map(str, scripts)], capture_output=True)
             self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_cli_is_built_for_apple_silicon_only_on_macos(self):
+        # Maintainer decision, 17 October 2026 (#1018): 0.2.1 is the last
+        # release with an Intel macOS build.
+        self.package()
+        cli = json.loads((self.assets / "cli-metadata.json").read_text())
+        self.assertEqual(set(cli["releases"][0]["platforms"]), {"linux-aarch64", "linux-x86_64", "macos-aarch64"})
+        self.assertFalse((self.assets / "relish-macos-x86_64.sig").exists())
+        self.assertNotIn("macos-x86_64", (self.assets / "SHA256SUMS").read_text())
+        installer = (self.assets / "install.sh").read_text()
+        self.assertNotIn("@MACOS_X86_64", installer)
+        self.assertNotIn("platform=macos-x86_64", installer)
+
+    def intel_mac_tools(self, name, sysctl):
+        """A Mac whose uname says x86_64, with `sysctl` given by the caller."""
+        tools = self.root / name
+        tools.mkdir()
+        (tools / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; esac\n')
+        (tools / "sysctl").write_text("#!/bin/sh\n" + sysctl)
+        (tools / "curl").write_text('#!/bin/sh\nfor argument; do printf "%s\\n" "$argument" >>"$CALLS"; done\n'
+                                    'while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then cp "$FIXTURE" "$2"; exit; fi; shift; done\nexit 1\n')
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        return tools
+
+    def test_installer_refuses_an_intel_mac_and_says_what_to_use(self):
+        import os
+        self.package()
+        installer = self.assets / "install.sh"
+        intel = {
+            # An Intel Mac has no hw.optional.arm64 at all.
+            "missing": 'echo "sysctl: unknown oid \'hw.optional.arm64\'" >&2\nexit 1\n',
+            "zero": 'echo 0\n',
+        }
+        for shell in POSIX_SHELLS:
+            for case, sysctl in intel.items():
+                with self.subTest(shell=shell, sysctl=case):
+                    tools = self.intel_mac_tools(f"intel-{shell}-{case}", sysctl)
+                    home = self.root / f"intel-home-{shell}-{case}"
+                    home.mkdir()
+                    calls = self.root / f"intel-calls-{shell}-{case}"
+                    env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                               CALLS=str(calls), FIXTURE=str(self.assets / "relish-macos-aarch64"))
+                    result = subprocess.run([shell, str(installer), "--install-only"], env=env, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    stderr = result.stderr.decode()
+                    self.assertIn("Intel Mac", stderr)
+                    self.assertIn("Apple silicon", stderr)
+                    self.assertIn("Linux", stderr)
+                    self.assertIn("RELIABURGER_VERSION=v0.2.1", stderr)
+                    self.assertFalse(calls.exists(), "an Intel Mac reached a download")
+                    self.assertFalse((home / ".reliaburger").exists(), "an Intel Mac got a store")
+
+    def test_installer_gives_apple_silicon_under_rosetta_the_native_build(self):
+        # A shell running under Rosetta sees `uname -m` say x86_64 on an
+        # Apple silicon Mac; the hardware still says arm64.
+        import os
+        self.package()
+        installer = self.assets / "install.sh"
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                tools = self.intel_mac_tools(f"rosetta-{shell}", 'echo 1\n')
+                home = self.root / f"rosetta-home-{shell}"
+                home.mkdir()
+                calls = self.root / f"rosetta-calls-{shell}"
+                env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                           CALLS=str(calls), FIXTURE=str(self.assets / "relish-macos-aarch64"))
+                result = subprocess.run([shell, str(installer), "--install-only"], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("https://github.com/reliaburger/reliaburger/releases/download/v0.1.0/relish-macos-aarch64",
+                              calls.read_text().splitlines())
+                self.assertEqual((home / ".reliaburger/bin/relish").read_bytes(),
+                                 (self.assets / "relish-macos-aarch64").read_bytes())
 
     def test_untrusted_key_cannot_publish_metadata(self):
         self.trusted = ["ed25519:" + base64.b64encode(bytes(32)).decode()]

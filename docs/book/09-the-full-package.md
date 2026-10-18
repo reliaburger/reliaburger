@@ -1840,6 +1840,40 @@ The bar itself is curl's `--progress-bar`, but only when standard error is a ter
 
 Both scripts now carry the same `download` helper, word for word. Keeping two copies of a shell function in step by hand is how one of them ends up with a bug the other fixed, so a test compares them.
 
+### One Mac, not two
+
+Until 0.2.1, every release carried two macOS CLIs: `relish-macos-aarch64` for
+Apple silicon and `relish-macos-x86_64` for Intel. Nobody ever installed the
+Intel one end to end. Every staged install, soak and tour ran on Apple
+silicon, so each release shipped a binary that only a compiler had looked at.
+Meanwhile it cost the most of anything we built: Intel macOS runners
+(`macos-15-intel`) are the scarcest on GitHub Actions, and 0.2.1's candidate
+build waited over an hour for one. On a Mac the cluster runs in Linux VMs
+anyway, so the CLI was the only thing the Intel build gave anyone. From 0.2.2
+it's gone ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
+The x86_64 guest image stays, because Linux x86_64 hosts boot it.
+
+Dropping a platform means three lists in step: the build matrix in
+`build.yml`, `PLATFORMS` in `package.py` (which signs every binary and which
+`candidate.py` reads to decide what a complete candidate contains), and the
+installer's `case` on `uname`. A new test in `test_build_workflow.py` reads
+the matrix out of `build.yml` and checks it builds exactly what `PLATFORMS`
+signs, so the next time one list changes without the other, a test says so
+instead of a release candidate that waits for a binary nobody builds.
+
+The installer can't just fall through to "unsupported platform" on an Intel
+Mac. That person needs to know what to do next, so it says: use a Linux host,
+or install 0.2.1, the last release built for Intel Macs, with
+`RELIABURGER_VERSION=v0.2.1`. There's a trap, though. A Terminal running under
+Rosetta (Apple's x86_64 translator) sees `uname -m` print `x86_64` on an Apple
+silicon Mac. Trusting `uname` would turn away people with perfectly good
+hardware. So on `Darwin-x86_64` the installer asks the hardware instead:
+`sysctl -n hw.optional.arm64` prints `1` on Apple silicon, even under
+Rosetta, and an Intel Mac doesn't have that key at all. Apple silicon gets
+the native arm64 build, which runs fine from a translated shell. The tests
+fake both answers, plus the missing key, and check that an Intel Mac never
+reaches a download or creates `~/.reliaburger`.
+
 ### Getting onto `PATH` without editing your files behind your back
 
 An installer that ends with "now add this directory to PATH" has handed you homework, and the next command in the tutorial fails until you do it. But an installer that quietly appends to your `.zshrc` has edited a file you care about without asking. We wanted neither.
