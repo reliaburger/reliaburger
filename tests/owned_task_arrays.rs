@@ -2464,6 +2464,87 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A job's `pids` becomes its command cgroup's `pids.max` (#741), and the
+/// kernel refuses the fork past it. The helper keeps its own 16.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and cgroup v2; run with make test-linux"]
+async fn cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup() {
+    use reliaburger::bun::{
+        execution_budget::ExecutionBudget,
+        task_executor::{TaskInvocation, TaskRunner},
+        task_runtime::OwnedRunner,
+    };
+    use reliaburger::grill::{AnyGrill, ProcessGrill};
+    use reliaburger::meat::Resources;
+    use tokio_util::sync::CancellationToken;
+    let root = tempfile::Builder::new()
+        .prefix("rb-native-pids-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    eprintln!("native pids fixture: {}", root.display());
+    let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
+    let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
+    let runner = OwnedRunner::with_slot_count(AnyGrill::Process(runtime.clone()), 1)
+        .with_budget(budget.clone());
+    let template: reliaburger::config::job::JobSpec = toml::from_str(
+        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native-pids'\ncpu='100m-1000m'\nmemory='32Mi'\npids=8",
+    )
+    .unwrap();
+    // Everything after the subshell is a shell builtin, so reading the
+    // results never needs a fork the limit could refuse. The subshell
+    // forks sleeps until the kernel says no.
+    let script = r#"
+        ( i=0; while [ $i -lt 32 ]; do sleep 2 & i=$((i+1)); done; wait ) 2>/dev/null
+        read -r line < /proc/self/cgroup
+        group=/sys/fs/cgroup${line#0::}
+        read -r limit < "$group/pids.max"
+        read -r helper < "${group%/task}/helper/pids.max"
+        echo "group=$group"
+        echo "limit=$limit"
+        echo "helper=$helper"
+        while read -r key value; do echo "event_$key=$value"; done < "$group/pids.events"
+    "#;
+    let task = TaskInvocation {
+        template: Some(Box::new(template)),
+        index: 0,
+        attempt: 1,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![],
+        run: None,
+    };
+    let cancel = CancellationToken::new();
+    let outcome = runner.run(&task, Duration::from_secs(20), &cancel).await;
+    assert!(outcome.outcome.succeeded(), "{outcome:?}");
+    let text = String::from_utf8_lossy(&outcome.output.head).into_owned();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} in {text}"))
+            .to_string()
+    };
+    let group = field("group");
+    assert!(
+        group.ends_with("/task"),
+        "command escaped its cgroup: {text}"
+    );
+    assert_eq!(field("limit"), "8", "{text}");
+    let refused: u64 = field("event_max").parse().unwrap();
+    assert!(refused > 0, "the kernel never refused a fork: {text}");
+    assert_eq!(field("helper"), "16", "{text}");
+    // The idle executor retires on its own and returns its reservation.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while budget.available() != budget.capacity() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the idle executor kept its reservation");
+    drop(runner);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Dropping a caller hands its executor to the eviction loop, which retires
 /// it and returns the reservation without a restart. A restart afterwards
 /// reuses only the originally retired slot identity, never a recovered PID.

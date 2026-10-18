@@ -397,8 +397,11 @@ what's shipped and what's scheduled.
   independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
   the V02 leftovers, the snapshot uploader under power cuts and the
   `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
-  V04, cold installs on Intel macOS, Linux x86_64 and Linux arm64
+  V04, cold installs on Linux x86_64 and Linux arm64
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
+  Intel macOS left V04 when 0.2.2 dropped its build: 0.2.1 is the last release
+  with `relish-macos-x86_64`
+  ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
 - **Missing capabilities F01–F11**, one issue each, placed in
   [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
   [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F07 part 2

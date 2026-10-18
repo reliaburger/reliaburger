@@ -43,6 +43,9 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
         eprintln!();
     }
     loaded.config.validate_intrinsic()?;
+    for warning in loaded.config.warnings() {
+        eprintln!("warning: {warning}");
+    }
     Ok(loaded.config)
 }
 
@@ -1529,6 +1532,9 @@ pub async fn rollback(app: &str, namespace: &str, force: bool) -> Result<(), Rel
 pub fn lint(path: &Path) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
+    for warning in config.warnings() {
+        eprintln!("warning: {warning}");
+    }
 
     // Count resources
     let app_count = config.app.len();
@@ -2698,6 +2704,7 @@ pub fn task_array_request(
         name: run.name,
         namespace: Some(run.namespace),
         template: crate::config::job::JobSpec {
+            pids: None,
             runtime: run.runtime,
             image: run.image,
             command: Some(run.args),

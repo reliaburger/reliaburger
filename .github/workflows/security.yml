@@ -16,3 +16,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
       - run: make audit
+
+  # How far Cargo.lock lags crates.io. Informational: it never fails, and the
+  # refresh itself is a release step (docs/releasing.md) and Dependabot's job.
+  outdated:
+    name: weekly dependency lag report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Report the lag in the job summary
+        run: |
+          {
+            echo '## Dependency lag'
+            echo
+            echo '```'
+            make outdated 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

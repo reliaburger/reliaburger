@@ -160,6 +160,7 @@ mod tests {
                     },
                 ],
                 resources: Some(OciResources {
+                    pids: None,
                     cpu: None,
                     memory: None,
                     unified: std::collections::BTreeMap::new(),

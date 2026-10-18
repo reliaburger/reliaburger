@@ -443,6 +443,11 @@ fn export_job(
             "[job.{name}] runtime = \"shared-runc\" container reuse — exported as a Job with a fresh Pod per attempt"
         ));
     }
+    if job.pids.is_some() {
+        report.unsupported.push(format!(
+            "[job.{name}] pids — a Pod spec has no process limit; the kubelet sets one per node (podPidsLimit)"
+        ));
+    }
     let app_namespace = job.namespace.clone();
     // Env and resources go through the same helpers as the app path — the job
     // exporter used to drop both, so a job with a memory limit and database
@@ -843,6 +848,24 @@ mod tests {
                 .iter()
                 .any(|u| u.contains("shared-runc") && u.contains("fresh Pod"))
         );
+    }
+
+    #[test]
+    fn a_jobs_pids_limit_is_reported_because_a_pod_spec_cannot_carry_one() {
+        let config = parse_config("[job.worker]\nimage='fixture:v1'\npids=512");
+        let result = export_kubernetes(&config).unwrap();
+        assert_eq!(result.report.resources_created, vec!["Job/worker"]);
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("[job.worker] pids") && u.contains("podPidsLimit")),
+            "{:?}",
+            result.report.unsupported
+        );
+        let plain = export_kubernetes(&parse_config("[job.worker]\nimage='fixture:v1'")).unwrap();
+        assert!(plain.report.unsupported.is_empty());
     }
 
     #[test]

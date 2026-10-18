@@ -32,6 +32,9 @@ what comes after it.
 - **macOS runs containers through a managed Linux VM**
   ([quickstart](quickstart.md)). Direct Apple Container is disabled; native
   macOS Bun runs process workloads.
+- **The released macOS CLI is Apple silicon only.** 0.2.1 is the last release
+  with an Intel macOS build; on an Intel Mac, use a Linux host
+  ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
 - **Native processes are foreground-only.** See the
   [ProcessGrill contract](#processgrill-built-in-fallback).
 - **Clusters start fresh.** There's no upgrade path from development builds:
@@ -380,6 +383,7 @@ make test-linux  # provisioned Linux runtime/kernel suite
 make test-rootless-runc # non-root runc/slirp replacement proof
 make lint        # clippy with warnings as errors
 make audit       # RustSec advisory and dependency-maintenance gate
+make outdated    # report crates behind crates.io (never fails)
 make fmt         # format with rustfmt
 make ci          # portable format, lint, test, doctest and CI-script checks
 make ci-bench    # make ci, then the gossip benchmarks

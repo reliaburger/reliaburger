@@ -1974,6 +1974,22 @@ pub fn host_init_binaries(spec: &AppSpec) -> impl Iterator<Item = &Path> {
 
 `impl Iterator<Item = &Path>` says "some iterator of borrowed paths" without naming its type, which here is a chain of adapters nobody wants to spell out. It's lazy, like a Python generator: nothing runs until someone pulls from it. The `move` keyword makes the closure take its own copy of `host`, because the iterator outlives the function's local variables. `WorkloadRequirements` now carries `host_binaries`, the app's binary followed by these, and the filter wants a node that runs every one of them. The node's admission walks the same iterator, so placement and refusal still agree.
 
+Both of those answers arrive after `relish apply` has returned, as an unplaced reason or a refused deploy. The commonest mistake is writing `echo` where the allowlist says `/bin/echo`, and config validation can spot that before anything is sent (#1044). `Config::warnings` walks the same iterator and flags any binary with no `/` in it:
+
+```rust
+for binary in crate::meat::filter::host_init_binaries(app) {
+    let binary = binary.to_string_lossy();
+    if binary.contains('/') {
+        continue;
+    }
+    warnings.push(format!("app {namespace}/{name}: init container command {binary:?} is a bare name, ..."));
+}
+```
+
+`to_string_lossy` turns a `&Path` into text, swapping any bytes that aren't valid UTF-8 for a replacement character. It returns a `Cow<str>`, "clone on write": a borrow when the path was already valid UTF-8, an owned `String` only when it had to fix something. Paths on Unix are bytes, not text, which is why Rust makes you ask.
+
+It's a warning, not a refusal. The allowlist compares paths exactly, and nothing stops a node from listing a bare `echo`, which ProcessGrill then finds on its `PATH`. Refusing would break that node's apps, so `relish lint` and `relish apply` print the warning and carry on.
+
 The opposite constraint came in 0.2.1 (#914). A node on `--runtime process` runs host workloads only and refuses an app that names an image, so placing one there would fail after placement. Each node now reports `containers` in its capabilities, true for runc, Apple Container and the mixed runtime, and an image app needs it:
 
 ```rust
