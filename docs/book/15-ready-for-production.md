@@ -861,8 +861,12 @@ would enable it. `cargo tree --target all -i rkyv` found no active path, and Rel
 no rkyv archives. The advertised fix starts at the incompatible rkyv 0.8 API while
 `rust_decimal` 1.x deliberately pins its optional integration to 0.7. We recorded a temporary,
 expiring exception instead of pretending that changing an unused lockfile version was a fix.
-The exception has a condition attached: `make audit` asks Cargo for the active `rkyv`
-graph first, and fails if any feature or target activates it, or if Cargo can't answer.
+The exception had a condition attached: `make audit` asked Cargo for the active `rkyv`
+graph first, and failed if any feature or target activated it, or if Cargo couldn't answer.
+The October 2026 dependency refresh (below) retired it. The newer lockfile no longer
+carries `rkyv` at all, so the guard's own `cargo tree -i rkyv` failed with "did not match
+any packages", and we deleted the exception and the guard together. A test in the suite
+now fails if `rkyv` ever comes back.
 
 The repository audit denies every new vulnerability and maintenance warning. Its short
 exception list expires on 18 November 2026, and the Make target fails after that date until we
@@ -873,6 +877,51 @@ quieter way to forget a problem.
 Now a green portable run means something narrow and valuable: the portable behaviour ran,
 without retries, on this machine. The privileged, cluster, upgrade, slow and benchmark jobs
 make their own claims. Smaller claims. Better evidence.
+
+### A fix you never picked up
+
+`cargo audit` answers one question: does a crate we lock have a published advisory? It
+says nothing about the bugs upstream fixed quietly, in a changelog line rather than a
+RustSec entry. The 0.2.1 release gate found one of those the hard way. A soak powered off a
+node while redb was growing the Raft log's file, and on the next start Bun panicked on an
+assertion in redb's page manager, every time, until we wiped the node
+([#1024](https://github.com/reliaburger/reliaburger/issues/1024)). redb 4.2.0's changelog
+describes exactly that crash, fixed. We were on 2.6.3. Nobody had chosen to stay there; we
+had just never asked to move.
+
+Two Cargo mechanisms got us there, and both are doing their job. The first is the version
+requirement. `redb = "2"` in `Cargo.toml` doesn't mean "version 2". It's a caret range,
+`>=2.0.0, <3.0.0`: any release that semantic versioning (semver) promises won't break our
+code. Below 1.0 the leftmost non-zero number counts as the major version, so `nix =
+"0.29"` takes any 0.29.x and never 0.30. If you know Go, this is close to a `go.mod`
+line, which also never crosses a major version, though Go makes that a new import path
+(`/v2`) where Cargo just refuses. Python's `~=` operator is the nearest pip equivalent.
+
+The second is the lockfile. When Cargo first resolves the graph it picks the newest
+version inside each range, then writes the exact choice, with a checksum, to `Cargo.lock`.
+A binary project commits that file, so every build, CI run and release uses the same bytes
+until someone runs `cargo update`. That's the point: a release we soaked for eight hours
+must be the release we ship. Go's minimal version selection reaches a similar place
+differently, by choosing the oldest version that satisfies everyone; Cargo chooses the
+newest and then freezes it.
+
+Put those together and the drift is obvious. Our lockfile moved when we added a crate or
+fixed an advisory, and at no other time. By October 2026 a plain `cargo update` had 244
+compatible updates waiting, and eighteen direct dependencies were a major version or more
+behind, redb among them. No range would ever have reached 4.x on its own.
+
+So we made moving routine
+([#1026](https://github.com/reliaburger/reliaburger/issues/1026)). The first PR of every
+minor release runs `cargo update`, which stays inside the ranges, and the release's soak
+then proves the new set. Dependabot opens the same lockfile-only refresh as one grouped PR
+each week between releases. Major versions stay deliberate, one crate per PR, because
+they're allowed to break an API or a wire format. `make outdated` lists them (it runs
+`cargo update --dry-run --verbose`, which changes nothing), and a weekly job prints the
+list, without ever failing the build. A lag report that broke builds would get muted
+within a week. One that nobody reads would rot just as fast, which is why the refresh is a
+numbered step in the release runbook, not a good intention.
+
+The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
 

@@ -558,7 +558,8 @@ journal, bundle and route files, and at startup it sweeps any an interrupted
 retirement left behind, so executor metadata doesn't grow with every namespace
 that ever ran a job.
 
-The command is born in its task cgroup, with independent CPU and memory limits.
+The command is born in its task cgroup, with independent CPU, memory and
+process limits.
 It receives its own mount and IPC namespaces, empty environment before explicit
 image/job variables, and fresh 16 MiB `/tmp` and `/dev/shm` filesystems. Its root
 is read-only; regular files have a 1 MiB size limit. No command receives the
@@ -597,10 +598,32 @@ in both fresh and reused execution. A job exceeding its RAM limit can be OOM-kil
 spill into swap and consume unaccounted disk I/O. Choose the memory range for
 the actual working set, including model weights.
 
-Some limits are fixed rather than derived from the profile. Each command's
-task cgroup allows 256 processes and threads (`pids.max`); threads count, so a
-JVM or another heavily threaded command may need fresh containers instead. The
-helper's own cgroup allows 16, outside the command's limits. `/tmp` and
+Each command's task cgroup allows 256 processes and threads (`pids.max`)
+unless the job sets `pids`. Threads count, so give a JVM or another heavily
+threaded command more:
+
+```toml
+[job.index-build]
+image = "registry.example.com/indexer@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+runtime = "shared-runc"
+command = ["/usr/bin/java", "-jar", "/opt/indexer.jar"]
+memory = "512Mi-1Gi"
+pids = 2048
+```
+
+`pids` takes 1 to 32768; 0, anything larger, and anything that isn't a whole
+number are refused when the job is applied or submitted. The limit is part of
+the executor profile, like CPU and memory, so jobs with different limits never
+share a container. It doesn't reserve anything: processes aren't a scheduled
+resource. A fresh `runc` job gets the limit as its container's `pids.max` when
+it sets one, and no limit when it doesn't, the same as an omitted `cpu` or
+`memory`. Host jobs need the native executor to enforce it; a node on the
+fallback process backend refuses a host job that sets `pids`, as it refuses
+CPU and memory ranges. Kubernetes export reports `pids` as unsupported: a Pod
+spec has no process limit, only the kubelet's per-node `podPidsLimit`.
+
+Some limits are fixed rather than derived from the profile. The helper's own
+cgroup allows 16 processes, outside the command's limits. `/tmp` and
 `/dev/shm` are 16 MiB tmpfs mounts, and regular files written anywhere are
 capped at 1 MiB.
 
@@ -608,7 +631,7 @@ Reusable executors need Linux 5.8 or later, the same minimum as the rest of
 the node. Bun checks the kernel the first time it is asked for an executor and
 logs what it found. On an older kernel the pools are off: `shared-runc` jobs
 fail with a reason, and host jobs use the original owned process backend,
-which refuses explicit CPU and memory ranges. A kernel without `cgroup.kill`
+which refuses explicit CPU and memory ranges and `pids`. A kernel without `cgroup.kill`
 (before 5.14, such as Debian 11's 5.10) keeps its pools: retirement freezes the
 task cgroup and kills each process in it instead. Native host executors also
 need `CONFIG_PROC_CHILDREN`, which every mainstream distribution kernel
@@ -623,7 +646,7 @@ decrypt with live keys for the job's namespace. Decrypted configuration stays
 execution-local; captured output uses normal scoped retention. Host jobs require the owned process runtime, an absolute
 allowlisted binary (or `/bin/sh` for scripts) and disabled mount isolation.
 Rootful Linux process jobs use bounded native executors and accept explicit
-CPU/memory ranges. Each fresh command is born inside its limited task cgroup;
+CPU/memory ranges and `pids`. Each fresh command is born inside its limited task cgroup;
 helper overhead stays reserved while its executor is idle. Commands retain
 Bun's user, privileges and host filesystem access: under a root Bun they run
 as root with every capability, and nothing sets `no_new_privs`. Use trusted
@@ -634,7 +657,7 @@ environment, then the job's own `env`. Other Bun variables, such as cloud
 credentials, never reach a command. `relish exec` into a host workload gets
 that workload's environment, as `docker exec` would.
 Other platforms retain the original owned process backend and refuse explicit
-resource ranges. This change applies to jobs; host applications keep their
+resource ranges and `pids`. This change applies to jobs; host applications keep their
 existing runtime contract. GPU jobs remain refused;
 GPU placement is tracked separately in #359. Test-lease workloads retain their
 lease-aware admission; unowned lease namespaces and images are refused here.

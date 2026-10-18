@@ -134,6 +134,11 @@ pub struct UpgradeManager {
     running_sha256: std::sync::Arc<tokio::sync::OnceCell<String>>,
     /// Retry policy for an unavailable binary source.
     fetch_retry: FetchRetry,
+    /// The executable a first upgrade adopts into the store as its rollback
+    /// target. `None`, as `bun` leaves it, means the executable this process
+    /// was started from. Tests point it at a small file: the lib test binary
+    /// is over 800 MB, and copying it timed a test out on a busy host (#993).
+    adopt_from: Option<PathBuf>,
 }
 
 /// Derive the store stem from the executable path bun was invoked as.
@@ -200,6 +205,7 @@ impl UpgradeManager {
             cluster_http: crate::cluster::ClusterHttp::plaintext(),
             running_sha256: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             fetch_retry: DEFAULT_FETCH_RETRY,
+            adopt_from: None,
         })
     }
 
@@ -453,11 +459,12 @@ impl UpgradeManager {
         // are the bytes that were checked.
         let store = self.store.clone();
         let running_version = self.running_version.clone();
+        let adopt_from = self.adopt_from.clone();
         let marker_path = self.marker_path.clone();
         let marker = tokio::task::spawn_blocking(move || -> Result<_, UpgradeError> {
             // First upgrade from an un-versioned install: adopt the running
             // binary into the store so rollback has something to return to.
-            adopt_running_binary_if_missing(&store, &running_version)?;
+            adopt_running_binary_if_missing(&store, &running_version, adopt_from.as_deref())?;
             store.stage_file(&marker.target_version, probe.into_temp_path(), &envelope)?;
             marker.store(&marker_path)?;
             Ok(marker)
@@ -657,9 +664,10 @@ impl UpgradeManager {
         // twice: both block, as in `prepare` (#794).
         let store = self.store.clone();
         let running_version = self.running_version.clone();
+        let adopt_from = self.adopt_from.clone();
         let marker_path = self.marker_path.clone();
         let marker = tokio::task::spawn_blocking(move || -> Result<_, UpgradeError> {
-            adopt_running_binary_if_missing(&store, &running_version)?;
+            adopt_running_binary_if_missing(&store, &running_version, adopt_from.as_deref())?;
             marker.store(&marker_path)?;
             Ok(marker)
         })
@@ -1054,17 +1062,18 @@ fn rollback_id(target: &BinaryVersion) -> String {
 }
 
 /// First-upgrade bootstrap: if the running version has no versioned file
-/// in the store (plain `bun` install), copy the current executable in so
+/// in the store (plain `bun` install), copy the running executable in so
 /// rollback has a target. Blocking: it reads and writes a whole binary.
 fn adopt_running_binary_if_missing(
     store: &BinaryStore,
     running_version: &BinaryVersion,
+    adopt_from: Option<&Path>,
 ) -> Result<(), UpgradeError> {
     let path = store.binary_path(running_version);
     if path.is_file() {
         return Ok(());
     }
-    let current = std::fs::canonicalize(std::env::current_exe()?)?;
+    let current = adoption_source(adopt_from)?;
     // Copied and hashed a piece at a time: the running binary is as big as
     // any candidate (#892).
     let directory = path
@@ -1081,6 +1090,15 @@ fn adopt_running_binary_if_missing(
     };
     store.stage_file(running_version, copy.into_temp_path(), &envelope)?;
     Ok(())
+}
+
+/// The file a first upgrade adopts: `adopt_from` when a test set it, or else
+/// the one this process was started from, with symlinks resolved.
+fn adoption_source(adopt_from: Option<&Path>) -> std::io::Result<PathBuf> {
+    match adopt_from {
+        Some(path) => std::fs::canonicalize(path),
+        None => std::fs::canonicalize(std::env::current_exe()?),
+    }
 }
 
 #[cfg(test)]
@@ -1988,7 +2006,7 @@ mod tests {
             release_keys_override: Some(vec![encode_public_key(&release_public)]),
             ..UpgradeSection::default()
         };
-        let manager = UpgradeManager::new(
+        let mut manager = UpgradeManager::new(
             &config,
             &dir.path().join("data"),
             &binary_dir.join("bun"),
@@ -1996,6 +2014,12 @@ mod tests {
             vec!["bun".to_string()],
         )
         .unwrap();
+        // Stand in for the running executable. The real one is the lib
+        // test binary, over 800 MB: copying, hashing and syncing it took
+        // 3 s idle and past nextest's 60 s on a loaded laptop (#993).
+        let running = dir.path().join("running-bun");
+        std::fs::write(&running, b"the running binary").unwrap();
+        manager.adopt_from = Some(running);
 
         let executable = compatible_binary(b"new binary");
         let bytes = executable.as_slice();
@@ -2013,8 +2037,34 @@ mod tests {
         };
         manager.prepare(&directive, vec![]).await.unwrap().unwrap();
 
-        // The running (test) binary was copied in as the rollback target.
-        assert!(binary_dir.join("bun-v0.1.0").is_file());
+        // The running binary was copied in as the rollback target, with a
+        // stub envelope that records its digest.
+        assert_eq!(
+            std::fs::read(binary_dir.join("bun-v0.1.0")).unwrap(),
+            b"the running binary"
+        );
+        let envelope = manager.store().envelope_path(&v("0.1.0"));
+        assert_eq!(
+            SignatureEnvelope::load(&envelope).unwrap().sha256,
+            sha256_hex(b"the running binary")
+        );
+    }
+
+    #[test]
+    fn adoption_copies_the_executable_this_process_runs_by_default() {
+        let expected = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(adoption_source(None).unwrap(), expected);
+    }
+
+    #[test]
+    fn adoption_copies_the_configured_executable_when_one_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = dir.path().join("running-bun");
+        std::fs::write(&running, b"bytes").unwrap();
+        assert_eq!(
+            adoption_source(Some(&running)).unwrap(),
+            std::fs::canonicalize(&running).unwrap()
+        );
     }
 
     // M5: the single-node network flow downloads the artefact and stages it as

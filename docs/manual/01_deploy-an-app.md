@@ -121,6 +121,15 @@ command = ["worker.py"]
 command = ["/bin/sh", "-c", "mkdir -p /tmp/worker"]   # /bin/sh must be allowed
 ```
 
+`relish lint` and `relish apply` warn about a host init whose command starts
+with a bare name such as `echo`, and suggest the full path. It's a warning,
+not a refusal: a node that allowlists the bare name word for word runs it,
+looking it up on its `PATH`.
+
+```text
+warning: app default/worker: init container command "echo" is a bare name, but it runs on the host, where allowed_binaries names binaries by full path; use the full path (`command -v echo` on the node prints it)
+```
+
 ## Config files
 
 ```toml

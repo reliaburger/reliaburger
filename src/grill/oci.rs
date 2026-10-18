@@ -280,6 +280,9 @@ pub struct OciResources {
     pub cpu: Option<OciCpuResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<OciMemoryResources>,
+    /// The process and thread ceiling (`pids.max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<OciPidsResources>,
     /// cgroup v2 native controller keys, written verbatim by runc into
     /// the workload's cgroup. We use it for the resource *requests* that
     /// the classic `cpu`/`memory` blocks can't express:
@@ -310,6 +313,12 @@ pub struct OciCpuResources {
 /// Memory resource limits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OciMemoryResources {
+    pub limit: i64,
+}
+
+/// Process-count limit: runc writes `limit` to the cgroup's `pids.max`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciPidsResources {
     pub limit: i64,
 }
 
@@ -749,6 +758,7 @@ fn build_resources_from_ranges(
 
     if cpu_res.is_some() || memory_res.is_some() {
         Some(OciResources {
+            pids: None,
             cpu: cpu_res,
             memory: memory_res,
             unified,
@@ -801,6 +811,20 @@ pub fn generate_job_oci_spec(
         resources
             .unified
             .insert("memory.swap.max".into(), "0".into());
+    }
+    if let Some(limit) = spec.pids {
+        // Only a reused executor's commands get a default; a fresh container
+        // without `pids` keeps no limit, like one without `cpu` or `memory`.
+        resources
+            .get_or_insert_with(|| OciResources {
+                cpu: None,
+                memory: None,
+                pids: None,
+                unified: BTreeMap::new(),
+            })
+            .pids = Some(OciPidsResources {
+            limit: i64::from(limit.get()),
+        });
     }
 
     OciSpec {
@@ -1905,6 +1929,31 @@ mod tests {
         );
         assert!(oci.process.env.is_empty());
         assert!(oci.linux.resources.is_none());
+    }
+
+    #[test]
+    fn a_fresh_job_container_enforces_an_explicit_pids_limit() {
+        let mut spec = minimal_job();
+        spec.pids = Some(crate::config::types::PidsLimit::try_from(512).unwrap());
+        let oci = generate_job_oci_spec("migrate", "default", &spec, "/cg", None);
+        let resources = oci.linux.resources.clone().unwrap();
+        assert_eq!(resources.pids, Some(OciPidsResources { limit: 512 }));
+        // A pids limit alone sets no CPU or memory limit.
+        assert_eq!((resources.cpu, resources.memory), (None, None));
+        // runc reads the OCI field `linux.resources.pids.limit`.
+        let json = serde_json::to_value(&oci).unwrap();
+        assert_eq!(
+            json["linux"]["resources"]["pids"],
+            serde_json::json!({ "limit": 512 })
+        );
+        // It combines with CPU and memory rather than replacing them.
+        spec.memory = Some(ResourceRange::parse_memory("64Mi").unwrap());
+        let combined = generate_job_oci_spec("migrate", "default", &spec, "/cg", None)
+            .linux
+            .resources
+            .unwrap();
+        assert_eq!(combined.pids, Some(OciPidsResources { limit: 512 }));
+        assert!(combined.memory.is_some());
     }
 
     // -- OOM score (#984) -----------------------------------------------------
