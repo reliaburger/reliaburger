@@ -1038,6 +1038,19 @@ So the test workload ships *inside* the orchestrator. `bun testapp` runs a small
 HTTP server that every node already has, because every node already has `bun`.
 Version-locked by construction, no registry involved.
 
+There's one catch. Since 0.2.1 the process runtime runs no images (#914), so
+the `process-grill` profile launches `bun testapp` as an `exec` app of
+`/usr/local/bin/bun`, and that path has to be in the node's
+`[process_workloads] allowed_binaries` like any other. Shouldn't the profile
+just allowlist it itself? We looked at that in 0.2.2 (#935) and said no. The
+client can't touch a node's policy, which is the point of a policy. And Bun
+quietly allowing its own binary would let anyone who can deploy an `exec` app
+run the node agent, as root, with whatever arguments they like: a second agent,
+`bun testapp` on any port, every subcommand we add later. An operator who wants
+the catalogue on a process node adds the line and owns that choice. Without it,
+the cases fail at deploy, refused by the node or left unplaced by the
+scheduler, with a reason that points at the host binary.
+
 It's a hand-rolled TCP server rather than axum, which looks like the wrong call
 until you remember where it runs: inside a container, in its own network
 namespace, on a node under deliberate stress. It should have no opinions and no
@@ -6351,6 +6364,18 @@ accepts an injection but before the client records its ID, cleanup can't rely on
 an empty client list. Track the pending operation and reconcile it. Healing every
 fault on the node would remove someone else's experiment too. Exact ownership
 matters most when the happy path has already stopped running.
+
+Our own examples need the same treatment. 0.2.1 started refusing a health
+timeout longer than its interval, since a probe that outlasts the interval
+overlaps the next one. The quickstart's built-in `hello` app set `interval = 1`
+and left the timeout at its default of 5 seconds. Its unit test only parsed the
+manifest, so it stayed green, and the first staged install of the 0.2.1
+candidate stopped at its very last step: "run hello through ingress". Parsing
+proves the TOML is well formed; only validation proves the cluster will take
+it. Now the demo's test runs `validate_intrinsic`, the same checks the API
+applies, and `tests/suite/documented_manifests.rs` runs them on every manifest
+we tell people to apply as written: everything in `examples/`, and the TOML in
+the README, the quickstart, the Linux servers guide and the website.
 
 Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check

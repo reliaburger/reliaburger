@@ -852,7 +852,7 @@ pub fn generate_job_oci_spec(
 /// `app`.
 ///
 /// The init runs `init.command` in its own image, or the app's when it names
-/// none, with the app's environment (secrets already decrypted), the app's
+/// none (on the host, for an `exec` or `script` app), with the app's environment (secrets already decrypted), the app's
 /// mounts (volumes, config files and identity, host paths already approved)
 /// and the app's cgroup. It takes nothing from the app's process settings and
 /// publishes no port. Building on the app's finished spec rather than its
@@ -867,7 +867,9 @@ pub fn generate_init_oci_spec(
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
         reusable_executor: false,
-        host_process: false,
+        // A host app's init that names no image runs on the host like its
+        // app, so the mixed runtime routes it there too (#935).
+        host_process: app.host_process && init.image.is_none(),
         initialiser: true,
         root: OciRoot {
             path: root,
@@ -952,6 +954,32 @@ mod tests {
         // Without an image of its own it inherits the app's.
         let inherited = generate_init_oci_spec(&init_container(None, &["true"]), &app);
         assert_eq!(inherited.root.path, "myapp:v1");
+    }
+
+    /// #935: an `exec` or `script` app's init container that names no image
+    /// runs on the host like its app, so it records as a host spec. One
+    /// that names an image, or an image app's init, stays a container.
+    #[test]
+    fn an_init_container_of_a_host_app_records_as_a_host_spec() {
+        for host_app in [r#"exec = "/bin/sleep""#, r#"script = "sleep 60""#] {
+            let app = app_oci(&toml::from_str(host_app).unwrap());
+            assert!(app.host_process, "{host_app}");
+
+            let init = generate_init_oci_spec(&init_container(None, &["/bin/true"]), &app);
+            assert!(init.host_process, "{host_app}: init must be a host spec");
+            assert_eq!(init.root.path, HOST_ROOT);
+
+            let own_image =
+                generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+            assert!(
+                !own_image.host_process,
+                "{host_app}: an init with its own image is a container"
+            );
+        }
+
+        let image_app = app_oci(&minimal_app());
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &image_app);
+        assert!(!init.host_process, "an image app's init is a container");
     }
 
     #[test]
