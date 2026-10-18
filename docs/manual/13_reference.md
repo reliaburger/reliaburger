@@ -161,8 +161,9 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `max_attempts` | 1–10. Default 4, or 1 for a hook |
 | `task_timeout_secs` | 0–86400 per attempt; 0 means no deadline. Default none, or 600 for a hook |
 | `overlap` | Cron only: `forbid` (default) skips an occurrence while a run is active; `allow` starts another |
-| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` | Ordinary TOML jobs,
-cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
+| `replay_unknown` | `true` replays automatically after an unknown outcome and counts a timeout as an ordinary failure; hooks refuse it. Default `false` |
+
+Ordinary TOML jobs, cron and hooks use the same executor as arrays. See [batch jobs](14_batch-jobs.md)
 for retry, overlap, retention, supported runtimes and API shapes.
 
 Job limits, all enforced by the council:
