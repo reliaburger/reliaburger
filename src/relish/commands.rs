@@ -54,6 +54,9 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
         eprintln!();
     }
     loaded.config.validate_intrinsic()?;
+    for warning in loaded.config.warnings() {
+        eprintln!("warning: {warning}");
+    }
     Ok(loaded.config)
 }
 
@@ -1607,6 +1610,9 @@ pub async fn rollback(app: &str, namespace: &str, force: bool) -> Result<(), Rel
 pub fn lint(path: &Path) -> Result<(), RelishError> {
     let config = load_config_file(path)?;
     config.validate()?;
+    for warning in config.warnings() {
+        eprintln!("warning: {warning}");
+    }
 
     // Count resources
     let app_count = config.app.len();

@@ -21,6 +21,7 @@ run it.
 | Lint and format | Clippy with warnings as errors, all features and none; the macOS job runs the all-features pass only, because that one holds the macOS-only code | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
 | Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct addition](qualification/2026-10-12-dependency-exceptions.md)) | `make audit` |
+| Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
 | Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
@@ -155,6 +156,12 @@ ignored by default and run by their own targets and CI jobs
 | Wall-clock acceptance | Timeouts, back-offs and leases that can't be tested with a paused clock | ignored tests in [`tests/integration.rs`](../tests/integration.rs) | `make test-slow` |
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
+
+A test that runs a host command names a path every Unix host has. macOS has
+`/bin/sh`, `/bin/echo` and `/bin/sleep`, but keeps `true` and `false` only in
+`/usr/bin`, so a job naming `/bin/false` is refused there as a missing binary
+([#934](https://github.com/reliaburger/reliaburger/issues/934)). For a command
+that fails, use `/bin/sh -c "exit 1"`.
 
 The eBPF tests load the object embedded in the library under test, as Bun
 does, and never search the target directory. Worktrees can share one
@@ -306,6 +313,17 @@ their own. When GitHub retargets a stacked pull request,
 [`ci-retarget.yml`](../.github/workflows/ci-retarget.yml) reruns CI with the
 new base, so the new base's set applies without another push. The fixtures in
 [`test_select_jobs.py`](../scripts/ci/test_select_jobs.py) cover each case.
+
+Every job that downloads an artefact (the cluster and acceptance jobs fetch
+the nextest archive, the evidence gate fetches every envelope, and the V02
+loops do both) gives each download 5 minutes and retries a failed one once.
+A download normally takes a minute or two, but one stalled for 13 minutes and
+pushed `acceptance` past its 40-minute limit
+([#977](https://github.com/reliaburger/reliaburger/issues/977)). Now a stall
+costs at most 10 minutes, and the second attempt usually recovers it. The
+jobs keep their own limits.
+[`test_ci_workflow.py`](../scripts/ci/test_ci_workflow.py) fails any download
+step without its own limit or its retry.
 
 ### Portable macOS in three shards
 
@@ -466,7 +484,17 @@ and a rule-of-three summary, and deletes the VM. It never touches
 ## Before a release
 
 Nothing ships that hasn't been built once, signed, staged and installed the way
-a user would install it. The runbook is [`releasing.md`](releasing.md).
+a user would install it, then soaked under faults for hours. The runbook is
+[`releasing.md`](releasing.md); the homepage's
+[How a release is tested](https://reliaburger.com/#release-testing) is the
+short version, and the [release log](release-log.md) is the track record: what
+each release's soaks found, and how many candidates it took.
+
+In order: `build.yml` builds and signs every binary and guest image at one
+commit, `stage.yml` publishes them as a private pre-release, the gates below
+run against those exact files, and `promote.yml` copies them, byte for byte,
+into the release once the maintainer tags the commit. Nothing is rebuilt
+after the first step.
 
 | Gate | What it does | Where |
 |---|---|---|
@@ -475,6 +503,36 @@ a user would install it. The runbook is [`releasing.md`](releasing.md).
 | Job qualification, fast tier (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. About an hour compressed; every job mode overlaps every fault kind | [`qualify-jobs-sustained.sh --tier fast`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c) |
 | Final soak | 8 hours on the hourly schedule, once per final candidate: the job soak above on the full schedule, so it checks everything the V02 final does as well as the jobs, and it's the only final soak the gate runs (maintainer decision, 17 October 2026, [#991](https://github.com/reliaburger/reliaburger/issues/991)). It's there for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run passes V02. Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). `qualify-sustained.sh --tier final` still runs the V02 final alone, outside the gate | [`qualify-jobs-sustained.sh --tier final`](../scripts/release/qualify-jobs-sustained.sh), [plans](plans/2026-09-25-v02-sustained.md), [runbook](releasing.md#staging-a-candidate) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
+| Power cut and reboot | A disposable VM forced off mid-write for each storage path (exporters, leases, council backups), and rebooted with containers and eBPF network rules in place, 10 times per lane, or 25 when the release changes storage, locking or ownership (0.2.0 ran 25); every acknowledged write and every owned resource must survive ([above](#pulling-the-plug)) | [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh), [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh), [0.2.0 record](qualification/2026-10-16-power-cut-reboot.md) |
+| Task-array benchmarks | Nightly on `main`, failing on a regression of more than 2x against the last baseline | [Benchmarks in CI](#benchmarks-in-ci) |
+
+
+**What fails a release.** One occurrence of any of these, in any soak: a lost
+write or a counter going backwards; a certificate close to expiry or a
+rotation that stops; no leader for more than 30 seconds, or quorum not back
+within two minutes; a fault that doesn't settle by its deadline; containers,
+namespaces, eBPF pins, file descriptors or memory leaking after settling; an
+upgrade that ends on the wrong version; a Bun panic or a restart no fault
+explains; an agent loop turn over a second; or, with jobs, a run that executes
+twice, goes missing or never drains. The full list is the soak plan's
+[pass and fail](plans/2026-09-25-v02-sustained.md#4-pass-and-fail). Each
+failure gets a root cause; a product fix means a new candidate and every soak
+again. Before 1.0, a final run whose only failures match a documented harness
+artefact still passes, with the evidence in its record.
+
+**What the soaks don't prove.** They run three small VMs on one laptop, so
+they say nothing about large clusters, real networks between machines or
+failing hardware. A VM forced off is the closest they come to a power cut. The
+fault schedule isn't production traffic, and zero failures in 25 runs rules out
+failure rates above about 12% (the rule of three), not rare races.
+
+Every soak record also gets charts of each node's Bun memory, open fds and CPU,
+and of accepted jobs a second when jobs ran, with the faults marked along the
+time axis. `sustained_check.py render` draws them beside the record, and
+`sustained_check.py render-charts EVIDENCE DIRECTORY` redraws them from a kept
+evidence directory ([plan](plans/archive/2026-10-17-soak-charts.md)). The
+homepage shows the released version's final soak charts
+([how](website/README.md#soak-charts)).
 
 ## When a test flakes
 

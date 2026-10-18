@@ -7,6 +7,20 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
+RELEASED=ROOT/'docs/qualification/2026-10-17-v0.2.0-job-throughput'
+SCENARIOS=('jobs-vm-baseline','jobs-containers','jobs-shared-containers','jobs-host-processes')
+
+def released_medians():
+    """Each scenario's median rate and 60-second count across the release's rounds."""
+    import statistics
+    medians={}
+    for scenario in SCENARIOS:
+        rows=[json.loads(path.read_text()) for path in sorted(RELEASED.glob(f'r*-{scenario}.json'))]
+        counts=[round(row['successes_per_second']*row['requested_seconds']) for row in rows]
+        medians[scenario]=dict(rate=statistics.median(row['successes_per_second'] for row in rows),
+                               count=statistics.median(counts))
+    return medians
+
 class JobDemo(unittest.TestCase):
     def test_visible_demo_follows_tour_with_collapsed_details_and_matches_evidence(self):
         import importlib.util
@@ -50,8 +64,12 @@ class JobDemo(unittest.TestCase):
             self.assertTrue(row['measurement_complete'])
             count=row['verified_successes'] if row.get('path')=='Bare' else row['unique_accepted_successes']
             self.assertEqual(row['extrapolated_runs_per_day'],count*1440)
-            self.assertIn(f'{count:,}',text)
-            self.assertIn(tiers.human_count(round(count*1440)),text)
+        # The table publishes the released build's medians, not the recording's single run.
+        table=text[text.index('<table'):text.index('</table>')]
+        for scenario,median in released_medians().items():
+            self.assertIn(f"{median['count']:,}",table,scenario)
+            self.assertIn(f"{median['rate']:,.1f}/s",table,scenario)
+            self.assertIn(tiers.human_count(median['count']*1440),table,scenario)
         for row in report['tiers']:
             self.assertEqual(row['terminal_failures'],0)
             self.assertEqual(row['cleanup_failed_submissions'],[])
@@ -61,10 +79,29 @@ class JobDemo(unittest.TestCase):
             self.assertEqual((ROOT/'docs/website/assets'/asset).read_bytes(),(raw/evidence).read_bytes())
         self.assertEqual(recording[0]['version'],2)
         self.assertEqual([row[0] for row in recording[1:]],sorted(row[0] for row in recording[1:]))
-        for phrase in ['60 seconds','extrapolated','independent','repeatable','no isolation','VM baseline','durable ownership','development binaries']:
+        for phrase in ['60 seconds','extrapolated','independent','repeatable','no isolation','VM baseline','durable ownership','published v0.2.0 binaries']:
             self.assertIn(phrase,text)
         self.assertRegex(text,r'data-cast="\./assets/job-throughput\.cast"')
         self.assertIn('./assets/job-throughput-report.json',text)
+
+    def test_released_rounds_are_complete_healthy_and_drained(self):
+        for scenario in SCENARIOS:
+            rows=[json.loads(path.read_text()) for path in sorted(RELEASED.glob(f'r*-{scenario}.json'))]
+            self.assertEqual(len(rows),5,scenario)
+            for row in rows:
+                self.assertEqual(row['scenario'],scenario)
+                self.assertEqual(row['requested_seconds'],60)
+                self.assertEqual(row['concurrency'],27)
+                self.assertTrue(row['measurement_complete'])
+                self.assertTrue(row['cleanup_verified'])
+                self.assertEqual(row['terminal_failures'],0)
+                self.assertIsNone(row['error'])
+        binaries=(RELEASED/'binaries.txt').read_text()
+        # v0.2.0's published bun and relish, and the pinned image's BusyBox.
+        for digest in ('a10896975da13146320bb65236566e537390b0ed6a0a4b400c7c3cbdc1b98c6d',
+                       '2d74f6685a963b0b64f98af1ce24aadc8e7bf9eb6ce2e51c38e3b744bc017fc5',
+                       'f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5'):
+            self.assertIn(digest,binaries)
 
     def test_published_demo_executes_the_packaged_default_commands(self):
         report=json.loads((ROOT/'docs/website/assets/job-throughput-report.json').read_text())

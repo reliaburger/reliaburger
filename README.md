@@ -18,16 +18,14 @@ glibc builds; static builds are planned for 0.3.0
 
 It applies most Kubernetes manifests directly and tells you what it had to
 change or drop (see [what converts](docs/manual/09_kubernetes.md)). The tour below
-takes a laptop to a three-node cluster, runs a real Kubernetes app on it,
-breaks it and watches it heal. Five minutes is the target.
+takes a laptop to a three-node cluster, runs a real Kubernetes app and a
+batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.1.6 was released on 7 October 2026, and the one-line installer fetches
-its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
-8 GiB of free memory and 15 GiB of disk. 0.2.0, "A million jobs", is in
-development: anything marked *0.2.0, not in 0.1.6* below needs a development
-build, not the installer.
+0.2.0 was released on 16 October 2026, and the one-line installer fetches
+its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
+and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs
@@ -46,6 +44,11 @@ relish build burger/burger.toml
 relish images                        # burger:v1, built for amd64 and arm64
 relish apply burger/burger.toml
 curl http://burger.localhost:18080/order   # calls podinfo's backend by name
+
+# Ten jobs from the same image, packed around the running apps
+relish batch submit burger/jobs.toml
+relish batch watch 1                 # the number submit printed
+relish jobs                          # the finished run and its rate
 
 # See every hop from frontend to Redis: DNS, VIP, eBPF map, firewall, TCP
 relish path frontend --to redis
@@ -91,7 +94,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
-  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL *(0.2.0, not in 0.1.6)*
+  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL *(0.2.1, not in 0.2.0)*
   - `relish council re-enrol --data-dir <DATA_DIR>`: Re-enrol a voter fenced out by `council recover`
 - `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
 - `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
@@ -109,15 +112,15 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster and stop all its instances
 - `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
-  - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles *(0.2.0, not in 0.1.6)*
-  - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants *(0.2.0, not in 0.1.6)*
-  - `relish batch watch <ID>`: Watch rates, bounded profile summaries and duration distributions *(0.2.0, not in 0.1.6)*
-  - `relish batch cancel <ID>`: Cancel an array or mixed manifest and retire its active attempts *(0.2.0, not in 0.1.6)*
-  - `relish batch results <ID>`: Read a bounded indexed page of accepted task outcomes *(0.2.0, not in 0.1.6)*
-  - `relish batch logs --index <INDEX> <ID>`: Print a task's retained output (the first and last 2 KiB): any singleton's, or a failed task's in a larger array *(0.2.0, not in 0.1.6)*
-- `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary *(0.2.0, not in 0.1.6)*
+  - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
+  - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
+  - `relish batch watch <ID>`: Watch rates, bounded profile summaries and duration distributions
+  - `relish batch cancel <ID>`: Cancel an array or mixed manifest and retire its active attempts
+  - `relish batch results <ID>`: Read a bounded indexed page of accepted task outcomes
+  - `relish batch logs --index <INDEX> <ID>`: Print a task's retained output (the first and last 2 KiB): any singleton's, or a failed task's in a larger array
+- `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
 - `relish batch-status <ID>`: Show the progress of a submitted batch
-- `relish jobs`: List bounded job run summaries and rates, or durable definitions with their last outcomes *(0.2.0, not in 0.1.6)*
+- `relish jobs`: List bounded job run summaries and rates, or durable definitions with their last outcomes
 
 **Work with config files** ([deploy an app](docs/manual/01_deploy-an-app.md), [coming from Kubernetes](docs/manual/09_kubernetes.md))
 
@@ -189,12 +192,12 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
-- `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster *(0.2.0, not in 0.1.6)*
+- `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
 
 **Images and volumes** ([images and volumes](docs/manual/11_images-and-volumes.md))
 
 - `relish images`: List images in the Pickle registry, or delete a tag
-  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.0, not in 0.1.6)*
+  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers *(0.2.1, not in 0.2.0)*
 - `relish build <PATH>`: Build an OCI image and push to Pickle
 - `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
   - `relish snapshot create <APP>`: Snapshot an app's managed volumes
@@ -212,10 +215,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
-- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.0, not in 0.1.6)*
-  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.0, not in 0.1.6)*
-  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.0, not in 0.1.6)*
-  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.0, not in 0.1.6)*
+- `relish gitops`: Show or change the cluster's GitOps configuration *(0.2.1, not in 0.2.0)*
+  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown *(0.2.1, not in 0.2.0)*
+  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft *(0.2.1, not in 0.2.0)*
+  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place *(0.2.1, not in 0.2.0)*
 
 **Learn** ([under the hood](docs/manual/06_under-the-hood.md))
 
@@ -244,8 +247,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 ## What's in the binary
 
-This is what 0.1.6, the release the installer fetches, does. The section after
-the table covers what 0.2.0 adds.
+This is what 0.2.0, the release the installer fetches, does.
 
 **Runs Kubernetes YAML.** `relish apply -f` takes Deployments, StatefulSets,
 DaemonSets, Services, Ingresses, ConfigMaps, Secrets, Jobs, CronJobs, HPAs and
@@ -280,6 +282,14 @@ roles and namespace scopes, and the registry can refuse unsigned images.
 Every apply binds image tags to digests, so a moved tag can't change what runs,
 and node config can limit which upstream registries images may come from.
 
+**Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
+at a real address, unless an app or job's `allow_from` lets a named caller
+in, and egress allowlists hold apps and jobs to the hosts they list.
+
+**An audit log.** Each node keeps a durable, bounded log of who applied,
+deleted, exec'd, upgraded or broke what, and from where. `relish audit` reads
+it.
+
 **A registry on every node.** Pickle is an OCI registry built into the cluster.
 Push once and nodes pull layers from each other. It also caches upstream
 registries, and `relish build` builds images from your config straight into it.
@@ -299,9 +309,30 @@ it would take out every replica or put the council's quorum at risk.
 `relish test --chaos` runs scripted recovery scenarios.
 
 **Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
-blue-green switches, autoscaling on metrics, jobs, cron and batch. Point the
-cluster at a Git repository and the leader keeps it in sync, verifying commit
-signatures if you ask it to.
+blue-green switches and autoscaling on metrics. Point the cluster at a Git
+repository and the leader keeps it in sync, verifying commit signatures if you
+ask it to.
+
+**A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
+cron schedule, a hook that runs before a deploy, and a task array that runs the
+same command thousands or millions of times (`relish run --batch`, or a
+manifest with `relish batch submit`). An array is stored as a template and a
+count, not a record per task. Jobs share CPU and memory admission with your
+apps, namespace quotas and per-namespace caps keep one team from starving the
+rest, and an outcome the cluster accepted survives a leader change. A job picks
+how it runs: a fresh container for every attempt (the default), a reused
+container with each command in its own process under its own limits, or an
+allowlisted host command. `relish jobs` shows runs and their rates, and each
+definition's recent outcomes; each run raises one event, and a failed run pages
+through the alert webhooks. The [job manual](docs/manual/14_batch-jobs.md)
+explains it all. The [throughput demo](https://reliaburger.com/#job-throughput)
+and its [qualification record](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
+show what each kind of isolation costs per job; `relish bench --scenario
+jobs-shared-containers` and its siblings rerun them on your own cluster, and
+`--compare OLD.json` fails on a drop against an earlier report. Before
+release, 0.2.0 ran 12 hours on a three-VM laptop cluster with apps, faults
+and upgrades at 4,600 accepted jobs a second, against 1,158 for 100 million a
+day ([record](docs/qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)).
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
@@ -347,51 +378,14 @@ binary was built from. Neither needs a network.
 | Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
-| Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron and batch, with task arrays from 0.2.0 |
+| Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
 | Chaos Mesh or Litmus | `relish fault` |
 | Grafana (for the basics) | TUI and web dashboard |
 
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Coming in 0.2.0: a million jobs
-
-<!-- TODO(#688): when 0.2.0 is promoted, fold this section into "What's in the
-binary" and drop the labels; tests/suite/website.rs then insists on it. -->
-
-Everything in this section is 0.2.0, not in 0.1.6: it's on the development
-branch, and the installer doesn't fetch it yet.
-
-**Jobs.** Every kind of job runs on one lifecycle: a one-off job, a cron
-schedule, a hook that runs before a deploy, and a task array that runs the
-same command thousands or millions of times (`relish run --batch`, or a
-manifest with `relish batch submit`; 0.2.0, not in 0.1.6). An array is stored
-as a template and a count, not a record per task. Jobs share CPU and memory
-admission with your apps, namespace quotas and per-namespace caps keep one
-team from starving the rest, and an outcome the cluster accepted survives a
-leader change. A job picks how it runs: a fresh container for every attempt
-(the default), a reused container with each command in its own process under
-its own limits, or an allowlisted host command. `relish jobs` shows runs and
-their rates, each run raises one event, and a failed run pages through the
-alert webhooks. The [job manual](docs/manual/14_batch-jobs.md) explains it
-all; the [throughput demo](https://reliaburger.com/#job-throughput) and its
-[qualification record](docs/qualification/2026-10-09-timed-job-scenarios/README.md)
-show what each kind of isolation costs per job; `relish bench --scenario
-jobs-shared-containers` and its siblings rerun them on your own cluster, and
-`--compare OLD.json` fails on a drop against an earlier report. The sustained
-target of 100 million jobs a day needs an 8-hour job final soak that hasn't
-passed yet ([#668](https://github.com/reliaburger/reliaburger/issues/668)).
-
-**Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
-at a real address, unless an app or job's `allow_from` lets a named caller
-in, and egress allowlists hold apps and jobs to the hosts they list.
-
-**An audit log.** Each node keeps a durable, bounded log of who applied,
-deleted, exec'd, upgraded or broke what, and from where, plus the requests
-it refused, rate-limited so a flood of bad tokens can't flush the history.
-`relish audit` reads it (0.2.0, not in 0.1.6).
-
-## Limits in 0.1.6
+## Limits in 0.2.0
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.

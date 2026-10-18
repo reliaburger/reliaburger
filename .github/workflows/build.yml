@@ -38,7 +38,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"},{"target":"x86_64-apple-darwin","suffix":"macos-x86_64","runner":"macos-15-intel","arguments":"--bin relish"}]'
+          all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"}]'
           if [ "$EVENT" != pull_request ]; then
             pdf=true binaries=true guest_images=true matrix="$all"
           else

@@ -107,6 +107,29 @@ migration can read `DATABASE_URL` and a config generator can write a volume.
 The volume stays the app's: an init container doesn't take it over, so run it
 as root (most images do) or as the app's user.
 
+An `exec` or `script` app's init container that names no image runs its
+command on the host, like the app. The node's `[process_workloads]
+allowed_binaries` must name the command's first word by its full path, or the
+deploy is refused, and the scheduler only places the app where it does:
+
+```toml
+[app.worker]
+exec = "/usr/bin/python3"
+command = ["worker.py"]
+
+[[app.worker.init]]
+command = ["/bin/sh", "-c", "mkdir -p /tmp/worker"]   # /bin/sh must be allowed
+```
+
+`relish lint` and `relish apply` warn about a host init whose command starts
+with a bare name such as `echo`, and suggest the full path. It's a warning,
+not a refusal: a node that allowlists the bare name word for word runs it,
+looking it up on its `PATH`.
+
+```text
+warning: app default/worker: init container command "echo" is a bare name, but it runs on the host, where allowed_binaries names binaries by full path; use the full path (`command -v echo` on the node prints it)
+```
+
 ## Config files
 
 ```toml
@@ -525,7 +548,6 @@ skipped. The policy fields (`max_attempts`, `task_timeout_secs`, `overlap` and
 
 ## Task arrays
 
-Development preview for 0.2.0: use matching PR #266 binaries and a fresh cluster.
 When the same program needs to run thousands or millions of times, submit one
 template and a count, with `{index}` wherever the task's number goes.
 

@@ -1,4 +1,5 @@
 """The candidate build tells qualification its digest without a 2 GB download."""
+import json
 from pathlib import Path
 import re
 import unittest
@@ -61,6 +62,35 @@ class CandidateManifestTests(unittest.TestCase):
         self.assertIn("name: candidate-${{ github.sha }}-${{ github.run_attempt }}", candidate)
         self.assertIn("path: dist/*", candidate)
         self.assertIn("retention-days: 90", candidate)
+
+
+def build_matrix(text):
+    """The full build matrix the `changes` job selects for a candidate."""
+    match = re.search(r"all='(\[.*\])'", text)
+    if not match:
+        raise AssertionError("build.yml has no full build matrix")
+    return json.loads(match.group(1))
+
+
+class BuildMatrixTests(unittest.TestCase):
+    def setUp(self):
+        self.matrix = build_matrix(WORKFLOW.read_text())
+
+    def test_no_intel_macos_build_since_0_2_2(self):
+        # Maintainer decision, 17 October 2026 (#1018): 0.2.1 is the last
+        # release with `relish-macos-x86_64`.
+        self.assertNotIn("x86_64-apple-darwin", [entry["target"] for entry in self.matrix])
+        self.assertNotIn("macos-15-intel", [entry["runner"] for entry in self.matrix])
+
+    def test_matrix_builds_exactly_what_packaging_signs(self):
+        from package import PLATFORMS
+
+        built = set()
+        for entry in self.matrix:
+            for binary in re.findall(r"--bin (\S+)", entry["arguments"]):
+                built.add(f"{binary}-{entry['suffix']}")
+        expected = {f"{binary}-{platform}" for binary, platforms in PLATFORMS.items() for platform in platforms}
+        self.assertEqual(built, expected)
 
 
 if __name__ == "__main__":
