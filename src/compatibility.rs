@@ -138,6 +138,8 @@ pub struct Compatibility {
 /// process owner and runc adoption records (#984).
 /// The state report's `CapacityRefusal::ordinals`, the replicas a node
 /// couldn't start, so a refused scale-up moves only those (#971).
+/// The Raft `log.redb` and `snapshot.redb` files are redb's v3 file format
+/// (redb 4), which can't open the v2 files redb 2 wrote (#1024).
 ///
 /// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
 /// train opened. Each 0.2.2 change to the wire or durable state adds its

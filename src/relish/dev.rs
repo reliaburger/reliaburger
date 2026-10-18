@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::RelishError;
 use super::local_context::LocalContext;
-use super::quickstart::lima::GuestFile;
+use super::quickstart::lima::{GuestFile, Lima, POWER_OFF_DEADLINE};
 use super::quickstart::runner::JOIN_SCRIPT;
 
 /// Command to launch the bun agent in a cluster VM. `--cluster` is essential:
@@ -997,8 +997,19 @@ pub async fn stop(name: &str) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
     require_cluster_vms(&cluster).await?;
     println!("Stopping {} nodes...", cluster.nodes.len());
+    // Each guest powers itself off, because `limactl stop` power-cuts it
+    // (#1023). Each Lima command gets the same 120 s as `relish local`.
+    let lima = Lima::new(
+        PathBuf::from("limactl"),
+        std::time::Duration::from_secs(120),
+    );
     for node in &cluster.nodes {
-        limactl(&["stop", &node.name]).await?;
+        lima.power_off(&node.name, POWER_OFF_DEADLINE)
+            .await
+            .map_err(|error| RelishError::LimaError {
+                command: format!("power off {}", node.name),
+                stderr: format!("{error:#}"),
+            })?;
     }
     println!("Dev cluster \"{name}\" stopped.");
     Ok(())

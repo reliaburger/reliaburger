@@ -2,11 +2,11 @@
 
 The same tour as the homepage's "Try it in five minutes": install, run a real
 Kubernetes app on a three-node laptop cluster, build and run an app of your
-own next to it, walk its network path, measure it, break it and watch it
-heal. Open it any time with `relish manual tour`.
+own next to it, run ten jobs beside them, walk its network path,
+measure it, break it and watch it heal. Open it any time with `relish manual tour`.
 
 It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install fetches the signed 0.1.6 release.
+15 GiB of disk. The one-line install fetches the signed 0.2.0 release.
 
 ## Install and build the cluster
 
@@ -87,6 +87,29 @@ signatures. Each order names the podinfo backend that "cooked" it: the burger
 service calls `http://backend:9898/` by service name, exactly as it would in a
 Kubernetes pod. Run the `curl` a few times and the cashier changes as the
 ingress takes turns between the two replicas.
+
+## Run ten jobs beside it
+
+```sh
+relish batch submit burger/jobs.toml
+relish batch watch 1
+relish jobs
+```
+
+`burger/jobs.toml` asks for 10 tasks from the same `burger:v1` image in
+two resource profiles: 8 small ones that ask for 100m to 250m of CPU and
+32 to 64 MiB, and 2 larger ones that ask for a whole core and 128 MiB. Each
+task hashes a block of memory and prints a digest, so the run takes a few
+seconds. The cluster stores each profile as a task array, a template
+and a count rather than a record per task, and packs the tasks onto the nodes
+around the apps already running there.
+
+`submit` prints the manifest's number; on a fresh cluster it's 1. `watch`
+takes that number and prints a summary a second: how many tasks succeeded,
+the rate, how long the final attempts took, and where they ran. It returns
+when the run finishes. Meanwhile the burger keeps taking orders. `relish jobs`
+then lists the run with its outcome and rate. The `batch` chapter covers
+cron, deployment hooks, retries and choosing how each job is isolated.
 
 ## See the whole path
 
@@ -189,4 +212,4 @@ tools and the image cache.
 - Write your own app config: `deploy-an-app`
 - How the cluster fits together: `cluster-basics`
 - More ways to break things: `chaos`
-- Jobs, cron and batch work: `batch`
+- Jobs, cron, hooks and task arrays: `batch`

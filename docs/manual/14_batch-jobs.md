@@ -1,8 +1,8 @@
 # Batch jobs
 
-Development preview: 0.2.0, not in 0.1.6. Build matching development binaries
-and start a fresh cluster, because 0.2.0 changes the control messages and the
-durable state. Published 0.1.6 binaries don't have this lifecycle. A council replicates
+This lifecycle arrived in 0.2.0, which changed the control messages and the
+durable state: a cluster made with an earlier release can't roll to it, so start
+a fresh one (`operations` explains why). A council replicates
 cluster definitions and runs; standalone Bun persists the same state in private
 `job-state/jobs.json` before acknowledging admission.
 
@@ -199,8 +199,8 @@ relish manual batch
 
 Use the actual parent ID returned by submission in place of `1`. Watch shows
 child array IDs; use the small profile's ID in place of `2` for task detail.
-The example has 1,000 small tasks requesting 100m CPU and 32 MiB each, and 64
-large tasks requesting 1 CPU and 128 MiB each. The node packs actual attempts
+The example has 8 small tasks requesting 100m CPU and 32 MiB each, and
+2 large tasks requesting 1 CPU and 128 MiB each, so it finishes in seconds. The node packs actual attempts
 beside the web service, respecting both resource dimensions. Submission commits
 all profiles atomically; cancelling the parent cancels all profiles.
 
@@ -1019,24 +1019,31 @@ runtimes. At 25m, admission can exceed 27; reusable executors still have a separ
 `null` when unavailable. The [full curve and repeats](../qualification/2026-10-09-timed-job-scenarios/README.md#concurrency-review)
 show the cold-start variation and all settings, including the slower ones.
 
-## Measured development results
+## Measured results on the released 0.2.0
 
-The landing-page recording gives each scenario 60 seconds on a four-vCPU,
-8 GiB Ubuntu 24.04 aarch64 Lima VM, running locally on an Apple M2 Max
-host (12 physical cores, 32 GiB host RAM). The guest runs Linux 6.8 and runc 1.4.
-These are dispatch-overhead measurements; benchmark representative work on your
-own hardware. Every mode runs the same pinned BusyBox `true`
-command with a concurrency cap of 27:
+The published v0.2.0 binaries, measured with
+[`scripts/release/job_bench_rounds.sh`](../../scripts/release/job_bench_rounds.sh):
+five rounds of each scenario for 60 seconds on a four-vCPU, 8 GiB Ubuntu 24.04
+aarch64 Lima VM, running locally on an Apple M2 Max host (12 physical cores,
+32 GiB host RAM), beside a 500m BusyBox web app. The guest runs Linux 6.8 and
+runc 1.4. These are dispatch-overhead measurements; benchmark representative
+work on your own hardware. Every mode runs the same pinned BusyBox `true`
+command with a concurrency cap of 27. The table gives the median of the five
+rounds:
 
 | Path | Completed in 60 seconds | Rate | Extrapolated runs/day | Retries |
 |---|---:|---:|---:|---:|
-| Raw VM processes | 993,718 exits | 16,562.0/s | 1.4B | Not applicable |
-| Fresh containers | 213 accepted successes | 3.55/s | 306.7k | 0 |
-| Shared containers | 58,000 accepted successes | 966.7/s | 83.5M | 0 |
-| Host jobs | 294,000 accepted successes | 4,900.0/s | 423.4M | 0 |
+| Raw VM processes | 929,510 exits | 15,491.8/s | 1.3B | Not applicable |
+| Fresh containers | 762 accepted successes | 12.7/s | 1.1M | 1 in five rounds |
+| Shared containers | 175,000 accepted successes | 2,916.7/s | 252M | 0 |
+| Host jobs | 280,000 accepted successes | 4,666.7/s | 403.2M | 0 |
 
-The public windows accepted 352,213 unique successes with no terminal failures
-or retries. Unused queued work was cancelled and positively drained afterwards.
+No window had a terminal failure, and unused queued work was cancelled and
+positively drained after every one. Raw and host-job rates varied by about a
+quarter across the rounds and the container paths by up to 15%, so compare
+medians, not single windows. The
+[record](../qualification/2026-10-17-v0.2.0-job-throughput/README.md) keeps
+every report for `relish bench --compare`.
 All public paths request 25m CPU / 32 MiB and enforce a one-core CPU limit;
 native/shared helpers reserve another 10m / 8 MiB. Images are warm, executor
 processes start cold, and one active submission caps total concurrency at 27.
@@ -1044,6 +1051,9 @@ Fresh receipt chunks contain one job; fast paths use 1,000 jobs. This reporting
 choice makes slow progress visible and amortises fast outcomes, so the rate gap
 also includes receipt granularity. Chunk size never decides how many jobs fit.
 
+The landing page's recording is an earlier development build's single run
+(`006aca5f`, [record](../qualification/2026-10-09-timed-job-scenarios/README.md)):
+3.55/s for fresh containers and 966.7/s for shared ones then.
 An independent rerun on an older M1 Max laptop VM (five interleaved rounds per
 build) measured raw and host-job rates 14–23% lower and the container paths 1.7
 to 3 times higher. With about 13 ms of real CPU work per task, host jobs
@@ -1089,7 +1099,7 @@ summaries now count retries by cause. The [full hourly
 record](../qualification/2026-10-09-timed-job-scenarios/README.md#hourly-sequence)
 includes resource samples, latency, cleanup proofs and these diagnostic limits.
 These completed hours establish saturation observations; global metadata bounds,
-fault qualification and a real daily run remain in #668.
+the 12-hour fault qualification is [its own record](../qualification/2026-10-17-v0.2.0-job-qualification.md).
 
 ### Previous continuous one-hour native host run
 

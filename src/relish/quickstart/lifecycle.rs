@@ -1,7 +1,7 @@
 //! Lifecycle commands restricted to the resources in a locked operation record.
 
 use super::{
-    lima::Lima,
+    lima::{Lima, POWER_OFF_DEADLINE},
     security,
     state::{ClusterState, Operation},
 };
@@ -199,7 +199,8 @@ pub async fn stop(
     }
     for index in selection.indexes(nodes.len()) {
         if running[index] {
-            lima.command(&["stop", &nodes[index].name]).await?;
+            lima.power_off(&nodes[index].name, POWER_OFF_DEADLINE)
+                .await?;
             println!("stopped {}", nodes[index].name);
         }
     }
@@ -379,7 +380,8 @@ mod tests {
     use crate::relish::quickstart::state::ClusterSpec;
 
     /// A stand-in `limactl`: it appends each argument list to `calls.log`
-    /// and answers `list --json` from `list.json`.
+    /// and answers `list --json` from `list.json`. A guest `systemctl
+    /// poweroff` marks that VM `Stopped`, as a real guest would.
     struct FakeLima {
         directory: tempfile::TempDir,
         lima: Lima,
@@ -394,7 +396,15 @@ mod tests {
             // script finds this test's files beside itself.
             std::fs::write(
                 &script,
-                "dir=${0%/*}\nprintf '%s\\n' \"$*\" >> \"$dir/calls.log\"\nif [ \"$1\" = list ]; then cat \"$dir/list.json\"; fi\n",
+                r#"dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/calls.log"
+if [ "$1" = list ]; then cat "$dir/list.json"; fi
+if [ "$5" = poweroff ]; then
+  grep -v "\"$2\"" "$dir/list.json" > "$dir/list.next"
+  printf '{"name":"%s","status":"Stopped"}\n' "$2" >> "$dir/list.next"
+  mv "$dir/list.next" "$dir/list.json"
+fi
+"#,
             )
             .unwrap();
             let lima = Lima::shell_script(script, Duration::from_secs(5));
@@ -421,6 +431,11 @@ mod tests {
                 .map(str::to_string)
                 .collect()
         }
+    }
+
+    /// The guest-side shutdown `stop` asks each VM for.
+    fn power_off(name: &str) -> String {
+        format!("shell {name} sudo systemctl poweroff --no-block")
     }
 
     fn operation(root: &std::path::Path) -> Operation {
@@ -466,7 +481,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fake.actions(),
-            vec![format!("stop {}", operation.state.nodes[2].name)]
+            vec![power_off(&operation.state.nodes[2].name)]
         );
     }
 
@@ -490,7 +505,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fake.actions(),
-            vec![format!("stop {}", operation.state.nodes[0].name)]
+            vec![power_off(&operation.state.nodes[0].name)]
         );
     }
 
@@ -535,10 +550,7 @@ mod tests {
         let names = &operation.state.nodes;
         assert_eq!(
             fake.actions(),
-            vec![
-                format!("stop {}", names[0].name),
-                format!("stop {}", names[2].name),
-            ]
+            vec![power_off(&names[0].name), power_off(&names[2].name),]
         );
     }
 
