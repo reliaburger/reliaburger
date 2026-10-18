@@ -949,7 +949,7 @@ The `unsafe` block turns raw bytes into a Rust type, so it deserves a closer loo
 
 Verifying a bearer and minting a token both go through one helper, `hash_off_heap`. Verification reads the variant, version, cost and salt from the stored hash, as the crate's own `verify_password` does, and compares the result with `password_hash::Output`'s `==`, which runs in constant time. A hash the crate made still verifies, a hash we mint still verifies with the crate, and a hash with other parameters verifies with its own. Unit tests pin all three, because a hand-rolled verifier that quietly accepted the wrong thing would be far worse than a fat heap.
 
-`tests/auth_memory.rs` is the test we wrote first. Like the upgrade and connection memory tests, it's a binary with a counting global allocator, so it sees every heap byte the check asks for. Checking a bearer against three stored tokens peaked at 19,922,944 heap bytes before the fix: one Argon2 block array, 19,456 KiB to the byte. After it, the same check stays under a 1 MiB ceiling, and so do refusing a wrong secret and minting a token.
+`tests/auth_memory.rs` was the test we wrote first. Like the upgrade and connection memory tests, it was a binary with a counting global allocator, so it sees every heap byte the check asks for. Checking a bearer against three stored tokens peaked at 19,922,944 heap bytes before the fix: one Argon2 block array, 19,456 KiB to the byte. After it, the same check stays under a 1 MiB ceiling, and so do refusing a wrong secret and minting a token.
 
 A heap test proves the bytes left the heap. It can't prove RSS, so we reproduced the soak in a two-CPU, 2 GiB Lima VM with swap off: one Bun, six job runs of the soak's calibration mix (262,144-task arrays and 512-task long runs on the process runtime), and the soak's request mix, each request a fresh `curl` through a forwarder that holds the connection open until Bun's idle timeout, as Lima's does. Thirty minutes, with a Bun restart at ten:
 
@@ -1915,22 +1915,20 @@ Token rotation is tested at three layers, and the tests came first. In `sesame/t
 
 ### Integration tests — the lifecycles
 
-Two integration files drive whole features through the library, no running agent required:
+One integration file drives whole features through the library, no running agent required:
 
 - **`tests/suite/security_integration.rs`** is the lifecycle suite: `join_token_single_use_enforced` and `join_token_expiry_enforced` (the loop we left open in Chapter 4), `secret_rotation_dual_key_window` and `secret_rotation_finalize_drops_old_key` (the dual-key window), and `crl_revoked_cert_rejected` / `crl_valid_cert_allowed` / `crl_empty_allows_all` (revocation).
-- **`tests/identity_demo.rs`** doubles as a runnable walkthrough. Each test is a stage of the SPIFFE story — `demo_cluster_init_and_ca_hierarchy`, `demo_csr_generation_and_signing`, `demo_oidc_jwt`, `demo_identity_bundle_and_tmpfs`, `demo_rotation_state_machine` — and they print as they go.
+
+There used to be a second, an `identity_demo` binary whose tests walked through the SPIFFE story stage by stage and printed as they went. We deleted it in July 2026. It read like a tour, but it checked nothing the unit tests in `sesame` didn't already check, and a test file that looks like coverage while adding none is worse than no file.
 
 ### Running them
 
-No gating — crypto needs only a CPU:
+No gating, since crypto needs only a CPU:
 
 ```sh
 cargo test --lib sesame pickle::signing               # unit tests
 cargo test --test suite security_integration::        # token / rotation / CRL lifecycle
-cargo test --test identity_demo -- --nocapture        # the SPIFFE walkthrough, printed
 ```
-
-The `--nocapture` on the last one is the point: it turns the test into a guided tour of cluster init, CSR signing, JWT minting, and rotation, printed to your terminal.
 
 ## Trust the image, or don't run it
 

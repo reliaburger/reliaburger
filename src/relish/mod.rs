@@ -15,6 +15,7 @@ pub mod council_view;
 pub mod dashboard;
 pub mod dev;
 pub mod diff;
+pub mod events_cmd;
 pub mod fault;
 pub mod fmt;
 pub mod inspect;
@@ -75,8 +76,12 @@ pub enum CommandOutcome {
     Clean,
     /// Ran fine, but found failures the caller should act on. Exit 1.
     Problems,
-    /// Ran fine, found only warnings. Exit 2.
+    /// Ran fine, found only warnings. Exit 3: clap already uses 2 for a
+    /// usage error, and a script must be able to tell the two apart.
     Warnings,
+    /// `relish exec` ran a command that exited with this code; relish exits
+    /// with it too.
+    Exited(u8),
 }
 
 impl CommandOutcome {
@@ -85,7 +90,8 @@ impl CommandOutcome {
         match self {
             CommandOutcome::Clean => 0,
             CommandOutcome::Problems => 1,
-            CommandOutcome::Warnings => 2,
+            CommandOutcome::Warnings => 3,
+            CommandOutcome::Exited(code) => code,
         }
     }
 }

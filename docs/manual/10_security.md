@@ -127,7 +127,7 @@ caller and the end of the grace period.
 it expires (`never`, `(in 30d)` or `(expired)`), when it was **last used** and
 its **scope** (`all`, or `apps=… namespaces=…`). New columns are added on the
 right, so a script that cuts the older ones out keeps working;
-`relish --output json token list` gives the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
+`relish -o json token list` gives the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
 never) plus a `principal` id that matches the `principal` of that token's audit
 events.
 
@@ -338,6 +338,9 @@ relish secret pubkey                  # ask the cluster
 relish secret pubkey cluster          # offline, from `relish init` output
 relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
 ```
+
+`examples/phase-1/container-secrets.toml` is a job that reads an encrypted
+value and prints its length, never the value; its header has the commands.
 
 Encryption is local: `secret encrypt` never contacts the cluster. The node
 that starts the instance decrypts the value into its environment. If it can't

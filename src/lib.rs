@@ -20,6 +20,7 @@ pub(crate) mod durable;
 pub mod file_lock;
 pub mod firewall;
 pub mod grill;
+pub mod http_client;
 pub mod ketchup;
 pub mod lettuce;
 pub mod mayo;

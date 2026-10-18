@@ -355,12 +355,25 @@ pub(super) async fn exec_handler(
     })
     .await
     {
-        Ok(Ok(output)) => Json(serde_json::json!({ "output": output })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        // A command that ran answers 200 whatever its exit code: the code is
+        // the command's answer, not the API's (D34).
+        Ok(Ok(output)) => Json(output).into_response(),
+        Ok(Err(error)) => {
+            let status = match error {
+                crate::bun::BunError::AppNotFound { .. }
+                | crate::bun::BunError::InstanceNotFound { .. }
+                | crate::bun::BunError::Grill(crate::grill::GrillError::NotFound { .. }) => {
+                    StatusCode::NOT_FOUND
+                }
+                crate::bun::BunError::ExecTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
         Err(response) => response,
     }
 }

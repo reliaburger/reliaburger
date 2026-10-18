@@ -110,7 +110,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Show cluster and app status
 - `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
-- `relish exec <APP> [COMMAND]...`: Execute a command inside a running container
+- `relish exec <APP> [COMMAND]...`: Run a command once inside a running instance and exit with its exit code. Not interactive: no stdin and no terminal
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
 - `relish history <APP>`: Show deploy history for an app, from every node
@@ -151,6 +151,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish logs <NAME>`: Stream logs from an app or job
 - `relish logs-export --dest <DEST>`: Export Parquet log files to a destination directory
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
+- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last *(0.2.1, not in 0.2.0)*
 
 **Diagnose and test** ([diagnostics](docs/manual/07_diagnostics.md))
 
@@ -316,7 +317,10 @@ it would take out every replica or put the council's quorum at risk.
 **Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
 blue-green switches and autoscaling on metrics. Point the cluster at a Git
 repository and the leader keeps it in sync, verifying commit signatures if you
-ask it to.
+ask it to. `scripts/demo/rollout.sh` and `scripts/demo/gitops.sh` show both on
+a one-node cluster from a checkout, with
+[`examples/phase-1/proc-rollout.toml`](examples/phase-1/proc-rollout.toml) and
+[`examples/gitops/repository`](examples/gitops/repository).
 
 **A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
 cron schedule, a hook that runs before a deploy, and a task array that runs the

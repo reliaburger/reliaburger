@@ -680,7 +680,11 @@ impl super::Grill for RuncGrill {
         self.owned_logs(instance).await
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         self.owned_exec(instance, command).await
     }
 
@@ -1538,7 +1542,7 @@ mod tests {
                     &["cat".to_string(), "/reliaburger-isolation".to_string()],
                 )
                 .await
-                .is_ok_and(|output| output.trim() == "adopted")
+                .is_ok_and(|output| output.output.trim() == "adopted")
             {
                 break;
             }
@@ -1587,7 +1591,8 @@ mod tests {
                 &["cat".to_string(), "/reliaburger-isolation".to_string()],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(contents.trim(), "adopted");
 
         let next_id = InstanceId("payments__runc-rootfs-adoption-1".into());
@@ -1711,7 +1716,8 @@ mod tests {
                 ],
             )
             .await
-            .expect("the pinned workload should support exec");
+            .expect("the pinned workload should support exec")
+            .output;
         assert_eq!(
             output, "reliaburger-pinned-workload",
             "unexpected output from the selected platform manifest"
@@ -1798,7 +1804,8 @@ mod tests {
                 ],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(
             probe.contains("8.8.0|hello|/data|0|redis"),
             "image env, app env, working dir, image user and image-owned files: {probe}"
@@ -1994,7 +2001,13 @@ mod tests {
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {
         let mut argv = vec!["redis-cli".to_string()];
         argv.extend(command.iter().map(|part| part.to_string()));
-        grill.exec(id, &argv).await.unwrap().trim().to_string()
+        grill
+            .exec(id, &argv)
+            .await
+            .unwrap()
+            .output
+            .trim()
+            .to_string()
     }
 
     /// Z1.1: user-namespaced redis writes to a managed volume and finds its
