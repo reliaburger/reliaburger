@@ -50,6 +50,15 @@ cluster's real state where the tour says to wait. `tests/suite/website.rs`
 runs `tour.sh --check`, which fails if the page gains a command the script
 doesn't know how to run.
 
+Once the cluster is up, the script samples every node VM every five seconds
+through `limactl shell` (`scripts/demo/resources.py`): Bun's memory and CPU,
+the whole guest's, and the guest's network traffic. Each wait ends with a
+one-line readout of the latest sample, so the recording shows the cluster's
+footprint at the moment it describes, whatever idle time the player trims, and
+the tour ends with each measure's average and peak. Set `DEMO_RESOURCES_OUT`
+to keep the samples as CSV with SVG charts in the soak charts' style, or
+`DEMO_RESOURCES=0` to leave the measuring out.
+
 Every promoted release re-records the tour against its published install
 ([releasing step 9](../releasing.md#staging-a-candidate)). With no other
 quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`

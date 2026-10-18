@@ -1817,6 +1817,33 @@ The demo needs a cluster, because `RolloutFailed` is the council's mark, and the
 
 `examples/phase-1/container-rollout.toml` is the container version, with `strategy = "blue-green"` on podinfo. The process version can't roll surge-first: two testapp instances can't both listen on one host port, so it sets `max_surge = 0` and `max_unavailable = 1` and the planner retires before it starts.
 
+### What the demo costs
+
+Reliaburger says it's light. A demo that rolls three versions and never shows what that cost the laptop asks the audience to take the claim on trust, so the demos measure themselves (#671). `scripts/demo/resources.py` runs in the background from the moment `demo_start` launches Bun to the moment `demo_stop` shuts it down, which is why it lives in `lib.sh`: the rollout and GitOps demos gained it without a line changing in either. Before each heading, `demo_step` prints the latest sample on one line, and the demo ends with a table:
+
+```text
+    resources: bun 109.5 MiB, 66.7 % CPU · 2 workloads 23.8 MiB, 1.0 % CPU
+
+==> Roll back: the council remembers the last version that rolled out healthy
+...
+==> Resource use: 25 samples over 24 s on demo-node
+                     average           peak
+  bun CPU               70.4 %         94.6 %
+  bun memory           109.7 MiB      117.3 MiB
+  workload CPU           0.3 %          1.0 %
+  workload memory       17.2 MiB       24.3 MiB
+  CPU is a percentage of one core.
+  network: not measured (a local node talks over loopback, which neither Linux nor macOS counts per process)
+```
+
+That's a debug build on a laptop running a dozen other builds, and the first run's numbers were the first surprise: Bun at two thirds of a core to roll one app. A debug build of anything Tokio-heavy is slow, which is why the manual tells you to point `BUN` at a release build before quoting a number. The measurement is the point. Before it, nobody could have told you what the demo cost at all.
+
+The issue's first wish was a graph that moves with the asciinema recording. That turns out to be the hard version. The tour's recording trims idle time to two seconds and plays setup four times faster, so a chart drawn against the wall clock drifts away from the terminal it's meant to sit beside, and keeping the two in step would mean a custom player. The readout line gets the same effect for free: it's part of the terminal output, so it lands in the recording at exactly the moment it describes, whatever the player cuts. For a chart, `DEMO_RESOURCES_OUT=dir` keeps the samples as `resources.csv` and draws `cpu.svg` and `memory.svg` with the soak charts' code from `scripts/release/soak_charts.py`, the demo's steps marked along the time axis where the soak marks its faults. Reusing it took three small changes there: time steps of seconds for a run that lasts a minute, a `key` argument so the legend says "demo step" instead of "upgrade walk", and a `step` mark that draws as a tick.
+
+Two details decide whether the numbers are honest. The first is what counts as a workload. The obvious answer, Bun's descendants, misses most of them: the process runtime runs each workload under an owner process that outlives Bun on purpose (so a Bun restart doesn't kill your app), and an owner that outlives its parent gets re-parented to `init` or `launchd`. The sampler finds them by their command lines, which name the node's data directory, and adds their descendants. The second is what isn't measured. A one-node demo talks to itself over loopback, and neither Linux nor macOS keeps per-process byte counts for that without eBPF or `nettop` parsing. Rather than print a system-wide loopback figure that includes the browser in the next window, the summary says network wasn't measured. The tour is different: its nodes are Lima VMs, so `scripts/demo/tour.sh` samples each guest through `limactl shell` every five seconds and reports Bun, the whole guest (Bun, its workloads and the operating system together) and the guest's network links. A VM's traffic is its own, so there it's worth counting.
+
+The sampler is a Python script, like the soak's tooling, not a `relish` subcommand. It reads `/proc` on Linux and `ps` on macOS, and whatever it can't read it leaves blank instead of failing the demo: a demo that dies because `ps` printed a column differently would be measuring the wrong thing. `scripts/ci/test_demo_resources.py` covers the parsing (macOS's `1:02.50` and Linux's `00:01:02` for the same minute of CPU, a `/proc/PID/stat` whose command name has spaces and parentheses in it), the CPU arithmetic, a restarted Bun whose tick count went backwards, the CSV and the summary. `tests/demos.rs` checks every live run prints both the readout and the summary, so a sampler that silently stops sampling fails `make test-cluster`.
+
 ### What we learned
 
 The bug in the abort wasn't in a tricky line. Each step was locally reasonable: tear down what you started, keep what you didn't touch. The mistake was not writing down the invariant the whole function had to keep, "never end below the capacity you started with", and testing for it. Once it was written down, the fix was mostly reuse.

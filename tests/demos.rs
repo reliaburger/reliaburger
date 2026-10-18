@@ -50,6 +50,16 @@ fn run_demo(script: &str) -> String {
         stdout.contains("demo complete"),
         "{script} exited 0 without finishing:\n{stdout}"
     );
+    // lib.sh measures every demo (#671): a readout at each step and the
+    // average and peak at the end, from real samples of Bun and its workloads.
+    assert!(
+        stdout.contains("==> Resource use:") && stdout.contains("bun memory"),
+        "{script} printed no resource summary:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("    resources: bun "),
+        "{script} printed no resource readout at its steps:\n{stdout}"
+    );
     stdout
 }
 

@@ -60,6 +60,30 @@ class DemoScripts(unittest.TestCase):
                 self.assertNotRegex(text, r'\$\{?BUN\}?"?\s', 'only lib.sh runs bun')
                 self.assertIn('demo complete', text)
 
+    def test_every_demo_measures_its_resource_use_through_one_sampler(self):
+        # #671: the library samples around every feature demo, the tour
+        # samples its quickstart VMs, and nothing else runs the sampler.
+        library = LIBRARY.read_text()
+        start = re.search(r'(?ms)^demo_start\(\) \{.*?^\}', library).group(0)
+        stop = re.search(r'(?ms)^demo_stop\(\) \{.*?^\}', library).group(0)
+        step = re.search(r'(?ms)^demo_step\(\) \{.*?^\}', library).group(0)
+        self.assertIn('demo_resources_start', start)
+        self.assertIn('demo_resources_stop', stop)
+        self.assertIn('demo_resources_readout', step)
+        self.assertIn('resources.py', library)
+        self.assertIn('DEMO_RESOURCES', library)
+        self.assertTrue((DEMO / 'resources.py').is_file())
+        for name in FEATURE_DEMOS:
+            with self.subTest(script=name):
+                self.assertNotIn('resources.py', '\n'.join(code_lines(DEMO / name)))
+        tour = '\n'.join(code_lines(DEMO / 'tour.sh'))
+        self.assertIn('resources.py', tour)
+        self.assertIn('--quickstart', tour)
+        self.assertIn(' summary ', tour)
+
+    def test_the_live_runs_check_the_resource_summary(self):
+        self.assertIn('Resource use', (ROOT / 'tests/demos.rs').read_text())
+
     def test_demos_apply_the_shipped_examples(self):
         for name in FEATURE_DEMOS:
             with self.subTest(script=name):
