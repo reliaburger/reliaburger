@@ -463,6 +463,15 @@ push_pair() {
         mv /etc/reliaburger/soak-tls/ingress.crt.new /etc/reliaburger/soak-tls/ingress.crt'
 }
 
+# Push the current pair to a node that may have missed rotations, and tell
+# the checker that's what it must serve. A rotation while every node is down
+# still moves `current` on (#1108).
+push_current_pair() {
+    local node=$1
+    push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem" || true
+    check ingress-expect "$evidence" "${vm[node]}" "$(cat "$tls/current/serial")"
+}
+
 served_ingress_serial() {
     gsh "$1" 'echo | timeout 5 openssl s_client -connect 127.0.0.1:443 -servername podinfo.localhost 2>/dev/null | openssl x509 -noout -serial' \
         2>/dev/null | sed -n 's/^serial=//p'
@@ -1145,9 +1154,7 @@ power_on() {
     local node=$1 result=0
     "$relish" local start "$node" > "$evidence/snapshots/power-on-$node-$(date +%s).log" 2>&1 || result=$?
     down[node]=0
-    # A node that missed rotations must serve the current pair.
-    push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem" || true
-    check ingress-expect "$evidence" "${vm[node]}" "$(cat "$tls/current/serial")"
+    push_current_pair "$node"
     return "$result"
 }
 
@@ -1354,7 +1361,7 @@ special_all_off() {
     down=(0 0 0 0)
     local node
     for node in 1 2 3; do
-        push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem" || true
+        push_current_pair "$node"
     done
     [ "$result" -eq 0 ] || record_failure all-off-start "relish local start exited $result"
     settle special:all-off 600 || true

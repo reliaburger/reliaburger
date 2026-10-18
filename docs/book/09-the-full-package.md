@@ -1660,6 +1660,28 @@ decompressor for qcow2 (Lima's `master` has added one since). The host agent
 still steps the guest clock every 10 s past 100 ms of drift. The workarounds
 stay.
 
+### A rotation while every node was down
+
+The soak rotates the operator's ingress certificate every few minutes, and
+after each reload it tells the checker which serial each node must now serve.
+The 0.2.1 candidate 6 jobs soak failed every node at once: "serves 100B, not
+the 100A reloaded 590 s ago". Bun was right; the harness had lost track.
+
+A rotation fired while the "every VM powered off at once" special held the
+whole cluster down. It skipped all three nodes, as it should, but it still
+made 100B the pair the harness calls current. On power-on, the special pushed
+that current pair to every node and never told the checker, which still
+expected 100A from the last rotation that had reached them. A single-node
+power-on did tell it, because it pushed the pair through code that also
+records the expectation. Now both paths use one helper,
+`push_current_pair`, and a test reads `qualify-sustained.sh` to check that
+every push of the current pair records what the node must serve
+([#1108](https://github.com/reliaburger/reliaburger/issues/1108)).
+
+The lesson is an old one: two copies of "do the thing, then record it" drift
+apart, and the copy that runs least is the one that's wrong. The all-off
+special runs once per soak.
+
 ### Status from any node
 
 A one-replica app can run on the third VM while your CLI connects to the first.
