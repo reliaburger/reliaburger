@@ -1136,6 +1136,31 @@ The last piece is the bootstrap guard's freshness check. `is_fresh` used to retu
 
 The test that ties the theme together does the full loop through the real startup path: bootstrap a node on durable storage, write state, trigger a snapshot, let openraft purge the log, then flip one byte in the stored payload and restart. The restart must return an error — the checksum mismatch — and never a plausible-looking empty cluster. A sibling test deletes the snapshot outright and expects the purge-boundary error instead. Corruption you can detect at startup is an incident; corruption you detect three weeks later is an archaeology dig.
 
+### The file that outgrew its header
+
+All that care about our own bytes didn't help when the store underneath us broke. The 0.2.1 soak cut the power to a node, and on the way back up Bun panicked inside redb before it had read a single key:
+
+```
+assertion failed: storage.raw_file_len()? >= header.layout().len()
+```
+
+It panicked on every start after that, so systemd gave up and the node was gone until someone wiped its Raft directory (#1024). Nothing we'd written was wrong. The file was.
+
+redb keeps a header at the front of the file, and the header records the layout: how many regions the file holds, and so how long it must be. When a commit needs more room, redb 2 extended the file, wrote the pages, then wrote a header naming the bigger layout, and made all of it durable with one `fdatasync`. On ext4 that one call does two separate things. The header page is an overwrite of a block the file already owns, so it goes straight to disk. The file's new length (`i_size`) is metadata, so it waits for the journal to commit. Cut the power between the two and you wake up with a header that promises more file than there is. In our test that's a 34 MiB layout over a 1 MiB file. redb 2.6.3 checked that promise with `assert!`, and an assertion that fails at open time turns a recoverable store into a crash loop.
+
+redb 4.2 closed that window: it now makes the longer file durable *before* any header can name the bigger layout, the same order it already used when shrinking. A cut part way through can only leave an old header over a longer file, and redb recovers from that on the next open. A file that's still shorter than its header (one redb 2 left behind, or one that a copy tool truncated) now gets a `StorageError::Corrupted` or an I/O error, which Bun reports and exits on, like any other unreadable store. So we upgraded from redb 2.6.3 to 4.4.0. Two tests in `durable_log.rs` build both crash images by copying a live store's file on either side of a growing commit, then cutting the copy to the other length. The short one panicked on redb 2.6.3, which is how we knew the test reproduced the soak. The other reopens with its vote and entries intact.
+
+The upgrade changed redb's file format from v2 to v3, and redb 4 won't open v2 files. Before 1.0 we don't migrate, so this is one more line under the 0.2.1 `state` bump in `src/compatibility.rs`. A node refuses a 0.2.0 data directory before redb ever sees it.
+
+The API change was one line per file, and it's a Rust lesson. redb 3 moved `begin_read` off `Database` and onto a `ReadableDatabase` trait, so `Database` and the new `ReadOnlyDatabase` can share it. The method still exists on `Database`, but the compiler wouldn't find it:
+
+```
+error[E0599]: no method named `begin_read` found for struct `Arc<redb::Database>`
+    = help: items from traits can only be used if the trait is in scope
+```
+
+In Go, a method belongs to the type and is always callable. In Rust, a trait method is only callable where the trait is in scope, so the fix is to import it: `use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};`. It stops two crates' traits that define a method with the same name from clashing silently, and you can see from the imports which traits a file leans on. `ReadableTable` was already there for the same reason.
+
 ### The in-memory log store
 
 The log store is the simplest adapter. It stores entries in a `BTreeMap<u64, Entry>` keyed by log index:
@@ -2175,6 +2200,39 @@ Two small things also changed. A frame used to go out as two writes (the length 
 #### Did it help?
 
 `examples/raft-heartbeat-rtt.rs` forms a three-voter council over the real transport (TCP, mTLS, live identities, node-bound connectors) on loopback and times `ensure_linearizable` on the leader, which is exactly what a linearizable read pays. The results, before and after, in both build profiles and with and without CPU load, are in the [council design doc](../design/gossip-mustard.md#33-raft-integration). On an M2 Max with an idle host, the median leadership check fell from 2.50 ms to 0.53 ms in a debug build and from 1.43 ms to 0.26 ms in a release build. Under full CPU load the medians fell by similar factors, but the slowest checks barely moved: once every core is busy, the tail is the scheduler's, not the handshake's. No check came near 150 ms on loopback either way, because the debug builds already carried the `ring` fix and loopback has no virtual network in the way. The honest summary is that the pool takes the handshake out of the heartbeat's budget entirely, rather than making a slow cluster fast.
+
+#### One late round isn't a lost leader
+
+The tail still bit, in a merge queue on a saturated CI runner ([#1009](https://github.com/reliaburger/reliaburger/issues/1009)). A test asked the leader for a test lease right after creating it and got a 503 "retry shortly". The leader was settled: the test checked a moment later that it still led. What failed was the single leadership check behind the read. openraft's `ensure_linearizable` sends one heartbeat round and gives each follower one `heartbeat_interval` (150 ms) to answer. If both followers miss it, the leader can't prove a quorum, the check fails, and the route treats the node as "not leader". The node then tries to forward the read, sees that its own metrics name itself as leader, and answers 503 rather than forward to itself. Running the test in three parallel lanes at a load average of about 147, a probe of 3,600 reads against the settled leader got two 503s. That's rare, but every read pays the odds.
+
+The check itself is right: a leader that can't hear a quorum mustn't serve a linearizable read. Giving up after one round is the bug, because the route already had a 3-second budget for it. `CouncilNode::confirm_leadership` spends that budget:
+
+```rust
+pub async fn confirm_leadership(&self, within: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    let retry_pause = std::time::Duration::from_millis(self.raft.config().heartbeat_interval);
+    loop {
+        match tokio::time::timeout_at(deadline, self.is_leader()).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        let believes_it_leads = {
+            let metrics = self.metrics();
+            let metrics = metrics.borrow();
+            metrics.current_leader == Some(metrics.id)
+        };
+        if !believes_it_leads || tokio::time::Instant::now() + retry_pause >= deadline {
+            return false;
+        }
+        tokio::time::sleep(retry_pause).await;
+    }
+}
+```
+
+`timeout_at` is `timeout` with an absolute deadline instead of a duration, so every attempt shares the one budget, however many there are. It returns `Err` when the deadline passes, and `Ok` wrapping the inner future's answer otherwise, which is why the `match` has three arms. The `{ ... }` block that computes `believes_it_leads` is there for the borrow: `borrow()` on a `watch::Receiver` holds a read lock until the guard is dropped, and the guard is dropped at the block's closing brace, before the `sleep`'s `.await`. The retry only runs while the node still believes it leads. A follower knows another voter leads, so it gets "no" straight away and forwards the read, with no added delay.
+
+The unit test models the slow followers with the in-memory router: it holds elections on every voter, cuts the leader off from both followers, checks that one `is_leader` round fails, and heals the partition 300 ms later while `confirm_leadership` is running. With the same probe and load, 102 runs of the test made 30,600 reads and got no 503. The integration test also stopped treating the 503 as fatal: it retries that one documented answer for up to 30 seconds and asserts 200 on whatever comes back.
 
 ### The ClusterHandle
 

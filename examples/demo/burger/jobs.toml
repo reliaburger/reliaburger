@@ -1,12 +1,15 @@
-# Development preview: PR #266 / 0.2.0, on rootful Linux nodes.
+# The five-minute tour's jobs step: relish batch submit burger/jobs.toml.
+# Image jobs need rootful Linux nodes, as the laptop quickstart's VMs are.
+# Ten fast tasks in two profiles, so the step takes seconds, not minutes.
 # A chunk queues indexes; CPU and memory requests govern actual concurrency.
+# Small chunks let these few tasks spread across the nodes.
 name = "burger-orders"
 namespace = "default"
 
 [[cohort]]
 name = "small"
-count = 1000
-chunk_size = 128
+count = 8
+chunk_size = 2
 max_attempts = 3
 task_timeout_secs = 30
 [cohort.template]
@@ -17,8 +20,8 @@ memory = "32Mi-64Mi"
 
 [[cohort]]
 name = "large"
-count = 64
-chunk_size = 16
+count = 2
+chunk_size = 1
 max_attempts = 3
 task_timeout_secs = 30
 [cohort.template]
