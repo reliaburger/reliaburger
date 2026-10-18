@@ -1,0 +1,92 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="metrics_surfaces.Metrics for an external monitoring stack" tests="3" errors="2" failures="0" skipped="0" time="30.226493" timestamp="2026-10-18T14:12:53.517572" hostname="serval"><testcase classname="metrics_surfaces.Metrics for an external monitoring stack" name="Collect metrics through the node API path /metrics -- @1.1 " status="error" time="28.801195"><error type="Unsupported" message="no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier (_ssl.c:1032)&gt;'">
+
+Failing step: Then the response should be in the Prometheus text exposition format ... error in 0.001s
+Location: features/extensibility/metrics_surfaces.feature:12
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/integration_steps.py", line 195, in step_exposition
+    raise Unsupported(f"no Prometheus surface: HTTP {status}; body starts {str(body)[:160]!r}")
+harness.core.Unsupported: no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier (_ssl.c:1032)&gt;'
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_EXT-004 @claim_no_prometheus_endpoint_remote_read_or_promql @claim_app_metrics_scraping_and_extra_targets
+  Scenario Outline: Collect metrics through the node API path /metrics -- @1.1 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.603s
+    And the native fixture application is running ... passed in 28.194s
+    When I request metrics through the node API path /metrics from the workstation ... passed in 0.004s
+    Then the response should be in the Prometheus text exposition format ... error in 0.001s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-004[node-api]: UNSUPPORTED (no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identi)
+
+
+</system-err></testcase><testcase classname="metrics_surfaces.Metrics for an external monitoring stack" name="Collect metrics through the node API path /v1/read -- @1.2 " status="error" time="0.708329"><error type="Unsupported" message="no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier (_ssl.c:1032)&gt;'">
+
+Failing step: Then the response should be in the Prometheus text exposition format ... error in 0.001s
+Location: features/extensibility/metrics_surfaces.feature:12
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/integration_steps.py", line 195, in step_exposition
+    raise Unsupported(f"no Prometheus surface: HTTP {status}; body starts {str(body)[:160]!r}")
+harness.core.Unsupported: no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identifier (_ssl.c:1032)&gt;'
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_EXT-004 @claim_no_prometheus_endpoint_remote_read_or_promql @claim_app_metrics_scraping_and_extra_targets
+  Scenario Outline: Collect metrics through the node API path /v1/read -- @1.2 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.563s
+    And the native fixture application is running ... passed in 0.142s
+    When I request metrics through the node API path /v1/read from the workstation ... passed in 0.003s
+    Then the response should be in the Prometheus text exposition format ... error in 0.001s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-004[remote-read]: UNSUPPORTED (no Prometheus surface: HTTP None; body starts 'URLError: &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority Key Identi)
+
+
+</system-err></testcase><testcase classname="metrics_surfaces.Metrics for an external monitoring stack" name="Collect metrics through the application's own ingress at /metrics -- @1.3 " status="passed" time="0.716969"><system-out>
+
+@scenario.begin
+
+  @req_EXT-004 @claim_no_prometheus_endpoint_remote_read_or_promql @claim_app_metrics_scraping_and_extra_targets
+  Scenario Outline: Collect metrics through the application's own ingress at /metrics -- @1.3 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.541s
+    And the native fixture application is running ... passed in 0.173s
+    When I request metrics through the application's own ingress at /metrics from the workstation ... passed in 0.003s
+    Then the response should be in the Prometheus text exposition format ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-004[app-ingress]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

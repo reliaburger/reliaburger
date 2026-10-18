@@ -1,0 +1,113 @@
+{
+  "batches": [
+    {
+      "batch_id": 1,
+      "kind": "array",
+      "name": "rbeval-fail-c21f631bccb2",
+      "namespace": "default",
+      "status": "CompletedWithFailures",
+      "done": true,
+      "total": 1,
+      "succeeded": 0,
+      "failed": 1,
+      "not_run": 0,
+      "retried": 0,
+      "retry_causes": {
+        "exit_code": 0,
+        "signal": 0,
+        "timeout": 0,
+        "unknown": 0,
+        "launch": 0,
+        "unrecorded": 0
+      },
+      "queued": 0,
+      "held": 0,
+      "active_commands": 0,
+      "other_in_flight_attempts": 0,
+      "activity_semantics": "last_node_sync_verified_start_to_positive_cleanup",
+      "elapsed_seconds": 9,
+      "whole_run_successes_per_second": 0.0,
+      "chunks": 1,
+      "chunks_done": 1,
+      "failed_indices": [
+        [
+          0,
+          0
+        ]
+      ],
+      "failed_overflow": 0,
+      "submitted_at_epoch_secs": 1792325143,
+      "nodes": [],
+      "nodes_truncated": false,
+      "duration_final_attempt_ms": {
+        "bounds": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192,
+          16384,
+          null
+        ],
+        "counts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ]
+      },
+      "cpu_request_millicores": 50,
+      "memory_request_bytes": 16777216,
+      "age_seconds": 109,
+      "details_retention_seconds": 3600,
+      "execution_semantics": "at_least_once",
+      "runtime": "runc",
+      "idle_executor_reservation": null,
+      "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
+      "quota_blocked": null,
+      "quota_blocked_reason": null,
+      "unrunnable_reason": null,
+      "run": {
+        "name": "rbeval-fail-c21f631bccb2",
+        "namespace": "default",
+        "revision": 1,
+        "trigger": {
+          "manual": {
+            "request_id": "418a788c741e5ca74d2b8a65016eeeba"
+          }
+        },
+        "definition_digest": "95128780bd988d374428acb043a3f37583361ac3519c4b854e94fe5d9da2b73e",
+        "replay_unknown": true,
+        "unknown_owners": []
+      },
+      "unknown_owners": [],
+      "rates": {
+        "successes_per_second": 0.0,
+        "failures_per_second": 0.0,
+        "interval_seconds": 1.00146137,
+        "sampled_at_epoch_ms": 1792325252065
+      }
+    }
+  ]
+}

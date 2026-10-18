@@ -1,0 +1,38 @@
+{
+  "claim": {
+    "id": "claim_partitions_no_split_brain_and_degradation",
+    "axis": "operations",
+    "statement": "Network partitions cannot split the brain because Raft needs a majority; minority-side nodes keep running apps but cannot deploy, and during a sustained partition certificate rotation fails at 30 minutes and workload certificates expire at 1 hour (4 hours with the grace period).",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/whitepaper.md:532-532",
+        "quote": "Network partitions can't cause split-brain: Raft requires a majority quorum"
+      },
+      {
+        "ref": "docs/whitepaper.md:536-536",
+        "quote": "certificate rotation fails (at 30 minutes), and workload certificates expire (at 1 hour, or 4 hours with the grace period)"
+      }
+    ],
+    "measurable": "Partition one of three nodes with nftables or relish fault; the majority keeps serving writes, the minority refuses them; existing connections and apps keep working; verify the progressive degradation timeline (stale service map for new cross-partition connections immediately, cert rotation failing at 30 min, workload cert expiry at 1 h or 4 h). After heal the council converges. relish test --chaos scenario minority_partition_degrades_and_heals covers the council case.",
+    "interfaces": [
+      "relish fault partition <svc> --from <svc>",
+      "relish test --chaos --filter minority_partition_degrades_and_heals",
+      "relish council status"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_partitions_no_split_brain_and_degradation",
+      "ref": "docs/whitepaper.md:532-532",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_partitions_no_split_brain_and_degradation",
+      "ref": "docs/whitepaper.md:536-536",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

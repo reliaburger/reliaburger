@@ -1,0 +1,38 @@
+{
+  "claim": {
+    "id": "claim_network_perimeter_firewall",
+    "axis": "operations",
+    "statement": "On clustered rootful Linux, bun runs an nftables perimeter that drops the API (9117), gossip, Raft and reporting ports (9443 to 9445) and the host port range for everyone but cluster members, bootstrap_peers and operator_cidrs.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/13_reference.md:66-66",
+        "quote": "Bun's perimeter firewall drops 9117,"
+      },
+      {
+        "ref": "docs/manual/10_security.md:43-43",
+        "quote": "Bun refuses to start on a malformed entry, a `/0`"
+      }
+    ],
+    "measurable": "From a non-member host nmap ports 9117, 9443, 9444, 9445 and 10000-60000; all filtered. Add the host to [security] operator_cidrs and restart; only 9117 opens and a token is still required; /0 and host-bit CIDRs make bun refuse to start; no live reload. Rootless bun and macOS do not run the perimeter.",
+    "interfaces": [
+      "[security] operator_cidrs, bootstrap_peers",
+      "bun --listen 0.0.0.0:9117 (allowed only once an API token exists)",
+      "ports 9117, 9443, 9444, 9445"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_network_perimeter_firewall",
+      "ref": "docs/manual/13_reference.md:66-66",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_network_perimeter_firewall",
+      "ref": "docs/manual/10_security.md:43-43",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

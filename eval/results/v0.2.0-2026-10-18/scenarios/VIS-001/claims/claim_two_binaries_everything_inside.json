@@ -1,0 +1,49 @@
+{
+  "claim": {
+    "id": "claim_two_binaries_everything_inside",
+    "axis": "vision",
+    "statement": "Reliaburger is two binaries, the node agent bun and the CLI relish, and scheduling, ingress, PKI, secrets, registry, metrics, logs, GitOps, jobs, fault injection and service discovery are compiled into bun.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "README.md:10-12",
+        "quote": "Scheduling, clustering, service discovery, ingress, PKI, secrets, an image registry, metrics, logs, GitOps, jobs and fault injection are compiled into that agent."
+      },
+      {
+        "ref": "docs/whitepaper.md:134-134",
+        "quote": "There's no separate control-plane binary and no plugin to pick"
+      },
+      {
+        "ref": "README.md:13-13",
+        "quote": "There's no control plane to assemble and no add-ons to install."
+      }
+    ],
+    "measurable": "Install the release; only bun and relish exist and no control plane or add-on is installed (no other daemon or container is needed to reach a working cluster); every subsystem command (relish routes, images, metrics, logs, fault, batch, dashboard, resolve) answers against a cluster that has only bun running on each node.",
+    "interfaces": [
+      "bun",
+      "relish",
+      "bun --cluster",
+      "relish status"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_two_binaries_everything_inside",
+      "ref": "README.md:10-12",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_two_binaries_everything_inside",
+      "ref": "docs/whitepaper.md:134-134",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_two_binaries_everything_inside",
+      "ref": "README.md:13-13",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

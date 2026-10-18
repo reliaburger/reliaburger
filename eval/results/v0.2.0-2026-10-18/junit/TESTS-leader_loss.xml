@@ -1,0 +1,30 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="leader_loss.Council leader loss" tests="1" errors="0" failures="1" skipped="0" time="29.385173" timestamp="2026-10-18T14:27:18.739657" hostname="serval"><testcase classname="leader_loss.Council leader loss" name="Writes resume after the council leader loses power" status="failed" time="29.385173"><failure type="AssertionError" message="election took 11.6 s &gt; 5 s">
+
+Failing step: Then a new leader should be elected within the configured election target ... failed in 11.266s
+Location: features/operations/leader_loss.feature:13
+ASSERT FAILED: election took 11.6 s &gt; 5 s
+</failure><system-out>
+
+@scenario.begin
+
+  @req_OPS-006 @claim_leader_election_and_learning_period_targets @claim_council_raft_quorum_and_self_healing @destructive
+  Scenario: Writes resume after the council leader loses power
+    Given a healthy disposable 3-node Reliaburger cluster with sufficient spare capacity ... passed in 1.551s
+    And the native fixture application is running ... passed in 10.957s
+    And an external probe recording availability once per second ... passed in 5.001s
+    When I cut the power to the council leader ... passed in 0.609s
+    Then a new leader should be elected within the configured election target ... failed in 11.266s
+    And a newly applied app should be committed and running within the configured write target ... skipped in 0.000s
+    And the fixture should keep serving through the surviving ingresses ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-006: FAIL (Then a new leader should be elected within the configured election target: AssertionError: election took 11.6 s &gt; 5 s)
+
+
+</system-err></testcase></testsuite>

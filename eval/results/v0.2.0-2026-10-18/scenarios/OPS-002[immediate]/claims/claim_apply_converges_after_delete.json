@@ -1,0 +1,49 @@
+{
+  "claim": {
+    "id": "claim_apply_converges_after_delete",
+    "axis": "operations",
+    "statement": "relish apply deploys or converges everything in the file, and relish delete removes the app while each node retires its instances on its own; re-applying a deleted app therefore converges to the file again.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/01_deploy-an-app.md:128-128",
+        "quote": "deploy (or converge) everything in the file"
+      },
+      {
+        "ref": "docs/manual/01_deploy-an-app.md:137-137",
+        "quote": "remove the app from the cluster"
+      },
+      {
+        "ref": "docs/manual/01_deploy-an-app.md:142-145",
+        "quote": "Each node then retires its instances on its own"
+      }
+    ],
+    "measurable": "Delete a running 2-service app and apply the same file again, either at once or after relish status shows no instances; every cycle reaches the desired running replica count and serves through every ingress within the pre-registered budget, with no stopped instances left behind.",
+    "interfaces": [
+      "relish apply",
+      "relish delete",
+      "relish status",
+      "relish inspect"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_apply_converges_after_delete",
+      "ref": "docs/manual/01_deploy-an-app.md:128-128",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_apply_converges_after_delete",
+      "ref": "docs/manual/01_deploy-an-app.md:137-137",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_apply_converges_after_delete",
+      "ref": "docs/manual/01_deploy-an-app.md:142-145",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "claim": {
+    "id": "claim_no_otlp_opentelemetry_export",
+    "axis": "extensibility",
+    "statement": "The platform has no OpenTelemetry or OTLP export for metrics, logs or traces; traces are left to applications' own OpenTelemetry SDKs and external collectors.",
+    "kind": "hypothesis",
+    "sources": [
+      {
+        "ref": "docs/whitepaper.md:991-991",
+        "quote": "Applications export traces to external collectors (Jaeger, Tempo, Datadog) using standard OpenTelemetry SDKs."
+      }
+    ],
+    "gap": "No mention found of otlp (rg -n -i \"otlp\" README.md docs/whitepaper.md docs/manual docs/README.md docs/design returned nothing). The only OpenTelemetry mention is the whitepaper section 22 note that a distributed tracing backend is deliberately not included and apps should use OpenTelemetry SDKs directly.",
+    "measurable": "Search the config schema and binary for an OTLP endpoint option; run an OTLP collector on a separate host and verify bun sends nothing to port 4317/4318. An app that exports spans to an external collector works through normal egress (an egress allow list needs the collector host:port).",
+    "interfaces": [
+      "[app.X.egress] allow = [\"collector:4317\"]"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_no_otlp_opentelemetry_export",
+      "ref": "docs/whitepaper.md:991-991",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

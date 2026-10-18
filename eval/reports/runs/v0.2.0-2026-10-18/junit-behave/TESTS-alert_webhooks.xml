@@ -1,0 +1,26 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="alert_webhooks.Outbound alert webhooks" tests="1" errors="0" failures="0" skipped="0" time="166.906515" timestamp="2026-10-18T14:06:50.582691" hostname="serval"><testcase classname="alert_webhooks.Outbound alert webhooks" name="A failed job run raises one signed webhook alert" status="passed" time="166.906515"><system-out>
+
+@scenario.begin
+
+  @req_EXT-003 @claim_alert_webhooks_outbound
+  Scenario: A failed job run raises one signed webhook alert
+    Given a healthy disposable Reliaburger cluster ... passed in 0.620s
+    And an alert receiver on the lab gateway ... passed in 87.282s
+    And every node sends alerts to that receiver with a signing secret ... passed in 36.728s
+    When I run a task array whose only task fails ... passed in 0.271s
+    Then the receiver should get a job_run_failed alert within the configured delivery time ... passed in 12.001s
+    And the alert body should carry the documented fields ... passed in 0.001s
+    And the X-Mayo-Signature-256 header should be the HMAC-SHA256 of the body ... passed in 0.003s
+    And only one job_run_failed alert should arrive for the run ... passed in 30.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-003: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

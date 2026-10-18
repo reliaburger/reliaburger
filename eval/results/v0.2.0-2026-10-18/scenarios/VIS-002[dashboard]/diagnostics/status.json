@@ -1,0 +1,57 @@
+[
+  {
+    "node": "node-01",
+    "id": "default__backend-0",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 46974,
+    "pid": 3134,
+    "status_age_ms": 107
+  },
+  {
+    "node": "node-01",
+    "id": "default__frontend-0",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 14745,
+    "pid": 3256,
+    "status_age_ms": 107
+  },
+  {
+    "node": "node-02",
+    "id": "default__backend-1",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 59483,
+    "pid": 2584,
+    "status_age_ms": 849
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-1",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 40133,
+    "pid": 2710,
+    "status_age_ms": 849
+  },
+  {
+    "node": "node-03",
+    "id": "default__frontend-2",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 17052,
+    "pid": 2587,
+    "status_age_ms": 84
+  }
+]

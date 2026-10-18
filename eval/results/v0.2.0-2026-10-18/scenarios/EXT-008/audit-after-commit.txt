@@ -1,0 +1,14 @@
+TIME (UTC)            NODE          WHO               ACTION                      TARGET                    SOURCE
+2026-10-18 12:02:42   node-01       local-bootstrap   token.created               -                         127.0.0.1:33672
+2026-10-18 12:02:49   node-01       admin             join_token.created          -                         127.0.0.1:33678
+2026-10-18 12:02:52   node-01       admin             join_token.created          -                         127.0.0.1:33978
+2026-10-18 12:03:10   node-01       admin             app.applied                 @default                  10.77.0.1:45244
+2026-10-18 12:05:43   node-01       admin             array.submitted             rbeval-fail-c21f631bccb2@default  10.77.0.1:35256
+2026-10-18 12:05:43   node-03       admin             array.submitted             rbeval-fail-c21f631bccb2@default  10.77.0.11:44308
+2026-10-18 12:06:51   node-01       admin             app.applied                 @default                  10.77.0.1:49646
+2026-10-18 12:07:51   node-01       admin             app.applied                 ctrl-202597313e89@default  10.77.0.1:34978
+2026-10-18 12:08:02   node-01       admin             app.applied                 ctrl-202597313e89@default  10.77.0.1:40676
+2026-10-18 12:08:10   node-01       admin             app.applied                 ctrl-202597313e89@default  10.77.0.1:39886
+2026-10-18 12:08:23   node-01       admin             app.deleted                 ctrl-202597313e89@default  10.77.0.1:60300
+2026-10-18 12:08:34   node-01       admin             app.applied                 otelfix@default           10.77.0.1:40660
+2026-10-18 12:09:03   node-01       admin             app.deleted                 otelfix@default           10.77.0.1:49940

@@ -1,0 +1,50 @@
+{
+  "claim": {
+    "id": "claim_rolling_deploys_health_gated_auto_rollback",
+    "axis": "operations",
+    "statement": "Applying a changed app replaces instances one at a time behind a health gate (max_surge 1, max_unavailable 0, health_timeout 60 s, drain_timeout 30 s), auto-rolls back on failure, and relish rollback restores the previous version while keeping the scale; rollouts are node-local, so a one-replica-per-node app can be briefly down everywhere.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/01_deploy-an-app.md:244-244",
+        "quote": "A new instance that doesn't turn healthy within `health_timeout` fails the"
+      },
+      {
+        "ref": "docs/manual/01_deploy-an-app.md:210-210",
+        "quote": "health_timeout = \"60s\"    # default 60s"
+      },
+      {
+        "ref": "docs/whitepaper.md:689-689",
+        "quote": "an app with one replica per node is briefly down everywhere on each redeploy"
+      }
+    ],
+    "measurable": "Deploy a version whose health check never passes; it fails after 60 s and the previous version is restored on that node; the desired spec in Raft still names the new version and the reconciler keeps retrying (admitted, RolloutFailed state planned for 0.2.1,",
+    "interfaces": [
+      "[app.X.deploy] strategy, max_surge, max_unavailable, health_timeout, drain_timeout, auto_rollback",
+      "relish deploy",
+      "relish history <app>",
+      "relish rollback <app>",
+      "relish cancel-deploy <id>"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_rolling_deploys_health_gated_auto_rollback",
+      "ref": "docs/manual/01_deploy-an-app.md:244-244",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_rolling_deploys_health_gated_auto_rollback",
+      "ref": "docs/manual/01_deploy-an-app.md:210-210",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_rolling_deploys_health_gated_auto_rollback",
+      "ref": "docs/whitepaper.md:689-689",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

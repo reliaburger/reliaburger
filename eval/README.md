@@ -89,9 +89,13 @@ Each run writes `results/<run-id>/results.json` (one record per scenario), `summ
 
 ## Known harness issues
 
-These make a row report FAIL for a reason in the harness, not the product. They stay as they were when the recorded runs ran, so no check changed after its result was seen.
+These make a row report a status for a reason in the harness, not the product. They stay as they were when the recorded run ran, so no check changed after its result was seen. [`reports/creator_review.md`](reports/creator_review.md) has the evidence for each.
 
-- VIS-002 dashboard: the check requests the printed launch link and expects 200. The link answers 303 and sets a session cookie, so the check has to follow it with that cookie.
-- EXT-002 `wtf`: the check treats any non-zero exit as a failure, but `wtf` exits 2 when it reports warnings, as documented.
-- OPS-003: each token is used as soon as `relish token create` returns. On v0.2.0 a new token is refused with 401 for about 3 seconds, so a row can fail on that delay before it reaches the role check. The docs state no bound for the delay, so no threshold was registered for it.
-
+- VIS-002 dashboard: requests the launch link and expects 200; the link answers 303 with a session cookie the check does not follow.
+- EXT-002 `wtf`: any non-zero exit counts as a failure, but `wtf` exits 2 when it reports warnings, as documented.
+- EXT-005 admission: any doc hit for "admission" or "validat" gives FAIL; it should give UNSUPPORTED.
+- EXT-004, EXT-006: the Python client uses strict X.509 verification (Python 3.13), which refuses the node certificate for lacking an Authority Key Identifier, so those requests never reach the node.
+- EXT-008: the GitOps app is committed under `apps/`, so it lands in namespace `apps` while the check looks in `default`.
+- INT-003 podinfo: the vendored manifest lost a `---` separator inside `reconciler-rbac.yaml`.
+- OPS-003: tokens are created against the preferred endpoint and used as soon as `token create` returns. On v0.2.0, `token create` on a follower returns 503 and is not forwarded, and a new token can be refused with 401 for about 3 s. The harness neither retries against the leader nor waits.
+- OPS-009: one snapshot 33 s after power-on instead of waiting out the recovery budget.

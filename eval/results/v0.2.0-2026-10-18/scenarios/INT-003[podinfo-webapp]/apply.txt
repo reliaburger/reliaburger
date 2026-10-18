@@ -1,0 +1,3 @@
+
+--- stderr ---
+error: format failed: YAML parse error: duplicate entry with key "apiVersion" at line 19 column 1

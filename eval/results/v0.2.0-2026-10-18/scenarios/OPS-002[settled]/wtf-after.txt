@@ -1,0 +1,21 @@
+Reliaburger diagnosis: rbeval (3 nodes)
+collected at unix 1792327036
+
+OK (15)
+  [alerts] no relevant alerts are firing
+  [builds] all 3 nodes run bun v0.2.0 (cc5f643), sha256 6dbda6ff6716
+  [certificates] all observed certificates are currently valid with healthy automatic rotation
+  [council] council quorum healthy (3/3)
+  [cpu-throttling] no application accumulated throttled CPU time
+  [crashloops] no applications have three timestamped restarts in 15 minutes (caveat: restart history is held in node-local, bounded, non-durable event rings)
+  [deploys] no deploy has been active for more than 15 minutes (caveat: terminal deploy history is bounded and process-local; operation targets do not yet carry image versions)
+  [disks] all observed storage domains are below 85% usage
+  [faults] no active Smoker faults
+  [namespace-isolation] every reporting node enforces namespace isolation
+  [nodes] all 3 nodes alive and answering
+  [registry] Pickle is reachable and its known layers meet the redundancy target
+  [replicas] every app runs its desired replicas
+  [services] all deployed services have a healthy backend
+  [tokens] no API token expires within 14 days, and no admin token is past 90 days
+
+Summary: 0 critical, 0 warning, 0 unknown, 15 OK

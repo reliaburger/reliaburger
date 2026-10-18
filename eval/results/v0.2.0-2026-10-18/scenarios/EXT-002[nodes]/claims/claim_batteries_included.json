@@ -1,0 +1,25 @@
+{
+  "claim": {
+    "id": "claim_batteries_included",
+    "axis": "extensibility",
+    "statement": "The built-in subsystems cover common operational needs; the seed hypothesis is that application telemetry can be exported to an external collector through a supported interface.",
+    "kind": "hypothesis",
+    "sources": [
+      {
+        "ref": "README.md:12-12",
+        "quote": "metrics, logs, GitOps, jobs and fault injection are compiled into that agent."
+      }
+    ],
+    "gap": "The repository documents no OTLP/OpenTelemetry, remote_write or log shipping (see claim_no_otlp_opentelemetry_export, claim_no_prometheus_endpoint_remote_read_or_promql, claim_no_syslog_loki_log_shipping). Documented outbound interfaces are alert webhooks, the HTTP API with --output json, Parquet export to object storage and SSE log streaming.",
+    "related": [
+      "claim_no_otlp_opentelemetry_export",
+      "claim_alert_webhooks_outbound",
+      "claim_log_and_metric_export_to_object_storage",
+      "claim_event_and_log_streaming_apis",
+      "claim_http_api_on_9117"
+    ],
+    "measurable": "An external collector on the lab network receives telemetry attributable to a fixture app; the integration is classified native, configured, workaround, source_change or unsupported.",
+    "interfaces": []
+  },
+  "citation_checks": []
+}

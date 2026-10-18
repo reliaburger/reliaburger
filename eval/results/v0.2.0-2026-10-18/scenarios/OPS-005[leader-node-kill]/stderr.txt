@@ -1,0 +1,2 @@
+Warning: No --duration specified. Fault will auto-expire in 10 minutes.
+error: API error (status 400): {"error":"fault targets the cluster leader (use --include-leader)"}

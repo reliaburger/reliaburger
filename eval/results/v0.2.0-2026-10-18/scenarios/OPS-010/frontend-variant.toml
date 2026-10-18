@@ -1,0 +1,39 @@
+# Fixture for VIS-001: two communicating services written as Reliaburger TOML.
+# frontend calls backend by service name (POST /echo is forwarded to
+# http://backend:9898/echo); the external probe goes through the ingress.
+[app.backend]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+command = ["./podinfo", "--port=9898", "--port-metrics=9797", "--level=info"]
+replicas = 2
+port = 9898
+cpu = "100m-1000m"
+memory = "32Mi-256Mi"
+
+[app.backend.health]
+path = "/readyz"
+
+[app.backend.env]
+PODINFO_UI_MESSAGE = "rbeval-backend"
+
+[app.frontend]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+command = ["./podinfo", "--port=9898", "--port-metrics=9797", "--level=info",
+           "--backend-url=http://backend:9898/echo"]
+replicas = 3
+port = 9898
+cpu = "100m-1000m"
+memory = "32Mi-256Mi"
+
+[app.frontend.health]
+path = "/readyz"
+
+[app.frontend.env]
+PODINFO_UI_MESSAGE = "rbeval-frontend-v2-284667b00cb9"
+
+[app.frontend.ingress]
+host = "fixture.rbeval.test"
+path = "/"
+
+[app.frontend.metrics]
+port = 9797
+path = "/metrics"

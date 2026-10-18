@@ -1,0 +1,51 @@
+{
+  "claim": {
+    "id": "claim_no_prometheus_endpoint_remote_read_or_promql",
+    "axis": "extensibility",
+    "statement": "The cluster's own metrics cannot be scraped or remote-read by an external Prometheus; Mayo exposes no /metrics exposition endpoint, no remote-read, no remote_write and no PromQL, only /v1/metrics JSON endpoints, relish, the dashboards and SQL.",
+    "kind": "explicit",
+    "limitation": true,
+    "sources": [
+      {
+        "ref": "docs/design/metrics-mayo.md:45-45",
+        "quote": "Mayo does not expose its data in Prometheus exposition format."
+      },
+      {
+        "ref": "docs/design/metrics-mayo.md:122-122",
+        "quote": "There is no `/v1/read` remote-read endpoint and no `/metrics` Prometheus-exposition endpoint."
+      },
+      {
+        "ref": "docs/manual/04_observability.md:177-177",
+        "quote": "There's no PromQL."
+      }
+    ],
+    "measurable": "curl -k https://NODE:9117/metrics and /v1/read are not served (no Prometheus exposition or remote-read); no remote_write sender exists in the config schema; an external Prometheus cannot federate the cluster. Admitted limitation, not a defect (roadmap lists PromQL and the full metrics architecture under Later, F06",
+    "interfaces": [
+      "GET /metrics (absent)",
+      "GET /v1/metrics* (internal JSON)",
+      "relish metrics",
+      "relish logs-search (SQL)"
+    ],
+    "gap": "rg -n -i \"otlp|remote_write|federat\" found only planned or negative statements (docs/design/metrics-mayo.md lines 44-45, 122, 501; docs/roadmap.md line 426)."
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_no_prometheus_endpoint_remote_read_or_promql",
+      "ref": "docs/design/metrics-mayo.md:45-45",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_no_prometheus_endpoint_remote_read_or_promql",
+      "ref": "docs/design/metrics-mayo.md:122-122",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_no_prometheus_endpoint_remote_read_or_promql",
+      "ref": "docs/manual/04_observability.md:177-177",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

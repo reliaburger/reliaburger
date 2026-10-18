@@ -1,0 +1,209 @@
+[
+  {
+    "ts": "2026-10-18T12:28:17.650+00:00",
+    "t_rel_s": -5.3,
+    "nodes": {
+      "node-03": "alive",
+      "node-01": "alive",
+      "node-02": "alive"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02",
+      "node-03"
+    ],
+    "unanswered": [],
+    "frontend": [
+      "node-01:default__frontend-0:running",
+      "node-03:default__frontend-1:running",
+      "node-03:default__frontend-2:running"
+    ]
+  },
+  {
+    "ts": "2026-10-18T12:28:28.535+00:00",
+    "t_rel_s": 0.7,
+    "nodes": {
+      "node-03": "alive",
+      "node-01": "alive",
+      "node-02": "alive"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02"
+    ],
+    "unanswered": [
+      [
+        "node-03",
+        "timed out after 5s"
+      ]
+    ],
+    "frontend": [
+      "node-01:default__frontend-0:running"
+    ]
+  },
+  {
+    "ts": "2026-10-18T12:28:28.849+00:00",
+    "t_rel_s": 5.9,
+    "nodes": {
+      "node-01": "alive",
+      "node-02": "alive",
+      "node-03": "dead"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02"
+    ],
+    "unanswered": [
+      [
+        "node-03",
+        "gossip reports it dead"
+      ]
+    ],
+    "frontend": [
+      "node-01:default__frontend-0:running"
+    ]
+  },
+  {
+    "ts": "2026-10-18T12:28:37.839+00:00",
+    "t_rel_s": 14.9,
+    "nodes": {
+      "node-01": "alive",
+      "node-02": "alive",
+      "node-03": "dead"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02"
+    ],
+    "unanswered": [
+      [
+        "node-03",
+        "gossip reports it dead"
+      ]
+    ],
+    "frontend": [
+      "node-01:default__frontend-0:running",
+      "node-01:default__frontend-2:preparing"
+    ]
+  },
+  {
+    "ts": "2026-10-18T12:28:40.880+00:00",
+    "t_rel_s": 17.9,
+    "nodes": {
+      "node-01": "alive",
+      "node-02": "alive",
+      "node-03": "dead"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02"
+    ],
+    "unanswered": [
+      [
+        "node-03",
+        "gossip reports it dead"
+      ]
+    ],
+    "frontend": [
+      "node-01:default__frontend-0:running",
+      "node-01:default__frontend-2:health-wait",
+      "node-02:default__frontend-1:preparing"
+    ]
+  },
+  {
+    "ts": "2026-10-18T12:28:43.888+00:00",
+    "t_rel_s": 20.9,
+    "nodes": {
+      "node-01": "alive",
+      "node-02": "alive",
+      "node-03": "dead"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02"
+    ],
+    "unanswered": [
+      [
+        "node-03",
+        "gossip reports it dead"
+      ]
+    ],
+    "frontend": [
+      "node-01:default__frontend-0:running",
+      "node-01:default__frontend-2:health-wait",
+      "node-02:default__frontend-1:health-wait"
+    ]
+  },
+  {
+    "ts": "2026-10-18T12:28:48.896+00:00",
+    "t_rel_s": 25.9,
+    "nodes": {
+      "node-01": "alive",
+      "node-02": "alive",
+      "node-03": "dead"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02"
+    ],
+    "unanswered": [
+      [
+        "node-03",
+        "gossip reports it dead"
+      ]
+    ],
+    "frontend": [
+      "node-01:default__frontend-0:running",
+      "node-01:default__frontend-2:running",
+      "node-02:default__frontend-1:health-wait"
+    ]
+  },
+  {
+    "ts": "2026-10-18T12:28:52.860+00:00",
+    "t_rel_s": 29.9,
+    "nodes": {
+      "node-01": "alive",
+      "node-02": "alive",
+      "node-03": "dead"
+    },
+    "leaders": [
+      "node-01"
+    ],
+    "voters_answering": [
+      "node-01",
+      "node-02"
+    ],
+    "unanswered": [
+      [
+        "node-03",
+        "gossip reports it dead"
+      ]
+    ],
+    "frontend": [
+      "node-01:default__frontend-0:running",
+      "node-01:default__frontend-2:running",
+      "node-02:default__frontend-1:running"
+    ]
+  }
+]

@@ -1,0 +1,39 @@
+{
+  "claim": {
+    "id": "claim_brioche_dashboard_and_tui",
+    "axis": "vision",
+    "statement": "A web dashboard (Brioche) and a terminal UI are built into the binary; relish dashboard opens a read-only browser session through the CLI's own authenticated connection.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/04_observability.md:244-244",
+        "quote": "opens a one-time link to it. It forwards read-only requests using the CLI's own"
+      },
+      {
+        "ref": "README.md:322-322",
+        "quote": "Run `relish` with no arguments for the"
+      }
+    ],
+    "measurable": "relish dashboard prints/opens a loopback URL; the page loads charts for CPU, memory, requests per second and latency; a state-changing request through it is refused; opening a node's :9117 in a browser with tokens configured asks for a token and grants a read-only session for 12 hours.",
+    "interfaces": [
+      "relish dashboard [--no-open --port]",
+      "relish (TUI)",
+      "http://NODE:9117/",
+      "port 9117"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_brioche_dashboard_and_tui",
+      "ref": "docs/manual/04_observability.md:244-244",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_brioche_dashboard_and_tui",
+      "ref": "README.md:322-322",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

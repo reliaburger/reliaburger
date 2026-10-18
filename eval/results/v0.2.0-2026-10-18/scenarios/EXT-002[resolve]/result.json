@@ -1,0 +1,88 @@
+{
+  "id": "EXT-002[resolve]",
+  "name": "relish resolve backend honours --output json -- @2.3 other read commands under the global --output flag",
+  "feature": "features/extensibility/cli_json_contract.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_cli_machine_readable_output",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/manual/13_reference.md:13-13@v0.2.0",
+    "docs/design/cli-relish.md:1947-1947@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_cli_machine_readable_output",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "req_EXT-002"
+  ],
+  "hypothesis": true,
+  "status": "FAIL",
+  "status_reason": "And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'Service:  backend\\nVIP:      127.128.131.21\\nPort:     9898\\nBackends: 2/2 healthy\\n\\n  INSTANCE             NODE            '",
+  "start_time": "2026-10-18T12:07:22.277+00:00",
+  "duration_ms": 3989,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run",
+    "command: relish --output json resolve backend"
+  ],
+  "expected": {
+    "exit_code": 0,
+    "stdout_is_json": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:07:22.608+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-03": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "exit_code": 0,
+    "stdout_bytes": 330,
+    "stdout_is_json": false,
+    "stdout_head": "Service:  backend\nVIP:      127.128.131.21\nPort:     9898\nBackends: 2/2 healthy\n\n  INSTANCE             NODE               PORT     HEALTH  \n  default__backend-0   10.167.36.2        9898     healthy "
+  },
+  "evidence_paths": [
+    "scenarios/EXT-002[resolve]/claims/claim_cli_machine_readable_output.json",
+    "scenarios/EXT-002[resolve]/claims/claim_batteries_included.json",
+    "scenarios/EXT-002[resolve]/cluster_state.json",
+    "scenarios/EXT-002[resolve]/stdout.txt",
+    "scenarios/EXT-002[resolve]/stderr.txt",
+    "scenarios/EXT-002[resolve]/diagnostics/wtf.json",
+    "scenarios/EXT-002[resolve]/diagnostics/status.json",
+    "scenarios/EXT-002[resolve]/diagnostics/council.json",
+    "scenarios/EXT-002[resolve]/diagnostics/nodes.json",
+    "scenarios/EXT-002[resolve]/diagnostics/journal-node-01.txt",
+    "scenarios/EXT-002[resolve]/diagnostics/journal-node-02.txt",
+    "scenarios/EXT-002[resolve]/diagnostics/journal-node-03.txt",
+    "scenarios/EXT-002[resolve]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "And its standard output should parse as JSON"
+}

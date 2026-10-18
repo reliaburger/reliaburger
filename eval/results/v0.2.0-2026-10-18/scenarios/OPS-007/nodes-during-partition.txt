@@ -1,0 +1,4 @@
+NODE                 ADDRESS                STATE      COUNCIL  LEADER  
+node-01              10.77.0.11:9443        alive      yes      -       
+node-03              10.77.0.13:9443        alive      yes      yes     
+node-02              10.77.0.12:9443        dead       yes      -       

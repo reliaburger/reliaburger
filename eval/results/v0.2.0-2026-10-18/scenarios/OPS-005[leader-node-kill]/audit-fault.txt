@@ -1,0 +1,9 @@
+TIME (UTC)            NODE          WHO               ACTION                      TARGET                    SOURCE
+2026-10-18 12:24:46   node-01       admin             fault.injected              frontend@default          10.77.0.1:37456
+2026-10-18 12:24:47   node-01       system            fault.expired               frontend@default          -
+2026-10-18 12:25:20   node-01       admin             fault.injected              frontend@default          10.77.0.1:38722
+2026-10-18 12:25:20   node-02       admin             fault.injected              frontend@default          10.77.0.11:52084
+2026-10-18 12:25:20   node-03       admin             fault.injected              frontend@default          10.77.0.11:34832
+2026-10-18 12:25:20   node-03       system            fault.expired               frontend@default          -
+2026-10-18 12:25:21   node-01       system            fault.expired               frontend@default          -
+2026-10-18 12:25:21   node-02       system            fault.expired               frontend@default          -

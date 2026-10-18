@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="kubernetes_migration.Application migration from Kubernetes" tests="1" errors="0" failures="0" skipped="0" time="36.866835" timestamp="2026-10-18T14:13:33.501011" hostname="serval"><testcase classname="kubernetes_migration.Application migration from Kubernetes" name="Import a baseline Kubernetes application" status="passed" time="36.866835"><system-out>
+
+@scenario.begin
+
+  @req_INT-001 @claim_k8s_apply_converts_eleven_kinds @claim_k8s_drops_reported_not_silent
+  Scenario: Import a baseline Kubernetes application
+    Given a validated fixture application defined by Kubernetes Deployment, Service, ConfigMap, and Secret manifests ... passed in 3.062s
+    And a healthy disposable Reliaburger cluster ... passed in 0.660s
+    When I import the fixture using the documented Kubernetes migration path ... passed in 33.118s
+    Then the harness should record accepted and rejected resource kinds ... passed in 0.011s
+    And every rejected resource should have its diagnostic output preserved ... passed in 0.000s
+    And the migrated application should pass the same external functional probes as the baseline ... passed in 0.016s
+    And the evidence should record every manifest change and manual migration step ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] INT-001: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

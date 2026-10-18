@@ -1,0 +1,85 @@
+Oct 18 12:11:50 node-03 bun[5054]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:11:57 node-03 systemd[1]: Stopping reliaburger.service - Reliaburger node...
+Oct 18 12:11:57 node-03 bun[5054]: bun: received shutdown signal
+Oct 18 12:11:57 node-03 bun[5054]: warning: pull-through cache failed for ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query) — falling back to a direct pull
+Oct 18 12:12:03 node-03 bun[5054]: bun: shutdown complete
+Oct 18 12:12:03 node-03 systemd[1]: reliaburger.service: Deactivated successfully.
+Oct 18 12:12:03 node-03 systemd[1]: Stopped reliaburger.service - Reliaburger node.
+Oct 18 12:12:03 node-03 systemd[1]: reliaburger.service: Consumed 34.174s CPU time.
+Oct 18 12:12:03 node-03 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:12:03 node-03 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:12:03 node-03 bun[6163]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:12:03 node-03 bun[6163]: bun: using runc runtime (root)
+Oct 18 12:12:03 node-03 bun[6163]: bun: workloads use DNS nameserver 10.77.0.13
+Oct 18 12:12:03 node-03 bun[6163]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:12:03 node-03 bun[6163]: bun: cluster mode — gossip on 10.77.0.13:9443, 1 seed(s)
+Oct 18 12:12:03 node-03 bun[6163]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:12:03 node-03 bun[6163]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:12:03 node-03 bun[6163]: bun: dns responder ready on 10.77.0.13:53
+Oct 18 12:12:03 node-03 bun[6163]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:12:03 node-03 bun[6163]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:12:03 node-03 bun[6163]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:12:03 node-03 bun[6163]: bun: pickle catalog loaded (1 manifests)
+Oct 18 12:12:03 node-03 bun[6163]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:12:03 node-03 bun[6163]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:12:03 node-03 bun[6163]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:12:03 node-03 bun[6163]: orchestrator: deploy of gitops-6f367e3a6ac8/apps failed (attempt 1), retrying in 5s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:12:06 node-03 bun[6163]: bun: agent loop turn took 501 ms in health_tick: journal write 17 ms, runtime inventory 0 ms
+Oct 18 12:13:30 node-03 bun[6163]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 16 ms, runtime inventory 0 ms
+Oct 18 12:13:40 node-03 bun[6163]: bun: agent loop turn took 501 ms in stop_wait: journal write 16 ms, runtime inventory 0 ms
+Oct 18 12:13:40 node-03 bun[6163]: bun: agent loop turn took 501 ms in stop_wait: journal write 16 ms, runtime inventory 1 ms
+Oct 18 12:13:41 node-03 bun[6163]: sesame: source identity for rbeval-shop__frontend-g1-0 did not arrive within the turn; the next tick retries
+Oct 18 12:13:41 node-03 bun[6163]: sesame: source identity for rbeval-shop__frontend-g1-0 did not arrive within the turn; the next tick retries
+Oct 18 12:13:41 node-03 bun[6163]: bun: agent loop turn took 639 ms in stop_wait: journal write 242 ms, runtime inventory 1 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 307 ms
+Oct 18 12:16:33 node-03 bun[6163]: orchestrator: deploy of loadgenerator/boutique failed (attempt 1), retrying in 5s: init container 0 failed for instance boutique__loadgenerator-0: exited with code 1: =; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Attempt 12: Pinging frontend: ...'; + wget --server-response http://; + awk '/^  HTTP/{print $2}'; + STATUSCODE=; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Failed to reach frontend after 12 attempts.'; + exit 1
+Oct 18 12:20:01 node-03 bun[6163]: orchestrator: deploy of loadgenerator/boutique failed (attempt 2), retrying in 10s: failed to initialise boutique__loadgenerator-g2-0: init container 0 failed for instance boutique__loadgenerator-g2-0: exited with code 1: =; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Attempt 12: Pinging frontend: ...'; + wget --server-response http://; + awk '/^  HTTP/{print $2}'; + STATUSCODE=; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Failed to reach frontend after 12 attempts.'; + exit 1
+Oct 18 12:22:17 node-03 bun[6163]: orchestrator: deploy of loadgenerator/boutique failed (attempt 3), retrying in 20s: failed to initialise boutique__loadgenerator-g3-0: init container 0 failed for instance boutique__loadgenerator-g3-0: exited with code 1: =; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Attempt 12: Pinging frontend: ...'; + wget --server-response http://; + awk '/^  HTTP/{print $2}'; + STATUSCODE=; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Failed to reach frontend after 12 attempts.'; + exit 1
+Oct 18 12:23:58 node-03 bun[6163]: orchestrator: retirement of adservice/boutique failed, will retry: cannot retire artifacts for boutique__adservice-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:23:58 node-03 bun[6163]: orchestrator: retirement of cartservice/boutique failed, will retry: cannot retire artifacts for boutique__cartservice-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:24:00 node-03 bun[6163]: orchestrator: retirement of checkoutservice/boutique failed, will retry: cannot retire artifacts for boutique__checkoutservice-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:24:01 node-03 bun[6163]: bun: agent loop turn took 500 ms in stop_wait: journal write 12 ms, runtime inventory 1 ms
+Oct 18 12:24:02 node-03 bun[6163]: bun: agent loop turn took 501 ms in stop_wait: journal write 11 ms, runtime inventory 1 ms
+Oct 18 12:24:02 node-03 bun[6163]: bun: agent loop turn took 268 ms in stop_wait: journal write 154 ms, runtime inventory 4 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 55 ms
+Oct 18 12:24:03 node-03 bun[6163]: bun: agent loop turn took 501 ms in stop_wait: journal write 11 ms, runtime inventory 1 ms
+Oct 18 12:24:05 node-03 bun[6163]: bun: agent loop turn took 501 ms in stop_wait: journal write 15 ms, runtime inventory 2 ms
+Oct 18 12:24:11 node-03 bun[6163]: bun: agent loop turn took 500 ms in stop_wait: journal write 13 ms, runtime inventory 1 ms
+Oct 18 12:24:11 node-03 bun[6163]: bun: agent loop turn took 304 ms in follow_up (consumer_sync/journal): journal write 22 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 282 ms
+Oct 18 12:24:13 node-03 bun[6163]: bun: agent loop turn took 500 ms in stop_wait: journal write 26 ms, runtime inventory 1 ms
+Oct 18 12:24:13 node-03 bun[6163]: bun: agent loop turn took 358 ms in follow_up (consumer_sync/journal): journal write 21 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 335 ms
+Oct 18 12:24:14 node-03 bun[6163]: bun: agent loop turn took 500 ms in stop_wait: journal write 12 ms, runtime inventory 0 ms
+Oct 18 12:24:17 node-03 bun[6163]: orchestrator: retirement of recommendationservice/boutique failed, will retry: cannot retire artifacts for boutique__recommendationservice-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:24:23 node-03 bun[6163]: orchestrator: retirement of redis-cart/boutique failed, will retry: cannot retire artifacts for boutique__redis-cart-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:24:25 node-03 bun[6163]: bun: agent loop turn took 501 ms in stop_wait: journal write 32 ms, runtime inventory 2 ms
+Oct 18 12:24:25 node-03 bun[6163]: bun: agent loop turn took 501 ms in stop_wait: journal write 20 ms, runtime inventory 2 ms
+Oct 18 12:24:26 node-03 bun[6163]: bun: agent loop turn took 500 ms in stop_wait: journal write 17 ms, runtime inventory 1 ms
+Oct 18 12:24:26 node-03 bun[6163]: bun: agent loop turn took 500 ms in stop_wait: journal write 11 ms, runtime inventory 0 ms
+Oct 18 12:24:43 node-03 bun[6163]: orchestrator: deploy of loadgenerator/boutique failed (attempt 4), retrying in 40s: failed to initialise boutique__loadgenerator-g4-0: init container 0 failed for instance boutique__loadgenerator-g4-0: exited with code 1: =; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Attempt 12: Pinging frontend: ...'; + wget --server-response http://; + awk '/^  HTTP/{print $2}'; + STATUSCODE=; + '[' -eq 200 ]; sh: 200: unknown operand; + echo 'Error: Could not reach frontend - Status code: '; + sleep 10; + echo 'Failed to reach frontend after 12 attempts.'; + exit 1
+Oct 18 12:25:20 node-03 bun[6163]: smoker: fault fault-1 expired (resume), cleaning up
+-- Boot 918d8758c433428895ca07ca8a438b1d --
+Oct 18 12:25:54 node-03 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:25:54 node-03 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:25:54 node-03 bun[733]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:25:54 node-03 bun[733]: bun: using runc runtime (root)
+Oct 18 12:25:54 node-03 bun[733]: bun: workloads use DNS nameserver 10.77.0.13
+Oct 18 12:25:54 node-03 bun[733]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:25:54 node-03 bun[733]: bun: cluster mode — gossip on 10.77.0.13:9443, 1 seed(s)
+Oct 18 12:25:55 node-03 bun[733]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:25:55 node-03 bun[733]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:25:55 node-03 bun[733]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:25:57 node-03 bun[733]: bun: dns responder ready on 10.77.0.13:53
+Oct 18 12:25:57 node-03 bun[733]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:25:57 node-03 bun[733]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:25:57 node-03 bun[733]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:25:57 node-03 bun[733]: bun: pickle catalog loaded (14 manifests)
+Oct 18 12:25:57 node-03 bun[733]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:25:57 node-03 bun[733]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:25:57 node-03 bun[733]: orchestrator: deploy of backend/default failed (attempt 1), retrying in 5s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:25:57 node-03 bun[733]: orchestrator: deploy of gitops-6f367e3a6ac8/apps failed (attempt 1), retrying in 5s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:25:58 node-03 bun[733]: orchestrator: deploy of frontend/default failed (attempt 1), retrying in 5s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:26:01 node-03 bun[733]: bun: agent loop turn took 501 ms in health_tick: journal write 9 ms, runtime inventory 2 ms
+Oct 18 12:26:03 node-03 bun[733]: bun: agent loop turn took 500 ms in health_tick: journal write 11 ms, runtime inventory 3 ms
+Oct 18 12:26:03 node-03 bun[733]: orchestrator: deploy of backend/default failed (attempt 2), retrying in 10s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:26:03 node-03 bun[733]: orchestrator: deploy of gitops-6f367e3a6ac8/apps failed (attempt 2), retrying in 10s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:26:03 node-03 bun[733]: orchestrator: deploy of frontend/default failed (attempt 2), retrying in 10s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:26:05 node-03 bun[733]: bun: agent loop turn took 501 ms in health_tick: journal write 12 ms, runtime inventory 2 ms
+Oct 18 12:26:07 node-03 bun[733]: bun: agent loop turn took 501 ms in health_tick: journal write 17 ms, runtime inventory 3 ms

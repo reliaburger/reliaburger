@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="log_export.Log export for external analysis" tests="1" errors="0" failures="1" skipped="0" time="5.489189" timestamp="2026-10-18T14:12:15.321541" hostname="serval"><testcase classname="log_export.Log export for external analysis" name="Exported Parquet logs are readable by a standard tool" status="failed" time="5.489189"><failure type="AssertionError" message="relish logs-export exit 0, 0 files:">
+
+Failing step: When I export the logs of the node running it to the workstation with relish logs-export ... failed in 0.266s
+Location: features/extensibility/log_export.feature:11
+ASSERT FAILED: relish logs-export exit 0, 0 files: 
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-007 @claim_log_and_metric_export_to_object_storage
+  Scenario: Exported Parquet logs are readable by a standard tool
+    Given a healthy disposable Reliaburger cluster ... passed in 0.638s
+    And an app printing a unique log marker ... passed in 4.585s
+    When I export the logs of the node running it to the workstation with relish logs-export ... failed in 0.266s
+    Then a standard Parquet reader on the workstation should find the marker ... skipped in 0.000s
+    And relish logs-search on the workstation should find the same marker ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-007: FAIL (When I export the logs of the node running it to the workstation with relish logs-export: AssertionError: relish logs-export exit 0, 0 files: )
+
+
+</system-err></testcase></testsuite>

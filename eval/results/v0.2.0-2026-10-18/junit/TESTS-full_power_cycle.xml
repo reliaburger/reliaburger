@@ -1,0 +1,29 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="full_power_cycle.Whole-cluster power loss" tests="1" errors="0" failures="1" skipped="0" time="48.288531" timestamp="2026-10-18T14:26:23.406473" hostname="serval"><testcase classname="full_power_cycle.Whole-cluster power loss" name="Every node loses power at once and is powered on again" status="failed" time="48.288531"><failure type="AssertionError" message="running after power cycle: {'backend': 1, 'frontend': 1}">
+
+Failing step: And the applied apps should still be defined ... failed in 0.408s
+Location: features/operations/full_power_cycle.feature:14
+ASSERT FAILED: running after power cycle: {'backend': 1, 'frontend': 1}
+</failure><system-out>
+
+@scenario.begin
+
+  @req_OPS-009 @claim_council_raft_quorum_and_self_healing @destructive
+  Scenario: Every node loses power at once and is powered on again
+    Given a healthy disposable 3-node Reliaburger cluster with sufficient spare capacity ... passed in 1.567s
+    And the native fixture application is running ... passed in 0.177s
+    When I cut the power to every node at once and power them all on again ... passed in 13.447s
+    Then the council should be healthy within the configured recovery time ... passed in 12.665s
+    And the fixture should serve on every ingress within the configured recovery time ... passed in 20.025s
+    And the applied apps should still be defined ... failed in 0.408s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-009: FAIL (And the applied apps should still be defined: AssertionError: running after power cycle: {'backend': 1, 'frontend': 1})
+
+
+</system-err></testcase></testsuite>

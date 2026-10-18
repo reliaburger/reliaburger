@@ -1,0 +1,322 @@
+{
+  "id": "VIS-001",
+  "name": "Bootstrap and serve a multi-service application",
+  "feature": "features/vision/integrated_platform_bootstrap.feature",
+  "axis": "vision",
+  "claim_ids": [
+    "claim_two_binaries_everything_inside",
+    "claim_integrated_platform"
+  ],
+  "source_refs": [
+    "README.md:10-12@v0.2.0",
+    "docs/whitepaper.md:134-134@v0.2.0",
+    "README.md:13-13@v0.2.0",
+    "README.md:13-13@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_two_binaries_everything_inside",
+    "claim_integrated_platform",
+    "smoke",
+    "fresh_lab",
+    "axis_vision",
+    "req_VIS-001"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:00:44.540+00:00",
+  "duration_ms": 174146,
+  "observations": [],
+  "expected": {
+    "app_ready_s": "<= 300",
+    "formation_after_last_start_s": "<= 180",
+    "ingress /healthz on every node": 200,
+    "frontend -> http://backend:9898/echo by name": "10/10 echoed"
+  },
+  "measured": {
+    "vm_provision_s": 23.5,
+    "vm_ssh_ready_s": {
+      "node-01": 12.1,
+      "node-02": 1.2,
+      "node-03": 1.4
+    },
+    "guest_os": {
+      "node-01": [
+        "Ubuntu 24.04.5 LTS",
+        "6.8.0-139-generic",
+        "cgroup2fs"
+      ],
+      "node-02": [
+        "Ubuntu 24.04.5 LTS",
+        "6.8.0-139-generic",
+        "cgroup2fs"
+      ],
+      "node-03": [
+        "Ubuntu 24.04.5 LTS",
+        "6.8.0-139-generic",
+        "cgroup2fs"
+      ]
+    },
+    "product": {
+      "target": "v0.2.0",
+      "version": "0.2.0",
+      "commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+      "sha256": {
+        "SHA256SUMS": "343ffd3b3406541b41e537e3d20e744059709be4fc4e673b313917085e374be9",
+        "bun-linux-x86_64": "6dbda6ff67163e0103999d9bbf7433ff055f71e5d59ef24bdada6a779e5830a4",
+        "relish-linux-x86_64": "2a37047113068b3735e226fedb14322f3be0e9ecf621d4634837aaefad31d190"
+      },
+      "docs_ref": "v0.2.0"
+    },
+    "bootstrap_timings_s": {
+      "install_s": 88.4,
+      "token_after_start_s": 0.5,
+      "procedure_s": 103.4,
+      "formation_after_last_start_s": 13.0,
+      "total_s": 115.5
+    },
+    "services_added_per_node": {
+      "node-01": {
+        "packagekit.service": "preinstalled OS package packagekit (activated during provisioning)",
+        "reliaburger.service": "product"
+      },
+      "node-02": {
+        "packagekit.service": "preinstalled OS package packagekit (activated during provisioning)",
+        "reliaburger.service": "product"
+      },
+      "node-03": {
+        "packagekit.service": "preinstalled OS package packagekit (activated during provisioning)",
+        "reliaburger.service": "product"
+      }
+    },
+    "node_versions": {
+      "node-01": [
+        "bun 0.2.0 (cc5f643)",
+        "6.8.0-139-generic",
+        "4",
+        "5925"
+      ],
+      "node-02": [
+        "bun 0.2.0 (cc5f643)",
+        "6.8.0-139-generic",
+        "4",
+        "5925"
+      ],
+      "node-03": [
+        "bun 0.2.0 (cc5f643)",
+        "6.8.0-139-generic",
+        "4",
+        "5925"
+      ]
+    },
+    "app_ready_s": 27.3,
+    "placement": {
+      "frontend": {
+        "node-01": [
+          "default__frontend-0:running"
+        ],
+        "node-02": [
+          "default__frontend-1:running"
+        ],
+        "node-03": [
+          "default__frontend-2:running"
+        ]
+      },
+      "backend": {
+        "node-01": [
+          "default__backend-0:running"
+        ],
+        "node-02": [
+          "default__backend-1:running"
+        ]
+      }
+    },
+    "health_after_bootstrap": {
+      "ts": "2026-10-18T12:03:38.308+00:00",
+      "nodes": {
+        "node-01": "alive",
+        "node-02": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "ingress_health": {
+      "10.77.0.11": {
+        "status": 200,
+        "latency_ms": 2.4,
+        "error": null
+      },
+      "10.77.0.12": {
+        "status": 200,
+        "latency_ms": 1.4,
+        "error": null
+      },
+      "10.77.0.13": {
+        "status": 200,
+        "latency_ms": 1.5,
+        "error": null
+      }
+    },
+    "echo_trials": [
+      {
+        "via": "10.77.0.11",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-4dc844317593\"\n]"
+      },
+      {
+        "via": "10.77.0.12",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-27b22d35780e\"\n]"
+      },
+      {
+        "via": "10.77.0.13",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-c1d3759ec884\"\n]"
+      },
+      {
+        "via": "10.77.0.11",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-90359de47d15\"\n]"
+      },
+      {
+        "via": "10.77.0.12",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-ce07c9a5df5a\"\n]"
+      },
+      {
+        "via": "10.77.0.13",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-9353c6c0bfea\"\n]"
+      },
+      {
+        "via": "10.77.0.11",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-3343a56f5a25\"\n]"
+      },
+      {
+        "via": "10.77.0.12",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-d655c1408a88\"\n]"
+      },
+      {
+        "via": "10.77.0.13",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-e58d78a48a91\"\n]"
+      },
+      {
+        "via": "10.77.0.11",
+        "status": 200,
+        "echoed": true,
+        "body": "[\n  \"echo-d0586f541c92\"\n]"
+      }
+    ],
+    "echo_ok": "10/10",
+    "operator_actions_count": 37,
+    "operator_actions": [
+      "\u00a71 install required packages on node-01",
+      "\u00a71 mount bpffs on node-01",
+      "\u00a72.1 download, verify and install bun and relish on node-01",
+      "\u00a72.2 create config and state directories on node-01",
+      "\u00a71 install required packages on node-02",
+      "\u00a71 mount bpffs on node-02",
+      "\u00a72.1 download, verify and install bun and relish on node-02",
+      "\u00a72.2 create config and state directories on node-02",
+      "\u00a71 install required packages on node-03",
+      "\u00a71 mount bpffs on node-03",
+      "\u00a72.1 download, verify and install bun and relish on node-03",
+      "\u00a72.2 create config and state directories on node-03",
+      "\u00a73.1 relish init on node-01",
+      "\u00a73.2 write node-01 node.toml",
+      "\u00a73.3 write node-01 systemd unit",
+      "\u00a73.3 enable and start bun on node-01",
+      "\u00a73.4 copy root CA certificate for the CLI",
+      "\u00a73.4 mint the admin token",
+      "\u00a75.2 copy root CA and admin token to the workstation",
+      "\u00a73.5 change --listen to 0.0.0.0:9117",
+      "\u00a73.5 reload and restart bun on node-01",
+      "\u00a74.1 copy master key to node-02",
+      "\u00a74.2 create single-use join token for node-02",
+      "\u00a74.3 relish join on node-02",
+      "\u00a74.3 write node-02 node.toml",
+      "\u00a74.3 write node-02 systemd unit",
+      "\u00a74.1 copy master key to node-03",
+      "\u00a74.2 create single-use join token for node-03",
+      "\u00a74.3 relish join on node-03",
+      "\u00a74.3 write node-03 node.toml",
+      "\u00a74.3 write node-03 systemd unit",
+      "\u00a74.3 enable and start bun on node-02",
+      "\u00a74.3 enable and start bun on node-03",
+      "\u00a76 relish nodes",
+      "\u00a76 relish council",
+      "\u00a76 relish status",
+      "deploy fixture with relish apply"
+    ],
+    "services_added_by_origin": {
+      "packagekit.service": "preinstalled OS package packagekit (activated during provisioning)",
+      "reliaburger.service": "product"
+    }
+  },
+  "evidence_paths": [
+    "scenarios/VIS-001/claims/claim_two_binaries_everything_inside.json",
+    "scenarios/VIS-001/claims/claim_integrated_platform.json",
+    "scenarios/VIS-001/docs/linux-servers.md",
+    "scenarios/VIS-001/cluster_state.json",
+    "scenarios/VIS-001/fixture.toml",
+    "scenarios/VIS-001/resolve-backend.txt",
+    "scenarios/VIS-001/operator_actions.json",
+    "scenarios/VIS-001/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [
+    "distro package: runc",
+    "distro package: uidmap",
+    "distro package: iptables",
+    "distro package: iproute2",
+    "distro package: btrfs-progs",
+    "distro package: nftables",
+    "distro package: curl",
+    "distro package: buildah (node-01 only, optional, for relish build)",
+    "release download: https://github.com/reliaburger/reliaburger/releases/download/v0.2.0 (bun, relish, SHA256SUMS)",
+    "container registry: ghcr.io"
+  ],
+  "limitations": [],
+  "deviations": [
+    "The master key and join tokens are streamed node-to-node through the operator workstation (ssh node-01 ... | ssh node-0N ...) instead of from node-01 over SSH; the bytes never touch the workstation's disk, as in the docs.",
+    "apt-get gets -o DPkg::Lock::Timeout=300 because a fresh cloud image runs unattended-upgrades at first boot.",
+    "The [testing] section that \u00a78.3 adds later (with a restart) is written at creation, so fault scenarios need no rolling restart.",
+    "buildah (optional in \u00a71) is installed on node-01 only.",
+    "Cluster name is `rbeval`, not `prod`; addresses are the lab's 10.77.0.0/24.",
+    "Operator CIDR is the hypervisor bridge address 10.77.0.1/32, where the harness runs.",
+    "operator_cidrs goes in every node's config, not only Node 1's as \u00a73.2 shows. With Node 1 alone the workstation reaches no other node's API, so relish cannot fail over and the survivors of a Node 1 failure cannot be observed from outside."
+  ],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

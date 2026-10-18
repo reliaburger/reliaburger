@@ -1,0 +1,76 @@
+Oct 18 12:28:30 node-01 bun[721]: scheduler: placement pass refused: admission revision changed
+-- Boot a3a346d25798472b9e2d7d25d4e799d8 --
+Oct 18 12:31:15 node-01 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:31:15 node-01 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:31:15 node-01 bun[734]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:31:15 node-01 bun[734]: bun: using runc runtime (root)
+Oct 18 12:31:15 node-01 bun[734]: bun: workloads use DNS nameserver 10.77.0.11
+Oct 18 12:31:15 node-01 bun[734]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:31:15 node-01 bun[734]: bun: cluster mode — gossip on 10.77.0.11:9443, 0 seed(s)
+Oct 18 12:31:15 node-01 bun[734]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:31:15 node-01 bun[734]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:31:15 node-01 bun[734]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:31:17 node-01 bun[734]: bun: dns responder ready on 10.77.0.11:53
+Oct 18 12:31:17 node-01 bun[734]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:31:17 node-01 bun[734]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:31:17 node-01 bun[734]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:31:17 node-01 bun[734]: bun: pickle catalog loaded (3 manifests)
+Oct 18 12:31:17 node-01 bun[734]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:31:17 node-01 bun[734]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:31:18 node-01 bun[734]: bun: agent loop turn took 500 ms in health_tick: journal write 15 ms, runtime inventory 1 ms
+Oct 18 12:31:20 node-01 bun[734]: bun: agent loop turn took 501 ms in health_tick: journal write 7 ms, runtime inventory 1 ms
+Oct 18 12:31:22 node-01 bun[734]: bun: agent loop turn took 504 ms in health_tick: journal write 20 ms, runtime inventory 1 ms
+Oct 18 12:31:24 node-01 bun[734]: bun: agent loop turn took 501 ms in health_tick: journal write 10 ms, runtime inventory 1 ms
+Oct 18 12:32:25 node-01 bun[734]: pickle: registry cleanup pending: replication failed: registry leader refused proposal: 503 Service Unavailable
+Oct 18 12:32:26 node-01 bun[734]: pickle: registry cleanup pending: replication failed: registry leader refused proposal: 503 Service Unavailable
+Oct 18 12:34:23 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 11 ms, runtime inventory 1 ms
+Oct 18 12:34:28 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 12 ms, runtime inventory 1 ms
+Oct 18 12:34:32 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 14 ms, runtime inventory 1 ms
+Oct 18 12:34:38 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 12 ms, runtime inventory 0 ms
+Oct 18 12:34:38 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 12 ms, runtime inventory 1 ms
+Oct 18 12:34:39 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 33 ms, runtime inventory 3 ms
+Oct 18 12:35:09 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:35:10 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 16 ms, runtime inventory 0 ms
+Oct 18 12:35:13 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 14 ms, runtime inventory 1 ms
+Oct 18 12:35:42 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 20 ms, runtime inventory 1 ms
+Oct 18 12:35:42 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 46 ms, runtime inventory 1 ms
+Oct 18 12:35:43 node-01 bun[734]: bun: agent loop turn took 370 ms in stop_wait: journal write 75 ms, runtime inventory 2 ms, kernel lock wait 0 ms, firewall sync 252 ms
+Oct 18 12:36:11 node-01 bun[734]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:12 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 17 ms, runtime inventory 0 ms
+Oct 18 12:36:14 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 22 ms, runtime inventory 1 ms
+Oct 18 12:36:41 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:42 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:45 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 12 ms, runtime inventory 0 ms
+Oct 18 12:36:47 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 11 ms, runtime inventory 0 ms
+Oct 18 12:37:23 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:23 node-01 bun[734]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:30 node-01 bun[734]: bun: agent loop turn took 500 ms in deploy_op (finish_retire): journal write 13 ms, runtime inventory 1 ms
+Oct 18 12:37:36 node-01 bun[734]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 16 ms, runtime inventory 1 ms
+Oct 18 12:37:43 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-g1-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:44 node-01 bun[734]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-g2-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:46 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-g1-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:47 node-01 bun[734]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-g2-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:53 node-01 bun[734]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 11 ms, runtime inventory 1 ms
+Oct 18 12:37:53 node-01 bun[734]: orchestrator: deploy of backend/default failed (attempt 1), retrying in 5s: rollout finalisation failed: cannot publish backend for default__backend: original service allocation has not retired; started replacements retained for cleanup
+Oct 18 12:37:57 node-01 bun[734]: orchestrator: deploy of frontend/default failed (attempt 1), retrying in 5s: cannot publish backend for default__frontend: original service allocation has not retired
+Oct 18 12:38:01 node-01 bun[734]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 17 ms, runtime inventory 1 ms
+Oct 18 12:38:01 node-01 bun[734]: bun: agent loop turn took 321 ms in follow_up (consumer_sync/journal): journal write 17 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 303 ms
+Oct 18 12:38:03 node-01 bun[734]: orchestrator: deploy of backend/default failed (attempt 2), retrying in 10s: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:38:08 node-01 bun[734]: orchestrator: deploy of frontend/default failed (attempt 2), retrying in 10s: cannot publish backend for default__frontend: original service allocation has not retired
+Oct 18 12:38:12 node-01 bun[734]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 16 ms, runtime inventory 1 ms
+Oct 18 12:38:15 node-01 bun[734]: bun: agent loop turn took 418 ms in follow_up (consumer_sync/journal): journal write 19 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 398 ms
+Oct 18 12:38:16 node-01 bun[734]: orchestrator: deploy of backend/default failed (attempt 3), retrying in 20s: old instance artifact retirement failed: cannot retire artifacts for default__backend-g5-0: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:38:22 node-01 bun[734]: orchestrator: deploy of frontend/default failed (attempt 3), retrying in 20s: cannot publish backend for default__frontend: original service allocation has not retired
+Oct 18 12:38:26 node-01 bun[734]: bun: agent loop turn took 500 ms in deploy_op (finish_retire): journal write 14 ms, runtime inventory 1 ms
+Oct 18 12:38:37 node-01 bun[734]: bun: agent loop turn took 434 ms in follow_up (consumer_sync/journal): journal write 29 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 405 ms
+Oct 18 12:38:38 node-01 bun[734]: orchestrator: deploy of backend/default failed (attempt 4), retrying in 40s: old instance artifact retirement failed: cannot retire artifacts for default__backend-g5-0: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:38:46 node-01 bun[734]: orchestrator: deploy of frontend/default failed (attempt 4), retrying in 40s: cannot publish backend for default__frontend: original service allocation has not retired
+Oct 18 12:38:51 node-01 bun[734]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 13 ms, runtime inventory 1 ms
+Oct 18 12:39:19 node-01 bun[734]: bun: agent loop turn took 414 ms in follow_up (consumer_sync/journal): journal write 22 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 391 ms
+Oct 18 12:39:20 node-01 bun[734]: orchestrator: deploy of backend/default failed (attempt 5), retrying in 80s: old instance artifact retirement failed: cannot retire artifacts for default__backend-g5-0: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:39:30 node-01 bun[734]: orchestrator: deploy of frontend/default failed (attempt 5), retrying in 80s: cannot publish backend for default__frontend: original service allocation has not retired
+Oct 18 12:39:32 node-01 bun[734]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 17 ms, runtime inventory 1 ms
+Oct 18 12:40:41 node-01 bun[734]: bun: agent loop turn took 413 ms in follow_up (consumer_sync/journal): journal write 20 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 392 ms
+Oct 18 12:40:42 node-01 bun[734]: orchestrator: deploy of backend/default failed (attempt 6), retrying in 160s: old instance artifact retirement failed: cannot retire artifacts for default__backend-g5-0: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:40:54 node-01 bun[734]: orchestrator: deploy of frontend/default failed (attempt 6), retrying in 160s: cannot publish backend for default__frontend: original service allocation has not retired
+Oct 18 12:40:59 node-01 bun[734]: bun: agent loop turn took 500 ms in deploy_op (finish_retire): journal write 14 ms, runtime inventory 1 ms

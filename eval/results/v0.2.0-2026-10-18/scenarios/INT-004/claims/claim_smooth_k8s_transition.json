@@ -1,0 +1,33 @@
+{
+  "claim": {
+    "id": "claim_smooth_k8s_transition",
+    "axis": "interoperability",
+    "statement": "Teams that choose to can move from Kubernetes smoothly, reusing existing manifests where supported, with what does not convert reported rather than silently lost.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/09_kubernetes.md:3-3",
+        "quote": "You don't have to rewrite your manifests to try Reliaburger."
+      }
+    ],
+    "related": [
+      "claim_k8s_apply_converts_eleven_kinds",
+      "claim_k8s_drops_reported_not_silent"
+    ],
+    "measurable": "A fixture validated on Kubernetes (Deployment, Service, ConfigMap, Secret, Ingress) imports through relish apply -f; accepted and rejected kinds are recorded; after the documented manual steps the app passes the same functional probes as on Kubernetes; the count of manifest changes and manual steps is recorded.",
+    "interfaces": [
+      "relish apply -f",
+      "relish apply --dry-run",
+      "relish import",
+      "relish export"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_smooth_k8s_transition",
+      "ref": "docs/manual/09_kubernetes.md:3-3",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

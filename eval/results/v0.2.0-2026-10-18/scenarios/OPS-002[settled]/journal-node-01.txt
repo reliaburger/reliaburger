@@ -1,0 +1,18 @@
+Oct 18 12:34:28 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 12 ms, runtime inventory 1 ms
+Oct 18 12:34:32 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 14 ms, runtime inventory 1 ms
+Oct 18 12:34:38 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 12 ms, runtime inventory 0 ms
+Oct 18 12:34:38 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 12 ms, runtime inventory 1 ms
+Oct 18 12:34:39 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 33 ms, runtime inventory 3 ms
+Oct 18 12:35:09 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:35:10 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 16 ms, runtime inventory 0 ms
+Oct 18 12:35:13 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 14 ms, runtime inventory 1 ms
+Oct 18 12:35:42 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 20 ms, runtime inventory 1 ms
+Oct 18 12:35:42 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 46 ms, runtime inventory 1 ms
+Oct 18 12:35:43 node-01 bun[734]: bun: agent loop turn took 370 ms in stop_wait: journal write 75 ms, runtime inventory 2 ms, kernel lock wait 0 ms, firewall sync 252 ms
+Oct 18 12:36:11 node-01 bun[734]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:12 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 17 ms, runtime inventory 0 ms
+Oct 18 12:36:14 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 22 ms, runtime inventory 1 ms
+Oct 18 12:36:41 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:42 node-01 bun[734]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:45 node-01 bun[734]: bun: agent loop turn took 500 ms in stop_wait: journal write 12 ms, runtime inventory 0 ms
+Oct 18 12:36:47 node-01 bun[734]: bun: agent loop turn took 501 ms in stop_wait: journal write 11 ms, runtime inventory 0 ms

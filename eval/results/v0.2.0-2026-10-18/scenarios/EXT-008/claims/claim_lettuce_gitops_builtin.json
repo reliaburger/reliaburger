@@ -1,0 +1,47 @@
+{
+  "claim": {
+    "id": "claim_lettuce_gitops_builtin",
+    "axis": "vision",
+    "statement": "The council leader polls a Git repository (every 30 s by default), reconciles apps, namespaces and permissions including deletions, undoes manual drift, and can require signed commits.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/12_operations.md:251-251",
+        "quote": "Point the config at a repository and the council leader keeps the cluster in"
+      },
+      {
+        "ref": "docs/manual/12_operations.md:293-293",
+        "quote": "a GitOps-managed app by hand and the next poll puts it back"
+      },
+      {
+        "ref": "docs/manual/12_operations.md:281-281",
+        "quote": "a commit that doesn't verify"
+      }
+    ],
+    "measurable": "Push a commit changing replicas; the cluster converges within poll_interval_secs (30). Edit a GitOps-managed app by hand; the next poll reverts it. Delete an app from the repo; it is removed. An unsigned commit is not applied when require_signed_commits = true. A git command running over 2 minutes is killed and retried. Any [job.*] declaration refuses the whole commit.",
+    "interfaces": [
+      "[gitops] repo, branch, path, poll_interval_secs, require_signed_commits, trusted_signing_keys, webhook_secret",
+      "dashboard GitOps page (no relish gitops command)"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_lettuce_gitops_builtin",
+      "ref": "docs/manual/12_operations.md:251-251",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_lettuce_gitops_builtin",
+      "ref": "docs/manual/12_operations.md:293-293",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_lettuce_gitops_builtin",
+      "ref": "docs/manual/12_operations.md:281-281",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

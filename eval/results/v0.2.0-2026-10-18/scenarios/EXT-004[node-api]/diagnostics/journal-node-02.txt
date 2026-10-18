@@ -1,0 +1,154 @@
+Oct 18 12:02:54 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:02:54 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:02:54 node-02 bun[2598]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:02:54 node-02 bun[2598]: bun: using runc runtime (root)
+Oct 18 12:02:54 node-02 bun[2598]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:02:54 node-02 bun[2598]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:02:54 node-02 bun[2598]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:02:54 node-02 bun[2598]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:02:54 node-02 bun[2598]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:02:54 node-02 bun[2598]: bun: waiting for replicated API credentials before opening 0.0.0.0:9117
+Oct 18 12:02:56 node-02 bun[2598]: report worker: snapshot collection failed or timed out, and no recent observation to re-send
+Oct 18 12:02:59 node-02 bun[2598]: council: joined a council at recovery epoch 0
+Oct 18 12:03:01 node-02 bun[2598]: report worker: snapshot collection failed or timed out, and no recent observation to re-send
+Oct 18 12:03:04 node-02 bun[2598]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:03:04 node-02 bun[2598]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:03:04 node-02 bun[2598]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:03:04 node-02 bun[2598]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:03:04 node-02 bun[2598]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:03:04 node-02 bun[2598]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:05:10 node-02 systemd[1]: Stopping reliaburger.service - Reliaburger node...
+Oct 18 12:05:10 node-02 bun[2598]: bun: received shutdown signal
+Oct 18 12:05:16 node-02 bun[2598]: bun: shutdown complete
+Oct 18 12:05:16 node-02 systemd[1]: reliaburger.service: Deactivated successfully.
+Oct 18 12:05:16 node-02 systemd[1]: Stopped reliaburger.service - Reliaburger node.
+Oct 18 12:05:16 node-02 systemd[1]: reliaburger.service: Consumed 10.448s CPU time.
+Oct 18 12:05:16 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:05:16 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:05:16 node-02 bun[3365]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:05:16 node-02 bun[3365]: bun: using runc runtime (root)
+Oct 18 12:05:16 node-02 bun[3365]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:05:16 node-02 bun[3365]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:05:16 node-02 bun[3365]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:05:16 node-02 bun[3365]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:05:16 node-02 bun[3365]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:05:17 node-02 bun[3365]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:05:17 node-02 bun[3365]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:05:17 node-02 bun[3365]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:05:17 node-02 bun[3365]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:05:17 node-02 bun[3365]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:05:17 node-02 bun[3365]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:05:17 node-02 bun[3365]: bun: alert webhooks enabled (1 destination(s), every 30s)
+Oct 18 12:05:17 node-02 bun[3365]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:05:17 node-02 bun[3365]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:05:19 node-02 bun[3365]: bun: agent loop turn took 501 ms in health_tick: journal write 14 ms, runtime inventory 0 ms
+Oct 18 12:05:21 node-02 bun[3365]: bun: agent loop turn took 501 ms in health_tick: journal write 17 ms, runtime inventory 0 ms
+Oct 18 12:05:29 node-02 bun[3365]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:05:30 node-02 bun[3365]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:05:31 node-02 bun[3365]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445: Connection refused (os error 111)
+Oct 18 12:05:31 node-02 bun[3365]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445: Connection refused (os error 111)
+Oct 18 12:05:31 node-02 bun[3365]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445: Connection refused (os error 111)
+Oct 18 12:05:31 node-02 bun[3365]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:05:32 node-02 bun[3365]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:06:32 node-02 systemd[1]: Stopping reliaburger.service - Reliaburger node...
+Oct 18 12:06:32 node-02 bun[3365]: bun: received shutdown signal
+Oct 18 12:06:38 node-02 bun[3365]: bun: shutdown complete
+Oct 18 12:06:38 node-02 systemd[1]: reliaburger.service: Deactivated successfully.
+Oct 18 12:06:38 node-02 systemd[1]: Stopped reliaburger.service - Reliaburger node.
+Oct 18 12:06:38 node-02 systemd[1]: reliaburger.service: Consumed 8.899s CPU time.
+Oct 18 12:06:38 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:06:38 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:06:38 node-02 bun[4152]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:06:38 node-02 bun[4152]: bun: using runc runtime (root)
+Oct 18 12:06:38 node-02 bun[4152]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:06:38 node-02 bun[4152]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:06:38 node-02 bun[4152]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:06:38 node-02 bun[4152]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:06:38 node-02 bun[4152]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:06:39 node-02 bun[4152]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:06:40 node-02 bun[4152]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:06:40 node-02 bun[4152]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:06:40 node-02 bun[4152]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:06:40 node-02 bun[4152]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:06:40 node-02 bun[4152]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:06:40 node-02 bun[4152]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:06:40 node-02 bun[4152]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:06:41 node-02 bun[4152]: bun: agent loop turn took 501 ms in health_tick: journal write 11 ms, runtime inventory 0 ms
+Oct 18 12:06:42 node-02 bun[4152]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:06:43 node-02 bun[4152]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:06:43 node-02 bun[4152]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:06:43 node-02 bun[4152]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:06:43 node-02 bun[4152]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:06:44 node-02 bun[4152]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:06:45 node-02 bun[4152]: bun: agent loop turn took 501 ms in health_tick: journal write 13 ms, runtime inventory 1 ms
+Oct 18 12:06:47 node-02 bun[4152]: bun: agent loop turn took 501 ms in health_tick: journal write 19 ms, runtime inventory 1 ms
+Oct 18 12:08:12 node-02 bun[4152]: orchestrator: retirement of ctrl-202597313e89/default failed, will retry: cannot retire artifacts for default__ctrl-202597313e89-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:08:17 node-02 bun[4152]: bun: agent loop turn took 500 ms in deploy_op (finish_retire): journal write 11 ms, runtime inventory 1 ms
+Oct 18 12:08:29 node-02 bun[4152]: bun: agent loop turn took 500 ms in stop_wait: journal write 17 ms, runtime inventory 0 ms
+Oct 18 12:09:09 node-02 bun[4152]: bun: agent loop turn took 500 ms in stop_wait: journal write 28 ms, runtime inventory 0 ms
+Oct 18 12:09:43 node-02 systemd[1]: Stopping reliaburger.service - Reliaburger node...
+Oct 18 12:09:43 node-02 bun[4152]: bun: received shutdown signal
+Oct 18 12:09:49 node-02 bun[4152]: bun: shutdown complete
+Oct 18 12:09:49 node-02 systemd[1]: reliaburger.service: Deactivated successfully.
+Oct 18 12:09:49 node-02 systemd[1]: Stopped reliaburger.service - Reliaburger node.
+Oct 18 12:09:49 node-02 systemd[1]: reliaburger.service: Consumed 23.571s CPU time.
+Oct 18 12:09:49 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:09:49 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:09:49 node-02 bun[5927]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:09:49 node-02 bun[5927]: bun: using runc runtime (root)
+Oct 18 12:09:49 node-02 bun[5927]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:09:49 node-02 bun[5927]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:09:49 node-02 bun[5927]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:09:49 node-02 bun[5927]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:09:49 node-02 bun[5927]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:09:50 node-02 bun[5927]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:09:50 node-02 bun[5927]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:09:50 node-02 bun[5927]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:09:50 node-02 bun[5927]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:09:50 node-02 bun[5927]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:09:50 node-02 bun[5927]: bun: gitops sync loop started
+Oct 18 12:09:50 node-02 bun[5927]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:09:50 node-02 bun[5927]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:09:50 node-02 bun[5927]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:09:51 node-02 bun[5927]: bun: agent loop turn took 501 ms in health_tick: journal write 17 ms, runtime inventory 0 ms
+Oct 18 12:09:53 node-02 bun[5927]: bun: agent loop turn took 501 ms in health_tick: journal write 11 ms, runtime inventory 0 ms
+Oct 18 12:10:00 node-02 bun[5927]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:10:01 node-02 bun[5927]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:10:02 node-02 bun[5927]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:10:03 node-02 bun[5927]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.11:9117/v1/registry/query)
+Oct 18 12:10:34 node-02 bun[5927]: bun: agent loop turn took 500 ms in stop_wait: journal write 14 ms, runtime inventory 0 ms
+Oct 18 12:10:34 node-02 bun[5927]: bun: agent loop turn took 500 ms in stop_wait: journal write 27 ms, runtime inventory 0 ms
+Oct 18 12:10:35 node-02 bun[5927]: bun: agent loop turn took 501 ms in stop_wait: journal write 25 ms, runtime inventory 0 ms
+Oct 18 12:11:50 node-02 systemd[1]: Stopping reliaburger.service - Reliaburger node...
+Oct 18 12:11:50 node-02 bun[5927]: bun: received shutdown signal
+Oct 18 12:11:54 node-02 bun[5927]: bun: shutdown complete
+Oct 18 12:11:54 node-02 systemd[1]: reliaburger.service: Deactivated successfully.
+Oct 18 12:11:54 node-02 systemd[1]: Stopped reliaburger.service - Reliaburger node.
+Oct 18 12:11:54 node-02 systemd[1]: reliaburger.service: Consumed 4min 8.444s CPU time.
+Oct 18 12:11:54 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:11:54 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:11:54 node-02 bun[6926]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:11:54 node-02 bun[6926]: bun: using runc runtime (root)
+Oct 18 12:11:54 node-02 bun[6926]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:11:54 node-02 bun[6926]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:11:54 node-02 bun[6926]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:11:54 node-02 bun[6926]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:11:54 node-02 bun[6926]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:11:55 node-02 bun[6926]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:11:55 node-02 bun[6926]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:11:55 node-02 bun[6926]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:11:55 node-02 bun[6926]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:11:55 node-02 bun[6926]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:11:55 node-02 bun[6926]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:11:55 node-02 bun[6926]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:11:56 node-02 bun[6926]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:11:56 node-02 bun[6926]: bun: agent loop turn took 501 ms in health_tick: journal write 16 ms, runtime inventory 1 ms
+Oct 18 12:11:58 node-02 bun[6926]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:11:59 node-02 bun[6926]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:11:59 node-02 bun[6926]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:11:59 node-02 bun[6926]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:11:59 node-02 bun[6926]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:12:00 node-02 bun[6926]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:12:02 node-02 bun[6926]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:12:16 node-02 bun[6926]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:12:18 node-02 bun[6926]: scheduler: placement pass refused: admission revision changed

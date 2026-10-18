@@ -1,0 +1,31 @@
+[
+  {
+    "node_id": "node-02",
+    "address": "10.77.0.12:9443",
+    "api_address": "10.77.0.12:9117",
+    "state": "alive",
+    "incarnation": 4,
+    "is_council": true,
+    "is_leader": false,
+    "labels": {}
+  },
+  {
+    "node_id": "node-03",
+    "address": "10.77.0.13:9443",
+    "api_address": "10.77.0.13:9117",
+    "state": "alive",
+    "incarnation": 4,
+    "is_council": true,
+    "is_leader": true,
+    "labels": {}
+  },
+  {
+    "node_id": "node-01",
+    "address": "10.77.0.11:9443",
+    "state": "dead",
+    "incarnation": 3,
+    "is_council": true,
+    "is_leader": false,
+    "labels": {}
+  }
+]

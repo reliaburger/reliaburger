@@ -1,0 +1,116 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="extension_points.Extension points" tests="3" errors="2" failures="1" skipped="0" time="1.793956" timestamp="2026-10-18T14:07:49.306282" hostname="serval"><testcase classname="extension_points.Extension points" name="Extend the platform with a custom resource kind in the app config -- @1.1 " status="error" time="0.581388"><error type="Unsupported" message="relish apply refuses a table it does not know: error: failed to parse TOML: TOML parse error at line 1, column 2&#10;  |&#10;1 | [widget.rbeval]&#10;  |  ^^^^^^&#10;unknown field `widget`, expected one of `app`, `job`, `namespace`, `permission`, `build`">
+
+Failing step: When I try to extend the platform with a custom resource kind in the app config ... error in 0.022s
+Location: features/extensibility/extension_points.feature:10
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/integration_steps.py", line 260, in step_extend
+    table[mechanism](context)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "features/steps/integration_steps.py", line 214, in _custom_kind
+    raise Unsupported(f"relish apply refuses a table it does not know: {r.stderr.strip()[:300]}")
+harness.core.Unsupported: relish apply refuses a table it does not know: error: failed to parse TOML: TOML parse error at line 1, column 2
+  |
+1 | [widget.rbeval]
+  |  ^^^^^^
+unknown field `widget`, expected one of `app`, `job`, `namespace`, `permission`, `build`
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_EXT-005 @claim_no_crds_operators_plugins_custom_schedulers
+  Scenario Outline: Extend the platform with a custom resource kind in the app config -- @1.1 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.559s
+    When I try to extend the platform with a custom resource kind in the app config ... error in 0.022s
+    Then the extension should work through a documented interface ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-005[custom-kind]: UNSUPPORTED (relish apply refuses a table it does not know: error: failed to parse TOML: TOML parse error at line 1, column 2
+  |
+1 | [widget.rbeval]
+  |  ^^^^^^
+unknown fie)
+
+
+</system-err></testcase><testcase classname="extension_points.Extension points" name="Extend the platform with a relish plugin executable on PATH -- @1.2 " status="error" time="0.664228"><error type="Unsupported" message="relish does not dispatch relish-&lt;name&gt; executables on PATH: error: unrecognized subcommand 'rbevalhello'&#10;&#10;Usage: relish-linux-x86_64 [OPTIONS] [COMMAND]&#10;&#10;For more information, try '--help'.">
+
+Failing step: When I try to extend the platform with a relish plugin executable on PATH ... error in 0.010s
+Location: features/extensibility/extension_points.feature:10
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/integration_steps.py", line 260, in step_extend
+    table[mechanism](context)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "features/steps/integration_steps.py", line 232, in _cli_plugin
+    raise Unsupported(f"relish does not dispatch relish-&lt;name&gt; executables on PATH: {r.stderr.strip()[:200]}")
+harness.core.Unsupported: relish does not dispatch relish-&lt;name&gt; executables on PATH: error: unrecognized subcommand 'rbevalhello'
+
+Usage: relish-linux-x86_64 [OPTIONS] [COMMAND]
+
+For more information, try '--help'.
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_EXT-005 @claim_no_crds_operators_plugins_custom_schedulers
+  Scenario Outline: Extend the platform with a relish plugin executable on PATH -- @1.2 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.655s
+    When I try to extend the platform with a relish plugin executable on PATH ... error in 0.010s
+    Then the extension should work through a documented interface ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-005[cli-plugin]: UNSUPPORTED (relish does not dispatch relish-&lt;name&gt; executables on PATH: error: unrecognized subcommand 'rbevalhello'
+
+Usage: relish-linux-x86_64 [OPTIONS] [COMMAND]
+
+For mo)
+
+
+</system-err></testcase><testcase classname="extension_points.Extension points" name="Extend the platform with an admission or validation webhook -- @1.3 " status="failed" time="0.54834"><failure type="AssertionError" message="documentation mentions admission or validation hooks but the harness has no check: {'--help': ['lint               Validate a config file without deploying'], 'docs/manual/01_deploy-an-app.md': ['&quot;acknowledge replay before another admission&quot;.']}">
+
+Failing step: When I try to extend the platform with an admission or validation webhook ... failed in 0.023s
+Location: features/extensibility/extension_points.feature:10
+ASSERT FAILED: documentation mentions admission or validation hooks but the harness has no check: {'--help': ['lint               Validate a config file without deploying'], 'docs/manual/01_deploy-an-app.md': ['"acknowledge replay before another admission".']}
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-005 @claim_no_crds_operators_plugins_custom_schedulers
+  Scenario Outline: Extend the platform with an admission or validation webhook -- @1.3 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.526s
+    When I try to extend the platform with an admission or validation webhook ... failed in 0.023s
+    Then the extension should work through a documented interface ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-005[admission]: FAIL (When I try to extend the platform with an admission or validation webhook: AssertionError: documentation mentions admission or validation hooks but the harness )
+
+
+</system-err></testcase></testsuite>

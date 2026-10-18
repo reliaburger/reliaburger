@@ -1,0 +1,3 @@
+
+Dropped (no Reliaburger equivalent):
+  - PersistentVolumeClaim/data — no Reliaburger equivalent

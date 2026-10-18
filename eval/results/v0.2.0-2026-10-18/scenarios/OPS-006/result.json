@@ -1,0 +1,124 @@
+{
+  "id": "OPS-006",
+  "name": "Writes resume after the council leader loses power",
+  "feature": "features/operations/leader_loss.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_council_raft_quorum_and_self_healing",
+    "claim_leader_election_and_learning_period_targets",
+    "claim_self_healing"
+  ],
+  "source_refs": [
+    "docs/manual/02_cluster-basics.md:6-6@v0.2.0",
+    "docs/manual/02_cluster-basics.md:98-98@v0.2.0",
+    "docs/whitepaper.md:529-529@v0.2.0",
+    "docs/whitepaper.md:106-106@v0.2.0",
+    "docs/whitepaper.md:522-522@v0.2.0",
+    "docs/manual/08_five-minute-tour.md:164-164@v0.2.0",
+    "README.md:252-253@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "axis_operations",
+    "destructive",
+    "req_OPS-006",
+    "claim_council_raft_quorum_and_self_healing",
+    "claim_leader_election_and_learning_period_targets",
+    "claim_self_healing"
+  ],
+  "hypothesis": false,
+  "status": "FAIL",
+  "status_reason": "Then a new leader should be elected within the configured election target: AssertionError: election took 11.6 s > 5 s",
+  "start_time": "2026-10-18T12:26:23.407+00:00",
+  "duration_ms": 55330,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "election_s": "<= 5"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:26:23.732+00:00",
+      "nodes": {
+        "node-03": "alive",
+        "node-01": "alive",
+        "node-02": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "node_capacity": {
+      "node-01": {
+        "available_mib": 5350,
+        "cpus": 4
+      },
+      "node-02": {
+        "available_mib": 5394,
+        "cpus": 4
+      },
+      "node-03": {
+        "available_mib": 5392,
+        "cpus": 4
+      }
+    },
+    "probe_before_fault": {
+      "count": 15,
+      "ok": 15,
+      "ratio": 1.0,
+      "longest_failure_streak": 0,
+      "p50_ms": 2.3,
+      "p99_ms": 3.3,
+      "errors": []
+    },
+    "power_off": {
+      "node": "node-02",
+      "rc": 0,
+      "ts": "2026-10-18T12:26:41.198+00:00"
+    },
+    "election_s": 11.6,
+    "new_leader": "node-01",
+    "node-02_rejoined_after_power_on_s": 11.9
+  },
+  "evidence_paths": [
+    "scenarios/OPS-006/claims/claim_council_raft_quorum_and_self_healing.json",
+    "scenarios/OPS-006/claims/claim_leader_election_and_learning_period_targets.json",
+    "scenarios/OPS-006/claims/claim_self_healing.json",
+    "scenarios/OPS-006/cluster_state.json",
+    "scenarios/OPS-006/probe.jsonl",
+    "scenarios/OPS-006/cluster_state.jsonl",
+    "scenarios/OPS-006/council-samples.json",
+    "scenarios/OPS-006/diagnostics/wtf.json",
+    "scenarios/OPS-006/diagnostics/status.json",
+    "scenarios/OPS-006/diagnostics/council.json",
+    "scenarios/OPS-006/diagnostics/nodes.json",
+    "scenarios/OPS-006/diagnostics/journal-node-01.txt",
+    "scenarios/OPS-006/diagnostics/journal-node-03.txt",
+    "scenarios/OPS-006/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [
+    "election time is sampled every 0.5 s from the workstation and includes CLI round trips"
+  ],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "Then a new leader should be elected within the configured election target"
+}

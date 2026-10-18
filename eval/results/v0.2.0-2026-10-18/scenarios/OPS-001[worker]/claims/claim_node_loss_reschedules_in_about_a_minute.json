@@ -1,0 +1,39 @@
+{
+  "claim": {
+    "id": "claim_node_loss_reschedules_in_about_a_minute",
+    "axis": "operations",
+    "statement": "After a whole machine is lost, about a minute later the cluster again runs the desired replica count on the survivors, with no operator action; the measured discharge of the silent node was 52 to 57 seconds.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/08_five-minute-tour.md:161-161",
+        "quote": "About a minute later there are three running"
+      },
+      {
+        "ref": "docs/qualification/2026-09-24-node-loss.md:83-83",
+        "quote": "the leader waits 80 s from after it served that request"
+      }
+    ],
+    "measurable": "With 3 frontends on 3 nodes, power off one node and time until three running frontends exist on the two survivors (qualification - step 12 took 24 to 27 s after a graceful VM stop that itself takes about 30 s; node-3 discharged +52 to +57 s after the old replica was deferred). The old replica shows stopped until its release completes. Consumer view lease 60 s, leader waits 80 s. Hard power loss may differ from graceful stop.",
+    "interfaces": [
+      "relish local stop node-3",
+      "relish inspect frontend",
+      "relish nodes",
+      "relish wtf"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_node_loss_reschedules_in_about_a_minute",
+      "ref": "docs/manual/08_five-minute-tour.md:161-161",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_node_loss_reschedules_in_about_a_minute",
+      "ref": "docs/qualification/2026-09-24-node-loss.md:83-83",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

@@ -1,0 +1,103 @@
+{
+  "records": [
+    {
+      "sequence": 1,
+      "timestamp": 1792324962,
+      "kind": "token",
+      "severity": "info",
+      "action": "token.created",
+      "principal": "local-bootstrap",
+      "node": "node-01",
+      "source_address": "127.0.0.1:33672",
+      "details": {
+        "role": "admin",
+        "token": "admin",
+        "token_name": "local-bootstrap"
+      },
+      "message": "API token admin created with role admin"
+    },
+    {
+      "sequence": 2,
+      "timestamp": 1792324969,
+      "kind": "token",
+      "severity": "info",
+      "action": "join_token.created",
+      "principal": "token:d2729cb2712bc3b428bcc9d4ff3825bb969d31186ac772a6ecfee2208293614a",
+      "node": "node-01",
+      "source_address": "127.0.0.1:33678",
+      "details": {
+        "node_id": "node-02",
+        "token_name": "admin",
+        "ttl_seconds": "900"
+      },
+      "message": "join token created for node node-02"
+    },
+    {
+      "sequence": 3,
+      "timestamp": 1792324972,
+      "kind": "token",
+      "severity": "info",
+      "action": "join_token.created",
+      "principal": "token:d2729cb2712bc3b428bcc9d4ff3825bb969d31186ac772a6ecfee2208293614a",
+      "node": "node-01",
+      "source_address": "127.0.0.1:33978",
+      "details": {
+        "node_id": "node-03",
+        "token_name": "admin",
+        "ttl_seconds": "900"
+      },
+      "message": "join token created for node node-03"
+    },
+    {
+      "sequence": 4,
+      "timestamp": 1792324990,
+      "kind": "operation",
+      "severity": "info",
+      "action": "app.applied",
+      "principal": "token:d2729cb2712bc3b428bcc9d4ff3825bb969d31186ac772a6ecfee2208293614a",
+      "namespace": "default",
+      "node": "node-01",
+      "source_address": "10.77.0.1:45244",
+      "details": {
+        "namespaces": "default",
+        "token_name": "admin",
+        "workloads": "backend@default,frontend@default"
+      },
+      "message": "app.applied in default by admin"
+    },
+    {
+      "sequence": 5,
+      "timestamp": 1792325143,
+      "kind": "operation",
+      "severity": "info",
+      "action": "array.submitted",
+      "principal": "token:d2729cb2712bc3b428bcc9d4ff3825bb969d31186ac772a6ecfee2208293614a",
+      "app": "rbeval-fail-c21f631bccb2",
+      "namespace": "default",
+      "node": "node-01",
+      "source_address": "10.77.0.1:35256",
+      "details": {
+        "token_name": "admin"
+      },
+      "message": "array.submitted rbeval-fail-c21f631bccb2 in default by admin"
+    },
+    {
+      "sequence": 6,
+      "timestamp": 1792325211,
+      "kind": "operation",
+      "severity": "info",
+      "action": "app.applied",
+      "principal": "token:d2729cb2712bc3b428bcc9d4ff3825bb969d31186ac772a6ecfee2208293614a",
+      "namespace": "default",
+      "node": "node-01",
+      "source_address": "10.77.0.1:49646",
+      "details": {
+        "namespaces": "default",
+        "token_name": "admin",
+        "workloads": "backend@default,frontend@default"
+      },
+      "message": "app.applied in default by admin"
+    }
+  ],
+  "warnings": []
+}

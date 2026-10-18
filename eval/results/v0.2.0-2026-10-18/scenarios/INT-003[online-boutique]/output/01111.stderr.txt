@@ -1,0 +1,92 @@
+Converted:
+  + Namespace/boutique
+  + Deployment/adservice → [app.adservice]
+  + Deployment/shippingservice → [app.shippingservice]
+  + Deployment/checkoutservice → [app.checkoutservice]
+  + Deployment/currencyservice → [app.currencyservice]
+  + Deployment/emailservice → [app.emailservice]
+  + Deployment/productcatalogservice → [app.productcatalogservice]
+  + Deployment/frontend → [app.frontend]
+  + Deployment/recommendationservice → [app.recommendationservice]
+  + Deployment/loadgenerator → [app.loadgenerator]
+  + Deployment/cartservice → [app.cartservice]
+  + Deployment/redis-cart → [app.redis-cart]
+  + Deployment/paymentservice → [app.paymentservice]
+
+Approximated (review recommended):
+  ~ Deployment/adservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/adservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/adservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/shippingservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/shippingservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/shippingservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/checkoutservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/checkoutservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/checkoutservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/currencyservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/currencyservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/currencyservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/emailservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/emailservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/emailservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Service/emailservice — port 5000 forwards to container port 8080; Reliaburger has no port mapping, so clients must connect to emailservice:8080 (ingress is unaffected)
+  ~ Deployment/productcatalogservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/productcatalogservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/productcatalogservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/frontend — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/frontend — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Service/frontend — port 80 forwards to container port 8080; Reliaburger has no port mapping, so clients must connect to frontend:8080 (ingress is unaffected)
+  ~ Deployment/recommendationservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/recommendationservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/recommendationservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/loadgenerator — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/cartservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/cartservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/cartservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/redis-cart — pod volumes are not imported; declare Reliaburger volumes manually
+  ~ Deployment/redis-cart — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/redis-cart — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/redis-cart — readinessProbe is a tcpSocket check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/paymentservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/paymentservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/paymentservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Service/frontend-external — no imported workload has this name, so nothing answers to it; an app is reachable only by its own name
+
+Dropped (no Reliaburger equivalent):
+  - ServiceAccount/adservice — no Reliaburger equivalent
+  - ServiceAccount/shippingservice — no Reliaburger equivalent
+  - ServiceAccount/checkoutservice — no Reliaburger equivalent
+  - ServiceAccount/currencyservice — no Reliaburger equivalent
+  - ServiceAccount/emailservice — no Reliaburger equivalent
+  - ServiceAccount/productcatalogservice — no Reliaburger equivalent
+  - ServiceAccount/frontend — no Reliaburger equivalent
+  - ServiceAccount/recommendationservice — no Reliaburger equivalent
+  - ServiceAccount/loadgenerator — no Reliaburger equivalent
+  - ServiceAccount/cartservice — no Reliaburger equivalent
+  - ServiceAccount/paymentservice — no Reliaburger equivalent
+
+  adservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.7 → sha256:7b26b5ea1a64... (from the registry)
+  cartservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.7 → sha256:e5310c2aa457... (from the registry)
+  checkoutservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.7 → sha256:f0e72ff7b438... (from the registry)
+  currencyservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.7 → sha256:c581681bbf9a... (from the registry)
+  emailservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.7 → sha256:1142813191b5... (from the registry)
+  frontend: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.7 → sha256:e1cbd4561d3c... (from the registry)
+  loadgenerator: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator:v0.10.7 → sha256:f86f07c0da48... (from the registry)
+  paymentservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.7 → sha256:e1ff27c553f7... (from the registry)
+  productcatalogservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.7 → sha256:ba573405e9b0... (from the registry)
+  recommendationservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.7 → sha256:69291992f551... (from the registry)
+  redis-cart: redis:alpine → sha256:3811787313eb... (from the registry)
+  shippingservice: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.7 → sha256:3984397422ef... (from the registry)
+  namespace boutique: committed to the cluster
+  app adservice: committed to the cluster
+  app cartservice: committed to the cluster
+  app checkoutservice: committed to the cluster
+  app currencyservice: committed to the cluster
+  app emailservice: committed to the cluster
+  app frontend: committed to the cluster
+  app loadgenerator: committed to the cluster
+  app paymentservice: committed to the cluster
+  app productcatalogservice: committed to the cluster
+  app recommendationservice: committed to the cluster
+  app redis-cart: committed to the cluster
+  app shippingservice: committed to the cluster

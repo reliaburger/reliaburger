@@ -1,0 +1,4 @@
+TIME (UTC)            NODE          WHO               ACTION                      TARGET                    SOURCE
+2026-10-18 12:00:04   node-03       admin             app.applied                 logprobe@default          10.77.0.1:38272
+2026-10-18 12:00:19   node-03       admin             app.deleted                 logprobe@default          10.77.0.1:33540
+2026-10-18 12:00:20   node-03       admin             array.submitted             rbeval-batch-b9cd0a4b1893@default  10.77.0.1:33648

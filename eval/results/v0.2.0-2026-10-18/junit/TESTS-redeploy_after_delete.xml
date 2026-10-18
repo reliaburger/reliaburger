@@ -1,0 +1,51 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="redeploy_after_delete.Re-applying an app after deleting it" tests="2" errors="0" failures="1" skipped="0" time="493.355974" timestamp="2026-10-18T14:46:23.906963" hostname="serval"><testcase classname="redeploy_after_delete.Re-applying an app after deleting it" name="Delete and re-apply the fixture after relish status shows no instances -- @1.1 " status="passed" time="169.738948"><system-out>
+
+@scenario.begin
+
+  @req_OPS-002 @claim_apply_converges_after_delete
+  Scenario Outline: Delete and re-apply the fixture after relish status shows no instances -- @1.1 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.655s
+    And the fixture application is running with 2 backend and 3 frontend replicas ... passed in 1.280s
+    When I delete and re-apply the fixture for the configured number of cycles, after relish status shows no instances ... passed in 163.698s
+    Then every cycle should reach the desired replicas within the configured convergence timeout ... passed in 0.000s
+    And no stopped fixture instances should remain after the last cycle ... passed in 0.053s
+    And the evidence should record each cycle's timings and the node logs ... passed in 4.053s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-002[settled]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="redeploy_after_delete.Re-applying an app after deleting it" name="Delete and re-apply the fixture immediately after relish delete returns -- @1.2 " status="failed" time="323.617026"><failure type="AssertionError" message="cycle 4 of 5 never converged; instances: ['node-01:default__backend-g3-0:running', 'node-01:default__backend-g5-0:stopped', 'node-01:default__frontend-g2-0:stopped', 'node-02:default__backend-1:running', 'node-02:default__frontend-g3-1:stopped', 'node-02:default__frontend-g4-1:stopped', 'node-03:default__frontend-2:running']">
+
+Failing step: Then every cycle should reach the desired replicas within the configured convergence timeout ... failed in 0.000s
+Location: features/operations/redeploy_after_delete.feature:12
+ASSERT FAILED: cycle 4 of 5 never converged; instances: ['node-01:default__backend-g3-0:running', 'node-01:default__backend-g5-0:stopped', 'node-01:default__frontend-g2-0:stopped', 'node-02:default__backend-1:running', 'node-02:default__frontend-g3-1:stopped', 'node-02:default__frontend-g4-1:stopped', 'node-03:default__frontend-2:running']
+</failure><system-out>
+
+@scenario.begin
+
+  @req_OPS-002 @claim_apply_converges_after_delete
+  Scenario Outline: Delete and re-apply the fixture immediately after relish delete returns -- @1.2 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.603s
+    And the fixture application is running with 2 backend and 3 frontend replicas ... passed in 0.404s
+    When I delete and re-apply the fixture for the configured number of cycles, immediately after relish delete returns ... passed in 322.610s
+    Then every cycle should reach the desired replicas within the configured convergence timeout ... failed in 0.000s
+    And no stopped fixture instances should remain after the last cycle ... skipped in 0.000s
+    And the evidence should record each cycle's timings and the node logs ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-002[immediate]: FAIL (Then every cycle should reach the desired replicas within the configured convergence timeout: AssertionError: cycle 4 of 5 never converged; instances: ['node-01)
+
+
+</system-err></testcase></testsuite>

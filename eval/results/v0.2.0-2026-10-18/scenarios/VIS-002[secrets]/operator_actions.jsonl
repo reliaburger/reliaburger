@@ -1,0 +1,36 @@
+{"ts": "2026-10-18T11:57:44.996+00:00", "kind": "command", "description": "\u00a71 install required packages on node-01", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:57:45.334+00:00", "kind": "command", "description": "\u00a71 mount bpffs on node-01", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:57:54.586+00:00", "kind": "command", "description": "\u00a72.1 download, verify and install bun and relish on node-01", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:57:54.931+00:00", "kind": "command", "description": "\u00a72.2 create config and state directories on node-01", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:12.765+00:00", "kind": "command", "description": "\u00a71 install required packages on node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:13.111+00:00", "kind": "command", "description": "\u00a71 mount bpffs on node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:21.582+00:00", "kind": "command", "description": "\u00a72.1 download, verify and install bun and relish on node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:22.211+00:00", "kind": "command", "description": "\u00a72.2 create config and state directories on node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:40.357+00:00", "kind": "command", "description": "\u00a71 install required packages on node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:40.702+00:00", "kind": "command", "description": "\u00a71 mount bpffs on node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:50.199+00:00", "kind": "command", "description": "\u00a72.1 download, verify and install bun and relish on node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:50.568+00:00", "kind": "command", "description": "\u00a72.2 create config and state directories on node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:51.638+00:00", "kind": "command", "description": "\u00a73.1 relish init on node-01", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:52.001+00:00", "kind": "command", "description": "\u00a73.2 write node-01 node.toml", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:52.359+00:00", "kind": "command", "description": "\u00a73.3 write node-01 systemd unit", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:53.123+00:00", "kind": "command", "description": "\u00a73.3 enable and start bun on node-01", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:53.477+00:00", "kind": "command", "description": "\u00a73.4 copy root CA certificate for the CLI", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:53.875+00:00", "kind": "command", "description": "\u00a73.4 mint the admin token", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:54.462+00:00", "kind": "command", "description": "\u00a75.2 copy root CA and admin token to the workstation", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:54.768+00:00", "kind": "command", "description": "\u00a73.5 change --listen to 0.0.0.0:9117", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:58:55.423+00:00", "kind": "command", "description": "\u00a73.5 reload and restart bun on node-01", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:00.328+00:00", "kind": "command", "description": "\u00a74.1 copy master key to node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:00.723+00:00", "kind": "command", "description": "\u00a74.2 create single-use join token for node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:01.189+00:00", "kind": "command", "description": "\u00a74.3 relish join on node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:01.536+00:00", "kind": "command", "description": "\u00a74.3 write node-02 node.toml", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:01.839+00:00", "kind": "command", "description": "\u00a74.3 write node-02 systemd unit", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:02.316+00:00", "kind": "command", "description": "\u00a74.1 copy master key to node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:02.754+00:00", "kind": "command", "description": "\u00a74.2 create single-use join token for node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:03.240+00:00", "kind": "command", "description": "\u00a74.3 relish join on node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:03.581+00:00", "kind": "command", "description": "\u00a74.3 write node-03 node.toml", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:03.908+00:00", "kind": "command", "description": "\u00a74.3 write node-03 systemd unit", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:04.544+00:00", "kind": "command", "description": "\u00a74.3 enable and start bun on node-02", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:05.291+00:00", "kind": "command", "description": "\u00a74.3 enable and start bun on node-03", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:16.915+00:00", "kind": "command", "description": "\u00a76 relish nodes", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:17.131+00:00", "kind": "command", "description": "\u00a76 relish council", "scenario": "VIS-002[secrets]"}
+{"ts": "2026-10-18T11:59:17.496+00:00", "kind": "command", "description": "\u00a76 relish status", "scenario": "VIS-002[secrets]"}
