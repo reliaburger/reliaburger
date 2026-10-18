@@ -210,6 +210,8 @@ def execute(root, directory, context, entry, *, tools=None, environment=None, ru
     c.require(entry['owner_command'] == w.OWNERS[entry['gate']], 'wrong Make owner command')
     c.require(entry['gate'] not in ('portable-linux', 'oci-interruptions'),
               'gate needs its dedicated owner')
+    c.require((entry.get('archive_origin') is None) == (entry.get('archive_extraction') is None),
+              "archived owner needs its job's archive extraction")
     gates.candidate_sources(root, context['commit'], run, entry['source_files'])
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=False)
