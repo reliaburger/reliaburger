@@ -914,8 +914,6 @@ cargo test --test suite logs_cross_node::          # cross-node log fan-out
 cargo test --test suite log_export::               # Parquet export + remote SQL
 ```
 
-Phase 11 adds 147 tests, bringing the total to 1595.
-
 ## What's next
 
 Phase 11 is complete. We have cluster-wide metrics via hierarchical aggregation, cross-node log queries, Parquet log export with remote search, disk pressure management, a multi-page Brioche UI with HTMX and uPlot charts, and alert webhooks with HMAC signing and retry.

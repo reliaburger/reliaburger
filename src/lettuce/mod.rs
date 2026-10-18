@@ -5,10 +5,10 @@
 /// cluster state in Raft. Changes are applied selectively — only
 /// modified resources are written.
 ///
-/// Lettuce runs on a single council member elected as the GitOps
-/// coordinator. If the coordinator fails, another council member
-/// assumes the role within seconds, inheriting the last sync state
-/// from Raft.
+/// Lettuce runs on the Raft leader, which is the GitOps coordinator
+/// (see `sync::coordinator_for_leader`). If the leader fails, the next
+/// leader's sync loop takes over, inheriting the last sync state from
+/// Raft.
 pub mod diff;
 pub mod git;
 pub mod runner;
