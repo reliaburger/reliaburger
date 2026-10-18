@@ -1889,3 +1889,150 @@ async fn a_startup_retirement_completes_within_the_budget_on_a_slow_disk() {
         .await;
     server.abort();
 }
+
+/// A deployed `default/web` that journals discovery and turns unhealthy on
+/// one failed probe, with a no-op journal write left in flight off the loop,
+/// as a consumer step leaves one when its write outlasts the turn (#890).
+async fn web_with_a_discovery_write_in_flight() -> (
+    TestAgent,
+    tempfile::TempDir,
+    InstanceId,
+    crate::onion::service_id::ServiceId,
+) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent.set_records_dir(root.path().join("records"));
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    grill.set_pid(std::process::id());
+    grill.set_container_ip("10.0.2.5".parse().unwrap());
+    grill
+        .set_network_reference(original_test_network_reference())
+        .await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = InstanceId("default__web-0".into());
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let mut health = crate::bun::health::HealthCheckConfig::from_spec(
+        config_with_health().app["web"].health.as_ref().unwrap(),
+        8080,
+    );
+    health.threshold_unhealthy = 1;
+    health.threshold_healthy = 1;
+    agent
+        .supervisor
+        .get_instance_mut(&id)
+        .unwrap()
+        .health_config = Some(health);
+    assert!(agent.service_map.resolve(&service).unwrap().backends[0].healthy);
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    let landing = agent
+        .write_discovery_inventory(&service, |_| {}, Some(tokio::time::Instant::now()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        landing,
+        crate::bun::agent::discovery_ownership::Landing::InFlight
+    ));
+    // Only the write in flight is slow: wait until it has read its stall.
+    while agent.loop_stalls.reached(LoopStall::Persist) == reached {
+        tokio::task::yield_now().await;
+    }
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    (agent, root, id, service)
+}
+
+/// The 0.2.1 candidate 5 soak: a node restarted on a busy disk, a consumer
+/// sync's journal write went on off the loop for 5.9 s, and the next health
+/// probe that changed an instance's health published it, which waited for
+/// that write inline: a 4,987 ms `deploy_op (health_probe_result)` turn
+/// (#1100). The probe now leaves publication to the next one, and a health
+/// change it couldn't publish doesn't restart the instance.
+#[tokio::test]
+async fn a_health_change_waits_for_no_discovery_write_in_flight() {
+    let (mut agent, _root, id, service) = web_with_a_discovery_write_in_flight().await;
+    let created_at = agent.supervisor.get_instance(&id).unwrap().created_at;
+    let probe = std::time::Instant::now();
+    agent
+        .handle_deploy_op(crate::bun::agent::deploy_ops::DeployOp::HealthProbeResult {
+            instance_id: id.clone(),
+            created_at,
+            status: Ok(crate::bun::health::HealthStatus::Unhealthy),
+        })
+        .await;
+    let took = probe.elapsed();
+    assert!(
+        took < TURN_BUDGET,
+        "the probe's turn took {took:?} while a journal write took {STALLED_JOURNAL_WRITE:?}"
+    );
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the probe waited for the write"
+    );
+    assert!(
+        agent.service_map.resolve(&service).unwrap().backends[0].healthy,
+        "published without journalling"
+    );
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Unhealthy);
+    assert_eq!(
+        instance.restart_count, 0,
+        "restarted before its withdrawal was published"
+    );
+
+    agent.settle_discovery_write().await;
+    let created_at = agent.supervisor.get_instance(&id).unwrap().created_at;
+    agent
+        .complete_health_probe(
+            id.clone(),
+            created_at,
+            Ok(crate::bun::health::HealthStatus::Unhealthy),
+        )
+        .await;
+    assert!(
+        !agent.service_map.resolve(&service).unwrap().backends[0].healthy,
+        "the next probe didn't publish the withdrawal"
+    );
+    assert!(
+        !agent
+            .service_map_tx
+            .borrow()
+            .resolve(&service)
+            .unwrap()
+            .backends[0]
+            .healthy,
+        "readers still see a healthy backend"
+    );
+    agent.retire_workload("web", "default").await.unwrap();
+}
+
+/// A turn that does wait for a write in flight says so in its slow-turn
+/// line, rather than reporting only its own (fast) journal write (#1100).
+#[tokio::test]
+async fn a_turn_that_waits_for_a_write_in_flight_names_the_wait() {
+    let (mut agent, _root, _id, _service) = web_with_a_discovery_write_in_flight().await;
+    let turn = agent
+        .loop_meter
+        .begin(LoopBranch::DeployOp, Some("health_probe_result"));
+    agent.settle_discovery_write().await;
+    agent.loop_meter.finish(turn);
+    let waited = agent
+        .loop_meter
+        .last_turn()
+        .unwrap()
+        .part(TurnPart::InFlightWrite)
+        .expect("the wait for the write in flight wasn't timed");
+    assert!(
+        waited >= STALLED_JOURNAL_WRITE / 2,
+        "timed {waited:?} of a {STALLED_JOURNAL_WRITE:?} write"
+    );
+    assert!(!agent.discovery_write_in_flight());
+}

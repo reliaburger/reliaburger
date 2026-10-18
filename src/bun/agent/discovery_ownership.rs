@@ -630,8 +630,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let DiscoveryOwnership::Writing(write) = &mut self.discovery_ownership else {
             return;
         };
+        let waited = std::time::Instant::now();
         // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
         let outcome = (&mut write.task).await;
+        // The write's own time was the earlier turn's; name this turn's wait
+        // for it, so a slow line adds up (#1100).
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::InFlightWrite,
+            waited.elapsed(),
+        );
         self.land_discovery_write(outcome).await;
     }
 

@@ -5291,6 +5291,71 @@ change only its own ownership, so the services and runtime holds everyone
 else reads are the same either side of one. That's what makes them safe to
 leave in flight.
 
+#### The wait moved, not the write
+
+That last paragraph had a hole in it, and the 0.2.1 soak found it. Node 2
+rolled back mid-upgrade, its Bun restarted on a disk busy with the restart,
+and the journal said:
+
+```
+21:44:47 bun: a discovery journal write took 5864 ms; the agent loop went on meanwhile
+21:44:47 bun: agent loop turn took 4987 ms in deploy_op (health_probe_result): journal write 22 ms
+```
+
+The consumer's write did go on without the loop. Then a health probe came
+back with a change, and publishing an instance's health journals discovery
+too. `update_discovery_inventory` settles a write in flight first, exactly
+as the paragraph above promised. So the probe's turn sat out the other
+write's last five seconds, and its own write took 22 ms. The line was
+honest about the part it timed, and silent about the rest.
+
+Two changes (#1100). First, the wait gets a name. `settle_discovery_write`
+times its await as a new part, `TurnPart::InFlightWrite`, so a turn that
+pays for someone else's write now says "wait for a write in flight 4965 ms"
+instead of leaving four seconds unexplained. Second, a health probe doesn't
+pay at all. Publishing health now says what it did:
+
+```rust
+pub(super) enum HealthPublication {
+    Current,
+    Published,
+    Deferred,
+}
+```
+
+`Deferred` means a write is in flight, so nothing was published and nothing
+changed. The probe's caller handles it like a refused publication:
+
+```rust
+match self.publish_instance_health(&instance_id).await {
+    Ok(HealthPublication::Current | HealthPublication::Published) => {}
+    Ok(HealthPublication::Deferred) => { /* schedule the next probe, stop */ }
+    Err(error) => { /* log, schedule the next probe, stop */ }
+}
+```
+
+The `|` inside a pattern matches either variant, so one arm covers both
+outcomes that let the probe carry on. Stopping is safe for the same reason a
+failed publication's retry is: `service_map` changes only after a
+publication succeeds, so the next probe still sees a difference and
+publishes it. And because the probe stops before the restart code, an
+instance that turned unhealthy can't be restarted until its withdrawal is
+on disk.
+
+`a_health_change_waits_for_no_discovery_write_in_flight` leaves a 1.6 s write
+in flight, delivers an unhealthy probe through `handle_deploy_op`, and checks
+that the turn stays inside the budget, the backend still reads healthy, and
+the instance hasn't restarted. Then it lands the write, and the next probe
+publishes the withdrawal. `a_turn_that_waits_for_a_write_in_flight_names_the_wait`
+checks the new part.
+
+What we still didn't do is defer every writer. A restart that has already
+started its replacement, a deploy publishing a new backend, and a stop
+retiring a service still wait for a write in flight, because each decides
+what to do next from what it wrote. Health probes were different: they run
+on every interval for every checked instance, and what they publish can
+always wait for the next one.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`
