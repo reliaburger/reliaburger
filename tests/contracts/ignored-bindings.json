@@ -1804,5 +1804,17 @@
     "function": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
     "binary": "reliaburger::placement",
     "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed",
+    "binary": "reliaburger::demos",
+    "test": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
+    "binary": "reliaburger::demos",
+    "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone"
   }
 ]

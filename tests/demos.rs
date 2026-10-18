@@ -23,9 +23,9 @@ fn run_demo(script: &str) -> String {
         "set RELIABURGER_CLUSTER_TESTS=1 (make test-cluster)"
     );
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // The demo binds six ports from its base. The lease keeps other
+    // The demo binds seven ports from its base. The lease keeps other
     // fixtures off them until the demo is done.
-    let ports = bun_process::reserve_port_block_lease(6);
+    let ports = bun_process::reserve_port_block_lease(7);
     let base = ports.base;
     let output = Command::new("bash")
         .arg(root.join("scripts/demo").join(script))
@@ -68,7 +68,7 @@ fn gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone() {
     let stdout = run_demo("gitops.sh");
     assert!(stdout.contains("GitOps removed storefront"), "{stdout}");
     assert!(
-        stdout.contains("scratch, applied by hand, survived"),
+        stdout.contains("web, applied by hand, survived every sync"),
         "{stdout}"
     );
 }

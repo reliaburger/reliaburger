@@ -64,7 +64,7 @@ class DemoScripts(unittest.TestCase):
         for name in FEATURE_DEMOS:
             with self.subTest(script=name):
                 text = (DEMO / name).read_text()
-                examples = re.findall(r'examples/[\w./-]+', text)
+                examples = re.findall(r'examples/[\w/-]+(?:\.[a-z]+)?', text)
                 self.assertTrue(examples, f'{name} names no shipped example')
                 for example in examples:
                     self.assertTrue((ROOT / example).exists(), f'{name}: {example} is missing')

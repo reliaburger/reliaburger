@@ -452,6 +452,19 @@ returns once the council has recorded the spec, and prints no operation id,
 because each node runs its own deploy later. `examples/phase-1/proc-restarts.toml`
 shows the health checker restarting an app that goes unhealthy.
 
+To watch all of this happen, run the rollout demo from a checkout. It starts a
+one-node cluster on the process runtime, applies
+`examples/phase-1/proc-rollout.toml` as v1, rolls it to v2, rolls it back, then
+applies a v3 that fails its health check and shows it rolled back and marked
+`RolloutFailed`. Every step checks what the app really serves:
+
+```sh
+scripts/demo/rollout.sh
+```
+
+`examples/phase-1/container-rollout.toml` is the same story with real
+containers and `strategy = "blue-green"`, for a cluster with runc.
+
 `relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
 `strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
 `health_timeout` that isn't a whole number of seconds, minutes or hours
@@ -551,8 +564,13 @@ lost with a worker's disk; accepted aggregate counts remain replicated.
 - Volumes (managed + host path): `examples/phase-1/container-volumes.toml`
   (volumes need a container runtime)
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
-- Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
-  `relish batch-status <ID> --wait`
+- Rolling deploys and rollback: `examples/phase-1/proc-rollout.toml`
+  (`scripts/demo/rollout.sh` runs it), `container-rollout.toml` (blue-green)
+- An encrypted secret: `examples/phase-1/container-secrets.toml`
+- A migration that gates its app: `examples/phase-8/proc-run-before.toml`
+- A host binary as an app: `examples/phase-8/proc-exec-app.toml`
+- Batch scheduling: `relish batch examples/phase-8/container-batch-jobs.toml`,
+  then `relish batch-status <ID> --wait`
   Batch jobs must be non-scheduled and have no `run_before` declarations. Use
   ordinary apply for cron schedules and jobs that gate apps in the same manifest.
 

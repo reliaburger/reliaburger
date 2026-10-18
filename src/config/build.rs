@@ -106,9 +106,14 @@ pub fn parse_pickle_destination(dest: &str) -> Result<PickleDestination, ConfigE
     Ok(PickleDestination { name, tag })
 }
 
-/// Validate that a build's destination namespace matches its declared namespace.
+/// Validate a build spec's destination and context before it's submitted.
 ///
-/// Prevents a build in namespace A from pushing to namespace B's scope.
+/// Checks that the destination is a well-formed `pickle://` reference and
+/// that an absolute context path exists. It doesn't compare the
+/// destination's namespace with `namespace`: the node does that when it runs
+/// the build (`pickle::build::check_namespace_scope`), refusing a
+/// `pickle://B/...` destination from a build in namespace A. A bare
+/// destination such as `pickle://app:v1` names no namespace and passes both.
 pub fn validate_build_namespace(build_name: &str, spec: &BuildSpec) -> Result<(), ConfigError> {
     // Destination must use pickle:// protocol
     parse_pickle_destination(&spec.destination)?;
