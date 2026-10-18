@@ -971,6 +971,27 @@ sealed by the old build and made the tests open them (chapter 4 has the details)
 paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
 `cargo audit` exception went too.
 
+One crate never showed up in `make outdated` at all. We were on `oci-distribution` 0.11,
+and upstream had renamed it `oci-client` and carried on publishing under the new name. No
+newer `oci-distribution` will ever exist, so `cargo update` saw nothing to do. A rename is
+invisible to every tool that compares version numbers; only reading the changelog, or the
+crate page, finds it
+([#1045](https://github.com/reliaburger/reliaburger/issues/1045)). Before we moved, we
+checked that `oci-client` 0.18 was a real, maintained release, because the `bincode` bump
+had just taught us that a new major version can be a tombstone.
+
+Moving wasn't only a rename. `oci-client` 0.18 sits on reqwest 0.13, which changed three
+defaults underneath us: it trusts the operating system's certificate store instead of the
+Mozilla roots we ship, it falls back to aws-lc for crypto instead of *ring*, and with its
+`http2` feature on it offers HTTP/2 in every TLS handshake. Cargo builds each crate version
+once, with the union of the features every dependant asks for (*feature unification*), so
+when `object_store` asks for `http2`, every reqwest 0.13 client in the build gets it.
+`oci-client` builds its reqwest client internally and only exposes a config struct, so we
+pinned what that struct allows (the trust roots) and installed *ring* before building it.
+The HTTP version has no setting, so registry pulls now negotiate HTTP/2 when the registry
+offers it. Chapter 1 shows the code; the test that pins the HTTP/2 offer exists so the
+difference stays a documented choice, not a surprise.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
