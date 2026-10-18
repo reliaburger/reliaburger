@@ -37,7 +37,7 @@ pub fn generate_self_signed_cert()
             .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
 
     let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+    let key_der = PrivateKeyDer::try_from(cert.signing_key.serialize_der())
         .map_err(|e| TlsError::CertGenFailed(format!("invalid key: {e}")))?;
 
     Ok((cert_der, key_der))
@@ -630,13 +630,13 @@ mod tests {
     // material crosses stdout or process arguments.
     #[test]
     fn ingress_serial_child() {
-        use rcgen::{CertificateParams, KeyPair};
+        use rcgen::KeyPair;
         let Some(directory) = std::env::var_os("RELIABURGER_SERIAL_TEST_DIRECTORY") else {
             return;
         };
         let directory = std::path::PathBuf::from(directory);
         let certificate = CertificateDer::from(std::fs::read(directory.join("ca.der")).unwrap());
-        let params = CertificateParams::from_ca_cert_der(&certificate).unwrap();
+        let params = crate::sesame::ca::issuer_params_from_der(&certificate).unwrap();
         let key =
             PrivateKeyDer::try_from(std::fs::read(directory.join("ca.key")).unwrap()).unwrap();
         let key = KeyPair::from_der_and_sign_algo(&key, &rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
