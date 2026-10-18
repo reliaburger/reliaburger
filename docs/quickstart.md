@@ -4,8 +4,13 @@ The command below installs the published, signed 0.2.0 release
 (16 October 2026) and builds a laptop cluster from it. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
 to a ready three-node cluster ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
-Intel Macs and Linux hosts haven't been measured yet, and your connection and
-what's already cached decide most of the time.
+Linux hosts haven't been measured yet, and your connection and what's already
+cached decide most of the time.
+
+It runs on macOS on Apple silicon, or on Linux (x86_64 or arm64) with QEMU and
+KVM. Intel Macs aren't supported from 0.2.2: the installer refuses one and
+suggests a Linux host, or 0.2.1, the last release built for Intel Macs
+(`curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_VERSION=v0.2.1 sh`).
 
 ## Install and boot
 
