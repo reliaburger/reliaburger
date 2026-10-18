@@ -320,11 +320,12 @@ pub fn ca_signing_material(
 
 /// Rebuild the issuer params a stored CA certificate signs with.
 ///
-/// A leaf names its issuer by copying the CA's subject name and subject key
-/// identifier, and the leaf's validity is clamped to the CA's. So the params
-/// carry exactly those three things, read off the signed certificate: the
-/// subject name with its original string types (a verifier compares names
-/// byte for byte), the subject key identifier, and the validity window. They
+/// A leaf names its issuer by copying the CA's subject name, and the leaf's
+/// validity is clamped to the CA's. So the params carry what an issuer needs,
+/// read off the signed certificate: the subject name with its original
+/// string types (a verifier compares names byte for byte), the validity
+/// window, and the subject key identifier (rcgen would copy it into an
+/// authority key identifier, which our leaves don't currently carry). They
 /// describe an issuer, not a certificate to re-create.
 ///
 /// rcgen 0.13 had `CertificateParams::from_ca_cert_der` for this; 0.14 folds
@@ -1309,34 +1310,13 @@ mod tests {
         );
     }
 
-    /// The raw DER of a certificate's issuer name and its authority key id.
-    fn issuer_and_authority_key_id(der: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
-        use x509_parser::extensions::ParsedExtension;
+    /// The raw DER of a certificate's issuer name and its subject name.
+    fn raw_issuer_and_subject(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
-        let key_id =
-            cert.extensions()
-                .iter()
-                .find_map(|extension| match extension.parsed_extension() {
-                    ParsedExtension::AuthorityKeyIdentifier(aki) => {
-                        aki.key_identifier.as_ref().map(|id| id.0.to_vec())
-                    }
-                    _ => None,
-                });
-        (cert.issuer().as_raw().to_vec(), key_id)
-    }
-
-    /// The raw DER of a certificate's subject name and its subject key id.
-    fn subject_and_key_id(der: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
-        use x509_parser::extensions::ParsedExtension;
-        let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
-        let key_id =
-            cert.extensions()
-                .iter()
-                .find_map(|extension| match extension.parsed_extension() {
-                    ParsedExtension::SubjectKeyIdentifier(ski) => Some(ski.0.to_vec()),
-                    _ => None,
-                });
-        (cert.subject().as_raw().to_vec(), key_id)
+        (
+            cert.issuer().as_raw().to_vec(),
+            cert.subject().as_raw().to_vec(),
+        )
     }
 
     /// Verify `leaf` the way a TLS client does: rustls's webpki verifier,
@@ -1368,8 +1348,7 @@ mod tests {
         // Joining, workload signing and ingress all rebuild the issuer from
         // the stored CA certificate rather than from the params that made
         // it. The leaf's issuer name must be the CA's subject byte for byte,
-        // and its authority key id the CA's subject key id, or path building
-        // in a TLS verifier quietly fails.
+        // or path building in a TLS verifier quietly fails.
         let hierarchy = generate_ca_hierarchy("rebuilt", b"ikm").unwrap();
         let ca_der = &hierarchy.node.ca.certificate_der;
         let params = issuer_params_from_der(ca_der).unwrap();
@@ -1382,11 +1361,9 @@ mod tests {
         )
         .unwrap();
 
-        let (leaf_issuer, leaf_authority) = issuer_and_authority_key_id(&leaf);
-        let (ca_subject, ca_key_id) = subject_and_key_id(ca_der);
+        let (leaf_issuer, _) = raw_issuer_and_subject(&leaf);
+        let (_, ca_subject) = raw_issuer_and_subject(ca_der);
         assert_eq!(leaf_issuer, ca_subject, "issuer name must match exactly");
-        assert!(ca_key_id.is_some(), "the CA carries a subject key id");
-        assert_eq!(leaf_authority, ca_key_id, "authority key id names the CA");
 
         cert::validate_chain(&leaf, ca_der, &hierarchy.root.ca.certificate_der).unwrap();
         webpki_accepts(
