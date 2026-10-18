@@ -485,7 +485,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.6` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.0` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -815,6 +815,18 @@ the real `curl … | sh` install against it on every host we advertise.
    ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
    website deploys from `main`, and publishes `/demo/*` from the tag the
    bootstrap installs, so merge that change after promotion, not before.
+
+   Refresh the homepage's
+   [How a release is tested](https://reliaburger.com/#release-testing)
+   section (`#release-testing` in `index.html`) to the new release: its
+   latest-release paragraph, its headline numbers with links to this
+   release's records, and the soak charts beside them. The charts are copies
+   of the final app soak's and the final job soak's `-charts/` directories in
+   `docs/website/assets/soak/`, which holds only this release's
+   ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
+   fails while the section names a version older than the installer's
+   default, the release log's newest entry isn't this release, or a chart
+   isn't a byte-for-byte copy of this release's record.
 
    Add the release's paragraph to the top of the
    [release log](release-log.md): the promotion date, how long qualifying it

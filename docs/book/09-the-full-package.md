@@ -1744,6 +1744,43 @@ five-line shell script that logs its arguments and answers `list --json` from
 a file, so they can assert exactly which VM was stopped and that a refused
 stop touched nothing.
 
+#### Why stop powers off from inside
+
+For months, `relish local stop` ran `limactl stop` and printed `stopped` for
+each node. It looked fine. Then the 0.2.1 soak stopped a whole cluster
+gracefully, started it again, and one node couldn't open its Raft store
+(#1024). The journals told the story: the previous boot ended mid-sentence,
+with no systemd shutdown lines at all, and the kernel ran ext4 recovery on the
+next boot. Every "graceful" stop had been a power cut.
+
+Lima's vz driver stops a VM by calling `RequestStop()`, the virtual
+machine's equivalent of a short press on the power button. Our Linux guests ignore it. Lima waits 30
+seconds, logs `fatal: vz timeout while waiting for stop status` and kills the
+VM. So now `Lima::power_off` asks the guest itself:
+
+```rust
+let request = self
+    .command(&["shell", name, "sudo", "systemctl", "poweroff", "--no-block"])
+    .await;
+```
+
+systemd stops `bun` (which logs `shutdown complete`), unmounts the disks and
+powers off in a few seconds. `--no-block` queues the shutdown and returns at
+once, so the SSH session closes before systemd takes the network down under
+it. Then we poll `limactl list` until the VM reads `Stopped`,
+inside a `tokio::time::timeout` of two minutes. Only if the guest shell fails,
+or the guest is still up when the timeout fires, do we fall back to
+`limactl stop`, and we say so on stderr, because a silent power cut is how we
+got here. `relish dev stop` uses the same method. The deliberate power-off
+faults in the release harness keep `limactl stop --force`: there a power cut
+is the point.
+
+The tests use another fake `limactl`. When the guest "obeys", its `shell`
+call rewrites the status file to `Stopped`; when it doesn't, the status stays
+`Running` and the test passes a 300 ms deadline, then checks that the next
+call was `stop`. A third test makes the shell fail and expects the fallback
+straight away.
+
 Numbers are the other trap. `relish fault --duration 5m` must fit the request's seconds field:
 
 ```rust

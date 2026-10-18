@@ -746,6 +746,40 @@ async fn batch_failing_job_reports_failed() {
     assert_eq!(summary["succeeded"].as_u64(), Some(0), "{summary}");
 }
 
+/// A process job whose command starts and exits non-zero is a failed
+/// attempt, not a refused launch: it's retried up to `max_attempts`, and
+/// the retries show as the run's `restart_count` (#934). The command is one
+/// every Unix host has at the same path, so macOS shards check this too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_job_that_exits_non_zero_is_retried_before_it_fails() {
+    let harness = Harness::start().await;
+
+    let jobs = jobs_from(
+        r#"
+        [job.flaky]
+        runtime = "process"
+        exec = "/bin/sh"
+        command = ["-c", "exit 1"]
+        max_attempts = 3
+    "#,
+    );
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
+    let batch_id = response["batch_id"].as_u64().unwrap();
+    let summary = harness.wait_done(batch_id, 30).await;
+    assert_eq!(summary["failed"].as_u64(), Some(1), "{summary}");
+
+    let statuses = harness.client.status().await.unwrap();
+    let run = statuses
+        .iter()
+        .find(|status| status.app_name == "flaky")
+        .unwrap_or_else(|| panic!("no status row for flaky in {statuses:?}"));
+    assert_eq!(run.state, "failed", "{run:?}");
+    assert_eq!(
+        run.restart_count, 2,
+        "three attempts are two retries: {run:?}"
+    );
+}
+
 /// An empty batch is a client error, not a mysterious empty success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_batch_is_rejected() {
