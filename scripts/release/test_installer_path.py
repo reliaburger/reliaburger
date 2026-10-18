@@ -32,7 +32,7 @@ class InstallerPathTests(unittest.TestCase):
         public = subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", str(key), "-pubout", "-outform", "DER"], check=True, capture_output=True).stdout
         assets = self.root / "assets"
         assets.mkdir()
-        for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64", "relish-macos-x86_64"):
+        for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64"):
             (assets / name).write_bytes(b"test binary: " + name.encode())
         pins = {"packages": ["runc"], "images": {"fixture": {"asset": "guest.qcow2", "source": {
             "file": "ubuntu.img", "url": "https://images.example/ubuntu.img", "sha256": "5" * 64}}}}

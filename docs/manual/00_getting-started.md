@@ -16,8 +16,10 @@ relish setup --quickstart
 Relish installs a private copy of Lima, downloads a signed Ubuntu guest image
 and signed Linux binaries, forms an mTLS cluster, deploys a sample app and
 checks it answers on <http://localhost:18080/>. Rerun the same command to
-resume if it stops. It needs macOS, or Linux with QEMU and KVM, plus about
-8 GiB of free memory and 15 GiB of disk. `--nodes 1` builds a single-node
+resume if it stops. It needs a Mac with Apple silicon, or Linux with QEMU and
+KVM, plus about 8 GiB of free memory and 15 GiB of disk. From 0.2.2 there's
+no Intel Mac build: the installer refuses one and suggests a Linux host, or
+0.2.1, the last release built for Intel Macs. `--nodes 1` builds a single-node
 cluster instead. `curl -fsSL https://reliaburger.com/install.sh | sh` installs
 the released `relish` and runs this for you.
 
@@ -42,7 +44,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.1.6.
+runc path inside Linux VMs. Apple Container isn't supported in 0.2.0.
 
 ## From source, without containers
 

@@ -25,12 +25,19 @@ requests, main and manual candidate builds:
 | `relish-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux CLI |
 | `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
 | `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
-| `relish-macos-x86_64` | macOS 15 Intel | CLI build; cold-install qualification still required |
 | `reliaburger-guest-ubuntu-24.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image |
 | `reliaburger-guest-ubuntu-24.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image |
 
 Pull requests build the guest images only when `build_guest_image.sh`,
 `guest-images.json` or the workflow changes.
+
+There's no Intel macOS build. 0.2.1 was the last release with
+`relish-macos-x86_64` (maintainer decision, 17 October 2026,
+[#1018](https://github.com/reliaburger/reliaburger/issues/1018)): nothing ever
+qualified it, Intel macOS runners are the scarcest on Actions, and the macOS
+CLI only drives Linux VMs anyway. The installer refuses an Intel Mac and
+points at a Linux host or at 0.2.1. The x86_64 guest image stays, because
+Linux x86_64 hosts use it.
 
 Native runners avoid depending on tools installed outside a cross-build
 container. Runner labels follow GitHub's
@@ -478,7 +485,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.6` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.0` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -543,7 +550,7 @@ the real `curl … | sh` install against it on every host we advertise.
    again, and one whose bytes differ stops the run without changing anything.
    A rebuilt candidate (a new attempt) gets its own tag.
 
-3. **Qualify it on every host in the matrix**: Apple silicon, Intel macOS,
+3. **Qualify it on every host in the matrix**: macOS on Apple silicon,
    Linux x86_64 and Linux arm64. From a checkout of the same `main`:
 
    ```sh
@@ -808,6 +815,18 @@ the real `curl … | sh` install against it on every host we advertise.
    ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
    website deploys from `main`, and publishes `/demo/*` from the tag the
    bootstrap installs, so merge that change after promotion, not before.
+
+   Refresh the homepage's
+   [How a release is tested](https://reliaburger.com/#release-testing)
+   section (`#release-testing` in `index.html`) to the new release: its
+   latest-release paragraph, its headline numbers with links to this
+   release's records, and the soak charts beside them. The charts are copies
+   of the final app soak's and the final job soak's `-charts/` directories in
+   `docs/website/assets/soak/`, which holds only this release's
+   ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
+   fails while the section names a version older than the installer's
+   default, the release log's newest entry isn't this release, or a chart
+   isn't a byte-for-byte copy of this release's record.
 
    Add the release's paragraph to the top of the
    [release log](release-log.md): the promotion date, how long qualifying it
