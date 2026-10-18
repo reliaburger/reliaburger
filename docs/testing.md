@@ -156,6 +156,12 @@ ignored by default and run by their own targets and CI jobs
 | Standard registry clients | docker, podman, skopeo and crane log in with an API token, verify the cluster CA, push and pull layers back through Pickle's TLS listener; a wrong token, another cluster's CA and an out-of-namespace push are refused | [`tests/suite/registry_standard_clients.rs`](../tests/suite/registry_standard_clients.rs) | `make test-standard-clients` (Linux, with the four clients and `sudo scripts/standard-clients-host.sh --provision`) |
 | Benchmarks | Gossip convergence from 5 to 1,000 nodes, one scheduling pass (`plan_pass`) over 1,000 and 10,000 nodes, in-process task-array costs, plus the data plane on a live cluster (`relish bench`) | [`benches/`](../benches), [`src/testkit/bench/`](../src/testkit/bench) | `make bench`, `make bench-large`, `make bench-task-arrays` ([which job](#benchmarks-in-ci)) |
 
+A test that runs a host command names a path every Unix host has. macOS has
+`/bin/sh`, `/bin/echo` and `/bin/sleep`, but keeps `true` and `false` only in
+`/usr/bin`, so a job naming `/bin/false` is refused there as a missing binary
+([#934](https://github.com/reliaburger/reliaburger/issues/934)). For a command
+that fails, use `/bin/sh -c "exit 1"`.
+
 The eBPF tests load the object embedded in the library under test, as Bun
 does, and never search the target directory. Worktrees can share one
 `CARGO_TARGET_DIR` without testing each other's programs.
