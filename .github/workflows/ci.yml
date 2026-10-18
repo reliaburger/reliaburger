@@ -733,8 +733,10 @@ jobs:
     # only when one is more than twice as slow as the rest, or the run's
     # median is more than twice as slow (#857). A benchmark over that limit
     # is measured once more on its own, and fails only when it's over the
-    # limit both times, so one disk stall isn't a regression (#936). The full
-    # Criterion output is kept for the trend #668 reads.
+    # limit both times, so one disk stall isn't a regression (#936). The
+    # on-disk ledger benchmark measures this runner's disk, which can stay
+    # slow for the whole job, so it's report only; its tmpfs variant is gated
+    # (#1038). The full Criterion output is kept for the trend #668 reads.
     name: task-array benchmarks
     needs: changes
     if: needs.changes.outputs.task_arrays == 'true'
@@ -756,7 +758,7 @@ jobs:
           restore-keys: task-array-bench-
       - run: make bench-task-arrays
       - name: Compare with main's baseline
-        run: python3 scripts/ci/bench_baseline.py compare --criterion target/criterion --baseline target/task-array-baseline/baseline.json --max-ratio 2 --summary "$GITHUB_STEP_SUMMARY" --remeasure 'cargo bench --bench task_arrays --'
+        run: python3 scripts/ci/bench_baseline.py compare --criterion target/criterion --baseline target/task-array-baseline/baseline.json --max-ratio 2 --summary "$GITHUB_STEP_SUMMARY" --remeasure 'cargo bench --bench task_arrays --' --report-only storage/ledger_and_index_64k
       - name: Record this run as main's baseline
         if: github.ref == 'refs/heads/main'
         run: python3 scripts/ci/bench_baseline.py save --criterion target/criterion --baseline target/task-array-baseline/baseline.json

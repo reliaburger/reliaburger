@@ -251,13 +251,41 @@ October, #936), so a benchmark over the limit gets one more chance: the step
 re-runs just those benchmarks (`--remeasure`, which appends an anchored
 Criterion filter naming them to `cargo bench --bench task_arrays --`), compares
 again, and fails a benchmark only when it's over the limit on both
-measurements. The median check isn't re-measured. The job summary shows each
-benchmark's ratio, its ratio against the rest and the runner factor (the
-median), plus both measurements of any benchmark it re-measured. The means of the 12 October runs are
-a fixture in
+measurements. The median check isn't re-measured.
+
+That didn't save `storage/ledger_and_index_64k` (#1038). Most of its time
+goes on more than 30 fsyncs, so it measures the runner's disk, and a slow disk
+can stay slow for the whole job: in the 0.2.1 merge queue for PR #992 it was
+3.20× the rest of its run and 2.93× on the re-measure. In the eight runs from
+12 to 18 October where it alone was over the limit, its ten samples ranged from about 15 ms to as much as 134 ms
+within one benchmark, where a healthy runner keeps them within a few per cent,
+and no other benchmark in those runs was above 1.11× the rest. So the compare
+step names it with `--report-only`: it's measured and shown, marked "report
+only", but never fails the run, is never re-measured, and isn't part of the
+median any other benchmark is measured against. Its twin,
+`storage/ledger_and_index_64k_tmpfs`, does the same writes in a directory on
+`/dev/shm`, where an fsync costs nothing, and is gated like everything else
+once `main` has recorded a baseline for it (until then it's listed as new).
+That still catches a ledger or index change that makes encoding, writing or
+indexing the records slower. What it can't catch is a change that adds
+fsyncs, since those cost nothing on tmpfs; that shows up only in the on-disk
+benchmark's reported ratio. The tmpfs twin runs on Linux only: on macOS
+`make bench-task-arrays` skips it with a note. A normalising disk reference in
+the same job was the other option, and the samples ruled it out: the disk's
+speed changes several-fold within one benchmark's few seconds, so a reference
+measured before or after it sees a different disk.
+
+The job summary shows each benchmark's ratio, its ratio against the rest and
+the runner factor (the median), plus both measurements of any benchmark it
+re-measured. The means of the 12 October runs are a fixture in
 [`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
 `make test-ci-scripts` checks that they pass and that a benchmark pushed to
-2.1× the rest of any of them fails. The gate matches benchmarks by name, so
+2.1× the rest of any of them fails. The eight disk-stall runs are a second
+fixture,
+[`fixtures/task-array-disk-stalls-2026-10.json`](../scripts/ci/fixtures/task-array-disk-stalls-2026-10.json):
+each fails with every benchmark gated, passes with the on-disk ledger report
+only, and still fails when any gated benchmark, the tmpfs twin included, is
+pushed to 2.1× the rest. The gate matches benchmarks by name, so
 a benchmark whose workload changes gets a new name (as
 `state/json_encode_1m_x64` did, #872): under its old name it would be
 compared with `main`'s baseline for the old workload, and a new name starts
