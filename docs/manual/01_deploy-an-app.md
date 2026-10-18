@@ -107,6 +107,20 @@ migration can read `DATABASE_URL` and a config generator can write a volume.
 The volume stays the app's: an init container doesn't take it over, so run it
 as root (most images do) or as the app's user.
 
+An `exec` or `script` app's init container that names no image runs its
+command on the host, like the app. The node's `[process_workloads]
+allowed_binaries` must name the command's first word by its full path, or the
+deploy is refused, and the scheduler only places the app where it does:
+
+```toml
+[app.worker]
+exec = "/usr/bin/python3"
+command = ["worker.py"]
+
+[[app.worker.init]]
+command = ["/bin/sh", "-c", "mkdir -p /tmp/worker"]   # /bin/sh must be allowed
+```
+
 ## Config files
 
 ```toml

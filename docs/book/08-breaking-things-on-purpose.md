@@ -1427,10 +1427,16 @@ fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
 }
 ```
 
-`host_process` is set only for an `exec` or `script` app, so anything else is
-a container. The exception is an init container of a host app that names no
-image of its own: it inherits the app's root, `HOST_ROOT`, and runs on the host
-like its app. The last expression uses `bool::then_some`, which turns `true`
+`host_process` is set for an `exec` or `script` app, and for an init container
+of one that names no image of its own: that init inherits the app's root,
+`HOST_ROOT`, and runs on the host like its app. Anything else is a container.
+The init used to be the exception, recorded with `host_process = false` and let
+through only by the `HOST_ROOT` check. The process runtime didn't mind, but the
+mixed runtime routes by `host_process` alone, so it sent the init to runc, and a
+Bun restarted from `--runtime process` to `mixed` while one was running couldn't
+adopt it (#935). Now `generate_init_oci_spec` sets the flag from the app's:
+`app.host_process && init.image.is_none()`, so the durable owner record says
+what the launch really is. The `HOST_ROOT` check stays as a second line. The last expression uses `bool::then_some`, which turns `true`
 into `Some(LaunchProblem::NoCommand)` and `false` into `None`, so a spec with
 something to run has no problem. Both new variants ride the `LaunchRefused`
 path above: the deploy fails at once with `needs a container runtime to run

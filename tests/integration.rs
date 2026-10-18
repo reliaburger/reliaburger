@@ -416,7 +416,7 @@ async fn init_container_success_allows_app_start() {
         script = "exec sleep 60"
 
         [[app.web.init]]
-        command = ["echo", "init done"]
+        command = ["/bin/sh", "-c", "echo init done"]
     "#,
     )
     .unwrap();
@@ -438,7 +438,7 @@ async fn init_container_failure_prevents_start() {
         script = "exec sleep 60"
 
         [[app.web.init]]
-        command = ["false"]
+        command = ["/bin/sh", "-c", "false"]
     "#,
     )
     .unwrap();

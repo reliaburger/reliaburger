@@ -1959,6 +1959,21 @@ pub fn host_binary(spec: &AppSpec) -> Option<&Path> {
 
 `spec.exec` is an `Option<PathBuf>`, an owned path. `as_deref()` turns that into an `Option<&Path>`, a borrowed view, without copying anything; `PathBuf` is to `Path` what `String` is to `&str`. `or_else` runs its closure only when the first option is `None`, so a `script` app falls back to the interpreter, `/bin/sh`, which is the binary a node actually runs for it. One function answers "which binary does this app need?", so the node's own refusal, placement and (from #701) app validation can't give three different answers.
 
+That answer had a hole until 0.2.2 (#935). An `exec` app's init container that names no image runs its command on the host, like its app, and nothing checked that command against the allowlist. A node would happily run `/usr/bin/migrate` as root for an app that was only allowed `/usr/bin/python3`. A second function names those binaries:
+
+```rust
+pub fn host_init_binaries(spec: &AppSpec) -> impl Iterator<Item = &Path> {
+    let host = host_binary(spec).is_some();
+    spec.init
+        .iter()
+        .filter(move |init| host && init.image.is_none())
+        .filter_map(|init| init.command.first())
+        .map(Path::new)
+}
+```
+
+`impl Iterator<Item = &Path>` says "some iterator of borrowed paths" without naming its type, which here is a chain of adapters nobody wants to spell out. It's lazy, like a Python generator: nothing runs until someone pulls from it. The `move` keyword makes the closure take its own copy of `host`, because the iterator outlives the function's local variables. `WorkloadRequirements` now carries `host_binaries`, the app's binary followed by these, and the filter wants a node that runs every one of them. The node's admission walks the same iterator, so placement and refusal still agree.
+
 The opposite constraint came in 0.2.1 (#914). A node on `--runtime process` runs host workloads only and refuses an app that names an image, so placing one there would fail after placement. Each node now reports `containers` in its capabilities, true for runc, Apple Container and the mixed runtime, and an image app needs it:
 
 ```rust

@@ -989,6 +989,19 @@ So the test workload ships *inside* the orchestrator. `bun testapp` runs a small
 HTTP server that every node already has, because every node already has `bun`.
 Version-locked by construction, no registry involved.
 
+There's one catch. Since 0.2.1 the process runtime runs no images (#914), so
+the `process-grill` profile launches `bun testapp` as an `exec` app of
+`/usr/local/bin/bun`, and that path has to be in the node's
+`[process_workloads] allowed_binaries` like any other. Shouldn't the profile
+just allowlist it itself? We looked at that in 0.2.2 (#935) and said no. The
+client can't touch a node's policy, which is the point of a policy. And Bun
+quietly allowing its own binary would let anyone who can deploy an `exec` app
+run the node agent, as root, with whatever arguments they like: a second agent,
+`bun testapp` on any port, every subcommand we add later. An operator who wants
+the catalogue on a process node adds the line and owns that choice. Without it,
+the cases fail at deploy, refused by the node or left unplaced by the
+scheduler, with a reason that points at the host binary.
+
 It's a hand-rolled TCP server rather than axum, which looks like the wrong call
 until you remember where it runs: inside a container, in its own network
 namespace, on a node under deliberate stress. It should have no opinions and no
