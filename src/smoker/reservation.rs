@@ -152,6 +152,8 @@ mod tests {
             boot_id: "boot-a".into(),
             cleanup_after_unix_ms: 100,
             request: super::super::types::FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: super::super::types::FaultType::NodeKill {
                     kill_containers: false,
                 },

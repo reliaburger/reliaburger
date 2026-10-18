@@ -101,6 +101,10 @@ pub(super) async fn fault_inject_handler(
             .clone()
             .unwrap_or_else(|| "default".to_string());
         request.namespace = Some(namespace.clone());
+        // Whether the target is an app or a job is Bun's call, from what
+        // runs, never the caller's: an app relabelled as a job would step
+        // around the replica rail (#704).
+        request.workload = crate::smoker::types::WorkloadKind::App;
         if let Err(response) = crate::sesame::auth::authorize_scoped(
             auth.as_deref(),
             &request.target_service,
@@ -372,6 +376,7 @@ pub(super) async fn check_node_fault_cluster_safety(
             .into_response());
     };
     let context = crate::smoker::types::SafetyContext {
+        workload: Default::default(),
         council_size: council_voters.len() as u32,
         council_nodes_with_active_faults: unavailable_council_nodes,
         leader_node_id,
@@ -735,14 +740,20 @@ pub(super) const FAULT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Durati
 /// An owner receiving a forwarded share (its `target_node` names the owner)
 /// repeats the same steps, so its own server policy and its own view of the
 /// replica rail decide before anything happens there.
+///
+/// A target with no app instances may be a job or task array: then every
+/// node's running attempts are the candidates, and the replica rail stands
+/// aside (#704).
 pub(super) async fn route_workload_fault(
     state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
     headers: &HeaderMap,
-    request: crate::smoker::types::FaultRequest,
+    mut request: crate::smoker::types::FaultRequest,
     self_name: &str,
 ) -> Response {
-    use crate::smoker::routing::{WorkloadInstance, plan_workload_fault, replica_evidence};
+    use crate::smoker::routing::{
+        WorkloadInstance, plan_workload_fault, replica_evidence, scope_workload_fault,
+    };
 
     if request.fault_type.acts_on_callers() {
         return route_network_fault(state, auth, headers, request, self_name).await;
@@ -768,11 +779,29 @@ pub(super) async fn route_workload_fault(
             running: status.instance.state == "running",
             node: status.node,
             instance_id: status.instance.id,
+            task_index: None,
+            kind: crate::smoker::types::WorkloadKind::App,
         })
         .collect();
+    let attempts = if instances.is_empty() {
+        cluster_attempts(state, &namespace, &request.target_service).await
+    } else {
+        Vec::new()
+    };
+    let instances = match scope_workload_fault(&mut request, instances, attempts) {
+        Ok(instances) => instances,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
     let evidence = replica_evidence(&request, &instances, &faults.0);
 
     let context = crate::smoker::types::SafetyContext {
+        workload: request.workload,
         // Workload faults only meet the replica rail; zeroed cluster fields
         // make the node rails stand aside, as they do in standalone mode.
         council_size: 0,
@@ -836,7 +865,7 @@ pub(super) async fn route_network_fault(
         None => Vec::new(),
     };
     nodes.push(self_name.to_string());
-    let sources: Vec<WorkloadInstance> = match request.fault_type.source_app() {
+    let mut sources: Vec<WorkloadInstance> = match request.fault_type.source_app() {
         Some(source) => match collect_cluster_statuses(state, FAULT_EVIDENCE_TIMEOUT).await {
             Ok((statuses, _unreachable)) => statuses
                 .into_iter()
@@ -847,12 +876,21 @@ pub(super) async fn route_network_fault(
                     running: status.instance.state == "running",
                     node: status.node,
                     instance_id: status.instance.id,
+                    task_index: None,
+                    kind: crate::smoker::types::WorkloadKind::App,
                 })
                 .collect(),
             Err(error) => return unavailable_response(error),
         },
         None => Vec::new(),
     };
+    // A source with no app instances may be a job: its running attempts
+    // make the calls, on whichever nodes run them (#704).
+    if let Some(source) = request.fault_type.source_app()
+        && sources.is_empty()
+    {
+        sources = cluster_attempts(state, &namespace, source).await;
+    }
     let plan = match plan_network_fault(&request, &nodes, &sources) {
         Ok(plan) => plan,
         Err(error) => {
@@ -864,6 +902,63 @@ pub(super) async fn route_network_fault(
         }
     };
     send_routed_faults(state, auth, headers, plan, self_name, None).await
+}
+
+/// The running attempts of `job` in `namespace` on every node, as routing
+/// candidates. A peer that doesn't answer contributes none.
+pub(super) async fn cluster_attempts(
+    state: &ApiState,
+    namespace: &str,
+    job: &str,
+) -> Vec<crate::smoker::routing::WorkloadInstance> {
+    let local = state
+        .task_arrays
+        .node
+        .as_ref()
+        .map(|node| node.attempt_statuses())
+        .unwrap_or_default();
+    let (peers, _unreachable) = fan_out_to_peers::<Vec<crate::bun::live_attempts::AttemptStatus>>(
+        state,
+        "/v1/fault/attempts",
+        FAULT_EVIDENCE_TIMEOUT,
+    )
+    .await;
+    std::iter::once((local_node_name(state), local))
+        .chain(peers)
+        .flat_map(|(node, attempts)| {
+            attempts
+                .into_iter()
+                .map(move |attempt| (node.clone(), attempt))
+        })
+        .filter(|(_, attempt)| attempt.namespace == namespace && attempt.job == job)
+        .map(|(node, attempt)| crate::smoker::routing::WorkloadInstance {
+            node,
+            instance_id: format!("{}[{}]", attempt.job, attempt.index),
+            running: true,
+            task_index: Some(attempt.index),
+            kind: crate::smoker::types::WorkloadKind::of_run(attempt.task_count),
+        })
+        .collect()
+}
+
+/// `GET /v1/fault/attempts`: the job and task-array attempts running on this
+/// node, for a peer routing a fault to them. Scoped callers see only their
+/// own namespaces' jobs.
+pub(super) async fn fault_attempts_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    let auth = auth.as_deref();
+    let mut attempts = state
+        .task_arrays
+        .node
+        .as_ref()
+        .map(|node| node.attempt_statuses())
+        .unwrap_or_default();
+    attempts.retain(|attempt| {
+        crate::sesame::auth::authorize_scoped(auth, &attempt.job, &attempt.namespace).is_ok()
+    });
+    Json(attempts).into_response()
 }
 
 /// Apply this node's share of a routed fault and forward every other share,

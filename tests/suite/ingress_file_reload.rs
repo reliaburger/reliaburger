@@ -68,7 +68,7 @@ async fn operator_files_reload_only_as_a_valid_pair_and_keep_existing_connection
     let cert_path = directory.path().join("cert.pem");
     let key_path = directory.path().join("key.pem");
     std::fs::write(&cert_path, first.cert.pem()).unwrap();
-    std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, first.signing_key.serialize_pem()).unwrap();
     let shutdown = CancellationToken::new();
     let proxy = bind_proxy(
         WrapperConfig {
@@ -94,7 +94,7 @@ async fn operator_files_reload_only_as_a_valid_pair_and_keep_existing_connection
     std::fs::write(&cert_path, second.cert.pem()).unwrap();
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(leaf(&connect(address, &roots).await), *first.cert.der());
-    std::fs::write(&key_path, second.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, second.signing_key.serialize_pem()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if leaf(&connect(address, &roots).await) == *second.cert.der() {
@@ -153,7 +153,7 @@ fn operator_pem_inputs_are_bounded_regular_files() {
     let directory = tempfile::tempdir().unwrap();
     let cert_path = directory.path().join("cert.pem");
     let key_path = directory.path().join("key.pem");
-    std::fs::write(&key_path, certificate.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, certificate.signing_key.serialize_pem()).unwrap();
     let oversized = format!("{}{}", certificate.cert.pem(), " ".repeat(1024 * 1024));
     std::fs::write(&cert_path, oversized).unwrap();
     let error = reliaburger::wrapper::tls::load_certs_from_disk(&cert_path, &key_path).unwrap_err();

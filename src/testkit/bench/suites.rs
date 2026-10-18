@@ -477,6 +477,8 @@ async fn reconstruction_time(context: &SuiteContext) -> Result<BenchMetric, Stri
         .map(|(_, client)| client.clone())
         .ok_or_else(|| "no non-leader observer is available".to_string())?;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },

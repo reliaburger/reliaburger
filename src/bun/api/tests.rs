@@ -694,6 +694,8 @@ pub(super) fn workload_fault_static_capabilities() -> crate::bun::capabilities::
 
 fn workload_fault_body(acknowledged: bool, injected_by: &str) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::DnsNxdomain,
         target_service: "web".to_string(),
         namespace: None,
@@ -711,6 +713,8 @@ fn workload_fault_body(acknowledged: bool, injected_by: &str) -> String {
 
 fn council_partition_body(acknowledged: bool) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::CouncilPartition {
             peers: vec!["node-b".to_string()],
         },
@@ -730,6 +734,8 @@ fn council_partition_body(acknowledged: bool) -> String {
 
 fn node_kill_body(acknowledged: bool) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::NodeKill {
             kill_containers: false,
         },
@@ -749,6 +755,8 @@ fn node_kill_body(acknowledged: bool) -> String {
 
 fn node_pressure_body(acknowledged: bool) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::NodePressure {
             cpu_percentage: 80,
             memory_percentage: 90,

@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from candidate import candidate_names, record_candidate, verify_candidate, verify_run, verify_uploaded_assets
+from candidate import candidate_names, record_candidate, staging_notes, verify_candidate, verify_run, verify_uploaded_assets
 from package import GUEST_METADATA
 
 
@@ -53,6 +53,12 @@ class CandidateTests(unittest.TestCase):
         self.assertIn("relish-macos-aarch64", names)
         self.assertNotIn("relish-macos-x86_64", names)
         self.assertNotIn("relish-macos-x86_64.sig", names)
+
+    def test_staging_notes_install_the_candidate_as_a_laptop_cluster(self):
+        # Without a mode the installer only explains the choices (#670).
+        notes = staging_notes(self.identity, "v0.1.0-staging-123-2", "b" * 64)
+        self.assertIn("RELIABURGER_RELEASE_BASE_URL=https://github.com/reliaburger/reliaburger/releases/download/"
+                      "v0.1.0-staging-123-2 sh -s -- --laptop\n", notes)
 
     def test_any_changed_missing_or_extra_asset_refuses_promotion(self):
         digest = self.record()

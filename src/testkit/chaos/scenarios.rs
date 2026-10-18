@@ -66,6 +66,8 @@ fn node_request(
     reason: &str,
 ) -> FaultRequest {
     FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type,
         target_service: String::new(),
         namespace: None,
@@ -658,6 +660,7 @@ mod tests {
             let target = request.target_node.clone().unwrap_or_default();
             seen.lock().await.push(format!("inject {target}"));
             axum::Json(FaultSummary {
+                task_index: None,
                 id: 7,
                 fault_type: "node-kill".to_string(),
                 target_service: String::new(),

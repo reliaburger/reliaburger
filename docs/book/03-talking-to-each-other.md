@@ -1090,7 +1090,7 @@ pub fn generate_self_signed_cert()
     let cert = rcgen::generate_simple_self_signed(
         vec!["localhost".to_string(), "127.0.0.1".to_string()]
     )?;
-    Ok((CertificateDer::from(cert.cert), PrivateKeyDer::try_from(cert.key_pair.serialize_der())?))
+    Ok((CertificateDer::from(cert.cert), PrivateKeyDer::try_from(cert.signing_key.serialize_der())?))
 }
 ```
 

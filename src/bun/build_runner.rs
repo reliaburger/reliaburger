@@ -2017,7 +2017,7 @@ mod tests {
             let authority = security.active_ca(CaRole::Workload).unwrap();
             let (issuer_key, issuer_params) =
                 ca::ca_signing_material(authority, council.wrapping_ikm().unwrap()).unwrap();
-            let issuer = issuer_params.self_signed(&issuer_key).unwrap();
+            let issuer = rcgen::Issuer::new(issuer_params, &issuer_key);
             let leaf_key = rcgen::KeyPair::from_der_and_sign_algo(
                 &rustls::pki_types::PrivateKeyDer::try_from(previous.private_key_der.clone())
                     .unwrap(),
@@ -2032,11 +2032,7 @@ mod tests {
             leaf.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
             leaf.not_after =
                 time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds_remaining);
-            previous.cert_der = leaf
-                .signed_by(&leaf_key, &issuer, &issuer_key)
-                .unwrap()
-                .der()
-                .to_vec();
+            previous.cert_der = leaf.signed_by(&leaf_key, &issuer).unwrap().der().to_vec();
             let expired_der = previous.cert_der.clone();
             cache.lock().await.insert("default".into(), previous);
             let current = get_or_provision_build_signer(

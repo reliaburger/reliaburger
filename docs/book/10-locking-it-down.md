@@ -122,12 +122,13 @@ pub fn validate_and_sign_csr(
     params.not_before = time::OffsetDateTime::from(now - CLOCK_SKEW_BACKDATE);
     params.not_after = time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME);
 
-    let signed = params.signed_by(&csr_params.public_key, &ca_cert, workload_ca_keypair)?;
+    let issuer = Issuer::from_params(workload_ca_params, workload_ca_keypair);
+    let signed = params.signed_by(&csr_params.public_key, &issuer)?;
     Ok(signed.der().to_vec())
 }
 ```
 
-The `rcgen` crate gives us the CSR round-trip. We enabled the `x509-parser` feature on rcgen to get `CertificateSigningRequestParams::from_der()`, which parses the incoming CSR and extracts the public key and SANs. The three-argument `signed_by(public_key, issuer, issuer_key)` on `CertificateParams` is the key move: it builds a certificate from *our* parameters around *their* public key. The worker still has the only copy of the private key, the council has the CA key, and neither side ever sees the other's.
+The `rcgen` crate gives us the CSR round-trip. We enabled the `x509-parser` feature on rcgen to get `CertificateSigningRequestParams::from_der()`, which parses the incoming CSR and extracts the public key and SANs. `signed_by(public_key, issuer)` on `CertificateParams` is the key move: it builds a certificate from *our* parameters around *their* public key. The `Issuer` borrows the CA's params and keypair: its name and key identifier go into the leaf, its key signs it. (rcgen 0.13 took the issuer as a certificate plus a key, so we used to self-sign a throwaway copy of the CA just to hand it over. 0.14 dropped that dance.) The worker still has the only copy of the private key, the council has the CA key, and neither side ever sees the other's.
 
 The regression test (`smuggled_csr_sans_are_not_signed`) hand-builds a hostile CSR with two extra SANs, signs it, parses the issued DER, and asserts the SAN set contains exactly one URI — the expected one.
 
@@ -1997,7 +1998,7 @@ The **EKU check** matters more than it looks. Extended Key Usage is the CA sayin
 
 We didn't reimplement any of the chain logic. `validate_chain_at` loops `verify_signature` and `check_validity_at` (the same helpers Phase 4's mTLS uses) over the chain with an injected clock, so a test can assert "this expires in exactly one hour" by moving the clock, not by sleeping.
 
-Writing the issuer-binding check flushed out a real latent bug, by the way. The build-signing path reconstructed the Workload CA's distinguished name from a `cluster_name` string the caller passed. When that string didn't match the CA's actual name, the signed leaf carried the wrong issuer DN. Nobody noticed because the old verifier never compared DNs. The fix reads the issuer straight off the real CA certificate with `CertificateParams::from_ca_cert_der` instead of trusting a string. The stronger check found the weaker code.
+Writing the issuer-binding check flushed out a real latent bug, by the way. The build-signing path reconstructed the Workload CA's distinguished name from a `cluster_name` string the caller passed. When that string didn't match the CA's actual name, the signed leaf carried the wrong issuer DN. Nobody noticed because the old verifier never compared DNs. The fix reads the issuer straight off the real CA certificate (today with `ca::issuer_params_from_der`) instead of trusting a string. The stronger check found the weaker code.
 
 ### Constraining the JWT
 

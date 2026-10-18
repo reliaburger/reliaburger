@@ -874,6 +874,8 @@ async fn kill_fault_actually_kills_the_instance() {
 
     // Kill one of the two replicas — within the safety budget (one survives).
     let fault = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Kill { count: 1 },
         target_service: "victim".into(),
         namespace: None,
@@ -932,6 +934,8 @@ async fn network_fault_without_ebpf_is_rejected_not_faked() {
         .await;
 
     let fault = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Delay {
             delay_ns: 100_000_000,
             jitter_ns: 0,

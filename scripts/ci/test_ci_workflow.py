@@ -594,6 +594,66 @@ class ArtifactDownloadTests(unittest.TestCase):
                 self.assert_downloads_retried(dict(ci, acceptance=changed))
 
 
+class ArchiveExtractionTests(unittest.TestCase):
+    """Each archive consumer extracts the test archive once (#1050).
+
+    `acceptance` has four owners and `cluster` one, and each owner used to
+    extract the 2.9 GB archive twice, for its discovery and for its run. Now
+    one step per job extracts it, and every owner names that step's receipt
+    digest, so its evidence is bound to the archive the step checked.
+    """
+
+    CONSUMERS = ("cluster", "acceptance")
+
+    def setUp(self):
+        self.ci = jobs((WORKFLOWS / "ci.yml").read_text())
+
+    def assert_extracts_once(self, job):
+        """No subTest here: the detection test expects the first failure to raise."""
+        blocks = steps(job)
+        extracts = [index for index, step in enumerate(blocks) if "workflow_adapter.py extract" in step]
+        self.assertEqual(len(extracts), 1, "exactly one extraction per consumer job")
+        extract = blocks[extracts[0]]
+        step_id = re.search(r"\n        id: ([a-z_]+)\n", extract)
+        self.assertIsNotNone(step_id, "the extraction needs an id for its output")
+        self.assertNotIn("\n        if:", extract, "a skipped extraction must fail the owners")
+        downloads = [index for index, step in enumerate(blocks) if "uses: actions/download-artifact@" in step]
+        self.assertTrue(downloads and max(downloads) < extracts[0],
+                        "extract after the download and its retry")
+        producers = [index for index, step in enumerate(blocks) if "workflow_adapter.py produce" in step]
+        self.assertTrue(producers and extracts[0] < min(producers), "extract before every owner")
+        reference = ('--archive-extraction "${{ steps.' + step_id.group(1)
+                     + '.outputs.archive_extraction_sha256 }}"')
+        for index in producers:
+            self.assertIn(reference, blocks[index], "every owner names the job's extraction")
+        for option in ("--archive-file", "--extract-to", "--extract-overwrite"):
+            self.assertNotIn(option, job, "an owner must not open the archive again")
+        return len(producers)
+
+    def test_each_archive_consumer_extracts_once_before_its_owners(self):
+        owners = {name: self.assert_extracts_once(self.ci[name]) for name in self.CONSUMERS}
+        self.assertEqual(owners, {"cluster": 1, "acceptance": 4})
+
+    def test_a_missing_repeated_late_or_unreferenced_extraction_is_detected(self):
+        original = self.ci["acceptance"]
+        blocks = steps(original)
+        extract = next(step for step in blocks if "workflow_adapter.py extract" in step)
+        first = next(step for step in blocks if "workflow_adapter.py produce" in step)
+        last = [step for step in blocks if "workflow_adapter.py produce" in step][-1]
+        changes = [
+            original.replace(extract + "\n", ""),
+            original.replace(extract, extract + "\n" + extract.replace("id: ", "id: again_")),
+            original.replace(extract + "\n", "").replace(first, first + "\n" + extract),
+            original.replace(extract, extract.replace("\n        id: ", "\n        if: ${{ !cancelled() }}\n        id: ")),
+            original.replace(last, last.replace(" --archive-extraction", " --unrelated")),
+            original.replace(last, last.replace("outputs.archive_extraction_sha256", "outputs.something_else")),
+            original + "\n    env:\n      ARCHIVED: cargo nextest run --archive-file tests.tar.zst",
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_extracts_once(changed)
+
+
 class RetargetTests(unittest.TestCase):
     def setUp(self):
         self.ci = (WORKFLOWS / "ci.yml").read_text()

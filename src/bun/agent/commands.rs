@@ -910,6 +910,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     return;
                 }
 
+                // An app or a job? This node's own evidence decides, before
+                // the rails see the request (#704).
+                if let Err(reason) = self.scope_local_workload_fault(&mut request) {
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    return;
+                }
+
                 if request.fault_type.is_node_targeted() {
                     let result = reservation
                         .as_deref()

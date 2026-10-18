@@ -80,8 +80,10 @@ class WorkflowAdapter(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def oracle(self, manifest, gate, context, approved, directory, shard=None):
+    def oracle(self, manifest, gate, context, approved, directory, shard=None, archive=None):
         self.assertEqual(approved, {'synthetic': gate, 'shard': shard})
+        # Archived owners are checked against the builder's archive digest.
+        self.assertEqual(archive, self.a.builder_archive(gate, self.needs))
         required = self.a.required_cases(manifest, gate)
         if shard is None:
             return required
@@ -335,9 +337,9 @@ class WorkflowAdapter(unittest.TestCase):
         self.reseal('portable-darwin', 2, attempt='3')
         seen = {}
 
-        def oracle(manifest, gate, context, approved, directory, shard=None):
+        def oracle(manifest, gate, context, approved, directory, shard=None, archive=None):
             seen[(gate, shard)] = context
-            return self.oracle(manifest, gate, context, approved, directory, shard)
+            return self.oracle(manifest, gate, context, approved, directory, shard, archive)
 
         with patch.object(self.a.gates, 'candidate_sources'), patch.object(self.a, 'verify_owner', oracle):
             verified = self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs)

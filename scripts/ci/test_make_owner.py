@@ -231,3 +231,57 @@ class MakeOwner(unittest.TestCase):
         self.directory.joinpath('junit.xml').write_text('<testsuites/>')
         with self.assertRaises(c.Invalid):
             self.evidence()
+
+    def archived(self):
+        """A cluster owner whose job has already extracted the archive once."""
+        self.context['host'] = 'linux'
+        self.root.joinpath('Makefile').write_text(
+            MAKEFILE + "test-cluster:\n\tRELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover)'\n")
+        builder = dict(schema_version=1, commit=self.context['commit'], run_id=self.context['run_id'],
+                       attempt=self.context['attempt'], host='linux', command=w.ARCHIVE_COMMAND,
+                       exit_code=0, archive_sha256='1' * 64)
+        origin_path = self.root / 'archive-origin.json'
+        origin_path.write_text(json.dumps(builder))
+        origin = dict(path='archive-origin.json', sha256=c.digest(origin_path), builder=builder)
+        metadata = {}
+        for name in w.ARCHIVE_METADATA:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('synthetic extracted ' + name)
+            metadata[name] = c.digest(path)
+        extraction = dict(schema_version=1, context=dict(self.context), archive_sha256='1' * 64,
+                          archive_origin_sha256=origin['sha256'],
+                          command=w.extraction_command(self.tools['nextest']['path']), exit_code=0,
+                          metadata=metadata)
+        selectors, environment = w.make_selection(self.root, 'test-cluster', archived=True)
+        self.entry.update(gate='cluster-tests', host='linux', owner_command=['make', 'test-cluster'],
+                          selectors=selectors, environment=environment, archive_origin=origin,
+                          archive_extraction=extraction)
+        self.entry['inputs'].update(metadata)
+
+    def test_an_archived_owner_lists_and_runs_the_extracted_build_without_reopening_the_archive(self):
+        self.archived()
+        self.assertEqual(self.execute(), 0)
+        actual = [cmd for cmd, _ in self.calls if cmd[0] == self.tools['nextest']['path']]
+        self.assertEqual(len(actual), 2)
+        for command in actual:
+            self.assertIn('--binaries-metadata', command)
+            self.assertIn('--target-dir-remap', command)
+            self.assertNotIn('--archive-file', command)
+            self.assertNotIn('--extract-to', command)
+        # No tests.tar.zst exists here: the owner never hashes or opens it.
+        self.assertFalse((self.root / 'tests.tar.zst').exists())
+        self.assertEqual(self.evidence(), {('reliaburger', 'pickle::tests::bounded')})
+
+    def test_metadata_changed_after_extraction_refuses_before_discovery(self):
+        self.archived()
+        (self.root / w.ARCHIVE_METADATA[0]).write_text('another build')
+        self.assertNotEqual(self.execute(), 0)
+        self.assertFalse(any(cmd[0] == self.tools['nextest']['path'] for cmd, _ in self.calls))
+
+    def test_an_archived_owner_without_its_jobs_extraction_refuses(self):
+        self.archived()
+        del self.entry['archive_extraction']
+        with self.assertRaisesRegex(c.Invalid, 'extraction'):
+            self.execute()
+        self.assertFalse(any(cmd[0] == 'make' for cmd, _ in self.calls))

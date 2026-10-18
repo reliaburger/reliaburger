@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 
 use super::follow_ups::FollowUp;
 use super::{BunAgent, BunError, Grill, InstanceId};
+use crate::bun::live_attempts::AttemptHandle;
 use crate::smoker::types::{FaultId, FaultReversal, FaultRule, FaultSummary, FaultType};
 
 /// How long a task waits for the runtime to name the targets' pids. A
@@ -52,6 +53,16 @@ impl Signal {
     }
 }
 
+/// Something a signal fault signals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SignalTarget {
+    /// A runtime instance: the runtime names its main pid.
+    Instance(InstanceId),
+    /// A reusable executor's task cgroup: every process in it, which is
+    /// the one command running there and nothing else.
+    TaskGroup(std::path::PathBuf),
+}
+
 /// A signal fault's task result, for the loop to finish.
 pub(super) struct Signalled {
     rule_id: FaultId,
@@ -60,34 +71,54 @@ pub(super) struct Signalled {
     response: oneshot::Sender<Result<FaultSummary, BunError>>,
 }
 
-/// Read each target's pid at once until `deadline`, keeping at most
-/// `count` (0: all). Reads that don't finish in time are left out.
+/// Read each target's pids at once until `deadline`, keeping the pids of
+/// at most `count` targets (0: all). Reads that don't finish in time are
+/// left out, and so is a target with no process left.
 pub(super) async fn read_pids<G: Grill>(
     grill: &G,
-    ids: &[InstanceId],
+    targets: &[SignalTarget],
     count: u32,
     deadline: tokio::time::Instant,
 ) -> Vec<u32> {
-    let reads = ids.iter().map(|id| async move {
-        tokio::time::timeout_at(deadline, grill.pid(id))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
+    let reads = targets.iter().map(|target| async move {
+        match target {
+            SignalTarget::Instance(id) => tokio::time::timeout_at(deadline, grill.pid(id))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .into_iter()
+                .collect(),
+            SignalTarget::TaskGroup(cgroup) => task_group_pids(cgroup),
+        }
     });
     // `timeout_at` polls the reads before its clock, so at the deadline the
     // reads that finished still count.
-    let mut pids: Vec<u32> =
+    let mut per_target: Vec<Vec<u32>> =
         tokio::time::timeout_at(deadline, futures_util::future::join_all(reads))
             .await
             .unwrap_or_default()
             .into_iter()
-            .flatten()
+            .filter(|pids: &Vec<u32>| !pids.is_empty())
             .collect();
     if count > 0 {
-        pids.truncate(count as usize);
+        per_target.truncate(count as usize);
     }
-    pids
+    per_target.into_iter().flatten().collect()
+}
+
+/// The processes in a task cgroup. cgroupfs is an in-memory kernel
+/// interface, like `/proc`, so the read never waits on a disk. A group that
+/// has gone (the command finished) has none.
+fn task_group_pids(cgroup: &std::path::Path) -> Vec<u32> {
+    std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .map(|listed| {
+            listed
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Send `signal` to `pids`. A kill or a pause with nobody to signal fails;
@@ -117,9 +148,21 @@ pub(super) fn send(
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Running instances a fault targets: its service (or one instance of
-    /// it) in its namespace, past their image pull.
-    pub(super) fn fault_targets(&self, rule: &FaultRule) -> Vec<InstanceId> {
+    /// What a fault signals. For an app: its running instances (or one of
+    /// them) in its namespace, past their image pull. For a job or task
+    /// array: its running attempts (or one task's), each by its own runtime
+    /// instance or by its reusable executor's task cgroup.
+    pub(super) fn fault_targets(&self, rule: &FaultRule) -> Vec<SignalTarget> {
+        if rule.workload.runs_to_completion() {
+            return self
+                .attempt_targets(rule)
+                .into_iter()
+                .map(|attempt| match attempt.handle {
+                    AttemptHandle::Instance(id) => SignalTarget::Instance(id),
+                    AttemptHandle::TaskGroup(cgroup) => SignalTarget::TaskGroup(cgroup),
+                })
+                .collect();
+        }
         self.supervisor
             .list_instances()
             .iter()
@@ -132,7 +175,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .is_none_or(|target| &instance.id.0 == target)
                     && !instance.is_being_created()
             })
-            .map(|instance| instance.id.clone())
+            .map(|instance| SignalTarget::Instance(instance.id.clone()))
             .collect()
     }
 
