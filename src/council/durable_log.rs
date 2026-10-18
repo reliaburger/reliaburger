@@ -523,6 +523,61 @@ mod tests {
         );
     }
 
+    fn raw_meta_bytes(store: &DurableLogStore, key: &str) -> Vec<u8> {
+        store.get_meta(key).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn vote_and_log_ids_are_stored_as_postcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let vote = Vote::new(3, 42);
+        store.save_vote(&vote).await.unwrap();
+        store.save_committed(Some(log_id(2, 3))).await.unwrap();
+        store.write_entries(vec![entry(1, 1), entry(1, 2)]).unwrap();
+        store.purge(log_id(1, 2)).await.unwrap();
+
+        assert_eq!(
+            raw_meta_bytes(&store, VOTE_KEY),
+            postcard::to_stdvec(&vote).unwrap()
+        );
+        assert_eq!(
+            raw_meta_bytes(&store, COMMITTED_KEY),
+            postcard::to_stdvec(&log_id(2, 3)).unwrap()
+        );
+        assert_eq!(
+            raw_meta_bytes(&store, PURGED_KEY),
+            postcard::to_stdvec(&log_id(1, 2)).unwrap()
+        );
+    }
+
+    /// The vote as bincode wrote it before postcard: term and node id as
+    /// fixed-width little-endian `u64`s, then the committed flag. Read as
+    /// postcard, it would be term 3, node 0, uncommitted, with 13 bytes left
+    /// over, and those leftover bytes are what refuse it. The state stamp
+    /// refuses the whole directory first; this is the second line.
+    #[test]
+    fn a_bincode_vote_from_the_previous_generation_is_refused_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let mut old = 3u64.to_le_bytes().to_vec();
+        old.extend(42u64.to_le_bytes());
+        old.push(1);
+        store.put_meta(VOTE_KEY, &old).unwrap();
+        assert!(store.get_vote().is_err());
+        assert!(store.is_fresh().is_err());
+    }
+
+    #[test]
+    fn a_log_id_with_trailing_bytes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let mut bytes = postcard::to_stdvec(&log_id(1, 2)).unwrap();
+        bytes.push(0);
+        store.put_meta(PURGED_KEY, &bytes).unwrap();
+        assert!(store.last_purged_log_id().is_err());
+    }
+
     #[tokio::test]
     async fn last_purged_log_id_reports_the_purge_boundary() {
         let dir = tempfile::tempdir().unwrap();
@@ -591,6 +646,14 @@ mod tests {
         assert!(
             raft_encryption::is_encrypted(&raw, &plaintext),
             "stored value must not contain the plaintext entry"
+        );
+
+        // Behind the marker, the envelope is exactly one postcard value.
+        let (envelope, rest) = postcard::take_from_bytes::<EncryptedEntry>(&raw[1..]).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(
+            raft_encryption::decrypt_entry(&envelope, &key).unwrap(),
+            plaintext
         );
 
         let mut reader = store.get_log_reader().await;

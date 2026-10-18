@@ -463,7 +463,27 @@ pub fn encode_datagram(message: &GossipMessage) -> Result<Vec<u8>, bincode::Erro
 /// Decode a supported datagram, rejecting protocol/state mismatches.
 /// An absent or malformed directory extension does not invalidate the
 /// membership payload; callers still require endpoint/readiness evidence.
-pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
+pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, DatagramError> {
+    decode_datagram_bincode(bytes).map_err(|error| match error.to_string().as_str() {
+        "incompatible gossip protocol" => DatagramError::IncompatibleProtocol,
+        _ => DatagramError::Decode(postcard::Error::DeserializeBadEncoding),
+    })
+}
+
+/// Why a datagram was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum DatagramError {
+    #[error("datagram of {len} bytes exceeds the {MAX_DATAGRAM_BYTES}-byte budget")]
+    TooLarge { len: usize },
+    #[error("incompatible gossip protocol")]
+    IncompatibleProtocol,
+    #[error("incompatible gossip state format")]
+    IncompatibleState,
+    #[error("malformed datagram: {0}")]
+    Decode(#[from] postcard::Error),
+}
+
+fn decode_datagram_bincode(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
     if bytes.first() != Some(&GossipMessage::VERSION) {
         return Err(Box::new(bincode::ErrorKind::Custom(
             "incompatible gossip protocol".into(),
@@ -784,7 +804,7 @@ mod tests {
     /// #788: the job summary stays small, since it rides every probe.
     #[test]
     fn the_job_summary_costs_ten_bytes_at_most() {
-        let cost = bincode::serialized_size(&Some(every_job_capability())).unwrap();
+        let cost = postcard::experimental::serialized_size(&Some(every_job_capability())).unwrap();
         assert!(cost <= 10, "job summary costs {cost} bytes");
     }
 
@@ -1006,7 +1026,7 @@ mod tests {
     fn extension_stays_within_the_udp_budget() {
         let mut msg = a_message();
         msg.extension = Some(an_extension());
-        let plain = bincode::serialize(&msg).unwrap();
+        let plain = postcard::to_stdvec(&msg).unwrap();
         let datagram = encode_datagram(&msg).unwrap();
         // The extension costs well under 200 bytes of the 1400-byte budget.
         assert!(
@@ -1106,7 +1126,7 @@ mod tests {
         ext.labels = bounded_labels(&labels);
         let mut msg = a_message();
         msg.extension = Some(ext);
-        let plain = bincode::serialize(&msg).unwrap();
+        let plain = postcard::to_stdvec(&msg).unwrap();
         let datagram = encode_datagram(&msg).unwrap();
         // A full label set plus endpoints stays well under the 1400-byte MTU.
         assert!(
@@ -1138,13 +1158,100 @@ mod tests {
         assert_eq!(decoded.incarnation, msg.incarnation);
     }
 
-    /// The decoder uses bincode's `Options` builder, whose default is
-    /// *varint* encoding — a silent wire-format change that compiles
-    /// perfectly and simply stops talking to every peer. Pin the fixed-width
-    /// shape against bytes produced by `bincode::serialize` directly, which
-    /// is what peers send.
+    /// The wire encoding is postcard's: varint integers, a `u8` as one raw
+    /// byte (so the protocol generation stays the first byte), strings and
+    /// sequences behind a varint length. Pin the exact bytes of a small
+    /// message so a codec or configuration change shows up here, not as a
+    /// cluster whose nodes silently stop understanding each other.
     #[test]
-    fn fixed_width_wire_bytes_decode_unchanged() {
+    fn the_gossip_wire_bytes_are_pinned() {
+        let mut msg = GossipMessage::new(
+            NodeId::new("a"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        msg.sequence = 2;
+        let state = u8::try_from(crate::compatibility::CURRENT.state).unwrap();
+        assert!(state < 0x80, "a one-byte varint");
+
+        let mut expected = vec![GossipMessage::VERSION, state, 1, b'a', 1, 2];
+        expected.extend([0u8; 32]); // hmac
+        expected.extend([0, 0]); // Ping, no updates
+        assert_eq!(encode_datagram(&msg).unwrap(), expected);
+        assert_eq!(msg.encoded_len(), expected.len());
+
+        let decoded = decode_datagram(&expected).expect("pinned bytes must decode");
+        assert_eq!(decoded.sender, msg.sender);
+        assert_eq!(decoded.sequence, 2);
+    }
+
+    /// A bincode datagram from the generation before postcard (protocol 52):
+    /// the version byte, then fixed-width little-endian integers. The first
+    /// byte names the old generation, so it's refused before anything is
+    /// decoded, rather than misread as postcard varints.
+    #[test]
+    fn a_bincode_datagram_from_the_previous_generation_is_refused() {
+        let mut old = vec![52u8];
+        old.extend(69u32.to_le_bytes()); // state_format
+        old.extend(1u64.to_le_bytes()); // sender length
+        old.push(b'a');
+        old.extend(1u64.to_le_bytes()); // incarnation
+        old.extend(2u64.to_le_bytes()); // sequence
+        old.extend([0u8; 32]); // hmac
+        old.extend(0u32.to_le_bytes()); // Ping
+        old.extend(0u64.to_le_bytes()); // no updates
+        assert!(matches!(
+            decode_datagram(&old),
+            Err(DatagramError::IncompatibleProtocol)
+        ));
+    }
+
+    /// A length prefix inside the datagram can claim any size. postcard
+    /// checks a string's length against the bytes left before it borrows
+    /// them, and a sequence that claims more elements than there are bytes
+    /// left reserves nothing up front, so the claim is a decode error, not
+    /// an allocation.
+    #[test]
+    fn a_hostile_length_prefix_is_a_decode_error() {
+        let state = u8::try_from(crate::compatibility::CURRENT.state).unwrap();
+        let huge = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+
+        // The sender's name claims 2^64 - 1 bytes.
+        let mut hostile_name = vec![GossipMessage::VERSION, state];
+        hostile_name.extend(huge);
+        assert!(decode_datagram(&hostile_name).is_err());
+
+        // A valid header, then a Ping whose update list claims 2^64 - 1
+        // entries and carries none.
+        let quiet = GossipMessage::new(
+            NodeId::new("sender"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        let mut hostile_list = encode_datagram(&quiet).unwrap();
+        assert_eq!(hostile_list.pop(), Some(0), "the empty update list");
+        hostile_list.extend(huge);
+        assert!(decode_datagram(&hostile_list).is_err());
+    }
+
+    /// No legitimate peer sends more than [`MAX_DATAGRAM_BYTES`]: the sender
+    /// refuses to. So a longer datagram is refused before any of it reaches
+    /// the deserialiser, which bounds what decoding can be asked to do.
+    #[test]
+    fn a_datagram_longer_than_the_budget_is_refused_before_decoding() {
+        let mut datagram = encode_datagram(&a_message()).unwrap();
+        datagram.resize(MAX_DATAGRAM_BYTES, 0);
+        assert!(decode_datagram(&datagram).is_ok(), "exactly the budget");
+        datagram.push(0);
+        assert!(matches!(
+            decode_datagram(&datagram),
+            Err(DatagramError::TooLarge { .. })
+        ));
+    }
+
+    /// Bytes a peer of this generation sends, straight from postcard, decode.
+    #[test]
+    fn postcard_wire_bytes_decode_unchanged() {
         let msg = GossipMessage::new(
             NodeId::new("peer"),
             42,
@@ -1158,8 +1265,7 @@ mod tests {
                 relayed_for: None,
             },
         );
-        // Exactly what a peer puts on the wire: plain `bincode::serialize`.
-        let bytes = bincode::serialize(&msg).expect("encode");
+        let bytes = postcard::to_stdvec(&msg).expect("encode");
         let decoded = decode_datagram(&bytes).expect("peer bytes must decode");
 
         assert_eq!(decoded.version, msg.version);
