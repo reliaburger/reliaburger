@@ -2234,6 +2234,43 @@ pub async fn confirm_leadership(&self, within: std::time::Duration) -> bool {
 
 The unit test models the slow followers with the in-memory router: it holds elections on every voter, cuts the leader off from both followers, checks that one `is_leader` round fails, and heals the partition 300 ms later while `confirm_leadership` is running. With the same probe and load, 102 runs of the test made 30,600 reads and got no 503. The integration test also stopped treating the 503 as fatal: it retries that one documented answer for up to 30 seconds and asserts 200 on whatever comes back.
 
+#### Who leads, and can I prove it?
+
+`CouncilNode` answers two questions that sound like one. `current_leader()` asks "who leads?" and returns openraft's view: the node this one last heard from as leader, or itself. `is_leader()` asks "can I prove I lead, right now?" and runs `ensure_linearizable`, which needs a quorum to answer. Most of the time the answers agree. Sometimes they don't, and the gap is a node that Raft still names as leader but that can't hear a majority. openraft restores a node that led before a restart as leader, so every leader is in that gap for the council's startup recovery probe. A leader cut off from its followers is in it too, until someone else wins an election.
+
+Every leader-only API route used to follow the same pattern:
+
+```rust
+if !council.is_leader().await {
+    let Some(leader_url) = leader_api_url(&state, &council).await else { ... };
+    // forward the request to leader_url
+}
+```
+
+Spot the hole? A node in the gap fails `is_leader`, so it forwards. `leader_api_url` looks up `current_leader`, which names this node, and builds a URL for this node's own API. The request comes straight back into the same handler, which fails `is_leader` again and forwards again. Each hop opens a fresh mTLS connection and carries the caller's token, and nothing limits the depth. The 0.2.1 soak found it three times ([#1069](https://github.com/reliaburger/reliaburger/issues/1069)), after a quorum-loss fault, a power cut and a graceful whole-cluster restart. The soak's job controller polls `GET /v1/batch/{id}`, so it fed the loop without trying. One node reached 1.7 GB of RSS within 18 seconds of starting on a 2 GB VM, with 2,818 established TCP connections from itself to its own API port. The kernel then killed everything except the node (which had a low OOM score), and the node thrashed until DNS and `nft` timed out.
+
+A few routes already knew about this. The lease routes and the upgrade calls checked whether their own metrics named themselves before forwarding, and each had a private header that refused a second hop. They were each fixing the bug locally. The fix makes that the rule for every route, with two guards in shared code.
+
+The first guard is that `leader_api_url` never names this node. It now returns a `Result` whose error says why there's nowhere to forward:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum NoLeaderRoute {
+    #[error("no cluster leader known yet; retry shortly")]
+    Unknown,
+    #[error("this node holds the leader role but can't confirm it with a quorum; retry shortly")]
+    ThisNode,
+    #[error("this request was already forwarded to this node, which can't confirm it leads; ...")]
+    AlreadyForwarded,
+}
+```
+
+The old `Option<String>` could only say "here's a URL" or "no leader". It had no way to say "the leader is me, and I can't prove it", so that case slipped through as a URL. With an enum the compiler made us visit every call site, because each `let Some(url) = ... else` stopped type-checking. `NoLeaderRoute` also implements axum's `IntoResponse`, so most sites answer with `Err(refusal) => return refusal.into_response()`: a 503 with the message as JSON, and no outbound request at all. Sites that had their own "no leader known" wording, such as the fault reservation and the build runner, keep it by matching `NoLeaderRoute::Unknown` first. The upgrade calls, which used to treat "my metrics name me" as "I lead", now ask `confirm_leadership` too, and answer `ThisNode` when it says no.
+
+The second guard is defence in depth. Every request one node forwards to the leader now carries `x-reliaburger-forwarded: 1`, added by `mark_leader_forwarded`. A node that receives a marked request and can't confirm it leads answers 503 instead of forwarding it again. That catches the loops the first guard can't see: two nodes that each think the other leads, or a stale gossip directory pointing back at the sender. A confirmed leader ignores the header and serves the request, so a marked request still lands. Anyone can set the header, but all it ever does is turn a forward into a 503 for the client who set it. It grants nothing, so there's nothing to authenticate.
+
+The tests build the gap with the in-memory Raft router. Three nodes elect node 1, then the router partitions node 1 from both followers and the test waits until `is_leader` fails while `current_leader` still answers `Some(1)`. Node 1's API port is a bare TCP listener that counts every connection it accepts. `a_leader_without_quorum_answers_503_instead_of_forwarding_to_itself` sends apply, stop, batch submit, batch status, upgrade start and abort, the desired-apps read and a build signature to node 1, expects 503 from each, and expects the counter to read zero. Before the fix, the first call came back 502: node 1 had connected to itself, and the counting listener hung up. `a_follower_never_forwards_a_request_another_node_already_forwarded` sends the same calls with the header to a healthy follower, whose leader is a fake that records what reaches it, and expects 503 from each and nothing recorded. `a_follower_marks_every_request_it_forwards_to_the_leader` checks the other side: the fake leader sees the header on everything it receives.
+
 ### The ClusterHandle
 
 The agent needs to answer questions like "who's in the cluster?" and "who's the leader?" without holding mutable borrows on gossip or Raft. We use watch channels for this.

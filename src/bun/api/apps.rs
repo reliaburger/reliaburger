@@ -66,7 +66,7 @@ pub(super) async fn stop_handler(
             .into_response();
     }
     if let Some(council) = state.council.clone() {
-        return cluster_app_change(state, council, app, namespace, AppChange::Stop).await;
+        return cluster_app_change(state, council, app, namespace, AppChange::Stop, &headers).await;
     }
 
     stop_local(&state, app, namespace).await
@@ -143,7 +143,7 @@ pub(super) async fn delete_handler(
     }
     if let Some(council) = state.council.clone() {
         let change = AppChange::Delete { force: query.force };
-        return cluster_app_change(state, council, app, namespace, change).await;
+        return cluster_app_change(state, council, app, namespace, change, &headers).await;
     }
 
     stop_local(&state, app, namespace).await
@@ -211,18 +211,14 @@ pub(super) async fn cluster_app_change(
     app: String,
     namespace: String,
     change: AppChange,
+    caller_headers: &HeaderMap,
 ) -> Response {
     // Followers can't write to Raft (openraft does not forward client
     // writes), so forward the whole request to the leader's API.
     if !council.is_leader().await {
-        let Some(leader_url) = leader_api_url(&state, &council).await else {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "no cluster leader known yet; retry shortly"
-                })),
-            )
-                .into_response();
+        let leader_url = match leader_api_url(&state, &council, caller_headers).await {
+            Ok(url) => url,
+            Err(refusal) => return refusal.into_response(),
         };
         let force = if matches!(change, AppChange::Delete { force: true }) {
             "?force=true"
@@ -230,7 +226,7 @@ pub(super) async fn cluster_app_change(
             ""
         };
         let url = format!("{leader_url}/v1/{}/{app}/{namespace}{force}", change.verb());
-        let mut request = state.cluster_http.client().post(url);
+        let mut request = mark_leader_forwarded(state.cluster_http.client().post(url));
         if let Some(token) = &state.service_token {
             request = request.bearer_auth(token);
         }

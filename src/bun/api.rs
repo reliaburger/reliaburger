@@ -66,7 +66,10 @@ mod test_leases;
 mod ui;
 mod upgrade;
 
-pub(crate) use apply::{LEADER_FORWARDED_HEADER, bind_images, leader_api_url};
+pub(crate) use apply::{
+    LEADER_FORWARDED_HEADER, NoLeaderRoute, bind_images, leader_api_url, leader_to_forward_to,
+    mark_leader_forwarded,
+};
 use apply::{apply_handler, cluster_apply};
 use apps::{delete_handler, exec_handler, stop_handler};
 use audit::audit_handler;
