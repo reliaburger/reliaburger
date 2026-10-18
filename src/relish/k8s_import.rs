@@ -3058,4 +3058,683 @@ spec:
                 .starts_with("public.ecr.aws/docker/library/busybox@sha256:")
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #703: keying by (namespace, name), selector correlation, envFrom, Job
+    // fields. Every finding there was a silent loss, so each test checks the
+    // report as well as the config.
+    // -----------------------------------------------------------------------
+
+    fn report_lines(report: &MigrationReport) -> Vec<String> {
+        report
+            .warnings
+            .iter()
+            .map(|w| format!("{}: {}", w.resource, w.message))
+            .collect()
+    }
+
+    #[test]
+    fn same_named_jobs_in_two_namespaces_both_survive() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: a
+spec:
+  template:
+    spec:
+      containers:
+      - name: migrate
+        image: migrate:a
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: migrate
+  namespace: b
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: migrate
+            image: migrate:b
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.job.len(), 2, "{:?}", result.config.job.keys());
+        assert_eq!(
+            result.config.job["migrate"].image.as_deref(),
+            Some("migrate:a")
+        );
+        assert_eq!(
+            result.config.job["b-migrate"].image.as_deref(),
+            Some("migrate:b")
+        );
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("CronJob/b/migrate") && w.contains("[job.b-migrate]")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn same_named_services_in_two_namespaces_attach_to_their_own_workload() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: alpha
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: api:alpha
+        ports:
+        - containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: beta
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: api:beta
+        ports:
+        - containerPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: alpha
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: beta
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 9090
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app["api"].port, Some(8080));
+        assert_eq!(result.config.app["beta-api"].port, Some(9090));
+        let warnings = report_lines(&result.report);
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("Service/")),
+            "each Service attaches to its own namespace's workload: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_attaches_by_label_selector_not_name() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        tier: frontend
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+        - containerPort: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-http
+spec:
+  selector:
+    app.kubernetes.io/name: web
+  ports:
+  - port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+spec:
+  rules:
+  - host: web.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-http
+            port:
+              number: 9000
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let web = &result.config.app["web"];
+        assert_eq!(web.port, Some(9000), "the Service's port wins");
+        assert_eq!(
+            web.ingress.as_ref().map(|i| i.host.as_str()),
+            Some("web.example.com"),
+            "the Ingress follows its Service to the workload"
+        );
+        let warnings = report_lines(&result.report);
+        // The Service's own name isn't kept, so its clients must be told.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Service/web-http") && w.contains("web:9000")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("nothing answers")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_selector_must_be_a_subset_of_the_pod_labels() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+    tier: frontend
+  ports:
+  - port: 9999
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        // Same name, but the selector doesn't match: Kubernetes would route
+        // nothing, so neither does the import.
+        assert_eq!(result.config.app["web"].port, Some(8080));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Service/web") && w.contains("selects no")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_selecting_two_workloads_is_reported() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blue
+spec:
+  template:
+    metadata:
+      labels:
+        app: shop
+        colour: blue
+    spec:
+      containers:
+      - name: shop
+        image: shop:blue
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: green
+spec:
+  template:
+    metadata:
+      labels:
+        app: shop
+        colour: green
+    spec:
+      containers:
+      - name: shop
+        image: shop:green
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  selector:
+    app: shop
+  ports:
+  - port: 8080
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        // Each workload still takes the Service's port...
+        assert_eq!(result.config.app["blue"].port, Some(8080));
+        assert_eq!(result.config.app["green"].port, Some(8080));
+        // ...but one Service name can't front two apps.
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Service/shop")
+                && w.contains("selects 2 workloads")
+                && w.contains("Deployment/blue")
+                && w.contains("Deployment/green")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_without_a_selector_falls_back_to_its_name_with_a_warning() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+  - port: 8080
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app["web"].port, Some(8080));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Service/web") && w.contains("no selector")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_matching_service_named_after_its_workload_is_not_reported() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 8080
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(
+            result.report.warnings.is_empty(),
+            "{:?}",
+            report_lines(&result.report)
+        );
+        assert!(result.report.dropped.is_empty());
+    }
+
+    #[test]
+    fn env_from_configmap_in_input_is_flattened() {
+        let yaml = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+data:
+  LOG_LEVEL: debug
+  MODE: from-configmap
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        env:
+        - name: MODE
+          value: explicit
+        envFrom:
+        - configMapRef:
+            name: settings
+        - prefix: APP_
+          configMapRef:
+            name: settings
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let env = &result.config.app["web"].env;
+        let plain = |key: &str| match env.get(key) {
+            Some(EnvValue::Plain(v)) => Some(v.clone()),
+            _ => None,
+        };
+        assert_eq!(plain("LOG_LEVEL").as_deref(), Some("debug"));
+        assert_eq!(
+            plain("MODE").as_deref(),
+            Some("explicit"),
+            "explicit env wins"
+        );
+        assert_eq!(plain("APP_LOG_LEVEL").as_deref(), Some("debug"));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings.iter().any(
+                |w| w.starts_with("Deployment/web") && w.contains("envFrom ConfigMap/settings")
+            ),
+            "flattening is an approximation: {warnings:?}"
+        );
+        // A ConfigMap that envFrom consumed isn't "not referenced".
+        assert!(
+            !warnings.iter().any(|w| w.contains("not referenced")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn env_from_secret_is_warned() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup
+spec:
+  template:
+    spec:
+      containers:
+      - name: backup
+        image: backup:v1
+        envFrom:
+        - secretRef:
+            name: s3-credentials
+        - configMapRef:
+            name: not-in-the-input
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(result.config.job["backup"].env.is_empty());
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Job/backup") && w.contains("Secret/s3-credentials")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Job/backup")
+                && w.contains("ConfigMap/not-in-the-input")
+                && w.contains("not in the input")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn env_from_configmap_in_another_namespace_is_not_used() {
+        let yaml = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+  namespace: other
+data:
+  LOG_LEVEL: debug
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        envFrom:
+        - configMapRef:
+            name: settings
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(result.config.app["web"].env.is_empty());
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Deployment/web") && w.contains("not in the input")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn job_backoff_limit_maps_to_attempts() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      activeDeadlineSeconds: 300
+      containers:
+      - name: migrate
+        image: migrate:v1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: patient
+spec:
+  backoffLimit: 30
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      containers:
+      - name: patient
+        image: patient:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        // backoffLimit counts retries; max_attempts counts the first try too.
+        let migrate = &result.config.job["migrate"];
+        assert_eq!(migrate.max_attempts, Some(3));
+        // A pod's deadline is per attempt, exactly like task_timeout_secs.
+        assert_eq!(migrate.task_timeout_secs, Some(300));
+
+        let patient = &result.config.job["patient"];
+        assert_eq!(patient.max_attempts, Some(10), "clamped to the 1-10 range");
+        assert_eq!(patient.task_timeout_secs, Some(900));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Job/patient") && w.contains("backoffLimit 30")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Job/patient")
+                && w.contains("activeDeadlineSeconds 900")
+                && w.contains("per attempt")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("Job/migrate")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn job_completions_is_warned() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: render
+spec:
+  completions: 50
+  parallelism: 5
+  completionMode: Indexed
+  template:
+    spec:
+      tolerations:
+      - key: gpu
+        operator: Exists
+      affinity:
+        nodeAffinity: {}
+      nodeSelector:
+        disk: ssd
+      volumes:
+      - name: scratch
+        emptyDir: {}
+      containers:
+      - name: render
+        image: render:v1
+        workingDir: /work
+        securityContext:
+          runAsUser: 1000
+      - name: sidecar
+        image: sidecar:v1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: "0 3 * * *"
+  timeZone: Europe/London
+  startingDeadlineSeconds: 60
+  jobTemplate:
+    spec:
+      completions: 2
+      template:
+        spec:
+          containers:
+          - name: nightly
+            image: nightly:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let warnings = report_lines(&result.report);
+        for field in [
+            "completions 50",
+            "parallelism 5",
+            "completionMode Indexed",
+            "tolerations",
+            "affinity",
+            "nodeSelector",
+            "volumes",
+            "workingDir",
+            "runAsUser",
+            "sidecar(s)",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("Job/render") && w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
+        for field in [
+            "timeZone Europe/London",
+            "startingDeadlineSeconds",
+            "completions 2",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("CronJob/nightly") && w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_tolerations_and_affinity_are_warned() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      tolerations:
+      - key: dedicated
+        operator: Exists
+      affinity:
+        podAntiAffinity: {}
+      containers:
+      - name: web
+        image: web:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let warnings = report_lines(&result.report);
+        for field in ["tolerations", "affinity"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("Deployment/web") && w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
+    }
 }

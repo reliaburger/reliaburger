@@ -1165,4 +1165,94 @@ mod tests {
             result.report.unsupported
         );
     }
+
+    /// #703: only `command` used to reach the container, so Redis's
+    /// `--maxmemory 64mb --save ""` vanished and the image's user and
+    /// directory came back as the image defaults.
+    #[test]
+    fn export_keeps_args_working_dir_and_user() {
+        let config = parse_config(
+            r#"
+            [app.redis]
+            image = "redis:8"
+            command = ["redis-server"]
+            args = ["--maxmemory", "64mb", "--save", ""]
+            working_dir = "/data"
+            run_as_user = 999
+            run_as_group = 1000
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        let deployment: Deployment = yaml_serde::from_str(&result.yaml).unwrap();
+        let pod = deployment.spec.unwrap().template.spec.unwrap();
+        let container = &pod.containers[0];
+        assert_eq!(container.command, Some(vec!["redis-server".to_string()]));
+        assert_eq!(
+            container.args,
+            Some(vec![
+                "--maxmemory".to_string(),
+                "64mb".to_string(),
+                "--save".to_string(),
+                String::new(),
+            ])
+        );
+        assert_eq!(container.working_dir.as_deref(), Some("/data"));
+        let security = container.security_context.as_ref().unwrap();
+        assert_eq!(security.run_as_user, Some(999));
+        assert_eq!(security.run_as_group, Some(1000));
+    }
+
+    #[test]
+    fn export_reports_encrypted_values() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "web:v1"
+            env = { DB_PASSWORD = "ENC[AGE:abc123]", MODE = "fast" }
+
+            [job.backup]
+            image = "backup:v1"
+            env = { S3_SECRET = "ENC[AGE:def456]" }
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert!(!result.yaml.contains("abc123"), "ciphertext never leaks");
+        for (table, variable) in [("app.web", "DB_PASSWORD"), ("job.backup", "S3_SECRET")] {
+            assert!(
+                result
+                    .report
+                    .dropped
+                    .iter()
+                    .any(|d| d.contains(&format!("[{table}]"))
+                        && d.contains(variable)
+                        && d.contains("Secret")),
+                "{variable} must be reported as needing a Secret: {:?}",
+                result.report.dropped
+            );
+        }
+        assert!(
+            !result.report.dropped.iter().any(|d| d.contains("MODE")),
+            "{:?}",
+            result.report.dropped
+        );
+    }
+
+    #[test]
+    fn export_maps_job_attempts_and_timeout() {
+        let config = parse_config(
+            r#"
+            [job.migrate]
+            image = "migrate:v1"
+            command = ["migrate"]
+            max_attempts = 3
+            task_timeout_secs = 300
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        let job: Job = yaml_serde::from_str(&result.yaml).unwrap();
+        let spec = job.spec.unwrap();
+        assert_eq!(spec.backoff_limit, Some(2));
+        let pod = spec.template.spec.unwrap();
+        assert_eq!(pod.active_deadline_seconds, Some(300));
+    }
 }
