@@ -6283,6 +6283,17 @@ applies, and `tests/suite/documented_manifests.rs` runs them on every manifest
 we tell people to apply as written: everything in `examples/`, and the TOML in
 the README, the quickstart, the Linux servers guide and the website.
 
+That guard only reads manifests we wrote by hand. `relish test` writes its own,
+in code, and two of its generators still set `interval = 1` with `timeout = 2`.
+Three 0.2.1 soaks (candidates 3 and 4, and the run that reproduced them) each
+recorded a failed chaos scenario that died at apply in 200 milliseconds. The harness kept the last three lines of the JSON
+report, which were closing brackets, so the reason sat unread in the evidence
+directory. A spec generated at run time is still a spec the API judges. Now
+each module that builds one has a unit test that renders it and runs
+`validate_intrinsic`: the `TestContext` helpers, the chaos workload, the bench
+suites and the volume and firewall fixtures. The soak records each failing
+case's reason instead of the tail of the file.
+
 Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check
 still has a separate gap. Calling all upgrade verification either finished or

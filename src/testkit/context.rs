@@ -343,7 +343,7 @@ impl TestContext {
              [app.{app}.health]\n\
              path = \"/\"\n\
              interval = 1\n\
-             timeout = 2\n\
+             timeout = 1\n\
              threshold_unhealthy = 3\n\
              threshold_healthy = 1\n",
             ns = self.namespace,
@@ -966,6 +966,24 @@ fn testapp_port(app: &str) -> u16 {
     40_000 + (hash % 20_000) as u16
 }
 
+/// A context that talks to no cluster, for unit tests of spec generators.
+#[cfg(test)]
+impl TestContext {
+    pub(crate) fn offline(namespace: &str) -> Self {
+        TestContext {
+            client: BunClient::new_with_token("http://127.0.0.1:9117", None),
+            namespace: namespace.to_string(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: ClusterCapabilities::default(),
+            timeout: Duration::from_millis(200),
+            deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
+            peer_route: PeerRoute::Direct,
+            wait_note: Default::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,17 +1002,7 @@ mod tests {
     }
 
     fn context(namespace: &str) -> TestContext {
-        TestContext {
-            client: BunClient::new_with_token("http://127.0.0.1:9117", None),
-            namespace: namespace.to_string(),
-            lease_id: None,
-            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
-            capabilities: ClusterCapabilities::default(),
-            timeout: Duration::from_millis(200),
-            deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
-            peer_route: PeerRoute::Direct,
-            wait_note: Default::default(),
-        }
+        TestContext::offline(namespace)
     }
 
     #[tokio::test]
@@ -1613,6 +1621,29 @@ mod tests {
         assert!(!headers.contains("private-api-token"));
         server.await.unwrap();
         forwarding.await.unwrap();
+    }
+
+    /// The API refuses a spec `validate_intrinsic` refuses, so a generated
+    /// spec has to pass it too: a health timeout longer than its interval
+    /// failed every `relish test` case built on `testapp_spec` at apply
+    /// (#1068).
+    #[test]
+    fn every_generated_spec_passes_the_validation_the_api_applies() {
+        let ctx = context("rbtest-abc-00");
+        let specs = [
+            ctx.testapp_spec("web", "healthy", 1),
+            ctx.testapp_spec_args("slow", "slow", 1, &["--delay", "500"]),
+            ctx.process_job_spec("once", &["/bin/sh", "-c", "exit 0"]),
+            ctx.process_job_spec("empty", &[]),
+            ctx.container_idle_spec("box"),
+            ctx.container_http_spec("web", 2),
+        ];
+        for spec in specs {
+            let config = Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this generated spec: {error}\n{spec}");
+            }
+        }
     }
 
     #[test]

@@ -1009,3 +1009,39 @@ Oct 16 10:02:00 rb-a-1 kernel: eth0: carrier ok
         bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
         self.assertIn('memory_report "$node" cursor > "$directory/memory-${vm[node]}.txt"', heavy)
         self.assertIn('memory_report "$node" recent > "$directory/memory-${vm[node]}.txt"', bundle)
+
+
+class TestFailures(unittest.TestCase):
+    """#1068: the chaos scenario recorded the JSON report's last three lines,
+    `} ] }`, which hid why `relish test` failed."""
+
+    REASON = "apply failed: API error (status 400): timeout (2s) must not be longer than interval (1s)"
+
+    def report(self):
+        return json.dumps({"schema_version": 1, "results": [
+            {"name": "dead_worker_node_has_workloads_rescheduled", "outcome": {"status": "fail", "reason": self.REASON}},
+            {"name": "passing_case", "outcome": {"status": "pass"}},
+        ]}, indent=2)
+
+    def test_a_report_names_each_failing_case_and_its_reason(self):
+        self.assertEqual(checker.test_failure_reasons(self.report()),
+                         f"dead_worker_node_has_workloads_rescheduled: fail: {self.REASON}")
+
+    def test_without_a_report_it_keeps_the_tail_of_stderr(self):
+        self.assertEqual(checker.test_failure_reasons("", "connecting\nerror: cluster unreachable\n"),
+                         "connecting error: cluster unreachable")
+
+    def test_the_subcommand_reads_the_report_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "chaos-3.log"
+            report.write_text(self.report())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(checker.main(["test-failures", str(report), str(report) + ".err"]), 0)
+        self.assertIn(self.REASON, out.getvalue())
+
+    def test_the_chaos_scenario_records_the_reason_not_the_tail(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
+        self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
+        self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)

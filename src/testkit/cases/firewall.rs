@@ -135,3 +135,20 @@ pub fn cases() -> Vec<TestCase> {
         },
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firewall_targets_pass_the_validation_the_api_applies() {
+        let ctx = TestContext::offline("rbtest-firewall-00");
+        for allowed in [&["fw-client"][..], &["fw-first", "fw-second"]] {
+            let spec = target_allowing(&ctx, "fw-target", allowed);
+            let config = crate::config::Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this firewall target: {error}\n{spec}");
+            }
+        }
+    }
+}

@@ -36,7 +36,7 @@ fn container_spec(context: &TestContext, app: &str, replicas: u32, delayed: bool
          [app.{app}.health]\n\
          path = \"/hostname\"\n\
          interval = 1\n\
-         timeout = 2\n\
+         timeout = 1\n\
          threshold_unhealthy = 3\n\
          threshold_healthy = 1\n",
         namespace = context.namespace,
@@ -799,6 +799,20 @@ mod tests {
             );
         }
         assert_self_served(&context.container_http_spec("web", 1), "web");
+    }
+
+    /// V02 soak: C2 failed at apply in 200 ms because its health timeout was
+    /// longer than its interval, which the API refuses (#1068).
+    #[test]
+    fn chaos_workloads_pass_the_validation_the_api_applies() {
+        let context = offline_context();
+        for delayed in [false, true] {
+            let spec = container_spec(&context, "chaos-c2-reschedule", 3, delayed);
+            let config = Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this chaos workload: {error}\n{spec}");
+            }
+        }
     }
 
     #[test]
