@@ -1258,10 +1258,18 @@ chaos_one() {
         memory) rel fault memory frontend 90% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         scenario)
             rel_budget=900 rel --output json test --chaos --yes --filter dead_worker_node_has_workloads_rescheduled \
-                --timeout 600s > "$output" 2>&1 || result=$? ;;
+                --timeout 600s > "$output" 2> "$output.err" || result=$? ;;
     esac
     event --phase "fault:chaos-$kind" --exit "$result" --command "$kind" --verdict "$([ "$result" -eq 0 ] && echo ok || echo fail)"
-    [ "$result" -eq 0 ] || record_failure "chaos-$kind" "$(tail -n 3 "$output" | tr '\n' ' ')"
+    if [ "$result" -ne 0 ]; then
+        # A JSON report's last lines are only closing brackets: name the
+        # failing case and its reason instead (#1068).
+        if [ "$kind" = scenario ]; then
+            record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"
+        else
+            record_failure "chaos-$kind" "$(tail -n 3 "$output" | tr '\n' ' ')"
+        fi
+    fi
     case $kind in kill|scenario) ;; *) wait_until $(( $(date +%s) + 65 )) ;; esac
     rel fault clear > /dev/null 2>&1 || true
     settle "fault:chaos-$kind" 300 || true
