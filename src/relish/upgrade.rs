@@ -981,9 +981,12 @@ pub fn resolve_registry_route(
 
 /// Download a URL into memory (shared with `relish setup`).
 pub(crate) async fn download(url: &str) -> Result<Vec<u8>, RelishError> {
-    let response = reqwest::get(url)
-        .await
-        .map_err(|e| RelishError::FormatFailed(format!("download failed: {e}")))?;
+    let download_failed =
+        |e: reqwest::Error| RelishError::FormatFailed(format!("download failed: {e}"));
+    let client = crate::http_client::builder()
+        .build()
+        .map_err(download_failed)?;
+    let response = client.get(url).send().await.map_err(download_failed)?;
     if !response.status().is_success() {
         return Err(RelishError::FormatFailed(format!(
             "download failed: status {}",

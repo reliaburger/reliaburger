@@ -855,7 +855,7 @@ PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }
 
 async fn probe_demo(port: u16) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
     tokio::time::timeout(Duration::from_secs(45), async {
