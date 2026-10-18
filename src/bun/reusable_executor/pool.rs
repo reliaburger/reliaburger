@@ -820,6 +820,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             request: HELPER_MEMORY_BYTES,
             limit: HELPER_MEMORY_BYTES,
         });
+        // The job's `pids` is for its commands. runc would write it over the
+        // helper's own limit, which `prepare_cgroups` already set.
+        helper_profile.pids = None;
         spec.linux.resources = crate::grill::oci::generate_job_oci_spec(
             "helper",
             "default",
@@ -1597,7 +1600,7 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
     std::fs::write(task.join("memory.swap.max"), "0")?;
     std::fs::write(task.join("memory.high"), profile.memory.request.to_string())?;
     std::fs::write(task.join("memory.oom.group"), "1")?;
-    std::fs::write(task.join("pids.max"), "256")?;
+    std::fs::write(task.join("pids.max"), profile.pids.to_string())?;
     std::fs::write(
         base.join("helper/cpu.max"),
         crate::grill::cpu_max_from_millicores(100),
@@ -1611,7 +1614,7 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
         HELPER_MEMORY_BYTES.to_string(),
     )?;
     std::fs::write(base.join("helper/memory.swap.max"), "0")?;
-    std::fs::write(base.join("helper/pids.max"), "16")?;
+    std::fs::write(base.join("helper/pids.max"), super::HELPER_PIDS.to_string())?;
     std::fs::write(
         base.join("helper/memory.max"),
         HELPER_MEMORY_BYTES.to_string(),

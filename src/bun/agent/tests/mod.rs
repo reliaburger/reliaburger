@@ -9543,6 +9543,7 @@ pub(super) fn limited_adoption_record(
     let mut record = adoption_record(instance, app, false);
     record.oci_spec.linux.cgroups_path = Some(format!("/reliaburger/default/{app}/0"));
     record.oci_spec.linux.resources = Some(crate::grill::oci::OciResources {
+        pids: None,
         cpu: Some(crate::grill::oci::OciCpuResources {
             quota: 50_000,
             period: 100_000,

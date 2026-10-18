@@ -1457,6 +1457,7 @@ fn pod_to_jobspec(
     };
 
     JobSpec {
+        pids: None,
         runtime: Default::default(),
         image: container.and_then(|c| c.image.clone()),
         command,
