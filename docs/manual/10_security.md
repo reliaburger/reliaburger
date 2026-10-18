@@ -339,6 +339,9 @@ relish secret pubkey cluster          # offline, from `relish init` output
 relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
 ```
 
+`examples/phase-1/container-secrets.toml` is a job that reads an encrypted
+value and prints its length, never the value; its header has the commands.
+
 Encryption is local: `secret encrypt` never contacts the cluster. The node
 that starts the instance decrypts the value into its environment. If it can't
 decrypt, it refuses to start the instance rather than pass the ciphertext

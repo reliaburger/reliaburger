@@ -8305,6 +8305,44 @@
       "boundaries": [
         "Run the cluster and Linux gates; the portable agent tests stand a plain file in for a task cgroup."
       ]
+    },
+    {
+      "id": "issue-705-scripted-feature-demos",
+      "issue": 705,
+      "promise": "The rollout and GitOps demos run to completion on a real one-node cluster and fail on the first step that does not do what it says.",
+      "supported_paths": [
+        "scripts/demo/rollout.sh and scripts/demo/gitops.sh, each starting its own relish-init cluster on the process runtime."
+      ],
+      "refused_paths": [
+        "A demo that exits 0 without printing its completion line, or swallows a failed step, cannot pass."
+      ],
+      "boundaries": [
+        "The demos run with this checkout's binaries; they do not exercise a container runtime."
+      ],
+      "cases": [
+        {
+          "id": "demo-rollout_demo_rolls_back_a_bad_version_and_marks_it_failed",
+          "binary": "reliaburger::demos",
+          "test": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/demos.rs"
+          ]
+        },
+        {
+          "id": "demo-gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
+          "binary": "reliaburger::demos",
+          "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/demos.rs"
+          ]
+        }
+      ]
     }
   ]
 }

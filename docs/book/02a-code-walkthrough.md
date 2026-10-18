@@ -129,7 +129,7 @@ One subtlety worth noting: `wait_for_ack()` drains the transport while waiting. 
 `MustardTransport` is a trait with `send()` and `recv()` methods. Two implementations:
 
 - `InMemoryNetwork` + `InMemoryTransport`: for tests. Supports simulated partitions via a blocklist, `try_recv()` for deterministic test driving.
-- `UdpMustardTransport`: for production. Real UDP sockets, bincode serialisation.
+- `UdpMustardTransport`: for production. Real UDP sockets, bincode serialisation (postcard since 0.2.2; Chapter 2 explains the move).
 
 The in-memory transport deserves a close look if you're writing tests. It's what makes the gossip tests deterministic and fast.
 

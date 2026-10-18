@@ -964,12 +964,91 @@ list, without ever failing the build. A lag report that broke builds would get m
 within a week. One that nobody reads would rot just as fast, which is why the refresh is a
 numbered step in the release runbook, not a good intention.
 
+The first security-relevant major bump shows why. reqwest 0.12 to 0.13 needed two edits
+to compile: `query` is an opt-in feature now, and one test called the removed
+`tls_built_in_root_certs`. Everything else built first time. And three of its defaults had
+moved underneath us.
+
+reqwest 0.12, built with our `rustls-tls` feature, checked public certificates against
+the Mozilla root list compiled into the binary, did its crypto with *ring*, and spoke only
+HTTP/1.1. 0.13 checks them against the operating system's trust store, falls back to
+aws-lc for crypto, and the `http2` feature turns on HTTP/2 in the TLS handshake. We
+didn't ask for any of those. We switched off reqwest's default features and picked
+`rustls-no-provider`, which brings no crypto provider of its own. That doesn't help,
+because of *feature unification*. Cargo builds each crate version once per build, with the
+union of the features every dependant asked for. `object_store`, our backup crate, was
+already on reqwest 0.13 with `rustls` and `http2`, so our reqwest got them too. If you
+know Go modules, there's no equivalent: a Go package has no optional features to merge.
+In Cargo a feature is a one-way switch, and any crate in the graph can flip it on for
+everyone.
+
+The trust store is the one that bites. On Linux, reqwest 0.13 reads the host's CA bundle
+when it *builds* a client, before any request. On a host without one it refuses to build
+at all, even for a plain `http://` scrape, and `reqwest::Client::new()` panics. We had
+`.unwrap_or_default()` fallbacks that would have turned that into a panic on a node with
+a stripped-down image.
+
+So every production client now starts from one function, `http_client::builder()` in
+`src/http_client.rs`:
+
+```rust
+pub fn builder() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .http1_only()
+        .tls_certs_only(bundled_roots().iter().cloned())
+}
+
+fn bundled_roots() -> &'static [reqwest::Certificate] {
+    static ROOTS: std::sync::LazyLock<Vec<reqwest::Certificate>> =
+        std::sync::LazyLock::new(|| {
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+                .collect()
+        });
+    &ROOTS
+}
+```
+
+`tls_certs_only` trusts exactly the certificates we hand it: the same Mozilla list 0.12
+bundled, from `webpki-root-certs`. `http1_only` puts the handshake back to HTTP/1.1.
+Installing ring as the process's default provider matters because reqwest asks rustls for
+that default before it reaches for aws-lc. The `let _ =` throws away the error you get
+when a provider is already installed, which is the common case after the first call.
+
+`static` with `LazyLock` is Rust's answer to "compute this once, the first time someone
+needs it". In C you'd reach for a global and `pthread_once`; in Python, a module-level
+value. `LazyLock` runs the closure on first access, from whichever thread gets there
+first, and every later access gets the same `Vec`. Returning `&'static [Certificate]`
+promises callers the slice lives for the whole program, which a `static` does.
+
+The clients that pin the cluster CA (relish over HTTPS, node-to-node mTLS, certificate
+renewal) didn't change behaviour. They hand reqwest a complete rustls config through
+`use_preconfigured_tls`, and that config's roots replace reqwest's. They start from
+`builder()` anyway, so there's one rule to remember. A unit test enforces it by reading
+the source tree and failing on a bare `reqwest::Client::builder()`, `Client::new()` or
+`reqwest::get()` outside test code. Other tests check the parts a default could undo: a
+server offering `h2` gets `http/1.1`, ring is the installed provider, and a client handed
+the wrong cluster CA is still refused.
+
+Proxies, the other default people worry about, didn't move. Both versions read
+`HTTP_PROXY` and friends from the environment, and neither reads macOS or Windows proxy
+settings unless the `system-proxy` feature is on, and nothing in our graph enables it.
+
 The `age` bump from 0.10 to 0.12 shows what "deliberate" means. The API we seal the root
 CA backup with changed shape, which the compiler caught. What the compiler can't catch is
 whether 0.12 still opens a file 0.10 sealed years ago, so that PR first checked in files
 sealed by the old build and made the tests open them (chapter 4 has the details). It also
 paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
 `cargo audit` exception went too.
+
+Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
+3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
+maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
+"replace it": gossip, reporting frames and the Raft metadata moved to postcard, which
+changed the wire and durable formats along with the crate (Chapter 2 has the details). A
+lag report can tell you you're behind. It can't tell you the road ahead still exists.
 
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 

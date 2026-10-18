@@ -295,38 +295,42 @@ Egress is opt-in. Apps without `[egress]` have all egress allowed. This is backw
 
 ## Scripted chaos scenarios
 
-For repeatable tests, faults can be defined in a TOML file:
+For repeatable tests, faults can be defined in a TOML file. This is the start of `examples/phase-8/container-chaos-scenario.toml`, which targets the podinfo apps from the five-minute tour:
 
 ```toml
-name = "Payment cascade failure"
+name = "Cache cascade"
 
 [[step]]
-description = "Database CPU starvation"
-fault = "cpu"
-target = "pg"
-value = "80%"
+description = "The cache slows down for the frontend"
+fault = "delay"
+target = "redis"
+from = "frontend"
+value = "300ms"
+jitter = "100ms"
 duration = "2m"
 
 [[step]]
-description = "Database drops connections"
+description = "The cache starts dropping connections"
 fault = "drop"
-target = "pg"
+target = "redis"
 value = "25%"
 start_after = "2m"
-duration = "3m"
+duration = "2m"
 ```
 
 The executor builds a timeline, sorts by activation time, and runs each step at the right moment. A speed multiplier lets you run scenarios faster for CI:
 
 ```bash
-relish fault scenario payment-cascade.toml --speed 10.0 --acknowledge
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --speed 10.0 --acknowledge
 ```
 
 Dry-run mode prints the timeline without executing:
 
 ```bash
-relish fault scenario payment-cascade.toml --dry-run
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --dry-run
 ```
+
+The shipped example used to target `pg` and `payment-service`, apps no example defined, and its header left out `--acknowledge`, so it couldn't run as written. `chaos_scenario_example_targets_apps_a_shipped_example_defines` in `tests/examples.rs` now parses the scenario, collects every app a shipped example declares (TOML `[app.*]` tables and Kubernetes Deployments) and fails on a step aimed at anything else.
 
 The first version of the runner had three habits that made it useless in CI.
 It parsed each step only when its turn came, so a typo in step three surfaced
@@ -1169,6 +1173,18 @@ need their interpreter (`/bin/sh`) on the list. `mount_isolation` defaults to
 `true` on Linux, but process mode doesn't implement a mount namespace, so a host
 workload is refused until you set it to `false` and accept running unisolated.
 Use Linux containers when the workload needs that boundary.
+
+The phase-8 example used to say the opposite: an empty allowlist "allows all".
+It never did. `examples/phase-8/proc-exec-app.toml` now says deny-by-default,
+runs testapp so it works as written against
+`examples/node/process-runtime.toml`, and `proc-run-before.toml` beside it
+gates an app on a host migration job. Since #914 a process-only node refuses
+an app with an `image`, so `process_examples_run_no_images` in
+`tests/examples.rs` keeps every `proc-*` example image-free, and
+`example_names_follow_the_runtime_prefix_convention` fails on any file under
+`examples/phase-*` without a `proc-`, `container-`, `apple-` or `runc-`
+prefix. That caught the unprefixed batch, build and chaos examples, now
+`container-*`.
 
 ### How it fits together
 

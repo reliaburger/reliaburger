@@ -152,6 +152,8 @@ pub struct Compatibility {
 /// `FaultRequest`, `FaultRule` and routed workload faults carry a `workload`
 /// kind and a `task_index`, `FaultSummary` a `task_index`, and nodes answer
 /// `GET /v1/fault/attempts` with their running job attempts (#704).
+/// Gossip datagrams, reporting frames and the Raft log's vote, log ids and
+/// encrypted-entry envelope are postcard, not bincode (#1026).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 53,
     state: 70,

@@ -939,7 +939,7 @@ pub async fn join(
     // a mismatch is refused *here*, before the one-time token is ever sent — so
     // a man-in-the-middle cannot capture and replay a token the real cluster
     // never consumed.
-    let tofu_client = reqwest::Client::builder()
+    let tofu_client = crate::http_client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(30))
         .build()

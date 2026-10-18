@@ -549,7 +549,15 @@ its attempt has positively retired.
 ## Reusable containers
 
 For short image commands, select `runtime = "shared-runc"` explicitly
-in the job or profile template. The default remains `runc`.
+in the job or profile template, or pass `--runtime shared-runc` to
+`relish run --batch`. The default remains `runc`.
+`examples/phase-8/container-shared-runc-array.toml` is a 1,000-task array on
+reusable containers, with both forms in its header:
+
+```sh
+relish batch submit examples/phase-8/container-shared-runc-array.toml --dry-run
+relish batch submit examples/phase-8/container-shared-runc-array.toml
+```
 
 ```toml
 [job.prepare-record]

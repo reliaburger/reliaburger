@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -57,8 +57,8 @@ test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah t
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
-test-cluster: ## Run all real multi-node cluster acceptance suites
-	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability)'
+test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
+	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos)'
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -135,8 +135,11 @@ coverage: ## Run the portable suite once under line coverage and enforce the flo
 	$(COVERAGE_REPORT) --html --output-dir target/coverage/html
 	$(COVERAGE_REPORT) --fail-under-lines $(COVERAGE_MIN_LINES)
 
-deploy-demo: build ## Deploy an app, show history, lint config
-	./scripts/deploy-demo.sh
+rollout-demo: ## Roll an app forward, roll it back, and watch a bad version roll back by itself
+	scripts/demo/rollout.sh
+
+gitops-demo: ## Sync a one-node cluster from a file:// Git repository
+	scripts/demo/gitops.sh
 
 observability-demo: build ## Start bun, collect metrics, query them, show dashboard
 	./scripts/observability-demo.sh
