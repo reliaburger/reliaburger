@@ -158,63 +158,20 @@ That second case took us a while to get right: see "A rollback must not cost cap
 
 Jobs can declare `run_before = ["app.web"]`, meaning they must complete before the rolling phase begins. Database migrations are the classic example: you want `migrate` to finish before `web` gets the new code.
 
-On a node, the agent runs every job that names the app in `run_before` to completion before it touches an instance. If any of them fails, the deploy fails and no instance is modified.
-
-Cluster apply has another gate to protect: the app spec in Raft. Once that spec
-commits, another node can schedule the new app. The agent first reserves the
-local operation and checks image trust for the complete manifest. Raft then
-records a bounded claim owning every app and job identity, without publishing
-the new desired state. Prerequisites must reference an app in the same apply
-and effective namespace.
-
-A migration opens the gate only after a positive zero exit and a durable job
-checkpoint. A negative exit is recorded before reporting failure; failed
-migrations never enter the ordinary automatic retry path. The claim's original
-leadership term and recovery epoch fence an old worker. A new leader cannot
-infer the outcome from its own local records, so uncertainty retains ownership
-and prevents a changed app-only or job-only submission from repeating the work.
-
-After success, one Raft entry checks the complete manifest again and publishes
-its desired writes atomically. If ordinary jobs remain, their identities stay
-reserved until exact namespace, spec and generation receipts establish positive
-terminal outcomes. A startup acknowledgment or an empty receipt cannot release
-that ownership. Registered cron work has no finite execution receipt, so this
-chapter's first version of cluster apply refused recurring schedules outright.
-In 0.2.0 that refusal went away: once the apps publish, the same Raft
-transaction that admits ordinary jobs registers each schedule as a durable
-definition, and the leader claims every matching UTC minute itself. Chapter 17
-tells that story.
+The gate is the app spec in Raft. Once that spec commits, any node can start the new version, so the migration has to finish first. Apply records a deployment intent (`JobApplyCommit`), admits the prerequisite hooks as runs of the common job lifecycle, and waits for their accepted results. A migration opens the gate only after a positive zero exit. Then one Raft entry publishes the apps and admits the ordinary jobs together, and registers each cron schedule as a durable definition whose UTC minutes the leader claims itself. Prerequisites must reference an app in the same apply and effective namespace. A failed hook fails the deploy with no instance touched, and an unknown outcome never opens the gate: someone has to look first (see "Jobs that might already have run", below).
 
 Migration cancellation also needs a boundary after the job settles. An accepted cancellation remains meaningful when the child subsequently exits zero: check it after settlement and immediately before proposing the desired-state transaction. A proposal already submitted to Raft can still commit; cancellation cannot roll that transaction back. Each replicated ownership write has a five-second caller deadline. A timeout does not tell us whether Raft committed, so we keep the uncertain fence and report an error. This is why the terminal job watcher ends without inventing a release when its settlement write stalls.
 
-The tests hold real Process migrations while inspecting desired state, forward
-a failed migration through a follower and change leaders while an old runner
-is blocked. A cold restart preserves a failed generation; an explicitly
-corrected apply launches a new one. State-machine and actor tests also cover
-atomic refusals, overlapping identities, malformed snapshots, pending retries
-and missing or uncertain ordinary-job receipts. Old-term or recovered claims
-stay held; there is no automatic expiry or replay, and administrator recovery
-is a separately proposed extension.
-
-
-Held migration and ordinary-job claims also protect placement capacity. These
-jobs run on the receiving leader; the claim records no authoritative worker
-assignment. Both app and batch planners therefore reserve the complete held
-CPU/memory request on every candidate, without crediting a guessed replica or
-an unrelated report. Before app publication this includes all jobs; afterwards
-it includes only the ordinary tail. This can over-reserve capacity, including
-capacity already reported locally. It prevents new placements from spending
-uncertain commitments; it does not add initial job capacity or quota admission.
-Positive terminal settlement releases the corresponding held request.
+The first version held the gate differently. Raft recorded a bounded *claim* owning every app and job identity in the apply, with the leadership term that admitted it, until the jobs settled. A claim from an earlier term could never be released, each one reserved its jobs' resources on every candidate node, and a few leader changes during leased applies quietly leaked capacity. In 0.2.0 the claims went (#681), along with the agent's own job runner: Chapter 17's "Retiring the batch engine from Chapter 12" tells that story.
 
 ## What actually runs
 
-So the path that deploys your app lives in the Bun agent, in `src/bun/agent/deploy_worker.rs`: `rolling_redeploy`, `blue_green_redeploy`, and an inline `run_before` gate, each calling the supervisor and the container runtime directly.
+The path that deploys your app lives in the Bun agent, in `src/bun/agent/deploy_worker.rs`: `rolling_redeploy` and `blue_green_redeploy`, each calling the supervisor and the container runtime directly.
 
-- **`run_before`**: before an app deploys, the agent runs every job naming it in `run_before` to completion, polling the runtime until the job exits and gating on a clean exit code. A failure aborts the deploy; a gating job runs exactly once and is skipped in the regular jobs loop.
+- **`run_before`**: the hooks run on the common job lifecycle before the app is published, as "Dependency ordering" describes. The agent itself no longer runs jobs; a deploy that names one is refused before it touches a runtime.
 - **Rolling**: `rolling_redeploy` loops on `plan_rolling_step`, starting a replacement or retiring an old instance as the planner says, until it answers `Done`.
 - **Blue-green**: `strategy = "blue-green"` dispatches to `blue_green_redeploy`, which brings the whole green fleet up and health-checks it while blue keeps serving, then publishes green and retires blue. A green failure leaves blue untouched. Chapter 9 covers it.
-- **Scheduled jobs**: a job with a `schedule = "0 3 * * *"` doesn't run at deploy time at all. It's parsed by a small dependency-free cron matcher (`meat::cron`) and fired when its UTC minute matches, at most once per minute.
+- **Scheduled jobs**: a job with a `schedule = "0 3 * * *"` doesn't run at deploy time at all. It's parsed by a small dependency-free cron matcher (`meat::cron`), and the leader claims each matching UTC minute as one run.
 
 ## Raft persistence
 
@@ -575,7 +532,7 @@ Every valid transition gets a test, and so do the forks that depend on config (`
 
 ### Integration tests: the real agent
 
-`tests/integration.rs` exercises the agent end to end with a real (process-backed) runtime: `deploy_app_reaches_running`, `health_check_failing_app_marked_unhealthy`, `job_runs_to_completion`, `job_failed_retries_then_fails`, `init_container_success_allows_app_start`, and `init_container_failure_prevents_start`. These are slower (they spin up the agent and poll real state) but they prove the wiring the fake runtime can't.
+`tests/integration.rs` exercises the agent end to end with a real (process-backed) runtime: `deploy_app_reaches_running`, `health_check_failing_app_never_reaches_running`, `job_runs_to_completion`, `job_failed_retries_then_fails`, `init_container_success_allows_app_start`, and `init_container_failure_prevents_start`. These are slower (they spin up the agent and poll real state) but they prove the wiring the fake runtime can't.
 
 ### Running them
 
@@ -1242,29 +1199,30 @@ Most of these were found by tests that hold a runtime call open (a `kill` that d
 
 ## Jobs that might already have run
 
-Apps are easy to recover: if a web server's fate is unclear, you start it again. Jobs aren't. A job that sends invoices, migrates a schema or charges a card must not run twice just because bun crashed at an awkward moment. So bun records each attempt in a durable checkpoint, and it's honest about what it doesn't know:
+Apps are easy to recover: if a web server's fate is unclear, you start it again. Jobs aren't. A job that sends invoices, migrates a schema or charges a card must not run twice just because bun crashed at an awkward moment. So every attempt ends in an outcome that's honest about what it doesn't know (from `src/bun/task_executor.rs`, trimmed):
 
 ```rust
-pub(super) enum JobPhase {
-    /// Budget claimed before create; execution has not been authorised.
-    Preparing,
-    /// Runtime preparation completed and execution was authorised durably.
-    Launching,
-    /// The runtime reported an actual exit status.
-    Exited {
-        /// Observed process exit code, including zero for success.
-        code: i32,
-    },
-    /// The attempt may have run, but its outcome cannot be established.
-    Unknown,
-    /// Operator stop intent; retirement must still be confirmed.
-    Stopping,
-    /// Operator stop completed without authorising another automatic retry.
-    Stopped,
+pub enum AttemptOutcome {
+    /// The process exited with this code; 0 is success.
+    Exited { code: i32 },
+    /// The process was killed by a signal it didn't choose.
+    Signalled { signal: i32 },
+    /// The attempt ran past the task timeout and was killed.
+    TimedOut,
+    /// Refused before its command ran: retrying can't fix the spec.
+    Refused { reason: String },
+    /// The runtime failed before the command ran, so a retry can't run it twice.
+    LaunchFailed { reason: String },
+    /// Execution may have occurred, but its exit status could not be established.
+    Unknown { reason: String },
+    /// The array was cancelled while the attempt ran.
+    Cancelled,
 }
 ```
 
-(`pub(super)` makes the enum visible to the parent module, `bun`, and nowhere else; it's finer-grained than Go's upper-case export rule.) After a restart, bun adopts a job that's still running. A job that has gone, with an exit code the runtime can still report, becomes `Exited`. Anything else caught in `Preparing` or `Launching` becomes `Unknown`, and stays that way. Bun never guesses "probably failed, let's retry".
+The variants that carry data are little structs inside the enum, and `match` won't let you read `code` without first proving the attempt `Exited`. The distinction that matters here is between `LaunchFailed` and `Unknown`. A launch failure happened before the command was authorised to run, so retrying it is safe. Once the command was authorised, a failure to learn how it ended is `Unknown`: it might have charged the card. Unless the job sets `replay_unknown = true`, an `Unknown` or a timeout stops the run instead of retrying it. Bun never guesses "probably failed, let's retry".
+
+The first version of this lived in the agent, as a per-job checkpoint with its own `Preparing`, `Launching` and `Unknown` phases. In 0.2.0 every job moved onto the common lifecycle of Chapter 17 and the agent stopped running jobs itself, but the rule came along unchanged.
 
 `relish apply` refuses to start a job whose previous outcome is unknown. Our first answer was `--rerun-jobs`, the human saying "I've checked, run it again". In 0.2.0 that flag lost its recovery role. It now only mints a fresh apply operation, so jobs that already succeeded run again; a run that still has an unknown owner refuses the new admission with "acknowledge replay before another admission". The way out is `relish batch replay ID --node NODE --grant-digest DIGEST --acknowledge-side-effects`, which names the exact grant the operator checked, so an old acknowledgement can't authorise a later unknown attempt. The API accepts it only from a user with the Deployer role; GitOps, the reconciler and the service principal never can. Cron gets no exception any more either: while a definition has an unknown owner, the leader skips its occurrences, even with `overlap = "allow"`, because a new occurrence could repeat the uncertain one's side effects. Chapter 8 covers the retry budget and the crash tests behind the first version, and chapter 17 the replay that replaced it.
 
