@@ -11,10 +11,11 @@ of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.0
 ## Install and build the cluster
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | sh
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 ```
 
-This installs `relish`, then builds a three-node cluster in Linux VMs. Every
+This installs `relish`, then builds a three-node cluster in Linux VMs on this
+computer. Without `--laptop` the installer only explains the choices. Every
 download is checked against a pinned digest. It's the only step that takes
 minutes: about a minute and a half once the downloads are cached, closer to
 four the first time. If `relish` isn't on your `PATH` yet, the installer says how to

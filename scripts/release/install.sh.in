@@ -4,10 +4,15 @@
 # POSIX sh: no arrays, no [[ ]], no pipefail. Every pipeline below either ends
 # in a comparison that fails closed or feeds a value we check afterwards.
 #
-# Installer options come before any `relish setup` options:
+# Pick a mode; with none, the installer explains the choices and changes
+# nothing (#670):
+#   --laptop           install the CLI, then build a laptop cluster with
+#                      `relish setup --quickstart`; any option after it that
+#                      isn't the installer's own goes to setup
 #   --install-only     install the CLI and stop
 #   --no-modify-path   touch nothing outside ~/.reliaburger (also
 #                      RELIABURGER_NO_MODIFY_PATH=1)
+#   --help             explain the choices
 set -eu
 
 fail() { printf 'reliaburger: %s\n' "$*" >&2; exit 1; }
@@ -93,8 +98,52 @@ refuse_intel_mac() {
     'reliaburger: this is an Intel Mac, and Relish is built for Apple silicon only since 0.2.2.' \
     'Use a Linux host instead (this installer works on Linux x86_64 and arm64), or' \
     'install 0.2.1, the last release built for Intel Macs:' \
-    '  curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_VERSION=v0.2.1 sh' >&2
+    '  curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_VERSION=v0.2.1 sh -s -- --laptop' >&2
   exit 1
+}
+
+# What each mode does, shown when none is given and for --help. The website
+# bootstrap carries the same function, word for word (test_package.py checks),
+# so `curl | sh` with no flag explains the choices before downloading anything.
+explain_choices() {
+  cat <<'CHOICES'
+Reliaburger installs in one of two ways. Pick one and run the installer again:
+
+  --laptop        a development cluster on this computer: relish, then three
+                  Linux VMs in Lima, running real containers with runc.
+                    curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
+
+  --install-only  just the relish CLI, for a cluster on Linux machines you
+                  already have: install bun on each, run `relish init` on the
+                  first and `relish join` on the rest. The walkthrough is
+                  https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md
+                    curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
+
+Netbooting a set of machines into a cluster is planned, but not built yet.
+
+Until 1.0.0, Reliaburger is for developers and enthusiasts trying it out:
+every mode builds a cluster to learn on, not for production.
+CHOICES
+}
+
+usage() {
+  printf '%s\n' \
+    'usage: install.sh --laptop [--no-modify-path] [relish setup options...]' \
+    '       install.sh --install-only [--no-modify-path]' \
+    '       install.sh --help' \
+    'From curl, put the options after "sh -s --":' \
+    '  curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop' >&2
+}
+
+refuse_usage() {
+  printf 'reliaburger: %s\n' "$1" >&2
+  usage
+  exit 2
+}
+
+choose_mode() {
+  [ -z "$mode" ] || [ "$mode" = "$1" ] || refuse_usage 'choose either --laptop or --install-only'
+  mode=$1
 }
 
 on_path() {
@@ -160,6 +209,38 @@ offer_path_line() {
 
 main() {
   umask 077
+  # An Intel Mac is refused first, whatever the flags say.
+  system=$(uname -s) || fail 'could not detect the operating system'
+  machine=$(uname -m) || fail 'could not detect the CPU architecture'
+  if [ "$system-$machine" = Darwin-x86_64 ]; then
+    refuse_intel_mac
+    machine=arm64
+  fi
+
+  mode=
+  modify_path=true
+  [ -z "${RELIABURGER_NO_MODIFY_PATH:-}" ] || modify_path=false
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --laptop) choose_mode laptop; shift ;;
+      --install-only) choose_mode install-only; shift ;;
+      --no-modify-path) modify_path=false; shift ;;
+      -h|--help) explain_choices; exit 0 ;;
+      *)
+        # The rest belongs to `relish setup --quickstart`.
+        [ "$mode" != laptop ] || break
+        refuse_usage "unknown option: $1" ;;
+    esac
+  done
+  # No mode: say what each one does and touch nothing. Exit non-zero, so an
+  # old `curl | sh && relish ...` script stops instead of carrying on without
+  # a cluster.
+  if [ -z "$mode" ]; then
+    explain_choices
+    printf '\nNothing was installed.\n'
+    exit 2
+  fi
+
   release_base=${RELIABURGER_RELEASE_BASE_URL:-https://github.com/@REPOSITORY@/releases/download/@VERSION@}
   case $release_base in
     https:///*|*[?#@\\[:space:]]*) fail 'release mirror must be an HTTPS URL without credentials, query or fragment' ;;
@@ -168,27 +249,7 @@ main() {
   esac
   release_base=${release_base%/}
 
-  install_only=false
-  modify_path=true
-  [ -z "${RELIABURGER_NO_MODIFY_PATH:-}" ] || modify_path=false
-  while [ "$#" -gt 0 ]; do
-    case $1 in
-      --install-only) install_only=true; shift ;;
-      --no-modify-path) modify_path=false; shift ;;
-      *) break ;;
-    esac
-  done
-  if [ "$install_only" = true ] && [ "$#" -gt 0 ]; then
-    fail '--install-only takes no further arguments'
-  fi
-
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
-  system=$(uname -s) || fail 'could not detect the operating system'
-  machine=$(uname -m) || fail 'could not detect the CPU architecture'
-  if [ "$system-$machine" = Darwin-x86_64 ]; then
-    refuse_intel_mac
-    machine=arm64
-  fi
   case "$system-$machine" in
     Darwin-arm64) platform=macos-aarch64; expected=@MACOS_AARCH64@; size=@MACOS_AARCH64_SIZE@ ;;
     Linux-aarch64|Linux-arm64) platform=linux-aarch64; expected=@LINUX_AARCH64@; size=@LINUX_AARCH64_SIZE@ ;;
@@ -252,7 +313,7 @@ main() {
     *) printf 'reliaburger: note: %s comes first on your PATH\n' "$found" >&2 ;;
   esac
 
-  if [ "$install_only" = true ]; then
+  if [ "$mode" = install-only ]; then
     exit 0
   fi
   if [ -n "${RELIABURGER_RELEASE_BASE_URL:-}" ]; then

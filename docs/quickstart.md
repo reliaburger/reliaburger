@@ -1,7 +1,9 @@
 # A laptop cluster
 
 The command below installs the published, signed 0.2.0 release
-(16 October 2026) and builds a laptop cluster from it. The two cold installs of the
+(16 October 2026) and builds a laptop cluster from it. A laptop cluster is a
+development cluster: until 1.0.0, Reliaburger is for developers and
+enthusiasts trying it out, not for production. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
 to a ready three-node cluster ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
 Linux hosts haven't been measured yet, and your connection and what's already
@@ -10,17 +12,26 @@ cached decide most of the time.
 It runs on macOS on Apple silicon, or on Linux (x86_64 or arm64) with QEMU and
 KVM. Intel Macs aren't supported from 0.2.2: the installer refuses one and
 suggests a Linux host, or 0.2.1, the last release built for Intel Macs
-(`curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_VERSION=v0.2.1 sh`).
+(`curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_VERSION=v0.2.1 sh -s -- --laptop`).
 
 ## Install and boot
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | sh
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 relish nodes
 relish status
 relish logs hello
 relish dashboard             # Ctrl-C stops the browser connection
 ```
+
+`--laptop` picks the laptop cluster. Run the installer with no flag and it
+only explains the choices, then exits with status 2 having downloaded nothing:
+`--laptop` for this computer, `--install-only` for the CLI alone when the
+cluster runs on Linux machines you already have (the
+[Linux servers guide](linux-servers.md) walks through `relish init` and
+`relish join`), and netbooting machines into a cluster, which is planned but
+not built. An unknown option gets the usage and status 2. Options after
+`--laptop` that aren't the installer's own go to `relish setup --quickstart`.
 
 The installer says what it's fetching before each download (for example
 `Downloading relish v0.2.0 for macos-aarch64 (RELISH_SIZE_0_2_0 MiB)...`), draws curl's
@@ -32,7 +43,7 @@ already on your `PATH`, it links `~/.local/bin/relish` there and you're done.
 Otherwise it prints the one line to add for your shell (`~/.zshrc`,
 `~/.bash_profile` on macOS, `~/.bashrc` on Linux, `fish_add_path` for fish)
 and asks, on the terminal, whether to add it for you. It never edits a file
-without a yes. Pass `--no-modify-path` (`sh -s -- --no-modify-path`) or set
+without a yes. Pass `--no-modify-path` (`sh -s -- --laptop --no-modify-path`) or set
 `RELIABURGER_NO_MODIFY_PATH=1` to keep everything inside `~/.reliaburger`.
 Until you open a new terminal, setup prints next steps with the full path.
 
@@ -79,10 +90,11 @@ fought, and the guest clock jumped back about 0.1 s every 10 s.
 For a smaller single-node cluster:
 
 ```sh
-curl -fsSL https://reliaburger.com/install.sh | sh -s -- --nodes 1
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop --nodes 1
 ```
 
-To install only the CLI, pass `--install-only`. Then start it separately:
+To install only the CLI, pass `--install-only` instead of `--laptop`. Then
+start it separately:
 
 ```sh
 relish setup --quickstart --nodes 3
