@@ -1455,6 +1455,20 @@ you've said whether it prints JSON. A refusal exits 2, the usage-error code,
 since asking a command for output it doesn't have is a usage error. The flag
 also gained the short form the manual had been documenting all along, `-o`.
 
+Adding `relish events` and one flag broke every parser test on Linux CI with
+a stack overflow, while macOS passed. Clap's derive writes one function,
+`augment_subcommands`, that builds every subcommand of `Command` and every
+argument declared inline in a variant. In a debug build each builder call
+keeps its own copy of the `Arg` on the stack, about 8 KiB per argument, so that
+one function's frame had reached a megabyte, plus another half for the `fault`
+subcommands it calls. Linux gives test threads 2 MiB; macOS gives more. The
+fix moves the biggest variants' arguments into their own `#[derive(Args)]`
+structs and boxes them, `Run(Box<RunOptions>)`, so each struct gets its own
+small function, called one after another rather than all in one frame. The
+real binary was never at risk: `main` parses on the process's main thread,
+which has 8 MiB, before the runtime starts any other thread. The tests now pass
+with a 1.5 MiB stack.
+
 Two smaller choices round out the command. Selection: `--filter
 scheduling,firewall` picks those groups, and an entry that names an exact case,
 such as `process_job_with_exit_zero_succeeds`, picks just that case; no filter
