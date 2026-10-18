@@ -144,6 +144,8 @@ pub struct Compatibility {
 /// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
 /// train opened. Each 0.2.2 change to the wire or durable state adds its
 /// line below this one, not another bump.
+/// An exec answer, from `POST /v1/exec` and from a process owner's
+/// exec socket, carries the command's `exit_code` beside its `output` (#522).
 /// `JobSpec::pids`, the per-command process limit, in Raft desired state,
 /// task-array templates and node syncs, and the OCI `linux.resources.pids`
 /// block in fresh job containers' specs and their owner records (#741).

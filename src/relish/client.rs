@@ -1124,6 +1124,15 @@ impl BunClient {
             .await
     }
 
+    /// Fetch the newest events across the cluster that match `filter`,
+    /// oldest first, plus a warning per node that didn't answer.
+    pub async fn events_matching(
+        &self,
+        filter: &super::events_cmd::EventsFilter,
+    ) -> Result<crate::bun::cluster_view::ClusterEvents, RelishError> {
+        self.get_typed_json(&filter.path()).await
+    }
+
     /// Fetch the newest `limit` events recorded by the node this client
     /// talks to, and no other.
     pub async fn node_events(
@@ -1867,13 +1876,15 @@ impl BunClient {
         Ok(String::new())
     }
 
-    /// Execute a command inside a running instance.
+    /// Execute a command inside a running instance, once, without stdin or
+    /// a terminal. A command that ran answers with its output and exit
+    /// code, whatever the code.
     pub async fn exec(
         &self,
         app: &str,
         namespace: &str,
         command: &[String],
-    ) -> Result<String, RelishError> {
+    ) -> Result<crate::grill::ExecOutput, RelishError> {
         let url = format!("{}/v1/exec/{}/{}", self.base_url, app, namespace);
         let response = self
             .http()?
@@ -1889,12 +1900,10 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+        response.json().await.map_err(|e| RelishError::ApiError {
             status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-
-        Ok(json["output"].as_str().unwrap_or("").to_string())
+            body: format!("failed to parse exec response: {e}"),
+        })
     }
 
     /// Permanently retire a node after explicit external workload fencing.
@@ -2998,6 +3007,32 @@ mod tests {
         assert_eq!(
             secret_public_key_path(Some("a&b")),
             "/v1/secret/public-key?namespace=a%26b"
+        );
+    }
+
+    /// D34: a command that ran and failed is an answer, not an HTTP error.
+    #[tokio::test]
+    async fn exec_returns_the_remote_exit_code() {
+        let app = axum::Router::new().route(
+            "/v1/exec/web/default",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"output": "boom\n", "exit_code": 3}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let result = client.exec("web", "default", &["false".into()]).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap(),
+            crate::grill::ExecOutput {
+                output: "boom\n".into(),
+                exit_code: 3,
+            }
         );
     }
 

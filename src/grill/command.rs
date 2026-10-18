@@ -205,7 +205,11 @@ impl OwnedCommands {
     /// Run an auxiliary command supervised by this command's independent owner.
     /// Cancelling the future closes its control socket and requests child retirement.
     /// Retirement of the main command waits for every accepted auxiliary command.
-    pub async fn exec(&self, id: &CommandId, command: &[String]) -> Result<String, CommandError> {
+    pub async fn exec(
+        &self,
+        id: &CommandId,
+        command: &[String],
+    ) -> Result<crate::grill::ExecOutput, CommandError> {
         Ok(self.control.exec(&id.0, command).await?)
     }
 

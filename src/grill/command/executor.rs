@@ -150,7 +150,11 @@ impl ClaimedCommandExecutor {
     /// Run auxiliary work without holding the adapter mutex during its lifetime.
     /// Cancellation closes the caller's owner socket; sealing can retire the role
     /// concurrently and waits for its accepted auxiliary children to disappear.
-    pub async fn exec_role(&self, role: RuntimeRole, command: &[String]) -> io::Result<String> {
+    pub async fn exec_role(
+        &self,
+        role: RuntimeRole,
+        command: &[String],
+    ) -> io::Result<crate::grill::ExecOutput> {
         if self.cleanup {
             return Err(io::Error::other(
                 "cleanup handle cannot execute runtime roles",

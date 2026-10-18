@@ -50,17 +50,22 @@ impl ManifestSource {
 pub enum ManifestFormat {
     /// Reliaburger's own TOML.
     Reliaburger,
-    /// Kubernetes YAML (any document with top-level `apiVersion` and `kind`).
+    /// Kubernetes YAML or JSON (a document with top-level `apiVersion` and `kind`).
     Kubernetes,
 }
 
-/// Tell Kubernetes YAML from Reliaburger TOML by its shape.
+/// Tell Kubernetes YAML or JSON from Reliaburger TOML by its shape.
 ///
 /// A top-level `apiVersion:` line is invalid TOML, so a document with one
 /// (and a `kind:`) can only be Kubernetes.
 pub fn detect_format(content: &str) -> ManifestFormat {
     let top_level = |key: &str| content.lines().any(|line| line.starts_with(key));
-    if top_level("apiVersion:") && top_level("kind:") {
+    // TOML can't open with `{`, so a JSON object naming its apiVersion and
+    // kind is Kubernetes JSON, which the YAML importer reads as it is.
+    let json = content.trim_start().starts_with('{')
+        && content.contains("\"apiVersion\"")
+        && content.contains("\"kind\"");
+    if json || (top_level("apiVersion:") && top_level("kind:")) {
         ManifestFormat::Kubernetes
     } else {
         ManifestFormat::Reliaburger
@@ -83,6 +88,12 @@ pub async fn load(source: &ManifestSource) -> Result<LoadedManifest, RelishError
         ManifestSource::Url(url) => fetch(url).await?,
     };
     parse(&content)
+}
+
+/// Read and parse a local manifest file. `lint`, `deploy`, `diff` and
+/// `compile` use this, so they read what `apply` reads.
+pub fn load_file(path: &Path) -> Result<LoadedManifest, RelishError> {
+    parse(&read_file(path)?)
 }
 
 /// Parse manifest text, importing it first when it's Kubernetes YAML.
@@ -225,6 +236,36 @@ spec:
         assert_eq!(app.port, Some(80));
         let report = loaded.migration_report.unwrap();
         assert!(report.contains("Deployment/web"), "{report}");
+    }
+
+    const DEPLOYMENT_JSON: &str = r#"{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {"name": "web"},
+  "spec": {"template": {"spec": {"containers": [{"name": "web", "image": "nginx:1"}]}}}
+}"#;
+
+    #[test]
+    fn kubernetes_json_is_told_apart_from_toml() {
+        assert_eq!(detect_format(DEPLOYMENT_JSON), ManifestFormat::Kubernetes);
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn kubernetes_json_imports_like_yaml() {
+        let loaded = parse(DEPLOYMENT_JSON).unwrap();
+        assert_eq!(loaded.config.app["web"].image.as_deref(), Some("nginx:1"));
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn local_files_load_through_the_same_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web.yaml");
+        std::fs::write(&path, DEPLOYMENT).unwrap();
+        let loaded = load_file(&path).unwrap();
+        assert!(loaded.config.app.contains_key("web"));
+        assert!(loaded.migration_report.is_some());
     }
 
     #[test]

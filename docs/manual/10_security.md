@@ -127,7 +127,7 @@ caller and the end of the grace period.
 it expires (`never`, `(in 30d)` or `(expired)`), when it was **last used** and
 its **scope** (`all`, or `apps=… namespaces=…`). New columns are added on the
 right, so a script that cuts the older ones out keeps working;
-`relish --output json token list` gives the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
+`relish -o json token list` gives the same fields (`scope`, `expires_at`, `last_used` in Unix seconds, `null` for
 never) plus a `principal` id that matches the `principal` of that token's audit
 events.
 
