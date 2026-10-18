@@ -486,13 +486,20 @@ pub(super) async fn prepare_and_reserve_node_fault(
     if council.is_leader().await {
         return reserve_node_fault_on_leader(state, prepared).await;
     }
-    let Some(leader) = leader_api_url(state, council).await else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "node fault safety requires a known council leader",
-        )
-            .into_response()
-            .into());
+    // This node starts the reservation itself, and the leader's reserve
+    // route never forwards, so there's no inbound marker to pass on. A
+    // leader that can't confirm it leads gets a 503, not a call to itself.
+    let leader = match leader_api_url(state, council, &HeaderMap::new()).await {
+        Ok(leader) => leader,
+        Err(NoLeaderRoute::Unknown) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node fault safety requires a known council leader",
+            )
+                .into_response()
+                .into());
+        }
+        Err(refusal) => return Err(Box::new(refusal.into_response())),
     };
     let bytes = post_node_fault_internal(state, format!("{leader}/v1/chaos/reserve"), &prepared)
         .await
