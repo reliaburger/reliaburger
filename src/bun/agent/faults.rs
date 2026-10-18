@@ -388,6 +388,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         crate::smoker::types::SafetyContext {
+            workload: request.workload,
             council_size,
             council_nodes_with_active_faults: active_node_faults,
             leader_node_id,
@@ -686,6 +687,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         rule: &crate::smoker::types::FaultRule,
     ) -> Vec<(InstanceId, std::path::PathBuf)> {
+        if rule.workload.runs_to_completion() {
+            // A command in a reusable executor was refused before this, so
+            // every attempt with a cgroup has one of its own.
+            return self
+                .attempt_targets(rule)
+                .into_iter()
+                .filter_map(|attempt| match attempt.handle {
+                    crate::bun::live_attempts::AttemptHandle::Instance(id) => {
+                        Some((id, attempt.cgroup?))
+                    }
+                    crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+                })
+                .collect();
+        }
         self.supervisor
             .list_instances()
             .iter()
@@ -1020,6 +1035,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rule: &crate::smoker::types::FaultRule,
         saved: &[(String, String)],
     ) -> Vec<(String, std::path::PathBuf, String)> {
+        if rule.workload.runs_to_completion() {
+            // Only an attempt still running under the same runtime instance
+            // gets its value back; a finished one took its cgroup with it.
+            let attempts = self.attempt_targets(rule);
+            return saved
+                .iter()
+                .filter_map(|(id, value)| {
+                    let path = attempts.iter().find_map(|attempt| match &attempt.handle {
+                        crate::bun::live_attempts::AttemptHandle::Instance(instance)
+                            if &instance.0 == id =>
+                        {
+                            attempt.cgroup.clone()
+                        }
+                        _ => None,
+                    })?;
+                    Some((id.clone(), path, value.clone()))
+                })
+                .collect();
+        }
         saved
             .iter()
             .filter_map(|(id, value)| {
@@ -1217,6 +1251,61 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         self.network_faults.pending_callers = pending;
+        callers.extend(self.attempt_callers(deadline).await);
+        callers
+    }
+
+    /// Job and task-array attempts in a runtime instance of their own, as
+    /// callers. A command in a reusable executor shares the executor's
+    /// cgroup and network with the tasks around it, so it is never one; a
+    /// fault from it is refused at injection.
+    ///
+    /// An attempt's cgroup is read afresh each time rather than cached: a
+    /// runtime slot's instance id comes back for the next task, under a new
+    /// cgroup. One the runtime can't name before `deadline` is left out
+    /// until the next reconcile, a second later.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    async fn attempt_callers(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Vec<crate::smoker::network::LocalCaller> {
+        use crate::smoker::network::applies_to_caller;
+        let mut callers = Vec::new();
+        for attempt in self.live_attempts.snapshot() {
+            let crate::bun::live_attempts::AttemptHandle::Instance(id) = attempt.handle else {
+                continue;
+            };
+            if attempt.shared_executor.is_some() {
+                continue;
+            }
+            let named_as_source = self.fault_registry.iter().any(|rule| {
+                rule.fault_type.source_app().is_some()
+                    && applies_to_caller(rule, &attempt.job, &attempt.namespace)
+            });
+            let cgroup_id = if named_as_source {
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.supervisor.grill().workload_cgroup(&id),
+                )
+                .await
+                {
+                    Ok(Ok(cgroup)) => cgroup,
+                    Ok(Err(error)) => {
+                        eprintln!("smoker: attempt {id} has no provable cgroup: {error}");
+                        None
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            callers.push(crate::smoker::network::LocalCaller {
+                instance_id: id.0,
+                app: attempt.job,
+                namespace: attempt.namespace,
+                cgroup_id,
+            });
+        }
         callers
     }
 
@@ -1317,14 +1406,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Instances with their own container address, the only ones a delay
-    /// can shape.
+    /// can shape: app instances with an address, and job attempts in a
+    /// container with its own network namespace.
     #[cfg(target_os = "linux")]
     fn addressed(&self) -> std::collections::HashSet<String> {
+        let attempts = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter(|attempt| attempt.shared_executor.is_none())
+            .filter_map(|attempt| match attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id) => Some(id),
+                crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+            })
+            // `/run/netns` is a tmpfs, so this stat never waits on a disk.
+            .filter(|id| crate::grill::netns::namespace_path(id).exists())
+            .map(|id| id.0);
         self.supervisor
             .list_instances()
             .into_iter()
             .filter(|instance| instance.container_ip.is_some())
             .map(|instance| instance.id.0.clone())
+            .chain(attempts)
             .collect()
     }
 

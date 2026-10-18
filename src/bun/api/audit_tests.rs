@@ -317,6 +317,8 @@ async fn fault_injected_audit_carries_namespace_and_override_flags() {
     )
     .await;
     let body = serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::DnsNxdomain,
         target_service: "web".to_string(),
         namespace: None,

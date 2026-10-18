@@ -136,6 +136,7 @@ pub struct FaultTargeting {
     #[arg(long)]
     pub namespace: Option<String>,
     /// Scope the fault to a single instance id instead of every instance.
+    /// For a job or task array, a task index.
     #[arg(long)]
     pub instance: Option<String>,
     /// Route the fault to a specific node (leader-mediated distribution).
@@ -161,6 +162,8 @@ fn make_request(
     targeting: &FaultTargeting,
 ) -> FaultRequest {
     FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type,
         target_service,
         namespace: targeting.namespace.clone(),
@@ -497,7 +500,11 @@ fn render_fault_list(faults: &[FaultSummary]) -> String {
             fault.fault_type,
             fault.node.as_deref().unwrap_or("-"),
             target,
-            fault.target_instance.as_deref().unwrap_or("-"),
+            match (&fault.target_instance, fault.task_index) {
+                (_, Some(index)) => format!("task {index}"),
+                (Some(instance), None) => instance.clone(),
+                (None, None) => "-".to_string(),
+            },
             format!("{}s", fault.remaining_secs),
             fault.injected_by,
         );
@@ -697,6 +704,7 @@ mod tests {
 
     fn summary(id: u64, node: &str, service: &str) -> FaultSummary {
         FaultSummary {
+            task_index: None,
             id,
             fault_type: "kill".to_string(),
             target_service: service.to_string(),

@@ -489,6 +489,7 @@ const NODE_FAULT_ID: u64 = 9;
 
 fn fault_on(id: u64, service: &str, namespace: Option<&str>) -> crate::smoker::types::FaultSummary {
     crate::smoker::types::FaultSummary {
+        task_index: None,
         id,
         fault_type: "pause".to_string(),
         target_service: service.to_string(),

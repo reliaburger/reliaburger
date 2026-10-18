@@ -631,6 +631,49 @@ The rest of the fix follows one idea: build once, then fan out.
   it. Code that only the no-features pass compiles depends on a feature alone and builds the
   same on Linux. Dropping the second pass on macOS saves about three minutes.
 
+Building once still left a repeated cost. Each acceptance suite is a Make owner that runs
+nextest twice: `list`, to record which tests it selected, then `run`. Both passed
+`--archive-file`, so both unpacked the whole 2.9 GB archive. Four owners made eight
+extractions in `acceptance`, and the one cluster owner made two. On one October run those
+extractions took six minutes and 43 seconds, and only one per job was needed.
+
+Now each job extracts the archive once, in a step of its own, before any suite starts:
+
+```sh
+cargo nextest list --archive-file tests.tar.zst --extract-to . --extract-overwrite \
+    --workspace-remap . --list-type binaries-only --message-format json
+```
+
+`--list-type binaries-only` extracts and reads the archive's metadata without starting a test
+binary. The suites then use nextest's build reuse instead of the archive: `--binaries-metadata`
+and `--cargo-metadata` point at the two JSON files the extraction left in `target/nextest`,
+and `--target-dir-remap target --workspace-remap .` say where the build and the workspace
+live now. The Make recipes still choose the tests and own their prerequisites. Only the
+source of the executables changed.
+
+Our first attempt (#933) didn't survive hosted CI. It treated the extracted tree as
+untrusted: it hashed every extracted file into a receipt and had each owner rehash the lot
+before discovery, between discovery and execution, and afterwards. That's several passes over
+gigabytes of test binaries, which could easily eat the time we were trying to save. It also
+never ran a test. Its list of allowed paths expected only the two metadata files under
+`target/nextest`, and a real archive also carries `target/nextest/libdirs`, the Rust standard
+library the binaries link against. Both jobs stopped at "invalid immutable archive payload
+path".
+
+So what does the evidence actually need? The extracted tree lives in one job on one runner,
+and nothing outside that job can write to it. The job checks the archive's hash against the
+build job's output once, before extracting. Then it writes a small receipt: the archive's
+digest, the extraction command, and the digests of the two metadata files. The workflow
+passes the receipt's digest to each suite as a trusted step output. Each suite checks those
+two small files before it lists anything, and its sealed evidence carries the receipt. When
+the evidence gate aggregates, it checks that the suite reused exactly that metadata, from
+the builder's archive, with the same nextest. A suite that opened the archive again, or
+named different metadata, fails the gate. It's the same chain as before, archive to suite,
+with no multi-gigabyte rehashing.
+
+The local recipes work the same way, by the way: `make test-upgrade-node` followed by
+`make test-upgrade-cluster` shares one `target` directory too.
+
 The last piece is choosing what a run needs. A small script diffs a pull request against its
 base and sets three outputs, and every expensive job asks one of them:
 
@@ -920,6 +963,13 @@ they're allowed to break an API or a wire format. `make outdated` lists them (it
 list, without ever failing the build. A lag report that broke builds would get muted
 within a week. One that nobody reads would rot just as fast, which is why the refresh is a
 numbered step in the release runbook, not a good intention.
+
+The `age` bump from 0.10 to 0.12 shows what "deliberate" means. The API we seal the root
+CA backup with changed shape, which the compiler caught. What the compiler can't catch is
+whether 0.12 still opens a file 0.10 sealed years ago, so that PR first checked in files
+sealed by the old build and made the tests open them (chapter 4 has the details). It also
+paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
+`cargo audit` exception went too.
 
 Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
 3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its

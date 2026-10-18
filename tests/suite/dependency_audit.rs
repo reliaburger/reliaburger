@@ -65,3 +65,22 @@ fn lock_file_has_no_bincode_and_audit_needs_no_exception_for_it() {
         ".cargo/audit.toml still ignores RUSTSEC-2025-0141"
     );
 }
+
+/// RUSTSEC-2024-0370: proc-macro-error is unmaintained. It came in at build
+/// time through age 0.10's i18n-embed-fl 0.7. The age 0.12 bump (#1026)
+/// moved to i18n-embed-fl 0.10, which uses proc-macro-error2, so the lock
+/// file must not pull it back in and the audit needs no exception for it.
+#[test]
+fn lock_file_has_no_proc_macro_error_and_audit_needs_no_exception_for_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    assert!(
+        !lock.contains("name = \"proc-macro-error\""),
+        "Cargo.lock contains proc-macro-error again"
+    );
+    let audit = std::fs::read_to_string(root.join(".cargo/audit.toml")).unwrap();
+    assert!(
+        !audit.contains("\"RUSTSEC-2024-0370\""),
+        ".cargo/audit.toml still ignores RUSTSEC-2024-0370"
+    );
+}

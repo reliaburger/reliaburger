@@ -1922,8 +1922,18 @@ And `relish` itself. It often runs on a node (the soak's harness does), and it r
 
 The behaviour tests sit beside the memory ones in `upgrade::manager`. A registry that sends half the binary and closes the connection gets a transient refusal and leaves no file behind, and a retry after it stages the whole binary, not the first half with the second appended. A tampered binary is still a `HashMismatch`, now read from the file, and is deleted. A passed leader check leaves nothing in the binary directory.
 
+### The test that copied itself
+
+A node's first upgrade has nothing to roll back to: a plain install has a `bun` file, not a `bun-v0.1.0`. So staging adopts the running executable into the store first. It copies it, hashes the copy and syncs it, a piece at a time like everything else here. In `first_upgrade_adopts_unversioned_binary_into_store` the running executable is the library's test binary, and that is 837 MB of debug build.
+
+On 17 October the test timed out under `make test` on a laptop busy with other agents' builds ([#993](https://github.com/reliaburger/reliaburger/issues/993)). Its last line was `phase=stage-begin`, 51 ms in, and then nothing for 60 s. Nothing at all for that long looks like a blocked runtime or a lock. It wasn't. On an idle laptop, staging took 3.2 s. Under twelve spinning CPU loops and three writers that synced 1.5 GB files, with the sibling builds beside them, it took 7 to 18 s in a row of 20 runs, and 12 to 20 s in three lanes of 10 at load average 30 to 180. It got slower as the load climbed, and it always finished. macOS's `sample` caught the runtime thread parked in `kevent`, which is Tokio waiting with nothing to run, and the blocking-pool thread inside `Candidate::sha256`. The work was on the right thread. There was just 837 MB of it, and a 60 s budget held about three times the worst run we saw.
+
+So the fix is in the test. `UpgradeManager` gained a private `adopt_from: Option<PathBuf>`, which `bun` leaves as `None`, meaning "the executable this process runs". The test points it at an 18-byte file, then checks that exactly those bytes landed as `bun-v0.1.0` and that the stub envelope holds their digest. That's a stronger check than before, which only asked whether the file existed. `adoption_copies_the_executable_this_process_runs_by_default` keeps the default honest without copying anything. Under the same load the staging step now takes 80 to 900 ms, and 50 of 50 runs passed.
+
 ### What we decided not to do
 
 We didn't add a size limit to the download. The registry already refuses uploads over 512 MiB, and each attempt has a timeout, so a misbehaving registry can't stream into the file forever.
 
 We didn't stream the hash. `fetch_once` could feed SHA-256 as the pieces arrive and refuse a wrong hash before the signature check reads the file again. But `verify_binary` checks the hash first anyway, from the page cache, and one check in one place is easier to trust than two.
+
+We didn't raise the adoption test's timeout either. A longer budget would have hidden the 837 MB, and it would have stretched again as the test binary grew.

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType, SerialNumber as RcgenSerial,
+    Issuer, KeyPair, KeyUsagePurpose, SanType, SerialNumber as RcgenSerial,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 
@@ -130,16 +130,11 @@ pub fn generate_intermediate_ca(
     let private_key_der = key_pair.serialize_der();
     let params = intermediate_ca_params(role, cluster_name, serial)?;
 
-    // Sign with parent — both self_signed and signed_by consume their params,
-    // so we clone before calling.
-    let parent_cert = parent_params
-        .clone()
-        .self_signed(parent_keypair)
-        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
-
     let certificate = params
-        .clone()
-        .signed_by(&key_pair, &parent_cert, parent_keypair)
+        .signed_by(
+            &key_pair,
+            &Issuer::from_params(parent_params, parent_keypair),
+        )
         .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
@@ -268,18 +263,15 @@ pub fn sign_intermediate_csr(
         .map_err(|e| CaError::SignFailed(format!("invalid root key DER: {e}")))?;
     let root_keypair = KeyPair::from_der_and_sign_algo(&root_key, &rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::SignFailed(format!("invalid root key: {e}")))?;
-    let root_params = CertificateParams::from_ca_cert_der(
-        &rustls::pki_types::CertificateDer::from(root_certificate_der.to_vec()),
-    )
-    .map_err(|e| CaError::SignFailed(format!("invalid root certificate: {e}")))?;
+    let root_params = issuer_params_from_der(root_certificate_der)?;
 
     let mut params = intermediate_ca_params(role, cluster_name, serial)?;
     bound_leaf_validity(&mut params, &root_params)?;
-    let root = root_params
-        .self_signed(&root_keypair)
-        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
     let certificate = params
-        .signed_by(&csr.public_key, &root, &root_keypair)
+        .signed_by(
+            &csr.public_key,
+            &Issuer::from_params(&root_params, &root_keypair),
+        )
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
     Ok(certificate.der().to_vec())
 }
@@ -322,10 +314,84 @@ pub fn ca_signing_material(
         .map_err(|e| CaError::KeyGenFailed(format!("invalid CA key DER: {e}")))?;
     let keypair = KeyPair::from_der_and_sign_algo(&key_der, &rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::KeyGenFailed(format!("invalid CA key: {e}")))?;
-    let cert_der = rustls::pki_types::CertificateDer::from(ca.certificate_der.clone());
-    let params = CertificateParams::from_ca_cert_der(&cert_der)
-        .map_err(|e| CaError::CertGenFailed(format!("invalid CA cert: {e}")))?;
+    let params = issuer_params_from_der(&ca.certificate_der)?;
     Ok((keypair, params))
+}
+
+/// Rebuild the issuer params a stored CA certificate signs with.
+///
+/// A leaf names its issuer by copying the CA's subject name, and the leaf's
+/// validity is clamped to the CA's. So the params carry what an issuer needs,
+/// read off the signed certificate: the subject name with its original
+/// string types (a verifier compares names byte for byte), the validity
+/// window, and the subject key identifier (rcgen would copy it into an
+/// authority key identifier, which our leaves don't currently carry). They
+/// describe an issuer, not a certificate to re-create.
+///
+/// rcgen 0.13 had `CertificateParams::from_ca_cert_der` for this; 0.14 folds
+/// it into `Issuer::from_ca_cert_der`, which hides the name and validity we
+/// need to bound a leaf, so we read them here.
+pub fn issuer_params_from_der(certificate_der: &[u8]) -> Result<CertificateParams, CaError> {
+    use x509_parser::extensions::ParsedExtension;
+
+    let invalid =
+        |reason: String| CaError::InvalidInput(format!("invalid CA certificate: {reason}"));
+    let (_, certificate) =
+        x509_parser::parse_x509_certificate(certificate_der).map_err(|e| invalid(e.to_string()))?;
+
+    let mut params = CertificateParams::default();
+    params.distinguished_name = distinguished_name_from_x509(certificate.subject())?;
+    for extension in certificate.extensions() {
+        if let ParsedExtension::SubjectKeyIdentifier(key_id) = extension.parsed_extension() {
+            params.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(key_id.0.to_vec());
+        }
+    }
+    let validity = certificate.validity();
+    params.not_before = time::OffsetDateTime::from_unix_timestamp(validity.not_before.timestamp())
+        .map_err(|e| invalid(format!("not_before: {e}")))?;
+    params.not_after = time::OffsetDateTime::from_unix_timestamp(validity.not_after.timestamp())
+        .map_err(|e| invalid(format!("not_after: {e}")))?;
+    Ok(params)
+}
+
+/// Convert a parsed X.509 name into rcgen's form, keeping each attribute's
+/// string type so rcgen re-encodes the same bytes.
+fn distinguished_name_from_x509(
+    name: &x509_parser::x509::X509Name<'_>,
+) -> Result<DistinguishedName, CaError> {
+    use x509_parser::der_parser::asn1_rs::Tag;
+
+    let invalid = |reason: &str| CaError::InvalidInput(format!("invalid CA subject: {reason}"));
+    let mut distinguished_name = DistinguishedName::new();
+    for relative_name in name.iter() {
+        let mut attributes = relative_name.iter();
+        let (Some(attribute), None) = (attributes.next(), attributes.next()) else {
+            return Err(invalid(
+                "each name component must hold exactly one attribute",
+            ));
+        };
+        let oid: Vec<u64> = attribute
+            .attr_type()
+            .iter()
+            .ok_or_else(|| invalid("attribute type is not a valid OID"))?
+            .collect();
+        let value = attribute.attr_value();
+        let text =
+            std::str::from_utf8(value.data).map_err(|_| invalid("attribute is not valid text"))?;
+        let value = match value.header.tag() {
+            Tag::Utf8String => rcgen::DnValue::Utf8String(text.to_owned()),
+            Tag::PrintableString => rcgen::DnValue::PrintableString(
+                text.try_into()
+                    .map_err(|_| invalid("not a printable string"))?,
+            ),
+            Tag::Ia5String => rcgen::DnValue::Ia5String(
+                text.try_into().map_err(|_| invalid("not an IA5 string"))?,
+            ),
+            _ => return Err(invalid("unsupported attribute string type")),
+        };
+        distinguished_name.push(DnType::from_oid(&oid), value);
+    }
+    Ok(distinguished_name)
 }
 
 /// Issue a leaf with a centrally allocated 64-bit serial.
@@ -429,13 +495,8 @@ fn sign_end_entity_cert(
     set_validity(&mut params, lifetime)?;
     bound_leaf_validity(&mut params, ca_params)?;
 
-    let ca_cert = ca_params
-        .clone()
-        .self_signed(ca_keypair)
-        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
-
     let certificate = params
-        .signed_by(&key_pair, &ca_cert, ca_keypair)
+        .signed_by(&key_pair, &Issuer::from_params(ca_params, ca_keypair))
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
@@ -461,12 +522,8 @@ pub fn issue_node_cert(
     let mut params = node_cert_params(node_id, serial, NODE_LEAF_LIFETIME)?;
     bound_leaf_validity(&mut params, ca_params)?;
 
-    let ca_cert = ca_params
-        .clone()
-        .self_signed(ca_keypair)
-        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
     let certificate = params
-        .signed_by(&key_pair, &ca_cert, ca_keypair)
+        .signed_by(&key_pair, &Issuer::from_params(ca_params, ca_keypair))
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
 
     Ok((certificate.der().to_vec(), private_key_der, serial))
@@ -501,12 +558,11 @@ pub fn sign_node_csr(
 
     let mut params = node_cert_params(node_id, serial, lifetime)?;
     bound_leaf_validity(&mut params, ca_params)?;
-    let ca_cert = ca_params
-        .clone()
-        .self_signed(ca_keypair)
-        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
     let certificate = params
-        .signed_by(&csr_params.public_key, &ca_cert, ca_keypair)
+        .signed_by(
+            &csr_params.public_key,
+            &Issuer::from_params(ca_params, ca_keypair),
+        )
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
 
     Ok((certificate.der().to_vec(), serial))
@@ -1252,5 +1308,139 @@ mod tests {
             (now + 3595..=now + 3600).contains(&not_after),
             "an hour-long override must end an hour from issue: {not_after} vs {now}"
         );
+    }
+
+    /// The raw DER of a certificate's issuer name and its subject name.
+    fn raw_issuer_and_subject(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
+        (
+            cert.issuer().as_raw().to_vec(),
+            cert.subject().as_raw().to_vec(),
+        )
+    }
+
+    /// Verify `leaf` the way a TLS client does: rustls's webpki verifier,
+    /// trusting only `root`, with `intermediate` presented alongside.
+    fn webpki_accepts(leaf: &[u8], intermediate: &[u8], root: &[u8], name: &str) {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(root.to_vec())).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            std::sync::Arc::new(roots),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        verifier
+            .verify_server_cert(
+                &CertificateDer::from(leaf.to_vec()),
+                &[CertificateDer::from(intermediate.to_vec())],
+                &ServerName::try_from(name.to_string()).unwrap(),
+                &[],
+                UnixTime::now(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_leaf_signed_with_issuer_params_rebuilt_from_the_ca_der_chains_to_that_ca() {
+        // Joining, workload signing and ingress all rebuild the issuer from
+        // the stored CA certificate rather than from the params that made
+        // it. The leaf's issuer name must be the CA's subject byte for byte,
+        // or path building in a TLS verifier quietly fails.
+        let hierarchy = generate_ca_hierarchy("rebuilt", b"ikm").unwrap();
+        let ca_der = &hierarchy.node.ca.certificate_der;
+        let params = issuer_params_from_der(ca_der).unwrap();
+
+        let (leaf, _, _) = issue_node_cert(
+            "node-rebuilt",
+            SerialNumber(50),
+            &hierarchy.node.signing_keypair,
+            &params,
+        )
+        .unwrap();
+
+        let (leaf_issuer, _) = raw_issuer_and_subject(&leaf);
+        let (_, ca_subject) = raw_issuer_and_subject(ca_der);
+        assert_eq!(leaf_issuer, ca_subject, "issuer name must match exactly");
+
+        cert::validate_chain(&leaf, ca_der, &hierarchy.root.ca.certificate_der).unwrap();
+        webpki_accepts(
+            &leaf,
+            ca_der,
+            &hierarchy.root.ca.certificate_der,
+            "node-rebuilt",
+        );
+    }
+
+    #[test]
+    fn issuer_params_rebuilt_from_the_ca_der_keep_the_signed_validity_window() {
+        let hierarchy = generate_ca_hierarchy("rebuilt", b"ikm").unwrap();
+        let params = issuer_params_from_der(&hierarchy.ingress.ca.certificate_der).unwrap();
+        let (_, ca) =
+            x509_parser::parse_x509_certificate(&hierarchy.ingress.ca.certificate_der).unwrap();
+        assert_eq!(
+            params.not_before.unix_timestamp(),
+            ca.validity().not_before.timestamp()
+        );
+        assert_eq!(
+            params.not_after.unix_timestamp(),
+            ca.validity().not_after.timestamp()
+        );
+    }
+
+    #[test]
+    fn issuer_params_from_bytes_that_are_not_a_certificate_are_refused() {
+        assert!(matches!(
+            issuer_params_from_der(b"not a certificate"),
+            Err(CaError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn every_issuing_path_produces_leaves_a_tls_verifier_accepts() {
+        // rcgen 0.14 replaced "self-sign the issuer params, then pass the
+        // certificate and key" with an `Issuer`. Prove each issuing path still
+        // yields a chain rustls accepts, from both freshly generated and
+        // stored-CA issuer params.
+        let hierarchy = generate_ca_hierarchy("paths", b"ikm").unwrap();
+        let root = &hierarchy.root.ca.certificate_der;
+        let node_ca = &hierarchy.node.ca.certificate_der;
+        let ingress_ca = &hierarchy.ingress.ca.certificate_der;
+        let stored_node = issuer_params_from_der(node_ca).unwrap();
+
+        for params in [&hierarchy.node.certificate_params, &stored_node] {
+            let (issued, _, _) = issue_node_cert(
+                "node-a",
+                SerialNumber(60),
+                &hierarchy.node.signing_keypair,
+                params,
+            )
+            .unwrap();
+            webpki_accepts(&issued, node_ca, root, "node-a");
+
+            let (csr, _) = create_node_csr("node-b").unwrap();
+            let (signed, _) = sign_node_csr(
+                &csr,
+                "node-b",
+                SerialNumber(61),
+                NODE_LEAF_LIFETIME,
+                &hierarchy.node.signing_keypair,
+                params,
+            )
+            .unwrap();
+            webpki_accepts(&signed, node_ca, root, "node-b");
+        }
+
+        let (ingress, _) = issue_ingress_leaf_cert(
+            "app.example.com",
+            Duration::from_secs(3600),
+            &[],
+            &hierarchy.ingress.signing_keypair,
+            &issuer_params_from_der(ingress_ca).unwrap(),
+        )
+        .unwrap();
+        webpki_accepts(&ingress, ingress_ca, root, "app.example.com");
     }
 }

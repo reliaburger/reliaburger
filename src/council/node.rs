@@ -684,10 +684,10 @@ impl CouncilNode {
         // leaf carries must match the actual Workload CA's subject exactly —
         // image verification now checks issuer binding (IMG3), so a DN derived
         // from a caller-supplied `cluster_name` that differs from the CA's own
-        // name would produce a leaf that fails the binding. `from_ca_cert_der`
-        // reads the subject straight off the certificate.
-        let ca_cert_der_pki = rustls::pki_types::CertificateDer::from(workload_ca_cert_der.clone());
-        let ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der_pki)
+        // name would produce a leaf that fails the binding.
+        // `issuer_params_from_der` reads the subject straight off the
+        // certificate.
+        let ca_params = crate::sesame::ca::issuer_params_from_der(&workload_ca_cert_der)
             .map_err(|e| CouncilError::SecurityError(format!("invalid CA cert DER: {e}")))?;
 
         // Allocate serial via Raft, reading the assigned value straight from the
@@ -832,6 +832,8 @@ mod tests {
             boot_id: "test-boot".into(),
             cleanup_after_unix_ms: 1,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::NodeKill {
                     kill_containers: false,
                 },

@@ -1111,18 +1111,12 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::seconds(300);
     params.not_after = now + time::Duration::seconds(120);
-    let issuer = hierarchy
-        .node
-        .certificate_params
-        .clone()
-        .self_signed(&hierarchy.node.signing_keypair)
-        .unwrap();
+    let issuer = rcgen::Issuer::from_params(
+        &hierarchy.node.certificate_params,
+        &hierarchy.node.signing_keypair,
+    );
     let mut due = (*nodes[worker_index].2.snapshot()).clone();
-    due.certificate_der = params
-        .signed_by(&key, &issuer, &hierarchy.node.signing_keypair)
-        .unwrap()
-        .der()
-        .to_vec();
+    due.certificate_der = params.signed_by(&key, &issuer).unwrap().der().to_vec();
     due.private_key_der = key.serialize_der();
     due.serial = SerialNumber(20);
     let trust = due.trust.clone();

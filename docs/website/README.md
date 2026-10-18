@@ -187,7 +187,12 @@ Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
 It installs `v0.2.0` unless `RELIABURGER_VERSION` names another release; bump
-that default when you promote a newer one. If the requested release isn't
+that default when you promote a newer one. Every line the site shows names a
+mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
+choices and exit 2, and the bootstrap does it before downloading anything.
+Asked for a release from before 0.2.2, which doesn't know `--laptop`, the
+bootstrap drops the flag, so the site's line works while the default still
+names an older release. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.

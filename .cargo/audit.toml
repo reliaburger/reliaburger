@@ -23,10 +23,11 @@
 #   - RUSTSEC-2025-0141 (bincode): no release fixes it, and bincode 3.0.0 is
 #     a compile_error! tombstone, so gossip, reporting frames and the Raft
 #     metadata moved to postcard (#1026). Removed.
+#   - RUSTSEC-2024-0370 (proc-macro-error): age 0.10 -> 0.12 (#1026) moves to
+#     i18n-embed-fl 0.10, which uses proc-macro-error2. Removed.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
-  "RUSTSEC-2024-0370", # proc-macro-error: unmaintained, no patched release; build-time only, reached through age
 ]
 
 [output]

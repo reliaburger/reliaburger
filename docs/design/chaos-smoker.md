@@ -137,6 +137,23 @@ All fault injection requests flow through the cluster API on the leader node:
   plan_network_fault`). No replica rail applies to them, and the replica rail
   counts only pauses, so a network fault held by five nodes doesn't look like
   five unavailable replicas.
+- **Jobs and task arrays.** A target can be a job or a task array. Their
+  attempts don't live in the supervisor: the task runtime lists each running
+  attempt (namespace, job, run, task index, attempt, and either its own
+  runtime instance and cgroup or the reusable executor's task cgroup) in a
+  `LiveAttempts` list it shares with the agent. The receiving node looks for
+  app instances first; only when there are none does it ask every node for
+  its attempts (`GET /v1/fault/attempts`). `smoker::routing::
+  scope_workload_fault` then sets the request's `workload` from that evidence,
+  overwriting whatever the caller sent, and moves a numeric `--instance` into
+  `task_index`. The agent repeats the same decision from its own supervisor
+  and attempt list before it applies anything. Kill and pause signal an own
+  attempt's main pid, or every process in an executor command's task cgroup
+  (which holds that one command and nothing else). Resource faults write an
+  own attempt's cgroup, and an own attempt is a caller for `--from JOB`
+  network faults. A command in a reusable executor shares that executor's
+  cgroup and network with the tasks before and after it, so resource and
+  network faults on it are refused with a reason that names the executor.
 - **Convergence on the caller's node.** Bun doesn't write a network fault's
   kernel state once. It recomputes what the active faults want from the
   instances running now (`smoker::network::desired_connect_faults`) and applies
@@ -498,6 +515,8 @@ pub struct SafetyContext {
     pub nodes_with_active_faults: u32,
     pub target_service_replicas: u32,
     pub target_service_faulted_replicas: u32,
+    /// App, job or task array; only apps meet the replica minimum.
+    pub workload: WorkloadKind,
 }
 ```
 
@@ -1538,7 +1557,7 @@ or a client-supplied JSON field.
 Smoker prevents faults that would make the cluster unrecoverable:
 
 - **Quorum protection.** Cannot partition more than `(council_size - 1) / 2` council nodes. This is the hard limit that preserves Raft quorum. It cannot be overridden.
-- **Replica minimum.** Cannot kill more replicas of an app than `replicas - 1`. At least one instance must survive. A pause counts as one replica with `--instance`, otherwise as all of them. The replicas already out of service are the active pauses on the same app in the same namespace; a network or resource fault leaves its replica serving and isn't counted. Cannot be overridden.
+- **Replica minimum.** Applies to apps only (`SafetyContext::workload`). A job or task-array attempt is meant to finish and is retried under its own policy, so killing or pausing every attempt is allowed. Cannot kill more replicas of an app than `replicas - 1`. At least one instance must survive. A pause counts as one replica with `--instance`, otherwise as all of them. The replicas already out of service are the active pauses on the same app in the same namespace; a network or resource fault leaves its replica serving and isn't counted. Cannot be overridden.
 - **Leader protection.** Cannot target the cluster leader without the explicit `--include-leader` flag.
 - **Node percentage limit.** Cannot inject faults on more than 50% of nodes simultaneously without `--override-safety`.
 
