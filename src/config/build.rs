@@ -1,8 +1,9 @@
 //! Build job configuration.
 //!
 //! A build job produces an OCI image from a Dockerfile and pushes it
-//! to the local Pickle registry. The `pickle://` destination syntax
-//! restricts pushes to namespace-scoped repositories.
+//! to the local Pickle registry, at a `pickle://` destination. A build
+//! that declares a `namespace` must push into that namespace's
+//! repositories (`pickle://<namespace>/<name>:<tag>`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,16 +23,16 @@ pub struct BuildSpec {
     #[serde(default = "default_dockerfile")]
     pub dockerfile: String,
 
-    /// Destination in `pickle://name:tag` format.
-    /// The image is pushed to the local Pickle registry.
+    /// Destination in `pickle://name:tag` or `pickle://namespace/name:tag`
+    /// format. The image is pushed to the local Pickle registry.
     pub destination: String,
 
     /// Build arguments (key=value pairs passed to the builder).
     #[serde(default)]
     pub args: BTreeMap<String, String>,
 
-    /// Namespace this build belongs to. Restricts push to
-    /// namespace-scoped repositories.
+    /// Namespace this build belongs to. When set, the destination must
+    /// be a repository in this namespace (`pickle://<namespace>/<name>`).
     pub namespace: Option<String>,
 
     /// Target platform(s) for the build.
@@ -106,12 +107,13 @@ pub fn parse_pickle_destination(dest: &str) -> Result<PickleDestination, ConfigE
     Ok(PickleDestination { name, tag })
 }
 
-/// Validate that a build's destination namespace matches its declared namespace.
+/// Validate a build's destination: `pickle://` syntax, a context that
+/// exists, and a destination inside the build's declared namespace.
 ///
-/// Prevents a build in namespace A from pushing to namespace B's scope.
+/// A build in namespace A can't push to namespace B's repositories, nor to
+/// a bare name that belongs to no namespace ([`check_destination_namespace`]).
 pub fn validate_build_namespace(build_name: &str, spec: &BuildSpec) -> Result<(), ConfigError> {
-    // Destination must use pickle:// protocol
-    parse_pickle_destination(&spec.destination)?;
+    check_destination_namespace(spec)?;
 
     // Context path must exist (or be relative — we check absolute paths only)
     if spec.context.is_absolute() && !spec.context.exists() {
@@ -123,6 +125,45 @@ pub fn validate_build_namespace(build_name: &str, spec: &BuildSpec) -> Result<()
     }
 
     Ok(())
+}
+
+/// Check that a build which declares a `namespace` pushes into it.
+///
+/// The destination's repository must be named `<namespace>/<name>` by the
+/// same rule the registry uses to place a repository in a namespace
+/// ([`crate::pickle::registry_auth::repository_namespace`]). A bare name
+/// (`pickle://api:v1`) belongs to no namespace, so it's refused rather than
+/// quietly scoped: the push would otherwise land in a repository every
+/// namespace can pull. A build with no `namespace` may push anywhere its
+/// caller's token allows, which the API checks separately.
+pub fn check_destination_namespace(spec: &BuildSpec) -> Result<(), ConfigError> {
+    let destination = parse_pickle_destination(&spec.destination)?;
+    let Some(namespace) = &spec.namespace else {
+        return Ok(());
+    };
+    let reason = match crate::pickle::registry_auth::repository_namespace(&destination.name) {
+        Some((dest_namespace, _)) if dest_namespace == namespace => return Ok(()),
+        Some((dest_namespace, _)) => format!(
+            "build is in namespace {namespace:?} but destination {:?} pushes to namespace \
+             {dest_namespace:?}",
+            spec.destination
+        ),
+        None if destination.name.contains('/') => format!(
+            "build is in namespace {namespace:?} but destination {:?} is not a repository \
+             in any namespace",
+            spec.destination
+        ),
+        None => format!(
+            "build is in namespace {namespace:?} but destination {:?} names no namespace; \
+             use pickle://{namespace}/{}:{}",
+            spec.destination, destination.name, destination.tag
+        ),
+    };
+    Err(ConfigError::Validation {
+        field: "destination".to_string(),
+        context: "build spec".to_string(),
+        reason,
+    })
 }
 
 #[cfg(test)]
@@ -221,14 +262,73 @@ mod tests {
 
     #[test]
     fn validate_build_accepts_pickle_destination() {
-        let spec = BuildSpec {
+        let spec = spec("pickle://default/myapp:v1", Some("default"));
+        assert!(validate_build_namespace("test-build", &spec).is_ok());
+    }
+
+    fn spec(destination: &str, namespace: Option<&str>) -> BuildSpec {
+        BuildSpec {
             context: PathBuf::from("."),
             dockerfile: "Dockerfile".into(),
-            destination: "pickle://myapp:v1".into(),
+            destination: destination.into(),
             args: BTreeMap::new(),
-            namespace: Some("default".into()),
+            namespace: namespace.map(str::to_string),
             platform: vec![],
-        };
-        assert!(validate_build_namespace("test-build", &spec).is_ok());
+        }
+    }
+
+    #[test]
+    fn namespaced_build_with_a_bare_destination_is_refused() {
+        let error = validate_build_namespace("api", &spec("pickle://api:v1", Some("production")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("production"), "{error}");
+        assert!(error.contains("pickle://production/api:v1"), "{error}");
+    }
+
+    #[test]
+    fn default_namespace_build_with_a_bare_destination_is_refused() {
+        // `default` is a namespace like any other: its repositories are
+        // `default/<app>`, and a bare name places nothing.
+        assert!(validate_build_namespace("api", &spec("pickle://api", Some("default"))).is_err());
+    }
+
+    #[test]
+    fn namespaced_build_into_its_own_namespace_is_accepted() {
+        validate_build_namespace(
+            "api",
+            &spec("pickle://production/api:v1", Some("production")),
+        )
+        .unwrap();
+        validate_build_namespace(
+            "api",
+            &spec("pickle://production/api/debug:v1", Some("production")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn namespaced_build_into_another_namespace_is_refused() {
+        let error =
+            validate_build_namespace("api", &spec("pickle://staging/api:v1", Some("production")))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("staging"), "{error}");
+    }
+
+    #[test]
+    fn namespaced_build_into_a_name_the_convention_cannot_place_is_refused() {
+        for destination in ["pickle://cache/api:v1", "pickle://production//api:v1"] {
+            assert!(
+                validate_build_namespace("api", &spec(destination, Some("production"))).is_err(),
+                "{destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_without_a_namespace_may_use_a_bare_destination() {
+        validate_build_namespace("api", &spec("pickle://api:v1", None)).unwrap();
+        validate_build_namespace("api", &spec("pickle://team-a/api:v1", None)).unwrap();
     }
 }

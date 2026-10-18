@@ -434,6 +434,65 @@ async fn submit_without_any_builder_is_503() {
     assert_eq!(response.status().as_u16(), 503);
 }
 
+/// Submit a build of `destination` declaring `namespace`, as the unscoped
+/// anonymous bootstrap principal, and return the status and body.
+async fn submit_namespaced_build(
+    harness: &Harness,
+    destination: &str,
+    namespace: Option<&str>,
+) -> (u16, String) {
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build", harness.base_url))
+        .json(&serde_json::json!({
+            "name": "app",
+            "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "spec": { "context": ".", "destination": destination, "namespace": namespace },
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// #1066: a build that declares a namespace pushes into that namespace or
+/// not at all. The refusal is the API's own (a raw call, no council, no
+/// `relish` validation in front of it), and it names the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespaced_build_with_a_destination_outside_its_namespace_is_a_400() {
+    let harness = Harness::start(HarnessOptions::default()).await;
+
+    let (status, body) =
+        submit_namespaced_build(&harness, "pickle://app:v1", Some("production")).await;
+    assert_eq!(status, 400, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let error = error["error"].as_str().unwrap();
+    assert!(error.contains("pickle://production/app:v1"), "{error}");
+
+    let (status, body) =
+        submit_namespaced_build(&harness, "pickle://staging/app:v1", Some("production")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("staging"), "{body}");
+}
+
+/// #1066: a destination in the build's own namespace, and an unscoped
+/// build of a bare name, both get past admission (to the 503 of a host
+/// without Buildah, or a 202 where Buildah is installed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_namespace_and_unscoped_builds_are_admitted() {
+    let harness = Harness::start(HarnessOptions::default()).await;
+    for (destination, namespace) in [
+        ("pickle://production/app:v1", Some("production")),
+        ("pickle://app:v1", None),
+    ] {
+        let (status, body) = submit_namespaced_build(&harness, destination, namespace).await;
+        assert!(
+            status == 503 || status == 202,
+            "{destination} in {namespace:?}: {status} {body}"
+        );
+    }
+}
+
 /// JOB2 residual: the registry destination is server-owned. A request
 /// that smuggles a `registry_port` (trying to point a privileged Bun at
 /// an arbitrary localhost service) is rejected as a bad request, not

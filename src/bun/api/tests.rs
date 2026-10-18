@@ -7977,7 +7977,7 @@ async fn apply_uses_committed_namespace_context_before_any_resource_write() {
     let before_builds = council.desired_state().await;
     for (namespace, expected) in [("existing", true), ("ghost", false)] {
         let build = crate::config::Config::parse(&format!(
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = '{namespace}'\n"
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://{namespace}/web:v1'\nnamespace = '{namespace}'\n"
         )).unwrap();
         let result = client.apply(&build).await;
         assert_eq!(

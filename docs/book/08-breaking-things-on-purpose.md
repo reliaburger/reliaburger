@@ -1877,12 +1877,12 @@ To build this inside the cluster and push it to Pickle, you write a build config
 [build.my-api]
 context = "./my-api"
 dockerfile = "Dockerfile"
-destination = "pickle://my-api:v1.2.3"
+destination = "pickle://production/my-api:v1.2.3"
 namespace = "production"
 platform = ["linux/amd64", "linux/arm64"]
 ```
 
-That's it. `context` is the directory containing your source. Everything inside it gets sent to the builder. `dockerfile` defaults to `"Dockerfile"` if you leave it out. `destination` uses the `pickle://` protocol, which means "push to the local Pickle registry on this cluster". `platform` defaults to both amd64 and arm64, so the image works on mixed-architecture clusters.
+That's it. `context` is the directory containing your source. Everything inside it gets sent to the builder. `dockerfile` defaults to `"Dockerfile"` if you leave it out. `destination` uses the `pickle://` protocol, which means "push to the local Pickle registry on this cluster". `platform` defaults to both amd64 and arm64, so the image works on mixed-architecture clusters. The destination's first path segment, `production`, is the namespace the image lives in, and it has to match the build's `namespace` (more on that below).
 
 You can pass build arguments too:
 
@@ -1904,7 +1904,8 @@ Once the build completes, deploy the image like any other app:
 
 ```toml
 [app.my-api]
-image = "my-api:v1.2.3"
+image = "production/my-api:v1.2.3"
+namespace = "production"
 port = 8080
 replicas = 3
 
@@ -1912,7 +1913,7 @@ replicas = 3
 path = "/healthz"
 ```
 
-Pickle resolves `my-api:v1.2.3` locally — no Docker Hub round-trip. The scheduler pulls the image from whichever Pickle node has it cached (or replicates it if needed).
+Pickle resolves `production/my-api:v1.2.3` locally — no Docker Hub round-trip. The scheduler pulls the image from whichever Pickle node has it cached (or replicates it if needed).
 
 The `pickle://` protocol is enforced at config validation time — you can't accidentally push to Docker Hub or a remote registry from a build job.
 
@@ -1961,7 +1962,7 @@ The digest of the tar becomes the context's identity. If two builds use the same
 ```
 buildah bud --storage-driver vfs -f Dockerfile \
   --platform linux/amd64,linux/arm64 \
-  --manifest localhost:9117/my-api:v1.2.3 .
+  --manifest localhost:9117/production/my-api:v1.2.3 .
 ```
 
 `--storage-driver vfs` tells buildah to use plain file copies instead of overlayfs. No kernel modules, no FUSE, no privileged access. Slower than overlay, but works anywhere without special permissions. Buildah reads the Dockerfile, pulls base images (e.g. `python:3.12-slim` from Docker Hub), runs each instruction, and produces an OCI image. With `--platform linux/amd64,linux/arm64`, it builds for both architectures and creates a manifest list (OCI index) so the image works on mixed clusters.
@@ -2001,17 +2002,24 @@ The `relish dev create` command installs it automatically when provisioning Lima
 
 ### Namespace-scoped pushes
 
-If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is treated as a namespace scope. A build in namespace "staging" can't push to `production/myapp`:
+If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is the namespace the image lives in. A build in namespace "staging" can't push to `production/myapp`.
+
+What about a build in "staging" whose destination has no prefix at all, `pickle://myapp:v1`? For a long time it was simply accepted. The check only looked at destinations that had a slash, so the build pushed to the bare `myapp` repository, which belongs to no namespace and which every namespace can pull. A doc comment even claimed the field "restricts push to namespace-scoped repositories". It didn't (#1066).
+
+We had two ways to close it. We could quietly rewrite the destination to `pickle://staging/myapp:v1`, or refuse the build. Rewriting is friendlier for about a minute, until someone deploys `image = "myapp:v1"` because that's what the config said, and gets yesterday's image or none. The registry chapter had already been through the same argument: guessing a namespace for a bare name is how scoped tokens end up with more than they were given. So a namespaced build is refused unless its destination is in its own namespace, and the error names the fix:
 
 ```rust
-if let Some(build_ns) = &spec.namespace
-    && ns_prefix != build_ns
-{
-    return Err(BuildError::NamespaceMismatch { ... });
-}
+let reason = match crate::pickle::registry_auth::repository_namespace(&destination.name) {
+    Some((dest_namespace, _)) if dest_namespace == namespace => return Ok(()),
+    Some((dest_namespace, _)) => format!(/* pushes to namespace {dest_namespace:?} */),
+    None if destination.name.contains('/') => format!(/* not in any namespace */),
+    None => format!(/* names no namespace; use pickle://{namespace}/{name}:{tag} */),
+};
 ```
 
-No prefix means the build can push anywhere — fine for shared infrastructure images. Layer caching is deferred to Phase 12.
+`match` with a guard (`if dest_namespace == namespace`) picks the first arm whose pattern fits *and* whose guard holds, so the happy path returns early and every other arm builds the reason for one way of being wrong. `repository_namespace` is the registry's own rule for placing a repository, the one a scoped `docker push` meets, so `cache/myapp` and `production//myapp` are refused here for the same reasons they're refused there.
+
+The check lives in `config::build::check_destination_namespace`, and two places call it. `relish build` runs it as part of config validation, so you hear about it before your context uploads. `POST /v1/build` runs it again before anything else, with or without a council, because the API is where the trust decision is made: a raw `curl` never meets `relish`'s validation. A build with no `namespace` is still held only by its caller's token, so an unscoped admin can build a shared, bare-named image. Layer caching is deferred to Phase 12.
 
 ## Lessons learned
 

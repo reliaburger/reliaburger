@@ -235,6 +235,38 @@ its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built images are
 signed by the cluster, which matters when `require_signatures` is on (see
 `security`).
 
+A build that sets `namespace` pushes into that namespace, so its destination
+names it as the first path segment:
+
+```toml
+[namespace.shop]
+
+[build.api]
+context = "./api"
+destination = "pickle://shop/api:v1.2.3"
+namespace = "shop"
+
+[app.api]
+image = "shop/api:v1.2.3"
+namespace = "shop"
+port = 8080
+```
+
+The same build with `destination = "pickle://api:v1.2.3"` or
+`"pickle://billing/api:v1.2.3"` is refused before anything uploads, and the
+API refuses it with a 400 too, whoever sends it:
+
+```
+destination in "build spec": build is in namespace "shop" but destination
+"pickle://api:v1.2.3" names no namespace; use pickle://shop/api:v1.2.3
+```
+
+A bare name belongs to no namespace, and every namespace can pull it, so a
+namespaced build can't write one. Leave `namespace` out to build a shared
+image under a bare name. That still takes a token that may push it: an
+unscoped one, since a token scoped with `--namespaces` can't push a bare name
+at all.
+
 A build targets `linux/amd64` and `linux/arm64` unless `platform` says
 otherwise (`platform = ["linux/arm64"]`). Pickle stores every platform under
 the one tag, and each node pulls the one that matches its own architecture. A

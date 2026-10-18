@@ -10,7 +10,7 @@
 [build.my-api]
 context = "./src/api"
 dockerfile = "Dockerfile"
-destination = "pickle://my-api:v1.2.3"
+destination = "pickle://production/my-api:v1.2.3"
 namespace = "production"
 
 [build.my-api.args]

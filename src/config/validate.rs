@@ -2181,7 +2181,7 @@ exec = "/usr/bin/python3""#,
             r#"
             [build.img]
             context = "."
-            destination = "pickle://img:v1"
+            destination = "pickle://ghost/img:v1"
             namespace = "ghost"
         "#,
         )
@@ -2193,6 +2193,23 @@ exec = "/usr/bin/python3""#,
     }
 
     #[test]
+    fn validate_build_bare_destination_in_a_namespace_rejected() {
+        let config = Config::parse(
+            r#"
+            [namespace.prod]
+
+            [build.img]
+            context = "."
+            destination = "pickle://img:v1"
+            namespace = "prod"
+        "#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("pickle://prod/img:v1"), "{error}");
+    }
+
+    #[test]
     fn validate_build_existing_namespace_passes() {
         let config = Config::parse(
             r#"
@@ -2201,7 +2218,7 @@ exec = "/usr/bin/python3""#,
 
             [build.img]
             context = "."
-            destination = "pickle://img:v1"
+            destination = "pickle://prod/img:v1"
             namespace = "prod"
         "#,
         )
