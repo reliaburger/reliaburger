@@ -668,4 +668,48 @@ mod tests {
         let mut reader = store.get_log_reader().await;
         assert!(reader.try_get_log_entries(1..2).await.is_err());
     }
+
+    #[tokio::test]
+    async fn store_reopens_after_a_power_cut_while_redb_grew_the_file() {
+        // #1024: redb commits a header whose layout covers a grown file in
+        // the same fsync that persists the growth. A power cut between the
+        // in-place header write and the filesystem's commit of the new file
+        // length leaves the file shorter than the header's layout. redb 2.6.3
+        // asserted on that state at every open, so Bun crash-looped. The
+        // store must reopen it with the last intact commit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+
+        {
+            let mut store = DurableLogStore::open(&path).unwrap();
+            store.save_vote(&Vote::new(3, 42)).await.unwrap();
+            store.write_entries(vec![entry(1, 1), entry(1, 2)]).unwrap();
+        }
+        let before_growth = std::fs::metadata(&path).unwrap().len();
+
+        // One commit big enough to make redb grow the file.
+        {
+            let store = DurableLogStore::open(&path).unwrap();
+            store.put_meta("ballast", &vec![0xA5; 8 << 20]).unwrap();
+        }
+        let after_growth = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after_growth > before_growth,
+            "the ballast commit must grow the file ({before_growth} -> {after_growth})"
+        );
+
+        // The cut: the header names the grown layout, the length is the old one.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(before_growth)
+            .unwrap();
+
+        let mut store = DurableLogStore::open(&path)
+            .expect("a file cut short while growing must reopen, not fail or panic");
+        assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 42)));
+        let mut reader = store.get_log_reader().await;
+        assert_eq!(reader.try_get_log_entries(1..3).await.unwrap().len(), 2);
+    }
 }
