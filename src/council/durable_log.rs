@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{Entry, LogId, RaftLogReader, StorageError, StorageIOError, Vote};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::types::TypeConfig;
 use crate::sesame::raft_encryption::{self, EncryptedEntry};
