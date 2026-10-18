@@ -130,7 +130,7 @@ fn target(record: &AuditRecord) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM:SS` in UTC.
-fn format_time(timestamp: u64) -> String {
+pub(crate) fn format_time(timestamp: u64) -> String {
     let Ok(seconds) = i64::try_from(timestamp) else {
         return timestamp.to_string();
     };

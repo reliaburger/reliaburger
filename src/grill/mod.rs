@@ -207,6 +207,15 @@ impl fmt::Display for InstanceIdentity {
     }
 }
 
+/// What a one-shot `exec` produced: its combined output and its exit code.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecOutput {
+    /// Standard output, then standard error.
+    pub output: String,
+    /// The command's own exit code.
+    pub exit_code: i32,
+}
+
 /// Errors from Grill operations.
 #[derive(Debug, thiserror::Error)]
 pub enum GrillError {
@@ -720,13 +729,15 @@ pub trait Grill: Send + Sync {
     /// Execute a command in the context of a running instance.
     ///
     /// Runs the given command and returns its combined stdout/stderr
-    /// output. For process-based runtimes this spawns a new process;
-    /// for container runtimes it enters the container's namespaces.
+    /// output and exit code. For process-based runtimes this spawns a new
+    /// process; for container runtimes it enters the container's namespaces.
+    /// A command that ran and exited non-zero is `Ok`: only failing to run
+    /// it is an error.
     fn exec(
         &self,
         instance: &InstanceId,
         command: &[String],
-    ) -> impl std::future::Future<Output = Result<String, GrillError>> + Send {
+    ) -> impl std::future::Future<Output = Result<ExecOutput, GrillError>> + Send {
         let _ = (instance, command);
         std::future::ready(Err(GrillError::NotFound {
             instance: InstanceId("exec not supported".to_string()),
@@ -1168,7 +1179,11 @@ impl Grill for AnyGrill {
         }
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<ExecOutput, GrillError> {
         match self {
             AnyGrill::Process(g) => g.exec(instance, command).await,
             #[cfg(target_os = "linux")]

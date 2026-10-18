@@ -230,7 +230,7 @@ impl ReportingTransport for TcpReportingSender {
 
 /// Real TCP transport for reporting tree messages.
 ///
-/// Uses length-prefixed framing: 4-byte big-endian length + bincode payload.
+/// Uses length-prefixed framing: 4-byte big-endian length + postcard payload.
 /// Server mode accepts incoming connections (council members).
 /// Client mode connects to the target for each send (workers).
 /// Supports a runtime blocklist for chaos testing.
@@ -413,7 +413,7 @@ impl TcpReportingTransport {
         }
     }
 
-    /// Send a length-prefixed bincode message over a new connection.
+    /// Send a length-prefixed postcard message over a new connection.
     async fn send_framed(
         target: SocketAddr,
         message: &ReportingMessage,
@@ -581,36 +581,47 @@ fn check_event_admission(message: &ReportingMessage) -> Result<(), String> {
 fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, ReportingError> {
     check_event_admission(message).map_err(|reason| ReportingError::SendFailed { reason })?;
     // The size pass traverses borrowed data without allocating an encoded copy.
-    let body_size = bincode::serialized_size(message)
+    let body_size = postcard::experimental::serialized_size(message)
         .map_err(|error| ReportingError::Serialisation(error.to_string()))?;
-    let size = body_size.saturating_add(report_header().len() as u64);
-    if size > MAX_REPORT_SIZE as u64 {
+    let size = body_size.saturating_add(report_header().len());
+    if size > MAX_REPORT_SIZE {
         return Err(ReportingError::ReportTooLarge {
-            size: usize::try_from(size).unwrap_or(usize::MAX),
+            size,
             max: MAX_REPORT_SIZE,
         });
     }
-    let mut bytes = Vec::with_capacity(size as usize);
+    let mut bytes = Vec::with_capacity(size);
     bytes.extend(report_header());
-    bincode::serialize_into(&mut bytes, message)
-        .map_err(|error| ReportingError::Serialisation(error.to_string()))?;
-    Ok(bytes)
+    postcard::to_extend(message, bytes)
+        .map_err(|error| ReportingError::Serialisation(error.to_string()))
 }
 
-fn decode_report(payload: &[u8]) -> Result<ReportingMessage, bincode::Error> {
-    use bincode::Options;
-    let body = payload.strip_prefix(&report_header()).ok_or_else(|| {
-        Box::new(bincode::ErrorKind::Custom(
-            "incompatible reporting formats".into(),
-        ))
-    })?;
-    let message = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(body.len() as u64)
-        .reject_trailing_bytes()
-        .deserialize(body)?;
-    check_event_admission(&message)
-        .map_err(|reason| Box::new(bincode::ErrorKind::Custom(reason)))?;
+fn decode_report(payload: &[u8]) -> Result<ReportingMessage, ReportingError> {
+    // The receiver never reads a longer frame, but the decoder doesn't lean
+    // on that: no sender may produce one, so it isn't decoded.
+    if payload.len() > MAX_REPORT_SIZE {
+        return Err(ReportingError::ReportTooLarge {
+            size: payload.len(),
+            max: MAX_REPORT_SIZE,
+        });
+    }
+    let body = payload
+        .strip_prefix(&report_header())
+        .ok_or_else(|| ReportingError::Deserialisation("incompatible reporting formats".into()))?;
+    // postcard reads only the slice it's given and checks each length prefix
+    // against the bytes left, so a hostile prefix is a decode error rather
+    // than an allocation. `take_from_bytes` returns what the message didn't
+    // use, and a frame holds exactly one message, so anything left over is
+    // refused.
+    let (message, rest) = postcard::take_from_bytes::<ReportingMessage>(body)
+        .map_err(|error| ReportingError::Deserialisation(error.to_string()))?;
+    if !rest.is_empty() {
+        return Err(ReportingError::Deserialisation(format!(
+            "{} trailing bytes after the report",
+            rest.len()
+        )));
+    }
+    check_event_admission(&message).map_err(ReportingError::Deserialisation)?;
     Ok(message)
 }
 
@@ -625,11 +636,13 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
+    /// A fixed timestamp, so a message's encoded size depends only on its
+    /// name: postcard writes the seconds and nanoseconds as varints.
     fn sample_msg(name: &str) -> ReportingMessage {
         ReportingMessage::Report(StateReport {
             has_buildah: false,
             node_id: NodeId::new(name),
-            timestamp: SystemTime::now(),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::new(1_800_000_000, 500_000_000),
             running_apps: vec![],
             cached_specs: vec![],
             rollouts: Vec::new(),
@@ -700,8 +713,15 @@ mod tests {
             .await
             .unwrap();
         let sender = TcpReportingSender::new(None, Default::default());
-        let empty_size = bincode::serialized_size(&sample_msg("")).unwrap() as usize + 12;
-        let name = "w".repeat(MAX_REPORT_SIZE - empty_size);
+        // postcard writes the name's length as a varint, so a longer name
+        // costs a byte or two more than its characters: shrink it until the
+        // frame lands on the limit exactly.
+        let frame_size = |name: &str| encode_report(&sample_msg(name)).map(|frame| frame.len());
+        let mut name = "w".repeat(MAX_REPORT_SIZE);
+        while frame_size(&name).is_err() {
+            name.pop();
+        }
+        assert_eq!(frame_size(&name).unwrap(), MAX_REPORT_SIZE);
         sender
             .send(receiver.local_addr(), &sample_msg(&name))
             .await
@@ -822,17 +842,75 @@ mod tests {
             wrong[offset] = 99;
             assert!(decode_report(&wrong).is_err());
         }
-        // Report enum discriminant, then an impossible node-id string length.
-        let mut malicious = report_header().to_vec();
-        malicious.extend(0u32.to_le_bytes());
-        malicious.push(0); // has_buildah
-        malicious.extend(u64::MAX.to_le_bytes());
+        // The Report variant and `has_buildah`, then a node-id length that
+        // claims 2^64 - 1 bytes: a decode error, not an allocation.
+        let unnamed = encode_report(&sample_msg("")).unwrap();
+        let mut malicious = unnamed[..report_header().len() + 2].to_vec();
+        malicious.extend([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
         assert!(decode_report(&malicious).is_err());
+    }
+
+    #[test]
+    fn every_reporting_message_round_trips_through_a_frame() {
+        use crate::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
+        let rollup = ReportingMessage::MetricsRollup(NodeRollup {
+            node_id: NodeId::new("worker"),
+            timestamp: 60,
+            entries: vec![RollupEntry {
+                metric_name: "cpu".into(),
+                labels: [("app".to_string(), "web".to_string())].into(),
+                aggregate: RollupAggregate {
+                    min: 0.5,
+                    max: 9.5,
+                    sum: 20.0,
+                    count: 4,
+                },
+            }],
+        });
+        for message in [sample_msg("worker"), rollup] {
+            let decoded = decode_report(&encode_report(&message).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap(),
+                serde_json::to_value(&message).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_with_trailing_bytes_is_refused() {
+        let mut frame = encode_report(&sample_msg("worker")).unwrap();
+        assert!(decode_report(&frame).is_ok());
+        frame.push(0);
+        assert!(decode_report(&frame).is_err());
+    }
+
+    #[test]
+    fn a_frame_over_the_size_limit_is_refused_before_decoding() {
+        let mut frame = encode_report(&sample_msg("worker")).unwrap();
+        frame.resize(MAX_REPORT_SIZE + 1, 0);
+        assert!(matches!(
+            decode_report(&frame),
+            Err(ReportingError::ReportTooLarge { .. })
+        ));
+    }
+
+    /// A bincode frame from the generation before postcard: its header names
+    /// protocol 52 and state 69, so it's refused before the body is read.
+    #[test]
+    fn a_bincode_frame_from_the_previous_generation_is_refused() {
+        let mut old = b"RBRP".to_vec();
+        old.extend(52u32.to_be_bytes());
+        old.extend(69u32.to_be_bytes());
+        old.extend(0u32.to_le_bytes()); // Report
+        old.push(0); // has_buildah
+        old.extend(1u64.to_le_bytes()); // node-id length
+        old.push(b'w');
+        assert!(decode_report(&old).is_err());
     }
 
     #[tokio::test]
     async fn unversioned_reporting_frame_never_reaches_the_inbox() {
-        let payload = bincode::serialize(&sample_msg("unversioned")).unwrap();
+        let payload = postcard::to_stdvec(&sample_msg("unversioned")).unwrap();
         let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
         frame.extend(payload);
         let (tx, mut rx) = mpsc::channel(1);

@@ -230,28 +230,35 @@ A scenario file lists faults with their targets, values, start offsets and
 durations, and Relish injects each one when its time comes:
 
 ```toml
-name = "Payment cascade failure"
+name = "Cache cascade"
 
 [[step]]
-description = "Database latency spike"
+description = "The cache slows down for the frontend"
 fault = "delay"
-target = "pg"
-value = "500ms"
+target = "redis"
+from = "frontend"
+value = "300ms"
 duration = "2m"
 
 [[step]]
-description = "Database starts dropping connections"
+description = "The cache starts dropping connections"
 fault = "drop"
-target = "pg"
+target = "redis"
 value = "25%"
 start_after = "2m"
-duration = "3m"
+duration = "2m"
 ```
 
+That's the start of `examples/phase-8/container-chaos-scenario.toml`, which
+goes on to squeeze the backend's memory and kill a frontend replica. It
+targets the tour's podinfo apps, so apply `examples/kubernetes/podinfo.yaml`
+first. `--dry-run` prints the timeline and injects nothing; a real run needs
+`--acknowledge`, like every fault:
+
 ```sh
-relish fault scenario examples/phase-8/chaos-scenario.toml --dry-run
-relish fault scenario examples/phase-8/chaos-scenario.toml --acknowledge
-relish fault scenario examples/phase-8/chaos-scenario.toml --speed 2.0 --acknowledge
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --dry-run
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --acknowledge
+relish fault scenario examples/phase-8/container-chaos-scenario.toml --speed 2.0 --acknowledge
 ```
 
 A step's `fault` is any workload fault: `delay`, `drop`, `dns`, `partition`,

@@ -208,12 +208,15 @@ impl Execution {
             }
         }
         self.retired = true;
-        let response = match if matches!(record.phase, OwnerPhase::Retired { exit_code: Some(_) }) {
-            self.read_output()
-        } else {
-            Err(io::Error::other("exec command was interrupted"))
+        let response = match match record.phase {
+            OwnerPhase::Retired {
+                exit_code: Some(exit_code),
+            } => self.read_output().map(|output| (output, exit_code)),
+            _ => Err(io::Error::other("exec command was interrupted")),
         } {
-            Ok(output) => serde_json::json!({"output": output}),
+            Ok((output, exit_code)) => {
+                serde_json::json!({"output": output, "exit_code": exit_code})
+            }
             Err(error) => serde_json::json!({"error": error.to_string()}),
         };
         self.queue_reply(response)

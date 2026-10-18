@@ -677,7 +677,7 @@ async fn exec_runs_command_and_returns_output() {
         .await
         .unwrap();
 
-    assert_eq!(output.trim(), "hello");
+    assert_eq!(output.output.trim(), "hello");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -599,10 +599,10 @@ struct EncryptedRecoveryCandidateList {
 
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
-| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
-| Mustard anti-entropy (Sync push-pull) | UDP | bincode (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
+| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | postcard (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
+| Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
 | Raft (AppendEntries, Vote, InstallSnapshot) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
-| Reporting tree (StateReports) | TCP + mTLS | bincode | 1 MiB (bounded by max events per report) |
+| Reporting tree (StateReports) | TCP + mTLS | postcard | 1 MiB (bounded by max events per report) |
 
 All TCP connections use mTLS via Sesame's Node CA certificates.
 
@@ -1413,7 +1413,7 @@ There is no production-quality Rust equivalent of HashiCorp's `memberlist` (Go).
 
 | Crate | Purpose |
 |-------|---------|
-| [`bincode`](https://crates.io/crates/bincode) | Binary serialisation for wire protocol messages. Compact and fast. |
+| [`postcard`](https://crates.io/crates/postcard) | Binary serialisation for gossip datagrams and reporting frames: compact varints over serde. Replaced the unmaintained `bincode` in 0.2.2 (RUSTSEC-2025-0141). |
 | [`serde`](https://crates.io/crates/serde) | Serialisation framework. All data structures derive Serialize/Deserialize. |
 | [`ring`](https://crates.io/crates/ring) | HMAC-SHA256 for gossip message authentication. SHA-256 for spec hashing. |
 | [`age`](https://crates.io/crates/age) | Encryption for the recovery candidate list and Raft log at-rest encryption. |
