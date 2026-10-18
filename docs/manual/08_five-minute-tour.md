@@ -5,8 +5,8 @@ Kubernetes app on a three-node laptop cluster, build and run an app of your
 own next to it, run ten jobs beside them, walk its network path,
 measure it, break it and watch it heal. Open it any time with `relish manual tour`.
 
-It needs macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
-15 GiB of disk. The one-line install fetches the signed 0.2.0 release.
+It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.0 release.
 
 ## Install and build the cluster
 

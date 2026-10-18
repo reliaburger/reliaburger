@@ -82,6 +82,21 @@ download() {
   done
 }
 
+# Relish is built for Apple silicon only since 0.2.2 (#1018). A shell running
+# under Rosetta sees `uname -m` say x86_64 on Apple silicon, so ask the
+# hardware: an Intel Mac has no hw.optional.arm64 at all.
+refuse_intel_mac() {
+  sysctl_command=$(command -v sysctl 2>/dev/null) || sysctl_command=/usr/sbin/sysctl
+  arm64=$("$sysctl_command" -n hw.optional.arm64 2>/dev/null) || arm64=
+  [ "$arm64" = 1 ] && return 0
+  printf '%s\n' \
+    'reliaburger: this is an Intel Mac, and Relish is built for Apple silicon only since 0.2.2.' \
+    'Use a Linux host instead (this installer works on Linux x86_64 and arm64), or' \
+    'install 0.2.1, the last release built for Intel Macs:' \
+    '  curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_VERSION=v0.2.1 sh' >&2
+  exit 1
+}
+
 on_path() {
   case ":${PATH:-}:" in
     *":$1:"*) return 0 ;;
@@ -170,12 +185,15 @@ main() {
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
   system=$(uname -s) || fail 'could not detect the operating system'
   machine=$(uname -m) || fail 'could not detect the CPU architecture'
+  if [ "$system-$machine" = Darwin-x86_64 ]; then
+    refuse_intel_mac
+    machine=arm64
+  fi
   case "$system-$machine" in
     Darwin-arm64) platform=macos-aarch64; expected=@MACOS_AARCH64@; size=@MACOS_AARCH64_SIZE@ ;;
-    Darwin-x86_64) platform=macos-x86_64; expected=@MACOS_X86_64@; size=@MACOS_X86_64_SIZE@ ;;
     Linux-aarch64|Linux-arm64) platform=linux-aarch64; expected=@LINUX_AARCH64@; size=@LINUX_AARCH64_SIZE@ ;;
     Linux-x86_64) platform=linux-x86_64; expected=@LINUX_X86_64@; size=@LINUX_X86_64_SIZE@ ;;
-    *) fail 'supported CLI platforms are macOS and Linux on arm64 or x86_64' ;;
+    *) fail 'supported CLI platforms are macOS on Apple silicon and Linux on arm64 or x86_64' ;;
   esac
   if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
     fail 'sha256sum or shasum is required'
