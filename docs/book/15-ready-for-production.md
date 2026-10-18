@@ -861,8 +861,12 @@ would enable it. `cargo tree --target all -i rkyv` found no active path, and Rel
 no rkyv archives. The advertised fix starts at the incompatible rkyv 0.8 API while
 `rust_decimal` 1.x deliberately pins its optional integration to 0.7. We recorded a temporary,
 expiring exception instead of pretending that changing an unused lockfile version was a fix.
-The exception has a condition attached: `make audit` asks Cargo for the active `rkyv`
-graph first, and fails if any feature or target activates it, or if Cargo can't answer.
+The exception had a condition attached: `make audit` asked Cargo for the active `rkyv`
+graph first, and failed if any feature or target activated it, or if Cargo couldn't answer.
+The October 2026 dependency refresh (below) retired it. The newer lockfile no longer
+carries `rkyv` at all, so the guard's own `cargo tree -i rkyv` failed with "did not match
+any packages", and we deleted the exception and the guard together. A test in the suite
+now fails if `rkyv` ever comes back.
 
 The repository audit denies every new vulnerability and maintenance warning. Its short
 exception list expires on 18 November 2026, and the Make target fails after that date until we
