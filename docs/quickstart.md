@@ -143,7 +143,10 @@ node is running and its critical subsystems are ready. Missing or stopped VMs,
 unresponsive APIs and unavailable evidence return exit 1 after printing the
 observations. A saved provisioning checkpoint is not a live health check.
 
-`stop` preserves data. `destroy --yes` removes only the VMs named in this
+`stop` preserves data. It asks each guest to power itself off, so every node
+shuts down cleanly in a few seconds. If a guest is still running after two
+minutes, `stop` says so and falls back to `limactl stop`, which cuts the
+power after 30 seconds. `destroy --yes` removes only the VMs named in this
 cluster's saved record, along with its credentials and checkpoints. It keeps
 the downloaded tool and image cache for future clusters. `--name NAME` selects
 a different saved cluster; setup currently supports one active CLI context.
