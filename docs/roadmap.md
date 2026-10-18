@@ -296,7 +296,7 @@ migration and no feature gate
   - [x] compact task arrays, a template and a count rather than a record per
     task ([#266](https://github.com/reliaburger/reliaburger/pull/266), #588);
   - [x] the common job lifecycle (#638, [#642](https://github.com/reliaburger/reliaburger/pull/642),
-    [plan](plans/2026-10-07-plan-common-job-lifecycle.md),
+    [plan](plans/archive/2026-10-07-plan-common-job-lifecycle.md),
     [qualification](qualification/2026-10-07-common-jobs/README.md));
   - [x] fresh, shared and host executors, and the timed throughput scenarios in
     `relish bench` ([#654](https://github.com/reliaburger/reliaburger/pull/654),

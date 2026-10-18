@@ -650,7 +650,7 @@ the real `curl … | sh` install against it on every host we advertise.
    runs found for 0.1.0, candidate by candidate, and the PR that fixed each
    failure.
 
-   The [job-soak extension plan](plans/2026-10-10-plan-release-job-soak.md)
+   The [job-soak extension plan](plans/archive/2026-10-10-plan-release-job-soak.md)
    runs fresh-container, shared-container and native host work alongside these
    apps and faults. Accounting, independent effects, heartbeat/progress, exact
    owner inventory, fault coverage and positive cleanup affect the verdict.

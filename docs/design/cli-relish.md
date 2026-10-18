@@ -56,7 +56,7 @@ the network locality and live map handles needed to make the observations.
 
 ### Mayo (metrics queries)
 
-The TUI resource-usage displays query the Mayo time-series database for CPU, memory, GPU, disk, and network metrics. Mayo runs locally on each node. Note that the CLI `relish top` and `relish inspect` do **not** show Mayo metrics — they print workload state, PID and restart counts from the local agent.
+The TUI resource-usage displays query the Mayo time-series database for CPU, memory, GPU, disk, and network metrics. Mayo runs locally on each node. The CLI's `relish top` shows every workload on every node with its latest CPU and memory, gathered from the nodes running it. `relish inspect` lists an app's instances across the cluster with their node, state and restart counts, without metrics.
 
 ### Ketchup (log and history queries)
 
@@ -68,7 +68,7 @@ The `relish routes` command queries the Wrapper ingress proxy for the current ro
 
 ### Sesame (security)
 
-`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). There is no `relish identity` or `relish ca` command; workload-identity and CA-management subcommands are **not implemented**.
+`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). `relish ca` backs up the root CA (`relish ca backup`), checks a backup offline (`relish ca verify`) and rotates an intermediate (`relish ca rotate`). CA status and revocation are planned (#362). There is no workload-identity command: `relish identity` *(planned)*.
 
 ---
 
@@ -658,7 +658,7 @@ relish resolve <name>               # Resolve a service to its VIP and backends
 relish resolve <name> --namespace <ns>  # Pick one when the name exists in several
 relish events [--app <app>] [--severity <level>] [--limit <n>]  # Recent events, cluster-wide
 relish routes                       # Show the ingress routing table
-relish top                          # Workload table: state, PID, restarts (no live CPU/memory)
+relish top                          # Every workload on every node, with its latest CPU and memory
 relish wtf                          # Correlated cluster health diagnosis
 relish wtf --app <app>              # Scope to one app
 relish wtf --watch                  # Re-run every 30s until Ctrl-C
@@ -731,6 +731,10 @@ relish run --batch <name> --image <image> [--count N] -- <command>
 relish run --batch <name> ... --idempotency-key <key>
 relish batch-status <id> [--wait] [--timeout <secs>] # --timeout bounds only the wait
 relish batch replay <id> --node <node> --grant-digest <digest> --acknowledge-side-effects
+relish batch watch <id>             # Rates, profile summaries, duration buckets
+relish batch results <id> [--index N] # Accepted task outcomes, one page at a time
+relish batch logs <id> --index N    # A task's retained output (head and tail)
+relish batch cancel <id>            # Cancel and retire active attempts
 relish jobs [--definitions]
 # Submitting commands print the key they send on stderr before sending, so a
 # timed-out submission can be retried without admitting the work twice.
@@ -838,9 +842,8 @@ shipped CLI. **Status: planned — not yet implemented.**
 - `relish route <hostname>` — only `relish routes` (no argument) exists.
 - `relish firewall <app>` / `relish firewall test` — no firewall-inspection command; use `relish path`.
 - `relish identity <app>` — no workload-identity command.
-- `relish ca status | rotate | revoke` — no CA-management command.
+- `relish ca status | revoke`: `relish ca` has `backup`, `verify` and `rotate` only (#362).
 - `relish pickle gc` — no registry garbage-collection command.
-- `relish token rotate <name>` — token has only `create`, `list`, `revoke`.
 - `relish volume snapshot | snapshots | restore` — the real surface is `relish snapshot create | list | restore | delete`.
 - `relish completions <shell>` — no shell-completion generator (no `clap_complete`).
 - `relish login` — no login/keychain flow; authenticate with `--token` / `RELIABURGER_TOKEN`.
@@ -848,7 +851,6 @@ shipped CLI. **Status: planned — not yet implemented.**
 - `relish rollback --to <version>` — rollback goes one step; no version target.
 - `relish deploy --continue` — no continue flag.
 - `relish import -f -` / `--from-cluster` / `--kubeconfig` / `--output-dir`, and `relish export --format` — the importer reads named files only; export has no `--format`.
-- `relish logs --instance <id>` — no per-instance flag.
 - `relish resolve --all` — no all-services flag.
 - `relish inspect app.<name>` / `node.<name>` — inspect takes a bare app name, not dotted notation.
 
@@ -919,7 +921,7 @@ Relish apply plan:
 Plan: 1 to create, 0 to update, 0 to destroy.
 ```
 
-**`relish scale <app> <n>`** — **Status: planned — not yet implemented.**
+`relish scale <app> <n>` *(planned)* — **Status: planned — not yet implemented.**
 
 There is no imperative scale command. Set `replicas` in the app's config and
 re-run `relish apply`.
@@ -969,7 +971,7 @@ change).
 
 #### Change Planning Commands
 
-**`relish plan <path>`** — **Status: planned — not yet implemented.**
+`relish plan <path>` *(planned)* — **Status: planned — not yet implemented.**
 
 There is no `plan` subcommand. Use `relish apply <path> --dry-run` (or
 `relish deploy <path> --dry-run`), which prints an `ApplyPlan`: `+` for creates,
@@ -1075,7 +1077,7 @@ Backends:  1/1 healthy
   default__redis-0     10.0.1.5           30891    healthy
 ```
 
-**`relish firewall <app>` / `relish firewall test`** — **Status: planned — not yet implemented.**
+`relish firewall <app>` *(planned)* / `relish firewall test` *(planned)* — **Status: planned — not yet implemented.**
 
 There is no firewall-inspection command. To observe firewall evidence for a
 specific source→destination path, use `relish path <src> --to <dst>`, whose
@@ -1529,7 +1531,7 @@ Each correlated group becomes one `[app.*]` block. Uncorrelated resources are co
 | Secret (mounted) | `[[app.*.config_file]]` | **Warning**: re-encrypt with `relish secret encrypt` |
 | Job | `[job.*]` | `command`+`args`, `image`, `env`, resources, namespace |
 | CronJob | `[job.*]` with `schedule` | Cron expression preserved; `suspend`/`concurrencyPolicy` warned |
-| PersistentVolumeClaim | `volume = { path, size }` | **Warning** if StorageClass is not local |
+| PersistentVolumeClaim | `[[app.NAME.volumes]]` with `path` and `size` | **Warning** if StorageClass is not local |
 | Namespace | `[namespace.*]` | ResourceQuota fields → quota fields |
 | NetworkPolicy | **Warning** | Partial via `allow_from`; complex policies dropped |
 | ServiceAccount | **Warning** | Replaced by SPIFFE workload identity |
@@ -1635,7 +1637,7 @@ namespace from config, or TUI-tuning file — those were never implemented.
 
 ### Shell Completions
 
-**Status: planned — not yet implemented.** There is no `relish completions`
+**Status: planned — not yet implemented.** There is no `relish completions` *(planned)*
 command and `clap_complete` is not wired in.
 
 ---
@@ -1685,7 +1687,7 @@ For streaming commands (`logs --follow`, `exec`), WebSocket disconnections are h
 
 ### Authentication Failures
 
-- **Expired token:** Clear error message. Mint a replacement with `relish token revoke <name>` followed by `relish token create --name <name> ...` (there is no `relish token rotate`).
+- **Expired token:** Clear error message. Rotate it with `relish token rotate <name> [--grace-hours N]`: the new secret works at once, and the old one keeps working for the grace period.
 - **Insufficient permissions:** The API returns the required role, and Relish displays it: `Permission denied: requires admin role (you have: deployer)`.
 - **Certificate mismatch:** Clear mTLS error with the expected CA fingerprint.
 
@@ -1696,7 +1698,7 @@ For streaming commands (`logs --follow`, `exec`), WebSocket disconnections are h
 ### Token Storage
 
 API tokens are sensitive credentials. Relish does **not** persist them: there is
-no OS keychain integration (no `keyring` crate, no `relish login`) and no CLI
+no OS keychain integration (no `keyring` crate, no `relish login` *(planned)*) and no CLI
 config file. A token reaches the CLI one of two ways:
 
 1. **`--token <token>`** on any command.
@@ -1717,9 +1719,9 @@ identity isolation exist in the current CLI:
 
 | Command | Required Role (planned) | Rationale |
 |---------|--------------|-----------|
-| `relish exec --debug <app>` | `deployer` or `admin` | Debug containers would be isolated (own identity, own firewall rules). |
-| `relish exec --debug --privileged <app>` | `admin` only | Privileged debug containers would bypass firewall rules. |
-| `relish exec --node <node> -- <cmd>` | `admin` only | Host-level access is the highest privilege level. |
+| `relish exec --debug <app>` *(planned)* | `deployer` or `admin` | Debug containers would be isolated (own identity, own firewall rules). |
+| `relish exec --debug --privileged <app>` *(planned)* | `admin` only | Privileged debug containers would bypass firewall rules. |
+| `relish exec --node <node> -- <cmd>` *(planned)* | `admin` only | Host-level access is the highest privilege level. |
 
 ### Audit Logging
 
@@ -1741,7 +1743,7 @@ These events are visible in `relish history` and in the TUI/web events view. Sec
 
 Target: under 50ms from invocation to first API request.
 
-Relish is a statically-linked Rust binary with no runtime dependencies. Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request. The binary is ~15MB and maps into memory quickly on modern systems.
+Relish is a single Rust binary. Linux release builds link glibc (`*-linux-gnu`); static musl builds are planned with 0.3.0 (#401). Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request.
 
 For commands that don't contact the cluster (`compile`, `lint`, `fmt`, `diff`, `--version`), total execution time is typically under 20ms.
 
@@ -1763,7 +1765,7 @@ Log lines from application stdout/stderr to the operator's terminal:
 
 ### Plan/Diff Computation
 
-`relish plan` and `relish diff` perform a single API round-trip. The cluster API computes the diff server-side (comparing the submitted configuration against Raft state) and returns the result. Typical response time: 50-200ms depending on the number of resources. The local TOML parsing and merging adds <10ms.
+`relish apply --dry-run` performs a single API round-trip: the agent supplies current state and the CLI computes the plan against it. (`relish diff` compares two local configs and needs no cluster.) The original design had the cluster compute the diff server-side (comparing the submitted configuration against Raft state) and returns the result. Typical response time: 50-200ms depending on the number of resources. The local TOML parsing and merging adds <10ms.
 
 ### API Request Overhead
 
@@ -1775,7 +1777,7 @@ All API requests use HTTP/2 with connection reuse. The mTLS handshake occurs onc
 
 ### CLI Integration Tests
 
-Each CLI command has integration tests that run against a real cluster (the same test cluster used by `relish test`). Tests are organised by command:
+This is the original per-command layout. Today the CLI's integration tests live in `tests/suite/relish_cli.rs` (plus the doc snippet tests in `tests/suite/doc_snippets.rs`), and the planned files below remain a target:
 
 ```
 tests/
@@ -1800,7 +1802,7 @@ tests/
     test_route.rs           # relish route ingress display
     test_secret.rs          # relish secret encrypt/rotate
     test_token.rs           # relish token create/list/rotate/revoke
-    test_volume.rs          # relish volume snapshot/restore
+    test_snapshot.rs        # relish snapshot create/list/restore/delete
     test_upgrade.rs         # relish upgrade check/plan/start/status
     test_fault.rs           # relish fault injection commands
     test_test.rs            # relish test (meta-test)
@@ -1897,7 +1899,7 @@ Reference: [kubectl design](https://kubernetes.io/docs/reference/kubectl/)
 
 **What we borrow:** The `apply` and `exec` interaction model. Operators familiar with `kubectl apply` and `kubectl exec` will find `relish apply` and `relish exec` immediately familiar.
 
-**What we do differently:** Everything else. `relish plan` replaces the blind `apply` workflow. `relish wtf` replaces the manual runbook-based diagnosis. `relish path` replaces the multi-tool connectivity debugging ritual. Events don't expire after 1 hour. There are no plugins to install.
+**What we do differently:** Everything else. `relish apply --dry-run` replaces the blind `apply` workflow. `relish wtf` replaces the manual runbook-based diagnosis. `relish path` replaces the multi-tool connectivity debugging ritual. Events don't expire after 1 hour. There are no plugins to install.
 
 ### k9s (Kubernetes TUI)
 
@@ -1925,9 +1927,9 @@ Terraform pioneered the plan-before-apply workflow for infrastructure. `terrafor
 
 Reference: [Terraform CLI docs](https://developer.hashicorp.com/terraform/cli)
 
-**What we borrow:** The entire plan/apply model. `relish plan` is directly inspired by `terraform plan`. The output format (create/update/destroy with `+`/`~`/`-` prefixes) is intentionally similar. `relish plan` also includes scheduling decisions, which Terraform doesn't need but container orchestrators benefit from.
+**What we borrow:** The entire plan/apply model. `relish apply --dry-run` is directly inspired by `terraform plan`. The output format (create/update/destroy with `+`/`~`/`-` prefixes) is intentionally similar. `relish plan` *(planned)* would also include scheduling decisions, which Terraform doesn't need but container orchestrators benefit from.
 
-**What we do differently:** `relish plan` also validates scheduling feasibility (sufficient resources, matching labels, node capacity). Kubernetes has nothing equivalent to `terraform plan`.
+**What we do differently:** `relish plan` *(planned)* would also validate scheduling feasibility (sufficient resources, matching labels, node capacity). Kubernetes has nothing equivalent to `terraform plan`.
 
 ### Nomad CLI (HashiCorp)
 
@@ -1969,7 +1971,7 @@ Relish is implemented in Rust. The following crates are used:
 | `rustls` | 0.23.x | TLS implementation (used by reqwest) for mTLS client certs |
 | `insta` | 1.x | Snapshot testing for TUI rendering (dev dependency) |
 
-All dependencies are vendored in the release build. The binary is statically linked (musl on Linux, native on macOS) with no runtime shared library dependencies.
+Release builds pin every dependency in `Cargo.lock`. Linux builds link glibc dynamically; a static musl build is planned with 0.3.0 (#401).
 
 ---
 
@@ -1989,7 +1991,7 @@ Decision deferred until user demand is clearer.
 
 ### Shell Completions
 
-Shell completions are not yet implemented (there is no `relish completions` command). If added via `clap_complete`, the open questions would be:
+Shell completions are not yet implemented (there is no `relish completions` *(planned)* command). If added via `clap_complete`, the open questions would be:
 
 - Should completions include dynamic values (app names, node names) fetched from the cluster API? This adds latency to tab completion but significantly improves usability.
 - If yes, should completions be cached locally with a TTL (e.g., 60 seconds) to avoid per-keystroke API calls?
@@ -2002,7 +2004,7 @@ Current leaning: implement dynamic completions with a 60-second cache and gracef
 Should Relish support running the TUI on a remote machine and forwarding the terminal over SSH? This is already possible (SSH naturally forwards terminal I/O), but there are optimisation questions:
 
 - Should Relish detect SSH sessions and reduce rendering frequency to accommodate latency?
-- Should there be a `relish serve-tui` mode that hosts a shared TUI session accessible by multiple operators (useful for incident response where multiple people want to see the same dashboard)?
+- Should there be a `relish serve-tui` *(planned)* mode that hosts a shared TUI session accessible by multiple operators (useful for incident response where multiple people want to see the same dashboard)?
 - Should the TUI support a web-based rendering mode (e.g., via xterm.js) as an alternative to SSH? (Note: this overlaps with Brioche, the web UI.)
 
 Current leaning: SSH works naturally. No special mode needed. Shared dashboards are Brioche's domain.
@@ -2019,7 +2021,7 @@ Current leaning: full command set with view replacement and history. Autocomplet
 
 ### Offline Mode
 
-Should `relish compile`, `relish lint`, and `relish fmt` work entirely offline without any cluster context? Currently they do (they only parse local TOML files). But should `relish plan` support an offline mode with a cached cluster state snapshot? This would allow operators to preview changes while disconnected.
+Should `relish compile`, `relish lint`, and `relish fmt` work entirely offline without any cluster context? Currently they do (they only parse local TOML files). But should `relish plan` *(planned)* support an offline mode with a cached cluster state snapshot? This would allow operators to preview changes while disconnected.
 
 Current leaning: not for v1. `plan` requires live cluster state to be meaningful. A stale snapshot could produce misleading results.
 
@@ -2028,7 +2030,7 @@ Current leaning: not for v1. `plan` requires live cluster state to be meaningful
 Should Relish support managing multiple clusters from a single config file (similar to kubectl contexts)? If so:
 
 - Config syntax: `[clusters.prod]`, `[clusters.staging]` sections?
-- Switching: `relish context use prod` or `--cluster prod` flag?
+- Switching: `relish context use prod` *(planned)* or `--cluster prod` flag?
 - TUI: cluster selector in the dashboard header?
 
-Current leaning: multiple `[clusters.*]` sections with `--cluster <name>` flag and a `relish context` subcommand. TUI cluster switching via `:context <name>` command palette.
+Current leaning: multiple `[clusters.*]` sections with `--cluster <name>` flag and a `relish context` *(planned)* subcommand. TUI cluster switching via `:context <name>` command palette.

@@ -12,53 +12,52 @@ the detail is in the GitHub milestones and issues.
 |---|---|---|
 | [0.2.2: UX patch](2026-10-16-plan-0.2.2-ux-patch.md) | The 0.2.2 merge train: the CLI review, Kubernetes fidelity, chaos for jobs, demos, book and design-doc corrections, doc snippet tests and the 0.2.1 follow-ups, in three waves on `release-0-2-2`. | [Milestone 0.2.2](https://github.com/reliaburger/reliaburger/milestone/15) |
 | [CI and test efficiency](2026-10-11-ci-and-test-efficiency.md) | Faster CI and stronger test and soak evidence: one archive extraction per job (#1050), integration policy, test consolidation and compilation costs, with an 18 October status of what's done, tracked and proposed. | Merge queue on the current train; the proposed test, fixture and soak-evidence issues |
-| [Job retirement and record-read races](2026-10-10-job-retirement-read-races.md) | Retain filesystem cleanup across timeouts and validate atomically replaced records with one metadata inspection. | #654: review and GitHub checks |
-| [Jobs in the release soak](2026-10-10-plan-release-job-soak.md) | Exercise all job runtimes alongside apps and existing faults within the current V02 duration, plus the job qualification tiers for the 0.2.0 exit gate (D18-C, #686): the #668 throughput target, node-level faults and the recorded M8 measurements. | Staged fast/final qualification and resource-cap calibration; the 12-hour run is [#668](https://github.com/reliaburger/reliaburger/issues/668) |
-| [Container migration](2026-10-09-plan-container-migration.md) | The delivery plan for moving running workloads: who it's for, decisions, ordered spikes with go/no-go rules, and nine named milestones across 0.4.0, 0.4.1 and 0.5.0 (live moves). The [research](2026-09-28-research-container-migration.md) holds the CRIU findings, continuity contract and design reference; checked against main on 9 October. | [#268](https://github.com/reliaburger/reliaburger/pull/268): feasibility spikes, implementation and qualification |
-| [GitOps webhook admission](2026-10-04-gitops-webhook-admission.md) | Replicate authenticated triggers before 202, with bounded admission and generation-aware retry. | [#553](https://github.com/reliaburger/reliaburger/issues/553) |
-| [GitOps job refusal](2026-10-04-gitops-job-refusal.md) | Refuse unsupported jobs before publishing their dependent apps or advancing the applied revision. | #549 |
-| [Shared configuration tree](2026-10-04-shared-config-tree.md) | Resolve defaults and directory namespaces consistently through CLI and GitOps adapters. | #548 |
-| [Desired-spec previews](2026-10-04-desired-spec-preview.md) | Complete scoped comparison evidence with explicit offline and unknown actions. | #550 |
-| [Autoscale target validation](2026-10-03-autoscale-target-validation.md) | Refuse nonpositive or nonfinite controller targets and measurements. | #554 |
-| [Batch execution identities](2026-10-03-batch-execution-identities.md) | Bind batch outcomes, scope and durable retries to one execution per submitted job. | #535 |
-| [Physical image storage quota](2026-10-03-plan-physical-image-quota.md) | Bound committed blobs and concurrent temporary payloads across all image writers ([#540](https://github.com/reliaburger/reliaburger/issues/540)). | Regressions, shared budget, production wiring and CI |
-| [Review 2: audit fixes](2026-10-03-review2-audit-fixes.md) | The approved 28-issue audit, implemented through one merge train with cross-path hardening last. | [#528–#555](https://github.com/reliaburger/reliaburger/milestone/11) |
-| [Registry verification admission](2026-10-03-plan-registry-verification.md) | Share the bounded Sesame verifier across API and OCI registry requests ([#539](https://github.com/reliaburger/reliaburger/issues/539)). | Router regression, implementation and portable CI |
-| [Blob repository authority](2026-10-03-plan-blob-repository-authority.md) | Require destination upload or catalogue evidence for shared CAS bytes ([#531](https://github.com/reliaburger/reliaburger/issues/531)). | Regressions, durable receipts, lifecycle and CI |
-| [Build signing lifetime](2026-10-03-plan-build-signing-lifetime.md) | Separate artefact authority from runtime mTLS and refresh the cached signer ([#529](https://github.com/reliaburger/reliaburger/issues/529)). | Regression, implementation and validation |
-| [Live namespace validation](2026-10-04-live-namespace-validation.md) | Keep intrinsic field checks local and resolve permission/build namespace existence on the leader. | #551 |
-| [Managed volume image identities](2026-10-03-managed-volume-image-identities.md) | Preserve full volume filenames and refuse overlapping storage artifacts. | #528 |
-| [Batch duplicate identities](2026-10-03-batch-duplicate-identities.md) | Refuse ambiguous duplicate labels before any batch dispatch. | #542 |
-| [Batch workload admission](2026-10-03-batch-workload-admission.md) | Enforce workload validation, scope and host-execution grants on batch submission. | #530 |
-| [Persistent host job executors](2026-10-09-plan-host-job-executors.md) | Matched measurements, bounded native executors, event-driven cleanup and resource limits. | #640 |
-| [Reusable containers and throughput](2026-10-07-plan-reusable-executors-and-throughput.md) | Built-in command executors, matched throughput measurements, a prominent demo and sustained qualification. | [#639](https://github.com/reliaburger/reliaburger/issues/639), [#640](https://github.com/reliaburger/reliaburger/issues/640) |
-| [Common job lifecycle](2026-10-07-plan-common-job-lifecycle.md) | One durable definition/run/task/attempt path for singleton jobs, batches, cron and deployment hooks. | [#638](https://github.com/reliaburger/reliaburger/issues/638), implementation and validation |
-| [Resource-aware delegated jobs](2026-10-04-plan-delegated-jobs.md) | Resource budgets, mixed profiles, durable outcomes, summaries and the homepage demo, continuing #266. | Implementation and qualification |
+| [Container migration](2026-10-09-plan-container-migration.md) | The delivery plan for moving running workloads: who it's for, decisions, ordered spikes with go/no-go rules, and nine named milestones across 0.4.0, 0.4.1 and 0.5.0 (live moves). The [research](2026-09-28-research-container-migration.md) holds the CRIU findings, continuity contract and design reference; checked against main on 9 October. | Feasibility spikes, implementation and qualification |
 | [V02: sustained qualification](2026-09-25-v02-sustained.md) | The design, invariants and pass/fail thresholds of the sustained soak. `scripts/release/qualify-sustained.sh`, `sustained_check.py` and the [release runbook](../releasing.md) run every release against it. | Snapshot uploader under power cuts and the `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)) |
 | [Review: the agent loop](2026-09-30-agent-loop-review.md) | A review brief on Bun's `run_loop`: how it works, every soak failure it caused, what's still inline, and three options for restructuring it. For discussion. | The maintainer's decision on the recommendation (keep the loop, add a turn meter and a starvation harness) and its six open questions |
-| [F07: cross-node views and log streams](2026-10-01-plan-f07-cross-node-views.md) | Which views and streams still answered for one node, and the split of [#365](https://github.com/reliaburger/reliaburger/issues/365): part 1 (every view and stream covers the cluster) ships in 0.1.3. | Part 2: separate stderr capture, `--until`/`--instance`/regex filters, a merged live event stream and a live-metrics contract |
-| [F03a: upstream image trust](2026-10-02-plan-f03-upstream-image-trust.md) | Binding every image to a digest at apply, a `node.toml` policy for images outside Pickle, and key-based cosign verification ([#361](https://github.com/reliaburger/reliaburger/issues/361)). The tag-and-digest parser fix and `bind_image` shipped in 0.1.4; the rest is 0.1.5. Worker key separation (F03b) follows in its own plan. | U1 wiring, U2–U4 (decisions recorded in the plan, 2 Oct) |
-| [F03c: keyless cosign and Sigstore bundles](2026-10-05-plan-f03c-keyless-cosign.md) | Fulcio certificates, identity rules and Rekor proofs for keyless signatures, in the classic `.sig` layout and as Sigstore bundles stored as OCI referrers, with a pinned Sigstore trusted root ([#619](https://github.com/reliaburger/reliaburger/issues/619)). Planned for a later release. | Everything, after the crate spike (K0) and the six open questions |
-| [F04: CA recovery and rotation](2026-10-02-plan-f04-ca-recovery-and-rotation.md) | Several CAs per role, trust bundles in every verifier, an operator-held root backup, intermediate then root rotation, restore into an isolated cluster, and a stated grace policy ([#362](https://github.com/reliaburger/reliaburger/issues/362)). R0 shipped in 0.1.4 (#472). | R1–R4 for 0.1.5, R5–R7 later (decisions recorded in the plan, 2 Oct) |
-| [F05: identity and tokens](2026-10-02-plan-f05-identity-and-tokens.md) | Audit attribution, token visibility and safe expiry, rotation and a default lifetime, per-namespace secret keys, per-app JWT audiences, and a decryption audit ([#363](https://github.com/reliaburger/reliaburger/issues/363)). I1 shipped in 0.1.4 (#473); I2 is on the 0.1.5 train (#483). | I3–I4 for 0.1.5, I5–I6 later (decisions recorded in the plan, 2 Oct) |
-| [CI feedback loop](2026-09-23-ci-feedback-loop.md) | The CI layout and flake work of 23 September. Everything but one item has shipped. | C6.4: whether entry-node fault pre-checks should read the leader's view instead of their own |
+| [F03c: keyless cosign and Sigstore bundles](2026-10-05-plan-f03c-keyless-cosign.md) | Fulcio certificates, identity rules and Rekor proofs for keyless signatures, in the classic `.sig` layout and as Sigstore bundles stored as OCI referrers, with a pinned Sigstore trusted root. Planned for a later release. | Everything, after the crate spike (K0) and the six open questions ([#619](https://github.com/reliaburger/reliaburger/issues/619)) |
+| [F04: CA recovery and rotation](2026-10-02-plan-f04-ca-recovery-and-rotation.md) | Several CAs per role, trust bundles in every verifier, an operator-held root backup, intermediate then root rotation, restore into an isolated cluster, and a stated grace policy. R0–R4 shipped by 0.1.6. | R5–R7 ([#362](https://github.com/reliaburger/reliaburger/issues/362)) |
+| [F05: identity and tokens](2026-10-02-plan-f05-identity-and-tokens.md) | Audit attribution, token visibility and safe expiry, rotation and a default lifetime, per-namespace secret keys, per-app JWT audiences, and a decryption audit. I1–I4 shipped by 0.1.6. | I5–I6 ([#363](https://github.com/reliaburger/reliaburger/issues/363)) |
+| [CI feedback loop](2026-09-23-ci-feedback-loop.md) | The CI layout and flake work of 23 September. Everything but one item has shipped. | C6.4: whether entry-node fault pre-checks should read the leader's view instead of their own ([#334](https://github.com/reliaburger/reliaburger/issues/334)) |
 
-Plans for later releases arrive with their pull requests: the Go demo build
-for 0.1.2 ([#248](https://github.com/reliaburger/reliaburger/pull/248)), a
-million jobs for 0.2.0 ([#266](https://github.com/reliaburger/reliaburger/pull/266)),
-the appliance for 0.3.0 ([#218](https://github.com/reliaburger/reliaburger/pull/218),
-[#259](https://github.com/reliaburger/reliaburger/pull/259)), container
-migration for 0.4.0 ([#268](https://github.com/reliaburger/reliaburger/pull/268))
-and the fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265)).
+Plans for later releases arrive with their own pull requests. The
+[roadmap](../roadmap.md) lists what comes next.
 
 ## History
 
-[archive/](archive/) holds the plans and reviews that led to 0.1.0. The
+[archive/](archive/) holds the plans and reviews that led to 0.1.0, and the
+finished plans since. The
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
-is the summary of how that ended.
+is the summary of how 0.1.0 ended.
 
 - [Soak charts](archive/2026-10-17-soak-charts.md): SVG charts in every soak record, and the released version's on the homepage (#979)
 - [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)
 - [A million jobs, the September design](archive/2026-09-28-plan-million-jobs.md): superseded by the October plans; its M8 targets are recorded, not gated, by every job qualification run (D18-C)
 - [Cluster migration prerequisites](archive/2026-10-04-cluster-migration-prerequisites.md): superseded in 0.2.0 when leased applies moved to the common job lifecycle and the prerequisite claims were retired (#681)
 - [Batch capacity reservations](archive/2026-10-04-batch-capacity-reservations.md): superseded in 0.2.0 when the leader's batch reservations were retired and app placement started counting job leases (#681)
+- [Job retirement and record-read races](archive/2026-10-10-job-retirement-read-races.md): retained cleanup across timeouts and single-inspection record reads (#654)
+- [Jobs in the release soak](archive/2026-10-10-plan-release-job-soak.md): all job runtimes in the V02 soak and the job qualification tiers of the 0.2.0 exit gate (#686, #668)
+- [Persistent host job executors](archive/2026-10-09-plan-host-job-executors.md): bounded native executors and their measurements (#640)
+- [Reusable containers and throughput](archive/2026-10-07-plan-reusable-executors-and-throughput.md): built-in command executors and the sustained throughput demo (#639, #640)
+- [Common job lifecycle](archive/2026-10-07-plan-common-job-lifecycle.md): one definition/run/task/attempt path for singleton jobs, batches, cron and hooks, shipped in 0.2.0 (#638)
+- [Resource-aware delegated jobs](archive/2026-10-04-plan-delegated-jobs.md): resource budgets, mixed profiles, durable outcomes and the homepage demo, shipped in 0.2.0
+- [GitOps webhook admission](archive/2026-10-04-gitops-webhook-admission.md) (#553)
+- [GitOps job refusal](archive/2026-10-04-gitops-job-refusal.md) (#549)
+- [Shared configuration tree](archive/2026-10-04-shared-config-tree.md) (#548)
+- [Desired-spec previews](archive/2026-10-04-desired-spec-preview.md) (#550)
+- [Live namespace validation](archive/2026-10-04-live-namespace-validation.md) (#551)
+- [Review 2: audit fixes](archive/2026-10-03-review2-audit-fixes.md): the 28-issue audit, #528–#555, shipped in 0.1.5
+- [Autoscale target validation](archive/2026-10-03-autoscale-target-validation.md) (#554)
+- [Batch execution identities](archive/2026-10-03-batch-execution-identities.md) (#535)
+- [Physical image storage quota](archive/2026-10-03-plan-physical-image-quota.md) (#540)
+- [Registry verification admission](archive/2026-10-03-plan-registry-verification.md) (#539)
+- [Blob repository authority](archive/2026-10-03-plan-blob-repository-authority.md) (#531)
+- [Build signing lifetime](archive/2026-10-03-plan-build-signing-lifetime.md) (#529)
+- [Managed volume image identities](archive/2026-10-03-managed-volume-image-identities.md) (#528)
+- [Batch duplicate identities](archive/2026-10-03-batch-duplicate-identities.md) (#542)
+- [Batch workload admission](archive/2026-10-03-batch-workload-admission.md) (#530)
+- [Bound cron arithmetic](archive/2026-10-03-cron-step-overflow.md) (#541)
+- [F03a: upstream image trust](archive/2026-10-02-plan-f03-upstream-image-trust.md): digest binding, the `node.toml` image policy and key-based cosign, shipped by 0.1.6; keyless signatures continue as F03c
+- [F07: cross-node views and log streams](archive/2026-10-01-plan-f07-cross-node-views.md): every view and stream covers the cluster (#365)
+- [Demo image build](archive/2026-09-27-plan-demo-image-build.md): the Go demo app, multi-arch export and Buildah pruning (#248)
+- [Task arrays and a 100,000-job tour step](archive/2026-09-25-plan-task-arrays.md): superseded by the September million-jobs design
