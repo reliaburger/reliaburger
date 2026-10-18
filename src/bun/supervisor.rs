@@ -1975,6 +1975,55 @@ mod tests {
         sup.admit_app("image", &image).unwrap();
     }
 
+    /// #935: a host app's init container that names no image runs its
+    /// command on the host, so its binary needs the allowlist as the app's
+    /// does. One with its own image is a container and needs no entry.
+    #[test]
+    fn a_host_apps_init_container_is_refused_when_its_binary_isnt_allowlisted() {
+        let root = tempfile::tempdir().unwrap();
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runtime = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mut sup = WorkloadSupervisor::with_process_config(
+            runtime,
+            PortAllocator::new(30000, 31000),
+            crate::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                script_dir: root.path().join("scripts"),
+            },
+        );
+        let host = |init: &str| {
+            crate::config::Config::parse(&format!(
+                "[app.host]\nexec='/bin/sh'\n[[app.host.init]]\n{init}"
+            ))
+            .unwrap()
+            .app
+            .remove("host")
+            .unwrap()
+        };
+
+        let error = sup
+            .admit_app("host", &host("command = ['/usr/bin/migrate']"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("/usr/bin/migrate") && error.contains("allowlist"),
+            "{error}"
+        );
+        sup.admit_app("host", &host("command = ['/bin/sh', '-c', 'true']"))
+            .unwrap();
+        sup.admit_app(
+            "host",
+            &host("image = 'migrate:v2'\ncommand = ['/usr/bin/migrate']"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn mixed_admission_does_not_promise_container_egress_enforcement_for_host_commands() {
         let root = tempfile::tempdir().unwrap();

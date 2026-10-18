@@ -438,6 +438,28 @@ mod tests {
         assert_eq!(result.len(), 4);
     }
 
+    /// #935: a host app's image-less init container runs its command on the
+    /// host, so the app lands only where the node allows that binary too,
+    /// or the node would refuse it after placement.
+    #[test]
+    fn a_host_apps_init_binary_must_be_allowlisted_for_placement() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(running("app-only", true, &["/usr/bin/python3"]));
+        cluster.set_node(running(
+            "both",
+            true,
+            &["/usr/bin/python3", "/usr/bin/migrate"],
+        ));
+        let spec: AppSpec = toml::from_str(
+            "exec = \"/usr/bin/python3\"\n[[init]]\ncommand = [\"/usr/bin/migrate\"]",
+        )
+        .unwrap();
+
+        let result = filter_nodes(&WorkloadRequirements::for_app(&spec, false), &cluster);
+
+        assert_eq!(result, vec![NodeId::new("both")]);
+    }
+
     #[test]
     fn an_empty_cluster_says_no_node_is_ready() {
         let mut cluster = ClusterStateCache::new();

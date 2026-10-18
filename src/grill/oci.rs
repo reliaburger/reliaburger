@@ -954,6 +954,35 @@ mod tests {
         assert_eq!(inherited.root.path, "myapp:v1");
     }
 
+    /// #935: an `exec` or `script` app's init container that names no image
+    /// runs on the host like its app, so it records as a host spec. One
+    /// that names an image, or an image app's init, stays a container.
+    #[test]
+    fn an_init_container_of_a_host_app_records_as_a_host_spec() {
+        for host_app in [
+            r#"exec = "/bin/sleep""#,
+            r#"script = "sleep 60""#,
+        ] {
+            let app = app_oci(&toml::from_str(host_app).unwrap());
+            assert!(app.host_process, "{host_app}");
+
+            let init = generate_init_oci_spec(&init_container(None, &["/bin/true"]), &app);
+            assert!(init.host_process, "{host_app}: init must be a host spec");
+            assert_eq!(init.root.path, HOST_ROOT);
+
+            let own_image =
+                generate_init_oci_spec(&init_container(Some("migrate:v2"), &["migrate"]), &app);
+            assert!(
+                !own_image.host_process,
+                "{host_app}: an init with its own image is a container"
+            );
+        }
+
+        let image_app = app_oci(&minimal_app());
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &image_app);
+        assert!(!init.host_process, "an image app's init is a container");
+    }
+
     #[test]
     fn init_spec_gets_app_env_and_volume_mounts() {
         let tmp = tempfile::tempdir().unwrap();
