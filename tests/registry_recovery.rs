@@ -403,13 +403,23 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
         catalogue.repository_owners.get(&repository),
         Some(&lease.lease_id)
     );
-    let observed = client
-        .http()
-        .unwrap()
-        .get(format!("{endpoint}/v1/test/leases/{}", lease.lease_id))
-        .send()
-        .await
-        .unwrap();
+    // A lease leader that can't prove it still leads answers 503 "retry
+    // shortly", the documented retryable answer (#1009). Retry that within
+    // a bound; any other status is the answer.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let observed = loop {
+        let response = client
+            .http()
+            .unwrap()
+            .get(format!("{endpoint}/v1/test/leases/{}", lease.lease_id))
+            .send()
+            .await
+            .unwrap();
+        if response.status() != 503 || Instant::now() >= deadline {
+            break response;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     assert_eq!(observed.status(), 200);
     let observed: reliaburger::testkit::lease::TestLease = observed.json().await.unwrap();
     assert_eq!(observed.repositories[&repository].len(), 1);

@@ -3,6 +3,10 @@
 use anyhow::{Context, Result, bail};
 use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
+/// How long [`Lima::power_off`] waits for a guest to shut itself down before
+/// falling back to `limactl stop`. A clean shutdown takes a few seconds.
+pub const POWER_OFF_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Runs a selected Lima binary; command errors never include its argument list.
 #[derive(Clone)]
 pub struct Lima {
@@ -209,6 +213,41 @@ impl Lima {
         }
         drop(turn);
         start.await.map(drop)
+    }
+
+    /// Shut a VM down cleanly, keeping its disk consistent.
+    ///
+    /// `limactl stop` is not a clean shutdown with the vz driver: the Linux
+    /// guest ignores its `RequestStop()`, and after 30 s Lima kills the VM
+    /// (issue #1023). So the guest powers itself off through systemd, which
+    /// stops `bun` and unmounts the disks first, and we wait up to `deadline`
+    /// for Lima to report it `Stopped`. Only if the guest can't be asked, or
+    /// doesn't stop in time, do we fall back to `limactl stop`, and say so.
+    pub async fn power_off(&self, name: &str, deadline: Duration) -> Result<()> {
+        // `--no-block` queues the shutdown and returns, so the SSH session
+        // ends before systemd takes the network down under it.
+        let request = self
+            .command(&["shell", name, "sudo", "systemctl", "poweroff", "--no-block"])
+            .await;
+        if let Err(error) = request {
+            eprintln!(
+                "could not power {name} off from inside ({error:#}); falling back to limactl stop"
+            );
+            return self.command(&["stop", name]).await.map(drop);
+        }
+        let stopped = async {
+            while !matches!(self.status(name).await, Ok(Some(status)) if status == "Stopped") {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        if tokio::time::timeout(deadline, stopped).await.is_ok() {
+            return Ok(());
+        }
+        eprintln!(
+            "{name} did not power off within {} s; falling back to limactl stop",
+            deadline.as_secs()
+        );
+        self.command(&["stop", name]).await.map(drop)
     }
 
     /// Read the status of exactly one owned VM; absence is not a command failure.
@@ -589,6 +628,91 @@ mod tests {
                 .unwrap()
                 .count(),
             0
+        );
+    }
+
+    /// A stand-in `limactl` for `power_off`: it logs each call, answers
+    /// `list --json` from `list.json`, and on `shell` either fails (when
+    /// `shell-fails` exists) or, when `guest-obeys` exists, marks the VM
+    /// `Stopped` the way a guest that powers off would.
+    fn power_off_fake(status: &str) -> (tempfile::TempDir, Lima) {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("limactl.sh");
+        std::fs::write(
+            &script,
+            r#"dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/calls.log"
+case "$1" in
+  list) cat "$dir/list.json" ;;
+  shell)
+    if [ -f "$dir/shell-fails" ]; then exit 1; fi
+    if [ -f "$dir/guest-obeys" ]; then
+      printf '{"name":"%s","status":"Stopped"}\n' "$2" > "$dir/list.json"
+    fi ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("list.json"),
+            format!(r#"{{"name":"rb-laptop-1","status":"{status}"}}"#),
+        )
+        .unwrap();
+        let lima = Lima::shell_script(script, Duration::from_secs(5));
+        (directory, lima)
+    }
+
+    /// Every call except the `list` reads.
+    fn power_off_actions(directory: &Path) -> Vec<String> {
+        std::fs::read_to_string(directory.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.starts_with("list"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    const POWER_OFF: &str = "shell rb-laptop-1 sudo systemctl poweroff --no-block";
+
+    #[tokio::test]
+    async fn power_off_shuts_the_guest_down_from_inside_and_waits_for_stopped() {
+        let (directory, lima) = power_off_fake("Running");
+        std::fs::write(directory.path().join("guest-obeys"), "").unwrap();
+
+        lima.power_off("rb-laptop-1", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(power_off_actions(directory.path()), vec![POWER_OFF]);
+        assert_eq!(
+            lima.status("rb-laptop-1").await.unwrap().as_deref(),
+            Some("Stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn power_off_falls_back_to_limactl_stop_when_the_guest_keeps_running() {
+        let (directory, lima) = power_off_fake("Running");
+
+        lima.power_off("rb-laptop-1", Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert_eq!(
+            power_off_actions(directory.path()),
+            vec![POWER_OFF, "stop rb-laptop-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn power_off_falls_back_to_limactl_stop_when_the_guest_shell_fails() {
+        let (directory, lima) = power_off_fake("Running");
+        std::fs::write(directory.path().join("shell-fails"), "").unwrap();
+
+        lima.power_off("rb-laptop-1", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            power_off_actions(directory.path()),
+            vec![POWER_OFF, "stop rb-laptop-1"]
         );
     }
 
