@@ -341,7 +341,7 @@ fn read_passphrase_file(path: &Path) -> Result<SecretString, RelishError> {
     let mut line = String::new();
     std::io::BufReader::new(file).read_line(&mut line)?;
     let line = line.trim_end_matches(['\n', '\r']).to_string();
-    Ok(SecretString::new(line))
+    Ok(SecretString::from(line))
 }
 
 /// Ask for a secret on the controlling terminal with echo off.
@@ -371,7 +371,7 @@ fn prompt_secret(prompt: &str) -> Result<SecretString, RelishError> {
     tcsetattr(&tty, SetArg::TCSANOW, &saved).map_err(|e| no_terminal(e.into()))?;
 
     let line = read?;
-    Ok(SecretString::new(
+    Ok(SecretString::from(
         line.trim_end_matches(['\n', '\r']).to_string(),
     ))
 }
