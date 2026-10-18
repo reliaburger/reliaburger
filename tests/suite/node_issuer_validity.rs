@@ -12,21 +12,14 @@ fn hierarchy_with_node_window(start: i64, end: i64) -> ca::CaHierarchy {
         .unwrap();
     hierarchy.node.certificate_params.not_before = now + time::Duration::seconds(start);
     hierarchy.node.certificate_params.not_after = now + time::Duration::seconds(end);
-    let root = hierarchy
-        .root
-        .certificate_params
-        .clone()
-        .self_signed(&hierarchy.root.signing_keypair)
-        .unwrap();
+    let root = rcgen::Issuer::from_params(
+        &hierarchy.root.certificate_params,
+        &hierarchy.root.signing_keypair,
+    );
     hierarchy.node.ca.certificate_der = hierarchy
         .node
         .certificate_params
-        .clone()
-        .signed_by(
-            &hierarchy.node.signing_keypair,
-            &root,
-            &hierarchy.root.signing_keypair,
-        )
+        .signed_by(&hierarchy.node.signing_keypair, &root)
         .unwrap()
         .der()
         .to_vec();
