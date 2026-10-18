@@ -18,11 +18,14 @@
 #                         API, gossip, Raft, reporting, and three for the
 #                         demo's apps (default 29200)
 #   DEMO_KEEP=1           keep the temporary directory, Bun's log included
+#   DEMO_RUNTIME          the node's runtime: process (default), or runc as root
+#                         on Linux to try the container examples
 #
 # The scripts need bash 3.2 (macOS's /bin/bash).
 
 REPO_DIR="$(cd "${DEMO_DIR}/../.." && pwd)"
 DEMO_PORT_BASE="${DEMO_PORT_BASE:-29200}"
+DEMO_RUNTIME="${DEMO_RUNTIME:-process}"
 DEMO_API_PORT="${DEMO_PORT_BASE}"
 # Ports for the demo's own apps to listen on.
 DEMO_APP_PORT=$((DEMO_PORT_BASE + 4))
@@ -131,13 +134,13 @@ demo_start() {
     trap demo_stop EXIT
     DEMO_WORK="$(mktemp -d "${TMPDIR:-/tmp}/reliaburger-demo.XXXXXX")"
 
-    demo_step "Starting a one-node cluster (process runtime) in ${DEMO_WORK}"
+    demo_step "Starting a one-node cluster (${DEMO_RUNTIME} runtime) in ${DEMO_WORK}"
     "${RELISH}" init "${DEMO_WORK}/cluster" --cluster-name demo --node-id demo-node \
         >"${DEMO_WORK}/init.log" 2>&1 \
         || demo_fail "relish init failed: $(cat "${DEMO_WORK}/init.log")"
     demo_node_config "${DEMO_WORK}/cluster/reliaburger.toml" "${DEMO_WORK}/node.toml"
     "${BUN}" --config "${DEMO_WORK}/node.toml" --listen "127.0.0.1:${DEMO_API_PORT}" \
-        --runtime process --cluster >"${DEMO_WORK}/bun.log" 2>&1 &
+        --runtime "${DEMO_RUNTIME}" --cluster >"${DEMO_WORK}/bun.log" 2>&1 &
     DEMO_BUN_PID=$!
 
     export RELIABURGER_ENDPOINT="https://127.0.0.1:${DEMO_API_PORT}"
