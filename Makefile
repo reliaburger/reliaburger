@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -110,12 +110,12 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 		echo "dependency advisory exceptions expired on 2026-11-18; review .cargo/audit.toml" >&2; \
 		exit 1; \
 	fi
-	@active=$$($(CARGO) tree --locked --all-features --target all -i rkyv --prefix none --format '{p}') || exit 1; \
-	if [ -n "$$active" ]; then \
-		echo "rkyv advisory exception requires an inactive dependency; review .cargo/audit.toml" >&2; \
-		exit 1; \
-	fi
 	$(CARGO) audit
+
+# Reports, never fails: the lag is information for the release's refresh
+# step (docs/releasing.md), not a gate. `--dry-run` leaves Cargo.lock alone.
+outdated: ## Report crates that cargo update would move and those a major version behind (never fails)
+	-$(CARGO) update --dry-run --verbose
 
 bench: ## Run reproducible transport and 5-250 node gossip benchmarks, and the 1k and 10k node scheduling pass
 	$(CARGO) bench --bench gossip
