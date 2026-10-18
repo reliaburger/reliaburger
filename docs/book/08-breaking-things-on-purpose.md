@@ -783,6 +783,150 @@ So the rule is now simple to state: a fault dies with the Bun that injected
 it, and the next Bun tidies up after it. If you still want the fault, inject
 it again.
 
+### Faults for things that finish
+
+0.2.0 made a million jobs a day the headline, and Smoker couldn't touch a
+single one of them. `relish fault kill migrate` was refused by the replica
+rail every time: a job is one task, and killing one of one leaves zero. And a
+task-array attempt doesn't live in the supervisor at all, so every lookup
+Smoker made (whose pids to signal, whose cgroup to throttle, who's calling)
+came back empty. The release's qualification broke whole nodes under its jobs
+instead. That's honest, but it can't answer the question a batch user
+actually asks: what does my job do when *its* attempt dies?
+
+Two things had to change, and the first is a one-liner with a long
+justification. The replica rail exists to keep a service serving. A job isn't
+serving anything; it's meant to finish, and when an attempt dies the job's
+own retry policy decides what happens next. So the rail now asks what it's
+looking at:
+
+```rust
+// A job or task-array attempt is meant to finish, and a killed one is
+// retried under its own policy: "keep one replica serving" doesn't apply.
+if !kills_instances || context.workload.runs_to_completion() {
+    return None;
+}
+```
+
+`workload` is a new enum on the request and the safety context, `App`, `Job`
+or `TaskArray`. The dangerous part isn't the rail, it's who fills that field
+in. If the caller could, `"workload": "job"` in a JSON body would turn the
+rail off for any app. So the API overwrites it on the way in, and decides
+from evidence instead: the receiving node looks for app instances by that
+name, and only when there are none does it ask every node which job attempts
+it's running. Apps and jobs can't share a name in one namespace, so at most
+one list has anything in it. The owning node's agent then makes the same call
+again from its own supervisor, and the supervisor wins: if it runs an app
+called `migrate`, the target is an app, whatever the request says.
+
+The new wire fields are `#[serde(default)]`. That attribute tells serde to
+use `Default::default()` when a field is missing from the JSON, so a scenario
+file or a script that never heard of `task_index` still parses. It isn't a
+compatibility promise between versions (we don't make those before 1.0, and
+0.2.2 bumped the protocol anyway); it just keeps `workload` optional for the
+people writing requests by hand.
+
+The second change is finding attempts at all. They run in the task runtime:
+either in a container of their own (a fresh runtime generation per attempt),
+or as one command in a reusable executor, a warm container that runs one task
+after another. Neither is something the agent can see. So the runtime now
+writes each attempt into a list it shares with the agent, `LiveAttempts`, and
+takes it out again when the attempt ends. "When the attempt ends" is the
+interesting part, because `run` can return early from a dozen places: a
+refusal, a timeout, a cancellation, a launch failure. Rust's answer is to tie
+the listing to a value's lifetime:
+
+```rust
+impl Drop for AttemptListing {
+    fn drop(&mut self) {
+        self.attempts
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+```
+
+`register` hands back an `AttemptListing`, the runner keeps it in a local
+variable, and when that variable goes out of scope, by any path, `drop`
+removes the entry. It's the same idea as Go's `defer` or Python's `with`,
+except the compiler attaches it to the value rather than to a block, so you
+can't forget to write it. C++ programmers will know it as RAII. The list
+itself sits behind a `std::sync::Mutex`, not tokio's: every critical section
+is a map insert, remove or copy, nobody holds the lock across an `.await`, and
+`drop` can't be `async` anyway.
+
+Each entry says how to reach the attempt, and that's an enum too:
+
+```rust
+pub enum AttemptHandle {
+    Instance(InstanceId),
+    TaskGroup(PathBuf),
+}
+```
+
+An attempt in its own container is a runtime instance: the runtime names its
+main pid, and it has its own cgroup and network namespace, so every fault
+works on it the way it works on an app replica. A command in a reusable
+executor is reached through the executor's `task` cgroup. The executor's
+helper lives in a sibling `helper` cgroup, and the pool runs one command at a
+time, so `task/cgroup.procs` holds exactly that command's processes. Kill and
+pause signal every pid in it and nothing else.
+
+The other faults are a different story, and this is where we chose refusal
+over cleverness. A CPU cap written to the executor's `task` cgroup stays
+there when the task ends, and the next task, a different index, starts under
+it. A netem delay on the container's interface slows whoever runs next too.
+We could have tried to lift the fault between tasks, but then a fault you
+asked for on task 41 would silently stop applying the moment task 41 finished
+its first attempt and quietly reappear on task 42's. So Bun refuses, and says
+why:
+
+```text
+cpu 50% can't be confined to task 41 of render: it runs in reusable executor
+default/executor-…-0, whose cgroup and network the job's other tasks share;
+only kill and pause act on one task there
+```
+
+The signal path needed one more change. It used to count pids: `kill
+--count 2` read every instance's pid and kept the first two. An executor's
+task group can hold several processes (a shell and its child, say), so
+counting pids would kill one task twice and miss the second. Now it counts
+*targets*: it reads each target's pids, keeps the first `count` targets that
+still have any, and only then flattens them into one list to signal.
+
+What happens after a kill is the job's business, and we left it that way.
+A command in a reusable executor reports the signal through its helper, so
+it's a failed attempt and retries. An attempt in its own process or container
+dies with no exit status, and a job without a status is the conservative case
+"A signal is not proof of exit" sets out further down this chapter: the work
+may have half happened, so it comes back `Unknown`. An array (or a job
+with `replay_unknown = true`) runs it again; any other job waits for an
+operator's `relish batch replay`. The end-to-end test in `tests/suite` sets
+`replay_unknown` for exactly that reason. Smoker could have told the job "it
+was me, count it as a failure", but then a chaos experiment would test a code
+path real crashes never take.
+
+`--instance` takes a task index for a job, since that's the identity a task
+keeps across retries. The router moves a numeric `--instance` into
+`task_index` and plans the fault onto the node that runs that task, in the
+same pure function it uses for apps.
+
+The tests come in three layers. The rail tests check that a job or array
+passes a kill-everything that an app with one replica can't, and that the
+quorum rail doesn't care what the request calls itself. The agent tests in
+`src/bun/agent/tests/job_faults.rs` stand a plain directory in for a task
+cgroup: a `cgroup.procs` file listing a real `sleep` process is all the agent
+reads, so they run on a laptop. One drives a real `TaskPool` whose first
+attempt sleeps until the agent kills it, and checks the task succeeds on its
+second. `tests/suite/batch.rs` does the same end to end through the HTTP API
+with a process job. Then the gated ones: on Linux, a real shared-runc command
+is listed, frozen and thawed through its task cgroup, and a partition `--from`
+a job keys the attempt's cgroup in the kernel's fault map; on a three-node
+cluster, attempts killed from different nodes mid-array are retried and every
+task still completes exactly once.
+
 ## One experiment at a time
 
 The quorum rail counts faults on the node that receives the request. Now picture

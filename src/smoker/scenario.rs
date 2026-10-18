@@ -182,6 +182,8 @@ pub fn step_to_fault_request(
     };
 
     Ok(FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type,
         target_service: step.target.clone(),
         // Absent means the API's `default`, as for `relish fault`.

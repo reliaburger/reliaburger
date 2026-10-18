@@ -172,7 +172,7 @@ write_record() {
         printf -- '- Bootstrap: `%s` (SHA-256 `%s`)\n' "$bootstrap" "${bootstrap_digest:-not fetched}"
         printf -- '- `candidate.json` SHA-256: `%s`%s\n' "${candidate_digest:-not fetched}" \
             "${qualified_digest:+ (required: \`$qualified_digest\`)}"
-        printf -- '- Command: `curl -fsSL %s | RELIABURGER_RELEASE_BASE_URL=%s sh -s -- --timings%s`\n' \
+        printf -- '- Command: `curl -fsSL %s | RELIABURGER_RELEASE_BASE_URL=%s sh -s -- --laptop --timings%s`\n' \
             "$bootstrap" "$base_url" "${setup_args[*]+ ${setup_args[*]}}"
         printf -- '- Relish: `%s`\n' "${relish_version:-not installed}"
         if [ "$result" = PASS ]; then printf -- '- Finished every step\n\n'; else printf -- '- Failed during: %s\n\n' "$stage"; fi
@@ -258,10 +258,11 @@ bootstrap_digest=$(sha256 "$evidence/bootstrap.sh")
 
 stage='install (curl | sh)'
 started=$(date +%s)
-# The same pipeline a user types; the bootstrap passes --timings to setup.
+# The same pipeline a user types; --laptop picks the laptop cluster, and the
+# installer passes --timings on to setup.
 # (`${a[@]+...}` because macOS's bash 3.2 calls an empty array unbound.)
 curl -fsSL "$bootstrap" | RELIABURGER_RELEASE_BASE_URL=$base_url \
-    sh -s -- --timings ${setup_args[@]+"${setup_args[@]}"} 2>&1 | tee "$evidence/install.log"
+    sh -s -- --laptop --timings ${setup_args[@]+"${setup_args[@]}"} 2>&1 | tee "$evidence/install.log"
 install_seconds=$(( $(date +%s) - started ))
 relish_version=$("$relish" --version)
 grep -q 'using an explicit release mirror' "$evidence/install.log" \

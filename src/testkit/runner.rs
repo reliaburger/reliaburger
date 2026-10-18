@@ -1147,6 +1147,7 @@ mod tests {
             .await
             .push(format!("fault-inject:{id}"));
         Json(crate::smoker::types::FaultSummary {
+            task_index: None,
             id,
             fault_type: request.fault_type.to_string(),
             target_service: request.target_service,
@@ -1354,6 +1355,8 @@ mod tests {
     async fn runner_reverses_exact_owned_faults_after_timeout_and_panic() {
         fn request() -> crate::smoker::types::FaultRequest {
             crate::smoker::types::FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: crate::smoker::types::FaultType::NodeKill {
                     kill_containers: false,
                 },

@@ -16,6 +16,8 @@ const SLOW_CGROUP_READ: std::time::Duration = std::time::Duration::from_millis(3
 
 fn partition_from_frontend() -> FaultRequest {
     FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Partition {
             source_app: Some("frontend".into()),
         },

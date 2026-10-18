@@ -389,6 +389,23 @@ selector or artifact. Archived suites also bind their executable/archive bytes
 to the successful current builder. Keep the failure artifacts; they explain a
 failure but cannot qualify another gate.
 
+The cluster and acceptance jobs extract the downloaded archive once each
+([#1050](https://github.com/reliaburger/reliaburger/issues/1050)).
+`workflow_adapter.py extract` checks the archive's digest against the build
+job's output, runs `cargo nextest list --archive-file tests.tar.zst
+--extract-to . --list-type binaries-only`, and writes
+`target/archive-extraction.json`: the archive digest, the command and the
+digests of `target/nextest/binaries-metadata.json` and `cargo-metadata.json`.
+Its step output carries the receipt's digest, and every owner in the job takes
+it as `--archive-extraction`. Each owner's `list` and `run` then use
+`--binaries-metadata`, `--cargo-metadata`, `--target-dir-remap target` and
+`--workspace-remap .`, and check the two metadata files before discovery. The
+extracted binaries aren't rehashed: they never leave the job. `aggregate`
+refuses an archived owner whose selectors open the archive again, whose
+metadata differs from its job's receipt, or whose receipt names another
+archive or another nextest. A re-run job extracts again for its own attempt,
+even when the archive came from an earlier one.
+
 "Re-run failed jobs" works without a new commit. GitHub gives the re-run jobs
 attempt N+1 and carries over the outputs and artifacts of the jobs that passed
 in attempt N. So each seal keeps the attempt that produced it, and `aggregate`
