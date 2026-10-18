@@ -135,6 +135,7 @@ impl JobBenchArgs {
         spec.chunk_size = if runtime == JobRuntime::Runc { 1 } else { 1000 };
         spec.per_node_concurrency = Some(self.concurrency);
         let template = JobSpec {
+            pids: None,
             runtime,
             image: (runtime != JobRuntime::Process).then(|| self.image.clone()),
             exec: (runtime == JobRuntime::Process)

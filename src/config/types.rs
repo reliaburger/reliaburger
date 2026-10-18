@@ -241,6 +241,44 @@ pub mod memory_range {
 }
 
 // ---------------------------------------------------------------------------
+// PidsLimit
+// ---------------------------------------------------------------------------
+
+/// The most processes and threads one job command may hold at once: the
+/// command cgroup's `pids.max`.
+///
+/// Written as a bare integer, `pids = 512`. Deserialising refuses 0 and
+/// anything above [`PidsLimit::MAX`], so every path a job spec arrives by
+/// (TOML, the JSON API, Raft) holds a value in range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct PidsLimit(u32);
+
+impl PidsLimit {
+    /// The largest limit a job may ask for.
+    pub const MAX: u32 = 32_768;
+
+    /// The limit as a number of processes and threads.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for PidsLimit {
+    type Error = ConfigError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ok(Self(value))
+    }
+}
+
+impl From<PidsLimit> for u32 {
+    fn from(limit: PidsLimit) -> Self {
+        limit.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Replicas
 // ---------------------------------------------------------------------------
 

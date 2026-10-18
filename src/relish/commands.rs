@@ -2698,6 +2698,7 @@ pub fn task_array_request(
         name: run.name,
         namespace: Some(run.namespace),
         template: crate::config::job::JobSpec {
+            pids: None,
             runtime: run.runtime,
             image: run.image,
             command: Some(run.args),

@@ -7837,6 +7837,7 @@ mod tests {
                 name: "render".to_string(),
                 namespace: "default".to_string(),
                 template: Box::new(crate::config::job::JobSpec {
+                    pids: None,
                     runtime: crate::config::job::JobRuntime::Process,
                     image: None,
                     command: None,

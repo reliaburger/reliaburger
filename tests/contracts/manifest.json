@@ -6731,6 +6731,33 @@
       ]
     },
     {
+      "id": "issue-741-cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+      "issue": 741,
+      "promise": "A job's pids limit becomes its command cgroup's pids.max, the kernel refuses forks past it, and the helper keeps its own limit of 16.",
+      "supported_paths": [
+        "Rootful Linux native executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "native-cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A pids limit of 0 or above 32768 is refused before the job reaches a node."
+      ],
+      "boundaries": [
+        "Real runtime regression for the native host executor; shared-runc writes the same task cgroup through the same code."
+      ]
+    },
+    {
       "id": "issue-639-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
       "issue": 639,
       "promise": "A dropped native caller hands its executor to eviction, which retires it and frees its capacity without a restart; a later restart reuses only the originally retired identity.",

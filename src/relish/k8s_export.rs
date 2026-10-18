@@ -846,6 +846,24 @@ mod tests {
     }
 
     #[test]
+    fn a_jobs_pids_limit_is_reported_because_a_pod_spec_cannot_carry_one() {
+        let config = parse_config("[job.worker]\nimage='fixture:v1'\npids=512");
+        let result = export_kubernetes(&config).unwrap();
+        assert_eq!(result.report.resources_created, vec!["Job/worker"]);
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("[job.worker] pids") && u.contains("podPidsLimit")),
+            "{:?}",
+            result.report.unsupported
+        );
+        let plain = export_kubernetes(&parse_config("[job.worker]\nimage='fixture:v1'")).unwrap();
+        assert!(plain.report.unsupported.is_empty());
+    }
+
+    #[test]
     fn host_process_jobs_are_reported_but_not_exported_without_an_image() {
         let config = parse_config("[job.backup]\nruntime='process'\nexec='/usr/bin/backup'");
         let result = export_kubernetes(&config).unwrap();
