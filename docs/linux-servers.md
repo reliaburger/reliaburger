@@ -535,7 +535,11 @@ Mac or a Windows PC, without keeping a shell open on the VMs.
 
 ### 5.1 Install Relish on your laptop
 
-#### On macOS (Apple silicon or Intel)
+#### On macOS (Apple silicon)
+
+Releases from 0.2.2 build `relish` for Apple silicon only. 0.2.1 is the last
+release with an Intel macOS build (`relish-macos-x86_64`); on an Intel Mac,
+manage the cluster from one of the Linux machines instead, or stay on 0.2.1.
 
 **Option A: Install script**
 ```sh
@@ -544,13 +548,8 @@ curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 
 **Option B: Direct download from GitHub Releases**
 ```sh
-# Detect Apple silicon (arm64) vs Intel (x86_64)
-ARCH="$(uname -m)"
-case "$ARCH" in
-  arm64|aarch64) ARCH="aarch64" ;;
-  x86_64)        ARCH="x86_64" ;;
-  *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
-esac
+# The macOS build is Apple silicon only (arm64)
+ARCH="aarch64"
 
 # Release version to install (e.g. v0.1.6 or vX.Y.Z)
 VERSION="v0.1.6"

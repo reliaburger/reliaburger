@@ -24,8 +24,8 @@ breaks it and watches it heal. Five minutes is the target.
 ## Five minutes, zero to cluster
 
 0.1.6 was released on 7 October 2026, and the one-line installer fetches
-its signed binaries. You'll need macOS, or Linux with QEMU and KVM, plus about
-8 GiB of free memory and 15 GiB of disk. 0.2.0, "A million jobs", is in
+its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
+and KVM, plus about 8 GiB of free memory and 15 GiB of disk. 0.2.0, "A million jobs", is in
 development: anything marked *0.2.0, not in 0.1.6* below needs a development
 build, not the installer.
 

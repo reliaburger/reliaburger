@@ -8,6 +8,10 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+Platforms change too. 0.2.1 is the last release with an Intel macOS CLI
+(`relish-macos-x86_64`); from 0.2.2 the macOS build is Apple silicon only
+([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
+
 ## 0.2.0: A million jobs
 
 TODO(records): promoted on DATE, promote run RUN_ID, tag `v0.2.0` at `cc5f6439`.
