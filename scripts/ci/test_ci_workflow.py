@@ -501,6 +501,99 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
 
 
+class ArtifactDownloadTests(unittest.TestCase):
+    """A stalled artefact download fails fast and is retried once (#977).
+
+    `actions/download-artifact` normally takes a minute or two, but one run
+    took 13 minutes and pushed `acceptance` past its 40-minute limit. Each
+    download gets its own short limit and one retry, so a stall costs at most
+    two short limits instead of the job's whole budget.
+    """
+
+    # The longest any one attempt may take; downloads normally take 1 to 2.
+    LIMIT_MINUTES = 5
+    WORKFLOW_FILES = ("ci.yml", "v02-loops.yml")
+
+    def setUp(self):
+        self.workflows = {name: jobs((WORKFLOWS / name).read_text())
+                          for name in self.WORKFLOW_FILES}
+
+    @staticmethod
+    def with_block(step):
+        """The step's `with:` inputs, as text."""
+        found = re.search(r"\n        with:\n((?:          .*\n?)*)", step)
+        return found.group(1).rstrip() if found else ""
+
+    def assert_downloads_retried(self, workflow_jobs):
+        """Every download is a bounded attempt followed by one bounded retry.
+
+        No subTest here: the detection test expects the first failure to raise.
+        """
+        pairs = 0
+        for name, job in workflow_jobs.items():
+            blocks = steps(job)
+            downloads = [index for index, step in enumerate(blocks)
+                         if "uses: actions/download-artifact@" in step]
+            remaining = list(downloads)
+            while remaining:
+                first = remaining.pop(0)
+                attempt = blocks[first]
+                self.assertIn("\n        continue-on-error: true", attempt, f"{name}: the first attempt must not fail the job")
+                step_id = re.search(r"\n        id: ([a-z_]+)\n", attempt)
+                self.assertIsNotNone(step_id, "the first attempt needs an id")
+                self.assertTrue(remaining and remaining[0] == first + 1,
+                                "the first attempt must be followed by its retry")
+                retry = blocks[remaining.pop(0)]
+                self.assertNotIn("continue-on-error", retry)
+                condition = re.search(r"\n        if: (.*)", retry)
+                self.assertIsNotNone(condition, "the retry runs only when the first attempt failed")
+                # !cancelled(): an earlier failed step in the job must not
+                # skip the retry of a download that runs regardless.
+                self.assertIn("!cancelled()", condition.group(1))
+                self.assertIn(f"steps.{step_id.group(1)}.outcome == 'failure'", condition.group(1))
+                self.assertEqual(self.with_block(attempt), self.with_block(retry))
+                self.assertNotEqual(self.with_block(attempt), "")
+                for step in (attempt, retry):
+                    limit = re.search(r"\n        timeout-minutes: (\d+)\n", step + "\n")
+                    self.assertIsNotNone(limit, "each attempt needs its own timeout-minutes")
+                    self.assertLessEqual(int(limit.group(1)), self.LIMIT_MINUTES)
+                pairs += 1
+        return pairs
+
+    def test_a_stalled_artefact_download_fails_fast_and_is_retried_once(self):
+        for name, workflow_jobs in self.workflows.items():
+            with self.subTest(workflow=name):
+                self.assertGreater(self.assert_downloads_retried(workflow_jobs), 0)
+
+    def test_the_jobs_that_download_the_test_archive_keep_their_own_limits(self):
+        ci = self.workflows["ci.yml"]
+        for name, minutes in (("cluster", 30), ("acceptance", 40), ("ignored-evidence", 10)):
+            with self.subTest(job=name):
+                self.assertIn(f"\n    timeout-minutes: {minutes}\n", ci[name])
+
+    def test_an_unbounded_unretried_or_skippable_download_is_detected(self):
+        ci = self.workflows["ci.yml"]
+        self.assert_downloads_retried(ci)
+        original = ci["acceptance"]
+        blocks = steps(original)
+        downloads = [step for step in blocks if "uses: actions/download-artifact@" in step]
+        self.assertEqual(len(downloads), 2)
+        attempt, retry = downloads
+        changes = [
+            original.replace(retry + "\n", ""),
+            original.replace(attempt, re.sub(r"\n        timeout-minutes: \d+", "", attempt)),
+            original.replace(retry, re.sub(r"timeout-minutes: \d+", "timeout-minutes: 15", retry)),
+            original.replace(attempt, attempt.replace("\n        continue-on-error: true", "")),
+            original.replace(retry, retry.replace("!cancelled() && ", "")),
+            original.replace(retry, retry.replace("outcome == 'failure'", "outcome == 'success'")),
+            original.replace(retry, retry.replace("name: nextest-archive", "name: something-else")),
+            original.replace(retry, retry + "\n" + retry),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_downloads_retried(dict(ci, acceptance=changed))
+
+
 class RetargetTests(unittest.TestCase):
     def setUp(self):
         self.ci = (WORKFLOWS / "ci.yml").read_text()
