@@ -98,7 +98,7 @@ tour_commands() {
 # script learns it.
 known_command() {
     case "$1" in
-        "curl -fsSL https://reliaburger.com/install.sh | sh" \
+        "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop" \
         | "relish apply -f ${DEMO_URL}" \
         | "relish status" \
         | "relish council status" \
@@ -340,7 +340,7 @@ sleep 2
 previous=""
 while IFS= read -r command <&3; do
     case "${command}" in
-        "curl -fsSL https://reliaburger.com/install.sh | sh")
+        "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop")
             if [[ -n "${INSTALL_VERSION}" ]]; then
                 say "Step 1 installs the published ${INSTALL_VERSION} release, then runs"
                 say "\`relish setup --quickstart\`. The times on the right are real."
@@ -348,7 +348,7 @@ while IFS= read -r command <&3; do
                     say "This step plays ${SETUP_SPEEDUP}× faster than it ran."
                 fi
                 if [[ -n "${SETUP_PORTS}" ]]; then
-                    show "${command} -s --${SETUP_PORTS}"
+                    show "${command}${SETUP_PORTS}"
                 else
                     show "${command}"
                 fi

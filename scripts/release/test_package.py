@@ -216,7 +216,7 @@ exit 1
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.decode().splitlines(), ["installer:--nodes", "installer:1"])
                 for invalid in ["v0.1", "0.1.0", "v0.1.0\nv0.1.0", "v0.1.0;id", "v0.1.0 "]:
-                    result = subprocess.run([shell, str(BOOTSTRAP)], env=dict(env, RELIABURGER_VERSION=invalid), capture_output=True)
+                    result = subprocess.run([shell, str(BOOTSTRAP), "--laptop"], env=dict(env, RELIABURGER_VERSION=invalid), capture_output=True)
                     self.assertNotEqual(result.returncode, 0, invalid)
                     self.assertIn(b"invalid RELIABURGER_VERSION", result.stderr)
 

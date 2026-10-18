@@ -7,7 +7,9 @@ see the [whitepaper](whitepaper.md); for status and what's next, see the
 
 0.2.0 was released on 16 October 2026. Its signed binaries, guest images and
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0),
-and `curl -fsSL https://reliaburger.com/install.sh | sh` installs it. Every
+and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
+and builds a laptop cluster; without a flag the installer explains the choices.
+Until 1.0.0 Reliaburger is for developers and enthusiasts, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
 The limits below are the ones 0.2.0 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.

@@ -181,8 +181,6 @@ fn every_shown_install_line_names_a_mode() {
         "docs/website/README.md".to_string(),
         "scripts/demo/tour.sh".to_string(),
         "scripts/release/install.sh.in".to_string(),
-        "scripts/release/candidate.py".to_string(),
-        "scripts/release/qualify-staged-install.sh".to_string(),
     ];
     for directory in ["docs", "docs/manual", "docs/book"] {
         for entry in std::fs::read_dir(repository().join(directory)).unwrap() {

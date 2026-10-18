@@ -27,9 +27,15 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
 and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
 
+`--laptop` asks for a development cluster on this computer. Without a flag the
+installer only explains the choices, including clusters on Linux machines you
+already have (`--install-only`, then the [Linux servers guide](docs/linux-servers.md)).
+Until 1.0.0, every Reliaburger cluster is for developers and enthusiasts
+trying it out, not for production.
+
 ```sh
-# Install relish and build a three-node cluster in Linux VMs
-curl -fsSL https://reliaburger.com/install.sh | sh
+# Install relish and build a three-node cluster in Linux VMs on this laptop
+curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
 
 # Run a real Kubernetes app: podinfo's frontend, backend and Redis
 relish apply -f https://reliaburger.com/demo/podinfo.yaml
