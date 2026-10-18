@@ -42,6 +42,7 @@ mod declarative_resources;
 mod dependency_audit;
 mod dev_robustness;
 mod dns;
+mod doc_snippets;
 mod endpoint_withdrawal;
 mod fixture_scripts;
 mod gitops;

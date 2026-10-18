@@ -17,6 +17,7 @@ run it.
 | Snapshot tests | CLI output, rendered config and TUI frames stay exactly as reviewed | [`insta`](https://insta.rs) snapshots, e.g. [`src/relish/snapshots/`](../src/relish/snapshots) | `make test` |
 | Integration suite | Real Bun and Relish processes over HTTP, TLS and the registry | [`tests/suite/`](../tests/suite) | `make test` |
 | Doctests | Examples in doc comments compile and run | `///` blocks | `make test-doc` |
+| Doc snippets | Every `relish` command and TOML block a reader copies from the manual, the READMEs and the whitepaper parses with the real code ([below](#doc-snippets)) | [`tests/suite/doc_snippets.rs`](../tests/suite/doc_snippets.rs) | `make test` |
 | Lint and format | Clippy with warnings as errors, all features and none; the macOS job runs the all-features pass only, because that one holds the macOS-only code | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
 | Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct addition](qualification/2026-10-12-dependency-exceptions.md)) | `make audit` |
@@ -70,6 +71,48 @@ run or on a pre-build whose features differ. The other gated targets build
 nothing before nextest: in CI the cluster and acceptance suites run from the
 `build tests` job's nextest archive, and the `qualify-*.sh` scripts already
 build with `cargo test --no-run`.
+
+### Doc snippets
+
+The manual ships inside `relish`, so a wrong snippet ships in the binary.
+[`doc_snippets.rs`](../tests/suite/doc_snippets.rs) reads
+`docs/manual/*.md`, `README.md`, `docs/README.md` and `docs/whitepaper.md`
+and checks three things:
+
+- **Shell blocks** (`sh`, `bash`, `shell`, `console`): every `relish`
+  invocation parses with the real CLI under `RELISH_PARSE_ONLY=1`. It finds
+  them as the shell would: after a `$ ` prompt, across `\` continuations,
+  behind `sudo`, `VAR=…` or `limactl shell VM`, inside `$(…)`, and as
+  `target/debug/relish` or `cargo run --bin relish --`. Comments and
+  redirections are dropped, and a `<PLACEHOLDER>` becomes `1`. In a
+  `console` block only prompt lines count.
+- **TOML blocks**: each top-level table goes to the type that reads it.
+  `[app.*]`, `[job.*]`, `[namespace.*]`, `[permission.*]` and `[build.*]`
+  go through `Config::parse` and `validate()`; `[[step]]` files through the
+  chaos scenario loader; `[[cohort]]` files through the batch manifest type;
+  everything else through `NodeConfig::parse`, which rejects a misspelt
+  table by name. A block mixing workload and node tables is split and both
+  halves are checked.
+- **Inline spans** in prose (`` `relish …` ``): the leading words must name a
+  real subcommand, and every flag must be one that subcommand takes. Missing
+  arguments are fine; prose rarely spells out a whole command.
+
+A snippet that can't pass says why, on the line before its fence:
+
+| Marker | Meaning | Checked? |
+|---|---|---|
+| `<!-- snippet: fragment -->` | Not complete enough to parse alone. Prefer completing it (add the `[app.NAME]` and `image` lines a sub-table needs) | No |
+| `<!-- snippet: planned #N -->` | Shows a feature issue N will build | No |
+| `<!-- snippet: pending #N -->` | Shows CLI or config issue N is adding | Yes, and it must still fail: when issue N lands the test asks for the marker to go |
+
+An inline span for a command that doesn't exist yet is either followed by
+` *(planned)*` in the text or listed in `INLINE_PENDING` with its issue, and
+it too must keep failing. `planned` and `pending` must name an issue in the
+test's `OPEN_ISSUES` list (CI has no GitHub token to ask); when an issue
+closes, drop it from that list and the markers naming it fail. An unknown
+marker, or a marker that isn't right before a fence, fails the test rather
+than skipping anything. Run the marker test with `--no-capture` to see every
+opt-out.
 
 ## The agent loop's turn budget
 

@@ -717,7 +717,7 @@ terminal dashboard. The TUI needs a terminal of at least 80×24 cells.
 ```sh
 cargo run --bin relish              # interactive TUI
 cargo run --bin relish -- tui       # the same, explicitly
-cargo run --bin relish -- <command>
+cargo run --bin relish -- status    # or any other command
 ```
 
 Every command, grouped by task with a link to the manual chapter that explains
@@ -1120,6 +1120,9 @@ The image's `Env` is merged under the app's `env` (the app wins on a clash). Eve
 Volumes follow the container's user:
 
 ```toml
+[app.cache]
+image = "redis:7"
+
 [[app.cache.volumes]]
 path = "/data"                      # managed: handed to the container user on first mount
 
