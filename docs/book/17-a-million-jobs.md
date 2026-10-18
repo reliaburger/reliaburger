@@ -2253,6 +2253,52 @@ back. The same change moved the start-up filesystem work (creating
 directories, permissions, `chown`, preparing cgroups) onto the blocking pool
 with `spawn_blocking`, off the async worker threads.
 
+For a while only half of that was tested. The gated pool tests used a helper
+that never connects, which proves the wait for the helper is interruptible.
+Nothing proved the pull was, because the test mirror serves a 2 MB layer from
+loopback in milliseconds. How do you cancel something mid-pull when the pull
+is over before you can blink? You slow the registry down (#740).
+`tests/support/slow_registry.rs` is a small axum server that sits in front of
+the pinned-image mirror, the way the mirror sits in front of a public
+registry. It forwards manifests at full speed and trickles every blob out at
+64 KiB a second, so the bytes are still the mirror's own and the client still
+checks every digest. The pacing is a stream adaptor:
+
+```rust
+let paced = chunks.then(move |chunk| {
+    let shared = Arc::clone(&in_flight.0);
+    async move {
+        tokio::time::sleep(pause).await;
+        // ... count the bytes ...
+        chunk
+    }
+});
+response.body(Body::from_stream(paced)).unwrap()
+```
+
+`then` comes from the `StreamExt` trait and works like `map` on an iterator,
+except each item goes through an `async` block, so a `sleep` between chunks
+holds the next one back. The `move` closure owns `in_flight`, a guard whose
+`Drop` takes one off the count of blobs still being sent. The closure lives
+inside the stream and the stream lives inside the response body, so when a
+client hangs up mid-blob, hyper drops the body and the count goes down. Go's
+`defer` would need the handler to still be running; in Rust the cleanup goes
+wherever the value goes.
+
+Two tests in `tests/owned_task_arrays.rs` use it, under `make test-linux`.
+`runc_cancelling_an_array_interrupts_a_slow_cold_pull` starts a two-task
+shared-runc array on a node that has never seen the image, waits until the
+registry is partway through the layer, then cancels. The chunk has to return
+within five seconds, with both tasks counted as not run, the reservation
+back, and no executor, network namespace or slot cgroup left over.
+`runc_a_deadline_interrupts_a_slow_cold_pull` gives its task a three-second
+deadline instead, and expects it to fail at the deadline rather than half a
+minute later when the pull would have finished. Both also check that a blob
+is still on the wire when the attempt returns. That proves two things: the
+attempt really did stop mid-pull, and the pull carries on filling the cache
+without it. We checked the tests can fail, too. With the pool's pull put
+back outside the `select!`, both waited out the whole pull.
+
 **Retrying a cold start that failed.** On 11 October a privileged CI run failed
 one task out of six with `container rbtest-batch__executor-…-1 state
 unavailable: runtime command … did not finish within 5s`. Every runc call the

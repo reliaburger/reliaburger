@@ -201,7 +201,12 @@ The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
 run through `make test-linux`, where the warmed digest-pinned mirror remains
 reachable. The shared-runc leader-loss case refuses to start without it: its
 cold executors read the image manifest dozens of times, which trips the public
-registry's anonymous rate limit (#786). Two of them start three in-process nodes (gossip, Raft, the API
+registry's anonymous rate limit (#786). Cases that must interrupt a real
+cold pull put `tests/support/slow_registry.rs` in front of that mirror: a
+loopback registry that forwards manifests at full speed and paces every blob
+body to 64 KiB a second, so the pinned workload image takes about half a
+minute to pull and a test can cancel it, or let a deadline expire, mid-layer
+(#740). Two of them start three in-process nodes (gossip, Raft, the API
 and the leader loop, as `bun --cluster` wires them) with real shared-runc or
 cgroup host executors, and stop the leader's control plane while it runs its
 own share of an array: no accepted outcome may be lost or counted twice, and
