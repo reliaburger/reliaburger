@@ -130,7 +130,7 @@ async fn fetch(url: &str) -> Result<String, RelishError> {
         url: url.to_string(),
         reason,
     };
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .https_only(true)
         .timeout(FETCH_TIMEOUT)
         .build()

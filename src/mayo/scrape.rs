@@ -181,7 +181,9 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, Scrap
 /// refused, timeout, invalid body). Used for the static
 /// `[[metrics.scrape_targets]]`, whose failures stay silent.
 pub async fn scrape_endpoint(url: &str) -> Vec<CollectedMetric> {
-    let client = reqwest::Client::new();
+    let Ok(client) = crate::http_client::builder().build() else {
+        return Vec::new();
+    };
     fetch_metrics(&client, url, Duration::from_secs(5))
         .await
         .unwrap_or_default()

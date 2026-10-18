@@ -15,11 +15,23 @@
 ///
 /// The caller adds timeouts, redirect policy, proxies and any extra roots.
 pub fn builder() -> reqwest::ClientBuilder {
+    // reqwest asks rustls for the process provider before its own aws-lc
+    // fallback. Installing ring fails harmlessly once one is in place.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
+        .http1_only()
+        .tls_certs_only(bundled_roots().iter().cloned())
 }
 
+/// The Mozilla root programme as shipped in `webpki-root-certs`, parsed once.
 fn bundled_roots() -> &'static [reqwest::Certificate] {
-    &[]
+    static ROOTS: std::sync::LazyLock<Vec<reqwest::Certificate>> = std::sync::LazyLock::new(|| {
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+            .collect()
+    });
+    &ROOTS
 }
 
 #[cfg(test)]
@@ -57,12 +69,16 @@ mod tests {
     /// Serve one canned HTTP/1.1 response per TLS connection, offering both
     /// `h2` and `http/1.1` in ALPN. Returns the address and the protocol each
     /// handshake settled on.
-    async fn spawn_server(pki: &TestPki) -> (std::net::SocketAddr, Arc<Mutex<Vec<Option<Vec<u8>>>>>) {
+    async fn spawn_server(
+        pki: &TestPki,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<Option<Vec<u8>>>>>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![rustls::pki_types::CertificateDer::from(pki.leaf_der.clone())],
+                vec![rustls::pki_types::CertificateDer::from(
+                    pki.leaf_der.clone(),
+                )],
                 rustls::pki_types::PrivateKeyDer::try_from(pki.key_der.clone()).unwrap(),
             )
             .unwrap();
@@ -88,7 +104,9 @@ mod tests {
                     }
                 }
                 let _ = tls
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
                     .await;
                 let _ = tls.shutdown().await;
             }
@@ -185,5 +203,56 @@ mod tests {
             webpki_root_certs::TLS_SERVER_ROOT_CERTS.len()
         );
         assert!(!bundled_roots().is_empty());
+    }
+
+    /// A direct `reqwest::Client::builder()`, `Client::new()` or
+    /// `reqwest::get()` in production code would quietly get reqwest's own
+    /// defaults back. Test modules and test-only files may still use them.
+    #[test]
+    fn production_code_builds_http_clients_only_through_this_module() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let banned = [
+            "reqwest::Client::builder()",
+            "reqwest::Client::new()",
+            "reqwest::get(",
+            " Client::builder()",
+            " Client::new()",
+        ];
+        let mut offenders = Vec::new();
+        let mut directories = vec![root.clone()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let test_only = relative.contains("tests")
+                    || relative.contains("testkit")
+                    || relative.contains("test_");
+                if path.extension().is_none_or(|e| e != "rs")
+                    || test_only
+                    || relative == "http_client.rs"
+                {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+                for (number, line) in production.lines().enumerate() {
+                    if banned.iter().any(|pattern| line.contains(pattern)) {
+                        offenders.push(format!("src/{relative}:{}", number + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use crate::http_client::builder() instead: {offenders:?}"
+        );
     }
 }

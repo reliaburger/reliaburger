@@ -187,7 +187,7 @@ pub async fn bind_proxy_with_tls(
     view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(30))
@@ -195,7 +195,7 @@ pub async fn bind_proxy_with_tls(
         .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
         .build()
         .map_err(|e| WrapperError::ProxyFailed(format!("failed to build http client: {e}")))?;
-    let fresh_client = reqwest::Client::builder()
+    let fresh_client = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(30))

@@ -696,7 +696,10 @@ pub async fn run_health_probes(
     config: HealthProbeConfig,
     shutdown: CancellationToken,
 ) {
-    let client = match reqwest::Client::builder().timeout(config.timeout).build() {
+    let client = match crate::http_client::builder()
+        .timeout(config.timeout)
+        .build()
+    {
         Ok(c) => c,
         // Without a client we can't probe; passive service-map health still
         // governs routing, so simply stand down rather than crash the proxy.
