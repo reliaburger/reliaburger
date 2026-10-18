@@ -1675,6 +1675,12 @@
   },
   {
     "source": "tests/owned_task_arrays.rs",
+    "function": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
     "function": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
     "binary": "reliaburger::owned_task_arrays",
     "test": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart"

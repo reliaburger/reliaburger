@@ -1653,6 +1653,7 @@ mod tests {
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: JobSpec {
+                pids: None,
                 runtime: crate::config::job::JobRuntime::Process,
                 image: None,
                 command: Some(vec!["frame".to_string(), "{index}".to_string()]),
@@ -2317,6 +2318,29 @@ mod tests {
             admission_refusal(&record, &[advertised("a", Some(isolated()))]),
             None,
             "mount isolation doesn't stop containers"
+        );
+    }
+
+    /// #741: a pids limit is a limit like CPU and memory, so a host run that
+    /// sets one needs a node that enforces host limits.
+    #[test]
+    fn admission_refuses_a_pids_limit_where_no_node_enforces_host_limits() {
+        let mut record = record(20, 10);
+        let unlimited = JobCapabilities {
+            host_limits: false,
+            ..capable()
+        };
+        assert_eq!(
+            admission_refusal(&record, &[advertised("a", Some(unlimited))]),
+            None,
+            "without a limit the fallback backend may take it"
+        );
+        record.template.pids = Some(crate::config::types::PidsLimit::try_from(64).unwrap());
+        let reason = admission_refusal(&record, &[advertised("a", Some(unlimited))]).unwrap();
+        assert!(reason.contains("pids"), "{reason}");
+        assert_eq!(
+            admission_refusal(&record, &[advertised("a", Some(capable()))]),
+            None
         );
     }
 

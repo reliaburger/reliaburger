@@ -151,6 +151,7 @@ A `[job.NAME]` table takes these fields. Unknown fields are refused.
 | `exec`, `script` | Host binary or inline script, for `process` only |
 | `command` | Command and arguments |
 | `cpu`, `memory` | Request–limit ranges, as for apps |
+| `pids` | Most processes and threads one command may hold (`pids.max`), 1–32768. Default 256 for `shared-runc` and host executor commands; no limit for a fresh `runc` container |
 | `env` | Environment variables, plain or encrypted |
 | `namespace` | Namespace; `default` when omitted |
 | `schedule` | Cron schedule in UTC: five fields or a macro such as `@daily` |

@@ -1108,6 +1108,7 @@ mod tests {
         let id = InstanceId("default__worker-0".into());
         let mut limited = spec(true);
         limited.linux.resources = Some(crate::grill::oci::OciResources {
+            pids: None,
             cpu: None,
             memory: None,
             unified: Default::default(),
