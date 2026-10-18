@@ -310,12 +310,18 @@ relish apply app.toml            # deploy (or converge) everything in the file
 relish apply app.toml --dry-run  # preview; no-agent output states its offline assumption
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
-relish exec web env              # run a command inside an instance, on whichever node runs it
+relish exec web env              # run a command once inside an instance; exits with its exit code
+relish events --app web          # the cluster's recent events for one app
 relish top                       # every workload on every node, with CPU and memory
 relish inspect web               # every instance on every node, desired vs running
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
+
+`relish exec` runs its command once, with no stdin and no terminal, so
+`relish exec web sh` exits straight away: name the command you want, as in
+`relish exec web ls /data`. Relish prints the output and exits with the
+command's exit code.
 
 `apply` and `deploy` check the file's syntax and field values locally. In a cluster, the leader checks permission/build namespace references against both the file and namespaces already created. You don't need to repeat a namespace declaration, which could replace its existing budget. `relish lint` works offline, so it requires those references to be declared in the file. Applying a build declaration validates its namespace; use `relish build` to execute the build.
 
@@ -349,7 +355,7 @@ standalone node with no cluster numbers its replicas from 0.
 ```sh
 relish compile config/ > all.toml   # merge, apply _defaults.toml, derive namespaces
 relish diff old.toml all.toml       # structural diff between two configs
-relish fmt all.toml --check         # canonical ordering; drop --check to rewrite
+relish fmt all.toml --check         # canonical ordering, comments kept; drop --check to rewrite
 relish apply all.toml
 ```
 
@@ -475,6 +481,19 @@ returns once the council has recorded the spec, and prints no operation id,
 because each node runs its own deploy later. `examples/phase-1/proc-restarts.toml`
 shows the health checker restarting an app that goes unhealthy.
 
+To watch all of this happen, run the rollout demo from a checkout. It starts a
+one-node cluster on the process runtime, applies
+`examples/phase-1/proc-rollout.toml` as v1, rolls it to v2, rolls it back, then
+applies a v3 that fails its health check and shows it rolled back and marked
+`RolloutFailed`. Every step checks what the app really serves:
+
+```sh
+scripts/demo/rollout.sh
+```
+
+`examples/phase-1/container-rollout.toml` is the same story with real
+containers and `strategy = "blue-green"`, for a cluster with runc.
+
 `relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
 `strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
 `health_timeout` that isn't a whole number of seconds, minutes or hours
@@ -573,8 +592,13 @@ lost with a worker's disk; accepted aggregate counts remain replicated.
 - Volumes (managed + host path): `examples/phase-1/container-volumes.toml`
   (volumes need a container runtime)
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
-- Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
-  `relish batch-status <ID> --wait`
+- Rolling deploys and rollback: `examples/phase-1/proc-rollout.toml`
+  (`scripts/demo/rollout.sh` runs it), `container-rollout.toml` (blue-green)
+- An encrypted secret: `examples/phase-1/container-secrets.toml`
+- A migration that gates its app: `examples/phase-8/proc-run-before.toml`
+- A host binary as an app: `examples/phase-8/proc-exec-app.toml`
+- Batch scheduling: `relish batch examples/phase-8/container-batch-jobs.toml`,
+  then `relish batch-status <ID> --wait`
   Batch jobs must be non-scheduled and have no `run_before` declarations. Use
   ordinary apply for cron schedules and jobs that gate apps in the same manifest.
 

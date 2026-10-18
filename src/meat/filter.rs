@@ -115,7 +115,9 @@ fn runs_its_kind(node: &SchedulerNodeState, requirements: &WorkloadRequirements)
 /// Filter the cluster to nodes eligible for placing this workload.
 ///
 /// A node passes the filter if:
-/// 1. It is ready (not unknown, draining, or cordoned).
+/// 1. It is ready: it has a fresh readiness report, its egress enforcement
+///    isn't degraded, and it hasn't been retired. Drain and cordon don't
+///    exist yet (#656).
 /// 2. It matches all required placement labels.
 /// 3. It runs containers if the workload is one, can enforce any security
 ///    capability the workload requires, and runs its host binary if it has

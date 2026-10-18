@@ -173,7 +173,7 @@ Spread was once a weight (60, scored on whether a node ran the App at all). That
 
 ## 4. Data Structures
 
-All types are Rust structs using `serde` for serialisation (Raft log entries are serialised with `bincode` for compactness; API responses use JSON).
+All types are Rust structs using `serde` for serialisation (Raft log entries are self-describing JSON, because config types such as `Replicas` need serde's `deserialize_any`; API responses use JSON too).
 
 ### Core Scheduling Types
 
@@ -1532,7 +1532,7 @@ Meat is compiled into the Reliaburger binary. The following Rust crates are used
 |-------|---------|---------|
 | `tokio` | 1.x | Async runtime for the scheduling loop, timers, and channel communication. |
 | `tokio::sync::mpsc` | (part of tokio) | Unbounded channels for the scheduling queue (deploy requests flow in, decisions flow out). |
-| `serde` + `bincode` | 1.x / 2.x | Serialisation for Raft log entries (`SchedulingDecision`, `BatchAllocation`). Bincode for compactness on the hot path; JSON for API responses. |
+| `serde` + `serde_json` | 1.x | Serialisation for Raft log entries (`SchedulingDecision`, `BatchAllocation`), which must be self-describing; JSON for API responses. |
 | `rand` | 0.8.x | Tie-breaking during node selection when scores are equal (optional jitter mode). |
 
 No external scheduling frameworks or orchestration libraries are used. The scheduling algorithm is implemented directly in Reliaburger-specific code to avoid abstraction overhead and maintain full control over the hot path.

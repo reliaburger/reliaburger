@@ -641,7 +641,11 @@ impl ProcessControl {
     }
 
     /// Run through the durable owner; dropping this future cancels its socket.
-    pub(crate) async fn exec(&self, id: &InstanceId, command: &[String]) -> io::Result<String> {
+    pub(crate) async fn exec(
+        &self,
+        id: &InstanceId,
+        command: &[String],
+    ) -> io::Result<super::ExecOutput> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
         let record = self.record(id).await?;
         if !matches!(record.phase, OwnerPhase::Running { .. }) {
@@ -673,11 +677,8 @@ impl ProcessControl {
             if let Some(error) = response.get("error") {
                 return Err(io::Error::other(format!("process exec refused: {error}")));
             }
-            response
-                .get("output")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-                .ok_or_else(|| io::Error::other("process exec returned no output"))
+            serde_json::from_value::<super::ExecOutput>(response)
+                .map_err(|error| io::Error::other(format!("invalid process exec answer: {error}")))
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "process exec timed out"))?

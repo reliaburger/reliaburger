@@ -1,0 +1,13 @@
+# App `status-page` in namespace `ops`: the directory names the namespace.
+# See ../_defaults.toml for how the repository fits together.
+
+[app.status-page]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8082"]
+port = 8082
+env = { VERSION = "status-v1" }
+
+[app.status-page.health]
+path = "/healthz"
+interval = 2
+timeout = 1
