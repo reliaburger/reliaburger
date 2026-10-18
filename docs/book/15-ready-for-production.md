@@ -964,6 +964,13 @@ list, without ever failing the build. A lag report that broke builds would get m
 within a week. One that nobody reads would rot just as fast, which is why the refresh is a
 numbered step in the release runbook, not a good intention.
 
+The `age` bump from 0.10 to 0.12 shows what "deliberate" means. The API we seal the root
+CA backup with changed shape, which the compiler caught. What the compiler can't catch is
+whether 0.12 still opens a file 0.10 sealed years ago, so that PR first checked in files
+sealed by the old build and made the tests open them (chapter 4 has the details). It also
+paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
+`cargo audit` exception went too.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do

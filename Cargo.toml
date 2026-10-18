@@ -64,7 +64,7 @@ time = "0.3"
 ring = "0.17"
 x509-parser = { version = "0.18", features = ["verify"] }
 pem = "3"
-age = { version = "0.10", features = ["armor"] }
+age = { version = "0.12", features = ["armor"] }
 base64 = "0.22"
 datafusion = "55"
 # `relish logs --grep` patterns: validated with the same engine DataFusion's

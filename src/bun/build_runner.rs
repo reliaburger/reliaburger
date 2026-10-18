@@ -1468,6 +1468,19 @@ pub async fn build_submit_handler(
         Err(resp) => return resp,
     };
 
+    // A build that declares a namespace pushes into that namespace or not
+    // at all (#1066), whoever asks: a bare `pickle://api:v1` would land in a
+    // repository every namespace pulls. `relish` checks this too, but this
+    // is where the decision holds, so a raw API call can't skip it, and it
+    // runs with or without a council.
+    if let Err(e) = crate::config::build::check_destination_namespace(&request.spec) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
     // Bind the push to the caller's namespace scope (AUTH1). The *destination's*
     // namespace decides who may push there — never a self-declared build field —
     // so a Deployer token scoped to namespace `a` cannot push an image into

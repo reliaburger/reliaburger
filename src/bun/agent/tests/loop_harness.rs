@@ -1866,6 +1866,11 @@ fn assert_at_most_two_writes_a_tick(writes_per_tick: &[usize]) {
 /// 150 ms a write, and would pass the budget at the 250 ms a write a loaded
 /// coverage runner measured (#421), so the release and the service's
 /// retirement now journal on different ticks (#422).
+///
+/// The verdict counts writes per turn instead of timing the turn. Two
+/// slowed writes take 500 ms, which leaves the host's real fsyncs the other
+/// half of the budget, and on a loaded hosted macOS runner they took more:
+/// a turn of exactly two writes ran 1032 ms (#939), the #508 class.
 #[tokio::test]
 async fn a_startup_retirement_completes_within_the_budget_on_a_slow_disk() {
     let (mut agent, _grill, _root, host_port, confirmation) =
@@ -1886,8 +1891,22 @@ async fn a_startup_retirement_completes_within_the_budget_on_a_slow_disk() {
     // The port goes back before the retirement's last journal writes, so
     // judge only once the whole retirement has finished.
     wait_for_startup_cleanup(&readiness, std::time::Duration::from_secs(10)).await;
-    running
-        .assert_responsive("a startup retirement journalled its release to a slow disk")
-        .await;
+    let status = running.status_latency().await;
+    let most_in_a_turn = running.stalls.most_in_a_turn(LoopStall::Persist);
+    let worst = running
+        .meter
+        .worst_turn()
+        .map_or_else(|| "none".to_string(), |turn| turn.to_string());
+    stop(running).await;
     server.abort();
+
+    assert!(
+        status.is_some(),
+        "status went unanswered after a startup retirement journalled to a slow disk"
+    );
+    assert!(
+        most_in_a_turn <= 2,
+        "one turn journalled {most_in_a_turn} writes to a slow disk (the worst turn \
+         took {worst}); a startup retirement may journal two"
+    );
 }

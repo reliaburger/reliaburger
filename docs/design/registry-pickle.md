@@ -116,6 +116,18 @@ the repositories the caller may read. Before this, a namespace-scoped Deployer c
 to any repository through `docker push`, and a bare build destination counted as
 `default`.
 
+A build that declares a `namespace` must push into it, whoever submits it: the
+destination's repository must be `<namespace>/<name>` by the same
+`repository_namespace` rule. `pickle://production/api:v1` in namespace `production` is
+admitted; `pickle://staging/api:v1` and a bare `pickle://api:v1` are refused with a 400
+whose error names the scoped destination to use. A bare name isn't quietly scoped,
+because the build would then push somewhere other than the destination it names, and
+pushing it as written would put a namespace's build in a repository every namespace
+pulls (#1066). `/v1/build` runs this check before the scope check, with or without a
+council, and `relish` config validation runs the same function first. A build with no
+`namespace` is held only by its caller's token, so an unscoped admin can still build a
+shared bare-named image.
+
 What works where:
 
 | Listener | Bearer clients (`relish build`) | Basic clients (docker, crane) |
@@ -1024,7 +1036,7 @@ By the time Meat schedules a new replica on a node, the image may already be cac
 
 Build jobs interact with Pickle through a scoped access model:
 
-1. **`pickle://` URI scheme.** Build jobs reference the Pickle registry using `pickle://` URIs (e.g., `pickle://api:v1.4.3`). Bun translates this to the local Pickle registry endpoint.
+1. **`pickle://` URI scheme.** Build jobs reference the Pickle registry using `pickle://` URIs (e.g., `pickle://api:v1.4.3`). Bun translates this to the local Pickle registry endpoint. A `[build.*]` that declares a `namespace` must name a repository in it (`pickle://<namespace>/api:v1.4.3`); see the registry authorisation section above.
 
 2. **Scoped Unix socket.** When a job has `build = true`, Bun mounts a Unix socket into the job container that provides write access to the local Pickle registry. This socket:
    - Is scoped to the repositories listed in `build_push_to` (e.g., `build_push_to = ["api"]` allows pushing only to `pickle://api:*`).
