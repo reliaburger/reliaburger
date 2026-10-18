@@ -60,6 +60,42 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 So nothing reaches a train, or `main`, without the full set having passed on
 that exact commit.
 
+## Refreshing dependencies
+
+The first PR on every minor release's train refreshes the dependencies, so
+the whole soak gate runs against the new set rather than a lockfile nobody
+has looked at since the last advisory
+([#1026](https://github.com/reliaburger/reliaburger/issues/1026)). 0.2.1's
+gate found why this matters: the soak bricked a Raft store with a redb crash
+that redb 4.2.0 had already fixed, while we still locked 2.6.3
+([#1024](https://github.com/reliaburger/reliaburger/issues/1024)).
+
+1. Run `make outdated` and save its output for the PR. It lists what `cargo
+   update` would move and every crate a major version behind.
+2. Run `cargo update`. It stays within the ranges in `Cargo.toml`, so it
+   never crosses a major version. Check that `Cargo.lock` has no `git`
+   sources.
+3. If `time` or `thiserror` moved, copy their new versions into the `=` pins in
+   `tests/contracts/cron/Cargo.toml` and run `cargo update --manifest-path
+   tests/contracts/cron/Cargo.toml`. CI's optimised cron contract fails
+   when the two graphs differ.
+4. Run `make audit`, `make ci` and every gated target, and add the `full-ci`
+   label to the PR.
+5. If one crate's update breaks something, pin it back with `cargo update -p
+   <crate> --precise <old version>`, name it in the PR, and open an issue.
+6. Pick the majors worth taking this release from the `make outdated` list
+   and bump them one crate per PR, security-relevant crates first. A bump
+   that changes a wire or durable format bumps `protocol` or `state` in
+   `CURRENT` (`src/compatibility.rs`).
+
+Between releases, [Dependabot](../.github/dependabot.yml) opens one grouped
+PR a week per ecosystem. Its Cargo PR is lockfile-only, the same `cargo
+update` as step 2; it never proposes a major version, which stays a
+deliberate PR of its own. It leaves the `dtolnay/rust-toolchain` tags alone,
+because those are the compiler pins below. The weekly
+[`security.yml`](../.github/workflows/security.yml) run prints `make
+outdated` in its job summary.
+
 ## Compiler baseline
 
 The source minimum is Rust 1.97 (`Cargo.toml`); CI checks the locked dependency
