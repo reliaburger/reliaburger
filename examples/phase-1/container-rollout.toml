@@ -1,0 +1,44 @@
+# Real containers: a blue-green deploy with automatic rollback.
+#
+# Two podinfo replicas (the image the five-minute tour runs), each saying
+# which version it is. Change PODINFO_UI_MESSAGE to "v2" and apply again:
+# with strategy = "blue-green", Bun starts a full green set beside the blue
+# one, waits until every green instance passes its health check, and only
+# then retires blue, so both replicas keep serving throughout. Then try a
+# version that can't start, say PODINFO_UI_MESSAGE = "v3" with
+# args = ["--port=9898", "--no-such-flag"]: green never turns
+# healthy within health_timeout, blue keeps serving, and the cluster marks
+# the spec RolloutFailed until you change it. `relish rollback web` goes back
+# to the last version that rolled out healthy.
+#
+# Requires runc on Linux (on macOS, use the managed Linux VM from
+# `relish setup --quickstart`). The process-runtime version, with a script
+# that checks every step, is proc-rollout.toml and scripts/demo/rollout.sh.
+#
+# Deploy with:
+#   relish apply examples/phase-1/container-rollout.toml
+#   relish resolve web                        # an address to curl
+#   curl -s http://<address>/ | grep message  # "message": "v1"
+#   # edit PODINFO_UI_MESSAGE to "v2", apply again, watch `relish status`
+#   relish history web
+#   relish rollback web
+
+[app.web]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+args = ["--port=9898"]
+port = 9898
+replicas = 2
+env = { PODINFO_UI_MESSAGE = "v1" }
+
+[app.web.health]
+path = "/readyz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+threshold_healthy = 1
+
+[app.web.deploy]
+strategy = "blue-green"
+health_timeout = "60s"
+drain_timeout = "10s"
+auto_rollback = true

@@ -483,7 +483,11 @@ impl super::Grill for AppleContainerGrill {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         if command.is_empty() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
@@ -505,7 +509,12 @@ impl super::Grill for AppleContainerGrill {
                 result.push_str(&stderr);
             }
         }
-        Ok(result)
+        Ok(super::ExecOutput {
+            output: result,
+            // `container exec` passes the command's status through; a
+            // signal-killed command has none, so report a plain failure.
+            exit_code: output.status.code().unwrap_or(1),
+        })
     }
 
     async fn follow_logs(
@@ -825,7 +834,8 @@ mod tests {
                     ],
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .output;
             let lines: Vec<_> = output.lines().collect();
             if lines.len() < 4
                 || lines[..3] != ["123", "456", "/work"]
@@ -993,7 +1003,8 @@ mod tests {
                     ],
                 )
                 .await
-                .map_err(|error| format!("pinned image exec failed: {error}"))?;
+                .map_err(|error| format!("pinned image exec failed: {error}"))?
+                .output;
             if output != "reliaburger-pinned-workload" {
                 return Err(format!("unexpected pinned image output: {output:?}"));
             }

@@ -311,10 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn state_report_bincode_round_trip() {
+    fn state_report_postcard_round_trip() {
         let report = sample_report("node-1");
-        let encoded = bincode::serialize(&report).unwrap();
-        let decoded: StateReport = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&report).unwrap();
+        let decoded: StateReport = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.node_id, NodeId::new("node-1"));
         assert_eq!(decoded.running_apps.len(), 1);
         assert_eq!(decoded.running_apps[0].app_name, "web");
@@ -362,8 +362,8 @@ mod tests {
             egress_degraded: false,
             egress_affected_workloads: Vec::new(),
         };
-        let encoded = bincode::serialize(&ReportingMessage::CapabilityReport(capability)).unwrap();
-        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&ReportingMessage::CapabilityReport(capability)).unwrap();
+        let decoded: ReportingMessage = postcard::from_bytes(&encoded).unwrap();
         let ReportingMessage::CapabilityReport(decoded) = decoded else {
             panic!("expected capability report");
         };
@@ -393,8 +393,8 @@ mod tests {
                 }],
             },
         });
-        let encoded = bincode::serialize(&message).unwrap();
-        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&message).unwrap();
+        let decoded: ReportingMessage = postcard::from_bytes(&encoded).unwrap();
         let ReportingMessage::NodeReadinessReport(decoded) = decoded else {
             panic!("expected node readiness report");
         };
@@ -412,7 +412,7 @@ mod tests {
                 detail: format!("event {i} with some detail text"),
             })
             .collect();
-        let encoded = bincode::serialize(&report).unwrap();
+        let encoded = postcard::to_stdvec(&report).unwrap();
         assert!(
             encoded.len() < 1_048_576,
             "report is {} bytes, exceeds 1 MiB",
@@ -422,13 +422,13 @@ mod tests {
 
     #[test]
     fn health_status_variants_serialize_distinctly() {
-        let healthy = bincode::serialize(&ReportHealthStatus::Healthy).unwrap();
-        let unhealthy = bincode::serialize(&ReportHealthStatus::Unhealthy {
+        let healthy = postcard::to_stdvec(&ReportHealthStatus::Healthy).unwrap();
+        let unhealthy = postcard::to_stdvec(&ReportHealthStatus::Unhealthy {
             consecutive_failures: 3,
         })
         .unwrap();
-        let starting = bincode::serialize(&ReportHealthStatus::Starting).unwrap();
-        let unknown = bincode::serialize(&ReportHealthStatus::Unknown).unwrap();
+        let starting = postcard::to_stdvec(&ReportHealthStatus::Starting).unwrap();
+        let unknown = postcard::to_stdvec(&ReportHealthStatus::Unknown).unwrap();
         // All four variants must produce different bytes
         assert_ne!(healthy, unhealthy);
         assert_ne!(healthy, starting);
@@ -441,8 +441,8 @@ mod tests {
     #[test]
     fn reporting_message_round_trip() {
         let msg = ReportingMessage::Report(sample_report("w1"));
-        let encoded = bincode::serialize(&msg).unwrap();
-        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&msg).unwrap();
+        let decoded: ReportingMessage = postcard::from_bytes(&encoded).unwrap();
         match decoded {
             ReportingMessage::Report(r) => assert_eq!(r.node_id, NodeId::new("w1")),
             _ => panic!("expected Report variant"),
@@ -469,8 +469,8 @@ mod tests {
             }],
         };
         let msg = ReportingMessage::MetricsRollup(rollup);
-        let encoded = bincode::serialize(&msg).unwrap();
-        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&msg).unwrap();
+        let decoded: ReportingMessage = postcard::from_bytes(&encoded).unwrap();
         match decoded {
             ReportingMessage::MetricsRollup(r) => {
                 assert_eq!(r.node_id, NodeId::new("w1"));

@@ -2267,7 +2267,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let scrape_cmd_tx = cmd_tx.clone();
         let scrape_node = node_name.clone();
         feeder_handles.push(tokio::spawn(async move {
-            let client = reqwest::Client::builder()
+            let client = reliaburger::http_client::builder()
                 .timeout(timeout)
                 .build()
                 .unwrap_or_default();
@@ -2748,7 +2748,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .with_telemetry(Arc::clone(&job_telemetry)),
         )))
         .with_job_notifier(WebhookDispatcher::new(
-            reqwest::Client::builder()
+            reliaburger::http_client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
@@ -2890,7 +2890,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
-        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        let mut builder =
+            reliaburger::http_client::builder().redirect(reqwest::redirect::Policy::none());
         if let Some(identity) = &api_identity {
             builder = builder.use_preconfigured_tls(
                 (*reliaburger::sesame::mtls::build_live_mtls_client_config(
@@ -3146,7 +3147,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let eval_interval = config.alerts.evaluation_interval_secs;
         let cluster_name = config.cluster.name.clone();
 
-        let webhook_client = reqwest::Client::builder()
+        let webhook_client = reliaburger::http_client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();

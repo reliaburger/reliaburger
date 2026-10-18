@@ -202,8 +202,10 @@ mod tests {
                             return axum::Json(running).into_response();
                         }
                         if path == format!("v1/exec/{app}/{NAMESPACE}") {
-                            return axum::Json(serde_json::json!({"output": "persisted\n"}))
-                                .into_response();
+                            return axum::Json(
+                                serde_json::json!({"output": "persisted\n", "exit_code": 0}),
+                            )
+                            .into_response();
                         }
                         StatusCode::NOT_FOUND.into_response()
                     }

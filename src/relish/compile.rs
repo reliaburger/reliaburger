@@ -41,9 +41,9 @@ pub fn compile(path: &Path) -> Result<CompileResult, RelishError> {
     compile_directory(path)
 }
 
-/// Compile a single TOML file.
+/// Compile a single file: Reliaburger TOML, or Kubernetes YAML or JSON.
 fn compile_single_file(path: &Path) -> Result<CompileResult, RelishError> {
-    let config = Config::from_file(path)?;
+    let config = super::commands::load_config_file(path)?;
     Ok(CompileResult {
         config,
         merged_from: vec![path.to_path_buf()],

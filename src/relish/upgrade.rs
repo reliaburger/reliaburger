@@ -724,31 +724,30 @@ fn render_plan(
     leader: usize,
     parallel: u32,
 ) -> String {
+    // Writing to a String never fails.
     use std::fmt::Write as _;
 
     let parallel = parallel.max(1) as usize;
     let mut out = String::new();
     let total = workers + council + leader;
-    writeln!(out, "upgrade plan to {version} ({total} node(s))").unwrap();
+    let _ = writeln!(out, "upgrade plan to {version} ({total} node(s))");
 
     let mut step = 1;
     let mut estimate = 0u64;
     if workers > 0 {
         let batches = workers.div_ceil(parallel);
-        writeln!(
+        let _ = writeln!(
             out,
             "  {step}. workers: {workers} node(s) in {batches} batch(es) of up to {parallel}"
-        )
-        .unwrap();
+        );
         estimate += batches as u64 * SECONDS_PER_NODE;
         step += 1;
     }
     if council > 0 {
-        writeln!(
+        let _ = writeln!(
             out,
             "  {step}. council members: {council} node(s), strictly one at a time"
-        )
-        .unwrap();
+        );
         estimate += council as u64 * SECONDS_PER_NODE;
         step += 1;
     }
@@ -756,57 +755,54 @@ fn render_plan(
         // The leader always upgrades last, in place (openraft 0.9 can't
         // gracefully hand off; a >=3-node council keeps quorum through the
         // sub-second exec bounce).
-        writeln!(out, "  {step}. the leader, in place (last)").unwrap();
+        let _ = writeln!(out, "  {step}. the leader, in place (last)");
         estimate += SECONDS_PER_NODE;
     }
-    writeln!(
+    let _ = writeln!(
         out,
         "estimated duration: ~{} min (assuming {SECONDS_PER_NODE}s per node)",
         estimate.div_ceil(60)
-    )
-    .unwrap();
+    );
     out.push_str("workloads keep running throughout (adoption across exec)\n");
     out
 }
 
 fn render_cluster_status(cluster: &serde_json::Value) -> String {
+    // Writing to a String never fails.
     use std::fmt::Write as _;
 
     let mut out = String::new();
     match cluster.get("active").filter(|a| !a.is_null()) {
         Some(active) => {
-            writeln!(
+            let _ = writeln!(
                 out,
                 "upgrade {} to {} — phase: {}",
                 active["upgrade_id"].as_str().unwrap_or("?"),
                 active["target_version"].as_str().unwrap_or("?"),
                 render_phase(&active["phase"]),
-            )
-            .unwrap();
-            writeln!(out, "{:<20} {:<10} {:<12} FROM", "NODE", "ROLE", "PHASE").unwrap();
+            );
+            let _ = writeln!(out, "{:<20} {:<10} {:<12} FROM", "NODE", "ROLE", "PHASE");
             for node in active["nodes"].as_array().into_iter().flatten() {
-                writeln!(
+                let _ = writeln!(
                     out,
                     "{:<20} {:<10} {:<12} {}",
                     node["node_id"].as_str().unwrap_or("?"),
                     render_phase(&node["role"]).to_lowercase(),
                     render_phase(&node["phase"]),
                     node["from_version"].as_str().unwrap_or("-"),
-                )
-                .unwrap();
+                );
             }
         }
         None => {
             out.push_str("no upgrade in progress\n");
             if let Some(last) = cluster["history"].as_array().and_then(|h| h.last()) {
-                writeln!(
+                let _ = writeln!(
                     out,
                     "last upgrade: {} to {} ({})",
                     last["upgrade_id"].as_str().unwrap_or("?"),
                     last["target_version"].as_str().unwrap_or("?"),
                     render_phase(&last["phase"]),
-                )
-                .unwrap();
+                );
             }
         }
     }
@@ -814,37 +810,37 @@ fn render_cluster_status(cluster: &serde_json::Value) -> String {
 }
 
 fn render_node_status(node: &serde_json::Value) -> String {
+    // Writing to a String never fails.
     use std::fmt::Write as _;
 
     let mut out = String::new();
-    writeln!(
+    let _ = writeln!(
         out,
         "running: {}",
         node["running_version"].as_str().unwrap_or("?")
-    )
-    .unwrap();
+    );
     match node.get("in_flight").filter(|m| !m.is_null()) {
-        Some(marker) => writeln!(
-            out,
-            "in flight: {} -> {} (phase: {}, boot attempts: {})",
-            marker["previous_version"].as_str().unwrap_or("?"),
-            marker["target_version"].as_str().unwrap_or("?"),
-            render_phase(&marker["phase"]),
-            marker["boot_attempts"].as_u64().unwrap_or(0),
-        )
-        .unwrap(),
+        Some(marker) => {
+            let _ = writeln!(
+                out,
+                "in flight: {} -> {} (phase: {}, boot attempts: {})",
+                marker["previous_version"].as_str().unwrap_or("?"),
+                marker["target_version"].as_str().unwrap_or("?"),
+                render_phase(&marker["phase"]),
+                marker["boot_attempts"].as_u64().unwrap_or(0),
+            );
+        }
         None => out.push_str("no upgrade in flight\n"),
     }
     for entry in node["history"].as_array().into_iter().flatten() {
-        writeln!(
+        let _ = writeln!(
             out,
             "  {} {} -> {}: {}",
             render_phase(&entry["outcome"]).to_lowercase(),
             entry["from_version"].as_str().unwrap_or("?"),
             entry["to_version"].as_str().unwrap_or("?"),
             entry["detail"].as_str().unwrap_or(""),
-        )
-        .unwrap();
+        );
     }
     out
 }
@@ -985,9 +981,12 @@ pub fn resolve_registry_route(
 
 /// Download a URL into memory (shared with `relish setup`).
 pub(crate) async fn download(url: &str) -> Result<Vec<u8>, RelishError> {
-    let response = reqwest::get(url)
-        .await
-        .map_err(|e| RelishError::FormatFailed(format!("download failed: {e}")))?;
+    let download_failed =
+        |e: reqwest::Error| RelishError::FormatFailed(format!("download failed: {e}"));
+    let client = crate::http_client::builder()
+        .build()
+        .map_err(download_failed)?;
+    let response = client.get(url).send().await.map_err(download_failed)?;
     if !response.status().is_success() {
         return Err(RelishError::FormatFailed(format!(
             "download failed: status {}",

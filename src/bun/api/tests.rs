@@ -6762,6 +6762,70 @@ async fn exec_nonexistent_app_returns_404() {
     shutdown.cancel();
 }
 
+/// An exec router whose agent answers each exec with the next of `answers`.
+fn exec_answering_router(
+    answers: Vec<Result<crate::grill::ExecOutput, crate::bun::BunError>>,
+) -> Router {
+    let (tx, mut rx) = mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut answers = answers.into_iter();
+        while let Some(command) = rx.recv().await {
+            if let AgentCommand::Exec { response, .. } = command
+                && let Some(answer) = answers.next()
+            {
+                let _ = response.send(answer);
+            }
+        }
+    });
+    router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    )
+}
+
+async fn post_exec(app: &Router) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/exec/web/default")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"command":["false"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// D34: a command that ran and exited non-zero answers 200 with its exit
+/// code; only a failure to run it is an HTTP error, and each keeps its own
+/// status instead of all becoming 404.
+#[tokio::test]
+async fn exec_answers_with_the_exit_code_and_distinct_failure_statuses() {
+    let app = exec_answering_router(vec![
+        Ok(crate::grill::ExecOutput {
+            output: "boom\n".into(),
+            exit_code: 3,
+        }),
+        Err(crate::bun::BunError::ExecTimeout { seconds: 300 }),
+        Err(crate::bun::BunError::AppNotFound {
+            app_name: "web".into(),
+            namespace: "default".into(),
+        }),
+    ]);
+    let (status, body) = post_exec(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["exit_code"], 3);
+    assert_eq!(body["output"], "boom\n");
+    let (status, _) = post_exec(&app).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    let (status, _) = post_exec(&app).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
     let (tx, mut rx) = mpsc::channel(1);

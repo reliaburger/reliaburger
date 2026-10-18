@@ -783,7 +783,11 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
             }
         }
     }
-    async fn exec(&self, id: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        id: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         // Like follow_logs, exec doesn't take the lifecycle claim: it may run
         // for minutes, and stop/kill need the claim. It also stays in the
         // caller's future, so the agent's exec timeout drops the backend call.
@@ -1173,7 +1177,7 @@ mod tests {
         drop(exec);
         runtime.host.release_execs(1);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(runtime.exec(&id, &command).await.unwrap(), "first");
+        assert_eq!(runtime.exec(&id, &command).await.unwrap().output, "first");
     }
 
     fn launch(id: &InstanceId, host: bool) -> RuntimeLaunch {

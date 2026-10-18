@@ -79,7 +79,7 @@ impl Downloader {
     /// progress: a slow link is not a broken one, and the caller owns the
     /// overall deadline.
     pub fn new(stall: Duration) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .connect_timeout(stall.min(Duration::from_secs(15)))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 10 {
