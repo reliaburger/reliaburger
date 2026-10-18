@@ -110,7 +110,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Show cluster and app status
 - `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
-- `relish exec <APP> [COMMAND]...`: Execute a command inside a running container
+- `relish exec <APP> [COMMAND]...`: Run a command once inside a running instance and exit with its exit code. Not interactive: no stdin and no terminal
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
 - `relish history <APP>`: Show deploy history for an app, from every node
@@ -151,6 +151,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish logs <NAME>`: Stream logs from an app or job
 - `relish logs-export --dest <DEST>`: Export Parquet log files to a destination directory
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
+- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last *(0.2.1, not in 0.2.0)*
 
 **Diagnose and test** ([diagnostics](docs/manual/07_diagnostics.md))
 

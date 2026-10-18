@@ -1,61 +1,159 @@
-/// TOML formatter for Reliaburger configs.
-///
-/// Parses TOML, validates it, and re-serialises with canonical section
-/// ordering and consistent key ordering. Idempotent: running the
-/// formatter twice produces the same output as running it once.
-///
-/// Note: comments are not preserved — the formatter round-trips through
-/// the `toml` crate's typed representation, which discards comments.
-/// This is acceptable for machine-generated configs (GitOps, compile
-/// output). For hand-edited configs, use `relish lint` to validate
-/// without reformatting.
+//! TOML formatter for Reliaburger configs (`relish fmt`).
+//!
+//! Edits the document in place with `toml_edit`, which keeps every comment
+//! and each value exactly as written. It orders sections canonically, sorts
+//! keys within each section, puts one space either side of `=`, drops
+//! indentation and leaves one blank line before each section header.
+//! Idempotent: running the formatter twice produces the same output as
+//! running it once.
 use std::collections::BTreeMap;
+
+use toml_edit::{DocumentMut, Item, RawString, Table};
 
 use super::RelishError;
 
 /// Canonical section ordering within a Reliaburger config file.
 const SECTION_ORDER: &[&str] = &["namespace", "permission", "app", "job", "build"];
 
-/// Format a TOML string with canonical ordering.
+/// Format a TOML string with canonical ordering, keeping its comments.
 ///
 /// Returns the formatted string. The output is deterministic and
 /// idempotent.
 pub fn format_toml(input: &str) -> Result<String, RelishError> {
-    // Parse into a generic TOML table (BTreeMap, so keys are alphabetical)
-    let table: BTreeMap<String, toml::Value> =
+    let original: BTreeMap<String, toml::Value> =
         toml::from_str(input).map_err(|e| RelishError::FormatFailed(e.to_string()))?;
+    let mut document: DocumentMut = input
+        .parse()
+        .map_err(|e: toml_edit::TomlError| RelishError::FormatFailed(e.to_string()))?;
 
-    let mut output = String::new();
+    let root = document.as_table_mut();
+    root.sort_values_by(|left, _, right, _| {
+        section_rank(left.get())
+            .cmp(&section_rank(right.get()))
+            .then_with(|| left.get().cmp(right.get()))
+    });
+    let mut layout = Layout {
+        position: 0,
+        header_written: false,
+    };
+    // The root's own keys print before any header.
+    root.set_position(layout.position);
+    layout.position += 1;
+    normalise_values(root);
+    layout.header_written = root.iter().any(|(_, item)| item.is_value());
+    for (_, item) in root.iter_mut() {
+        layout.visit(item);
+    }
+    let trailing = comment_lines(document.trailing().as_str().unwrap_or(""));
+    document.set_trailing(if trailing.is_empty() {
+        String::new()
+    } else {
+        format!("\n{trailing}")
+    });
 
-    // Top-level scalars first: emitted after any section header they
-    // would silently become part of that section, changing the config.
-    let mut scalars = String::new();
-    for (key, value) in &table {
-        if !value.is_table() {
-            scalars.push_str(&format!("{key} = {}\n", inline_value(value)));
-        }
-    }
-    if !scalars.is_empty() {
-        output.push_str(&scalars);
-        output.push('\n');
-    }
-
-    // Sections in canonical order, then any others alphabetically
-    for &section in SECTION_ORDER {
-        if let Some(toml::Value::Table(sub)) = table.get(section) {
-            append_table(&mut output, section, sub);
-        }
-    }
-    for (key, value) in &table {
-        if !SECTION_ORDER.contains(&key.as_str())
-            && let toml::Value::Table(sub) = value
-        {
-            append_table(&mut output, key, sub);
-        }
-    }
-
-    verify_roundtrip(&table, &output)?;
+    let output = document.to_string();
+    verify_roundtrip(&original, &output)?;
     Ok(output)
+}
+
+/// Where a top-level section sorts: the canonical ones first, in order,
+/// then everything else alphabetically.
+fn section_rank(key: &str) -> usize {
+    SECTION_ORDER
+        .iter()
+        .position(|section| *section == key)
+        .unwrap_or(SECTION_ORDER.len())
+}
+
+/// Walks the tables in print order, numbering them and setting the
+/// whitespace around their headers.
+struct Layout {
+    /// The next document position; `toml_edit` prints tables in this order.
+    position: usize,
+    /// Whether anything has printed yet, so the first header gets no blank
+    /// line above it.
+    header_written: bool,
+}
+
+impl Layout {
+    fn visit(&mut self, item: &mut Item) {
+        match item {
+            Item::Table(table) => self.visit_table(table),
+            // The elements of `[[x]]` keep their order: it's meaningful.
+            Item::ArrayOfTables(array) => {
+                for table in array.iter_mut() {
+                    self.visit_table(table);
+                }
+            }
+            Item::None | Item::Value(_) => {}
+        }
+    }
+
+    fn visit_table(&mut self, table: &mut Table) {
+        // Dotted keys (`a.b = 1`) print inside their parent, not as a header.
+        if table.is_dotted() {
+            return;
+        }
+        table.sort_values();
+        table.set_position(self.position);
+        self.position += 1;
+        normalise_values(table);
+        let has_values = table.iter().any(|(_, item)| item.is_value());
+        if !table.is_implicit() || has_values {
+            let comments = comment_lines(raw(table.decor().prefix()));
+            let blank = if self.header_written { "\n" } else { "" };
+            let suffix = trailing_comment(raw(table.decor().suffix()));
+            table.decor_mut().set_prefix(format!("{blank}{comments}"));
+            table.decor_mut().set_suffix(suffix);
+            self.header_written = true;
+        }
+        for (_, item) in table.iter_mut() {
+            self.visit(item);
+        }
+    }
+}
+
+/// Give each `key = value` line in `table` canonical spacing, keeping the
+/// comment lines above it and any comment after it.
+fn normalise_values(table: &mut Table) {
+    for (mut key, item) in table.iter_mut() {
+        let Item::Value(value) = item else {
+            continue;
+        };
+        let comments = comment_lines(raw(key.leaf_decor().prefix()));
+        key.leaf_decor_mut().set_prefix(comments);
+        key.leaf_decor_mut().set_suffix(" ");
+        let suffix = trailing_comment(raw(value.decor().suffix()));
+        value.decor_mut().set_prefix(" ");
+        value.decor_mut().set_suffix(suffix);
+    }
+}
+
+/// The text of a piece of decor. Parsed documents hold their decor as
+/// text, so a missing value is simply none.
+fn raw(decor: Option<&RawString>) -> &str {
+    decor.and_then(RawString::as_str).unwrap_or("")
+}
+
+/// The comment lines in a run of whitespace and comments, unindented, each
+/// ending in a newline. Blank lines go.
+fn comment_lines(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// A comment after a value or header on the same line, as ` # …`, or
+/// nothing.
+fn trailing_comment(text: &str) -> String {
+    let comment = text.trim();
+    if comment.starts_with('#') {
+        format!(" {comment}")
+    } else {
+        String::new()
+    }
 }
 
 /// Refuse to hand back output that re-parses to a different value tree.
@@ -78,36 +176,6 @@ fn verify_roundtrip(
         ));
     }
     Ok(())
-}
-
-/// Append a table as a `[path]` section: scalar and array fields first,
-/// then each nested table recursively as its own dotted section.
-fn append_table(output: &mut String, path: &str, table: &toml::map::Map<String, toml::Value>) {
-    let has_scalars = table.values().any(|v| !v.is_table());
-
-    if has_scalars || table.is_empty() {
-        output.push_str(&format!("[{path}]\n"));
-        for (k, v) in table {
-            if !v.is_table() {
-                output.push_str(&format!("{k} = {}\n", inline_value(v)));
-            }
-        }
-        output.push('\n');
-    }
-
-    for (k, v) in table {
-        if let toml::Value::Table(sub) = v {
-            append_table(output, &format!("{path}.{k}"), sub);
-        }
-    }
-}
-
-/// Format a TOML value inline (strings quoted, arrays bracketed,
-/// tables in `{ … }` form). `toml::Value`'s `Display` produces exactly
-/// this; `toml::to_string` must NOT be used here — it serialises tables
-/// in document form, which is invalid on the right of `=`.
-fn inline_value(value: &toml::Value) -> String {
-    value.to_string()
 }
 
 /// Check whether a TOML string is already formatted.
@@ -289,6 +357,76 @@ path = "/health"
             toml::from_str("[app.web]\nport = 8080\n").unwrap();
         let err = verify_roundtrip(&original, "not [ valid").unwrap_err();
         assert!(err.to_string().contains("invalid TOML"), "got: {err}");
+    }
+
+    /// D35: `relish fmt` used to round-trip through `toml::Value` and drop
+    /// every comment. Full-line comments travel with the key or section they
+    /// sit above, and a trailing comment stays on its line.
+    #[test]
+    fn fmt_keeps_every_comment() {
+        let input = "# The web tier.\n\
+                     [app.web]\n\
+                     # Pinned until the cache fix ships.\n\
+                     image = \"web:v1\"\n\
+                     replicas = 3 # one per zone\n\
+                     \n\
+                     # Runs before every deploy.\n\
+                     [job.migrate]\n\
+                     image = \"web:v1\"\n\
+                     # end of file\n";
+        let formatted = format_toml(input).unwrap();
+        for comment in [
+            "# The web tier.",
+            "# Pinned until the cache fix ships.",
+            "replicas = 3 # one per zone",
+            "# Runs before every deploy.",
+            "# end of file",
+        ] {
+            assert!(
+                formatted.contains(comment),
+                "lost {comment:?}:\n{formatted}"
+            );
+        }
+        let section_comment = formatted.find("# Runs before every deploy.").unwrap();
+        assert!(section_comment < formatted.find("[job.migrate]").unwrap());
+        let key_comment = formatted.find("# Pinned").unwrap();
+        assert!(key_comment < formatted.find("image").unwrap());
+    }
+
+    #[test]
+    fn fmt_moves_a_section_with_the_comment_above_it() {
+        let input =
+            "[app.web]\nimage = \"web:v1\"\n\n# Team budget.\n[namespace.team]\ncpu = \"8000m\"\n";
+        let formatted = format_toml(input).unwrap();
+        assert!(
+            formatted.starts_with("# Team budget.\n[namespace.team]\n"),
+            "got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn fmt_normalises_spacing_and_blank_lines() {
+        let input = "[app.web]\n   image=\"web:v1\"\n\n\n   port   =   8080\n[app.api]\nimage = \"api:v1\"\n";
+        let formatted = format_toml(input).unwrap();
+        assert_eq!(
+            formatted,
+            "[app.api]\nimage = \"api:v1\"\n\n[app.web]\nimage = \"web:v1\"\nport = 8080\n"
+        );
+    }
+
+    #[test]
+    fn fmt_with_comments_is_idempotent() {
+        let input = "# top\n[job.a]\nimage = \"a:1\" # pinned\n\n# web\n[app.web]\n# replicas\nreplicas = 2\nimage = \"w:1\"\n";
+        let first = format_toml(input).unwrap();
+        assert_eq!(first, format_toml(&first).unwrap());
+        assert!(is_formatted(&first).unwrap());
+    }
+
+    #[test]
+    fn fmt_keeps_array_of_tables_in_order() {
+        let input = "[[app.web.volume]]\npath = \"/b\"\n\n[[app.web.volume]]\npath = \"/a\"\n";
+        let formatted = format_toml(input).unwrap();
+        assert!(formatted.find("/b").unwrap() < formatted.find("/a").unwrap());
     }
 
     #[test]

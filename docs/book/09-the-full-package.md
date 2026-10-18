@@ -268,7 +268,7 @@ Invalid files produce warnings, not errors. One broken TOML file shouldn't block
 
 ### `relish fmt`
 
-Reformats a TOML config with canonical section ordering. The order is: namespace, permission, app, job, build. Within each section, keys are alphabetical (courtesy of `BTreeMap`'s ordering when we round-trip through `toml`).
+Reformats a TOML config with canonical section ordering. The order is: namespace, permission, app, job, build. Within each section, keys are alphabetical. Comments survive, which took a rewrite; "Keeping the comments" below tells that story.
 
 `relish fmt app.toml` rewrites the file in place. `relish fmt app.toml --check` exits non-zero if the file needs formatting, without modifying it. Use `--check` in CI to enforce consistent formatting.
 
@@ -326,7 +326,34 @@ Write the whole thing somewhere else, then `rename` it over the target. `rename(
 
 Worth noticing how the two protections differ. The round-trip guard is about *correctness*: is this output the same config? The atomic rename is about *atomicity*: is there any instant where an observer sees neither? A tool that rewrites files in place needs both, and having one makes it very easy to assume you have the other.
 
-The third thing `fmt` did quietly was eat comments. That part is by design — the formatter round-trips through `toml`'s typed representation, which has nowhere to keep them — but "by design" is not the same as "the operator knows". It now says so, once, when the input had comments to lose. Design decisions that destroy user data should be announced by the program, not by the documentation.
+The third thing `fmt` did quietly was eat comments. The formatter parsed the file into `toml::Value`, a tree of plain data with nowhere to keep a `#` line, and printed the tree back out. For a while it printed a warning when the input had comments to lose, on the theory that a design decision that destroys user data should at least be announced. The 2026-10-10 audit (D35) asked the obvious next question: why destroy it at all?
+
+#### Keeping the comments
+
+The `toml` crate has a sibling, `toml_edit`, built for exactly this: editing a TOML file the way a person would, leaving everything it doesn't touch alone. It was already in our dependency tree, because `toml` uses it to parse, so adding it as a direct dependency costs no new code. Where `toml::Value` is the *meaning* of a file, `toml_edit::DocumentMut` is the file: every key, value and header carries its *decor*, the whitespace and comments around it. A comment line above `image = ...` is the prefix decor of the key `image`; a `# one per zone` after `replicas = 3` is the suffix decor of the value.
+
+That turns formatting from "print a tree" into "tidy a document in place". Sorting reorders keys, and since a comment lives in its key's decor, it moves with its key. Reordering sections is the one part that needs care. `toml_edit` prints tables by a *position* number, the order they appeared in the input, so the formatter sorts the root table's keys into canonical order, then walks the tree in that order handing out fresh positions:
+
+```rust
+fn visit(&mut self, item: &mut Item) {
+    match item {
+        Item::Table(table) => self.visit_table(table),
+        // The elements of `[[x]]` keep their order: it's meaningful.
+        Item::ArrayOfTables(array) => {
+            for table in array.iter_mut() {
+                self.visit_table(table);
+            }
+        }
+        Item::None | Item::Value(_) => {}
+    }
+}
+```
+
+`Item` is an enum, and `match` makes the walk say what happens to every kind of item, including the two it ignores. `&mut Item` is a *mutable borrow*: the walk changes the document in place, and while it holds that borrow nothing else can read the document, so there's no way to observe a half-renumbered tree. An array of tables (`[[app.web.volume]]`) has its elements visited in order but never sorted, because their order is data.
+
+Each table on the walk then gets its spacing normalised: comment lines are kept, unindented, and blank lines go; `=` gets one space either side; each header gets one blank line above it except the first. Values keep their own spelling, so `0x1F` stays `0x1F` and a multi-line array keeps its layout. A comment written above a section header belongs to that header, so when `[namespace.team]` moves to the top of the file, its `# Team budget.` comes with it.
+
+The round-trip guard stays, unchanged. It compares meaning, not text, so it's just as good a check on `toml_edit` output as it was on ours. The new tests are the comment cases: `fmt_keeps_every_comment` (full-line, trailing and end-of-file comments), `fmt_moves_a_section_with_the_comment_above_it`, `fmt_normalises_spacing_and_blank_lines`, `fmt_with_comments_is_idempotent` and `fmt_keeps_array_of_tables_in_order`. One cost to note: a file formatted by an older relish may fail `relish fmt --check` once, because the new formatter ends a file with one newline, not a blank line. Before 1.0 we don't keep compatibility, and a single reformat fixes it.
 
 `compile` had the same shape of problem one level up. It merged files with `extend` on name-keyed maps, so a second `[app.web]` in a second file silently replaced the first, and the output looked complete. It now warns on every overwrite — while leaving two apps of the same name in *different* namespaces alone, since that's been legal since instance identity gained namespaces. And a malformed `_defaults.toml` used to be swallowed by `.ok()?`, making a typo indistinguishable from "there are no defaults": the default image vanished from every app in the directory and the error resurfaced much later as a missing field. `Option` is a lovely type for "there isn't one" and a terrible one for "there is one but I couldn't read it".
 
@@ -711,7 +738,9 @@ Import-then-apply is two commands and a file you didn't want. So `relish apply` 
 relish apply -f https://reliaburger.com/demo/podinfo.yaml
 ```
 
-How does it know? A top-level `apiVersion:` line isn't valid TOML, so a document with `apiVersion:` and `kind:` at the start of a line can only be Kubernetes. That document goes through the same importer in memory, its migration report still lands on stderr (applying mustn't hide what it approximated), and the resulting `Config` is validated and applied like any TOML file.
+How does it know? A top-level `apiVersion:` line isn't valid TOML, so a document with `apiVersion:` and `kind:` at the start of a line can only be Kubernetes. So is a document that opens with `{` and names `"apiVersion"` and `"kind"`: TOML can't start with a brace, and JSON is YAML, so the same importer reads it unchanged. That document goes through the importer in memory, its migration report still lands on stderr (applying mustn't hide what it approximated), and the resulting `Config` is validated and applied like any TOML file.
+
+For a while only `apply` knew this. `lint`, `deploy`, `diff` and `compile` called `Config::from_file`, so `relish lint podinfo.yaml` failed on the first line of a file `relish apply` would have run. Now all four go through `manifest::load_file`, which reads the file and hands it to the same `manifest::parse` that `apply` uses. One parser means one definition of "a manifest", and `local_config_commands_accept_kubernetes_yaml` holds the four commands to it.
 
 The download is where a convenience turns into an attack surface, so it's deliberately narrow: HTTPS only (redirects too, via reqwest's `https_only`), a 30-second timeout and a 1 MiB cap enforced while reading, not just from the `Content-Length` header a server can lie about. The CLI accepts the manifest positionally or with `-f`, and clap's `ArgGroup` makes exactly one of them required:
 

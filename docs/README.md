@@ -1369,12 +1369,19 @@ map; use `--namespace`, `--to-namespace` and `--port` when needed. The five
 steps cover the actual DNS answer, live userspace and attached eBPF service
 state, live attached firewall state, the faults active on the path, and the TCP
 result. Each step is labelled `observed`, `inferred` or `unavailable`. A
-failure exits 1; missing evidence or missing probe tools exits 2 rather than
+failure exits 1; missing evidence or missing probe tools exits 3 rather than
 pretending the path is healthy.
 
 `relish inspect <app>` lists every instance of the app on every node, with its
 node, under a desired vs running replica count; a node that did not answer or
 that gossip reports dead is named rather than silently left out.
+
+`relish events` lists the cluster's recent events, merged from every node
+(`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
+once, without stdin or a terminal, and exits with its exit code. `relish
+resolve <name> --namespace <ns>` picks a service whose name exists in several
+namespaces. `-o json` works wherever a command has machine output, and a
+command without it refuses `-o json` (exit 2). `relish fmt` keeps comments.
 
 External probes are denied by default. They require an Admin credential,
 `probe_external_destination` in `[testing].allowed_operations`, the protected
