@@ -115,6 +115,8 @@ async fn inject(
     let rule = agent
         .fault_registry
         .insert(&crate::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type,
             target_service: "web".to_string(),
             namespace: Some("default".to_string()),

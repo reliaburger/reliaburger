@@ -896,12 +896,18 @@ it injects any and exits non-zero if a step is refused. Admin doesn't
 override a disabled operation, and Bun attributes audit events to the
 authenticated credential rather than a client-supplied name.
 
-In 0.2.0 workload faults target apps only: the replica guard refuses a kill or
-pause aimed at a job, and array or shared-executor attempts aren't Smoker
-targets. Jobs are tested under node-level faults instead (Bun killed on a
-worker or the leader, delayed traffic between nodes, a full disk, slow
-fsync), which is how the release's job qualification breaks them. Job-aware
-chaos is planned for 0.2.2.
+Workload faults reach jobs and task arrays as well as apps. `relish fault
+kill render --instance 41` kills the attempt running task 41, wherever it
+runs, and the job handles it as it would a crash, under its own retry and
+`replay_unknown` policy. The replica guard applies
+only to apps, since a job is meant to finish; Bun decides what a target is
+from what runs, so a caller can't relabel an app to dodge the guard, and
+every other rail still applies. An attempt in its own container takes every
+fault. A command in a reusable executor takes kill and pause only, because a
+CPU, memory, I/O or network fault on the executor's shared cgroup would slow
+the tasks that run there next. The release's job qualification also breaks
+whole nodes under jobs (Bun killed on a worker or the leader, delayed traffic
+between nodes, a full disk, slow fsync).
 
 | | Chaos Mesh (K8s) | Litmus (K8s) | Gremlin (SaaS) | **Smoker** |
 |---|---|---|---|---|

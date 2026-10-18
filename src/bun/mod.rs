@@ -26,6 +26,7 @@ mod grant_fence;
 pub mod health;
 pub mod host_paths;
 pub mod job_events;
+pub mod live_attempts;
 pub mod loop_meter;
 pub mod namespace_keys;
 pub mod probe;

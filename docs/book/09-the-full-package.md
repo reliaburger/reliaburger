@@ -1874,6 +1874,60 @@ the native arm64 build, which runs fine from a translated shell. The tests
 fake both answers, plus the missing key, and check that an Intel Mac never
 reaches a download or creates `~/.reliaburger`.
 
+### Asking what you want
+
+Until 0.2.2 the one-liner on the homepage piped the installer to a bare `sh`,
+and it did one thing:
+install `relish`, then build three Lima VMs on your laptop. That's a fine
+first five minutes. But it looked like *the* way to install Reliaburger, and
+someone with three Linux servers waiting would reasonably run it there and get
+a laptop cluster they didn't ask for
+([#670](https://github.com/reliaburger/reliaburger/issues/670)).
+
+Reliaburger will eventually install in three ways: a development cluster in
+Lima on a laptop, `bun` on machines you already have, and machines netbooted
+straight into a cluster. Only the first two exist today, and none of them is
+production quality before 1.0.0. So the installer now asks. The homepage line
+is `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop`; `sh -s`
+reads the script from standard input, and everything after `--` becomes its
+arguments. With no flag at all, both the bootstrap and the versioned installer
+print the choices (`--laptop`, `--install-only` with a pointer to the Linux
+servers guide, netbooting as future work, and the not-for-production line) and
+exit. Nothing downloads, and `~/.reliaburger` isn't created.
+
+Which exit status? We picked 2, the conventional "you used me wrong". Zero is
+friendlier at a prompt, where nobody sees the status anyway. But old CI scripts
+and blog posts say `curl … | sh && relish apply …`, and with zero that `&&`
+carries on as if there were a cluster. An unknown option also gets 2, with the
+usage. Any option after `--laptop` that the installer doesn't know still goes
+to `relish setup --quickstart`, so `sh -s -- --laptop --nodes 1` works as
+before. Before `--laptop`, `--nodes` is just an unknown option.
+
+The Intel Mac check from the previous section runs before any of this, so an
+Intel Mac hears about Intel Macs, not about modes. Its advice now reads
+`RELIABURGER_VERSION=v0.2.1 sh -s -- --laptop`, which raised a compatibility
+question. The bootstrap on the website is shared by every release, but 0.2.1's
+installer has never heard of `--laptop`. It hands options it doesn't know to
+`relish setup`, which refuses them. So the bootstrap checks the version it's
+about to fetch and, before 0.2.2, drops the flag:
+
+```sh
+for argument do
+  shift
+  [ "$argument" = --laptop ] || set -- "$@" "$argument"
+done
+```
+
+POSIX sh has no arrays, only the positional parameters. `for argument do`
+iterates over a copy of them taken when the loop starts, so the body can
+`shift` each original off the front and `set --` the keepers back onto the
+end. The same shim covers the window between merging this change and
+promoting 0.2.2, while the bootstrap's default still names 0.2.0.
+
+The explanation lives in both scripts, because the bootstrap must answer
+before it downloads anything. Two copies of a function drift, so a test
+compares them, the same way it compares the `download` helpers.
+
 ### Getting onto `PATH` without editing your files behind your back
 
 An installer that ends with "now add this directory to PATH" has handed you homework, and the next command in the tutorial fails until you do it. But an installer that quietly appends to your `.zshrc` has edited a file you care about without asking. We wanted neither.

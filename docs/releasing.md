@@ -522,7 +522,10 @@ The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
 installs the version in its `RELIABURGER_VERSION` default (`v0.2.0` today), so
-bump that default in the same change that announces a newer release.
+bump that default in the same change that announces a newer release. Both
+scripts need a mode, `--laptop` or `--install-only`; with none they explain the
+choices and exit 2. For a release from before 0.2.2 the bootstrap drops
+`--laptop`, which that release's installer doesn't know.
 
 Before tagging a release, complete the managed-cluster and clean-install
 gates. Record timing from an empty cache, the actual artefact digests, host and
@@ -596,7 +599,7 @@ the real `curl … | sh` install against it on every host we advertise.
    ```
 
    It creates a fresh, short `RELIABURGER_HOME` under `/tmp` and runs
-   `curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_RELEASE_BASE_URL=… sh -s -- --timings`,
+   `curl -fsSL https://reliaburger.com/install.sh | RELIABURGER_RELEASE_BASE_URL=… sh -s -- --laptop --timings`,
    exactly as a user would. Use `--bootstrap docs/website/install.sh` if the
    website doesn't serve the current bootstrap yet (the record notes which one
    ran). It checks `candidate.json` against the digest, `SHA256SUMS` against
@@ -949,7 +952,7 @@ the candidate installer from empty caches:
 curl --fail --location --proto '=https' --proto-redir '=https' \
   https://YOUR_HOST/candidate/install.sh -o /tmp/reliaburger-candidate-install.sh
 RELIABURGER_RELEASE_BASE_URL=https://YOUR_HOST/candidate \
-  sh /tmp/reliaburger-candidate-install.sh
+  sh /tmp/reliaburger-candidate-install.sh --laptop
 ```
 
 The static bootstrap accepts the same environment variable and fetches the

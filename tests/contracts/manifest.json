@@ -6758,6 +6758,33 @@
       ]
     },
     {
+      "id": "issue-741-cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+      "issue": 741,
+      "promise": "A job's pids limit becomes its command cgroup's pids.max, the kernel refuses forks past it, and the helper keeps its own limit of 16.",
+      "supported_paths": [
+        "Rootful Linux native executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "native-cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A pids limit of 0 or above 32768 is refused before the job reaches a node."
+      ],
+      "boundaries": [
+        "Real runtime regression for the native host executor; shared-runc writes the same task cgroup through the same code."
+      ]
+    },
+    {
       "id": "issue-639-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
       "issue": 639,
       "promise": "A dropped native caller hands its executor to eviction, which retires it and frees its capacity without a restart; a later restart reuses only the originally retired identity.",
@@ -8226,6 +8253,57 @@
             "src/config/validate.rs"
           ]
         }
+      ]
+    },
+    {
+      "id": "issue-704-chaos-for-jobs-and-task-arrays",
+      "issue": 704,
+      "promise": "Workload faults reach running job and task-array attempts on whichever node runs them; killed or paused attempts follow the job's own retry and timeout policy.",
+      "supported_paths": [
+        "Attempts in their own runtime instance take every fault",
+        "Commands in a reusable executor take kill and pause"
+      ],
+      "cases": [
+        {
+          "id": "issue-704-killing_attempts_mid_array_still_completes_every_task",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "killing_attempts_mid_array_still_completes_every_task",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-704-runc_array_attempt_can_be_paused_and_resumed",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_array_attempt_can_be_paused_and_resumed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-704-partition_from_an_array_attempt_blocks_its_cgroup",
+          "binary": "reliaburger::ebpf",
+          "test": "partition_from_an_array_attempt_blocks_its_cgroup",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Resource and network faults on a command in a reusable executor are refused with a reason naming the executor.",
+        "A caller cannot label an app as a job to bypass the replica-minimum rail."
+      ],
+      "boundaries": [
+        "Run the cluster and Linux gates; the portable agent tests stand a plain file in for a task cgroup."
       ]
     }
   ]
