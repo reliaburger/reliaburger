@@ -22,7 +22,9 @@ const PENDING: &[(&str, &str)] = &[];
 
 const DEMO_MANIFEST_PENDING: bool = false;
 
-const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh";
+/// The one-line install names its mode: without one the installer only
+/// explains the choices (#670).
+const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop";
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";
 const DEMO_SOURCE: &str = "examples/kubernetes/podinfo.yaml";
 
@@ -164,6 +166,49 @@ fn homepage_and_manual_show_the_same_tour() {
     assert!(
         repository().join("docs/website/install.sh").is_file(),
         "the install line fetches /install.sh from the site"
+    );
+}
+
+/// Every place that shows someone how to pipe the installer to a shell
+/// names a mode, `--laptop` or `--install-only`. A bare `| sh` now only
+/// prints the choices, so a page showing one would leave its reader with
+/// nothing installed (#670).
+#[test]
+fn every_shown_install_line_names_a_mode() {
+    let mut pages = vec![
+        "README.md".to_string(),
+        "docs/website/index.html".to_string(),
+        "docs/website/README.md".to_string(),
+        "scripts/demo/tour.sh".to_string(),
+        "scripts/release/install.sh.in".to_string(),
+        "scripts/release/candidate.py".to_string(),
+        "scripts/release/qualify-staged-install.sh".to_string(),
+    ];
+    for directory in ["docs", "docs/manual", "docs/book"] {
+        for entry in std::fs::read_dir(repository().join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                let relative = path.strip_prefix(repository()).unwrap();
+                pages.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for page in &pages {
+        for (number, line) in read(page).lines().enumerate() {
+            let Some(at) = line.find("reliaburger.com/install.sh |") else {
+                continue;
+            };
+            let rest = &line[at..];
+            if !rest.contains("sh -s -- --laptop") && !rest.contains("sh -s -- --install-only") {
+                failures.push(format!("{page}:{}: {}", number + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "these install lines name no mode; add `sh -s -- --laptop` or `--install-only`:\n{}",
+        failures.join("\n")
     );
 }
 

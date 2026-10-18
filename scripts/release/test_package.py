@@ -181,7 +181,7 @@ esac
             with self.subTest(shell=shell, script=script):
                 urls.unlink(missing_ok=True)
                 arguments.unlink(missing_ok=True)
-                result = subprocess.run([shell, str(script), "--nodes", "1"], env=env, capture_output=True)
+                result = subprocess.run([shell, str(script), "--laptop", "--nodes", "1"], env=env, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = [mirror + "/relish-macos-aarch64"]
                 if script == bootstrap:
@@ -219,6 +219,150 @@ exit 1
                     result = subprocess.run([shell, str(BOOTSTRAP)], env=dict(env, RELIABURGER_VERSION=invalid), capture_output=True)
                     self.assertNotEqual(result.returncode, 0, invalid)
                     self.assertIn(b"invalid RELIABURGER_VERSION", result.stderr)
+
+    # --- Choosing what to install (#670) ------------------------------------
+
+    def arguments_tools(self, name):
+        """`recording_tools` plus a relish that writes its arguments to
+        $ARGUMENTS, so a test can see what the installer asked it to do."""
+        tools = self.recording_tools(name)
+        (self.assets / "relish-macos-aarch64").write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS"\n')
+        self.package()
+        return tools
+
+    def test_installer_without_a_mode_explains_the_choices_and_changes_nothing(self):
+        tools = self.arguments_tools("choices-tools")
+        for shell, script in [(shell, script) for shell in POSIX_SHELLS for script in [self.assets / "install.sh", BOOTSTRAP]]:
+            with self.subTest(shell=shell, script=script.parent.name):
+                home = self.root / f"choices-home-{shell}-{script.parent.name}"
+                home.mkdir()
+                calls, env = self.download_env(tools, home)
+                result = subprocess.run([shell, str(script)], env=env, capture_output=True)
+                # Non-zero: an old `curl | sh && relish ...` script must not
+                # carry on as if it had a cluster.
+                self.assertEqual(result.returncode, 2, result.stderr)
+                choices = result.stdout.decode()
+                for promise in ("--laptop", "Lima", "docs/linux-servers.md", "relish init", "relish join",
+                                "--install-only", "Netboot", "not for production",
+                                "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop"):
+                    self.assertIn(promise, choices)
+                self.assertIn("Nothing was installed", choices)
+                self.assertFalse(calls.exists(), "the installer downloaded something without a mode")
+                self.assertFalse((home / ".reliaburger").exists(), "the installer made a store without a mode")
+
+    def test_bootstrap_and_installer_explain_the_choices_in_the_same_words(self):
+        def explanation(text):
+            start = text.index("explain_choices() {")
+            return text[start:text.index("\n}\n", start)]
+        self.assertEqual(explanation(BOOTSTRAP.read_text()),
+                         explanation(Path(__file__).with_name("install.sh.in").read_text()))
+
+    def test_installer_help_shows_the_choices_and_succeeds(self):
+        tools = self.arguments_tools("help-tools")
+        home = self.root / "help-home"
+        home.mkdir()
+        for shell in POSIX_SHELLS:
+            for flag in ("--help", "-h"):
+                with self.subTest(shell=shell, flag=flag):
+                    calls, env = self.download_env(tools, home)
+                    result = subprocess.run([shell, str(self.assets / "install.sh"), flag], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("--laptop", result.stdout.decode())
+                    self.assertFalse(calls.exists())
+                    self.assertFalse((home / ".reliaburger").exists())
+
+    def test_laptop_installs_relish_and_builds_the_laptop_cluster(self):
+        tools = self.arguments_tools("laptop-tools")
+        arguments = self.root / "laptop-arguments"
+        mirror = "https://example.com/r"
+        cases = {
+            ("--laptop",): [],
+            ("--laptop", "--nodes", "1"): ["--nodes", "1"],
+            ("--no-modify-path", "--laptop", "--nodes", "1"): ["--nodes", "1"],
+            ("--laptop", "--no-modify-path", "--nodes", "1"): ["--nodes", "1"],
+        }
+        for shell in POSIX_SHELLS:
+            for number, (given, forwarded) in enumerate(cases.items()):
+                with self.subTest(shell=shell, arguments=given):
+                    home = self.root / f"laptop-home-{shell}-{number}"
+                    home.mkdir()
+                    arguments.unlink(missing_ok=True)
+                    _, env = self.download_env(tools, home)
+                    env = dict(env, ARGUMENTS=str(arguments))
+                    result = subprocess.run([shell, str(self.assets / "install.sh"), *given], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(arguments.read_text().splitlines(),
+                                     ["setup", "--quickstart", "--release-mirror", mirror, *forwarded])
+
+    def test_installer_refuses_an_unknown_option_with_usage(self):
+        tools = self.arguments_tools("unknown-tools")
+        cases = [
+            ["--bogus"],
+            # Setup options go after --laptop, so alone they're unknown.
+            ["--nodes", "1"],
+            ["--install-only", "--nodes", "1"],
+            ["--laptop", "--install-only"],
+            ["--install-only", "--laptop"],
+        ]
+        for shell in POSIX_SHELLS:
+            for number, given in enumerate(cases):
+                with self.subTest(shell=shell, arguments=given):
+                    home = self.root / f"unknown-home-{shell}-{number}"
+                    home.mkdir()
+                    calls, env = self.download_env(tools, home)
+                    result = subprocess.run([shell, str(self.assets / "install.sh"), *given], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    stderr = result.stderr.decode()
+                    self.assertIn("usage:", stderr)
+                    self.assertIn("--laptop", stderr)
+                    self.assertFalse(calls.exists(), "a refused option reached a download")
+                    self.assertFalse((home / ".reliaburger").exists())
+
+    def test_bootstrap_drops_laptop_for_releases_from_before_it(self):
+        """0.2.1 and older build the laptop cluster without a flag and would
+        hand --laptop to `relish setup`, which refuses it. The Intel Mac
+        advice installs 0.2.1 this way."""
+        import os
+        tools = self.root / "old-release-tools"
+        tools.mkdir()
+        (tools / "curl").write_text("""#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) printf '%s\\n' 'printf "installer:%s\\n" "$@"' > "$2"; shift ;;
+    https://*) printf '%s\\n' "$1" >> "$URLS" ;;
+  esac
+  shift
+done
+""")
+        (tools / "curl").chmod(0o755)
+        urls = self.root / "old-release-urls"
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"], URLS=str(urls))
+        env.pop("RELIABURGER_RELEASE_BASE_URL", None)
+        cases = {
+            "v0.1.6": ["--nodes", "1"],
+            "v0.2.1": ["--nodes", "1"],
+            "v0.2.2": ["--laptop", "--nodes", "1"],
+            "v0.2.2-rc.1": ["--laptop", "--nodes", "1"],
+            "v0.3.0": ["--laptop", "--nodes", "1"],
+            "v1.0.0": ["--laptop", "--nodes", "1"],
+        }
+        for shell in POSIX_SHELLS:
+            for version, forwarded in cases.items():
+                with self.subTest(shell=shell, version=version):
+                    urls.unlink(missing_ok=True)
+                    result = subprocess.run([shell, "-s", "--", "--laptop", "--nodes", "1"], input=BOOTSTRAP.read_bytes(),
+                                            env=dict(env, RELIABURGER_VERSION=version), capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.decode().splitlines(), [f"installer:{a}" for a in forwarded])
+                    self.assertEqual(urls.read_text().splitlines(),
+                                     [f"https://github.com/reliaburger/reliaburger/releases/download/{version}/install.sh"])
+            with self.subTest(shell=shell, mirror=True):
+                # A mirror serves a candidate of this release, which knows the flag.
+                result = subprocess.run([shell, str(BOOTSTRAP), "--laptop"], capture_output=True,
+                                        env=dict(env, RELIABURGER_VERSION="v0.2.1",
+                                                 RELIABURGER_RELEASE_BASE_URL="https://example.com/r"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.decode().splitlines(), ["installer:--laptop"])
 
     def flaky_tools(self, name, chunk):
         """Fake `curl` that delivers `chunk` more bytes per call and fails
@@ -432,6 +576,8 @@ esac
         summary_quote = "sed -n '/^where the time went/,$p' \"$evidence/install.log\""
         self.assertIn(mirror_check, qualify)
         self.assertIn(summary_quote, qualify)
+        # Without a mode the installer only explains the choices (#670).
+        self.assertIn("sh -s -- --laptop --timings", qualify)
         relish_output = ("using an explicit release mirror with checksum and signature verification\n"
                          "... check host\n"
                          "where the time went\n"
@@ -449,7 +595,7 @@ esac
             with self.subTest(shell=shell):
                 _, env = self.download_env(tools, home)
                 with log.open("wb") as output:
-                    result = subprocess.run([shell, str(BOOTSTRAP), "--timings"], env=env,
+                    result = subprocess.run([shell, str(BOOTSTRAP), "--laptop", "--timings"], env=env,
                                             stdout=output, stderr=subprocess.STDOUT)
                 self.assertEqual(result.returncode, 0, log.read_text())
                 env = dict(env, evidence=str(evidence))
@@ -525,15 +671,17 @@ esac
                     calls = self.root / f"intel-calls-{shell}-{case}"
                     env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
                                CALLS=str(calls), FIXTURE=str(self.assets / "relish-macos-aarch64"))
-                    result = subprocess.run([shell, str(installer), "--install-only"], env=env, capture_output=True)
-                    self.assertNotEqual(result.returncode, 0)
-                    stderr = result.stderr.decode()
-                    self.assertIn("Intel Mac", stderr)
-                    self.assertIn("Apple silicon", stderr)
-                    self.assertIn("Linux", stderr)
-                    self.assertIn("RELIABURGER_VERSION=v0.2.1", stderr)
-                    self.assertFalse(calls.exists(), "an Intel Mac reached a download")
-                    self.assertFalse((home / ".reliaburger").exists(), "an Intel Mac got a store")
+                    for arguments in (["--install-only"], ["--laptop"], [], ["--bogus"]):
+                        result = subprocess.run([shell, str(installer), *arguments], env=env, capture_output=True)
+                        self.assertEqual(result.returncode, 1, arguments)
+                        stderr = result.stderr.decode()
+                        self.assertIn("Intel Mac", stderr)
+                        self.assertIn("Apple silicon", stderr)
+                        self.assertIn("Linux", stderr)
+                        self.assertIn("RELIABURGER_VERSION=v0.2.1 sh -s -- --laptop", stderr)
+                        self.assertEqual(result.stdout, b"", "an Intel Mac was shown the choices")
+                        self.assertFalse(calls.exists(), "an Intel Mac reached a download")
+                        self.assertFalse((home / ".reliaburger").exists(), "an Intel Mac got a store")
 
     def test_installer_gives_apple_silicon_under_rosetta_the_native_build(self):
         # A shell running under Rosetta sees `uname -m` say x86_64 on an
