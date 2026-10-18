@@ -777,6 +777,30 @@ is exactly what a disk stall *doesn't* cause. The step summary shows both measur
 anything it re-measured, so a benchmark that passed on its second try is still visible to
 anyone reading the trend.
 
+Measuring twice assumed the stall was brief. It isn't always. In the 0.2.1 merge queue the
+storage benchmark came out at 3.20 times the rest of its run, and at 2.93 on the re-measure a
+few minutes later: that runner's disk was slow for the whole job (#1038). We went back through
+every `criterion-task-arrays` artefact we still had, 179 runs over a week. Eight failed on this
+benchmark alone, and in none of them was any other benchmark above 1.11 times the rest. The
+giveaway was inside each failing benchmark: its ten Criterion samples ranged from about 15 ms to
+as much as 134 ms, where a healthy runner keeps them within a few per cent. Most of the
+benchmark's time goes on fsyncs, so what it really measures is the disk.
+
+We had three ways out. Normalising it against a disk-bound reference in the same job sounds
+like the median trick again, but the samples rule it out: the disk changes speed several times
+over within one benchmark's few seconds, so a reference measured just before or after sees a
+different disk. Dropping the benchmark from the gate would stop the failures and also stop it
+catching anything. So we split it. A twin, `storage/ledger_and_index_64k_tmpfs`, does exactly
+the same writes in a directory on `/dev/shm`. That's tmpfs, a filesystem held in memory, where
+an fsync returns at once, so what's left to measure is encoding, writing and indexing the
+records, which is what a change to the ledger code can actually make slower. The twin is
+gated like any other benchmark. The on-disk original is passed to `--report-only`: the summary
+shows its ratio, marked "report only", but it can't fail the run, isn't re-measured and isn't
+counted in the median the others are measured against. The one regression this no longer
+catches is a change that adds fsyncs, since those are free on tmpfs. It still shows up in the
+on-disk ratio for anyone reading the summary, but nothing fails on it. We accepted that: until
+the disk under the runner is steady, a gate on fsync time is a gate on the runner's disk.
+
 Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
 alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
 slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
