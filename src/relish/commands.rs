@@ -1749,10 +1749,13 @@ pub fn import_k8s(files: &[std::path::PathBuf], strict: bool) -> Result<(), Reli
         eprint!("{}", result.report);
     }
 
-    if strict && !result.report.warnings.is_empty() {
-        return Err(RelishError::FormatFailed(
-            "import produced warnings (--strict mode)".to_string(),
-        ));
+    // #703: a dropped resource is a bigger loss than an approximated one, so
+    // `--strict` (a CI gate) fails on either.
+    let (warnings, dropped) = (result.report.warnings.len(), result.report.dropped.len());
+    if strict && (warnings > 0 || dropped > 0) {
+        return Err(RelishError::FormatFailed(format!(
+            "import produced {warnings} warning(s) and {dropped} dropped resource(s) (--strict mode)"
+        )));
     }
 
     Ok(())

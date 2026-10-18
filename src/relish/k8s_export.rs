@@ -18,7 +18,7 @@ use k8s_openapi::api::autoscaling::v2::{
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, Namespace, PodSpec, PodTemplateSpec, ResourceQuota,
-    ResourceQuotaSpec, ResourceRequirements, Service, ServicePort, ServiceSpec,
+    ResourceQuotaSpec, ResourceRequirements, SecurityContext, Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -139,6 +139,23 @@ fn export_app(
     if !app.command.is_empty() {
         container.command = Some(app.command.clone());
     }
+    // #703: `args`, the working directory and the user were dropped too, so
+    // Redis came back without `--maxmemory 64mb --save ""` and an image
+    // running as a fixed user came back as root.
+    if !app.args.is_empty() {
+        container.args = Some(app.args.clone());
+    }
+    container.working_dir = app
+        .working_dir
+        .as_ref()
+        .map(|dir| dir.display().to_string());
+    if app.run_as_user.is_some() || app.run_as_group.is_some() {
+        container.security_context = Some(SecurityContext {
+            run_as_user: app.run_as_user.map(i64::from),
+            run_as_group: app.run_as_group.map(i64::from),
+            ..SecurityContext::default()
+        });
+    }
 
     if let Some(port) = app.port {
         container.ports = Some(vec![ContainerPort {
@@ -148,7 +165,7 @@ fn export_app(
     }
 
     // Env vars — shared with the job path, which used to drop them (M28).
-    container.env = env_vars(&app.env);
+    container.env = env_vars(&format!("app.{name}"), &app.env, report);
 
     // M28: resource requests were dropped entirely, so an app with a 512Mi
     // memory limit exported as an unlimited pod — the scheduler saw a
@@ -456,16 +473,27 @@ fn export_job(
         name: name.to_string(),
         image: job.image.clone(),
         command: job.command.clone(),
-        env: env_vars(&job.env),
+        env: env_vars(&format!("job.{name}"), &job.env, report),
         resources: resource_requirements(job.memory.as_ref(), job.cpu.as_ref(), None),
         ..Container::default()
     };
 
+    // Each retry is a fresh Pod, so the Pod's deadline is per attempt, exactly
+    // like task_timeout_secs (0 means no deadline, which is Kubernetes'
+    // default too).
     let pod_spec = PodSpec {
         containers: vec![container],
         restart_policy: Some("Never".to_string()),
+        active_deadline_seconds: job
+            .task_timeout_secs
+            .filter(|seconds| *seconds > 0)
+            .map(i64::from),
         ..PodSpec::default()
     };
+    // backoffLimit counts retries; max_attempts counts the first try too.
+    let backoff_limit = job
+        .max_attempts
+        .map(|attempts| i32::from(attempts.saturating_sub(1)));
 
     let template = PodTemplateSpec {
         spec: Some(pod_spec),
@@ -488,6 +516,7 @@ fn export_job(
                 job_template: JobTemplateSpec {
                     spec: Some(JobSpec {
                         template,
+                        backoff_limit,
                         ..JobSpec::default()
                     }),
                     ..JobTemplateSpec::default()
@@ -511,6 +540,7 @@ fn export_job(
             },
             spec: Some(JobSpec {
                 template,
+                backoff_limit,
                 ..JobSpec::default()
             }),
             ..Job::default()
@@ -620,8 +650,14 @@ fn to_yaml<T: serde::Serialize>(resource: &T) -> Result<String, RelishError> {
 ///
 /// Encrypted values export as the placeholder `ENCRYPTED_VALUE` — the sealed
 /// ciphertext is useless outside the cluster that holds the key, and leaking
-/// it would be worse than a placeholder that fails loudly.
-fn env_vars(env: &BTreeMap<String, crate::config::types::EnvValue>) -> Option<Vec<EnvVar>> {
+/// it would be worse than a placeholder. A placeholder doesn't fail loudly,
+/// though: the pod starts with the wrong password. So each one is listed in
+/// the report, under `[table]`, as needing a Secret (#703).
+fn env_vars(
+    table: &str,
+    env: &BTreeMap<String, crate::config::types::EnvValue>,
+    report: &mut ExportReport,
+) -> Option<Vec<EnvVar>> {
     if env.is_empty() {
         return None;
     }
@@ -630,7 +666,14 @@ fn env_vars(env: &BTreeMap<String, crate::config::types::EnvValue>) -> Option<Ve
             .map(|(k, v)| {
                 let value = match v {
                     crate::config::types::EnvValue::Plain(s) => s.clone(),
-                    crate::config::types::EnvValue::Encrypted(_) => "ENCRYPTED_VALUE".to_string(),
+                    crate::config::types::EnvValue::Encrypted(_) => {
+                        report.dropped.push(format!(
+                            "[{table}] env {k} — encrypted, exported as the placeholder \
+                             ENCRYPTED_VALUE; create a Secret and reference it with \
+                             valueFrom.secretKeyRef"
+                        ));
+                        "ENCRYPTED_VALUE".to_string()
+                    }
                 };
                 EnvVar {
                     name: k.clone(),
