@@ -3186,6 +3186,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn snapshot_checksum_matches_the_fips_known_answer() {
+        // Stored beside every durable snapshot and checked on load.
+        assert_eq!(
+            hex::encode(snapshot_checksum(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     impl CouncilStateMachine {
         // Existing fixtures describe current plans, not a stale admission race.
         // Fill their CAS boundary from the preceding entry; explicit CAS tests

@@ -393,6 +393,16 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::time::Instant;
 
+    #[test]
+    fn verify_accepts_content_whose_digest_is_the_known_answer() {
+        let expected = concat!(
+            "sha256:",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(verify(b"abc", expected, Some(3)).is_ok());
+        assert!(verify(b"abd", expected, Some(3)).is_err());
+    }
+
     const BUDGET: RegistryReadBudget = RegistryReadBudget {
         attempt: Duration::from_secs(10),
         total: Duration::from_secs(60),

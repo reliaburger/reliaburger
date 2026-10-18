@@ -1357,6 +1357,28 @@ mod tests {
     }
 
     #[test]
+    fn rootfs_generation_path_matches_its_known_answer() {
+        let store = ImageStore::new(PathBuf::from("/tmp/images"));
+        let generation = store.rootfs_generation_path(
+            Path::new("/rootfs/tag"),
+            &[
+                PathBuf::from("/blobs/aaaa/data"),
+                PathBuf::from("/blobs/bbbb/data"),
+            ],
+        );
+        // The first 16 hex digits of SHA-256("aaaa\nbbbb\n").
+        assert_eq!(generation, Path::new("/rootfs/tag/gen-1200d291bac880a1"));
+    }
+
+    #[test]
+    fn layer_sha256_hex_matches_the_fips_known_answer() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn digest_pinned_rootfs_paths_are_safe_for_overlayfs() {
         let store = ImageStore::new(PathBuf::from("/var/lib/reliaburger/images"));
         let reference =

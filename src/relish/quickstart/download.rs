@@ -506,6 +506,28 @@ mod tests {
         (format!("http://{address}/asset"), calls, task)
     }
 
+    // Release checksums are published hex strings, so the computed digest
+    // must keep their exact lowercase form, not just agree with itself.
+    #[tokio::test]
+    async fn fetch_accepts_a_file_whose_digest_is_the_known_answer() {
+        let (url, _calls, task) = server(b"abc").await;
+        let downloader = Downloader::new(Duration::from_secs(2)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("download");
+        downloader
+            .fetch(
+                &url,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                &path,
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"abc");
+        task.abort();
+    }
+
     #[tokio::test]
     async fn release_mirror_fetches_exact_candidate_bytes_and_retains_checksums() {
         let (mirror, calls, task) = server(b"candidate bytes").await;

@@ -1210,6 +1210,14 @@ mod tests {
         assert_ne!(digest_of(b"hello"), digest_of(b"world"));
     }
 
+    #[test]
+    fn digest_of_matches_the_fips_known_answer() {
+        assert_eq!(
+            digest_of(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     // --- execute_build ---
 
     #[test]

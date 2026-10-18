@@ -56,6 +56,15 @@ mod tests {
     use crate::config::Config;
 
     #[test]
+    fn spec_fingerprint_is_the_sha256_of_the_json_encoding() {
+        // SHA-256 of the JSON string `"abc"`, quotes included.
+        assert_eq!(
+            spec_fingerprint(&"abc").as_deref(),
+            Some("6cc43f858fbb763301637b5af970e2a46b46f461f27e5a0f41e009c59b827b25")
+        );
+    }
+
+    #[test]
     fn placement_ordinals_and_implicit_default_do_not_change_desired_spec() {
         let spec = Config::parse("[app.web]\nimage = 'web:v1'\n")
             .unwrap()
