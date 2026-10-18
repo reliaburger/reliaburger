@@ -1133,7 +1133,7 @@ GitOpsWrite {
 },
 ```
 
-That's an enum variant holding a boxed value of its own enum. In C you'd reach for a pointer to a struct of the same type; in Rust the `Box` is what makes it legal at all. An enum is laid out inline, as big as its largest variant, so a variant that contained a `RaftRequest` directly would need infinite size. `Box` puts the inner request on the heap and leaves a pointer-sized field behind. Serde and bincode follow the box without noticing it's there.
+That's an enum variant holding a boxed value of its own enum. In C you'd reach for a pointer to a struct of the same type; in Rust the `Box` is what makes it legal at all. An enum is laid out inline, as big as its largest variant, so a variant that contained a `RaftRequest` directly would need infinite size. `Box` puts the inner request on the heap and leaves a pointer-sized field behind. Serde follows the box without noticing it's there.
 
 The state machine unwraps it, checks the inner change is one of the six declarative writes (an app, namespace or permission, spec or delete), applies it through the ordinary handler, and then updates `gitops_owned`:
 

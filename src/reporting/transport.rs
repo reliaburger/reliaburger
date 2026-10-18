@@ -230,7 +230,7 @@ impl ReportingTransport for TcpReportingSender {
 
 /// Real TCP transport for reporting tree messages.
 ///
-/// Uses length-prefixed framing: 4-byte big-endian length + bincode payload.
+/// Uses length-prefixed framing: 4-byte big-endian length + postcard payload.
 /// Server mode accepts incoming connections (council members).
 /// Client mode connects to the target for each send (workers).
 /// Supports a runtime blocklist for chaos testing.
@@ -413,7 +413,7 @@ impl TcpReportingTransport {
         }
     }
 
-    /// Send a length-prefixed bincode message over a new connection.
+    /// Send a length-prefixed postcard message over a new connection.
     async fn send_framed(
         target: SocketAddr,
         message: &ReportingMessage,
@@ -581,40 +581,47 @@ fn check_event_admission(message: &ReportingMessage) -> Result<(), String> {
 fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, ReportingError> {
     check_event_admission(message).map_err(|reason| ReportingError::SendFailed { reason })?;
     // The size pass traverses borrowed data without allocating an encoded copy.
-    let body_size = bincode::serialized_size(message)
+    let body_size = postcard::experimental::serialized_size(message)
         .map_err(|error| ReportingError::Serialisation(error.to_string()))?;
-    let size = body_size.saturating_add(report_header().len() as u64);
-    if size > MAX_REPORT_SIZE as u64 {
+    let size = body_size.saturating_add(report_header().len());
+    if size > MAX_REPORT_SIZE {
         return Err(ReportingError::ReportTooLarge {
-            size: usize::try_from(size).unwrap_or(usize::MAX),
+            size,
             max: MAX_REPORT_SIZE,
         });
     }
-    let mut bytes = Vec::with_capacity(size as usize);
+    let mut bytes = Vec::with_capacity(size);
     bytes.extend(report_header());
-    bincode::serialize_into(&mut bytes, message)
-        .map_err(|error| ReportingError::Serialisation(error.to_string()))?;
-    Ok(bytes)
+    postcard::to_extend(message, bytes)
+        .map_err(|error| ReportingError::Serialisation(error.to_string()))
 }
 
 fn decode_report(payload: &[u8]) -> Result<ReportingMessage, ReportingError> {
-    decode_report_bincode(payload).map_err(|error| ReportingError::Deserialisation(error.to_string()))
-}
-
-fn decode_report_bincode(payload: &[u8]) -> Result<ReportingMessage, bincode::Error> {
-    use bincode::Options;
-    let body = payload.strip_prefix(&report_header()).ok_or_else(|| {
-        Box::new(bincode::ErrorKind::Custom(
-            "incompatible reporting formats".into(),
-        ))
-    })?;
-    let message = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(body.len() as u64)
-        .reject_trailing_bytes()
-        .deserialize(body)?;
-    check_event_admission(&message)
-        .map_err(|reason| Box::new(bincode::ErrorKind::Custom(reason)))?;
+    // The receiver never reads a longer frame, but the decoder doesn't lean
+    // on that: no sender may produce one, so it isn't decoded.
+    if payload.len() > MAX_REPORT_SIZE {
+        return Err(ReportingError::ReportTooLarge {
+            size: payload.len(),
+            max: MAX_REPORT_SIZE,
+        });
+    }
+    let body = payload
+        .strip_prefix(&report_header())
+        .ok_or_else(|| ReportingError::Deserialisation("incompatible reporting formats".into()))?;
+    // postcard reads only the slice it's given and checks each length prefix
+    // against the bytes left, so a hostile prefix is a decode error rather
+    // than an allocation. `take_from_bytes` returns what the message didn't
+    // use, and a frame holds exactly one message, so anything left over is
+    // refused.
+    let (message, rest) = postcard::take_from_bytes::<ReportingMessage>(body)
+        .map_err(|error| ReportingError::Deserialisation(error.to_string()))?;
+    if !rest.is_empty() {
+        return Err(ReportingError::Deserialisation(format!(
+            "{} trailing bytes after the report",
+            rest.len()
+        )));
+    }
+    check_event_admission(&message).map_err(ReportingError::Deserialisation)?;
     Ok(message)
 }
 

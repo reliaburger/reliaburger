@@ -147,6 +147,8 @@ pub struct Compatibility {
 /// `JobSpec::pids`, the per-command process limit, in Raft desired state,
 /// task-array templates and node syncs, and the OCI `linux.resources.pids`
 /// block in fresh job containers' specs and their owner records (#741).
+/// Gossip datagrams, reporting frames and the Raft log's vote, log ids and
+/// encrypted-entry envelope are postcard, not bincode (#1026).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 53,
     state: 70,

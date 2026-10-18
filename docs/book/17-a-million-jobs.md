@@ -151,7 +151,7 @@ let run = match arrays.entry(assignment.batch_id) {
 
 On the node, a restart replays the ledger and each held chunk runs only the tasks with no terminal record (`TaskPool::resume_chunk`). The binary has to be on the node's `[process_workloads]` allowlist, like any host process, and a node that can't run an array answers with zero slots and the reason, which `relish batch-status` prints. The integration test pushes 20,000 fake tasks through a real single-node council and allows three Raft entries per thousand tasks; a run usually costs about ten. It used to push 100,000, and the whole array cost 51 entries, but that was 4.4 seconds of CPU in a debug build, and on a laptop shared with other test runs it crept up to the 60-second test timeout. Entries follow chunks and leader ticks, not tasks, so a fifth of the work shows the same ratio (#896).
 
-What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's bincode, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
+What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap for the done set: a million-bit bitmap is 122 KiB whatever it holds, while ranges are eight bytes in the common case. No progress over the reporting tree: it's a positional binary format, so a new field there would drag a binary format along, and a pull over HTTP puts the leader in charge of the cadence. Image tasks now use rootful Linux OCI isolation and resource limits. Host tasks still refuse mount isolation and explicit resource limits, and require the owned process runtime and an allowlist. And no speculative duplicates of slow chunks. At-least-once would allow them, but we'd rather measure a tail before we optimise one.
 
 ### Packing profiles and querying outcomes
 
@@ -1446,7 +1446,7 @@ holding a `String` can't have it.
 The summary rides the gossip directory extension, beside the node's labels
 and endpoints, on every probe. Since #696 a probe fills a fixed byte budget,
 and whatever the extension costs is room a membership update can't use. So
-the summary is small on purpose: bincode writes a `bool` as one byte, which
+the summary is small on purpose: postcard writes a `bool` as one byte, which
 makes the whole thing ten bytes with its `Option` tag. A test stamps the
 biggest extension a node can send (63-byte names, IPv6 endpoints, sixteen
 labels using the whole label budget, a leader hint, a recovery claim and

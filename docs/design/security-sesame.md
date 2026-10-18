@@ -1118,7 +1118,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 > plaintext entry (leading `{`) still decodes, so plaintext and encrypted logs
 > interoperate and a keyless/dev cluster stays plaintext. An encrypted entry
 > opened without the key errors rather than reading as empty (CP3-safe). Vote and
-> log-id metadata remain plaintext bincode (not app data). The HKDF *wrapping* of
+> log-id metadata remain plaintext postcard (not app data). The HKDF *wrapping* of
 > sensitive keys inside the log (step 5) ships as before. TPM sealing (step 2) is
 > still not implemented.
 

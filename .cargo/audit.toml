@@ -20,11 +20,13 @@
 #     and make audit's empty-graph guard went with it. Removed.
 #   - RUSTSEC-2024-0436 (paste): DataFusion 45 -> 55 drops paste from the
 #     graph, along with the Thrift crate behind GHSA-2f9f-gq7v-9h6m. Removed.
+#   - RUSTSEC-2025-0141 (bincode): no release fixes it, and bincode 3.0.0 is
+#     a compile_error! tombstone, so gossip, reporting frames and the Raft
+#     metadata moved to postcard (#1026). Removed.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
   "RUSTSEC-2024-0370", # proc-macro-error: unmaintained, no patched release; build-time only, reached through age
-  "RUSTSEC-2025-0141", # bincode 1: unmaintained, no patched release; durable-format migration required to move off
 ]
 
 [output]

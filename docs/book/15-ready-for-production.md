@@ -921,6 +921,13 @@ list, without ever failing the build. A lag report that broke builds would get m
 within a week. One that nobody reads would rot just as fast, which is why the refresh is a
 numbered step in the release runbook, not a good intention.
 
+Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
+3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
+maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
+"replace it": gossip, reporting frames and the Raft metadata moved to postcard, which
+changed the wire and durable formats along with the crate (Chapter 2 has the details). A
+lag report can tell you you're behind. It can't tell you the road ahead still exists.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do

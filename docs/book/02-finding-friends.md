@@ -504,7 +504,7 @@ let updates = self.dissemination.select_updates_within(room, MAX_PIGGYBACK_UPDAT
 *message.payload.updates_mut() = updates;
 ```
 
-(The real `probe_message` also puts our claim about the peer first, as we'll see in "Coming back after maintenance".) `piggyback_room` measures the message with `bincode::serialized_size` rather than adding up constants, so when a later release adds a field to the header or the extension, the budget shrinks by itself. An update that doesn't fit stays queued with its broadcast count untouched; selection stops there rather than skipping ahead, so priority order holds across messages. In the very worst case a PING still carries one update and a PING-REQ may carry none. That's fine: anti-entropy sends no extension and makes up the difference. And a send that does fail is now counted and logged, at most once every ten seconds with a count of what it held back, so a node that can't get its datagrams out says so.
+(The real `probe_message` also puts our claim about the peer first, as we'll see in "Coming back after maintenance".) `piggyback_room` measures the message with `postcard::experimental::serialized_size` rather than adding up constants, so when a later release adds a field to the header or the extension, the budget shrinks by itself. An update that doesn't fit stays queued with its broadcast count untouched; selection stops there rather than skipping ahead, so priority order holds across messages. In the very worst case a PING still carries one update and a PING-REQ may carry none. That's fine: anti-entropy sends no extension and makes up the difference. And a send that does fail is now counted and logged, at most once every ten seconds with a count of what it held back, so a node that can't get its datagrams out says so.
 
 **Replays.** Gossip has been HMAC-signed since Phase 4, but authentication stops forgery, not replay. "Coming back after maintenance" below deals with one replay, a stale `Left`. The audit found two more: `add_node` moved a known member to the UDP source address of *any* validly signed datagram from it, and directory fields were last-write-wins. So an attacker on the LAN could capture one of n2's PINGs and replay it from its own IP: everyone records n2 at the attacker's address, probes go there, and n2 is declared dead. Replay an old extension instead and n2's recovery epoch rolls back.
 
@@ -1661,7 +1661,7 @@ pub trait ReportingTransport: Send + Sync {
 }
 ```
 
-`InMemoryReportingNetwork` has the same structure as its gossip counterpart: `Arc<Mutex<NetworkInner>>` with per-address inboxes and partition injection for chaos testing. This is a bit of repetition, but keeping the transport implementations separate means we can evolve them independently. Gossip uses UDP; the reporting tree uses TCP with bincode encoding.
+`InMemoryReportingNetwork` has the same structure as its gossip counterpart: `Arc<Mutex<NetworkInner>>` with per-address inboxes and partition injection for chaos testing. This is a bit of repetition, but keeping the transport implementations separate means we can evolve them independently. Gossip uses UDP; the reporting tree uses TCP with postcard encoding.
 
 ### The worker side
 
@@ -1771,7 +1771,7 @@ On the receiving side, every node folds extensions into a `NodeDirectory` — a 
 
 ### Keeping the extension out of the message body
 
-Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Old and new binaries never share a wire format: the first byte is the protocol generation, and a mismatch is refused before anything else is read. Raft and reporting check their generations the same way, before decoding, because a development snapshot can deserialise cleanly and still mean something different. Until 0.1.0 a format change simply means starting a fresh cluster; Chapter 14 covers the compatibility policy that replaces that. The directory is still worth keeping apart from the membership payload, though. It's optional per datagram, and a bad one should cost us directory data, never membership.
+Gossip messages are postcard, and postcard is positional: no field names, no tags, just bytes in struct order. Old and new binaries never share a wire format: the first byte is the protocol generation, and a mismatch is refused before anything else is read. Raft and reporting check their generations the same way, before decoding, because a development snapshot can deserialise cleanly and still mean something different. Until 0.1.0 a format change simply means starting a fresh cluster; Chapter 14 covers the compatibility policy that replaces that. The directory is still worth keeping apart from the membership payload, though. It's optional per datagram, and a bad one should cost us directory data, never membership.
 
 So we don't put the extension in the message at all:
 
@@ -1783,9 +1783,35 @@ pub struct GossipMessage {
 }
 ```
 
-`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). The UDP transport appends the encoded extension after the message bytes in the same datagram. The receiver reads the message, notices the cursor hasn't consumed the whole datagram, and decodes the extension from the remainder. Trailing bytes that don't decode as an extension are dropped; the message still counts. The 10,000-member scale acceptance feeds these datagrams through the same production handler.
+`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). The UDP transport appends the encoded extension after the message bytes in the same datagram. The receiver reads the message, notices it hasn't consumed the whole datagram, and decodes the extension from the remainder. Trailing bytes that don't decode as an extension are dropped; the message still counts. The 10,000-member scale acceptance feeds these datagrams through the same production handler.
 
 Authentication needed one extra step. The message HMAC (Phase 4) covers only the message, so a datagram whose extension is dropped still verifies. The extension carries its own HMAC, computed over the message's canonical bytes plus the extension, under the same cluster key. A keyed receiver that gets an extension with a bad or missing tag drops the extension and keeps the message: worst case you lose directory data, never membership.
+
+### Moving off bincode
+
+Until 0.2.2 every one of those bytes was bincode, and so were the reporting frames and the Raft log's vote. Then bincode stopped. In December 2025 its maintainers ended development after a doxxing and harassment incident, and RustSec filed [RUSTSEC-2025-0141](https://rustsec.org/advisories/RUSTSEC-2025-0141.html): unmaintained, no patched version. They called 1.3.3 complete, and it probably is. But our audit gate denies every advisory it isn't told to ignore, so bincode lived on an exception with an expiry date.
+
+The usual fix for an old dependency is to bump its major version. We went to do exactly that and found that bincode 3.0.0 is a README and a `lib.rs` with one line in it:
+
+```rust
+compile_error!("https://xkcd.com/2347/");
+```
+
+`compile_error!` is a built-in macro that stops compilation with the message you give it, the Rust cousin of C's `#error`. Here it turns a crate into a tombstone: anything that depends on it can't build. The advisory covers bincode 2.x too, so no version would clear it. The only way out was a different crate.
+
+There were four candidates. `wincode` writes bincode-compatible bytes, but it doesn't use serde. It has its own derive traits, so every wire type would need a second derive, and hand-written serde impls like `RecoveryId`'s (coming up later in this chapter) would need porting. `rkyv` is zero-copy, a different model altogether. `bitcode` packs harder than we need. `postcard` is maintained, has a 1.0 wire format with a written specification, and drives serde like bincode did. That last point decided it. Our types keep their `#[derive(Serialize, Deserialize)]`, and the change stays in the three places that call the codec: gossip, the reporting transport and the durable log.
+
+What changes is the bytes. postcard writes integers as *varints*: seven bits per byte, with the top bit meaning "more follows". An incarnation of 3 takes one byte instead of bincode's fixed eight. A `u8` stays one raw byte, so the protocol generation is still the first byte of every datagram, and an older node's bincode datagram is refused on that byte alone. We didn't try to keep bincode's layout. Before 1.0 there's no mixed-version cluster to protect (Chapter 14), and 0.2.2 bumps the protocol and state generations anyway. So old peers and old data directories are refused before a single byte is decoded, and the new layout costs us nothing.
+
+Varints do make sizes depend on values, which matters for a byte budget. `piggyback_room` already asked the codec for the encoded size rather than adding up constants, so it carried over with one call changed. Signing still doesn't change the size either: postcard writes the 32-byte HMAC array as exactly 32 bytes, with no length in front. One test needed real thought. The reporting transport's "exactly 1 MiB is admitted" test built a report whose timestamp was "now", and now's nanoseconds take one to five bytes depending on the instant. A fixed timestamp keeps that test honest.
+
+The harder part was keeping bincode's safety properties, because postcard doesn't have bincode's `with_limit`. The datagram decoder is the one place unauthenticated bytes reach a deserialiser (the HMAC is inside the message, so we have to decode to find it), and a length prefix can claim a gigabyte from a datagram of forty bytes. Three things bound it now. First, a datagram longer than the 1400-byte budget is refused before decoding, because no peer sends one. Second, postcard reads only the slice it's handed. A string's claimed length is checked against the bytes left before anything is borrowed, and a sequence that claims more elements than there are bytes left reserves nothing up front. So an absurd claim is a decode error, not an allocation, and `a_hostile_length_prefix_is_a_decode_error` pins it. Third, trailing bytes are a decision, not an accident:
+
+```rust
+pub fn take_from_bytes<'a, T: Deserialize<'a>>(s: &'a [u8]) -> Result<(T, &'a [u8])>
+```
+
+That's postcard's signature, and the lifetime `'a` says the returned slice, everything the value didn't use, borrows from the input. It's a view into the same buffer, not a copy. Gossip uses the remainder as the directory extension. The reporting frame and the Raft metadata refuse it, because each holds exactly one value. For the Raft vote that refusal matters. A vote bincode wrote is seventeen bytes: two fixed-width `u64`s and a flag. Read as postcard, it decodes cleanly as term 3, node 0, uncommitted, with thirteen bytes left over. Without the check, a node would quietly believe it had voted for node 0. The state stamp refuses a 0.2.1 directory before the log is ever opened, so this is the second line of defence, not the first. It's still the line that turns "misread" into "unreadable", and unreadable is the failure Raft can survive.
 
 ### Proving it: eight-plus nodes through failover
 
@@ -2157,9 +2183,9 @@ We've built gossip, Raft, the reporting tree, state reconstruction, and the sche
 
 Each subsystem gets a production transport alongside its in-memory test double:
 
-**UDP for gossip.** `UdpMustardTransport` binds a single UDP socket. Gossip messages are small (under 1400 bytes to avoid IP fragmentation), so UDP is a natural fit. Each `send()` serialises the message with bincode and calls `sendto()`. Each `recv()` reads from the socket and deserialises. Malformed datagrams are silently skipped — the gossip protocol is resilient to lost messages anyway.
+**UDP for gossip.** `UdpMustardTransport` binds a single UDP socket. Gossip messages are small (under 1400 bytes to avoid IP fragmentation), so UDP is a natural fit. Each `send()` serialises the message with postcard and calls `sendto()`. Each `recv()` reads from the socket and deserialises. Malformed datagrams are silently skipped — the gossip protocol is resilient to lost messages anyway.
 
-**TCP for reporting.** `TcpReportingTransport` uses length-prefixed framing: 4 bytes for the payload length, then the bincode payload. The server side (council members) spawns an accept loop that pushes inbound messages into a channel. The client side (workers) opens a new connection for each report. At a 5-second reporting interval, one connection per report is fine.
+**TCP for reporting.** `TcpReportingTransport` uses length-prefixed framing: 4 bytes for the payload length, then the postcard payload. The server side (council members) spawns an accept loop that pushes inbound messages into a channel. The client side (workers) opens a new connection for each report. At a 5-second reporting interval, one connection per report is fine.
 
 **TCP for Raft.** `TcpRaftNetwork` implements openraft's `RaftNetwork` trait over length-prefixed TCP, just like reporting. The Raft RPC server accepts connections, reads the request envelope (`AppendEntries`, `Vote`, or `InstallSnapshot`), dispatches to the local Raft instance, and writes the response. We first opened a connection per RPC and reasoned that it was fine, because Raft's RPC volume is low (heartbeats every 150ms, but they're tiny). That reasoning didn't survive mTLS; the next section tells that story.
 
@@ -2815,7 +2841,7 @@ impl Serialize for RecoveryId {
 }
 ```
 
-This is the first time we've written `Serialize` by hand instead of deriving it. A derived impl would write the `u128` as a JSON number, and a 128-bit integer doesn't survive a JavaScript `JSON.parse` (it rounds to a 53-bit float), which is how the dashboard and anything else reading `relish council status --output json` would see it. So it's written as 32 hex digits, and the matching `Deserialize` impl checks the length before parsing. `Serializer` is serde's trait for an output format; our impl doesn't know or care whether that's JSON, bincode for gossip, or redb's snapshot envelope.
+This is the first time we've written `Serialize` by hand instead of deriving it. A derived impl would write the `u128` as a JSON number, and a 128-bit integer doesn't survive a JavaScript `JSON.parse` (it rounds to a 53-bit float), which is how the dashboard and anything else reading `relish council status --output json` would see it. So it's written as 32 hex digits, and the matching `Deserialize` impl checks the length before parsing. `Serializer` is serde's trait for an output format; our impl doesn't know or care whether that's JSON, postcard for gossip, or redb's snapshot envelope.
 
 The id travels next to the epoch everywhere the epoch goes: in the snapshot, in the fence record, on every Raft RPC, in a `Fenced` refusal and in each node's gossip directory extension. A node that meets its own epoch with a *different* id moves to a fifth fence state, `Split { other_id }`, and tells the other side its own id so it fences too. Both halves stop. That sounds harsh, and it's meant to: neither side can know which recovery the operator meant to keep, and guessing wrong loses writes. `relish council status` shows `1 split`, `relish wtf` raises a critical finding, and the way out is the `--force` path above: recover the side you're keeping (its record says it's fenced, so it lands above the split epoch) and re-enrol the other. `RecoveryClaim::conflicts_with` treats an unknown id as no conflict, which is what keeps epoch 0 (no recovery, no id) and a node that only knows a newer epoch by number from tripping it.
 
