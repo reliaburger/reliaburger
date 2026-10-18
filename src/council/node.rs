@@ -803,6 +803,8 @@ mod tests {
             boot_id: "test-boot".into(),
             cleanup_after_unix_ms: 1,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::NodeKill {
                     kill_containers: false,
                 },

@@ -691,6 +691,8 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
             reservation: None,
             replica_evidence: None,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::Drop { probability: 100 },
                 target_service: name.clone(),
                 namespace: Some("default".into()),
@@ -909,6 +911,8 @@ async fn partition_answers_only_once_every_source_instance_is_covered() {
             reservation: None,
             replica_evidence: None,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::Partition {
                     source_app: Some(source.clone()),
                 },

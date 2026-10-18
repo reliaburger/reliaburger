@@ -507,6 +507,9 @@ pub struct BunAgent<G: Grill> {
     trust_domain: String,
     /// Smoker fault registry — active faults on this node.
     fault_registry: crate::smoker::registry::FaultRegistry,
+    /// Job and task-array attempts running on this node, shared with the
+    /// task runtime that lists them, so faults can target them.
+    live_attempts: Arc<crate::bun::live_attempts::LiveAttempts>,
     /// Kernel state this node has installed for its active network faults.
     network_faults: InstalledNetworkFaults,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
@@ -843,6 +846,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            live_attempts: crate::bun::live_attempts::LiveAttempts::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
@@ -992,6 +996,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            live_attempts: crate::bun::live_attempts::LiveAttempts::new(),
             network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
@@ -1328,7 +1333,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> std::io::Result<super::task_runtime::OwnedRunner<G>> {
         let mut runner =
             super::task_runtime::OwnedRunner::for_data_dir(self.supervisor.grill().clone(), data)?
-                .with_log_sink(self.log_tx.clone(), self.capture_offsets.clone());
+                .with_log_sink(self.log_tx.clone(), self.capture_offsets.clone())
+                .with_live_attempts(self.live_attempts.clone());
         if let Some(cluster) = &self.cluster
             && let (Some(council), Some(ikm)) = (&cluster.council, cluster.wrapping_ikm)
         {
@@ -1336,6 +1342,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(runner)
     }
+    /// The job and task-array attempts running on this node, as the task
+    /// runtime lists them.
+    pub fn live_attempts(&self) -> Arc<crate::bun::live_attempts::LiveAttempts> {
+        self.live_attempts.clone()
+    }
+
     /// The network state delegated job runtimes share with this agent.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn delegated_network(

@@ -388,6 +388,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         crate::smoker::types::SafetyContext {
+            workload: Default::default(),
             council_size,
             council_nodes_with_active_faults: active_node_faults,
             leader_node_id,

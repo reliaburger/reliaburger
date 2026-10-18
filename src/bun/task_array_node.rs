@@ -838,6 +838,15 @@ impl TaskArrayNode {
             .map_or(default, |cap| cap.min(default).max(1))
     }
 
+    /// What this node reports about the attempts it runs, for routing a
+    /// fault to them. Empty for runners that don't list attempts.
+    pub fn attempt_statuses(&self) -> Vec<super::live_attempts::AttemptStatus> {
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => runner.live_attempts().statuses(),
+            NodeRunner::Process(_) | NodeRunner::Fake(_) => Vec::new(),
+        }
+    }
+
     /// The kinds of job this node runs, as it advertises them over gossip
     /// (#788). [`capability_refusal`] turns them back into the verdict
     /// `admit` reaches, so the leader can judge a run without asking.

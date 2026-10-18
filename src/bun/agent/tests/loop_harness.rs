@@ -787,6 +787,8 @@ async fn status_answers_while_a_fault_reads_its_targets() {
         reservation: None,
         replica_evidence: None,
         request: crate::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: crate::smoker::types::FaultType::Resume,
             target_service: "web".into(),
             namespace: Some("default".into()),

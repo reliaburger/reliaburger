@@ -372,6 +372,7 @@ pub(super) async fn check_node_fault_cluster_safety(
             .into_response());
     };
     let context = crate::smoker::types::SafetyContext {
+        workload: Default::default(),
         council_size: council_voters.len() as u32,
         council_nodes_with_active_faults: unavailable_council_nodes,
         leader_node_id,
@@ -768,11 +769,14 @@ pub(super) async fn route_workload_fault(
             running: status.instance.state == "running",
             node: status.node,
             instance_id: status.instance.id,
+            task_index: None,
+            kind: crate::smoker::types::WorkloadKind::App,
         })
         .collect();
     let evidence = replica_evidence(&request, &instances, &faults.0);
 
     let context = crate::smoker::types::SafetyContext {
+        workload: Default::default(),
         // Workload faults only meet the replica rail; zeroed cluster fields
         // make the node rails stand aside, as they do in standalone mode.
         council_size: 0,
@@ -847,6 +851,8 @@ pub(super) async fn route_network_fault(
                     running: status.instance.state == "running",
                     node: status.node,
                     instance_id: status.instance.id,
+                    task_index: None,
+                    kind: crate::smoker::types::WorkloadKind::App,
                 })
                 .collect(),
             Err(error) => return unavailable_response(error),

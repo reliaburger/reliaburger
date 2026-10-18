@@ -722,6 +722,59 @@ async fn batch_of_proc_jobs_completes_locally() {
     assert_eq!(summary["failed"].as_u64(), Some(0), "{summary}");
 }
 
+/// #704: `relish fault kill <job>` reaches a running job attempt, which the
+/// replica rail used to refuse outright. The killed attempt fails and the
+/// job retries it under its own policy, so the run still succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fault_kill_on_a_process_job_retries_it() {
+    let harness = Harness::start().await;
+    // The first attempt sleeps far past the test's deadline; a retry exits 0.
+    let jobs = jobs_from(
+        r#"
+        [job.flaky]
+        runtime = "process"
+        exec = "/bin/sh"
+        command = ["-c", "if [ \"$RELIABURGER_TASK_ATTEMPT\" = 1 ]; then exec /bin/sleep 60; fi"]
+    "#,
+    );
+    let response = harness.client.submit_batch(&jobs, None).await.unwrap();
+    let batch_id = response["batch_id"].as_u64().unwrap();
+
+    let kill = reliaburger::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
+        fault_type: reliaburger::smoker::types::FaultType::Kill { count: 1 },
+        target_service: "flaky".into(),
+        namespace: None,
+        target_instance: None,
+        target_node: None,
+        duration: Duration::from_secs(0),
+        injected_by: String::new(),
+        reason: None,
+        include_leader: false,
+        override_safety: false,
+        acknowledged: true,
+    };
+    // Until the attempt starts there is nothing to kill.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let summary = loop {
+        match harness.client.inject_fault(&kill).await {
+            Ok(summary) => break summary,
+            Err(error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the job's attempt never became a fault target: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    assert_eq!(summary.target_service, "flaky");
+
+    let done = harness.wait_done(batch_id, 30).await;
+    assert_eq!(done["succeeded"].as_u64(), Some(1), "{done}");
+}
+
 /// A job that runs and exits non-zero exhausts its retries (jobs get
 /// `RestartPolicy::for_job(3)`) and is reported failed — the tracker
 /// reaches a terminal state rather than pending forever.

@@ -119,6 +119,8 @@ pub struct OwnedRunner<G: Grill + Clone> {
     /// Fresh-runtime attempts running now, by run: their instance and cgroup,
     /// so the metrics loop can measure them.
     attempts: Mutex<RunningAttempts>,
+    /// Every attempt running here, with its job and task index, for Smoker.
+    live_attempts: std::sync::Arc<super::live_attempts::LiveAttempts>,
     available: Notify,
     secrets: Option<(std::sync::Arc<crate::council::CouncilNode>, [u8; 32])>,
     log_sink: Option<tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -154,6 +156,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             cgroup_root: crate::grill::cgroup::CGROUP_ROOT.into(),
             singletons: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(BTreeMap::new()),
+            live_attempts: super::live_attempts::LiveAttempts::new(),
             available: Notify::new(),
             secrets: None,
             log_sink: None,
@@ -378,6 +381,19 @@ impl<G: Grill + Clone> OwnedRunner<G> {
     ) -> Self {
         self.secrets = Some((council, ikm));
         self
+    }
+    /// List running attempts in `attempts`, which the agent shares, so
+    /// Smoker can find them.
+    pub fn with_live_attempts(
+        mut self,
+        attempts: std::sync::Arc<super::live_attempts::LiveAttempts>,
+    ) -> Self {
+        self.live_attempts = attempts;
+        self
+    }
+    /// The attempts running here.
+    pub fn live_attempts(&self) -> std::sync::Arc<super::live_attempts::LiveAttempts> {
+        self.live_attempts.clone()
     }
     /// Singleton jobs retain the ordinary live log stream and ingest checkpoints.
     pub fn with_log_sink(

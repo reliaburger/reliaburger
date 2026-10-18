@@ -5,6 +5,8 @@
 /// can be overridden with explicit CLI flags (LeaderTargeted,
 /// NodePercentageExceeded).
 use super::types::{FaultRequest, FaultType, SafetyCheck, SafetyContext, SafetyViolation};
+#[cfg(test)]
+use super::types::WorkloadKind;
 
 /// Evaluate all safety rails for a proposed fault.
 ///
@@ -205,6 +207,7 @@ mod tests {
 
     fn default_context() -> SafetyContext {
         SafetyContext {
+            workload: Default::default(),
             council_size: 5,
             council_nodes_with_active_faults: 0,
             leader_node_id: "node-1".into(),
@@ -217,6 +220,8 @@ mod tests {
 
     fn node_kill_request(target_node: &str) -> FaultRequest {
         FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::NodeKill {
                 kill_containers: false,
             },
@@ -235,6 +240,8 @@ mod tests {
 
     fn node_pressure_request(target_node: &str) -> FaultRequest {
         FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::NodePressure {
                 cpu_percentage: 80,
                 memory_percentage: 90,
@@ -254,6 +261,8 @@ mod tests {
 
     fn kill_request(service: &str, count: u32) -> FaultRequest {
         FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Kill { count },
             target_service: service.into(),
             namespace: None,
@@ -334,6 +343,8 @@ mod tests {
         let mut ctx = default_context();
         ctx.council_nodes_with_active_faults = ctx.council_size;
         let req = FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Partition {
                 source_app: Some("web".to_string()),
             },
@@ -404,6 +415,8 @@ mod tests {
     fn replica_minimum_applies_to_pause() {
         let ctx = default_context(); // 3 replicas
         let req = FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Pause,
             target_service: "web".into(),
             namespace: None,
@@ -423,11 +436,14 @@ mod tests {
 
     fn instance_pause(replicas: u32, faulted: u32) -> (FaultRequest, SafetyContext) {
         let context = SafetyContext {
+            workload: Default::default(),
             target_service_replicas: replicas,
             target_service_faulted_replicas: faulted,
             ..default_context()
         };
         let request = FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Pause,
             target_service: "web".into(),
             namespace: None,
@@ -465,6 +481,8 @@ mod tests {
     fn replica_minimum_does_not_apply_to_delay() {
         let ctx = default_context();
         let req = FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
@@ -483,6 +501,61 @@ mod tests {
         };
         let check = evaluate_safety(&req, &ctx);
         assert!(check.approved);
+    }
+
+    // -----------------------------------------------------------------------
+    // Run-to-completion workloads (#704)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replica_rail_does_not_apply_to_a_job() {
+        for workload in [WorkloadKind::Job, WorkloadKind::TaskArray] {
+            let context = SafetyContext {
+                target_service_replicas: 1,
+                workload,
+                ..default_context()
+            };
+            let mut request = kill_request("migrate", 0);
+            request.workload = workload;
+            assert!(
+                evaluate_safety(&request, &context).approved,
+                "killing every attempt of a {workload} must not meet the replica rail"
+            );
+            request.fault_type = FaultType::Pause;
+            assert!(evaluate_safety(&request, &context).approved);
+        }
+    }
+
+    #[test]
+    fn replica_rail_still_applies_to_an_app() {
+        let context = SafetyContext {
+            target_service_replicas: 1,
+            workload: WorkloadKind::App,
+            ..default_context()
+        };
+        let check = evaluate_safety(&kill_request("web", 0), &context);
+        assert!(matches!(
+            check.violation,
+            Some(SafetyViolation::ReplicaMinimum { surviving: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn council_rail_still_applies_to_a_job_on_a_council_node() {
+        // A job's exemption is from the replica rail only: a request that
+        // names a job and would take a council voter out is still refused.
+        let context = SafetyContext {
+            council_nodes_with_active_faults: 2,
+            workload: WorkloadKind::Job,
+            ..default_context()
+        };
+        let mut request = node_kill_request("node-3");
+        request.workload = WorkloadKind::Job;
+        request.target_service = "migrate".into();
+        assert!(matches!(
+            evaluate_safety(&request, &context).violation,
+            Some(SafetyViolation::QuorumRisk { .. })
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -612,6 +685,8 @@ mod tests {
     fn all_rails_pass_for_safe_fault() {
         let ctx = default_context();
         let req = FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,

@@ -161,6 +161,8 @@ fn make_request(
     targeting: &FaultTargeting,
 ) -> FaultRequest {
     FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type,
         target_service,
         namespace: targeting.namespace.clone(),
@@ -697,6 +699,7 @@ mod tests {
 
     fn summary(id: u64, node: &str, service: &str) -> FaultSummary {
         FaultSummary {
+            task_index: None,
             id,
             fault_type: "kill".to_string(),
             target_service: service.to_string(),
