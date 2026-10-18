@@ -832,6 +832,11 @@ pub(super) fn describe_write(request: &crate::council::types::RaftRequest) -> St
     }
 }
 
+/// Marks a request one node has forwarded to the leader. A node that
+/// receives a marked request and can't confirm it leads answers 503 rather
+/// than forwarding it again, so no forwarding chain can loop (#1069).
+pub(crate) const LEADER_FORWARDED_HEADER: &str = "x-reliaburger-forwarded";
+
 /// Resolve the current leader's API base URL.
 ///
 /// Preferred source is the gossip-fed membership table (it stores real
