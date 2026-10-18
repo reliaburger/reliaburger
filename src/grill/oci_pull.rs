@@ -39,7 +39,7 @@ pub(crate) fn verify(
     expected: &str,
     size: Option<i64>,
 ) -> Result<(), OciDistributionError> {
-    let actual = format!("sha256:{:x}", Sha256::digest(bytes));
+    let actual = format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
     if actual != expected {
         return Err(invalid(format!(
             "upstream content digest mismatch: expected {expected}, received {actual}"
@@ -197,7 +197,7 @@ async fn verified_image(
     std::str::from_utf8(&config_bytes)
         .map_err(|e| invalid(format!("upstream configuration is not UTF-8: {e}")))?;
     Ok(VerifiedImageManifest {
-        digest: format!("sha256:{:x}", Sha256::digest(&manifest_bytes)),
+        digest: format!("sha256:{}", hex::encode(Sha256::digest(&manifest_bytes))),
         manifest,
         manifest_bytes,
         config_bytes,
@@ -276,7 +276,7 @@ pub(crate) async fn pull_verified_root(
         manifests.push((entry, bytes));
     }
     Ok(VerifiedRoot::Index(VerifiedImageIndex {
-        digest: format!("sha256:{:x}", Sha256::digest(&index_bytes)),
+        digest: format!("sha256:{}", hex::encode(Sha256::digest(&index_bytes))),
         media_type: index
             .media_type
             .unwrap_or_else(|| OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),

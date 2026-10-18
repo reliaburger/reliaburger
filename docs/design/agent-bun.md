@@ -2014,7 +2014,7 @@ Bun Restart
 | `nix` | Safe Rust bindings for Unix APIs | 0.29+ | MIT | Mature | `clone()`, `unshare()`, `mount()`, `pivot_root()`, `setns()`, `prctl()`, signal handling. Essential for process workload namespace setup. |
 | `toml` + `serde` | TOML parsing and serialisation | latest | MIT/Apache-2.0 | Mature | For `node.toml` parsing and all TOML-based configuration. `serde` provides `#[serde(default)]` for optional fields with defaults. |
 | `age` | age encryption/decryption | 0.10+ | MIT/Apache-2.0 | Stable | For decrypting `ENC[AGE:...]` secrets. The `age` crate is the canonical Rust implementation of the age encryption format. |
-| `sha2` | SHA-256 hashing | 0.10+ | MIT/Apache-2.0 | Mature | For binary integrity verification during self-upgrade. Also used for content addressing in Pickle. |
+| `sha2` | SHA-256 hashing | 0.11+ | MIT/Apache-2.0 | Mature | For binary integrity verification during self-upgrade. Also used for content addressing in Pickle. |
 | `hyper` | HTTP client/server | 1.x | MIT | Mature | For health check probes (HTTP GET to workload endpoints), API server, and Wrapper ingress proxy. Used via Tokio. |
 | `rustls` | TLS implementation | 0.23+ | MIT/Apache-2.0/ISC | Mature | For mTLS (inter-node, workload identity). Pure Rust, no OpenSSL dependency. Used by `tokio-rustls` for inter-node TLS and by `hyper` for HTTPS. |
 | `rand` | Random number generation | 0.8+ | MIT/Apache-2.0 | Mature | For port allocation (random selection from available pool) and fault injection probability calculations. |

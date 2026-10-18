@@ -209,7 +209,7 @@ pub fn tar_context(context_dir: &Path) -> Result<Vec<u8>, BuildError> {
 pub fn digest_of(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data);
-    format!("sha256:{hash:x}")
+    format!("sha256:{}", hex::encode(hash))
 }
 
 /// Prepare a buildah build job from a BuildSpec.

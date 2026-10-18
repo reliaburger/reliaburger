@@ -842,7 +842,7 @@ impl MayoStore {
             }
             *prefix = prefix
                 .clone()
-                .join(format!("nodes/{:x}", Sha256::digest(owner.as_bytes())).as_str());
+                .join(format!("nodes/{}", hex::encode(Sha256::digest(owner.as_bytes()))).as_str());
         }
         Ok(store)
     }

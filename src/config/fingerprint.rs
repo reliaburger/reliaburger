@@ -7,7 +7,7 @@ use super::{AppSpec, JobSpec};
 /// Fingerprint every serialised field; unavailable evidence remains unknown.
 pub fn spec_fingerprint(spec: &impl Serialize) -> Option<String> {
     let bytes = serde_json::to_vec(spec).ok()?;
-    Some(format!("{:x}", Sha256::digest(bytes)))
+    Some(hex::encode(Sha256::digest(bytes)))
 }
 
 /// Fingerprint an app's effective namespace and ignore placement-only ordinals.

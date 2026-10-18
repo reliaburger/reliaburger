@@ -258,7 +258,7 @@ impl Downloader {
         }
         let expected = digest.to_ascii_lowercase();
         if let Some((hash, _)) = hash_file(path.to_owned(), limit).await?
-            && format!("{:x}", hash.finalize()) == expected
+            && hex::encode(hash.finalize()) == expected
         {
             if let Some(step) = step {
                 step.note("cached");
@@ -318,7 +318,7 @@ impl Downloader {
         let mut failures = 0;
         let mut attempt = 0;
         loop {
-            if file.length > 0 && format!("{:x}", file.hash.clone().finalize()) == expected {
+            if file.length > 0 && hex::encode(file.hash.clone().finalize()) == expected {
                 // Everything arrived before the connection went, perhaps in
                 // an earlier run that stopped before publishing.
                 if attempt == 0
@@ -347,7 +347,7 @@ impl Downloader {
             tokio::time::sleep(self.delay(failures)).await;
             attempt += 1;
         }
-        if format!("{:x}", file.hash.finalize()) != expected {
+        if hex::encode(file.hash.finalize()) != expected {
             return Err(Unrecoverable("download SHA-256 does not match release metadata").into());
         }
         Ok(())
@@ -538,7 +538,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("download");
         let original = "https://github.com/reliaburger/reliaburger/releases/download/v0.1.0/asset";
-        let digest = format!("{:x}", Sha256::digest(b"candidate bytes"));
+        let digest = hex::encode(Sha256::digest(b"candidate bytes"));
         downloader
             .fetch(original, &digest, &path, 1024, None)
             .await
@@ -574,7 +574,7 @@ mod tests {
         downloader
             .fetch(
                 &other,
-                &format!("{:x}", Sha256::digest(b"separate tooling")),
+                &hex::encode(Sha256::digest(b"separate tooling")),
                 &root.path().join("tool"),
                 1024,
                 None,
