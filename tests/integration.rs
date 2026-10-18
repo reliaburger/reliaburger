@@ -372,11 +372,15 @@ async fn tui_websocket_logs_replay_known_line() {
 async fn job_failed_retries_then_fails() {
     let harness = TestHarness::start().await;
 
+    // `/bin/sh` is at that path on every Unix host. macOS has no
+    // `/bin/false` (it's `/usr/bin/false`), so a job naming it is refused
+    // there as a missing binary, without a retry (#934).
     let config = Config::parse(
         r#"
         [job.broken]
         runtime = "process"
-        exec = "/bin/false"
+        exec = "/bin/sh"
+        command = ["-c", "exit 1"]
     "#,
     )
     .unwrap();

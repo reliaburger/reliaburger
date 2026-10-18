@@ -3430,6 +3430,19 @@ gained a third arm, `Self::LaunchRefused { .. }`. Without it, a job whose
 image can't run on a process-only node would have been launched
 `max_attempts` times, refused for the same reason each time.
 
+That arm showed up a test that had only ever run on Linux (#934). The
+wall-clock acceptance test for job retries ran `exec = "/bin/false"` and
+expected at least one retry. On macOS it failed every time: the job failed in
+a third of a second with `restart_count` 0. The cause wasn't the retry path.
+macOS keeps `false` in `/usr/bin` and has no `/bin/false`, so `create`'s
+binary check refused the launch as `binary not found`, exactly as it should.
+Linux has both paths, so CI, which runs that test only on Linux, never saw it.
+The test now runs `/bin/sh -c "exit 1"`, a command at the same path on every
+Unix host. A portable suite test pins the behaviour too, so the macOS shards
+check it on every train: a process job whose command starts and exits
+non-zero is a failed attempt, retried up to `max_attempts`, and its retries
+show as the run's `restart_count`.
+
 What about errors that could be either? A runc failure might be a bug in the
 spec or a busy host. A full disk might clear in a minute. We picked "retry"
 as the default, for two reasons. Every one of these errors happens before the
