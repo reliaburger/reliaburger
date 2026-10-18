@@ -1818,21 +1818,25 @@ async fn killing_attempts_mid_array_still_completes_every_task() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    // This cluster has a token store, so reads need the operator token too.
     let mut last = Value::Null;
-    wait_until(
-        "the array finishes",
-        Duration::from_secs(180),
-        async || match status(&http, &nodes[0], batch_id).await {
-            Some(summary) => {
-                let done = summary["done"] == true;
-                last = summary;
-                done
-            }
-            None => false,
-        },
-    )
-    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while last["done"] != true && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let Ok(response) = http
+            .get(api(&nodes[0], &format!("/v1/batch/{batch_id}")))
+            .bearer_auth(&created.plaintext)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if let Ok(summary) = response.json::<Value>().await {
+            last = summary;
+        }
+    }
     root.cancel();
+    assert_eq!(last["done"], true, "the array never finished: {last}");
     assert_eq!(last["status"], "Succeeded", "{last}");
     assert_eq!(last["succeeded"], COUNT, "{last}");
     assert_eq!(last["failed"], 0, "{last}");
