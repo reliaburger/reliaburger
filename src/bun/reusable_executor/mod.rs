@@ -151,6 +151,10 @@ impl ExecutorKey {
         compatible.script = None;
         compatible.cpu = Some(profile.cpu);
         compatible.memory = Some(profile.memory);
+        // An omitted limit and an explicit 256 build the same task cgroup.
+        compatible.pids = template
+            .pids
+            .filter(|limit| limit.get() != DEFAULT_COMMAND_PIDS);
         let encoded = serde_json::to_vec(&compatible)?;
         Ok(Self(Sha256::digest(encoded).into()))
     }
@@ -203,7 +207,9 @@ impl ExecutorProfile {
         Ok(Self {
             cpu,
             memory,
-            pids: DEFAULT_COMMAND_PIDS,
+            pids: template
+                .pids
+                .map_or(DEFAULT_COMMAND_PIDS, crate::config::types::PidsLimit::get),
             reservation,
         })
     }

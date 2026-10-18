@@ -1214,6 +1214,13 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 > memory-pressure reclaim before the hard `memory.max` OOM. A limit-only spec
 > (no request) emits no unified entries and is byte-identical to before.
 
+**Process accounting (jobs, #741):**
+
+- A job's `pids` (1 to 32768, `PidsLimit` in `src/config/types.rs`) is the most processes and threads one command may hold. Deserialisation refuses anything else, so TOML, the JSON API and Raft all carry a value in range.
+- A reused executor (`shared-runc` or a native host executor) writes it to the command's `task/pids.max`, 256 when the job omits it (`DEFAULT_COMMAND_PIDS`). It's part of the `ExecutorProfile` and the compatibility key, with an omitted limit and an explicit 256 keying the same. The helper's sibling `helper/pids.max` stays 16 (`HELPER_PIDS`); the helper's OCI resources drop the job's `pids` so runc can't overwrite it.
+- A fresh `runc` job carries it as the OCI `linux.resources.pids.limit` (`OciPidsResources`), and has no limit without it, as with an omitted `cpu` or `memory`.
+- It's a limit, not a request: the reservation doesn't change. A node that can't enforce host limits refuses a host job that sets it, the same verdict it gives CPU and memory ranges (`capability_refusal`). Apps don't take the field.
+
 **Node-wide OOM order (#984):** a cgroup's `memory.max` decides a cgroup OOM,
 but when the whole node runs out the kernel's global OOM killer picks by
 `oom_score_adj`. The systemd units we ship run Bun at `OOMScoreAdjust=-900`,

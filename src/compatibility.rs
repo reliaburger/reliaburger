@@ -142,6 +142,9 @@ pub struct Compatibility {
 /// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
 /// train opened. Each 0.2.2 change to the wire or durable state adds its
 /// line below this one, not another bump.
+/// `JobSpec::pids`, the per-command process limit, in Raft desired state,
+/// task-array templates and node syncs, and the OCI `linux.resources.pids`
+/// block in fresh job containers' specs and their owner records (#741).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 53,
     state: 70,

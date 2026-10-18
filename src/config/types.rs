@@ -268,6 +268,12 @@ impl TryFrom<u32> for PidsLimit {
     type Error = ConfigError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if !(1..=Self::MAX).contains(&value) {
+            return Err(ConfigError::InvalidResourceValue {
+                value: value.to_string(),
+                reason: format!("pids must be between 1 and {}", Self::MAX),
+            });
+        }
         Ok(Self(value))
     }
 }

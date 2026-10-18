@@ -812,6 +812,20 @@ pub fn generate_job_oci_spec(
             .unified
             .insert("memory.swap.max".into(), "0".into());
     }
+    if let Some(limit) = spec.pids {
+        // Only a reused executor's commands get a default; a fresh container
+        // without `pids` keeps no limit, like one without `cpu` or `memory`.
+        resources
+            .get_or_insert_with(|| OciResources {
+                cpu: None,
+                memory: None,
+                pids: None,
+                unified: BTreeMap::new(),
+            })
+            .pids = Some(OciPidsResources {
+            limit: i64::from(limit.get()),
+        });
+    }
 
     OciSpec {
         reusable_executor: false,

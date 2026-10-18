@@ -1924,11 +1924,52 @@ template with the per-command fields removed.
 `ExecutorKey::new` clones the template, clears `command`, `exec`, `script`,
 `schedule` and `run_before`, fills in the default namespace and resource
 ranges, serialises the result to JSON and hashes it. What's left is the pinned
-image digest, the namespace, the environment and the CPU and memory ranges. Two
+image digest, the namespace, the environment, the CPU and memory ranges and
+the process limit. Two
 different commands with the same image and limits share a key. A different
 memory limit or a rotated credential gets a different container. The key also
 refuses an image that isn't pinned by digest: `myimage:latest` can move under a
 warm container, and then "compatible" would be a lie.
+
+The profile has a third limit. Every command's task cgroup got `pids.max =
+256` from the day executors shipped, and threads count against it. A JVM
+starts dozens of threads before it reads a byte, so a heavily threaded command
+could hit `EAGAIN` on `clone` with no way out except a fresh container. Issue
+#741 made it a job field, `pids = 2048`, beside `cpu` and `memory`:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct PidsLimit(u32);
+
+impl TryFrom<u32> for PidsLimit {
+    type Error = ConfigError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if !(1..=Self::MAX).contains(&value) {
+            return Err(ConfigError::InvalidResourceValue { /* ... */ });
+        }
+        Ok(Self(value))
+    }
+}
+```
+
+That's the `try_from` trick from Chapter 5's image mirrors. serde reads a
+plain `u32`, then hands it to our `TryFrom`, and a failure there is a
+deserialisation error. So there's no separate validation pass to forget: TOML,
+the JSON API and a Raft entry all go through the same check, and code that
+holds a `PidsLimit` knows it's between 1 and 32,768. Why refuse 0? Because
+`pids.max = 0` means a command that can't even be born. Why 32,768? It's the
+kernel's traditional `pid_max`, and a command that wants more threads than a
+small machine has PIDs wants to be an app.
+
+The default stays 256 for reused executors, and the key treats an omitted
+limit and an explicit `pids = 256` as the same container. A fresh `runc` job
+takes the limit as the OCI `pids.limit` when it sets one and has none
+otherwise, which is exactly what an omitted `memory` does there too. One line
+in the executor start is easy to miss. The helper's OCI resources are built
+from a clone of the job template, so without `helper_profile.pids = None`
+runc would write the job's 2,048 over the helper's own limit of 16.
 
 A pool holds at most 32 of these containers per node, each running one command
 at a time. A chunk of a thousand indexes is still a queue, not a thousand

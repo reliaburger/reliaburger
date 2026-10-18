@@ -443,6 +443,11 @@ fn export_job(
             "[job.{name}] runtime = \"shared-runc\" container reuse — exported as a Job with a fresh Pod per attempt"
         ));
     }
+    if job.pids.is_some() {
+        report.unsupported.push(format!(
+            "[job.{name}] pids — a Pod spec has no process limit; the kubelet sets one per node (podPidsLimit)"
+        ));
+    }
     let app_namespace = job.namespace.clone();
     // Env and resources go through the same helpers as the app path — the job
     // exporter used to drop both, so a job with a memory limit and database
