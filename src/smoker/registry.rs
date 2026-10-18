@@ -46,6 +46,8 @@ impl FaultRegistry {
         );
         rule.namespace = request.namespace.clone();
         rule.target_instance = request.target_instance.clone();
+        rule.workload = request.workload;
+        rule.task_index = request.task_index;
         rule.target_node = request.target_node.clone();
         rule.reason = request.reason.clone();
 
@@ -227,6 +229,8 @@ mod tests {
 
     fn delay_request(service: &str, duration_secs: u64) -> FaultRequest {
         FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
@@ -247,6 +251,8 @@ mod tests {
 
     fn kill_request(service: &str) -> FaultRequest {
         FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Kill { count: 1 },
             target_service: service.into(),
             namespace: None,
@@ -497,6 +503,8 @@ mod tests {
 
     fn pause_request(service: &str, namespace: &str) -> FaultRequest {
         FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::Pause,
             namespace: Some(namespace.into()),
             ..kill_request(service)

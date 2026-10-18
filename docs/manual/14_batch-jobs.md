@@ -332,6 +332,26 @@ can go unannounced; its outcome is still in the definition's history.
 on each node, with the number of tasks in the PID column (`tasks:27`) and
 their CPU and memory. A singleton run keeps its own `run-ID` row.
 
+## Testing failure
+
+Smoker's workload faults reach running attempts, so you can watch a job's
+retry policy work before a real failure does it for you:
+
+```sh
+relish fault kill render --instance 41 --acknowledge
+relish fault pause migrate --duration 2m --acknowledge
+relish batch results 42 --failed --limit 20
+```
+
+A killed attempt behaves like a crash: a failed attempt that retries under
+`max_attempts` in a reusable executor, and an `Unknown` outcome in a container
+or process of its own, which runs again only with `replay_unknown = true` (or
+after `relish batch replay`). A paused attempt meets its `task_timeout_secs`,
+which is how you see a timeout become `Unknown` or a retry. `--instance`
+takes a task index. Commands in a reusable executor
+(`shared-runc`, or process jobs with Linux limits) take kill and pause only;
+see `relish manual chaos` for what reaches one task and which rails apply.
+
 ## Execution and capacity limits
 
 Every namespace shares the cluster, so no namespace may take all of it:

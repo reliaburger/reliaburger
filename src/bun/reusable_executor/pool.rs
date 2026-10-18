@@ -66,6 +66,8 @@ pub(crate) struct CommandReporting<'a> {
     pub singletons: &'a std::sync::Mutex<
         std::collections::BTreeMap<u64, Arc<crate::bun::task_runtime::SingletonRuntime>>,
     >,
+    /// Where each running command is listed for Smoker, if anywhere.
+    pub attempts: Option<&'a Arc<crate::bun::live_attempts::LiveAttempts>>,
 }
 
 struct Slot {
@@ -897,7 +899,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
     where
         F: std::future::Future<Output = Result<JobSpec, String>> + Send,
     {
-        let CommandReporting { sink, singletons } = reporting;
+        let CommandReporting {
+            sink,
+            singletons,
+            attempts,
+        } = reporting;
         // The command never ran, so the reason is the only output the task
         // keeps: without it a failed task shows nothing at all (#786). A
         // refusal about the job fails the task; a runtime, host, registry or
@@ -1189,6 +1195,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         };
         let run_id = task.run.as_ref().map(|run| run.batch_id);
         let executor_cgroup = context.base.clone();
+        let context_id = context.id.clone();
         // Only the command's own run time, from the helper's start receipt to
         // its exit: not slot queueing, admission, image pulls or cleanup.
         let mut ran = None;
@@ -1210,6 +1217,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             let mut started = false;
             let mut began = tokio::time::Instant::now();
             let mut logs = CommandLogs::new(task, &template, sink);
+            // Listed for Smoker from the start receipt until this future
+            // ends, however it ends (#704).
+            let mut _listed = None;
             if let Some(run) = task
                 .run
                 .as_ref()
@@ -1242,6 +1252,18 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                         let mut slots = self.slots.lock().await;
                         slots[index].active_run = run_id;
                         slots[index].cgroup = Some(executor_cgroup.clone());
+                        drop(slots);
+                        _listed = attempts
+                            .zip(crate::bun::live_attempts::LiveAttempt::of_task(
+                                task,
+                                template.namespace.as_deref().unwrap_or("default"),
+                                crate::bun::live_attempts::AttemptHandle::TaskGroup(
+                                    executor_cgroup.join("task"),
+                                ),
+                                None,
+                                Some(context_id.clone()),
+                            ))
+                            .map(|(attempts, attempt)| attempts.register(attempt));
                     }
                     protocol::Event::Output { stream, bytes } if started => {
                         output.push(&bytes);
@@ -2538,6 +2560,7 @@ mod tests {
                 CommandReporting {
                     sink: None,
                     singletons: &singletons,
+                    attempts: None,
                 },
             )
             .await;
@@ -2584,6 +2607,7 @@ mod tests {
                 CommandReporting {
                     sink: None,
                     singletons: &singletons,
+                    attempts: None,
                 },
             )
             .await;

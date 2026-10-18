@@ -10,6 +10,7 @@ use crate::grill::mock::MockGrill;
 #[cfg(target_os = "linux")]
 mod cgroup_faults;
 mod fault_coverage;
+mod job_faults;
 mod loop_harness;
 mod loop_rule;
 mod namespace_secrets;
@@ -142,6 +143,8 @@ async fn a_trace_lists_only_the_faults_that_act_on_its_own_path() {
         agent
             .fault_registry
             .insert(&FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type,
                 target_service: service.to_string(),
                 namespace: Some(namespace.to_string()),
@@ -10691,6 +10694,8 @@ fn register_fault(
     agent
         .fault_registry
         .insert(&crate::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type,
             target_service: String::new(),
             namespace: None,
@@ -10716,6 +10721,8 @@ async fn dns_fault_refuses_unknown_namespace_or_instance_scope_without_recording
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace,
@@ -10745,6 +10752,8 @@ async fn workload_fault_without_a_namespace_is_refused_before_recording() {
             reservation: None,
             replica_evidence: None,
             request: crate::smoker::types::FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: crate::smoker::types::FaultType::Pause,
                 target_service: "web".into(),
                 namespace: None,
@@ -10808,6 +10817,8 @@ async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace: Some("red".into()),
@@ -10857,6 +10868,8 @@ async fn node_fault_fence_reverses_before_acknowledging_and_blocks_late_activati
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -10933,6 +10946,8 @@ async fn clearing_a_reserved_node_fault_reports_its_reservation_until_fenced() {
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -11311,6 +11326,8 @@ async fn kill_all_is_refused_for_the_last_replica_without_a_cluster() {
     // `--count 0` means "all replicas"; killing all of a single-replica
     // service leaves zero survivors.
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 0 },
         target_service: "web".into(),
         namespace: Some("default".into()),
@@ -11348,6 +11365,8 @@ async fn cluster_replica_evidence_replaces_the_local_count() {
     while ev_rx.recv().await.is_some() {}
 
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 1 },
         target_service: "web".into(),
         namespace: Some("default".into()),
