@@ -307,6 +307,17 @@ their own. When GitHub retargets a stacked pull request,
 new base, so the new base's set applies without another push. The fixtures in
 [`test_select_jobs.py`](../scripts/ci/test_select_jobs.py) cover each case.
 
+Every job that downloads an artefact (the cluster and acceptance jobs fetch
+the nextest archive, the evidence gate fetches every envelope, and the V02
+loops do both) gives each download 5 minutes and retries a failed one once.
+A download normally takes a minute or two, but one stalled for 13 minutes and
+pushed `acceptance` past its 40-minute limit
+([#977](https://github.com/reliaburger/reliaburger/issues/977)). Now a stall
+costs at most 10 minutes, and the second attempt usually recovers it. The
+jobs keep their own limits.
+[`test_ci_workflow.py`](../scripts/ci/test_ci_workflow.py) fails any download
+step without its own limit or its retry.
+
 ### Portable macOS in three shards
 
 The portable suite on macOS runs as three parallel jobs, `portable macOS
