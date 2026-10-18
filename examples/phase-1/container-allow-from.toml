@@ -1,0 +1,48 @@
+# Real containers: one cross-namespace path, opened on purpose.
+#
+# Apps in one namespace can't reach apps in another. Here `cache` lives in
+# namespace `storage`, and its firewall lets `shop/checkout` in and nobody
+# else from outside `storage`. `checkout` pings the cache once a second and
+# logs what it hears; `snoop`, in namespace `other`, tries the same and is
+# refused.
+#
+# Requires rootful runc on Linux with [ebpf] and [dns] enabled (what
+# `sudo relish init` writes there; on macOS, use the managed Linux VM from
+# `relish setup --quickstart`). A node that can't enforce isolation refuses
+# `allow_from` rather than run it unenforced.
+#
+# Deploy with:
+#   relish apply examples/phase-1/container-allow-from.toml
+#   relish logs checkout --namespace shop     # +PONG, once a second
+#   relish logs snoop --namespace other       # refused
+#   relish path checkout --namespace shop --to cache --to-namespace storage
+
+[namespace.storage]
+[namespace.shop]
+[namespace.other]
+
+[app.cache]
+namespace = "storage"
+image = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b"
+port = 6379
+
+[app.cache.firewall]
+allow_from = ["shop/checkout"]
+
+[app.checkout]
+namespace = "shop"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = [
+  "/bin/sh",
+  "-c",
+  "while true; do printf 'PING\\r\\n' | nc -w 2 cache.storage.internal 6379 || echo refused; sleep 1; done",
+]
+
+[app.snoop]
+namespace = "other"
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = [
+  "/bin/sh",
+  "-c",
+  "while true; do printf 'PING\\r\\n' | nc -w 2 cache.storage.internal 6379 || echo refused; sleep 1; done",
+]

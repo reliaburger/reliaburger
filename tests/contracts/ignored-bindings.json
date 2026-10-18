@@ -1834,5 +1834,17 @@
     "function": "partition_from_an_array_attempt_blocks_its_cgroup",
     "binary": "reliaburger::ebpf",
     "test": "partition_from_an_array_attempt_blocks_its_cgroup"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed",
+    "binary": "reliaburger::demos",
+    "test": "rollout_demo_rolls_back_a_bad_version_and_marks_it_failed"
+  },
+  {
+    "source": "tests/demos.rs",
+    "function": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
+    "binary": "reliaburger::demos",
+    "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone"
   }
 ]
