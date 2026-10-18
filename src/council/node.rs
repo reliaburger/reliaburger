@@ -261,6 +261,35 @@ impl CouncilNode {
         self.raft.ensure_linearizable().await.is_ok()
     }
 
+    /// Return `true` once this node proves it leads, trying until `within`
+    /// passes while it still believes it leads.
+    ///
+    /// One [`is_leader`](Self::is_leader) round gives each follower a single
+    /// heartbeat interval to answer. On a loaded host both can miss it, and
+    /// a settled leader then reads as "not leader" (#1009). A node that
+    /// names another voter, or no leader at all, returns `false` straight
+    /// away: it has nothing to confirm.
+    pub async fn confirm_leadership(&self, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        let retry_pause = std::time::Duration::from_millis(self.raft.config().heartbeat_interval);
+        loop {
+            match tokio::time::timeout_at(deadline, self.is_leader()).await {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => return false,
+            }
+            let believes_it_leads = {
+                let metrics = self.metrics();
+                let metrics = metrics.borrow();
+                metrics.current_leader == Some(metrics.id)
+            };
+            if !believes_it_leads || tokio::time::Instant::now() + retry_pause >= deadline {
+                return false;
+            }
+            tokio::time::sleep(retry_pause).await;
+        }
+    }
+
     /// Stop this voter campaigning until another voter leads or `until`
     /// passes (#755).
     ///
@@ -1098,6 +1127,47 @@ mod tests {
         // A follower should not be leader.
         let follower_idx = if leader_id == 1 { 1 } else { 0 };
         assert!(!nodes[follower_idx].is_leader().await);
+    }
+
+    #[tokio::test]
+    async fn settled_leader_confirms_after_its_quorum_misses_a_heartbeat_round() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        // The followers must not depose the leader while it can't reach
+        // them: this models slow heartbeats, not a lost leader (#1009).
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        // One confirmation round can't reach a quorum.
+        assert!(!leader.is_leader().await);
+
+        let healer = router.clone();
+        let heal = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            healer.heal().await;
+        };
+        let (confirmed, ()) = tokio::join!(leader.confirm_leadership(Duration::from_secs(5)), heal);
+        assert!(confirmed, "a settled leader gave up after one missed round");
+    }
+
+    #[tokio::test]
+    async fn follower_does_not_wait_to_confirm_leadership() {
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let follower = &nodes[if leader_id == 1 { 1 } else { 0 }];
+        let started = std::time::Instant::now();
+        assert!(!follower.confirm_leadership(Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

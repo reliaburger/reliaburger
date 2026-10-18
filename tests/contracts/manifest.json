@@ -6458,6 +6458,33 @@
       ]
     },
     {
+      "id": "issue-1021-runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs",
+      "issue": 1021,
+      "promise": "A fresh runc task of a named job has its cgroup bound to the job's run identity and its egress allowlist before its command runs.",
+      "supported_paths": [
+        "Rootful Linux owned containers with eBPF and warmed digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "fresh-runc-runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A fresh task whose cgroup cannot be bound or held to its allowlist never runs its command."
+      ],
+      "boundaries": [
+        "This image-backed case requires the warmed-image Linux gate; the network-isolated OCI interruption driver cannot substitute."
+      ]
+    },
+    {
       "id": "issue-638-a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
       "issue": 638,
       "promise": "Cron occurrence IDs survive leader replacement without duplicate dispatch.",

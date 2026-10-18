@@ -939,14 +939,20 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         })?);
                 }
                 self.runtime.create(&id, &oci).await?;
-                // The task's allowlist and address ownership go in before
-                // its process runs, while runc holds it at create.
+                // The task's allowlist, run identity and address ownership
+                // go in before its process exists.
                 #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 if let Some(lease) = namespace_lease.as_mut() {
                     let failed = |error: std::io::Error| crate::grill::GrillError::StartFailed {
                         instance: id.clone(),
                         reason: error.to_string(),
                     };
+                    // Owned runc only stages the bundle at create: its cgroup
+                    // appears when `start` runs the container, too late to
+                    // bind. So make the leaf now. runc joins an existing
+                    // `cgroupsPath` directory untouched, so its inode, the id
+                    // the hooks see, is the one bound below (#1021).
+                    tokio::fs::create_dir_all(&cgroup).await.map_err(failed)?;
                     lease
                         .enforce_egress(&cgroup, egress_allow(template))
                         .await
@@ -1178,6 +1184,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         if let Some(lease) = namespace_lease {
             lease.retired().await;
+            remove_unused_task_cgroup(&cgroup).await;
         }
         if let Some(run) = run_id {
             self.retire_singleton(run).await;
@@ -1194,6 +1201,19 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             output,
             ran: None,
         }
+    }
+}
+
+/// Remove a retired attempt's task cgroup if it is still there. runc removes
+/// the cgroup of a container it ran; one made for an attempt that stopped
+/// before `start` would otherwise stay behind, empty, until the next sweep.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+async fn remove_unused_task_cgroup(cgroup: &std::path::Path) {
+    match tokio::fs::remove_dir(cgroup).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // The startup sweep removes any empty slot group left behind.
+        Err(error) => eprintln!("batch task cgroup {} kept: {error}", cgroup.display()),
     }
 }
 

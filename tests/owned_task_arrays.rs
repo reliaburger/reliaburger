@@ -768,6 +768,201 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A fresh runc task of a named job is bound to its job, and held to its
+/// egress allowlist, before its command runs (#1021). Owned runc makes the
+/// container's cgroup only when it runs it, so the runner has to make it first.
+#[cfg(feature = "ebpf")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, eBPF, pinned test image, ip and nft; run with make test-linux"]
+async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs() {
+    use reliaburger::bun::task_executor::{
+        AttemptOutcome, RunIdentity, TaskInvocation, TaskRunner,
+    };
+    use reliaburger::bun::task_namespace::TaskNamespacePolicy;
+    use reliaburger::bun::task_runtime::OwnedRunner;
+    use reliaburger::onion::ebpf::loader::OnionEbpf;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root_path = tempfile::Builder::new()
+        .prefix("rb-1021-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let root = root_path.as_path();
+    eprintln!("fresh named job fixture: {}", root.display());
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = RuncGrill::new(
+        root.join("bundles"),
+        images,
+        false,
+        root.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let kernel = Arc::new(tokio::sync::Mutex::new(
+        OnionEbpf::load_embedded(Path::new("/sys/fs/cgroup")).unwrap(),
+    ));
+    let policy = TaskNamespacePolicy::recover(kernel.clone(), root, Default::default(), None)
+        .await
+        .unwrap();
+    let runner = Arc::new(
+        OwnedRunner::with_slot_count(runtime.clone(), 1).with_namespace_policy(policy.clone()),
+    );
+    // Two host services outside the protected host port range (10000–60000):
+    // the allowlist names the first only.
+    let mut listeners = Vec::new();
+    for port in 8100..8200 {
+        if let Ok(bound) = tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+            listeners.push(bound);
+            if listeners.len() == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(listeners.len(), 2, "no two unallocated host fixture ports");
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect();
+    let server_cancel = CancellationToken::new();
+    let servers: Vec<_> = listeners
+        .into_iter()
+        .map(|listener| {
+            let cancel = server_cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    let accepted = tokio::select! { () = cancel.cancelled() => break, accepted = listener.accept() => accepted };
+                    let (mut connection, _) = accepted.unwrap();
+                    let mut request = [0u8; 1024];
+                    let _ = connection.read(&mut request).await;
+                    let _ = connection
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                }
+            })
+        })
+        .collect();
+    let host = runtime.dns_gateway_address().unwrap();
+    let namespace = format!("rbtest-fresh-{}", rand::random::<u32>());
+    let job = "probe";
+    let invocation = |command: String| TaskInvocation {
+        template: Some(Box::new(
+            toml::from_str(&format!(
+                "image='{image}'\nnamespace='{namespace}'\nruntime='runc'\n\
+                 [egress]\nallow=['{host}:{}']",
+                ports[0]
+            ))
+            .unwrap(),
+        )),
+        index: 0,
+        attempt: 1,
+        program: "/unused".into(),
+        args: vec!["/bin/sh".into(), "-c".into(), command],
+        env: vec![],
+        // Two tasks, so this is an array task rather than a singleton run.
+        run: Some(RunIdentity {
+            batch_id: u64::from(rand::random::<u32>()),
+            task_count: 2,
+            job_name: Some(job.into()),
+        }),
+    };
+    // The allowlist is in force from the command's first connect.
+    let outcome = runner
+        .run(
+            &invocation(format!(
+                "test \"$(wget -qO- -T 2 http://{host}:{}/)\" = ok && ! wget -qO- -T 2 http://{host}:{}/",
+                ports[0], ports[1]
+            )),
+            Duration::from_secs(30),
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        outcome.outcome,
+        AttemptOutcome::Exited { code: 0 },
+        "{:?}",
+        String::from_utf8_lossy(&outcome.output.head)
+    );
+    // While a task runs, its cgroup answers to the job's run identity.
+    let cancel = CancellationToken::new();
+    let attempt = {
+        let runner = runner.clone();
+        let sleeping = invocation("sleep 60 & wait".into());
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .run(&sleeping, Duration::from_secs(60), &cancel)
+                .await
+        })
+    };
+    // The runtime's pid is its launcher's; the workload's own cgroup is the
+    // one the hooks see.
+    let cgroup = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            for owner in runtime.launch_inventory().await.unwrap().unwrap() {
+                if runtime.state(&owner.instance_id).await.ok() == Some(ContainerState::Running)
+                    && let Some(cgroup) = runtime
+                        .workload_cgroup(&owner.instance_id)
+                        .await
+                        .ok()
+                        .flatten()
+                {
+                    return cgroup;
+                }
+            }
+            assert!(!attempt.is_finished(), "task ended before it was inspected");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("task never established a running workload");
+    assert_eq!(
+        reliaburger::sesame::firewall::read_cgroup_source_entry(
+            &mut kernel.lock().await.bpf,
+            cgroup
+        )
+        .unwrap(),
+        Some(reliaburger::sesame::firewall::job_source_identity(
+            &namespace, job
+        )),
+        "the running task's cgroup is not bound to its job"
+    );
+    cancel.cancel();
+    let retired = tokio::time::timeout(Duration::from_secs(30), attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired.outcome, AttemptOutcome::Cancelled, "{retired:?}");
+    // Retirement lifts the binding along with the container.
+    assert_eq!(
+        reliaburger::sesame::firewall::read_cgroup_source_entry(
+            &mut kernel.lock().await.bpf,
+            cgroup
+        )
+        .unwrap(),
+        None
+    );
+    for owner in runtime.launch_inventory().await.unwrap().unwrap() {
+        assert_retired(&runtime, &owner.instance_id).await;
+    }
+    server_cancel.cancel();
+    for server in servers {
+        server.await.unwrap();
+    }
+    drop(runner);
+    drop(policy);
+    kernel.lock().await.detach().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Common public admission retains encrypted templates, writable singleton roots
 /// and accepted hook gates on the actual owned container runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1602,6 +1602,12 @@
     "test": "runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner"
   },
   {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs"
+  },
+  {
     "source": "tests/cluster_task_arrays.rs",
     "function": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
     "binary": "reliaburger::cluster_task_arrays",

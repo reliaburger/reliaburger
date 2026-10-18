@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{Entry, LogId, RaftLogReader, StorageError, StorageIOError, Vote};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::types::TypeConfig;
 use crate::sesame::raft_encryption::{self, EncryptedEntry};
@@ -667,5 +667,91 @@ mod tests {
         let mut store = DurableLogStore::open(&path).unwrap();
         let mut reader = store.get_log_reader().await;
         assert!(reader.try_get_log_entries(1..2).await.is_err());
+    }
+
+    /// What a power cut can leave of a store whose last commit grew the file.
+    ///
+    /// `before` and `after` are copies of the live file taken just before and
+    /// just after that commit. The store stays open while they are taken, so
+    /// each copy is what survives a cut at that moment: every commit fsynced,
+    /// and the header marked as needing recovery because nothing closed it.
+    struct GrowthCut {
+        _dir: tempfile::TempDir,
+        before: std::path::PathBuf,
+        after: std::path::PathBuf,
+        before_len: u64,
+        after_len: u64,
+    }
+
+    /// Commit a vote and two entries, then one commit big enough to make redb
+    /// grow the file, copying the live file on either side of the growth.
+    async fn growth_cut() -> GrowthCut {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.redb");
+        let before = dir.path().join("before.redb");
+        let after = dir.path().join("after.redb");
+
+        let mut store = DurableLogStore::open(&live).unwrap();
+        store.save_vote(&Vote::new(3, 42)).await.unwrap();
+        store.write_entries(vec![entry(1, 1), entry(1, 2)]).unwrap();
+        std::fs::copy(&live, &before).unwrap();
+        let before_len = std::fs::metadata(&live).unwrap().len();
+
+        store.put_meta("ballast", &vec![0xA5; 8 << 20]).unwrap();
+        std::fs::copy(&live, &after).unwrap();
+        let after_len = std::fs::metadata(&live).unwrap().len();
+        assert!(
+            after_len > before_len,
+            "the ballast commit must grow the file ({before_len} -> {after_len})"
+        );
+        GrowthCut {
+            _dir: dir,
+            before,
+            after,
+            before_len,
+            after_len,
+        }
+    }
+
+    fn set_file_len(path: &Path, len: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn store_reopens_after_a_power_cut_while_redb_grew_the_file() {
+        // #1024. redb 4 makes the longer file durable before any header can
+        // name the larger layout, so a cut part way through a growing commit
+        // leaves the old header over the longer file. The store must reopen
+        // it with every earlier commit intact.
+        let cut = growth_cut().await;
+        set_file_len(&cut.before, cut.after_len);
+
+        let mut store = DurableLogStore::open(&cut.before)
+            .expect("a file cut while growing must reopen with its earlier commits");
+        assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 42)));
+        let mut reader = store.get_log_reader().await;
+        assert_eq!(reader.try_get_log_entries(1..3).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn store_open_errors_rather_than_panics_on_a_file_shorter_than_its_layout() {
+        // #1024. redb 2.6.3 wrote the header naming the grown layout in the
+        // same fsync that persisted the growth. On ext4 a cut between the
+        // in-place header write and the journal commit of the new length left
+        // the file shorter than its header's layout, and every open after
+        // that panicked on an assertion, so Bun crash-looped. Such a file must
+        // now give a typed error that the caller can report.
+        let cut = growth_cut().await;
+        set_file_len(&cut.after, cut.before_len);
+
+        assert!(
+            DurableLogStore::open(&cut.after).is_err(),
+            "a store whose last commit lies past the end of the file must not open"
+        );
     }
 }

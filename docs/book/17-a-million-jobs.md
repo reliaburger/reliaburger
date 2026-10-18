@@ -172,7 +172,7 @@ The first derived index was a redb database with a 1 MiB cache per profile, rath
 
 The default view is a summary, not a task list. Watch, JSON status and the dashboard show counts and rates. Histograms merge before p50/p95/p99 are read; those are bucket upper bounds for final attempts, not end-to-end latency. Detail pages inspect at most 4,096 indexes, return at most 1,000 rows and contact at most eight workers, with a cursor even for an empty failure page. Retention starts at terminal acceptance and groups a parent with its profiles. Worker loss can lose detail without changing replicated accepted counts.
 
-The manual's burger manifest runs 1,000 small and 64 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. This demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md) records that gate.
+The manual's burger manifest runs 8 small and 2 larger hashing jobs beside the web service; the executable homepage tour checks both the app and all accepted outcomes. It used to run 1,000 small and 64 larger ones, but fresh containers start at about 12.7 a second on the quickstart VM ([throughput record](../qualification/2026-10-17-v0.2.0-job-throughput/README.md)), so most of the tour's recording was `relish batch watch` waiting. Ten tasks in two profiles still show both cohorts in `relish jobs` and finish in seconds; the [throughput demo](https://reliaburger.com/#job-throughput) has its own scenarios for showing rate. The tour demonstrates the path, not the whitepaper's daily target. Qualifying 100 million unique successes needs a real sustained run with resource profiles, concurrent apps, retries, failures and storage measurements. The [implementation plan](../plans/2026-10-04-plan-delegated-jobs.md) records that gate.
 
 
 Control reports carry exact failed counts and a capped preview of 256 index
@@ -493,7 +493,7 @@ Jobs are the 0.2.0 headline workload, and for most of the release they couldn't 
 
 Programming them was the interesting part, because a job runs in two different places. (There was a third, a job the agent ran directly through the app's create → program → start path, until the old batch engine was retired; see "Retiring the batch engine from Chapter 12" below.)
 
-A fresh task attempt holds a `NamespaceLease` from the delegated runtime. The lease grew two methods: `enforce_egress` programs the task cgroup after `runc create` and before `start`, while runc holds the process, and `publish_address` records that the task's container address belongs to the job's namespace on every port, with its `allow_from`. Both are undone in `retired()`, which only runs once the runtime has proven the attempt gone. A name that doesn't resolve within five seconds refuses the attempt. Apps start deny-all and let the re-resolver fill in the allowlist later; a short task has no later, so refusing is the honest answer.
+A fresh task attempt holds a `NamespaceLease` from the delegated runtime. The lease grew two methods: `enforce_egress` programs the task cgroup after the runtime's `create` and before `start`, before the process exists ("When the cgroup wasn't there", below, has the catch), and `publish_address` records that the task's container address belongs to the job's namespace on every port, with its `allow_from`. Both are undone in `retired()`, which only runs once the runtime has proven the attempt gone. A name that doesn't resolve within five seconds refuses the attempt. Apps start deny-all and let the re-resolver fill in the allowlist later; a short task has no later, so refusing is the honest answer.
 
 A reusable executor is the subtle one. Its commands all land in the executor's `task` cgroup, so the allowlist goes there once, when the executor starts. That only works if every command the executor runs wants the same allowlist, and the executor key already hashes the whole template minus the fields that may vary per command. `egress` and `firewall` aren't on that list, so two templates with different policies get different keys and never share a container. `tasks_with_different_egress_never_share_an_executor` pins it.
 
@@ -507,7 +507,7 @@ That gave a job a way to be reached. It didn't give it a way to be *named*. Say 
 
 Here's why. `firewall_map` keys a grant on `(source cgroup, destination)`, and the agent fills in the source half from the cgroups of running app instances. A task isn't an app instance. It runs in a cgroup of its own under `/reliaburger/reports/`, and gets its namespace from that ancestor's binding, so the hook knows it belongs to `reports`. But the agent has no idea which job owns the cgroup, and there's nothing to key a grant on. Worse, tasks come and go thousands of times a minute. A grant that waited for the agent's next tick to notice each new task would race every short task's first `connect()`, and lose.
 
-So we turned it round: grant the job, then tell the kernel which cgroups belong to it. A new map, `cgroup_source_map`, binds a task's cgroup to its *run identity*, a hash of `namespace/job`. The task's `NamespaceLease` writes it with `bind_source`, after `runc create` and before `start`, right next to the egress allowlist. On the agent side, `resolve_job_source_rules` writes one grant per cross-namespace name in every `allow_from`, keyed on the identity instead of a cgroup:
+So we turned it round: grant the job, then tell the kernel which cgroups belong to it. A new map, `cgroup_source_map`, binds a task's cgroup to its *run identity*, a hash of `namespace/job`. The task's `NamespaceLease` writes it with `bind_source`, after `create` and before `start`, right next to the egress allowlist. On the agent side, `resolve_job_source_rules` writes one grant per cross-namespace name in every `allow_from`, keyed on the identity instead of a cgroup:
 
 ```rust
 pub fn resolve_job_source_rules(
@@ -555,6 +555,28 @@ None of this widens what an app may receive. The binding only adds grants: a tas
 Reusable executors needed one more change. An executor's commands all land in its `task` cgroup, and executors with the same template were shared between jobs. Bind that cgroup to one job and the next job's commands would borrow its grants. So `ExecutorKey::for_job` folds the job's name into the key, and two jobs never share an executor. `tasks_of_different_jobs_never_share_an_executor` pins it. The forward-path table needed nothing new: a task's address now answers to its job's name there too, so a source the hooks admit isn't then dropped between veths.
 
 `allow_from_can_name_a_delegated_job_as_its_source` runs it in the VM: two task cgroups in one namespace, one bound to the named job and one to another, plus an app cgroup in the same namespace. Only the named job's task gets through.
+
+### When the cgroup wasn't there
+
+The 0.2.1 soak stopped at its first step. Every job in a fresh runc container failed to launch, on every node, with `task cgroup identity is unavailable` (#1021). Reused executors and host jobs were fine.
+
+`bind_source` needs the task cgroup's id, which is its directory's inode, so it `stat`s `/sys/fs/cgroup/reliaburger/<namespace>/executor-<prefix>/<slot>`. The directory didn't exist. We'd written "after `runc create`, while runc holds the process", but Reliaburger's runc adapter doesn't call `runc create` at all. Its `create` claims the instance, reserves the network and stages the bundle. The container only comes into being in `start`, which runs `runc run`, and that's when runc makes the cgroup. By then the process is already in it, so there's nothing left to bind *before* it runs.
+
+The egress allowlist had the same lookup, and the same bug, since jobs got egress in 0.2.0. Nobody noticed because `enforce_egress` returns early for an empty allowlist, and no test ran a fresh runc task that had one. `bind_source` runs for every named job, so #737 turned a latent bug into one that stopped every fresh runc job.
+
+Apps hit this long ago, and the fix is the one they use: make the directory before the runtime does. runc joins an existing `cgroupsPath` untouched, so the inode we bind is the one the task's process lands in. The runner now creates the leaf right after `create`, then programs the allowlist and binds the job:
+
+```rust
+tokio::fs::create_dir_all(&cgroup).await.map_err(failed)?;
+lease
+    .enforce_egress(&cgroup, egress_allow(template))
+    .await
+    .map_err(failed)?;
+```
+
+`map_err(failed)` turns the `std::io::Error` into the runtime's `GrillError` with the closure defined just above, and `?` returns it, so a cgroup we can't make refuses the attempt before anything runs. runc removes the cgroup of a container it ran. An attempt that stops before `start` never gets that far, so once it retires the runner removes the leaf itself; `remove_dir` only succeeds on an empty cgroup, which is the only kind we want gone.
+
+`runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs` runs a named job with an allowlist in a fresh runc container: the task reaches the listed host port and is refused the unlisted one, and while a second task sleeps, its cgroup answers to the job's run identity. Before the fix it failed exactly as the soak did. The comment that said "runc holds it at create" described a call our adapter has never made: it has always driven containers with `runc run`. Now a test checks what the comment only claimed.
 
 ### Where the bytes went
 
@@ -3317,6 +3339,20 @@ these on 15 October 2026 ([#668](https://github.com/reliaburger/reliaburger/issu
 They're still recorded, never gated: a leaking Bun fails the soak through
 `leak-rss` and the wtf report, as before.
 
+A table of first, last and highest samples hides when things happened, and the
+evidence directory with the full series never leaves the release host. So the
+record now draws the series too: `sustained_check.py render` writes SVG charts
+of each node's Bun memory (with the 512 and 384 MiB lines), open fds, CPU and,
+for a job soak, accepted jobs a second against the target, with every fault,
+upgrade walk and special marked along the bottom. It's a few hundred lines of
+Python string formatting rather than a plotting library, because the release
+scripts use only the standard library, and the output is deterministic so a
+re-render shows no diff. The 0.2.0 jobs final shows why it was worth it: the
+jobs chart drops to zero at 10.5 hours, the moment the controller ran out of
+its run budget ([#989](https://github.com/reliaburger/reliaburger/issues/989)),
+while the memory chart beside it stays flat. The table said the same thing, but
+you had to know where to look.
+
 ### A task that failed before it ran
 
 Candidate 3's fast soak failed one fresh-runc task of ordinary work, out of
@@ -3396,6 +3432,19 @@ is the spec's fault as surely as a bad image reference, so `refuses_spec`
 gained a third arm, `Self::LaunchRefused { .. }`. Without it, a job whose
 image can't run on a process-only node would have been launched
 `max_attempts` times, refused for the same reason each time.
+
+That arm showed up a test that had only ever run on Linux (#934). The
+wall-clock acceptance test for job retries ran `exec = "/bin/false"` and
+expected at least one retry. On macOS it failed every time: the job failed in
+a third of a second with `restart_count` 0. The cause wasn't the retry path.
+macOS keeps `false` in `/usr/bin` and has no `/bin/false`, so `create`'s
+binary check refused the launch as `binary not found`, exactly as it should.
+Linux has both paths, so CI, which runs that test only on Linux, never saw it.
+The test now runs `/bin/sh -c "exit 1"`, a command at the same path on every
+Unix host. A portable suite test pins the behaviour too, so the macOS shards
+check it on every train: a process job whose command starts and exits
+non-zero is a failed attempt, retried up to `max_attempts`, and its retries
+show as the run's `restart_count`.
 
 What about errors that could be either? A runc failure might be a bug in the
 spec or a busy host. A full disk might clear in a minute. We picked "retry"
@@ -3922,6 +3971,16 @@ promotion can't skip the re-record the way 0.1.5 and 0.1.6 did. It caught
 something on its first run, too: the new 0.3.0 card on the homepage said
 `relish netboot`, a command no release has yet.
 
+The payoff came at the promotion. Flipping `install.sh` to `v0.2.0` turned
+every "0.2.0, not in 0.1.6" into an error, because a label naming the release
+before the installed one is stale, and it failed the recording check until the
+tour was re-recorded against the published 0.2.0. So the change that announced
+the release also had to put jobs back into the tour: `relish batch submit
+burger/jobs.toml`, `relish batch watch` and `relish jobs`, beside the burger
+app. The step had sat behind a `--jobs` flag in `scripts/demo/tour.sh` while
+the installer fetched a release without `batch`; now that the published
+release has it, the flag is gone and every recording runs the step.
+
 ## What 0.2.0 doesn't do yet
 
 An audit of the job path before the release
@@ -3932,10 +3991,14 @@ every accepted task used to leave ledger entries, output and executor metadata
 behind with nothing reclaiming them, which is what "Where the bytes went"
 fixed.
 
-What's left isn't code. The job final on at least three nodes
-([#668](https://github.com/reliaburger/reliaburger/issues/668)) runs against
-the release candidate, and until it passes, the hundred-million-a-day figure
-stays a target.
+What was left wasn't code. The 12-hour job qualification on three nodes
+([#668](https://github.com/reliaburger/reliaburger/issues/668)) ran against
+the eighth release candidate and accepted 4,600 jobs a second, four times the
+hundred-million-a-day rate, through every fault
+([record](../qualification/2026-10-17-v0.2.0-job-qualification.md)). It took two runs: the first found a socket leak in
+the VM manager's port forwarder that let the kernel kill Bun, and the second's
+failures were all the harness's own
+([release log](../release-log.md#020-a-million-jobs)).
 
 ## Lessons
 

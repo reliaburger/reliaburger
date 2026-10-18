@@ -3819,7 +3819,7 @@ async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy(
         replicas = 3
 
         [[app.web.init]]
-        command = ["sleep", "3"]
+        command = ["/bin/sleep", "3"]
 
         [app.web.deploy]
         max_surge = 0

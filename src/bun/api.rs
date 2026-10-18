@@ -916,11 +916,14 @@ fn system_time_millis(time: std::time::SystemTime) -> u64 {
 }
 
 /// Require a current quorum before a lease read or retirement instruction.
+///
+/// A leader gets the whole 3 s to prove it leads, so one heartbeat round its
+/// followers answer late doesn't turn a settled leader's read into a 503
+/// (#1009).
 async fn confirmed_lease_leader(council: &crate::council::CouncilNode) -> bool {
-    matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(3), council.is_leader()).await,
-        Ok(true)
-    )
+    council
+        .confirm_leadership(std::time::Duration::from_secs(3))
+        .await
 }
 
 /// Admin with cluster-wide authority. Upgrades, rollbacks and elections act

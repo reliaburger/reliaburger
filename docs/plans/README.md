@@ -56,6 +56,7 @@ and the fleet control plane ([#265](https://github.com/reliaburger/reliaburger/p
 [0.1.0 release closure record](../qualification/2026-09-27-v0.1.0-release-closure.md)
 is the summary of how that ended.
 
+- [Soak charts](archive/2026-10-17-soak-charts.md): SVG charts in every soak record, and the released version's on the homepage (#979)
 - [Equal-window job demonstrations and hourly saturation runs](archive/2026-10-09-plan-timed-job-scenarios.md)
 - [A million jobs, the September design](archive/2026-09-28-plan-million-jobs.md): superseded by the October plans; its M8 targets are recorded, not gated, by every job qualification run (D18-C)
 - [Cluster migration prerequisites](archive/2026-10-04-cluster-migration-prerequisites.md): superseded in 0.2.0 when leased applies moved to the common job lifecycle and the prerequisite claims were retired (#681)
