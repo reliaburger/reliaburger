@@ -358,6 +358,17 @@ migration and no feature gate
   Managed-volume retirement and the Apple runtime (F10,
   [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.x,
   outside the migration plan.
+- [ ] **0.4.2: "Plug in an AI SRE"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/18),
+  [research](plans/2026-10-18-research-ai-sre.md)). Make Reliaburger the
+  easiest orchestrator for an AI agent to operate, safely. Part 1 is
+  read-only: `relish mcp`, agent tokens, untrusted-content envelopes, a merged
+  incident timeline, `relish explain`, agent-ready webhooks, `llms.txt` and an
+  eval gym on Smoker faults. Part 2 adds human-approved mutations through
+  proposals, and log patterns in Ketchup. No LLM inside `bun`. Exit test: an
+  off-the-shelf agent with a read-only token diagnoses at least 4 of 5 runs of
+  each eval scenario and never attempts a mutation
+  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)).
 - [ ] **After 0.4.0: book v2 and the full CLI tour.** Book v2: a distilled
   rewrite alongside v1; v1 keeps collecting until then. The rewrite reads
   properly from beginning to end: it cuts the fluff, keeps the design
