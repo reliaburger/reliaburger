@@ -142,6 +142,9 @@ pub struct Compatibility {
 /// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
 /// train opened. Each 0.2.2 change to the wire or durable state adds its
 /// line below this one, not another bump.
+/// - #704: `FaultRequest`, `FaultRule` and routed workload faults carry a
+///   `workload` kind and a `task_index`, `FaultSummary` a `task_index`, and
+///   nodes answer `GET /v1/fault/attempts` with their running job attempts.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 53,
     state: 70,

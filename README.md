@@ -161,8 +161,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish fault cpu <TARGET> <PERCENTAGE>`: Consume CPU in a service's cgroup
   - `relish fault memory <TARGET> <VALUE>`: Push memory usage toward a service's limit
   - `relish fault disk-io <TARGET> <LIMIT>`: Throttle disk I/O for a service
-  - `relish fault kill <TARGET>`: Kill instances of a service (SIGKILL)
-  - `relish fault pause <TARGET>`: Freeze instances of a service (SIGSTOP)
+  - `relish fault kill <TARGET>`: Kill instances of a service, or running attempts of a job (SIGKILL)
+  - `relish fault pause <TARGET>`: Freeze instances of a service, or running attempts of a job (SIGSTOP)
   - `relish fault resume <TARGET>`: Resume (unfreeze) previously paused instances of a service
   - `relish fault node-drain <TARGET>`: Simulate graceful node departure
   - `relish fault node-kill <TARGET>`: Simulate abrupt node failure

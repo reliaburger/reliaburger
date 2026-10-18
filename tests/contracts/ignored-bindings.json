@@ -1804,5 +1804,23 @@
     "function": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
     "binary": "reliaburger::placement",
     "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "killing_attempts_mid_array_still_completes_every_task",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "killing_attempts_mid_array_still_completes_every_task"
+  },
+  {
+    "source": "tests/owned_task_arrays.rs",
+    "function": "runc_array_attempt_can_be_paused_and_resumed",
+    "binary": "reliaburger::owned_task_arrays",
+    "test": "runc_array_attempt_can_be_paused_and_resumed"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "partition_from_an_array_attempt_blocks_its_cgroup",
+    "binary": "reliaburger::ebpf",
+    "test": "partition_from_an_array_attempt_blocks_its_cgroup"
   }
 ]

@@ -802,6 +802,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         super::reusable_executor::CommandReporting {
                             sink: self.log_sink.as_ref(),
                             singletons: &self.singletons,
+                            attempts: Some(&self.live_attempts),
                         },
                     )
                     .await;
@@ -876,6 +877,18 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         let _listing = task.run.as_ref().map(|run| {
             AttemptListing::new(&self.attempts, run.batch_id, id.clone(), cgroup.clone())
         });
+        // Each attempt here is a fresh runtime generation of its own, so
+        // every fault can be scoped to it (#704).
+        let own_cgroup = (cfg!(target_os = "linux") && self.runtime.honours_cgroup_path())
+            .then(|| cgroup.clone());
+        let _live = super::live_attempts::LiveAttempt::of_task(
+            task,
+            namespace,
+            super::live_attempts::AttemptHandle::Instance(id.clone()),
+            own_cgroup,
+            None,
+        )
+        .map(|attempt| self.live_attempts.register(attempt));
         let mut oci = crate::grill::oci::generate_job_oci_spec(
             "task",
             namespace,

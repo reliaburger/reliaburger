@@ -1455,7 +1455,7 @@ async fn shared_budget_node(
 ) -> WiredNode {
     let directory = data.join("task-arrays");
     let build: Option<cluster_support::TaskArraysOnBudget> = executor.then(|| {
-        Box::new(move |budget| {
+        Box::new(move |shared: cluster_support::AgentExecution| {
             let node = TaskArrayNode::new(
                 TaskArrayNodeConfig {
                     root: directory,
@@ -1474,7 +1474,7 @@ async fn shared_budget_node(
                     AttemptOutcome::Exited { code: 0 }
                 })),
             )
-            .with_budget(budget);
+            .with_budget(shared.budget);
             Arc::new(TaskArrayService::with_timings(
                 Some(Arc::new(node)),
                 Duration::from_millis(100),
@@ -1636,5 +1636,208 @@ async fn app_replica_lands_on_the_idle_node_while_another_runs_an_array() {
     assert!(
         placed.iter().all(|node| node != "shared0"),
         "a replica landed on the node jobs had filled: {placed:?}"
+    );
+}
+
+/// A node whose executor runs real host processes through an owned runner on
+/// its agent's runtime, listing each attempt in the agent's live attempts as
+/// Bun does, and which serves fault injection (#704).
+async fn chaos_node(
+    ports: &PortBlockReservation,
+    index: usize,
+    seeds: Vec<std::net::SocketAddr>,
+    root: &CancellationToken,
+    data: &std::path::Path,
+    operator: &reliaburger::sesame::types::ApiToken,
+) -> WiredNode {
+    let directory = data.join("task-arrays");
+    let build: cluster_support::TaskArraysOnBudget =
+        Box::new(move |shared: cluster_support::AgentExecution| {
+            let runner = reliaburger::bun::task_runtime::OwnedRunner::new(
+                reliaburger::grill::AnyGrill::Process(shared.runtime),
+            )
+            .with_live_attempts(shared.live_attempts);
+            let node = TaskArrayNode::new(
+                TaskArrayNodeConfig {
+                    root: directory,
+                    policy: ProcessWorkloadsConfig {
+                        allowed_binaries: vec!["/bin/sh".into()],
+                        mount_isolation: false,
+                        ..Default::default()
+                    },
+                    default_concurrency: 4,
+                    backoff: (Duration::from_millis(1), Duration::from_millis(5)),
+                    group_commit: GroupCommit::default(),
+                    audit_dir: None,
+                },
+                NodeRunner::Owned(Box::new(runner)),
+            )
+            .with_budget(shared.budget);
+            Arc::new(TaskArrayService::with_timings(
+                Some(Arc::new(node)),
+                Duration::from_millis(100),
+                Duration::from_secs(10),
+            ))
+        });
+    start_wired_node(WiredNodeOptions {
+        name: format!("chaos{index}"),
+        gossip_port: ports.base,
+        seeds,
+        shutdown: root.child_token(),
+        data_dir_prefix: "rb-chaos-arrays",
+        data_root: Some(data.to_path_buf()),
+        stale_report_timeout_secs: 10,
+        stale_node_grace: None,
+        metrics_rollup: None,
+        scheduler: None,
+        lease_reaper: false,
+        membership: MembershipSource::Gossip,
+        service_identity: Some(SERVICE_TOKEN.into()),
+        operator_token: Some(operator.clone()),
+        fault_injection: true,
+        labels: Default::default(),
+        keep_data_dir: false,
+        task_arrays: None,
+        task_arrays_on_agent_budget: Some(build),
+        process_only: false,
+    })
+    .await
+}
+
+/// #704: Smoker reaches a task array's running attempts on whichever nodes
+/// run them. Killing attempts mid-run fails them, the array retries each
+/// under its policy, and every task still completes exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn killing_attempts_mid_array_still_completes_every_task() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    const COUNT: u64 = 24;
+    let created = reliaburger::sesame::token::create_token(
+        "chaos-arrays",
+        reliaburger::sesame::types::ApiRole::Admin,
+        reliaburger::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let root = CancellationToken::new();
+    let data: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ports = lease_node_ports(3);
+    let seed = local(ports[0].base);
+    let mut nodes =
+        vec![chaos_node(&ports[0], 0, vec![], &root, data[0].path(), &created.token).await];
+    for (index, directory) in data.iter().enumerate().skip(1) {
+        nodes.push(
+            chaos_node(
+                &ports[index],
+                index,
+                vec![seed],
+                &root,
+                directory.path(),
+                &created.token,
+            )
+            .await,
+        );
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&nodes).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    wait_until(
+        "gossip sees everyone",
+        Duration::from_secs(60),
+        async || {
+            for node in &nodes {
+                if node.membership_table.read().await.len() < 3 {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+
+    let http = reqwest::Client::new();
+    let api = |node: &WiredNode, path: &str| format!("http://127.0.0.1:{}{path}", node.api_port);
+    // Each task sleeps long enough to be caught running.
+    let answer: Value = http
+        .post(api(&nodes[1], "/v1/batch/array"))
+        .bearer_auth(&created.plaintext)
+        .json(&json!({
+            "name": "chaos",
+            "template": { "runtime": "process", "exec": "/bin/sh", "command": ["-c", "sleep 2"] },
+            "spec": { "count": COUNT, "chunk_size": 4, "max_attempts": 3 },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let batch_id = answer["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{answer}"));
+
+    // Kill two running attempts twice, asking a different node each time:
+    // the node asked finds the attempts wherever they run.
+    let mut kills = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while kills < 2 {
+        let entry = &nodes[kills % 3];
+        let response = http
+            .post(api(entry, "/v1/fault"))
+            .bearer_auth(&created.plaintext)
+            .json(&json!({
+                "fault_type": { "type": "Kill", "count": 2 },
+                "target_service": "chaos",
+                "namespace": "default",
+                "target_instance": null,
+                "target_node": null,
+                "duration": { "secs": 0, "nanos": 0 },
+                "injected_by": "",
+                "reason": "killing attempts mid-array",
+                "acknowledged": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            kills += 1;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        let body = response.text().await.unwrap_or_default();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "attempts never became fault targets: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut last = Value::Null;
+    wait_until(
+        "the array finishes",
+        Duration::from_secs(180),
+        async || match status(&http, &nodes[0], batch_id).await {
+            Some(summary) => {
+                let done = summary["done"] == true;
+                last = summary;
+                done
+            }
+            None => false,
+        },
+    )
+    .await;
+    root.cancel();
+    assert_eq!(last["status"], "Succeeded", "{last}");
+    assert_eq!(last["succeeded"], COUNT, "{last}");
+    assert_eq!(last["failed"], 0, "{last}");
+    assert!(
+        last["retried"].as_u64().unwrap_or(0) >= 2,
+        "the killed attempts were not retried: {last}"
     );
 }

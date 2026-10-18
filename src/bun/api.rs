@@ -78,8 +78,8 @@ use deploys::{
 use discovery::{resolve_all_handler, resolve_handler, routes_handler};
 pub use faults::ClusterFaultList;
 use faults::{
-    chaos_status_handler, fault_clear_all_handler, fault_clear_handler, fault_inject_handler,
-    fault_list_handler, node_fault_fence_handler, node_fault_reserve_handler,
+    chaos_status_handler, fault_attempts_handler, fault_clear_all_handler, fault_clear_handler,
+    fault_inject_handler, fault_list_handler, node_fault_fence_handler, node_fault_reserve_handler,
     spawn_node_fault_reaper,
 };
 pub use gitops::GitOpsLocalCheck;
@@ -754,6 +754,7 @@ pub fn router_with_upgrade(
         .route("/v1/fault", axum::routing::delete(fault_clear_all_handler))
         .route("/v1/fault", get(fault_list_handler))
         .route("/v1/fault/{id}", axum::routing::delete(fault_clear_handler))
+        .route("/v1/fault/attempts", get(fault_attempts_handler))
         .route("/v1/resolve", get(resolve_all_handler))
         .route("/v1/resolve/{name}", get(resolve_handler))
         .route("/v1/routes", get(routes_handler))

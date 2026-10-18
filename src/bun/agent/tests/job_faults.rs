@@ -252,9 +252,12 @@ async fn killed_attempt_is_retried_per_policy() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    inject(&mut agent, request(FaultType::Kill { count: 1 }, "migrate", None))
-        .await
-        .expect("the job's attempt is a fault target");
+    inject(
+        &mut agent,
+        request(FaultType::Kill { count: 1 }, "migrate", None),
+    )
+    .await
+    .expect("the job's attempt is a fault target");
 
     let outcome = running.await.unwrap();
     let record = &outcome.records[0];

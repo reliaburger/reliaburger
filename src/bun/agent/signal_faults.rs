@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 
 use super::follow_ups::FollowUp;
 use super::{BunAgent, BunError, Grill, InstanceId};
+use crate::bun::live_attempts::AttemptHandle;
 use crate::smoker::types::{FaultId, FaultReversal, FaultRule, FaultSummary, FaultType};
 
 /// How long a task waits for the runtime to name the targets' pids. A
@@ -147,9 +148,21 @@ pub(super) fn send(
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Running instances a fault targets: its service (or one instance of
-    /// it) in its namespace, past their image pull.
+    /// What a fault signals. For an app: its running instances (or one of
+    /// them) in its namespace, past their image pull. For a job or task
+    /// array: its running attempts (or one task's), each by its own runtime
+    /// instance or by its reusable executor's task cgroup.
     pub(super) fn fault_targets(&self, rule: &FaultRule) -> Vec<SignalTarget> {
+        if rule.workload.runs_to_completion() {
+            return self
+                .attempt_targets(rule)
+                .into_iter()
+                .map(|attempt| match attempt.handle {
+                    AttemptHandle::Instance(id) => SignalTarget::Instance(id),
+                    AttemptHandle::TaskGroup(cgroup) => SignalTarget::TaskGroup(cgroup),
+                })
+                .collect();
+        }
         self.supervisor
             .list_instances()
             .iter()

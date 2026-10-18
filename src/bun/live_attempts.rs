@@ -62,6 +62,29 @@ pub struct LiveAttempt {
 }
 
 impl LiveAttempt {
+    /// The attempt `task` is, reached through `handle`. `None` when the task
+    /// carries no named run, which leaves nothing a fault could name.
+    pub fn of_task(
+        task: &crate::bun::task_executor::TaskInvocation,
+        namespace: &str,
+        handle: AttemptHandle,
+        cgroup: Option<PathBuf>,
+        shared_executor: Option<InstanceId>,
+    ) -> Option<Self> {
+        let run = task.run.as_ref()?;
+        Some(Self {
+            namespace: namespace.to_string(),
+            job: run.job_name.clone()?,
+            batch_id: run.batch_id,
+            task_count: run.task_count,
+            index: task.index,
+            attempt: task.attempt,
+            handle,
+            cgroup,
+            shared_executor,
+        })
+    }
+
     /// Whether the attempt's run is a job or a task array.
     pub fn kind(&self) -> WorkloadKind {
         WorkloadKind::of_run(self.task_count)
@@ -149,7 +172,12 @@ impl LiveAttempts {
 
     /// The attempts of `job` in `namespace`, limited to one task index if
     /// given, oldest first.
-    pub fn matching(&self, namespace: &str, job: &str, task_index: Option<u32>) -> Vec<LiveAttempt> {
+    pub fn matching(
+        &self,
+        namespace: &str,
+        job: &str,
+        task_index: Option<u32>,
+    ) -> Vec<LiveAttempt> {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -1636,6 +1636,117 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// #704: a task-array command in a reusable runc executor is listed for
+/// Smoker while it runs, by its executor's task cgroup, and that cgroup holds
+/// the command's processes and nothing else: stopping every process in it
+/// freezes the task, and continuing them lets it finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc and pinned images; run with make test-linux"]
+async fn runc_array_attempt_can_be_paused_and_resumed() {
+    use reliaburger::bun::live_attempts::AttemptHandle;
+    use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
+    use reliaburger::bun::{execution_budget::ExecutionBudget, task_runtime::OwnedRunner};
+    use reliaburger::meat::Resources;
+    use reliaburger::smoker::types::WorkloadKind;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::Builder::new()
+        .prefix("rb-704-pause-")
+        .tempdir()
+        .unwrap();
+    let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
+    let images = ImageStore::new(root.path().join("images"))
+        .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
+        .with_mirrors(reliaburger::testkit::pinned_images::local_test_mirrors().unwrap());
+    images.pull_and_unpack(image).await.unwrap();
+    let runtime = RuncGrill::new(
+        root.path().join("bundles"),
+        images,
+        false,
+        root.path().join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    )
+    .unwrap();
+    let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
+    let runner = Arc::new(
+        OwnedRunner::for_data_dir(runtime.clone(), root.path())
+            .unwrap()
+            .with_budget(budget.clone()),
+    );
+    let attempts = runner.live_attempts();
+    let template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
+        "image='{image}'\nnamespace='rbtest-pause'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"
+    ))
+    .unwrap();
+    // Two seconds of work, then a marker: a frozen task can't print it.
+    let task = TaskInvocation {
+        template: Some(Box::new(template)),
+        index: 2,
+        attempt: 1,
+        program: "/unused".into(),
+        args: vec!["/bin/sh".into(), "-c".into(), "sleep 2; printf done".into()],
+        env: vec![],
+        run: Some(reliaburger::bun::task_executor::RunIdentity {
+            batch_id: 704,
+            task_count: 3,
+            job_name: Some("render".into()),
+        }),
+    };
+    let running = {
+        let runner = runner.clone();
+        tokio::spawn(async move {
+            runner
+                .run(&task, Duration::from_secs(60), &CancellationToken::new())
+                .await
+        })
+    };
+    wait_until("the command is listed", || !attempts.snapshot().is_empty()).await;
+    let listed = attempts.snapshot().remove(0);
+    assert_eq!(listed.job, "render");
+    assert_eq!(listed.index, 2);
+    assert_eq!(listed.kind(), WorkloadKind::TaskArray);
+    assert!(listed.shared_executor.is_some(), "{listed:?}");
+    let AttemptHandle::TaskGroup(group) = &listed.handle else {
+        panic!("a shared command is reached by its task cgroup: {listed:?}");
+    };
+    let pids: Vec<i32> = std::fs::read_to_string(group.join("cgroup.procs"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    assert!(!pids.is_empty(), "the task cgroup holds the command");
+    let signal = |signal| {
+        for pid in &pids {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid), signal);
+        }
+    };
+
+    signal(nix::sys::signal::Signal::SIGSTOP);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!running.is_finished(), "the paused task finished anyway");
+    signal(nix::sys::signal::Signal::SIGCONT);
+
+    let finished = tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .expect("the resumed task never finished")
+        .unwrap();
+    assert_eq!(
+        finished.outcome,
+        AttemptOutcome::Exited { code: 0 },
+        "{finished:?}"
+    );
+    assert!(String::from_utf8_lossy(&finished.output.head).contains("done"));
+    assert!(
+        attempts.snapshot().is_empty(),
+        "a finished task stayed listed"
+    );
+    wait_until("the executor retires", || {
+        budget.available() == budget.capacity()
+    })
+    .await;
+}
+
 /// Warm capacity remains usable while its reservation is retained; queued
 /// commands must resolve secrets again after that wait, before execution.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

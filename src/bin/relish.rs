@@ -1518,19 +1518,19 @@ enum FaultAction {
         #[command(flatten)]
         targeting: reliaburger::relish::fault::FaultTargeting,
     },
-    /// Kill instances of a service (SIGKILL).
+    /// Kill instances of a service, or running attempts of a job (SIGKILL).
     Kill {
-        /// Target service or instance name.
+        /// Target service or job name.
         target: String,
-        /// Number of instances to kill (0 = all).
+        /// Number of instances or attempts to kill (0 = all).
         #[arg(long, default_value = "1")]
         count: u32,
         #[command(flatten)]
         targeting: reliaburger::relish::fault::FaultTargeting,
     },
-    /// Freeze instances of a service (SIGSTOP).
+    /// Freeze instances of a service, or running attempts of a job (SIGSTOP).
     Pause {
-        /// Target service name.
+        /// Target service or job name.
         target: String,
         /// Fault duration (default: 10m).
         #[arg(long)]

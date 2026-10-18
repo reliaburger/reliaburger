@@ -56,13 +56,52 @@ pub enum RoutingError {
     TaskIndexOnApp { service: String },
 }
 
-/// Stub.
+/// Work out from what runs whether a workload fault targets an app or a job,
+/// and scope it to match. Returns the candidates to plan with.
+///
+/// `apps` are the instances of an app with the target's name and namespace;
+/// `attempts` are the running attempts of a job with that name and
+/// namespace. Apps and jobs can't share a name in one namespace, so at most
+/// one list has anything in it. The request's own `workload` is overwritten:
+/// a caller can't label an app as a job to step around the replica rail.
+///
+/// For a job, a numeric `target_instance` (`relish fault --instance 3`) is a
+/// task index and moves into `task_index`.
 pub fn scope_workload_fault(
-    _request: &mut FaultRequest,
+    request: &mut FaultRequest,
     apps: Vec<WorkloadInstance>,
-    _attempts: Vec<WorkloadInstance>,
+    attempts: Vec<WorkloadInstance>,
 ) -> Result<Vec<WorkloadInstance>, RoutingError> {
-    Ok(apps)
+    let Some(kind) = attempts
+        .first()
+        .filter(|_| apps.is_empty())
+        .map(|attempt| attempt.kind)
+    else {
+        request.workload = WorkloadKind::App;
+        if request.task_index.is_some() {
+            return Err(RoutingError::TaskIndexOnApp {
+                service: request.target_service.clone(),
+            });
+        }
+        return Ok(apps);
+    };
+    request.workload = kind;
+    scope_to_task(request)?;
+    Ok(attempts)
+}
+
+/// Move a job fault's numeric `--instance` into its task index.
+pub fn scope_to_task(request: &mut FaultRequest) -> Result<(), RoutingError> {
+    if let Some(instance) = request.target_instance.take() {
+        let index = instance
+            .parse::<u32>()
+            .map_err(|_| RoutingError::NotATaskIndex {
+                job: request.target_service.clone(),
+                instance: instance.clone(),
+            })?;
+        request.task_index = Some(index);
+    }
+    Ok(())
 }
 
 /// Split a workload fault into one request per node that owns a target.
@@ -79,11 +118,12 @@ pub fn plan_workload_fault(
     let mut candidates: Vec<&WorkloadInstance> = instances
         .iter()
         .filter(|instance| instance.running)
-        .filter(|instance| {
-            request
+        .filter(|instance| match request.task_index {
+            Some(index) => instance.task_index == Some(index),
+            None => request
                 .target_instance
                 .as_deref()
-                .is_none_or(|target| target == instance.instance_id)
+                .is_none_or(|target| target == instance.instance_id),
         })
         .filter(|instance| {
             request
@@ -508,7 +548,11 @@ mod tests {
         let mut targeted = request(FaultType::Pause);
         targeted.target_service = "render".to_string();
         targeted.target_instance = Some("2".to_string());
-        let attempts = vec![attempt("node-1", 0), attempt("node-1", 1), attempt("node-2", 2)];
+        let attempts = vec![
+            attempt("node-1", 0),
+            attempt("node-1", 1),
+            attempt("node-2", 2),
+        ];
 
         let candidates = scope_workload_fault(&mut targeted, Vec::new(), attempts).unwrap();
         let plan = plan_workload_fault(&targeted, &candidates).unwrap();

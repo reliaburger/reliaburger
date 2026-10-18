@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::types::WorkloadKind;
 /// Safety rail evaluation for fault injection.
 ///
 /// Every fault must pass these checks before the leader approves it.
@@ -5,8 +7,6 @@
 /// can be overridden with explicit CLI flags (LeaderTargeted,
 /// NodePercentageExceeded).
 use super::types::{FaultRequest, FaultType, SafetyCheck, SafetyContext, SafetyViolation};
-#[cfg(test)]
-use super::types::WorkloadKind;
 
 /// Evaluate all safety rails for a proposed fault.
 ///
@@ -99,7 +99,8 @@ fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<
 /// the faults that take a replica out of service. A resource or network
 /// fault slows a replica down but leaves it serving, so the rail lets it
 /// through; the already-faulted count it compares against is the target's
-/// active pauses in the same namespace.
+/// active pauses in the same namespace. Only apps meet it: jobs and task
+/// arrays run to completion.
 fn check_replica_minimum(
     request: &FaultRequest,
     context: &SafetyContext,
@@ -108,7 +109,9 @@ fn check_replica_minimum(
         request.fault_type,
         FaultType::Kill { .. } | FaultType::Pause
     );
-    if !kills_instances {
+    // A job or task-array attempt is meant to finish, and a killed one is
+    // retried under its own policy: "keep one replica serving" doesn't apply.
+    if !kills_instances || context.workload.runs_to_completion() {
         return None;
     }
 

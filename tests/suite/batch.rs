@@ -47,6 +47,8 @@ struct HarnessOptions {
     log_sink: Option<mpsc::Sender<reliaburger::ketchup::types::LogRecord>>,
     log_store: Option<Arc<RwLock<reliaburger::ketchup::log_store::LogStore>>>,
     records_dir: Option<std::path::PathBuf>,
+    /// Serve the development test policy that admits workload faults.
+    workload_faults: bool,
 }
 
 pub(crate) struct Harness {
@@ -217,7 +219,20 @@ impl Harness {
             "http",
             256 * 1024 * 1024,
             false,
-            reliaburger::bun::capabilities::StaticCapabilities::default(),
+            if options.workload_faults {
+                reliaburger::bun::capabilities::StaticCapabilities {
+                    test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
+                        safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
+                        allowed_operations: std::collections::BTreeSet::from([
+                            reliaburger::testkit::safety::OperationPermission::InjectWorkloadFaults,
+                        ]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            } else {
+                reliaburger::bun::capabilities::StaticCapabilities::default()
+            },
             reliaburger::bun::readiness::ReadinessTracker::new(),
             None,
             None,
@@ -727,14 +742,21 @@ async fn batch_of_proc_jobs_completes_locally() {
 /// job retries it under its own policy, so the run still succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fault_kill_on_a_process_job_retries_it() {
-    let harness = Harness::start().await;
+    let harness = Harness::start_with(HarnessOptions {
+        workload_faults: true,
+        ..Default::default()
+    })
+    .await;
     // The first attempt sleeps far past the test's deadline; a retry exits 0.
+    // A process killed by a signal leaves no exit status, so the attempt is
+    // `Unknown`, which this job allows to run again.
     let jobs = jobs_from(
         r#"
         [job.flaky]
         runtime = "process"
         exec = "/bin/sh"
         command = ["-c", "if [ \"$RELIABURGER_TASK_ATTEMPT\" = 1 ]; then exec /bin/sleep 60; fi"]
+        replay_unknown = true
     "#,
     );
     let response = harness.client.submit_batch(&jobs, None).await.unwrap();

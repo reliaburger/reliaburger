@@ -3190,11 +3190,14 @@ shifts them along by one, which reaches every node in the first three cycles
 and every kind on every node in nine. The 8-hour final's eight node faults
 cover eight of those nine pairs.
 
-Why node-level faults only? `relish fault kill` against a job is refused by the
-same replica rail that protects apps, and an array's attempts inside a shared
-executor aren't anything Smoker can name. Making chaos job-aware is real work
-(#704, in 0.2.2). Killing Bun, delaying a node or filling its disk needs no
-per-job targeting, and it's what an operator's hardware does anyway.
+Why node-level faults only? In 0.2.0, `relish fault kill` against a job was
+refused by the same replica rail that protects apps, and an array's attempts
+inside a shared executor weren't anything Smoker could name. Killing Bun,
+delaying a node or filling its disk needs no per-job targeting, and it's what
+an operator's hardware does anyway. 0.2.2 made chaos job-aware (#704): a
+fault can now name a job and a task index, and the replica rail stands aside
+for work that is meant to finish. Chapter 8's "Faults for things that finish"
+tells how.
 
 Two measurements needed a little product code. A retry used to be a number:
 the bulk ledger keeps final outcomes, so when four fresh-container retries

@@ -275,6 +275,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/fault", Deployer, Body(FAULT)),
     gated(Delete, "/v1/fault", Deployer, Body(FAULT)),
     route(Get, "/v1/fault", AnyToken),
+    route(Get, "/v1/fault/attempts", AnyToken),
     gated(Delete, "/v1/fault/{id}", Deployer, Body(FAULT)),
     // Discovery + routing.
     route(Post, "/v1/discovery/retire", System),

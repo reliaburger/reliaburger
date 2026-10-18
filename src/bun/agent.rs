@@ -81,6 +81,7 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
+mod attempt_faults;
 mod commands;
 mod consumer;
 mod council_requests;
