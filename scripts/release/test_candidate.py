@@ -46,6 +46,14 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(set(record["assets"]), set(before))
         verify_run(self.run, self.identity["repository"], self.identity["commit"], 123)
 
+    def test_candidate_has_no_intel_macos_build(self):
+        # 0.2.1 is the last release with `relish-macos-x86_64` (#1018), so
+        # staging and promotion must not wait for one.
+        names = candidate_names(self.pins)
+        self.assertIn("relish-macos-aarch64", names)
+        self.assertNotIn("relish-macos-x86_64", names)
+        self.assertNotIn("relish-macos-x86_64.sig", names)
+
     def test_any_changed_missing_or_extra_asset_refuses_promotion(self):
         digest = self.record()
         for name in sorted(candidate_names(self.pins)):

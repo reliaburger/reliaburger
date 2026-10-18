@@ -25,12 +25,19 @@ requests, main and manual candidate builds:
 | `relish-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux CLI |
 | `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
 | `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
-| `relish-macos-x86_64` | macOS 15 Intel | CLI build; cold-install qualification still required |
 | `reliaburger-guest-ubuntu-24.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image |
 | `reliaburger-guest-ubuntu-24.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image |
 
 Pull requests build the guest images only when `build_guest_image.sh`,
 `guest-images.json` or the workflow changes.
+
+There's no Intel macOS build. 0.2.1 was the last release with
+`relish-macos-x86_64` (maintainer decision, 17 October 2026,
+[#1018](https://github.com/reliaburger/reliaburger/issues/1018)): nothing ever
+qualified it, Intel macOS runners are the scarcest on Actions, and the macOS
+CLI only drives Linux VMs anyway. The installer refuses an Intel Mac and
+points at a Linux host or at 0.2.1. The x86_64 guest image stays, because
+Linux x86_64 hosts use it.
 
 Native runners avoid depending on tools installed outside a cross-build
 container. Runner labels follow GitHub's
@@ -579,7 +586,7 @@ the real `curl … | sh` install against it on every host we advertise.
    again, and one whose bytes differ stops the run without changing anything.
    A rebuilt candidate (a new attempt) gets its own tag.
 
-3. **Qualify it on every host in the matrix**: Apple silicon, Intel macOS,
+3. **Qualify it on every host in the matrix**: macOS on Apple silicon,
    Linux x86_64 and Linux arm64. From a checkout of the same `main`:
 
    ```sh
