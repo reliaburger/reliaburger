@@ -11,8 +11,10 @@
 #   relish fault scenario examples/phase-8/container-chaos-scenario.toml --speed 2.0 --acknowledge
 #
 # Faults need rootful runc with eBPF on Linux (on macOS, the managed Linux
-# VM from `relish setup --quickstart`). The steps fault apps only; faults
-# against jobs are a separate feature.
+# VM from `relish setup --quickstart`). These steps fault the tour's apps.
+# Faults can also target a job or one task of a task array (for example
+# `relish fault kill render --instance 3`, and the array retries that task):
+# see "Jobs and task arrays" in manual 05.
 
 name = "Cache cascade"
 
