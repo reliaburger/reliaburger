@@ -37,6 +37,7 @@
   figures.forEach(function (figure) {
     var screen = figure.querySelector(".recording-screen");
     var speeds = figure.querySelector(".recording-speed");
+    var chapters = figure.querySelector(".recording-chapters");
     var cast = figure.getAttribute("data-cast");
     var poster = figure.getAttribute("data-poster");
     var player = null;
@@ -82,6 +83,7 @@
       playerAssets().then(function () {
         figure.classList.add("has-player");
         speeds.hidden = false;
+        if (chapters) chapters.hidden = false;
         create(0, false);
       }).catch(function () {
         started = false;
@@ -96,6 +98,16 @@
     speeds.addEventListener("click", function (event) {
       var button = event.target.closest("button[data-speed]");
       if (button) setSpeed(button);
+    });
+    // Chapters seek the original recording. Its timestamps and measured
+    // durations stay intact even when the visitor skips a stage.
+    if (chapters) chapters.addEventListener("click", function (event) {
+      var button = event.target.closest("button[data-start]");
+      if (!button || !player) return;
+      var at = Number(button.getAttribute("data-start"));
+      if (!Number.isFinite(at) || at < 0) return;
+      hasPlayed = true;
+      create(at, true);
     });
     // Start a screen or so early, so the poster frame is ready when it's seen.
     if (!("IntersectionObserver" in window)) {

@@ -200,7 +200,7 @@ fn render_result(result: &TraceResult, output: OutputFormat) -> Result<String, R
         OutputFormat::Json => {
             serde_json::to_string_pretty(result).map_err(RelishError::SerialiseJson)
         }
-        OutputFormat::Yaml => serde_yaml::to_string(result).map_err(RelishError::SerialiseYaml),
+        OutputFormat::Yaml => yaml_serde::to_string(result).map_err(RelishError::SerialiseYaml),
     }
 }
 

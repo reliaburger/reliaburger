@@ -66,10 +66,22 @@ pub enum UpgradeError {
     /// signature. Every node fetches the binary from Pickle, so every node
     /// would refuse it.
     #[error(
-        "cluster upgrades need an external signature: sign the binary with \
-         `relish dev sign-binary --external-key` before starting"
+        "cluster upgrades need an external signature: pass your key with \
+         `relish upgrade start <version> --external-key <key>`, or countersign the \
+         binary with `relish dev countersign-binary` and pass its envelope with --sig"
     )]
     ExternalSignatureRequired,
+
+    /// A node runs on a platform the upgrade carries no build for.
+    #[error("{node} runs on {platform}, but the upgrade carries builds only for {available}")]
+    NoBuildForPlatform {
+        /// `node n1`.
+        node: String,
+        /// `linux-aarch64`.
+        platform: String,
+        /// The platforms the upgrade has builds for, comma-separated.
+        available: String,
+    },
 
     /// Some nodes have no external key to verify a cluster upgrade with.
     #[error(

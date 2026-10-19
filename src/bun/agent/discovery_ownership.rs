@@ -1,20 +1,71 @@
 //! Durable publication ownership at the agent boundary.
 
 use super::{BunAgent, BunError, Grill};
-use crate::bun::discovery_owners::DiscoveryJournal;
+use crate::bun::discovery_owners::{DiscoveryInventory, DiscoveryJournal};
 
 /// Critical readiness subsystem that reports a fenced discovery journal. While
 /// it is degraded the node cannot publish, withdraw or retire services.
 pub(super) const DISCOVERY_JOURNAL_SUBSYSTEM: &str = "discovery:journal";
 
-/// Publication is either unconfigured, exclusively owned, or fenced after uncertainty.
+/// Publication is either unconfigured, exclusively owned, writing off the
+/// loop, or fenced after uncertainty.
 #[derive(Debug, Default)]
 pub(super) enum DiscoveryOwnership {
     #[default]
     Disabled,
     Ready(DiscoveryJournal),
     Recovered(DiscoveryJournal),
+    /// A consumer step's write outlasted its turn and goes on off the loop
+    /// (#890). The journal itself is inside the write's task until it lands.
+    Writing(Box<DiscoveryWrite>),
     Uncertain,
+}
+
+impl DiscoveryOwnership {
+    /// The inventory on disk: the journal's, or while a write is in flight,
+    /// the one before it. Only consumer steps leave a write in flight, and
+    /// they change only the consumer's ownership, so the services and
+    /// runtime references read the same either side of it.
+    pub(super) fn durable(&self) -> Option<&DiscoveryInventory> {
+        match self {
+            DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal) => {
+                Some(journal.inventory())
+            }
+            DiscoveryOwnership::Writing(write) => Some(&write.durable),
+            DiscoveryOwnership::Disabled | DiscoveryOwnership::Uncertain => None,
+        }
+    }
+}
+
+/// A discovery-journal write still running after its turn ended.
+#[derive(Debug)]
+pub(super) struct DiscoveryWrite {
+    /// The fsync'd persist, which hands the journal back when it lands.
+    task: tokio::task::JoinHandle<std::io::Result<DiscoveryJournal>>,
+    /// The inventory before this write, for readers meanwhile.
+    durable: DiscoveryInventory,
+    /// Whether the journal was recovered, so it goes back the same way.
+    recovered: bool,
+    /// Where to reopen the journal if the write fails.
+    directory: std::path::PathBuf,
+    /// The service the write's failure is reported against.
+    service: crate::onion::service_id::ServiceId,
+    /// When the write started, for the log line a slow one leaves.
+    started: std::time::Instant,
+}
+
+/// How a discovery write ended, as the loop's `select!` branch sees it.
+pub(super) type DiscoveryWriteOutcome =
+    Result<std::io::Result<DiscoveryJournal>, tokio::task::JoinError>;
+
+/// Whether a write a step started has landed, or goes on off the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Landing {
+    /// The write is durable (or there was nothing to write).
+    Landed,
+    /// The turn's runtime budget ran out first. The step's next part waits
+    /// for [`BunAgent::settle_discovery_write`].
+    InFlight,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -70,13 +121,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         held: &crate::grill::runc_intent::NetworkReference,
     ) -> JournalReference {
-        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
-            &self.discovery_ownership
-        else {
+        let Some(inventory) = self.discovery_ownership.durable() else {
             return JournalReference::Unknown;
         };
-        match journal
-            .inventory()
+        match inventory
             .references
             .iter()
             .find(|owner| owner.reference.instance_id == held.instance_id)
@@ -206,6 +254,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
+        // Decide against the journal itself, not the one before a write.
+        self.settle_discovery_write().await;
         // The original grant was fsynced before the runtime release. Replaying
         // that exact permission must also work while the leader is unavailable.
         if self.require_discovery_release_permission(reference).is_ok() {
@@ -292,6 +342,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
+        self.settle_discovery_write().await;
         let refuse = |reason: &str| BunError::BackendPublication {
             service: service.clone(),
             reason: reason.into(),
@@ -407,6 +458,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
+        self.settle_discovery_write().await;
         self.require_discovery_release_permission(reference)?;
         let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
             &self.discovery_ownership
@@ -441,10 +493,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         reference: &crate::grill::runc_intent::NetworkReference,
     ) -> Result<(), BunError> {
         use crate::bun::discovery_owners::ReferencePhase;
-        match &self.discovery_ownership {
-            DiscoveryOwnership::Disabled => Ok(()),
-            DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)
-                if journal.inventory().references.iter().any(|owner| {
+        if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+            return Ok(());
+        }
+        match self.discovery_ownership.durable() {
+            Some(inventory)
+                if inventory.references.iter().any(|owner| {
                     owner.reference == *reference
                         && owner.phase == ReferencePhase::ReleaseAuthorised
                 }) =>
@@ -458,21 +512,44 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Journal `update` and wait for it to land.
     pub(super) async fn update_discovery_inventory(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
-        update: impl FnOnce(&mut crate::bun::discovery_owners::DiscoveryInventory) + Send,
+        update: impl FnOnce(&mut DiscoveryInventory) + Send,
     ) -> Result<(), BunError> {
+        match self.write_discovery_inventory(id, update, None).await? {
+            Landing::Landed => Ok(()),
+            // With no deadline the write is waited for; this only settles
+            // what can't happen.
+            Landing::InFlight => {
+                self.settle_discovery_write().await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Journal `update`, waiting for the write until `deadline` at most:
+    /// [`Landing::InFlight`] when it ran out first, and the write goes on off
+    /// the loop (#890). `None` waits for the write however long it takes.
+    pub(super) async fn write_discovery_inventory(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        update: impl FnOnce(&mut DiscoveryInventory) + Send,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Landing, BunError> {
         let failure = |reason: String| BunError::BackendPublication {
             service: id.clone(),
             reason,
         };
+        // One write at a time, each from the state the last one left.
+        self.settle_discovery_write().await;
         self.reopen_uncertain_discovery().await;
         let (journal, recovered) = match &self.discovery_ownership {
-            DiscoveryOwnership::Disabled => return Ok(()),
+            DiscoveryOwnership::Disabled => return Ok(Landing::Landed),
             DiscoveryOwnership::Ready(journal) => (journal, false),
             DiscoveryOwnership::Recovered(journal) => (journal, true),
-            DiscoveryOwnership::Uncertain => {
+            DiscoveryOwnership::Writing(_) | DiscoveryOwnership::Uncertain => {
                 return Err(failure(
                     "discovery ownership is uncertain; recovery required".into(),
                 ));
@@ -486,15 +563,122 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .check(&next)
             .map_err(|error| failure(error.to_string()))?;
         let directory = journal.directory().to_owned();
+        // Readers see this while the write is in flight. A write the turn
+        // waits out never needs it, but which one it will be isn't known yet.
+        let durable = deadline.map(|_| journal.inventory().clone());
         let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
             std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain)
         else {
             return Err(failure("discovery ownership changed during update".into()));
         };
+        let started = std::time::Instant::now();
         #[cfg(test)]
-        self.loop_stalls.hold(super::LoopStall::Persist).await;
+        let stalls = std::sync::Arc::clone(&self.loop_stalls);
+        let mut task = tokio::spawn(async move {
+            #[cfg(test)]
+            stalls.hold(super::LoopStall::Persist).await;
+            journal.persist(next).await
+        });
+        let joined = match deadline {
+            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+            None => Some((&mut task).await),
+            Some(deadline) => tokio::time::timeout_at(deadline, &mut task).await.ok(),
+        };
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::JournalWrite,
+            started.elapsed(),
+        );
+        let Some(joined) = joined else {
+            let Some(durable) = durable else {
+                return Err(failure("discovery write lost its durable inventory".into()));
+            };
+            self.discovery_ownership = DiscoveryOwnership::Writing(Box::new(DiscoveryWrite {
+                task,
+                durable,
+                recovered,
+                directory,
+                service: id.clone(),
+                started,
+            }));
+            return Ok(Landing::InFlight);
+        };
+        self.finish_discovery_write(joined, recovered, directory, id)
+            .await
+            .map(|()| Landing::Landed)
+    }
+
+    /// Whether a consumer step's write is still going on off the loop.
+    pub(super) fn discovery_write_in_flight(&self) -> bool {
+        matches!(self.discovery_ownership, DiscoveryOwnership::Writing(_))
+    }
+
+    /// Resolves when the write in flight lands; never, if there is none.
+    /// The loop's `select!` waits on it, so a slow write holds no turn.
+    pub(super) async fn discovery_write_done(
+        ownership: &mut DiscoveryOwnership,
+    ) -> DiscoveryWriteOutcome {
+        match ownership {
+            DiscoveryOwnership::Writing(write) => (&mut write.task).await,
+            _ => std::future::pending().await,
+        }
+    }
+
+    /// Wait for a write a consumer step left in flight, and hand its result
+    /// to that step. Every journal write and every decision made against
+    /// the journal itself settles first.
+    pub(super) async fn settle_discovery_write(&mut self) {
+        let DiscoveryOwnership::Writing(write) = &mut self.discovery_ownership else {
+            return;
+        };
+        let waited = std::time::Instant::now();
         // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
-        match journal.persist(next).await {
+        let outcome = (&mut write.task).await;
+        // The write's own time was the earlier turn's; name this turn's wait
+        // for it, so a slow line adds up (#1100).
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::InFlightWrite,
+            waited.elapsed(),
+        );
+        self.land_discovery_write(outcome).await;
+    }
+
+    /// Take back the journal a write in flight returned, or fence discovery
+    /// if it failed, and hand the result to the consumer step waiting for it.
+    pub(super) async fn land_discovery_write(&mut self, outcome: DiscoveryWriteOutcome) {
+        let DiscoveryOwnership::Writing(write) =
+            std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain)
+        else {
+            return;
+        };
+        let DiscoveryWrite {
+            recovered,
+            directory,
+            service,
+            started,
+            ..
+        } = *write;
+        let took = started.elapsed();
+        eprintln!(
+            "bun: a discovery journal write took {} ms; the agent loop went on meanwhile",
+            took.as_millis()
+        );
+        let landed = self
+            .finish_discovery_write(outcome, recovered, directory, &service)
+            .await;
+        self.consumer_syncs.write_landed(landed);
+    }
+
+    /// Put the journal back after its write, or fence discovery after a
+    /// failed one.
+    async fn finish_discovery_write(
+        &mut self,
+        outcome: DiscoveryWriteOutcome,
+        recovered: bool,
+        directory: std::path::PathBuf,
+        id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        let persisted = outcome.unwrap_or_else(|error| Err(std::io::Error::other(error)));
+        match persisted {
             Ok(journal) => {
                 self.discovery_ownership = if recovered {
                     DiscoveryOwnership::Recovered(journal)
@@ -507,6 +691,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // The write may or may not have reached disk. Reopening later
                 // adopts whichever checkpoint is durable; the journal is written
                 // before any kernel or userspace effect, so either is safe.
+                self.discovery_ownership = DiscoveryOwnership::Uncertain;
                 self.discovery_reopen = Some((directory, recovered));
                 if let Some(readiness) = &self.readiness {
                     // LOOP-INLINE: in-memory lock, no I/O
@@ -516,7 +701,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .degraded(DISCOVERY_JOURNAL_SUBSYSTEM, error.to_string())
                         .await;
                 }
-                Err(failure(error.to_string()))
+                Err(BunError::BackendPublication {
+                    service: id.clone(),
+                    reason: error.to_string(),
+                })
             }
         }
     }
@@ -562,13 +750,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         has_records: bool,
         has_launches: bool,
     ) -> Result<(), BunError> {
-        match &self.discovery_ownership {
-            DiscoveryOwnership::Disabled | DiscoveryOwnership::Recovered(_) => Ok(()),
-            DiscoveryOwnership::Ready(journal)
+        let recovered = match &self.discovery_ownership {
+            DiscoveryOwnership::Disabled | DiscoveryOwnership::Recovered(_) => return Ok(()),
+            DiscoveryOwnership::Writing(write) => write.recovered,
+            DiscoveryOwnership::Ready(_) | DiscoveryOwnership::Uncertain => false,
+        };
+        match self.discovery_ownership.durable() {
+            _ if recovered => Ok(()),
+            Some(inventory)
                 if !has_records
                     && !has_launches
-                    && journal.inventory().services.is_empty()
-                    && journal.inventory().references.is_empty() =>
+                    && inventory.services.is_empty()
+                    && inventory.references.is_empty() =>
             {
                 Ok(())
             }

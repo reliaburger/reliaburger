@@ -162,7 +162,7 @@ async fn a_task_array_finishes_with_retries_and_a_lost_node() {
                     .filter(|n| n.alive)
                     .map(|n| NodeSlots { node: n.id.clone(), slots: SLOTS })
                     .collect();
-                for (holder, chunks) in plan_grants(&state, &slots) {
+                for (holder, chunks) in plan_grants(&state, &slots, true) {
                     state.grant(&holder, &chunks).unwrap();
                     dispatch(&nodes[&holder], &state, &chunks, &reports);
                     changed = true;

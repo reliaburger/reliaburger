@@ -457,9 +457,12 @@ mod tests {
     #[test]
     fn constrained_verify_accepts_a_fully_correct_token() {
         let (config, ikm, constraints) = constrained_setup();
-        let token = mint_jwt(&test_claims(), &config, &ikm).unwrap();
+        // One set of claims: `test_claims` reads the clock, so a second call
+        // that lands in the next second has a different `iat` and `exp` (#849).
+        let claims = test_claims();
+        let token = mint_jwt(&claims, &config, &ikm).unwrap();
         let decoded = verify_jwt_with_constraints(&token, &config, &constraints).unwrap();
-        assert_eq!(decoded, test_claims());
+        assert_eq!(decoded, claims);
     }
 
     #[test]

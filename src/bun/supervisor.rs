@@ -8,7 +8,6 @@ use std::net::Ipv4Addr;
 use std::time::Instant;
 
 use crate::config::app::AppSpec;
-use crate::config::job::JobSpec;
 use crate::grill::oci::OciSpec;
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
@@ -50,8 +49,6 @@ pub struct WorkloadInstance {
     /// Health check config, if any. Stored here to avoid borrow conflicts
     /// when the supervisor needs both the instance and the health checker.
     pub health_config: Option<HealthCheckConfig>,
-    /// Whether this instance is a job (run-to-completion) rather than an app.
-    pub is_job: bool,
     /// A failed execution needs cleanup or retry, rather than an explicit stop.
     pub retry_pending: bool,
     /// OCI image reference, e.g. "docker.io/library/nginx:latest".
@@ -64,6 +61,9 @@ pub struct WorkloadInstance {
     /// Path to the host directory where identity files are written.
     /// Bind-mounted into the container at `/run/reliaburger/identity/`.
     pub identity_mount: Option<std::path::PathBuf>,
+    /// Why the runtime refused to launch this instance (#881), shown by
+    /// `relish status` and `relish wtf`. Set only on a `Failed` instance.
+    pub launch_failure: Option<String>,
 }
 
 impl WorkloadInstance {
@@ -120,6 +120,9 @@ pub struct WorkloadSupervisor<G: Grill> {
     /// Process workload manager — validates exec binaries against the
     /// allowlist and manages script temp file lifecycle.
     process_manager: crate::grill::process_workload::ProcessManager,
+    /// Which host paths a volume or config-file `source` may mount
+    /// (`[storage] allowed_host_paths`); refuses every one by default.
+    host_paths: super::host_paths::HostPathPolicy,
     /// What this node can actually enforce (GPU, rootless limits).
     capabilities: PlatformCapabilities,
     budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
@@ -155,6 +158,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             health_checker: HealthChecker::new(),
             app_instances: HashMap::new(),
             process_manager: crate::grill::process_workload::ProcessManager::new(process_config),
+            host_paths: super::host_paths::HostPathPolicy::default(),
             capabilities: PlatformCapabilities::default(),
             budget: super::execution_budget::ExecutionBudget::new(crate::meat::Resources::new(
                 u64::MAX,
@@ -223,6 +227,27 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.capabilities.dns
     }
 
+    /// The host process workloads this node runs, as `admit_app` judges
+    /// them: the runtime must run host processes, mount isolation must be
+    /// off (#714), and only the allowlisted binaries run. The leader
+    /// places `exec` and `script` apps on this (#702).
+    pub fn process_capability(&self) -> crate::meat::cluster_state::ProcessWorkloadCapability {
+        let config = self.process_manager.config();
+        crate::meat::cluster_state::ProcessWorkloadCapability {
+            enabled: self
+                .grill
+                .supports_runtime(crate::grill::records::RuntimeKind::Process)
+                && !config.mount_isolation,
+            allowed_binaries: config.allowed_binaries.clone(),
+        }
+    }
+
+    /// Whether this node's runtime runs containers, which an image app
+    /// needs (#914). The leader places image apps only where it does.
+    pub fn runs_containers(&self) -> bool {
+        self.grill.runs_containers()
+    }
+
     /// Replace the process-workloads policy (host-exec/script allowlist,
     /// mount isolation, script dir). The binary feeds the parsed
     /// `[process_workloads]` config here so the deny-by-default allowlist
@@ -234,16 +259,79 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.process_manager = crate::grill::process_workload::ProcessManager::new(config);
     }
 
-    /// Full admission check for an app: host-exec/script allowlist, GPU
-    /// availability, rootless resource limits and egress enforcement.
-    /// Returns the first refusal.
+    /// Replace the host-path policy. The binary feeds the one built from
+    /// `node.toml` here; without it every host-path `source` is refused.
+    pub fn set_host_path_policy(&mut self, policy: super::host_paths::HostPathPolicy) {
+        self.host_paths = policy;
+    }
+
+    /// Full admission check for an app: host-exec/script allowlist, host-path
+    /// allowlist, GPU availability, rootless resource limits and egress
+    /// enforcement. Returns the first refusal.
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
+        self.admit_host_paths(app_name, spec)?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
-        self.admit_rootless_limits(app_name, spec.memory.is_some() || spec.cpu.is_some())?;
-        self.admit_egress(app_name, spec.egress.as_ref())?;
+        self.admit_rootless_limits(
+            app_name,
+            spec.memory.is_some() || spec.cpu.is_some(),
+            spec.exec.is_some() || spec.script.is_some(),
+        )?;
+        self.admit_egress(
+            app_name,
+            spec.egress.as_ref(),
+            spec.exec.is_some() || spec.script.is_some(),
+        )?;
+        self.admit_allow_from(app_name, spec.firewall.as_ref())?;
         self.admit_dns(app_name)?;
         Ok(())
+    }
+
+    /// Refuse a volume or config-file `source` this node's
+    /// `[storage] allowed_host_paths` doesn't cover, or one that overlaps the
+    /// node's own storage and security directories.
+    fn admit_host_paths(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
+        self.approve_host_paths(app_name, spec).map(|_| ())
+    }
+
+    /// Check every host-path `source` of `spec` again, just before its
+    /// container is built, and return the spec to build it from: one whose
+    /// sources are the resolved paths the check approved (#797). Every path
+    /// that builds an OCI spec for an app (a fresh instance, a rolling or
+    /// blue-green replacement) goes through this, so what runc mounts is what
+    /// the policy checked, not whatever a symlink points at by then.
+    pub(crate) fn approve_host_paths<'a>(
+        &self,
+        app_name: &str,
+        spec: &'a AppSpec,
+    ) -> Result<std::borrow::Cow<'a, AppSpec>, BunError> {
+        self.host_paths
+            .approve_app(spec)
+            .map_err(|refusal| BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!("host path refused: {refusal}"),
+            })
+    }
+
+    /// Refuse `allow_from` on a node that can't enforce namespace isolation.
+    /// Without the eBPF hooks every namespace already reaches every other,
+    /// so a grant would describe a boundary that isn't there; refusing it
+    /// is the same fail-closed rule an egress allowlist follows.
+    fn admit_allow_from(
+        &self,
+        name: &str,
+        firewall: Option<&crate::config::app::FirewallSpec>,
+    ) -> Result<(), BunError> {
+        if firewall.is_none_or(|firewall| firewall.allow_from.is_empty())
+            || self.capabilities.egress.can_enforce_isolation()
+        {
+            return Ok(());
+        }
+        Err(BunError::DeployFailed {
+            app_name: name.to_string(),
+            reason: "allow_from requires namespace isolation, which needs the eBPF connect and sendmsg hooks and a runtime that binds the namespace before start (rootful Linux runc with [ebpf] enabled)"
+                .to_string(),
+        })
     }
 
     /// A DNS-enabled node may not create workloads until the resolver is both
@@ -269,6 +357,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         &self,
         app_name: &str,
         policy: Option<&crate::config::app::EgressSpec>,
+        host: bool,
     ) -> Result<(), BunError> {
         let Some(policy) = policy else {
             return Ok(());
@@ -280,7 +369,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                     .to_string(),
             });
         }
-        if policy.allow.is_empty() || self.capabilities.egress.can_enforce_allowlist() {
+        if policy.allow.is_empty() || (!host && self.capabilities.egress.can_enforce_allowlist()) {
             return Ok(());
         }
         Err(BunError::DeployFailed {
@@ -343,31 +432,21 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a GPU-requesting workload the node can't back (D15): either
-    /// `gpu_enabled = false` or the detector found no GPU. Makes
-    /// `gpu_enabled` effective instead of a silent lie.
+    /// Refuse every GPU-requesting workload (D41). Nothing passes a device
+    /// into the container yet and nothing counts which card a workload holds,
+    /// so admitting one would start it without its GPU. `relish apply`
+    /// refuses the request first; this is the node's second line, whatever
+    /// its `gpu_enabled` setting or detected cards say.
     fn admit_gpu(&self, app_name: &str, requested: u32) -> Result<(), BunError> {
         if requested == 0 {
             return Ok(());
         }
-        if !self.capabilities.gpu_enabled {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: "workload requests a GPU but GPU support is disabled on this node \
-                         ([resources] gpu_enabled = false)"
-                    .to_string(),
-            });
-        }
-        if self.capabilities.gpu_count < requested {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "workload requests {requested} gpu(s) but this node has {} available",
-                    self.capabilities.gpu_count
-                ),
-            });
-        }
-        Ok(())
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!(
+                "workload requests {requested} gpu(s), but GPU workloads aren't supported yet (#359)"
+            ),
+        })
     }
 
     /// Refuse a limit-requiring workload the node can't enforce (M22).
@@ -379,7 +458,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// - a ProcessGrill node (the process runtime never reads
     ///   `spec.linux.resources` at all — a rootful node without runc falls back
     ///   to it and would otherwise accept and ignore the limit).
-    fn admit_rootless_limits(&self, app_name: &str, has_limits: bool) -> Result<(), BunError> {
+    fn admit_rootless_limits(
+        &self,
+        app_name: &str,
+        has_limits: bool,
+        host: bool,
+    ) -> Result<(), BunError> {
         if !has_limits {
             return Ok(());
         }
@@ -391,7 +475,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                     .to_string(),
             });
         }
-        if self.grill.runtime_kind() == crate::grill::records::RuntimeKind::Process {
+        if self.grill.runtime_kind_for_host(host) == crate::grill::records::RuntimeKind::Process {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
                 reason: "workload declares cpu/memory limits but this node runs the process \
@@ -410,30 +494,6 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// instances are actually probed.
     pub fn register_health(&mut self, id: InstanceId, config: HealthCheckConfig, now: Instant) {
         self.health_checker.register(id, config, now);
-    }
-
-    /// Preserve the kind of every retained runtime owner before admitting work.
-    pub(crate) fn admit_workload_kind(
-        &self,
-        name: &str,
-        namespace: &str,
-        kind: super::deploy_operations::DeployTargetKind,
-    ) -> Result<(), BunError> {
-        let is_job = kind == super::deploy_operations::DeployTargetKind::Job;
-        if let Some(existing) = self.instances.values().find(|instance| {
-            instance.app_name == name
-                && instance.namespace == namespace
-                && instance.is_job != is_job
-        }) {
-            let owner = if existing.is_job { "job" } else { "app" };
-            return Err(BunError::DeployFailed {
-                app_name: name.into(),
-                reason: format!(
-                    "{namespace}/{name} is owned by an existing {owner}; apps and jobs must use distinct names"
-                ),
-            });
-        }
-        Ok(())
     }
 
     /// Keep textual IDs from replacing a different structured workload owner.
@@ -480,18 +540,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(instance_ids)
     }
 
-    /// Add `count` Pending replicas to an app that already runs, beside its
-    /// existing ones, for a deploy that only raises the replica count. They
-    /// take the assigned ordinals no owned instance uses, or on a standalone
-    /// node the lowest unused ones.
-    pub async fn add_app_replicas(
-        &mut self,
+    /// The ordinals [`WorkloadSupervisor::add_app_replicas`] gives `count` replicas
+    /// added to an app: the assigned ordinals no owned instance uses, or on
+    /// a standalone node the lowest unused ones.
+    pub fn ordinals_to_add(
+        &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
         count: u32,
-        now: Instant,
-    ) -> Result<Vec<InstanceId>, BunError> {
+    ) -> Vec<u32> {
         // An ordinal is in use whatever generation its instance is in: after
         // a rolling deploy the replicas are `{app}-g{gen}-{ordinal}`.
         let used: std::collections::HashSet<u32> = self
@@ -507,11 +565,26 @@ impl<G: Grill> WorkloadSupervisor<G> {
             Some(ordinals) => ordinals.clone(),
             None => (0..used.len() as u32 + count).collect(),
         };
-        let indices: Vec<u32> = candidates
+        candidates
             .into_iter()
             .filter(|index| !used.contains(index))
             .take(count as usize)
-            .collect();
+            .collect()
+    }
+
+    /// Add `count` Pending replicas to an app that already runs, beside its
+    /// existing ones, for a deploy that only raises the replica count. They
+    /// take the assigned ordinals no owned instance uses, or on a standalone
+    /// node the lowest unused ones.
+    pub async fn add_app_replicas(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        count: u32,
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        let indices = self.ordinals_to_add(app_name, namespace, spec, count);
         let added = self
             .create_app_instances(app_name, namespace, spec, &indices, now)
             .await?;
@@ -535,11 +608,6 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // Refuse anything this node can't honour before we allocate a thing:
         // an un-allowlisted host binary/script, a GPU we don't have, or a
         // resource limit rootless can't enforce.
-        self.admit_workload_kind(
-            app_name,
-            namespace,
-            super::deploy_operations::DeployTargetKind::App,
-        )?;
         self.admit_app(app_name, spec)?;
 
         // Preflight the whole fleet before reserving a port for any replica.
@@ -594,22 +662,17 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 None
             };
 
-            let health_config = if let Some(ref health_spec) = spec.health {
-                let app_port = match spec.port {
-                    Some(port) => port,
-                    None => {
-                        for port in &allocated_ports {
-                            let _ = self.port_allocator.release(*port).await;
-                        }
-                        return Err(BunError::NoPortForHealthCheck {
-                            app_name: app_name.to_string(),
-                        });
-                    }
-                };
-                Some(HealthCheckConfig::from_spec(health_spec, app_port))
-            } else {
-                None
-            };
+            // `health.port` is enough; only a health check with no port at
+            // all (which validation refuses) can't be probed.
+            let health_config = HealthCheckConfig::for_app(spec);
+            if spec.health.is_some() && health_config.is_none() {
+                for port in &allocated_ports {
+                    let _ = self.port_allocator.release(*port).await;
+                }
+                return Err(BunError::NoPortForHealthCheck {
+                    app_name: app_name.to_string(),
+                });
+            }
 
             prepared.push(WorkloadInstance {
                 id: instance_id,
@@ -624,12 +687,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 created_at: now,
                 restart_policy: RestartPolicy::default(),
                 health_config,
-                is_job: false,
                 retry_pending: false,
                 image: spec.image.clone().unwrap_or_default(),
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
+                launch_failure: None,
             });
         }
 
@@ -649,80 +712,6 @@ impl<G: Grill> WorkloadSupervisor<G> {
 
         self.resource_leases.extend(leases);
         Ok(instance_ids)
-    }
-
-    /// Check every predictable job admission rule without creating an instance.
-    /// Owned batch groups use this same gate before publishing any checkpoint.
-    pub(crate) fn admit_job(
-        &self,
-        job_name: &str,
-        namespace: &str,
-        spec: &JobSpec,
-    ) -> Result<(), BunError> {
-        self.admit_workload_kind(
-            job_name,
-            namespace,
-            super::deploy_operations::DeployTargetKind::Job,
-        )?;
-        // Same admission gate as apps (jobs have no GPU field, so only the
-        // host-exec/script allowlist and rootless-limit checks apply).
-        self.admit_process_workload(job_name, spec.exec.as_deref(), spec.script.as_deref())?;
-        self.admit_rootless_limits(job_name, spec.memory.is_some() || spec.cpu.is_some())?;
-
-        let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
-        self.admit_instance_identity(&instance_id, job_name, namespace)?;
-
-        Ok(())
-    }
-
-    /// Deploy a job, creating a single workload instance in Pending state.
-    ///
-    /// Jobs are run-to-completion tasks: no port allocation, no health
-    /// checks, and a finite restart budget (3 retries by default).
-    pub async fn deploy_job(
-        &mut self,
-        job_name: &str,
-        namespace: &str,
-        spec: &JobSpec,
-        now: Instant,
-    ) -> Result<Vec<InstanceId>, BunError> {
-        self.admit_job(job_name, namespace, spec)?;
-        let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
-
-        let request = crate::meat::Resources::new(
-            spec.cpu.map_or(0, |r| r.request),
-            spec.memory.map_or(0, |r| r.request),
-            0,
-        );
-        self.reserve_execution(instance_id.clone(), request)?;
-        let instance = WorkloadInstance {
-            id: instance_id.clone(),
-            app_name: job_name.to_string(),
-            namespace: namespace.to_string(),
-            state: ContainerState::Pending,
-            health_counters: HealthCounters::new(),
-            restart_count: 0,
-            last_restart: None,
-            host_port: None,
-            container_ip: None,
-            created_at: now,
-            restart_policy: RestartPolicy::for_job(3),
-            health_config: None,
-            is_job: true,
-            retry_pending: false,
-            image: spec.image.clone().unwrap_or_default(),
-            oci_spec: None,
-            identity: None,
-            identity_mount: None,
-        };
-
-        self.instances.insert(instance_id.clone(), instance);
-        self.app_instances.insert(
-            (job_name.to_string(), namespace.to_string()),
-            vec![instance_id.clone()],
-        );
-
-        Ok(vec![instance_id])
     }
 
     /// Cancel retries and move nonterminal instances towards observed shutdown.
@@ -1007,6 +996,145 @@ mod tests {
             run_as_user: None,
             run_as_group: None,
         }
+    }
+
+    /// The audit scenario (#676): a deployer in `team-a` names team B's
+    /// managed volume as a host-path source. Even an operator who allowlists a
+    /// parent of the volumes directory can't open that path.
+    #[tokio::test]
+    async fn a_host_path_into_another_namespaces_volume_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let mut node = crate::config::NodeConfig::default();
+        node.storage.volumes = root.path().join("volumes");
+        node.storage.allowed_host_paths = vec![root.path().to_path_buf()];
+        std::fs::create_dir_all(node.storage.volumes.join("team-b/db")).unwrap();
+        let mut sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        sup.set_host_path_policy(super::super::host_paths::HostPathPolicy::from_node_config(
+            &node,
+        ));
+        let mut thief = basic_app_spec(None);
+        thief.volumes = vec![crate::config::types::VolumeSpec {
+            path: "/steal".into(),
+            source: Some(node.storage.volumes.join("team-b/db")),
+            size: None,
+        }];
+        let error = sup
+            .deploy_app("thief", "team-a", &thief, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no workload may mount"),
+            "{error}"
+        );
+        assert!(sup.list_instances().is_empty());
+    }
+
+    /// The same refusal on a real runc node (#676): nothing reaches runc, so
+    /// no bundle is written and runc owns no container for the app.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires runc and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted() {
+        assert!(
+            std::env::var("RELIABURGER_RUNC_TESTS").is_ok(),
+            "set RELIABURGER_RUNC_TESTS=1 after installing runc"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let owner = std::env::var_os("RELIABURGER_BUN_BINARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                // Unit tests run from target/<profile>/deps; Bun is built beside it.
+                let executable = std::env::current_exe().unwrap();
+                executable.parent().unwrap().parent().unwrap().join("bun")
+            });
+        let grill = crate::grill::runc::RuncGrill::new(
+            root.path().join("bundles"),
+            crate::grill::ImageStore::new(root.path().join("images")),
+            false,
+            root.path().join("state"),
+            owner,
+        )
+        .unwrap();
+        let mut node = crate::config::NodeConfig::default();
+        node.storage.volumes = root.path().join("volumes");
+        std::fs::create_dir_all(node.storage.volumes.join("team-b/db")).unwrap();
+        std::fs::create_dir_all(root.path().join("import")).unwrap();
+        let mut sup = WorkloadSupervisor::new(grill, PortAllocator::new(42000, 43000));
+        let thief = |source: std::path::PathBuf| {
+            let mut spec = basic_app_spec(None);
+            spec.volumes = vec![crate::config::types::VolumeSpec {
+                path: "/steal".into(),
+                source: Some(source),
+                size: None,
+            }];
+            spec
+        };
+
+        let unlisted = thief(root.path().join("import"));
+        let error = sup
+            .deploy_app("thief", "team-a", &unlisted, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("allowed_host_paths"), "{error}");
+
+        node.storage.allowed_host_paths = vec![root.path().to_path_buf()];
+        sup.set_host_path_policy(super::super::host_paths::HostPathPolicy::from_node_config(
+            &node,
+        ));
+        let crossing = thief(node.storage.volumes.join("team-b/db"));
+        let error = sup
+            .deploy_app("thief", "team-a", &crossing, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no workload may mount"),
+            "{error}"
+        );
+
+        assert!(sup.list_instances().is_empty());
+        assert!(
+            sup.grill()
+                .launch_inventory()
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            std::fs::read_dir(root.path().join("bundles"))
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_path_source_is_refused_without_an_allowlist_and_admitted_under_one() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("import");
+        let mut sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        let mut app = basic_app_spec(None);
+        app.config_file = vec![crate::config::types::ConfigFileSpec {
+            path: "/etc/app.yaml".into(),
+            content: None,
+            source: Some(import.join("app.yaml").to_string_lossy().into_owned()),
+        }];
+        let error = sup.admit_app("web", &app).unwrap_err();
+        assert!(error.to_string().contains("allowed_host_paths"), "{error}");
+        sup.set_host_path_policy(super::super::host_paths::HostPathPolicy::new(
+            vec![import],
+            vec![root.path().join("volumes")],
+        ));
+        sup.admit_app("web", &app).unwrap();
+        // A managed volume needs no allowlist entry at all.
+        let mut managed = basic_app_spec(None);
+        managed.volumes = vec![crate::config::types::VolumeSpec {
+            path: "/data".into(),
+            source: None,
+            size: None,
+        }];
+        WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000))
+            .admit_app("db", &managed)
+            .unwrap();
     }
 
     fn app_spec_with_health(port: u16) -> AppSpec {
@@ -1413,82 +1541,6 @@ mod tests {
         assert_eq!(ids.len(), 1);
     }
 
-    // -- deploy_job -----------------------------------------------------------
-
-    fn basic_job_spec() -> crate::config::job::JobSpec {
-        toml::from_str(
-            r#"
-            image = "myapp:v1"
-            command = ["echo", "done"]
-        "#,
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn workload_kind_collision_preserves_existing_instances() {
-        for job_first in [false, true] {
-            let mut supervisor = test_supervisor();
-            let app = basic_app_spec(None);
-            let job = basic_job_spec();
-            let now = Instant::now();
-            let ids = if job_first {
-                supervisor
-                    .deploy_job("same", "default", &job, now)
-                    .await
-                    .unwrap()
-            } else {
-                supervisor
-                    .deploy_app("same", "default", &app, now)
-                    .await
-                    .unwrap()
-            };
-            let result = if job_first {
-                supervisor.deploy_app("same", "default", &app, now).await
-            } else {
-                supervisor.deploy_job("same", "default", &job, now).await
-            };
-            assert!(result.is_err(), "opposite kind replaced the original owner");
-            assert_eq!(supervisor.get_instance(&ids[0]).unwrap().is_job, job_first);
-            assert_eq!(supervisor.list_instances().len(), ids.len());
-        }
-    }
-
-    #[tokio::test]
-    async fn deploy_job_creates_pending_instance() {
-        let mut sup = test_supervisor();
-        let now = Instant::now();
-        let spec = basic_job_spec();
-
-        let ids = sup
-            .deploy_job("migrate", "default", &spec, now)
-            .await
-            .unwrap();
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0], InstanceId("default__migrate-0".to_string()));
-
-        let instance = sup.get_instance(&ids[0]).unwrap();
-        assert_eq!(instance.state, ContainerState::Pending);
-        assert!(instance.is_job);
-        assert!(instance.host_port.is_none());
-        assert!(instance.health_config.is_none());
-    }
-
-    #[tokio::test]
-    async fn deploy_job_has_finite_restart_policy() {
-        let mut sup = test_supervisor();
-        let now = Instant::now();
-        let spec = basic_job_spec();
-
-        let ids = sup
-            .deploy_job("migrate", "default", &spec, now)
-            .await
-            .unwrap();
-
-        let instance = sup.get_instance(&ids[0]).unwrap();
-        assert_eq!(instance.restart_policy.max_restarts, Some(3));
-    }
-
     // -- process-workload admission (D17/H8) ---------------------------------
 
     fn exec_app_spec(binary: &str) -> AppSpec {
@@ -1646,6 +1698,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allow_from_refused_when_isolation_cannot_be_enforced() {
+        let firewall = crate::config::app::FirewallSpec {
+            allow_from: vec!["frontend/web".to_string()],
+        };
+        let mut sup = test_supervisor();
+        let mut app = basic_app_spec(None);
+        app.firewall = Some(firewall.clone());
+        let err = sup
+            .deploy_app("api", "default", &app, Instant::now())
+            .await
+            .expect_err("a node without the eBPF hooks can't open a cross-namespace path");
+        assert!(
+            matches!(&err, BunError::DeployFailed { reason, .. } if reason.contains("allow_from")),
+            "{err}"
+        );
+        assert!(sup.list_instances().is_empty());
+
+        // An empty allow_from asks for nothing beyond default isolation.
+        app.firewall = Some(crate::config::app::FirewallSpec {
+            allow_from: Vec::new(),
+        });
+        sup.deploy_app("api", "default", &app, Instant::now())
+            .await
+            .unwrap();
+
+        sup.set_egress_capability(crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        });
+        app.firewall = Some(firewall.clone());
+        sup.deploy_app("db", "default", &app, Instant::now())
+            .await
+            .expect("an enforcing node admits allow_from");
+    }
+
+    #[tokio::test]
     async fn unimplemented_franchise_egress_is_refused_not_run_unrestricted() {
         let mut sup = test_supervisor();
         sup.set_egress_capability(crate::sesame::egress::EgressEnforcementCapability {
@@ -1711,7 +1802,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gpu_workload_runs_when_gpu_available() {
+    async fn gpu_workload_refused_even_where_a_gpu_is_detected() {
+        // D41: without device passthrough a `gpu = 1` workload would start
+        // with no device, and two of them would share one card on paper.
+        // Validation refuses it first; this is the agent's second line.
         let mut sup = test_supervisor();
         sup.set_capabilities(PlatformCapabilities {
             gpu_count: 2,
@@ -1722,11 +1816,11 @@ mod tests {
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
-        let ids = sup
+        let err = sup
             .deploy_app("trainer", "default", &spec, Instant::now())
             .await
-            .expect("a GPU workload should run where a device exists");
-        assert_eq!(ids.len(), 1);
+            .unwrap_err();
+        assert!(err.to_string().contains("#359"), "{err}");
     }
 
     #[tokio::test]
@@ -1847,5 +1941,104 @@ mod tests {
 
         assert!(matches!(err, BunError::DeployFailed { .. }));
         assert!(sup.list_instances().is_empty());
+    }
+    #[test]
+    fn mixed_admission_keeps_the_host_allowlist_and_limit_refusals() {
+        let root = tempfile::tempdir().unwrap();
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runtime = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mut sup = WorkloadSupervisor::new(runtime, PortAllocator::new(30000, 31000));
+        let mut host = basic_app_spec(None);
+        host.image = None;
+        host.exec = Some("/bin/sh".into());
+        assert!(sup.admit_app("host", &host).is_err());
+        sup.set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/sh".into()],
+            mount_isolation: false,
+            script_dir: root.path().join("scripts"),
+        });
+        sup.admit_app("host", &host).unwrap();
+        host.memory = Some(crate::config::types::ResourceRange::parse_memory("64Mi").unwrap());
+        assert!(
+            sup.admit_app("host", &host)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot enforce")
+        );
+        let mut image = basic_app_spec(None);
+        image.memory = host.memory;
+        sup.admit_app("image", &image).unwrap();
+    }
+
+    #[test]
+    fn mixed_admission_does_not_promise_container_egress_enforcement_for_host_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runtime = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mut sup = WorkloadSupervisor::with_process_config(
+            runtime,
+            PortAllocator::new(30000, 31000),
+            crate::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                script_dir: root.path().join("scripts"),
+            },
+        );
+        sup.set_capabilities(PlatformCapabilities {
+            egress: crate::sesame::egress::EgressEnforcementCapability {
+                connect_ipv4: true,
+                connect_ipv6: true,
+                udp_ipv4: true,
+                udp_ipv6: true,
+                pre_start: true,
+            },
+            ..Default::default()
+        });
+        let mut host = crate::config::Config::parse(
+            "[app.host]\nexec='/bin/sh'\n[app.host.egress]\nallow=['example.com:443']",
+        )
+        .unwrap()
+        .app
+        .remove("host")
+        .unwrap();
+        assert!(sup.admit_app("host", &host).is_err());
+        host.exec = None;
+        host.image = Some("fixture:v1".into());
+        sup.admit_app("image", &host).unwrap();
+    }
+
+    /// #914: the leader places image apps only on nodes that say they run
+    /// containers. A process runtime doesn't; runc, Apple Container and the
+    /// mixed runtime do.
+    #[test]
+    fn a_node_runs_containers_only_when_its_runtime_does() {
+        let root = tempfile::tempdir().unwrap();
+        let process = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        assert!(!process.runs_containers());
+
+        let runc = MockGrill::new();
+        runc.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let runc = WorkloadSupervisor::new(runc, PortAllocator::new(30000, 31000));
+        assert!(runc.runs_containers());
+
+        let image = MockGrill::new();
+        image.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let mixed = crate::grill::mixed::MixedGrill::new(
+            image,
+            MockGrill::new(),
+            root.path().join("routes"),
+        );
+        let mixed = WorkloadSupervisor::new(mixed, PortAllocator::new(30000, 31000));
+        assert!(mixed.runs_containers());
     }
 }

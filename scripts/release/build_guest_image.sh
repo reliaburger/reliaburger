@@ -177,7 +177,7 @@ umount "$root"
 losetup -d "$loop"
 loop=""
 
-# zlib, not zstd: Lima 2.1.0 reads zlib-compressed qcow2 natively but has
+# zlib, not zstd: Lima 2.2.1 (like 2.1.0) reads zlib-compressed qcow2 natively but has
 # no zstd decompressor for qcow2 clusters.
 qemu-img convert -c -O qcow2 -o compression_type=zlib "$work/disk.raw" "$work/$asset"
 mv "$work/$asset" "${output%/}/$asset"

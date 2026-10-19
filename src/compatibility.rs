@@ -79,12 +79,76 @@ pub struct Compatibility {
 /// ownership ranges, duration buckets and indexed result pages (47/64).
 /// Reusable job definitions, immutable run provenance and atomic schedule
 /// occurrence claims in the common execution store (48/65, #638).
+/// Explicit per-job runtimes replacing inferred execution and container
+/// isolation (50/67, #639). The decaying recent-duration histogram that grant
+/// lookahead learns from (`TaskArrayState::recent_duration_counts`), which
+/// travels in Raft snapshots as well as on disk (51/68).
+/// 0.2.1, cluster safety (52/69): one bump for the whole release, made when
+/// the train opened. Each 0.2.1 change to the wire or durable state adds its
+/// line below this one, not another bump.
+/// GitOps ownership and configuration in Raft (`DesiredState::gitops_owned`
+/// and `gitops_config`, `SyncState::warnings`, and the `GitOpsWrite`,
+/// `GitOpsConfigSet`, `TestLeaseAppDelete` and `TestLeaseNamespaceDelete`
+/// requests, #693).
+/// Recovery ids (#694): `DesiredState::recovery_id` in snapshots, the
+/// fence record's `recovery_id` and `split_with`, `sender_recovery_id` on
+/// every Raft RPC and `recovery_id` in its fenced reply, and the gossip
+/// directory extension's `recovery_id`.
+/// Registry durability (#697): the manifest catalogue's `untagged_at`,
+/// `DeleteTag::deleted_at_unix_ms` (deleting a tag now untags), the
+/// `ExpireManifest` request and `RegistryMutation::DeleteTag`; the registry
+/// `Usage` query is gone.
+/// Node-by-node rollouts and `RolloutFailed` (`DesiredState::rollouts`, the
+/// `RolloutFailed` and `RolloutReleased` requests, `StateReport::rollouts`,
+/// `NodeAssignment::held`, `/v1/rollouts/failed` and the
+/// `ApplyEvent::RolloutAborted` stream event, #692).
+/// Scheduler policy (#702): each node's process-workload policy in its
+/// capability report (`NodeCapabilities::process`), the apps placed only in
+/// part (`RaftRequest::Unschedulable`, `DesiredState::unschedulable` and
+/// `DesiredAppEvidence::unschedulable`), and the `placement` event kind.
+/// The capability report's `RegistryCapabilityEvidence::needs_mtls` (#792).
+/// Gossip robustness (#696): `GossipMessage::sequence` for replay
+/// protection, `GossipPayload::Ack::relayed_for` (a relay forwards an ACK in
+/// its own name) in place of `relayed`, and the reporting
+/// `ReportingMessage::AggregatedReport` variant is gone.
+/// The pinned eBPF map inventory gains `cgroup_source_map`, and `firewall_map`
+/// sources with bit 63 set name a job's run identity (#737).
+/// Compacted task results (#739): a worker rewrites a finished run's ledger
+/// and live index into `task-arrays/<id>/results`, 14-byte slots, and
+/// deletes both, so a finished run no longer has a ledger to replay.
+/// The gossip directory extension's `jobs`, each node's job capability
+/// summary, which the leader's job admission reads (#788).
+/// App config fields (#701): applying an `AppSpec` without `[autoscale]`
+/// clears its override and narrowed bounds clamp it, an `AutoscaleOverride`
+/// for an app that doesn't autoscale is refused, `OciSpec::initialiser` marks
+/// an init container's spec, managed-volume sidecars record `size_bytes`, and
+/// inline config files move to a per-instance directory.
+/// A task-array node's control fence is `control.fence`, two checksummed
+/// slots rewritten in place, not `control.json` (#745).
+/// API token hashes are SHA-256 digests of the full token, not Argon2id, and
+/// `ApiToken`, `PreviousSecret` and `TokenRotation` lose `token_salt`, so
+/// tokens must be reissued on the fresh 0.2.1 cluster (#912).
+/// Each array's grant fence is `grants.fence`, not `grants.json`, and both
+/// fences share one slot format: magic, generation, payload length, payload
+/// and CRC32, two slots of a power-of-two stride of at least 512 bytes (#902).
+/// A refused launch's `reason` on `/v1/status` instance rows (#881).
+/// The process owner record's `gate`, what the execution gate reported
+/// about its `exec`, and the gate's stdin is now a socket pair (#905).
+/// The capability report's `NodeCapabilities::containers`, and the
+/// `no_container_runtime` unschedulable reason in council state (#914).
+/// Workload OCI specs carry `process.oomScoreAdj`, including the ones in
+/// process owner and runc adoption records (#984).
+/// The state report's `CapacityRefusal::ordinals`, the replicas a node
+/// couldn't start, so a refused scale-up moves only those (#971).
+/// The Raft `log.redb` and `snapshot.redb` files are redb's v3 file format
+/// (redb 4), which can't open the v2 files redb 2 wrote (#1024).
 /// The appliance OS rollout (a new Raft request and a new field in council
 /// state) and the cluster-wide council size (`RaftRequest::CouncilSize` and
-/// `DesiredState::council_size`) on the 0.3.0 train (49/66).
+/// `DesiredState::council_size`) on the 0.3.0 train (54/71). The train skips
+/// 53/70, which the 0.2.2 train already carries for its own formats.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 49,
-    state: 66,
+    protocol: 54,
+    state: 71,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -323,15 +387,22 @@ mod tests {
     }
 
     /// The generations before the appliance OS rollout and the cluster-wide
-    /// council size: main's job definitions (#638).
+    /// council size: main's 0.2.1 cluster safety formats.
     const BEFORE_APPLIANCE: Compatibility = Compatibility {
-        protocol: 48,
-        state: 65,
+        protocol: 52,
+        state: 69,
+    };
+
+    /// The 0.2.2 train's generation, which the appliance train skips.
+    const PATCH_TRAIN: Compatibility = Compatibility {
+        protocol: 53,
+        state: 70,
     };
 
     #[test]
     fn peers_and_state_from_before_the_appliance_train_are_refused() {
         assert!(BEFORE_APPLIANCE.require_current().is_err());
+        assert!(PATCH_TRAIN.require_current().is_err());
         let directory = tempfile::tempdir().unwrap();
         let stamp = directory.path().join(STATE_STAMP);
         let old = format!(r#"{{"format":{}}}"#, BEFORE_APPLIANCE.state);
@@ -340,6 +411,26 @@ mod tests {
             ensure_state_compatible(directory.path()),
             Err(CompatibilityError::StateMismatch { found, expected, .. })
                 if found == BEFORE_APPLIANCE.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
+    }
+
+    #[test]
+    fn peers_and_state_from_before_the_decaying_histogram_are_refused() {
+        // #654's head wrote task-array snapshots without the recent histogram.
+        const BEFORE_RECENT_DURATIONS: Compatibility = Compatibility {
+            protocol: 50,
+            state: 67,
+        };
+        assert!(BEFORE_RECENT_DURATIONS.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_RECENT_DURATIONS.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_RECENT_DURATIONS.state && expected == CURRENT.state
         ));
         assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }

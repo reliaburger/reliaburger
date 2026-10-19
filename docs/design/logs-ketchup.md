@@ -180,7 +180,7 @@ The differences from earlier drafts are load-bearing:
 
 ### 4.3 Export and Retention Configuration
 
-The shipped log config is small (`LogsSection` in `src/config/node.rs`): `retention_days` (default 7), `export_path` (optional), `export_interval_secs` (default 3600), `max_storage_mb` (default 0 = unlimited). See §6.
+The shipped log config is small (`LogsSection` in `src/config/node.rs`): `retention_days` (default 7), `export_path` (optional), `export_interval_secs` (default 3600), `max_storage_mb` (default 2048; `0` explicitly opts out of the cap). See §6.
 
 **Status of the richer config below: planned -- not yet implemented.** There is no `LogExportConfig` struct, no `ExportFormat` (the export format is Parquet-as-is, **not** `jsonl.gz`), no `apps`/`fields` include/exclude selection, no `compressed_retention_days`, and no `ByteSize` string parser (`max_storage_mb` is a plain integer of megabytes). Export ships the ZSTD-Parquet files unchanged so an exported archive is queryable with the same DataFusion path as local logs.
 
@@ -272,7 +272,7 @@ s3://my-bucket/logs/<node>/logs_NNNNNN.parquet
 Retention is the same Parquet-file model as Mayo (`src/bun/disk_pressure.rs`, `check_and_relieve`), keyed on `retention_days` and `max_storage_mb`:
 
 1. If `export_path` is set, un-exported Parquet files are shipped to the destination first; only files whose exact bytes are recorded in the export checkpoint become eligible for deletion.
-2. Files are pruned **oldest-first by mtime** when past `retention_days` or when total size exceeds `max_storage_mb` (0 = unlimited, so only the retention cutoff applies).
+2. Files are pruned **oldest-first by mtime** when past `retention_days` or when total size exceeds `max_storage_mb` (2048 MB by default; `0` is an explicit "unlimited", so only the retention cutoff applies).
 
 **Status of the compression lifecycle: planned -- not yet implemented.** There is no `.log`→`.log.zst` compression step (Parquet is already ZSTD-compressed at write time), no separate `compressed_retention_days`, no per-app byte counter, no `log.storage_exhausted` alert, and no `relish events --type log-retention` stream. Pruning deletes whole Parquet files.
 
@@ -301,9 +301,11 @@ retention_days = 7
 # How often to export (seconds). Default: 3600 (1 hour).
 export_interval_secs = 3600
 
-# Maximum local log Parquet storage (MB). 0 = unlimited (the default).
-# When exceeded, exported files are pruned oldest-first.
-max_storage_mb = 0
+# Maximum local log Parquet storage (MB). Default: 2048. 0 = unlimited.
+# When exceeded, files are pruned oldest-first (exported ones only, when
+# export_path is set). Bun refuses to start with a cap larger than the
+# filesystem holding its data directory.
+max_storage_mb = 2048
 ```
 
 **Status: planned -- not yet implemented (none of these keys exist).** `compressed_retention_days`, `index_interval`, `compression_level`, `compression_frame_size`, `maintenance_interval`, the `[logs.export]` sub-table with `format = "jsonl.gz"`/`apps`/`fields`, and per-app overrides (`[app.*]` `logs.retention_days`/`logs.max_line_length`/`logs.suppress_stderr`). `max_storage` is not a byte-size string; it is the integer `max_storage_mb`. Export format is Parquet, not `jsonl.gz`.
@@ -314,7 +316,7 @@ max_storage_mb = 0
 |-----------|---------|-----------|
 | `retention_days` | 7 | Covers a typical on-call rotation; a week of logs enables post-incident review. |
 | `export_interval_secs` | 3600 | Hourly export keeps the object-store archive current without excessive churn. |
-| `max_storage_mb` | 0 (unlimited) | Off by default; set it to cap local log growth, at which point exported files are pruned oldest-first. |
+| `max_storage_mb` | 2048 | On by default since 0.2.0 (#678): singleton jobs stream their output into Ketchup under `run-<id>`, and at job rates the seven-day cutoff alone fills an ordinary disk. `0` is an explicit opt-out; a cap larger than the data filesystem is refused at startup. |
 
 ---
 
@@ -324,7 +326,7 @@ max_storage_mb = 0
 
 **Trigger:** local log Parquet exceeds `max_storage_mb`, or `retention_days` elapses.
 
-**Response (`src/bun/disk_pressure.rs`):** if `export_path` is set, un-exported files are shipped first (and only checkpoint-recorded files become deletable); then files are pruned oldest-first by mtime while past retention or over the size cap. With `max_storage_mb = 0` only the retention cutoff prunes.
+**Response (`src/bun/disk_pressure.rs`):** if `export_path` is set, un-exported files are shipped first (and only checkpoint-recorded files become deletable); then files are pruned oldest-first by mtime while past retention or over the size cap. With `max_storage_mb = 0` (an explicit opt-out; the default is 2048) only the retention cutoff prunes.
 
 The emergency per-app line-dropping, the `log.storage_exhausted` alert, and the `relish events` drop counter from earlier drafts are **planned -- not yet implemented**. There is no `ENOSPC`-triggered eviction path; pruning runs on the periodic pressure check.
 

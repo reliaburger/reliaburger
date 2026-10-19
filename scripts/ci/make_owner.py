@@ -238,8 +238,9 @@ def execute(root, directory, context, entry, *, tools=None, environment=None, ru
     # The helper base contains the common preapproved profile; Make appends only
     # the original recipe suffix. Archived owners keep their original options.
     archived = entry.get('archive_origin') is not None
-    prefix = w.ARCHIVED_SELECTORS if archived else ['--profile', 'ci']
-    suffix, _ = w.make_selection(root, entry['owner_command'][1], archived=archived)
+    split = entry.get('partition')
+    prefix = (w.ARCHIVED_SELECTORS if archived else ['--profile', 'ci']) + (['--partition', split] if split else [])
+    suffix, _ = w.make_selection(root, entry['owner_command'][1], archived=archived, partition=split)
     c.require(suffix == entry['selectors'], 'current Make selection changed')
     configuration = dict(root=str(root), directory=str(directory), expected=expected,
                          nonce=expected['nonce'])
@@ -306,11 +307,20 @@ def evidence(expected, directory, required):
     c.require(child_row['discovery_exit'] == 0 and child_row['exit_code'] == 0, 'Make child failed')
     c.require(c.digest(directory / 'discovery.json') == child_row['discovery_sha256']
               and c.digest(directory / 'junit.xml') == child_row['junit_sha256'], 'Make payload changed')
-    selected = c.selected(c.read_json(directory / 'discovery.json'))
+    discovery = c.read_json(directory / 'discovery.json')
     passed = c.passed_junit(directory / 'junit.xml')
-    c.require(passed <= selected and bool(required) and set(required) <= selected
-              and set(required) <= passed, 'required Make cases absent or incomplete')
-    return set(required)
+    if expected['entry'].get('partition') is None:
+        selected = c.selected(discovery)
+        c.require(passed <= selected and bool(required) and set(required) <= selected
+                  and set(required) <= passed, 'required Make cases absent or incomplete')
+        return set(required)
+    # One shard owes the required cases nextest put in its partition; the
+    # aggregator checks that the shards together cover every test once.
+    selected, everything = c.partitioned(discovery)
+    owed = set(required) & selected
+    c.require(passed <= selected and bool(required) and set(required) <= everything
+              and owed <= passed, 'required Make cases absent or incomplete in this shard')
+    return owed
 
 
 def main():

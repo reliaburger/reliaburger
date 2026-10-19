@@ -21,6 +21,7 @@ pub(super) struct SessionForm {
 /// is read-only regardless of the token's role.
 pub(super) async fn ui_session_handler(
     State(auth): State<crate::sesame::auth::AuthState>,
+    tls: Option<axum::Extension<crate::sesame::connection::TlsTransport>>,
     axum::Form(form): axum::Form<SessionForm>,
 ) -> Response {
     // Accept the internal service token or any valid user token. The session
@@ -45,15 +46,12 @@ pub(super) async fn ui_session_handler(
             None,
         ))
     } else {
-        // Snapshot the tokens under the lock, then verify through the same
-        // bounded path as a bearer (B12): a malformed token is refused by a
-        // string check before any hashing, and a well-shaped one waits for a
-        // permit from the process-wide Argon2 semaphore. This route is
-        // unauthenticated, so calling Argon2 directly here would let anyone on
-        // the network pin every core and exhaust memory with junk logins.
-        let tokens = auth.tokens.read().await.clone();
-        crate::sesame::auth::authenticate_off_lock(&form.token, tokens.clone())
-            .await
+        // Verify through the same path as a bearer (B12): a malformed token
+        // is refused by a string check before any hashing, and a well-shaped
+        // one costs a single SHA-256 (#912), so junk logins on this
+        // unauthenticated route can't pin the CPU or memory.
+        let tokens = auth.tokens.read().await;
+        crate::sesame::auth::authenticate(&form.token, &tokens)
             .ok()
             .map(|ctx| {
                 // A session opened with a rotated-out secret lives no longer
@@ -88,10 +86,11 @@ pub(super) async fn ui_session_handler(
     // The cookie lives no longer than the session, which lives no longer
     // than the token.
     let cookie = format!(
-        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
         crate::sesame::session::SESSION_COOKIE,
         session.id,
-        session.lifetime.as_secs()
+        session.lifetime.as_secs(),
+        secure_attribute(tls.is_some()),
     );
     (
         [(axum::http::header::SET_COOKIE, cookie)],
@@ -100,9 +99,17 @@ pub(super) async fn ui_session_handler(
         .into_response()
 }
 
+/// The cookie's `Secure` attribute when the API serves TLS, so a browser
+/// never sends the session over plain HTTP. A plaintext development API
+/// can't set it: the browser would then never send the cookie back at all.
+fn secure_attribute(over_tls: bool) -> &'static str {
+    if over_tls { "; Secure" } else { "" }
+}
+
 /// Clear the current session (logout).
 pub(super) async fn ui_logout_handler(
     State(auth): State<crate::sesame::auth::AuthState>,
+    tls: Option<axum::Extension<crate::sesame::connection::TlsTransport>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(id) = headers
@@ -113,8 +120,9 @@ pub(super) async fn ui_logout_handler(
         auth.sessions.remove(id).await;
     }
     let cleared = format!(
-        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-        crate::sesame::session::SESSION_COOKIE
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        crate::sesame::session::SESSION_COOKIE,
+        secure_attribute(tls.is_some()),
     );
     (
         [(axum::http::header::SET_COOKIE, cleared)],
@@ -632,4 +640,68 @@ pub(super) async fn fragment_batches_handler(
 ) -> Response {
     let rows = crate::bun::task_array_api::summaries(&state, auth.as_deref()).await;
     html_response(crate::brioche::dashboard::render_batches(&rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    /// Log in once and return the `Set-Cookie` header the browser receives.
+    async fn login_cookie(app: Router, plaintext: &str, over_tls: bool) -> String {
+        let mut request = axum::http::Request::post("/ui/session")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(format!("token={plaintext}")))
+            .unwrap();
+        if over_tls {
+            request
+                .extensions_mut()
+                .insert(crate::sesame::connection::TlsTransport);
+        }
+        let response = app.oneshot(request).await.unwrap();
+        response
+            .headers()
+            .get("set-cookie")
+            .expect("login sets a cookie")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn session_cookie_is_secure_over_tls() {
+        let created = crate::sesame::token::create_token(
+            "viewer",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+        );
+        let secure = login_cookie(app.clone(), &created.plaintext, true).await;
+        assert!(secure.contains("; Secure"), "{secure}");
+        assert!(secure.contains("HttpOnly"), "{secure}");
+        // A plaintext development API can't mark it Secure, or the browser
+        // would never send it back.
+        let plain = login_cookie(app, &created.plaintext, false).await;
+        assert!(!plain.contains("Secure"), "{plain}");
+    }
 }

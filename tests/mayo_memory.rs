@@ -100,11 +100,15 @@ async fn collect(store: &mut MayoStore, keys: &[MetricKey], from: u64, minutes: 
 }
 
 /// One alert evaluation and one rollup, measured: (peak above the starting
-/// heap, heap left behind).
+/// heap, heap left behind). Both reads judge the history against the test's
+/// own `now`, the instant it was written against, not the wall clock: writing
+/// four hours of history takes tens of seconds on a loaded host, long enough
+/// for the newest samples to fall outside the alert read's 90-second
+/// freshness bound if it read the clock itself (#763).
 async fn periodic_cycle(store: &MayoStore, rollups: &RollupGenerator, now: u64) -> (usize, isize) {
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
-    let latest = gather_latest_values(store).await;
+    let latest = gather_latest_values(store, now).await;
     let rollup = rollups.generate(store, now).await.unwrap();
     assert!(!latest.is_empty(), "the alert read found no fresh series");
     assert!(!rollup.entries.is_empty(), "the rollup found no samples");

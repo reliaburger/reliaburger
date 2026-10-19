@@ -7,10 +7,11 @@
 //! (no council) apply the same writes to an in-memory copy, so there's one
 //! set of rules either way.
 //!
-//! The writes are few by design: one `Register` per submission, at most one
-//! `Sync` per array per leader tick (carrying every finished chunk and every
-//! new grant since the last one), and a `Cancel` or `Requeue` when those
-//! happen. A million tasks cost a few hundred entries, not millions.
+//! The writes are few by design: one `Register` per submission, one `Tick`
+//! per leader tick (carrying every array's finished chunks, new grants and
+//! lost-node requeues since the last one), and a `Cancel` when someone
+//! cancels. A million tasks cost a few hundred entries, not millions, and
+//! sixty-four busy arrays still cost one entry a second.
 
 use std::collections::BTreeMap;
 
@@ -23,16 +24,44 @@ use super::types::NodeId;
 use crate::config::job::JobSpec;
 
 /// How long a finished array stays readable (status, results, logs)
-/// before a later registration prunes it.
+/// before the leader's retention write (or a later registration) prunes it.
 pub const TERMINAL_RETENTION_SECS: u64 = 3600;
 
-/// Most finished arrays kept, newest first. Each can hold up to about
-/// 160 KiB of failed-index ranges, so this bounds the snapshot too.
-pub const MAX_TERMINAL_ARRAYS: usize = 20;
+/// Most finished arrays kept across the cluster. Each can hold up to about
+/// 160 KiB of failed-index ranges, so this bounds the snapshot too. When
+/// more finish, the namespace keeping the most loses its oldest first, so a
+/// busy namespace can't push out a quiet one's runs.
+pub const MAX_TERMINAL_ARRAYS: usize = 24;
 
-/// Most arrays running at once. The leader syncs every node for every
-/// running array once a second, so this bounds that work.
-pub const MAX_ACTIVE_ARRAYS: usize = 64;
+/// Most finished arrays one namespace keeps. A definition's outcome history
+/// outlives this; the run's details (results, logs) don't.
+pub const MAX_TERMINAL_PER_NAMESPACE: usize = 20;
+
+/// Most runs active at once across the cluster. The leader syncs every node
+/// for every running array once a second, and every active run sits in the
+/// replicated state, so this bounds both. The state-size test
+/// `control_state_stays_within_budget_at_the_global_cap` justifies the number.
+pub const MAX_ACTIVE_ARRAYS: usize = 128;
+
+/// Active-run slots only cron fires and deployment jobs may use. Arrays,
+/// batches and manual runs stop at `MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS`,
+/// so bulk work can never lock out schedules and deployments.
+pub const RESERVED_TRIGGERED_RUNS: usize = 32;
+
+/// Most active arrays, batches and manual runs one namespace may hold, so one
+/// tenant can't take every slot. Cron fires and deployment jobs don't count.
+pub const MAX_ACTIVE_RUNS_PER_NAMESPACE: usize = 64;
+
+/// Most progress writes one `Tick` entry may carry. A tick with every
+/// active run, each with a sync, a quota note and a few lost nodes, fits;
+/// the leader splits a larger one across entries.
+pub const MAX_TICK_WRITES: usize = 1024;
+
+/// Longest reason an [`TaskArrayWrite::Unrunnable`] write may record.
+pub const MAX_UNRUNNABLE_REASON_BYTES: usize = 1024;
+
+/// Most named jobs in one finite batch (`relish batch` with several jobs).
+pub const MAX_FINITE_BATCH_JOBS: usize = 64;
 
 /// One submitted array: what to run, and how far it has got.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,15 +76,107 @@ pub struct TaskArrayRecord {
     pub state: TaskArrayState,
     /// Timestamp of the accepted terminal transition, supplied by the leader.
     pub terminal_at_epoch_secs: Option<u64>,
+    /// Why the leader is granting this run nothing more: its namespace quota
+    /// is used up. Cleared once a grant fits again or the run finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_blocked: Option<crate::meat::quota::QuotaError>,
+    /// Why the run failed without starting: every node refused it for
+    /// good (see [`TaskArrayWrite::Unrunnable`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrunnable: Option<String>,
 }
 
 /// One homogeneous resource profile in a mixed submission.
+///
+/// People write the count and policy flat beside the profile's name, so the
+/// serialised form is [`CohortWire`]. Serde can't combine `flatten` with
+/// `deny_unknown_fields`, and a flattened policy silently ignored typos such as
+/// `max_attempt = 1`; spelling every field out lets the wire form refuse them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "CohortWire", into = "CohortWire")]
 pub struct ManifestCohort {
+    /// Profile name, unique within the manifest.
     pub name: String,
-    #[serde(flatten)]
+    /// Count and policy for this profile's array.
     pub spec: TaskArraySpec,
+    /// What every task of this profile runs.
     pub template: JobSpec,
+}
+
+/// The flat, strict wire form of a [`ManifestCohort`]. Each field mirrors one
+/// of [`TaskArraySpec`]'s, with the same defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortWire {
+    name: String,
+    #[serde(default = "default_cohort_count")]
+    count: u32,
+    #[serde(default = "default_cohort_chunk_size")]
+    chunk_size: u32,
+    #[serde(default = "default_cohort_max_attempts")]
+    max_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_failed_indexes: Option<u32>,
+    #[serde(default = "default_cohort_task_timeout_secs")]
+    task_timeout_secs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    per_node_concurrency: Option<u32>,
+    template: JobSpec,
+}
+
+fn default_cohort_count() -> u32 {
+    TaskArraySpec::with_count(1).count
+}
+fn default_cohort_chunk_size() -> u32 {
+    TaskArraySpec::with_count(1).chunk_size
+}
+fn default_cohort_max_attempts() -> u8 {
+    TaskArraySpec::with_count(1).max_attempts
+}
+fn default_cohort_task_timeout_secs() -> u32 {
+    TaskArraySpec::with_count(1).task_timeout_secs
+}
+
+impl From<CohortWire> for ManifestCohort {
+    fn from(wire: CohortWire) -> Self {
+        Self {
+            name: wire.name,
+            spec: TaskArraySpec {
+                count: wire.count,
+                chunk_size: wire.chunk_size,
+                max_attempts: wire.max_attempts,
+                max_failed_indexes: wire.max_failed_indexes,
+                task_timeout_secs: wire.task_timeout_secs,
+                per_node_concurrency: wire.per_node_concurrency,
+            },
+            template: wire.template,
+        }
+    }
+}
+
+impl From<ManifestCohort> for CohortWire {
+    fn from(cohort: ManifestCohort) -> Self {
+        // Destructure without `..` so a new policy field fails to compile
+        // here until the wire form carries it too.
+        let TaskArraySpec {
+            count,
+            chunk_size,
+            max_attempts,
+            max_failed_indexes,
+            task_timeout_secs,
+            per_node_concurrency,
+        } = cohort.spec;
+        Self {
+            name: cohort.name,
+            count,
+            chunk_size,
+            max_attempts,
+            max_failed_indexes,
+            task_timeout_secs,
+            per_node_concurrency,
+            template: cohort.template,
+        }
+    }
 }
 /// Durable mapping from a manifest's profile names to stable array identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,6 +229,13 @@ pub enum TaskArrayWrite {
     Job(Box<super::job::JobWrite>),
     /// Persist the latest observed UTC minute independently of matching schedules.
     CronObserve { minute: i64 },
+    /// Drop finished runs past retention. The leader writes this on a timer
+    /// so an idle cluster still forgets them and workers delete their files.
+    /// Both values come from the write, so every replica drops the same runs.
+    Prune {
+        now_epoch_secs: u64,
+        retention_secs: u64,
+    },
     /// Retain a conservative run's ownership when its outcome cannot be established.
     Unknown { batch_id: u64, node: NodeId },
     /// An operator acknowledged repeating an unknown owner's side effects.
@@ -121,6 +249,9 @@ pub enum TaskArrayWrite {
     RegisterManifest {
         name: String,
         namespace: String,
+        /// The submission's `Idempotency-Key`: a retry with the same key and
+        /// content returns the existing runs instead of admitting new ones.
+        request_id: String,
         cohorts: Vec<ManifestCohort>,
         submitted_at_epoch_secs: u64,
     },
@@ -154,9 +285,64 @@ pub enum TaskArrayWrite {
         node: NodeId,
         now_epoch_secs: u64,
     },
+    /// The leader held grants back for the namespace quota (`Some`), or no
+    /// longer does (`None`).
+    QuotaBlocked {
+        batch_id: u64,
+        reason: Option<crate::meat::quota::QuotaError>,
+    },
+    /// Every node the leader can reach refused the array for good (its
+    /// allowlist, runtime or `mount_isolation`): fail it now, every queued
+    /// task not run, instead of leaving it queued until someone notices.
+    /// A run that has already stopped is left as it is.
+    Unrunnable {
+        batch_id: u64,
+        reason: String,
+        now_epoch_secs: u64,
+    },
+    /// One leader tick's progress for every array, in one entry: `Sync`,
+    /// `Requeue`, `Unknown`, `Unrunnable` and `QuotaBlocked` writes, at most
+    /// [`MAX_TICK_WRITES`]. Each applies on its own, so one refused array
+    /// doesn't drop the others.
+    Tick { writes: Vec<TaskArrayWrite> },
 }
 
 impl TaskArrayWrite {
+    /// The array a progress write is about (`None` for every other kind).
+    pub fn progress_batch_id(&self) -> Option<u64> {
+        match self {
+            Self::Sync { batch_id, .. }
+            | Self::Requeue { batch_id, .. }
+            | Self::Unknown { batch_id, .. }
+            | Self::Unrunnable { batch_id, .. }
+            | Self::QuotaBlocked { batch_id, .. } => Some(*batch_id),
+            _ => None,
+        }
+    }
+
+    /// Fill in the leader's clock where the write (or, for a `Tick`, each
+    /// of its writes) left it at zero.
+    pub fn stamp(&mut self, now: u64) {
+        match self {
+            Self::Sync { now_epoch_secs, .. }
+            | Self::Cancel { now_epoch_secs, .. }
+            | Self::Requeue { now_epoch_secs, .. }
+            | Self::Unrunnable { now_epoch_secs, .. }
+            | Self::Replay { now_epoch_secs, .. }
+            | Self::CancelManifest { now_epoch_secs, .. }
+                if *now_epoch_secs == 0 =>
+            {
+                *now_epoch_secs = now;
+            }
+            Self::Tick { writes } => {
+                for write in writes {
+                    write.stamp(now);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// IDs required by an atomic registration; progress writes allocate none.
     pub fn registration_ids(&self) -> usize {
         match self {
@@ -174,6 +360,8 @@ pub enum TaskArrayApplied {
     JobRecorded,
     /// A new array exists under this id.
     Registered { batch_id: u64 },
+    /// A run's quota-blocked reason changed.
+    QuotaRecorded,
     /// A sync went through. Refused items are stale (a lost node's late
     /// report, a grant raced by a cancel) and are skipped, not fatal.
     Synced {
@@ -187,6 +375,8 @@ pub enum TaskArrayApplied {
     /// These chunks went back to the queue (or were written off, if the
     /// array had stopped).
     Requeued { chunks: IndexRangeSet },
+    /// A tick applied; these of its writes were refused, by array.
+    Ticked { refused: Vec<(u64, String)> },
 }
 
 /// Why a write was refused as a whole.
@@ -202,8 +392,37 @@ pub enum TaskArrayStoreError {
     Invalid(#[from] TaskArraySpecError),
     #[error("a task array needs a name")]
     EmptyName,
-    #[error("{active} task arrays are already running; the limit is {MAX_ACTIVE_ARRAYS}")]
-    TooManyActive { active: usize },
+    #[error(
+        "{active} runs are already active; arrays, batches and manual runs may use {limit} \
+         of the {MAX_ACTIVE_ARRAYS} slots, the rest are kept for cron fires and deployments"
+    )]
+    TooManyActive { active: usize, limit: usize },
+    #[error(
+        "namespace {namespace:?} already has {active} active runs; the limit is \
+         {MAX_ACTIVE_RUNS_PER_NAMESPACE} per namespace"
+    )]
+    NamespaceFull { namespace: String, active: usize },
+}
+
+/// Which share of the active-run slots a new run may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Arrays, batches and manual runs: bounded per namespace, and kept out
+    /// of the reserved headroom.
+    Bulk,
+    /// Cron fires and deployment jobs: may use every slot.
+    Triggered,
+}
+
+impl Admission {
+    fn of(trigger: Option<&super::job::RunTrigger>) -> Self {
+        match trigger {
+            Some(super::job::RunTrigger::Cron { .. } | super::job::RunTrigger::Hook { .. }) => {
+                Self::Triggered
+            }
+            Some(super::job::RunTrigger::Manual { .. }) | None => Self::Bulk,
+        }
+    }
 }
 
 /// The replicated set of task arrays, keyed by batch id.
@@ -409,6 +628,72 @@ impl TryFrom<ArraysWire> for TaskArrays {
     }
 }
 
+/// One finished run, or one manifest with all its profiles, as pruning
+/// sees it.
+struct RetentionUnit<'a> {
+    finished_at: u64,
+    id: u64,
+    parent: bool,
+    namespace: &'a str,
+}
+
+/// Which finished units `prune` drops, given units sorted oldest first:
+/// everything past the retention window (normally [`TERMINAL_RETENTION_SECS`]), then each namespace's
+/// oldest beyond [`MAX_TERMINAL_PER_NAMESPACE`], then, while more than
+/// [`MAX_TERMINAL_ARRAYS`] remain, the oldest of whichever namespace keeps
+/// the most. Deterministic, so every replica drops the same units.
+fn retention_evictions(
+    terminal: &[RetentionUnit<'_>],
+    now_epoch_secs: u64,
+    retention_secs: u64,
+) -> Vec<(u64, bool)> {
+    let mut evicted = Vec::new();
+    let mut kept: BTreeMap<&str, std::collections::VecDeque<(u64, bool)>> = BTreeMap::new();
+    for unit in terminal {
+        if now_epoch_secs.saturating_sub(unit.finished_at) > retention_secs {
+            evicted.push((unit.id, unit.parent));
+        } else {
+            kept.entry(unit.namespace)
+                .or_default()
+                .push_back((unit.id, unit.parent));
+        }
+    }
+    for units in kept.values_mut() {
+        while units.len() > MAX_TERMINAL_PER_NAMESPACE {
+            evicted.extend(units.pop_front());
+        }
+    }
+    let mut total: usize = kept.values().map(|units| units.len()).sum();
+    while total > MAX_TERMINAL_ARRAYS {
+        // `max_by_key` keeps the last maximum it sees; walking backwards
+        // makes a tie go to the first namespace by name on every replica.
+        let Some(units) = kept.values_mut().rev().max_by_key(|units| units.len()) else {
+            break;
+        };
+        evicted.extend(units.pop_front());
+        total -= 1;
+    }
+    evicted
+}
+
+/// Digest of everything a manifest admits, so a retry can prove it names the
+/// same work as the receipt it matches.
+fn manifest_digest(write: &TaskArrayWrite) -> Result<String, TaskArrayStoreError> {
+    use sha2::{Digest, Sha256};
+    let TaskArrayWrite::RegisterManifest {
+        name,
+        namespace,
+        cohorts,
+        ..
+    } = write
+    else {
+        return Err(TaskArrayStoreError::Manifest("not a manifest".into()));
+    };
+    let bytes = serde_json::to_vec(&(name, namespace, cohorts))
+        .map_err(|error| TaskArrayStoreError::Manifest(error.to_string()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 impl TaskArrays {
     /// Apply one write. `allocate_id` is called only for a registration
     /// that will succeed, so a refused one doesn't burn an id.
@@ -473,13 +758,49 @@ impl TaskArrays {
                 self.cron_observed_minute = self.cron_observed_minute.max(Some(*minute));
                 Ok(TaskArrayApplied::JobRecorded)
             }
+            TaskArrayWrite::Prune {
+                now_epoch_secs,
+                retention_secs,
+            } => {
+                self.prune_within(*now_epoch_secs, *retention_secs);
+                Ok(TaskArrayApplied::JobRecorded)
+            }
             TaskArrayWrite::Job(write) => self.apply_job(write, allocate_id),
+            TaskArrayWrite::Tick { writes } => {
+                if writes.len() > MAX_TICK_WRITES
+                    || writes
+                        .iter()
+                        .any(|write| write.progress_batch_id().is_none())
+                {
+                    return Err(TaskArrayStoreError::Job(format!(
+                        "a tick carries at most {MAX_TICK_WRITES} progress writes"
+                    )));
+                }
+                // Each progress write checks everything before it changes
+                // anything, so a refused one leaves its array as it was.
+                let mut refused = Vec::new();
+                for write in writes {
+                    // A function pointer, not a closure: a closure here would be a
+                    // new type for every `allocate_id`, and `apply` would recurse
+                    // through them for ever at compile time.
+                    let no_ids: fn() -> u64 = || 0;
+                    if let Err(error) = self.apply(write, no_ids) {
+                        let batch_id = write.progress_batch_id().unwrap_or_default();
+                        refused.push((batch_id, error.to_string()));
+                    }
+                }
+                Ok(TaskArrayApplied::Ticked { refused })
+            }
             TaskArrayWrite::RegisterManifest {
                 name,
                 namespace,
+                request_id,
                 cohorts,
                 submitted_at_epoch_secs,
             } => {
+                if let Some(batch_id) = self.manifest_replay(write)? {
+                    return Ok(TaskArrayApplied::Registered { batch_id });
+                }
                 if !crate::config::valid_workload_label(name)
                     || !crate::config::valid_workload_label(namespace)
                     || cohorts.is_empty()
@@ -508,11 +829,7 @@ impl TaskArrays {
                         "manifest exceeds the task-count bound".into(),
                     ));
                 }
-                if self.active().count() + cohorts.len() > MAX_ACTIVE_ARRAYS {
-                    return Err(TaskArrayStoreError::TooManyActive {
-                        active: self.active().count(),
-                    });
-                }
+                self.check_capacity(namespace, Admission::Bulk, cohorts.len())?;
                 self.prune(*submitted_at_epoch_secs);
                 let batch_id = allocate_id();
                 let mut identities = Vec::new();
@@ -527,6 +844,8 @@ impl TaskArrays {
                             template: cohort.template.clone(),
                             state,
                             terminal_at_epoch_secs: None,
+                            quota_blocked: None,
+                            unrunnable: None,
                         },
                     );
                     identities.push((cohort.name.clone(), id));
@@ -538,7 +857,7 @@ impl TaskArrays {
                         namespace: namespace.clone(),
                         cohorts: identities,
                         common_jobs: false,
-                        request: None,
+                        request: Some((request_id.clone(), manifest_digest(write)?)),
                         submitted_at_epoch_secs: *submitted_at_epoch_secs,
                     },
                 );
@@ -576,15 +895,14 @@ impl TaskArrays {
                 validate_template(template)?;
                 let state = TaskArrayState::new(spec.clone(), *submitted_at_epoch_secs)?;
                 self.prune(*submitted_at_epoch_secs);
-                let active = self.active().count();
-                if active >= MAX_ACTIVE_ARRAYS {
-                    return Err(TaskArrayStoreError::TooManyActive { active });
-                }
+                self.check_capacity(namespace, Admission::Bulk, 1)?;
                 let batch_id = allocate_id();
                 self.arrays.insert(
                     batch_id,
                     TaskArrayRecord {
                         terminal_at_epoch_secs: None,
+                        quota_blocked: None,
+                        unrunnable: None,
                         name: name.clone(),
                         namespace: namespace.clone(),
                         template: (**template).clone(),
@@ -626,6 +944,24 @@ impl TaskArrays {
                 now_epoch_secs,
             } => {
                 self.record_mut(*batch_id)?.state.cancel();
+                self.mark_terminal(*batch_id, *now_epoch_secs)?;
+                Ok(TaskArrayApplied::Cancelled)
+            }
+            TaskArrayWrite::Unrunnable {
+                batch_id,
+                reason,
+                now_epoch_secs,
+            } => {
+                if reason.len() > MAX_UNRUNNABLE_REASON_BYTES {
+                    return Err(TaskArrayStoreError::Job(format!(
+                        "an unrunnable reason is at most {MAX_UNRUNNABLE_REASON_BYTES} bytes"
+                    )));
+                }
+                let record = self.record_mut(*batch_id)?;
+                if record.state.stop_reason().is_none() {
+                    record.state.refuse_unrunnable();
+                    record.unrunnable = Some(reason.clone());
+                }
                 self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Cancelled)
             }
@@ -683,6 +1019,15 @@ impl TaskArrays {
                 self.mark_terminal(*batch_id, *now_epoch_secs)?;
                 Ok(TaskArrayApplied::Requeued { chunks })
             }
+            TaskArrayWrite::QuotaBlocked { batch_id, reason } => {
+                let record = self.record_mut(*batch_id)?;
+                record.quota_blocked = if record.state.status().is_terminal() {
+                    None
+                } else {
+                    reason.clone()
+                };
+                Ok(TaskArrayApplied::QuotaRecorded)
+            }
             TaskArrayWrite::Requeue {
                 batch_id,
                 node,
@@ -704,9 +1049,49 @@ impl TaskArrays {
         }
     }
 
+    /// The parent id a manifest retry already created, if its `request_id`
+    /// names a retained receipt with the same content. The same key with
+    /// different content is refused rather than merged or duplicated.
+    fn manifest_replay(&self, write: &TaskArrayWrite) -> Result<Option<u64>, TaskArrayStoreError> {
+        let TaskArrayWrite::RegisterManifest { request_id, .. } = write else {
+            return Ok(None);
+        };
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || request_id.chars().any(char::is_control)
+        {
+            return Err(TaskArrayStoreError::Manifest(
+                "request identity must contain 1–128 bytes without control characters".into(),
+            ));
+        }
+        let Some((batch_id, prior)) = self.manifests.iter().find(|(_, record)| {
+            record
+                .request
+                .as_ref()
+                .is_some_and(|(id, _)| id == request_id)
+        }) else {
+            return Ok(None);
+        };
+        let digest = manifest_digest(write)?;
+        if prior
+            .request
+            .as_ref()
+            .is_some_and(|(_, prior)| *prior == digest)
+        {
+            Ok(Some(*batch_id))
+        } else {
+            Err(TaskArrayStoreError::Manifest(
+                "this Idempotency-Key already names different work".into(),
+            ))
+        }
+    }
+
     /// IDs needed by this exact transaction; idempotent replays and skipped
     /// occurrences remain admissible even when the shared counter is exhausted.
     pub fn registration_ids(&self, write: &TaskArrayWrite) -> Result<usize, TaskArrayStoreError> {
+        if self.manifest_replay(write)?.is_some() {
+            return Ok(0);
+        }
         if matches!(
             write,
             TaskArrayWrite::RegisterJobs { .. }
@@ -881,9 +1266,17 @@ impl TaskArrays {
                 now_epoch_secs,
             } => {
                 let state = TaskArrayState::new(definition.tasks, now_epoch_secs)?;
-                let active = self.active().count();
-                if active >= MAX_ACTIVE_ARRAYS {
-                    return Err(TaskArrayStoreError::TooManyActive { active });
+                let admission = Admission::of(Some(&run.trigger));
+                if let Err(full) = retained.check_capacity(&run.namespace, admission, 1) {
+                    let super::job::RunTrigger::Cron { minute } = run.trigger else {
+                        return Err(full);
+                    };
+                    // A refused cron fire still claims its minute, so the
+                    // leader doesn't retry it all minute and lose it silently.
+                    self.prune(now_epoch_secs);
+                    jobs.record_skip(&run.namespace, &run.name, minute);
+                    self.jobs = jobs;
+                    return Ok(TaskArrayApplied::JobRecorded);
                 }
                 // Every fallible check completes before pruning, allocating or publishing.
                 self.prune(now_epoch_secs);
@@ -896,6 +1289,8 @@ impl TaskArrays {
                         template: definition.template,
                         state,
                         terminal_at_epoch_secs: None,
+                        quota_blocked: None,
+                        unrunnable: None,
                     },
                 );
                 jobs.record_run(batch_id, run);
@@ -908,14 +1303,48 @@ impl TaskArrays {
     }
 
     fn mark_terminal(&mut self, id: u64, now: u64) -> Result<(), TaskArrayStoreError> {
-        let record = self.record_mut(id)?;
+        // Borrow the two fields separately: the record stays readable while
+        // the run is changed, with no copy of the array's state.
+        let Self { arrays, jobs, .. } = self;
+        let record = arrays
+            .get_mut(&id)
+            .ok_or(TaskArrayStoreError::UnknownArray { batch_id: id })?;
+        let mut outcome = None;
         if record.state.status().is_terminal() && record.terminal_at_epoch_secs.is_none() {
-            record.terminal_at_epoch_secs = Some(now.max(record.state.submitted_at_epoch_secs));
+            let finished = now.max(record.state.submitted_at_epoch_secs);
+            record.terminal_at_epoch_secs = Some(finished);
+            record.quota_blocked = None;
+            let summary = record.state.summary();
+            outcome = Some((
+                record.namespace.clone(),
+                record.name.clone(),
+                super::job::RunOutcome {
+                    run: id,
+                    started_at_epoch_secs: record.state.submitted_at_epoch_secs,
+                    finished_at_epoch_secs: finished,
+                    status: summary.status,
+                    succeeded: summary.succeeded,
+                    failed: summary.failed,
+                    not_run: summary.not_run,
+                    first_failed_index: record
+                        .state
+                        .failed_indices()
+                        .ranges()
+                        .next()
+                        .map(|range| *range.start()),
+                },
+            ));
         }
-        let state = record.state.clone();
-        if let Some(run) = self.jobs.run_mut(id) {
+        // Only runs a definition admitted carry history; a raw array or a
+        // manifest profile has no definition to keep it on.
+        if let Some((namespace, name, outcome)) = outcome
+            && jobs.run(id).is_some()
+        {
+            jobs.record_outcome(&namespace, &name, outcome);
+        }
+        if let Some(run) = jobs.run_mut(id) {
             run.unknown_owners
-                .retain(|node| state.held_by(node).is_some());
+                .retain(|node| record.state.held_by(node).is_some());
         }
         Ok(())
     }
@@ -930,6 +1359,39 @@ impl TaskArrays {
     /// [`MAX_TERMINAL_ARRAYS`] of the rest (newest ids win). `now` comes
     /// from the write, so every replica prunes the same arrays.
     pub(crate) fn prune(&mut self, now_epoch_secs: u64) {
+        self.prune_within(now_epoch_secs, TERMINAL_RETENTION_SECS);
+    }
+
+    /// Whether a retention write at `now_epoch_secs` would drop anything.
+    /// The leader asks first, so an idle cluster writes nothing.
+    pub fn has_expired(&self, now_epoch_secs: u64, retention_secs: u64) -> bool {
+        !self.expired(now_epoch_secs, retention_secs).is_empty()
+    }
+
+    fn prune_within(&mut self, now_epoch_secs: u64, retention_secs: u64) {
+        for (id, parent) in self.expired(now_epoch_secs, retention_secs) {
+            if parent {
+                if let Some(manifest) = self.manifests.remove(&id) {
+                    for (_, child) in manifest.cohorts {
+                        self.arrays.remove(&child);
+                    }
+                }
+            } else {
+                self.arrays.remove(&id);
+            }
+        }
+        self.jobs
+            .retain_runs(&self.arrays.keys().copied().collect());
+        let deployments = &self.deployments;
+        self.jobs.expire_one_off(|namespace, name| {
+            deployments
+                .values()
+                .any(|record| record.blocks(name, namespace))
+        });
+    }
+
+    /// Finished retention units to drop, as `(id, is_manifest_parent)`.
+    fn expired(&self, now_epoch_secs: u64, retention_secs: u64) -> Vec<(u64, bool)> {
         let pinned: std::collections::BTreeSet<_> = self
             .deployments
             .values()
@@ -943,7 +1405,7 @@ impl TaskArrays {
             .collect();
         // A parent and all its profiles are one retention unit. Its clock
         // starts when the last profile finishes, not at submission.
-        let mut terminal: Vec<(u64, u64, bool)> = self
+        let mut terminal: Vec<RetentionUnit<'_>> = self
             .manifests
             .iter()
             .filter_map(|(id, m)| {
@@ -952,41 +1414,61 @@ impl TaskArrays {
                     .iter()
                     .map(|(_, child)| self.arrays.get(child)?.terminal_at_epoch_secs)
                     .collect();
-                completed.map(|times| (times.into_iter().max().unwrap_or(0), *id, true))
+                completed.map(|times| RetentionUnit {
+                    finished_at: times.into_iter().max().unwrap_or(0),
+                    id: *id,
+                    parent: true,
+                    namespace: &m.namespace,
+                })
             })
             .chain(self.arrays.iter().filter_map(|(id, r)| {
                 if children.contains(id) || pinned.contains(id) {
                     return None;
                 }
-                r.terminal_at_epoch_secs.map(|time| (time, *id, false))
+                r.terminal_at_epoch_secs.map(|time| RetentionUnit {
+                    finished_at: time,
+                    id: *id,
+                    parent: false,
+                    namespace: &r.namespace,
+                })
             }))
             .collect();
-        terminal.sort_unstable();
-        let retained = terminal
-            .iter()
-            .filter(|(time, _, _)| now_epoch_secs.saturating_sub(*time) <= TERMINAL_RETENTION_SECS)
-            .count();
-        let mut excess = retained.saturating_sub(MAX_TERMINAL_ARRAYS);
-        for (time, id, parent) in terminal {
-            let expired = now_epoch_secs.saturating_sub(time) > TERMINAL_RETENTION_SECS;
-            if !expired && excess == 0 {
-                continue;
-            }
-            if !expired {
-                excess -= 1;
-            }
-            if parent {
-                if let Some(manifest) = self.manifests.remove(&id) {
-                    for (_, child) in manifest.cohorts {
-                        self.arrays.remove(&child);
-                    }
-                }
-            } else {
-                self.arrays.remove(&id);
+        terminal.sort_unstable_by_key(|unit| (unit.finished_at, unit.id));
+        retention_evictions(&terminal, now_epoch_secs, retention_secs)
+    }
+
+    /// Refuse a new run when its share of the active-run slots is full.
+    /// Bulk work stops short of the reserved headroom and at its namespace's
+    /// cap; cron fires and deployment jobs may use every slot.
+    fn check_capacity(
+        &self,
+        namespace: &str,
+        admission: Admission,
+        adding: usize,
+    ) -> Result<(), TaskArrayStoreError> {
+        let mut active = 0;
+        let mut namespace_bulk = 0;
+        for (id, record) in self.active() {
+            active += 1;
+            let trigger = self.jobs.run(id).map(|run| &run.trigger);
+            if record.namespace == namespace && Admission::of(trigger) == Admission::Bulk {
+                namespace_bulk += 1;
             }
         }
-        self.jobs
-            .retain_runs(&self.arrays.keys().copied().collect());
+        let limit = match admission {
+            Admission::Bulk => MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS,
+            Admission::Triggered => MAX_ACTIVE_ARRAYS,
+        };
+        if active + adding > limit {
+            return Err(TaskArrayStoreError::TooManyActive { active, limit });
+        }
+        if admission == Admission::Bulk && namespace_bulk + adding > MAX_ACTIVE_RUNS_PER_NAMESPACE {
+            return Err(TaskArrayStoreError::NamespaceFull {
+                namespace: namespace.to_string(),
+                active: namespace_bulk,
+            });
+        }
+        Ok(())
     }
 
     /// Active deployment intent, excluding bounded terminal receipts.
@@ -1030,7 +1512,7 @@ impl TaskArrays {
                     || request_id.len() > 128
                     || request_id.chars().any(char::is_control)
                     || jobs.is_empty()
-                    || jobs.len() > MAX_ACTIVE_ARRAYS
+                    || jobs.len() > MAX_FINITE_BATCH_JOBS
                 {
                     return Err(refuse(
                         "finite batches require a request identity and 1–64 named jobs; use resource profiles for larger submissions",
@@ -1422,6 +1904,7 @@ mod tests {
 
     fn template() -> Box<JobSpec> {
         Box::new(JobSpec {
+            runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: None,
             schedule: None,
@@ -1432,6 +1915,12 @@ mod tests {
             namespace: None,
             exec: Some("/usr/bin/true".into()),
             script: None,
+            firewall: None,
+            egress: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         })
     }
 
@@ -1477,6 +1966,7 @@ mod tests {
             failed_indices: IndexRangeSet::new(),
             not_run: 0,
             retried: 0,
+            retry_causes: Default::default(),
         }
     }
 
@@ -1521,6 +2011,7 @@ mod tests {
     fn register_accepts_an_image_template() {
         let mut arrays = TaskArrays::default();
         let mut image = template();
+        image.runtime = crate::config::job::JobRuntime::Runc;
         image.exec = None;
         image.image = Some("alpine:3".to_string());
         let write = TaskArrayWrite::Register {
@@ -1556,18 +2047,406 @@ mod tests {
         );
     }
 
-    #[test]
-    fn register_refuses_past_the_active_limit() {
-        let mut arrays = TaskArrays::default();
-        let mut ids = counter();
-        for _ in 0..MAX_ACTIVE_ARRAYS {
-            arrays.apply(&register(4, 4, 1), &mut ids).unwrap();
+    fn register_in(namespace: &str) -> TaskArrayWrite {
+        TaskArrayWrite::Register {
+            name: "render".to_string(),
+            namespace: namespace.to_string(),
+            template: template(),
+            spec: TaskArraySpec::with_count(4),
+            submitted_at_epoch_secs: 1,
+        }
+    }
+
+    /// Fill every bulk slot: whole namespaces of arrays, then the rest.
+    fn fill_bulk(arrays: &mut TaskArrays, ids: &mut impl FnMut() -> u64) {
+        let bulk = MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS;
+        for i in 0..bulk {
+            let namespace = format!("bulk-{}", i / MAX_ACTIVE_RUNS_PER_NAMESPACE);
+            arrays.apply(&register_in(&namespace), &mut *ids).unwrap();
         }
         assert_eq!(
-            arrays.apply(&register(4, 4, 1), &mut ids),
+            arrays.apply(&register_in("latecomer"), &mut *ids),
             Err(TaskArrayStoreError::TooManyActive {
-                active: MAX_ACTIVE_ARRAYS
+                active: bulk,
+                limit: bulk,
             })
+        );
+    }
+
+    fn job_put(
+        namespace: &str,
+        name: &str,
+        cron: Option<&str>,
+        trigger: Option<super::super::job::RunTrigger>,
+        now_epoch_secs: u64,
+    ) -> TaskArrayWrite {
+        let mut definition = super::super::job::JobDefinition::from_spec(*template());
+        definition.cron = cron.map(|expression| super::super::job::CronPolicy {
+            expression: expression.into(),
+            overlap: super::super::job::OverlapPolicy::Allow,
+            missed: super::super::job::MissedRunPolicy::Skip,
+        });
+        TaskArrayWrite::Job(Box::new(super::super::job::JobWrite::Put {
+            name: name.into(),
+            namespace: namespace.into(),
+            definition: Box::new(definition),
+            trigger,
+            now_epoch_secs,
+        }))
+    }
+
+    fn cron_fire(namespace: &str, name: &str, minute: i64) -> TaskArrayWrite {
+        TaskArrayWrite::Job(Box::new(super::super::job::JobWrite::Fire {
+            name: name.into(),
+            namespace: namespace.into(),
+            revision: 1,
+            minute,
+            now_epoch_secs: u64::try_from(minute).unwrap() * 60,
+        }))
+    }
+
+    #[test]
+    fn one_namespace_cannot_take_every_active_run() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        for _ in 0..MAX_ACTIVE_RUNS_PER_NAMESPACE {
+            arrays.apply(&register_in("greedy"), &mut ids).unwrap();
+        }
+        let refused = arrays.apply(&register_in("greedy"), &mut ids);
+        assert_eq!(
+            refused,
+            Err(TaskArrayStoreError::NamespaceFull {
+                namespace: "greedy".into(),
+                active: MAX_ACTIVE_RUNS_PER_NAMESPACE,
+            })
+        );
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("\"greedy\""), "{message}");
+        assert!(
+            message.contains(&MAX_ACTIVE_RUNS_PER_NAMESPACE.to_string()),
+            "{message}"
+        );
+        // Everyone else still gets in.
+        assert!(arrays.apply(&register_in("modest"), &mut ids).is_ok());
+    }
+
+    #[test]
+    fn cron_fire_uses_reserved_headroom_when_bulk_runs_fill_the_cap() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                &mut ids,
+            )
+            .unwrap();
+        fill_bulk(&mut arrays, &mut ids);
+        assert!(matches!(
+            arrays.apply(&cron_fire("ops", "nightly", 3), &mut ids),
+            Ok(TaskArrayApplied::Registered { .. })
+        ));
+    }
+
+    #[test]
+    fn hook_registers_when_bulk_arrays_fill_the_cap() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        fill_bulk(&mut arrays, &mut ids);
+        let config = crate::config::Config::parse(
+            "[app.web]\nimage='web:v1'\n[job.migrate]\nruntime='process'\nexec='/bin/true'\nrun_before=['app.web']",
+        )
+        .unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployBegin {
+                    operation_id: "b".repeat(32),
+                    config: Box::new(config),
+                    now_epoch_secs: 2,
+                },
+                &mut ids,
+            )
+            .unwrap();
+        let hook = arrays.deployment(&"b".repeat(32)).unwrap().hook_runs["migrate"];
+        assert!(arrays.get(hook).is_some());
+    }
+
+    #[test]
+    fn refused_cron_fire_is_recorded_as_skipped_capacity() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                &mut ids,
+            )
+            .unwrap();
+        fill_bulk(&mut arrays, &mut ids);
+        // Deployment-style runs take the reserved slots too.
+        for i in 0..RESERVED_TRIGGERED_RUNS {
+            let trigger = super::super::job::RunTrigger::Hook {
+                operation_id: format!("op-{i}"),
+            };
+            arrays
+                .apply(
+                    &job_put("deploys", &format!("hook-{i}"), None, Some(trigger), 120),
+                    &mut ids,
+                )
+                .unwrap();
+        }
+        assert_eq!(arrays.active().count(), MAX_ACTIVE_ARRAYS);
+
+        let mut allocated = false;
+        let applied = arrays.apply(&cron_fire("ops", "nightly", 3), || {
+            allocated = true;
+            0
+        });
+        assert_eq!(applied, Ok(TaskArrayApplied::JobRecorded));
+        assert!(!allocated, "a skipped occurrence spends no id");
+        let record = arrays.jobs().definition("ops", "nightly").unwrap();
+        assert_eq!(record.last_observed_minute, Some(3));
+        assert_eq!(
+            record.skipped,
+            Some(super::super::job::SkippedOccurrence {
+                minute: 3,
+                reason: super::super::job::SkipReason::Capacity,
+            })
+        );
+        assert_eq!(record.skipped_count, 1);
+        // The same minute again is a no-op, not a second skip.
+        arrays
+            .apply(&cron_fire("ops", "nightly", 3), &mut ids)
+            .unwrap();
+        assert_eq!(
+            arrays
+                .jobs()
+                .definition("ops", "nightly")
+                .unwrap()
+                .skipped_count,
+            1
+        );
+        // Once a slot frees, the next occurrence runs; the skip stays visible.
+        let first = arrays.active().next().unwrap().0;
+        arrays
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    batch_id: first,
+                    now_epoch_secs: 200,
+                },
+                &mut ids,
+            )
+            .unwrap();
+        assert!(matches!(
+            arrays.apply(&cron_fire("ops", "nightly", 4), &mut ids),
+            Ok(TaskArrayApplied::Registered { .. })
+        ));
+        assert_eq!(
+            arrays
+                .jobs()
+                .definition("ops", "nightly")
+                .unwrap()
+                .skipped
+                .map(|skip| skip.minute),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_quota_blocked_reason_lasts_until_the_run_finishes() {
+        let mut arrays = TaskArrays::default();
+        let id = registered(&mut arrays, &register(4, 4, 1), 1);
+        let reason = crate::meat::quota::QuotaError::CpuExceeded {
+            namespace: "default".into(),
+            current: 2000,
+            requested: 1000,
+            limit: 2000,
+        };
+        arrays
+            .apply(
+                &TaskArrayWrite::QuotaBlocked {
+                    batch_id: id,
+                    reason: Some(reason.clone()),
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(arrays.get(id).unwrap().quota_blocked, Some(reason));
+        let reopened: TaskArrays =
+            serde_json::from_value(serde_json::to_value(&arrays).unwrap()).unwrap();
+        assert_eq!(reopened, arrays);
+        arrays
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    batch_id: id,
+                    now_epoch_secs: 5,
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(arrays.get(id).unwrap().quota_blocked, None);
+    }
+
+    #[test]
+    fn a_run_no_node_can_run_fails_with_the_reason_in_one_tick() {
+        let mut arrays = TaskArrays::default();
+        let id = registered(&mut arrays, &register(4, 4, 1), 1);
+        let reason = "no node can run it: task arrays don't run under mount_isolation yet";
+        let applied = arrays
+            .apply(
+                &TaskArrayWrite::Tick {
+                    writes: vec![TaskArrayWrite::Unrunnable {
+                        batch_id: id,
+                        reason: reason.to_string(),
+                        now_epoch_secs: 7,
+                    }],
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(applied, TaskArrayApplied::Ticked { refused: vec![] });
+        let record = arrays.get(id).unwrap();
+        assert_eq!(record.state.status(), TaskArrayStatus::Failed);
+        assert_eq!(record.state.summary().not_run, 4);
+        assert_eq!(record.unrunnable.as_deref(), Some(reason));
+        assert_eq!(record.terminal_at_epoch_secs, Some(7));
+        let reopened: TaskArrays =
+            serde_json::from_value(serde_json::to_value(&arrays).unwrap()).unwrap();
+        assert_eq!(reopened, arrays);
+        // A repeat (a second leader's tick) changes nothing.
+        arrays
+            .apply(
+                &TaskArrayWrite::Unrunnable {
+                    batch_id: id,
+                    reason: "something else".into(),
+                    now_epoch_secs: 9,
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(arrays.get(id).unwrap().unrunnable.as_deref(), Some(reason));
+        assert_eq!(arrays.get(id).unwrap().terminal_at_epoch_secs, Some(7));
+    }
+
+    #[test]
+    fn an_unrunnable_write_with_an_oversized_reason_is_refused() {
+        let mut arrays = TaskArrays::default();
+        let id = registered(&mut arrays, &register(4, 4, 1), 1);
+        let error = arrays
+            .apply(
+                &TaskArrayWrite::Unrunnable {
+                    batch_id: id,
+                    reason: "x".repeat(MAX_UNRUNNABLE_REASON_BYTES + 1),
+                    now_epoch_secs: 7,
+                },
+                || 0,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("reason"), "{error}");
+        assert_eq!(
+            arrays.get(id).unwrap().state.status(),
+            TaskArrayStatus::Running
+        );
+    }
+
+    /// The largest template admission accepts: big argv and environment.
+    fn largest_template() -> JobSpec {
+        let mut template = *template();
+        template.command = Some(vec!["x".repeat(3584); 2]);
+        for i in 0..8 {
+            template.env.insert(
+                format!("VALUE_{i}"),
+                crate::config::types::EnvValue::Plain("v".repeat(1000)),
+            );
+        }
+        assert!(validate_template(&template).is_ok());
+        assert!(serde_json::to_vec(&template).unwrap().len() > 14 * 1024);
+        template
+    }
+
+    /// An active run as large as the store lets one get: the largest
+    /// template, and as many failed-index ranges as it keeps.
+    fn largest_active_record() -> TaskArrayRecord {
+        use super::super::task_array_state::MAX_FAILED_RANGES;
+        let spec = TaskArraySpec {
+            chunk_size: 512,
+            ..TaskArraySpec::with_count(super::super::task_array::MAX_TASK_COUNT)
+        };
+        let mut state = TaskArrayState::new(spec, 1).unwrap();
+        let mut chunk = 0;
+        while state.failed_indices().range_count() < MAX_FAILED_RANGES {
+            let set = IndexRangeSet::from_range(chunk..=chunk);
+            state.grant(&node("n1"), &set).unwrap();
+            let range = state.spec.chunk_range(ChunkId(chunk)).unwrap();
+            let mut failures = IndexRangeSet::new();
+            for index in range.clone().step_by(2) {
+                failures.insert(index);
+            }
+            let tasks = range.end() - range.start() + 1;
+            let result = ChunkResult {
+                duration_counts: [0; 16],
+                chunk: ChunkId(chunk),
+                attempt: 1,
+                succeeded: tasks - failures.len() as u32,
+                failed_count: failures.len() as u32,
+                failed_indices: failures,
+                not_run: 0,
+                retried: 0,
+                retry_causes: Default::default(),
+            };
+            state.complete(&node("n1"), &result).unwrap();
+            chunk += 1;
+        }
+        // Many nodes each hold a chunk, so the grant map is full too.
+        for holder in 0..64 {
+            let set = IndexRangeSet::from_range(chunk..=chunk);
+            state
+                .grant(&node(&format!("node-{holder:03}")), &set)
+                .unwrap();
+            chunk += 1;
+        }
+        assert!(!state.status().is_terminal());
+        TaskArrayRecord {
+            name: "a".repeat(63),
+            namespace: "n".repeat(63),
+            template: largest_template(),
+            state,
+            terminal_at_epoch_secs: None,
+            quota_blocked: Some(crate::meat::quota::QuotaError::CpuExceeded {
+                namespace: "n".repeat(63),
+                current: u64::MAX,
+                requested: u64::MAX,
+                limit: u64::MAX,
+            }),
+            unrunnable: None,
+        }
+    }
+
+    /// Replicated job state at the global active-run cap must fit a Raft
+    /// snapshot frame with room to spare, and every node's sync call must
+    /// fit the sync route's body limit. These two budgets are what justify
+    /// `MAX_ACTIVE_ARRAYS`.
+    #[test]
+    fn control_state_stays_within_budget_at_the_global_cap() {
+        const SNAPSHOT_BUDGET: usize = 32 * 1024 * 1024;
+        let record = largest_active_record();
+        let mut arrays = TaskArrays::default();
+        for id in 1..=MAX_ACTIVE_ARRAYS as u64 {
+            arrays.arrays.insert(id, record.clone());
+        }
+        let snapshot = serde_json::to_vec(&arrays).unwrap();
+        assert!(
+            snapshot.len() <= SNAPSHOT_BUDGET,
+            "{} bytes of job state at the cap",
+            snapshot.len()
+        );
+        // The snapshot is accepted back: the cap is inside the store's own bounds.
+        let reopened: TaskArrays = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(reopened.active().count(), MAX_ACTIVE_ARRAYS);
+
+        let request = crate::bun::task_array_leader::sync_request_for(&arrays, &node("node-000"));
+        let bytes = serde_json::to_vec(&request).unwrap().len();
+        assert!(
+            bytes <= crate::bun::task_array_node::MAX_SYNC_REQUEST_BYTES,
+            "{bytes} bytes in one node's sync call at the cap"
         );
     }
 
@@ -1602,9 +2481,50 @@ mod tests {
     }
 
     #[test]
-    fn registration_keeps_only_the_newest_finished_arrays() {
+    fn finished_arrays_expire_on_the_timer_without_new_submissions() {
+        let mut leader = TaskArrays::default();
+        let old = registered(&mut leader, &register(4, 4, 100), 1);
+        let running = registered(&mut leader, &register(4, 4, 100), 2);
+        leader
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    now_epoch_secs: 200,
+                    batch_id: old,
+                },
+                || 0,
+            )
+            .unwrap();
+        let mut follower = leader.clone();
+
+        // Nothing is due inside the window, so the leader writes nothing.
+        assert!(!leader.has_expired(200 + TERMINAL_RETENTION_SECS, TERMINAL_RETENTION_SECS));
+        assert!(leader.has_expired(201 + TERMINAL_RETENTION_SECS, TERMINAL_RETENTION_SECS));
+
+        // The timer write carries its own clock and window: every replica
+        // that applies it drops the same runs, with no registration at all.
+        let write = TaskArrayWrite::Prune {
+            now_epoch_secs: 201 + TERMINAL_RETENTION_SECS,
+            retention_secs: TERMINAL_RETENTION_SECS,
+        };
+        for replica in [&mut leader, &mut follower] {
+            replica.apply(&write, || panic!("no id allocated")).unwrap();
+            assert!(
+                replica.get(old).is_none(),
+                "finished run outlived retention"
+            );
+            assert!(
+                replica.get(running).is_some(),
+                "a running array is never pruned"
+            );
+        }
+        assert_eq!(leader, follower);
+        assert!(!leader.has_expired(201 + TERMINAL_RETENTION_SECS, TERMINAL_RETENTION_SECS));
+    }
+
+    #[test]
+    fn registration_keeps_only_a_namespaces_newest_finished_arrays() {
         let mut arrays = TaskArrays::default();
-        for id in 1..=(MAX_TERMINAL_ARRAYS as u64 + 5) {
+        for id in 1..=(MAX_TERMINAL_PER_NAMESPACE as u64 + 5) {
             registered(&mut arrays, &register(4, 4, 1), id);
             arrays
                 .apply(
@@ -1622,8 +2542,158 @@ mod tests {
             .filter(|(_, r)| r.state.status().is_terminal())
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(terminal.len(), MAX_TERMINAL_ARRAYS);
+        assert_eq!(terminal.len(), MAX_TERMINAL_PER_NAMESPACE);
         assert_eq!(terminal.first(), Some(&6), "the oldest go first");
+    }
+
+    /// Run a singleton to a failed end on node `a`, at `now`.
+    fn fail_singleton(arrays: &mut TaskArrays, id: u64, now: u64) {
+        arrays
+            .apply(
+                &sync(
+                    id,
+                    Vec::new(),
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                || 0,
+            )
+            .unwrap();
+        let mut result = finished(0, 1, 0);
+        result.failed_count = 1;
+        result.failed_indices = IndexRangeSet::from_range(0..=0);
+        arrays
+            .apply(
+                &TaskArrayWrite::Sync {
+                    now_epoch_secs: now,
+                    batch_id: id,
+                    results: vec![(node("a"), result)],
+                    grants: Vec::new(),
+                },
+                || 0,
+            )
+            .unwrap();
+        assert!(arrays.get(id).unwrap().state.status().is_terminal());
+    }
+
+    fn cancelled_in(arrays: &mut TaskArrays, namespace: &str, id: u64, now: u64) {
+        let mut write = register_in(namespace);
+        if let TaskArrayWrite::Register {
+            submitted_at_epoch_secs,
+            ..
+        } = &mut write
+        {
+            *submitted_at_epoch_secs = now;
+        }
+        registered(arrays, &write, id);
+        arrays
+            .apply(
+                &TaskArrayWrite::Cancel {
+                    now_epoch_secs: now,
+                    batch_id: id,
+                },
+                || 0,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_failed_cron_run_stays_in_definition_history_after_twenty_newer_runs() {
+        let mut arrays = TaskArrays::default();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                || 0,
+            )
+            .unwrap();
+        let failed = registered(&mut arrays, &cron_fire("ops", "nightly", 3), 1);
+        fail_singleton(&mut arrays, failed, 200);
+
+        for id in 2..=(MAX_TERMINAL_PER_NAMESPACE as u64 + 2) {
+            cancelled_in(&mut arrays, "ops", id, 300);
+        }
+        assert!(
+            arrays.get(failed).is_none(),
+            "the run's details were pruned"
+        );
+
+        let history = &arrays.jobs().definition("ops", "nightly").unwrap().history;
+        assert_eq!(history.len(), 1);
+        let outcome = &history[0];
+        assert_eq!(outcome.run, failed);
+        assert_eq!(outcome.status, TaskArrayStatus::CompletedWithFailures);
+        assert_eq!((outcome.succeeded, outcome.failed), (0, 1));
+        assert_eq!(outcome.started_at_epoch_secs, 180);
+        assert_eq!(outcome.finished_at_epoch_secs, 200);
+        assert_eq!(outcome.first_failed_index, Some(0));
+        assert!(outcome.failed());
+    }
+
+    #[test]
+    fn one_namespace_cannot_evict_another_namespaces_terminal_runs() {
+        let mut arrays = TaskArrays::default();
+        cancelled_in(&mut arrays, "quiet", 1, 10);
+        for id in 2..=(MAX_TERMINAL_ARRAYS as u64 * 2) {
+            cancelled_in(&mut arrays, "busy", id, 20);
+        }
+        // The next registration prunes.
+        registered(&mut arrays, &register_in("busy"), 1000);
+        assert!(arrays.get(1).is_some(), "quiet's only run was evicted");
+        let terminal: Vec<_> = arrays
+            .iter()
+            .filter(|(_, record)| record.state.status().is_terminal())
+            .collect();
+        assert!(
+            terminal.len() <= MAX_TERMINAL_ARRAYS,
+            "{} kept",
+            terminal.len()
+        );
+        let busy = terminal
+            .iter()
+            .filter(|(_, record)| record.namespace == "busy")
+            .count();
+        assert!(busy <= MAX_TERMINAL_PER_NAMESPACE, "{busy} kept for busy");
+    }
+
+    #[test]
+    fn definition_history_is_bounded_to_n_entries() {
+        use super::super::job::MAX_DEFINITION_HISTORY;
+        let mut arrays = TaskArrays::default();
+        arrays
+            .apply(
+                &job_put("ops", "nightly", Some("* * * * *"), None, 120),
+                || 0,
+            )
+            .unwrap();
+        let runs = MAX_DEFINITION_HISTORY as u64 + 3;
+        for minute in 3..3 + runs {
+            let id = registered(
+                &mut arrays,
+                &cron_fire("ops", "nightly", minute as i64),
+                minute,
+            );
+            arrays
+                .apply(
+                    &TaskArrayWrite::Cancel {
+                        now_epoch_secs: minute * 60,
+                        batch_id: id,
+                    },
+                    || 0,
+                )
+                .unwrap();
+        }
+        let history = &arrays.jobs().definition("ops", "nightly").unwrap().history;
+        assert_eq!(history.len(), MAX_DEFINITION_HISTORY);
+        assert_eq!(history.first().map(|outcome| outcome.run), Some(6));
+        assert_eq!(history.last().map(|outcome| outcome.run), Some(2 + runs));
+        assert!(
+            history
+                .iter()
+                .all(|outcome| outcome.status == TaskArrayStatus::Cancelled)
+        );
+        // The bound is part of the durable format too.
+        let reopened: TaskArrays =
+            serde_json::from_slice(&serde_json::to_vec(&arrays).unwrap()).unwrap();
+        assert_eq!(reopened, arrays);
     }
 
     #[test]
@@ -1663,6 +2733,142 @@ mod tests {
         let summary = arrays.get(id).unwrap().state.summary();
         assert_eq!(summary.succeeded, 4);
         assert_eq!(summary.held, 4);
+    }
+
+    #[test]
+    fn batched_tick_write_applies_every_array_atomically() {
+        let mut arrays = TaskArrays::default();
+        let ids: Vec<u64> = (1..=3)
+            .map(|id| registered(&mut arrays, &register(8, 4, 1), id))
+            .collect();
+        arrays
+            .apply(
+                &sync(
+                    1,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                || 0,
+            )
+            .unwrap();
+        // One entry: retire and regrant array 1, grant array 2, take array
+        // 1's other chunk back from a lost node, and note a quota on 3.
+        arrays
+            .apply(
+                &sync(
+                    1,
+                    vec![],
+                    vec![(node("b"), IndexRangeSet::from_range(1..=1))],
+                ),
+                || 0,
+            )
+            .unwrap();
+        let tick = TaskArrayWrite::Tick {
+            writes: vec![
+                TaskArrayWrite::Requeue {
+                    batch_id: 1,
+                    node: node("b"),
+                    now_epoch_secs: 5,
+                },
+                sync(
+                    1,
+                    vec![(node("a"), finished(0, 1, 4))],
+                    vec![(node("a"), IndexRangeSet::from_range(1..=1))],
+                ),
+                sync(
+                    2,
+                    vec![],
+                    vec![(node("b"), IndexRangeSet::from_range(0..=1))],
+                ),
+                TaskArrayWrite::QuotaBlocked {
+                    batch_id: 3,
+                    reason: Some(crate::meat::quota::QuotaError::CpuExceeded {
+                        namespace: "default".into(),
+                        current: 1000,
+                        requested: 1000,
+                        limit: 1000,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(tick.registration_ids(), 0);
+        assert_eq!(
+            arrays.apply(&tick, || panic!("a tick allocates no ids")),
+            Ok(TaskArrayApplied::Ticked {
+                refused: Vec::new()
+            })
+        );
+        let first = &arrays.get(ids[0]).unwrap().state;
+        assert_eq!(first.summary().succeeded, 4);
+        assert_eq!(
+            first.held_by(&node("a")),
+            Some(&IndexRangeSet::from_range(1..=1))
+        );
+        assert_eq!(
+            first.attempt_of(ChunkId(1)),
+            2,
+            "requeued before regranting"
+        );
+        assert_eq!(arrays.get(ids[1]).unwrap().state.summary().held, 8);
+        assert!(arrays.get(ids[2]).unwrap().quota_blocked.is_some());
+
+        // A tick may carry only progress writes; anything else refuses the
+        // whole entry before any of it applies.
+        let before = arrays.clone();
+        let mixed = TaskArrayWrite::Tick {
+            writes: vec![
+                sync(2, vec![(node("b"), finished(0, 1, 4))], vec![]),
+                register(8, 4, 1),
+            ],
+        };
+        assert!(arrays.apply(&mixed, || 9).is_err());
+        let nested = TaskArrayWrite::Tick {
+            writes: vec![TaskArrayWrite::Tick { writes: vec![] }],
+        };
+        assert!(arrays.apply(&nested, || 9).is_err());
+        let oversized = TaskArrayWrite::Tick {
+            writes: vec![sync(2, vec![], vec![]); MAX_TICK_WRITES + 1],
+        };
+        assert!(arrays.apply(&oversized, || 9).is_err());
+        assert_eq!(arrays, before);
+    }
+
+    #[test]
+    fn one_refused_array_in_a_batch_does_not_drop_the_others() {
+        let mut arrays = TaskArrays::default();
+        registered(&mut arrays, &register(8, 4, 1), 1);
+        registered(&mut arrays, &register(8, 4, 1), 2);
+        let tick = TaskArrayWrite::Tick {
+            writes: vec![
+                sync(
+                    1,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                // Pruned since the leader planned it.
+                sync(
+                    7,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(0..=0))],
+                ),
+                TaskArrayWrite::Unknown {
+                    batch_id: 2,
+                    node: node("nobody"),
+                },
+                sync(
+                    2,
+                    vec![],
+                    vec![(node("a"), IndexRangeSet::from_range(1..=1))],
+                ),
+            ],
+        };
+        let Ok(TaskArrayApplied::Ticked { refused }) = arrays.apply(&tick, || 0) else {
+            panic!("the tick as a whole applies");
+        };
+        let refused: Vec<u64> = refused.iter().map(|(id, _)| *id).collect();
+        assert_eq!(refused, vec![7, 2]);
+        assert_eq!(arrays.get(1).unwrap().state.summary().held, 4);
+        assert_eq!(arrays.get(2).unwrap().state.summary().held, 4);
     }
 
     #[test]
@@ -1723,7 +2929,7 @@ mod tests {
         for manifest in [false, true] {
             let mut arrays = TaskArrays::default();
             let config = crate::config::Config::parse(
-                "[app.web]\nimage='web:v1'\n[job.render]\nexec='/bin/true'\nrun_before=['app.web']",
+                "[app.web]\nimage='web:v1'\n[job.render]\nruntime='process'\nexec='/bin/true'\nrun_before=['app.web']",
             )
             .unwrap();
             let mut next = 1;
@@ -1760,6 +2966,7 @@ mod tests {
                 write = TaskArrayWrite::RegisterManifest {
                     name,
                     namespace,
+                    request_id: "manifest-1".into(),
                     cohorts: vec![ManifestCohort {
                         name: "small".into(),
                         template: *template,
@@ -1882,6 +3089,7 @@ mod tests {
                 &TaskArrayWrite::RegisterManifest {
                     name: "mixed".into(),
                     namespace: "default".into(),
+                    request_id: "mixed-1".into(),
                     cohorts: vec![cohort("small"), cohort("large")],
                     submitted_at_epoch_secs: 0,
                 },
@@ -1947,5 +3155,99 @@ mod tests {
         assert!(arrays.manifest(1).is_none());
         assert!(arrays.get(2).is_none());
         assert!(arrays.get(3).is_none());
+    }
+
+    #[test]
+    fn manifest_cohort_with_misspelt_policy_key_is_refused() {
+        let good = "name='mixed'\n[[cohort]]\nname='small'\ncount=4\ntask_timeout_secs=30\n[cohort.template]\nruntime='process'\nexec='/bin/true'";
+        let parsed: crate::bun::task_array_api::TaskManifestRequest = toml::from_str(good).unwrap();
+        assert_eq!(parsed.cohort[0].spec.task_timeout_secs, 30);
+        for typo in ["task_timeout = 30", "max_attempt = 1", "concurrency = 4"] {
+            let source = good.replace("task_timeout_secs=30", typo);
+            let error = toml::from_str::<crate::bun::task_array_api::TaskManifestRequest>(&source)
+                .unwrap_err()
+                .to_string();
+            let key = typo.split(' ').next().unwrap();
+            assert!(error.contains(key), "{typo}: {error}");
+        }
+        // The JSON API refuses the same typo.
+        let json = serde_json::json!({"name":"mixed","cohort":[{"name":"small","count":4,
+            "max_attempt":1,"template":{"runtime":"process","exec":"/bin/true"}}]});
+        assert!(
+            serde_json::from_value::<crate::bun::task_array_api::TaskManifestRequest>(json)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_cohort_round_trips_every_policy_field() {
+        let cohort = ManifestCohort {
+            name: "small".into(),
+            spec: TaskArraySpec {
+                count: 9,
+                chunk_size: 3,
+                max_attempts: 2,
+                max_failed_indexes: Some(1),
+                task_timeout_secs: 0,
+                per_node_concurrency: Some(4),
+            },
+            template: *template(),
+        };
+        let encoded = serde_json::to_value(&cohort).unwrap();
+        // Flat on the wire, like the TOML a person writes.
+        assert_eq!(encoded["per_node_concurrency"], 4);
+        assert_eq!(
+            serde_json::from_value::<ManifestCohort>(encoded).unwrap(),
+            cohort
+        );
+    }
+
+    fn manifest_write(request_id: &str, count: u32) -> TaskArrayWrite {
+        TaskArrayWrite::RegisterManifest {
+            name: "mixed".into(),
+            namespace: "default".into(),
+            request_id: request_id.into(),
+            cohorts: vec![ManifestCohort {
+                name: "small".into(),
+                spec: TaskArraySpec::with_count(count),
+                template: *template(),
+            }],
+            submitted_at_epoch_secs: 0,
+        }
+    }
+
+    #[test]
+    fn manifest_retry_with_same_key_returns_the_existing_runs() {
+        let mut arrays = TaskArrays::default();
+        let mut next = 0;
+        let mut allocate = || {
+            next += 1;
+            next
+        };
+        let first = arrays
+            .apply(&manifest_write("retry-1", 4), &mut allocate)
+            .unwrap();
+        let before = arrays.clone();
+        assert_eq!(
+            arrays
+                .registration_ids(&manifest_write("retry-1", 4))
+                .unwrap(),
+            0
+        );
+        let retry = arrays
+            .apply(&manifest_write("retry-1", 4), &mut allocate)
+            .unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(arrays, before, "a retry admits nothing new");
+        // Changed content under the same key is refused, not silently merged.
+        let error = arrays
+            .apply(&manifest_write("retry-1", 5), &mut allocate)
+            .unwrap_err();
+        assert!(error.to_string().contains("different work"), "{error}");
+        // A new key is a new submission.
+        let other = arrays
+            .apply(&manifest_write("retry-2", 4), &mut allocate)
+            .unwrap();
+        assert_ne!(other, first);
     }
 }

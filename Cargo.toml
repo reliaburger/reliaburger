@@ -1,6 +1,6 @@
 [package]
 name = "reliaburger"
-version = "0.1.6"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -25,16 +25,17 @@ path = "src/bin/testapp.rs"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-clap = { version = "4", features = ["derive"] }
-nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "dir", "mount", "term"] }
+clap = { version = "4", features = ["derive", "env"] }
+nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs", "dir", "mount", "term", "uio"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+yaml_serde = "0.10"
 semver = "1"
 thiserror = "2"
 tempfile = "3"
+memmap2 = "0.9"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 toml = "0.8"
@@ -53,7 +54,7 @@ ratatui = "0.30"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
-redb = "2"
+redb = "4"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
@@ -63,7 +64,6 @@ time = "0.3"
 ring = "0.17"
 x509-parser = { version = "0.16", features = ["verify"] }
 pem = "3"
-argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
 datafusion = "55"
@@ -92,7 +92,7 @@ pulldown-cmark = "0.13.4"
 nucleo-matcher = "0.3.1"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 libc = "0.2"
-ruzstd = "0.8"
+ruzstd = "0.9.1"
 mdns-sd = "0.21.4"
 # relish netboot's ProxyDHCP: DHCPv4 parsing and encoding.
 dhcproto = "0.15"
@@ -162,19 +162,14 @@ opt-level = 3
 [profile.test.package.block-buffer]
 opt-level = 3
 
-# API tokens are verified with Argon2id on every request. Unoptimised, one
-# verification costs most of a second, so the authorisation tests spent
-# their time hashing rather than testing. Same trade as the hash crates.
-[profile.dev.package.argon2]
+# Every Raft RPC opens a fresh mTLS connection, and openraft gives each
+# is-leader heartbeat only `heartbeat_interval` (150 ms). Unoptimised, ring's
+# handshake crypto pushed that over the limit between `relish dev` VMs, which
+# run debug builds, so every linearizable read on the leader failed (#870).
+[profile.dev.package.ring]
 opt-level = 3
 
-[profile.dev.package.blake2]
-opt-level = 3
-
-[profile.test.package.argon2]
-opt-level = 3
-
-[profile.test.package.blake2]
+[profile.test.package.ring]
 opt-level = 3
 
 [[bench]]
@@ -189,27 +184,6 @@ harness = false
 name = "task_arrays"
 harness = false
 
-# Parquet 59.3 can reserve memory for a Thrift list count far larger than
-# the metadata that follows, aborting the process on a crafted or corrupted
-# archive. Upstream fixed it in Parquet 60 (apache/arrow-rs#10979), but
-# DataFusion 55 still requires Parquet 59. This fork is the 59.3.0 tag plus
-# that one upstream commit. Every arrow-rs crate comes from the same revision
-# so Cargo builds a single copy of the Arrow types. Remove the whole block
-# once DataFusion depends on a Parquet release that contains #10979; the
-# tests/suite/parquet_safety.rs regressions must still pass on Linux.
-[patch.crates-io]
-arrow = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-arith = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-array = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-buffer = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-cast = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-csv = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-data = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-ipc = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-json = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-ord = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-row = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-schema = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-select = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-arrow-string = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
-parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214da1648b05fbd1a2b6de4f2b4a952" }
+[[bench]]
+name = "scheduler"
+harness = false

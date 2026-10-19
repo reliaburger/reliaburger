@@ -21,7 +21,9 @@ Every node must meet the following minimum specification:
 
 - **OS / Architecture**: Ubuntu 24.04+ or Debian 12+, on x86_64 or aarch64.
   Other distributions may work, but we haven't tested them.
-- **Kernel**: Linux 5.8 or later with cgroup v2 enabled.
+- **Kernel**: Linux 5.8 or later with cgroup v2 enabled. Job executors use
+  `cgroup.kill` from 5.14 when it's there and fall back to freezing and killing
+  each task on older kernels, so 5.8 is the minimum for them too.
 - **Privileges**: Root or `sudo` access on all three nodes.
 - **BPF filesystem**: `bpffs` mounted at `/sys/fs/bpf`.
 - **Resources**: At least 2 CPU cores, 2 GiB RAM, and 10 GiB available disk space per node.
@@ -60,7 +62,7 @@ Ensure the following ports are open:
 | `9444` | TCP | Raft consensus (Council) | Node-to-node |
 | `9445` | TCP | Reporting tree (state reports to the council) | Node-to-node |
 | `5050` | TCP | Pickle OCI image registry | Node-to-node |
-| `10000`-`60000` | TCP | Container host ports (`[network] port_range`); ingress reaches replicas on other nodes through them | Node-to-node |
+| `10000`-`32767` | TCP | Container host ports (`[network] port_range`); ingress reaches replicas on other nodes through them | Node-to-node |
 | `53` | UDP and TCP | Service discovery DNS (`.internal`) | Workloads to their own node |
 | `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External |
 
@@ -73,7 +75,7 @@ still has to let that traffic in. With UFW, run this on every node:
 ```sh
 for peer in 192.168.0.101 192.168.0.102 192.168.0.103; do
   sudo ufw allow proto udp from "$peer" to any port 9443
-  sudo ufw allow proto tcp from "$peer" to any port 9117,9444,9445,5050,10000:60000
+  sudo ufw allow proto tcp from "$peer" to any port 9117,9444,9445,5050,10000:32767
 done
 sudo ufw allow 53/udp
 sudo ufw allow 53/tcp
@@ -106,8 +108,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.6 or vX.Y.Z)
-VERSION="v0.1.6"
+# Release version to install (e.g. v0.2.0 or vX.Y.Z)
+VERSION="v0.2.0"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -134,10 +136,11 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.1.6 (82fa78e)`. Every node should print the same commit.
+`bun 0.2.0 (RELEASE_COMMIT_0_2_0)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
-`clang llvm libbpf-dev` and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
+`build-essential clang llvm libbpf-dev` (the static job executor helpers need a
+C compiler and a static libc) and run `cargo build --locked --release --features ebpf --bin bun --bin relish`
 from a repository checkout, the same build the release uses. Then install
 `target/release/bun` and `target/release/relish` as above.)*
 
@@ -235,6 +238,7 @@ ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 127.0.0.1:9117
 Restart=always
 RestartSec=2
+OOMScoreAdjust=-900
 LimitNOFILE=1048576
 KillMode=process
 TimeoutStopSec=30
@@ -247,6 +251,16 @@ WantedBy=multi-user.target
 > exists, the API has no credentials to check, so Bun fails closed (`AUTH3`)
 > and refuses to bind anything but a loopback address such as `127.0.0.1:9117`.
 > You'll mint that token next, then open the listener in §3.5.
+
+`OOMScoreAdjust=-900` tells the kernel to kill workloads before Bun when the
+machine runs out of memory: a killed Bun stops updating the discovery maps for
+every workload on the node, and on an API node it takes the API down too. Bun
+starts every workload, job and task at `oom_score_adj` +500, so they don't
+inherit Bun's -900, and the kernel's first choice is a workload, not the node
+agent. The `[dns]` section above sets no `upstream`, so
+containers resolve names outside `.internal` through the resolvers in this
+machine's `/etc/resolv.conf`, tried in order. If that file names no usable
+resolver, Bun refuses to start; set `upstream = "ADDRESS:53"` under `[dns]`.
 
 Enable and start the service:
 
@@ -419,6 +433,7 @@ ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
 Restart=always
 RestartSec=2
+OOMScoreAdjust=-900
 LimitNOFILE=1048576
 KillMode=process
 TimeoutStopSec=30
@@ -497,6 +512,7 @@ ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/
 ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
 Restart=always
 RestartSec=2
+OOMScoreAdjust=-900
 LimitNOFILE=1048576
 KillMode=process
 TimeoutStopSec=30
@@ -536,8 +552,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.1.6 or vX.Y.Z)
-VERSION="v0.1.6"
+# Release version to install (e.g. v0.2.0 or vX.Y.Z)
+VERSION="v0.2.0"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp
@@ -682,6 +698,7 @@ replicas = 3
 [app.hello.health]
 path = "/"
 interval = 2
+timeout = 1
 threshold_healthy = 1
 
 [app.hello.ingress]

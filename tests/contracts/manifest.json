@@ -11,7 +11,9 @@
         "coverage"
       ],
       "required_in": [
+        "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -39,7 +41,9 @@
         "test-contract-boundaries"
       ],
       "required_in": [
+        "light",
         "portable",
+        "train-full",
         "full"
       ]
     },
@@ -53,6 +57,7 @@
         "test-rootless-runc"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -66,6 +71,7 @@
         "test-linux"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -78,6 +84,7 @@
         "scripts/release/qualify-oci-interruptions.sh"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -91,6 +98,7 @@
         "test-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -104,6 +112,7 @@
         "test-slow"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -117,6 +126,7 @@
         "test-upgrade-node"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -130,6 +140,7 @@
         "test-upgrade-cluster"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     },
@@ -143,6 +154,7 @@
         "test-standard-clients"
       ],
       "required_in": [
+        "train-full",
         "full"
       ]
     }
@@ -290,18 +302,6 @@
         "Follower forwarding preserves caller credentials; authenticated internal dispatch still validates intrinsic specs and test leases."
       ],
       "cases": [
-        {
-          "id": "issue-530-internal_batch_dispatch_validates_specs_and_refuses_unowned_test_resources",
-          "binary": "reliaburger",
-          "test": "bun::batch::tests::internal_batch_dispatch_validates_specs_and_refuses_unowned_test_resources",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/batch.rs"
-          ]
-        },
         {
           "id": "issue-530-batch_submission_checks_every_job_against_token_scope_before_dispatch",
           "binary": "reliaburger::suite",
@@ -680,162 +680,6 @@
       ],
       "cases": [
         {
-          "id": "issue-534-a_completed_ordinary_job_does_not_make_its_registered_cron_peer_terminal",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::a_completed_ordinary_job_does_not_make_its_registered_cron_peer_terminal",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-cluster_cron_registration_ack_is_not_a_terminal_execution_receipt",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::cluster_cron_registration_ack_is_not_a_terminal_execution_receipt",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-ordinary_cluster_job_receipt_cannot_reuse_a_previous_generation_or_uncertain_publication",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::ordinary_cluster_job_receipt_cannot_reuse_a_previous_generation_or_uncertain_publication",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-ordinary_cluster_job_receipt_requires_current_positive_terminal_evidence",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::ordinary_cluster_job_receipt_requires_current_positive_terminal_evidence",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-ordinary_cluster_job_receipt_retains_retrying_failure_and_unconfirmed_stop",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::ordinary_cluster_job_receipt_retains_retrying_failure_and_unconfirmed_stop",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_cannot_launch_under_a_still_registered_cron_identity",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::prerequisite_cannot_launch_under_a_still_registered_cron_identity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_failed_attempt_cannot_claim_an_automatic_retry",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::prerequisite_failed_attempt_cannot_claim_an_automatic_retry",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_failure_is_durably_settled_before_the_gate_reports_failure",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::prerequisite_failure_is_durably_settled_before_the_gate_reports_failure",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_preparation_refuses_denied_host_job_before_claiming_migration",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::prerequisite_preparation_refuses_denied_host_job_before_claiming_migration",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_preparation_refuses_unenforceable_migration_limits",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::prerequisite_preparation_refuses_unenforceable_migration_limits",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_preparation_refuses_unenforceable_ordinary_tail_limits",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::prerequisite_preparation_refuses_unenforceable_ordinary_tail_limits",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_trust_preflight_refuses_before_any_migration_launch",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::prerequisite_trust_preflight_refuses_before_any_migration_launch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-534-scheduled_receipt_does_not_prove_retirement_when_schedule_publication_is_uncertain",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::scheduled_receipt_does_not_prove_retirement_when_schedule_publication_is_uncertain",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
           "id": "issue-534-an_admitted_job_only_apply_owns_its_name_before_executor_dispatch",
           "binary": "reliaburger",
           "test": "bun::api::tests::an_admitted_job_only_apply_owns_its_name_before_executor_dispatch",
@@ -901,66 +745,6 @@
           ]
         },
         {
-          "id": "issue-534-hung_terminal_job_claim_settlement_exits_its_watcher_and_retains_claim",
-          "binary": "reliaburger",
-          "test": "bun::api::tests::hung_terminal_job_claim_settlement_exits_its_watcher_and_retains_claim",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/api/tests.rs"
-          ]
-        },
-        {
-          "id": "issue-534-an_admitted_prerequisite_persists_and_recovers_without_its_apply_manifest",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::an_admitted_prerequisite_persists_and_recovers_without_its_apply_manifest",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-534-intrinsic_job_validation_still_refuses_malformed_prerequisite_records",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::intrinsic_job_validation_still_refuses_malformed_prerequisite_records",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-534-ordinary_placement_releases_migration_after_commit_but_keeps_the_ordinary_tail",
-          "binary": "reliaburger",
-          "test": "cluster::orchestrate::audit_prerequisite_capacity::ordinary_placement_releases_migration_after_commit_but_keeps_the_ordinary_tail",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/cluster/orchestrate.rs"
-          ]
-        },
-        {
-          "id": "issue-534-ordinary_placement_subtracts_precommit_jobs_from_every_candidate_before_reports_arrive",
-          "binary": "reliaburger",
-          "test": "cluster::orchestrate::audit_prerequisite_capacity::ordinary_placement_subtracts_precommit_jobs_from_every_candidate_before_reports_arrive",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/cluster/orchestrate.rs"
-          ]
-        },
-        {
           "id": "issue-534-prerequisites_require_an_app_in_the_same_apply_and_namespace",
           "binary": "reliaburger",
           "test": "config::validate::tests::prerequisites_require_an_app_in_the_same_apply_and_namespace",
@@ -985,270 +769,6 @@
           ]
         },
         {
-          "id": "issue-534-a_batch_display_label_matching_a_held_app_is_independent",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::a_batch_display_label_matching_a_held_app_is_independent",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-a_batch_physical_execution_matching_a_held_app_is_refused",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::a_batch_physical_execution_matching_a_held_app_is_refused",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-a_current_revision_batch_cannot_take_a_held_logical_job_but_other_namespace_is_independent",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::a_current_revision_batch_cannot_take_a_held_logical_job_but_other_namespace_is_independent",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-a_recovered_prerequisite_cannot_complete_or_release_when_the_term_number_repeats",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::a_recovered_prerequisite_cannot_complete_or_release_when_the_term_number_repeats",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-cross_namespace_same_label_claim_does_not_block_independent_batch_display_label",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::cross_namespace_same_label_claim_does_not_block_independent_batch_display_label",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-cross_namespace_same_label_claim_still_blocks_held_app_physical_identity",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::cross_namespace_same_label_claim_still_blocks_held_app_physical_identity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-cross_namespace_same_label_claim_still_blocks_its_held_job_operation",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::cross_namespace_same_label_claim_still_blocks_its_held_job_operation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-held_job_capacity_survives_snapshot_and_handover_without_a_guessed_release",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::held_job_capacity_survives_snapshot_and_handover_without_a_guessed_release",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-held_job_capacity_tracks_real_begin_commit_and_positive_settlement",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::held_job_capacity_tracks_real_begin_commit_and_positive_settlement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-ordinary_job_intent_blocks_a_same_namespace_prerequisite_but_not_another_namespace",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::ordinary_job_intent_blocks_a_same_namespace_prerequisite_but_not_another_namespace",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_begin_cannot_claim_a_pruned_global_batch_physical_identity",
-          "binary": "reliaburger",
-          "test": "council::state_machine::audit_held_job_admission::prerequisite_begin_cannot_claim_a_pruned_global_batch_physical_identity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_claim_refuses_a_delete_that_its_later_commit_would_restore",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_claim_refuses_a_delete_that_its_later_commit_would_restore",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_claim_refuses_a_stop_that_its_later_commit_would_undo",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_claim_refuses_a_stop_that_its_later_commit_would_undo",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_commit_rechecks_deleted_namespace_without_partial_publication",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_commit_rechecks_deleted_namespace_without_partial_publication",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_commit_releases_apps_and_migrations_but_retains_ordinary_job_names",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_commit_releases_apps_and_migrations_but_retains_ordinary_job_names",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_decode_refuses_a_duplicate_operation_key_in_the_snapshot_json",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_decode_refuses_a_duplicate_operation_key_in_the_snapshot_json",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_decode_refuses_distinct_operations_owning_the_same_active_identity",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_decode_refuses_distinct_operations_owning_the_same_active_identity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_decode_refuses_missing_or_malformed_ownership_inventory",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_decode_refuses_missing_or_malformed_ownership_inventory",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_decode_refuses_semantically_invalid_or_unbounded_claims",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_decode_refuses_semantically_invalid_or_unbounded_claims",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_encoded_size_bound_refuses_before_any_staged_desired_write",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_encoded_size_bound_refuses_before_any_staged_desired_write",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_resource_bound_refuses_before_any_staged_desired_write",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_resource_bound_refuses_before_any_staged_desired_write",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-534-prerequisite_snapshot_and_restart_retain_the_original_claim_and_term_fence",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::prerequisite_snapshot_and_restart_retain_the_original_claim_and_term_fence",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
           "id": "issue-534-a_blocked_cluster_prerequisite_owns_its_app_until_desired_writes_finish",
           "binary": "reliaburger::suite",
           "test": "batch::a_blocked_cluster_prerequisite_owns_its_app_until_desired_writes_finish",
@@ -1264,19 +784,6 @@
           "id": "issue-534-a_new_leader_cannot_repeat_an_uncertain_prerequisite_attempt",
           "binary": "reliaburger::suite",
           "test": "batch::a_new_leader_cannot_repeat_an_uncertain_prerequisite_attempt",
-          "requires": [
-            "portable-darwin",
-            "portable-linux"
-          ],
-          "sources": [
-            "src/meat/job_deploy.rs",
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-534-a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_on_the_same_node",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_positively_failed_migration_releases_its_claim_for_a_corrected_apply_on_the_same_node",
           "requires": [
             "portable-darwin",
             "portable-linux"
@@ -1429,42 +936,6 @@
       ],
       "cases": [
         {
-          "id": "issue-535-recovered_owned_apple_exit_keeps_retained_object_fenced",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::recovered_owned_apple_exit_keeps_retained_object_fenced",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-535-recovered_owned_process_exit_allows_positive_compact_retirement",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::recovered_owned_process_exit_allows_positive_compact_retirement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
-          "id": "issue-535-recovered_owned_runc_exit_keeps_retained_object_fenced",
-          "binary": "reliaburger",
-          "test": "bun::agent::tests::recovered_owned_runc_exit_keeps_retained_object_fenced",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/agent/tests/mod.rs"
-          ]
-        },
-        {
           "id": "issue-535-common_apply_refuses_missing_durable_storage_before_agent_work",
           "binary": "reliaburger",
           "test": "bun::api::tests::common_apply_refuses_missing_durable_storage_before_agent_work",
@@ -1475,18 +946,6 @@
           "sources": [
             "src/bun/api/tests.rs",
             "src/bun/job_apply.rs"
-          ]
-        },
-        {
-          "id": "issue-535-owned_internal_run_metadata_refuses_a_stalled_agent_before_writes_or_launch",
-          "binary": "reliaburger",
-          "test": "bun::api::tests::owned_internal_run_metadata_refuses_a_stalled_agent_before_writes_or_launch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/api/tests.rs"
           ]
         },
         {
@@ -1502,249 +961,9 @@
           ]
         },
         {
-          "id": "issue-535-owned_remote_log_metadata_bounds_the_local_collision_check",
-          "binary": "reliaburger",
-          "test": "bun::api::tests::owned_remote_log_metadata_bounds_the_local_collision_check",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/api/tests.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_confirmed_oci_exit_completes_without_claiming_object_retirement",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::a_confirmed_oci_exit_completes_without_claiming_object_retirement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_confirmed_process_exit_completes_an_owned_execution",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::a_confirmed_process_exit_completes_an_owned_execution",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-checkpoint_recovery_preserves_a_batchs_logical_label_and_execution_identity",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::checkpoint_recovery_preserves_a_batchs_logical_label_and_execution_identity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-invalid_logical_labels_cannot_enter_durable_job_state",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::invalid_logical_labels_cannot_enter_durable_job_state",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-mismatched_owned_exit_evidence_cannot_be_persisted",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::mismatched_owned_exit_evidence_cannot_be_persisted",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-mismatched_owned_exit_evidence_cannot_be_recovered",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::mismatched_owned_exit_evidence_cannot_be_recovered",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-mismatched_owned_exit_evidence_cannot_complete_a_batch",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::mismatched_owned_exit_evidence_cannot_complete_a_batch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-ordinary_schema_three_records_recover_with_explicit_null_ownership",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::ordinary_schema_three_records_recover_with_explicit_null_ownership",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-recovery_refuses_omitted_batch_ownership_in_a_schema_three_record",
-          "binary": "reliaburger",
-          "test": "bun::jobs::tests::recovery_refuses_omitted_batch_ownership_in_a_schema_three_record",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/jobs.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_batch_registration_cannot_borrow_another_batchs_execution_identity",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::a_batch_registration_cannot_borrow_another_batchs_execution_identity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_full_execution_ownership_index_refuses_registration_but_keeps_active_transitions",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::a_full_execution_ownership_index_refuses_registration_but_keeps_active_transitions",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-535-an_oversized_execution_ownership_index_refuses_the_whole_registration_before_mutation",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::an_oversized_execution_ownership_index_refuses_the_whole_registration_before_mutation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-535-committing_an_app_first_prevents_batch_execution_ownership_from_taking_it",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::committing_an_app_first_prevents_batch_execution_ownership_from_taking_it",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-535-committing_batch_ownership_first_atomically_refuses_app_and_leased_app_writes",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::committing_batch_ownership_first_atomically_refuses_app_and_leased_app_writes",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retries",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_full_batch_checkpoint_refuses_new_work_without_fencing_existing_retries",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_global_replay_fence_without_a_live_assignment_cannot_authorise_a_new_runner",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_global_replay_fence_without_a_live_assignment_cannot_authorise_a_new_runner",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_live_batch_assigned_to_another_worker_cannot_authorise_local_creation",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_live_batch_assigned_to_another_worker_cannot_authorise_local_creation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_live_batchs_original_spec_cannot_change_before_the_first_runner_admission",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_live_batchs_original_spec_cannot_change_before_the_first_runner_admission",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
           "id": "issue-535-a_maximum_length_batch_label_gets_a_valid_independent_execution_name",
           "binary": "reliaburger::suite",
           "test": "batch::a_maximum_length_batch_label_gets_a_valid_independent_execution_name",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_new_leader_refuses_cross_worker_reuse_of_a_pruned_execution",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_new_leader_refuses_cross_worker_reuse_of_a_pruned_execution",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -1766,318 +985,6 @@
           ]
         },
         {
-          "id": "issue-535-a_recovered_batch_execution_refuses_a_changed_spec_label_or_batch",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_recovered_batch_execution_refuses_a_changed_spec_label_or_batch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_remote_log_selector_uses_committed_ownership_and_original_scope",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_remote_log_selector_uses_committed_ownership_and_original_scope",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-a_retired_batch_execution_cannot_lend_its_result_to_another_batch",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_retired_batch_execution_cannot_lend_its_result_to_another_batch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-ambiguous_batch_log_paths_require_an_instance_with_its_own_logical_scope",
-          "binary": "reliaburger::suite",
-          "test": "batch::ambiguous_batch_log_paths_require_an_instance_with_its_own_logical_scope",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-an_existing_batch_execution_refuses_a_changed_spec_label_or_batch",
-          "binary": "reliaburger::suite",
-          "test": "batch::an_existing_batch_execution_refuses_a_changed_spec_label_or_batch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-an_uncertain_batch_checkpoint_refuses_dispatch_and_keeps_retries_fenced",
-          "binary": "reliaburger::suite",
-          "test": "batch::an_uncertain_batch_checkpoint_refuses_dispatch_and_keeps_retries_fenced",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-an_uncertain_retirement_proof_keeps_the_original_attempt_fenced_through_recovery",
-          "binary": "reliaburger::suite",
-          "test": "batch::an_uncertain_retirement_proof_keeps_the_original_attempt_fenced_through_recovery",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-another_worker_cannot_apply_an_ordinary_job_over_a_pruned_batch_execution",
-          "binary": "reliaburger::suite",
-          "test": "batch::another_worker_cannot_apply_an_ordinary_job_over_a_pruned_batch_execution",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-another_worker_cannot_reuse_an_execution_after_terminal_tracker_pruning",
-          "binary": "reliaburger::suite",
-          "test": "batch::another_worker_cannot_reuse_an_execution_after_terminal_tracker_pruning",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_log_rows_preserve_logical_scope_and_distinct_execution_ids",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_log_rows_preserve_logical_scope_and_distinct_execution_ids",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_runner_status_and_logs_use_the_logical_scope_for_distinct_executions",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_runner_status_and_logs_use_the_logical_scope_for_distinct_executions",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_sse_follow_does_not_substitute_same_label_app_placement",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_sse_follow_does_not_substitute_same_label_app_placement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_sse_follow_local_capture_never_uses_app_placements",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_sse_follow_local_capture_never_uses_app_placements",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_sse_follow_local_empty_never_uses_app_placements",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_sse_follow_local_empty_never_uses_app_placements",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_sse_follow_refuses_missing_allocation",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_sse_follow_refuses_missing_allocation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_sse_follow_refuses_pruned_allocation",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_sse_follow_refuses_pruned_allocation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_sse_follow_refuses_unadvertised_allocation",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_sse_follow_refuses_unadvertised_allocation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_sse_follow_uses_committed_remote_owner_without_app_placement",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_sse_follow_uses_committed_remote_owner_without_app_placement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_websocket_follow_does_not_substitute_same_label_app_placement",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_websocket_follow_does_not_substitute_same_label_app_placement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_websocket_follow_local_capture_never_uses_app_placements",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_websocket_follow_local_capture_never_uses_app_placements",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_websocket_follow_local_empty_never_uses_app_placements",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_websocket_follow_local_empty_never_uses_app_placements",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_websocket_follow_refuses_missing_allocation",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_websocket_follow_refuses_missing_allocation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_websocket_follow_refuses_pruned_allocation",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_websocket_follow_refuses_pruned_allocation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_websocket_follow_refuses_unadvertised_allocation",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_websocket_follow_refuses_unadvertised_allocation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-batch_websocket_follow_uses_committed_remote_owner_without_app_placement",
-          "binary": "reliaburger::suite",
-          "test": "batch::batch_websocket_follow_uses_committed_remote_owner_without_app_placement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-committed_remote_ownership_cannot_relabel_a_local_ordinary_log_selector",
-          "binary": "reliaburger::suite",
-          "test": "batch::committed_remote_ownership_cannot_relabel_a_local_ordinary_log_selector",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
           "id": "issue-535-concurrent_batches_with_the_same_label_run_independent_jobs",
           "binary": "reliaburger::suite",
           "test": "batch::concurrent_batches_with_the_same_label_run_independent_jobs",
@@ -2090,117 +997,9 @@
           ]
         },
         {
-          "id": "issue-535-internal_batch_dispatch_cannot_claim_an_ordinary_execution_identity",
-          "binary": "reliaburger::suite",
-          "test": "batch::internal_batch_dispatch_cannot_claim_an_ordinary_execution_identity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-internal_batch_dispatch_refuses_missing_extra_invalid_or_cross_namespace_labels",
-          "binary": "reliaburger::suite",
-          "test": "batch::internal_batch_dispatch_refuses_missing_extra_invalid_or_cross_namespace_labels",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-internal_batch_refuses_a_cron_schedule_before_ownership",
-          "binary": "reliaburger::suite",
-          "test": "batch::internal_batch_refuses_a_cron_schedule_before_ownership",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-internal_batch_refuses_run_before_without_an_app_submission",
-          "binary": "reliaburger::suite",
-          "test": "batch::internal_batch_refuses_run_before_without_an_app_submission",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-owned_batch_retry_keeps_current_attempt_outcome_through_recovery",
-          "binary": "reliaburger::suite",
-          "test": "batch::owned_batch_retry_keeps_current_attempt_outcome_through_recovery",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-predictable_host_policy_refusal_keeps_the_whole_batch_unadmitted",
-          "binary": "reliaburger::suite",
-          "test": "batch::predictable_host_policy_refusal_keeps_the_whole_batch_unadmitted",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-predictable_process_limits_refusal_keeps_the_whole_batch_unadmitted",
-          "binary": "reliaburger::suite",
-          "test": "batch::predictable_process_limits_refusal_keeps_the_whole_batch_unadmitted",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
           "id": "issue-535-public_apply_cannot_supply_a_batch_execution_label",
           "binary": "reliaburger::suite",
           "test": "batch::public_apply_cannot_supply_a_batch_execution_label",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-public_apply_cannot_take_over_a_completed_batch_execution",
-          "binary": "reliaburger::suite",
-          "test": "batch::public_apply_cannot_take_over_a_completed_batch_execution",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-public_apply_cannot_take_over_a_recovered_batch_execution",
-          "binary": "reliaburger::suite",
-          "test": "batch::public_apply_cannot_take_over_a_recovered_batch_execution",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -2225,90 +1024,6 @@
           "id": "issue-535-public_batch_refuses_run_before_without_an_app_submission",
           "binary": "reliaburger::suite",
           "test": "batch::public_batch_refuses_run_before_without_an_app_submission",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-recovered_batch_execution_refuses_to_launch_again_for_an_identical_dispatch",
-          "binary": "reliaburger::suite",
-          "test": "batch::recovered_batch_execution_refuses_to_launch_again_for_an_identical_dispatch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-recovered_raft_ownership_refuses_cross_worker_reuse_of_a_pruned_execution",
-          "binary": "reliaburger::suite",
-          "test": "batch::recovered_raft_ownership_refuses_cross_worker_reuse_of_a_pruned_execution",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-recovery_preserves_a_retired_batchs_replay_fence",
-          "binary": "reliaburger::suite",
-          "test": "batch::recovery_preserves_a_retired_batchs_replay_fence",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-recovery_refuses_an_active_and_retired_owner_for_the_same_batch_execution",
-          "binary": "reliaburger::suite",
-          "test": "batch::recovery_refuses_an_active_and_retired_owner_for_the_same_batch_execution",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-repeated_internal_batch_dispatch_preserves_a_successful_attempt",
-          "binary": "reliaburger::suite",
-          "test": "batch::repeated_internal_batch_dispatch_preserves_a_successful_attempt",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-retirement_keeps_a_batch_execution_fenced_against_a_delayed_retry",
-          "binary": "reliaburger::suite",
-          "test": "batch::retirement_keeps_a_batch_execution_fenced_against_a_delayed_retry",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-535-retiring_an_unknown_batch_exit_does_not_fabricate_a_terminal_retry_result",
-          "binary": "reliaburger::suite",
-          "test": "batch::retiring_an_unknown_batch_exit_does_not_fabricate_a_terminal_retry_result",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -2489,22 +1204,22 @@
     {
       "id": "issue-539",
       "issue": 539,
-      "promise": "Registry token verification shares bounded asynchronous API admission.",
+      "promise": "Registry token verification uses the shared API token check.",
       "supported_paths": [
-        "Bearer and Basic credentials on registry reads and writes resume after admission becomes available."
+        "Bearer and Basic credentials on registry reads and writes authenticate through the shared API token check."
       ],
       "refused_paths": [
-        "Malformed credentials return unauthorized without waiting for expensive verification admission."
+        "Malformed credentials return unauthorized before any hashing."
       ],
       "boundaries": [
-        "A saturated verifier does not execute verification before acquiring a permit.",
+        "Registry credentials go through the API token check, which hashes once with SHA-256 and runs inline since #912, so there is no admission permit to wait for.",
         "Related TLS lifecycle fixtures check pooled connection retirement at the credential deadline, with a disabled-retirement negative control."
       ],
       "cases": [
         {
-          "id": "issue-539-malformed_registry_credentials_do_not_wait_for_verification_admission",
+          "id": "issue-539-malformed_registry_credentials_are_refused_before_hashing",
           "binary": "reliaburger",
-          "test": "pickle::api::tests::malformed_registry_credentials_do_not_wait_for_verification_admission",
+          "test": "pickle::api::tests::malformed_registry_credentials_are_refused_before_hashing",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -2514,9 +1229,9 @@
           ]
         },
         {
-          "id": "issue-539-registry_reads_and_writes_share_the_api_verification_admission",
+          "id": "issue-539-registry_reads_and_writes_authenticate_bearer_and_basic_credentials",
           "binary": "reliaburger",
-          "test": "pickle::api::tests::registry_reads_and_writes_share_the_api_verification_admission",
+          "test": "pickle::api::tests::registry_reads_and_writes_authenticate_bearer_and_basic_credentials",
           "requires": [
             "portable-linux",
             "portable-darwin"
@@ -2835,18 +1550,6 @@
       ],
       "cases": [
         {
-          "id": "issue-542-duplicate_internal_dispatch_never_launches_jobs",
-          "binary": "reliaburger",
-          "test": "bun::batch::tests::duplicate_internal_dispatch_never_launches_jobs",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/batch.rs"
-          ]
-        },
-        {
           "id": "issue-542-duplicate_names_are_refused_even_across_namespaces",
           "binary": "reliaburger",
           "test": "bun::batch::tests::duplicate_names_are_refused_even_across_namespaces",
@@ -2889,42 +1592,6 @@
       ],
       "cases": [
         {
-          "id": "issue-543-a_report_published_before_its_receive_deadline_expires_between_ticks",
-          "binary": "reliaburger",
-          "test": "bun::batch::tests::a_report_published_before_its_receive_deadline_expires_between_ticks",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-543-a_stalled_actual_council_admission_returns_unknown_without_dispatch",
-          "binary": "reliaburger",
-          "test": "bun::batch::tests::a_stalled_actual_council_admission_returns_unknown_without_dispatch",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/batch.rs"
-          ]
-        },
-        {
-          "id": "issue-543-stale_reports_never_offer_batch_capacity",
-          "binary": "reliaburger",
-          "test": "bun::batch::tests::stale_reports_never_offer_batch_capacity",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/bun/batch.rs"
-          ]
-        },
-        {
           "id": "issue-543-ordinary_app_exact_complete_report_is_counted_once",
           "binary": "reliaburger",
           "test": "cluster::orchestrate::revalidation_in_place::ordinary_app_exact_complete_report_is_counted_once",
@@ -2958,78 +1625,6 @@
           ],
           "sources": [
             "src/cluster/orchestrate.rs"
-          ]
-        },
-        {
-          "id": "issue-543-ordinary_apps_respect_unreported_batch_reservations_and_exact_namespace_dedup",
-          "binary": "reliaburger",
-          "test": "cluster::orchestrate::revalidation_in_place::ordinary_apps_respect_unreported_batch_reservations_and_exact_namespace_dedup",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/cluster/orchestrate.rs"
-          ]
-        },
-        {
-          "id": "issue-543-owned_batch_exact_complete_report_is_counted_once",
-          "binary": "reliaburger",
-          "test": "cluster::orchestrate::revalidation_in_place::owned_batch_exact_complete_report_is_counted_once",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/cluster/orchestrate.rs"
-          ]
-        },
-        {
-          "id": "issue-543-owned_batch_other_ordinal_cannot_credit_execution_zero",
-          "binary": "reliaburger",
-          "test": "cluster::orchestrate::revalidation_in_place::owned_batch_other_ordinal_cannot_credit_execution_zero",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/cluster/orchestrate.rs"
-          ]
-        },
-        {
-          "id": "issue-543-owned_batch_partial_request_cannot_credit_the_full_reservation",
-          "binary": "reliaburger",
-          "test": "cluster::orchestrate::revalidation_in_place::owned_batch_partial_request_cannot_credit_the_full_reservation",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/cluster/orchestrate.rs"
-          ]
-        },
-        {
-          "id": "issue-543-batch_registration_on_the_current_revision_refuses_a_retired_target_atomically",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::batch_registration_on_the_current_revision_refuses_a_retired_target_atomically",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
-          ]
-        },
-        {
-          "id": "issue-543-shared_admission_compares_the_previous_log_and_keeps_refused_inventory_unchanged",
-          "binary": "reliaburger",
-          "test": "council::state_machine::tests::shared_admission_compares_the_previous_log_and_keeps_refused_inventory_unchanged",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "src/council/state_machine.rs"
           ]
         },
         {
@@ -3070,18 +1665,6 @@
           ]
         },
         {
-          "id": "issue-543-a_delayed_first_batch_dispatch_cannot_launch_after_durable_node_retirement",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_delayed_first_batch_dispatch_cannot_launch_after_durable_node_retirement",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
           "id": "issue-543-an_unfinished_conservative_grant_cannot_restart_without_replay",
           "binary": "reliaburger",
           "test": "bun::task_array_node::tests::an_unfinished_conservative_grant_cannot_restart_without_replay",
@@ -3106,18 +1689,6 @@
           ]
         },
         {
-          "id": "issue-543-a_retired_worker_in_a_fresh_api_roster_never_receives_new_batch_work",
-          "binary": "reliaburger::suite",
-          "test": "batch::a_retired_worker_in_a_fresh_api_roster_never_receives_new_batch_work",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
           "id": "issue-543-sync_retires_results_before_granting",
           "binary": "reliaburger",
           "test": "meat::task_array_store::tests::sync_retires_results_before_granting",
@@ -3130,18 +1701,6 @@
           ]
         },
         {
-          "id": "issue-543-an_expired_batch_with_an_unknown_runner_remains_nonterminal",
-          "binary": "reliaburger::suite",
-          "test": "batch::an_expired_batch_with_an_unknown_runner_remains_nonterminal",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs"
-          ]
-        },
-        {
           "id": "issue-543-positive-runtime-retirement",
           "binary": "reliaburger",
           "test": "bun::task_runtime::tests::task_runtime_uncertain_exit_holds_the_slot_until_positive_retirement",
@@ -3151,19 +1710,6 @@
           ],
           "sources": [
             "src/bun/task_runtime.rs"
-          ]
-        },
-        {
-          "id": "issue-543-legacy_callbacks_cannot_forge_or_change_common_run_outcomes",
-          "binary": "reliaburger::suite",
-          "test": "batch::legacy_callbacks_cannot_forge_or_change_common_run_outcomes",
-          "requires": [
-            "portable-linux",
-            "portable-darwin"
-          ],
-          "sources": [
-            "tests/suite/batch.rs",
-            "src/bun/batch.rs"
           ]
         },
         {
@@ -5885,6 +4431,83 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-cross_namespace_connect_to_container_ip_is_denied",
+          "binary": "reliaburger::ebpf",
+          "test": "cross_namespace_connect_to_container_ip_is_denied",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-cross_namespace_connect_to_node_host_port_is_denied",
+          "binary": "reliaburger::ebpf",
+          "test": "cross_namespace_connect_to_node_host_port_is_denied",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-allow_from_opens_the_real_address_path_too",
+          "binary": "reliaburger::ebpf",
+          "test": "allow_from_opens_the_real_address_path_too",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-exec_workload_is_held_to_its_namespace",
+          "binary": "reliaburger::ebpf",
+          "test": "exec_workload_is_held_to_its_namespace",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-egress_allowlist_still_resolves_dns",
+          "binary": "reliaburger::ebpf",
+          "test": "egress_allowlist_still_resolves_dns",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-job_egress_allowlist_is_enforced",
+          "binary": "reliaburger::ebpf",
+          "test": "job_egress_allowlist_is_enforced",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-allow_from_can_name_a_delegated_job_as_its_source",
+          "binary": "reliaburger::ebpf",
+          "test": "allow_from_can_name_a_delegated_job_as_its_source",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-dns_responder_resolves_internal_name",
           "binary": "reliaburger::ebpf",
           "test": "dns_responder_resolves_internal_name",
@@ -6295,17 +4918,6 @@
           "id": "legacy-ci-reliaburger-ebpf-source_policy_precedes_portless_application_start",
           "binary": "reliaburger::ebpf",
           "test": "source_policy_precedes_portless_application_start",
-          "requires": [
-            "linux-root-storage"
-          ],
-          "sources": [
-            "tests/ebpf.rs"
-          ]
-        },
-        {
-          "id": "legacy-ci-reliaburger-ebpf-source_policy_precedes_job_start",
-          "binary": "reliaburger::ebpf",
-          "test": "source_policy_precedes_job_start",
           "requires": [
             "linux-root-storage"
           ],
@@ -6880,9 +5492,9 @@
           ]
         },
         {
-          "id": "legacy-ci-reliaburger-council_disaster_recovery-trigger_elect_advances_term_and_can_move_leadership",
+          "id": "legacy-ci-reliaburger-council_disaster_recovery-trigger_elect_advances_the_term_and_leadership_settles",
           "binary": "reliaburger::council_disaster_recovery",
-          "test": "trigger_elect_advances_term_and_can_move_leadership",
+          "test": "trigger_elect_advances_the_term_and_leadership_settles",
           "requires": [
             "cluster-tests"
           ],
@@ -6894,6 +5506,17 @@
           "id": "legacy-ci-reliaburger-council_disaster_recovery-pressured_leader_resigns_and_leadership_moves",
           "binary": "reliaburger::council_disaster_recovery",
           "test": "pressured_leader_resigns_and_leadership_moves",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-council_disaster_recovery-leadership_moves_off_the_leader_every_time_under_write_load",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "leadership_moves_off_the_leader_every_time_under_write_load",
           "requires": [
             "cluster-tests"
           ],
@@ -6993,6 +5616,17 @@
           "id": "legacy-ci-reliaburger-placement-cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
           "binary": "reliaburger::placement",
           "test": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-placement-an_image_app_is_never_placed_on_a_process_only_node",
+          "binary": "reliaburger::placement",
+          "test": "an_image_app_is_never_placed_on_a_process_only_node",
           "requires": [
             "cluster-tests"
           ],
@@ -7169,6 +5803,17 @@
           "id": "legacy-ci-reliaburger-placement-concurrent_node_kills_and_leader_change_preserve_reserved_capacity",
           "binary": "reliaburger::placement",
           "test": "concurrent_node_kills_and_leader_change_preserve_reserved_capacity",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-placement-cluster_audit_query_merges_every_node",
+          "binary": "reliaburger::placement",
+          "test": "cluster_audit_query_merges_every_node",
           "requires": [
             "cluster-tests"
           ],
@@ -7743,33 +6388,6 @@
       ]
     },
     {
-      "id": "issue-555-original-standard-clients",
-      "issue": 555,
-      "promise": "Complete all uncovered original ignored cases through their declared owner.",
-      "supported_paths": [
-        "Original finite source/test identity retains its owner binding."
-      ],
-      "refused_paths": [
-        "Missing, skipped, unfinished or wrong-owner success cannot qualify."
-      ],
-      "boundaries": [
-        "Inherited host/feature selection must be checked by actual discovery; source tables have no CI authority."
-      ],
-      "cases": [
-        {
-          "id": "legacy-ci-reliaburger-suite-registry_standard_clients-crane_logs_in_pushes_and_pulls_over_tls",
-          "binary": "reliaburger::suite",
-          "test": "registry_standard_clients::crane_logs_in_pushes_and_pulls_over_tls",
-          "requires": [
-            "standard-clients"
-          ],
-          "sources": [
-            "tests/suite/registry_standard_clients.rs"
-          ]
-        }
-      ]
-    },
-    {
       "id": "issue-588-a_task_array_survives_losing_a_node_mid_run",
       "issue": 588,
       "promise": "Delegated arrays retain unique accepted outcomes after worker loss.",
@@ -7851,6 +6469,33 @@
       ]
     },
     {
+      "id": "issue-1021-runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs",
+      "issue": 1021,
+      "promise": "A fresh runc task of a named job has its cgroup bound to the job's run identity and its egress allowlist before its command runs.",
+      "supported_paths": [
+        "Rootful Linux owned containers with eBPF and warmed digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "fresh-runc-runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A fresh task whose cgroup cannot be bound or held to its allowlist never runs its command."
+      ],
+      "boundaries": [
+        "This image-backed case requires the warmed-image Linux gate; the network-isolated OCI interruption driver cannot substitute."
+      ]
+    },
+    {
       "id": "issue-638-a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
       "issue": 638,
       "promise": "Cron occurrence IDs survive leader replacement without duplicate dispatch.",
@@ -7868,6 +6513,60 @@
           "id": "common-a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
           "binary": "reliaburger::cluster_task_arrays",
           "test": "a_durable_cron_occurrence_keeps_its_run_identity_across_leadership_change",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-679-cron_in_one_namespace_fires_while_another_fills_the_bulk_cap",
+      "issue": 679,
+      "promise": "Cron fires use reserved headroom, so one tenant filling every bulk slot cannot lock out another tenant's schedule.",
+      "supported_paths": [
+        "Common job lifecycle on a real three-node council with per-namespace active-run caps."
+      ],
+      "refused_paths": [
+        "Bulk arrays past the bulk share are refused with a reason naming the reserved headroom."
+      ],
+      "boundaries": [
+        "Real multi-node consensus in the declared gate is required; synthetic evidence cannot qualify the reserve."
+      ],
+      "cases": [
+        {
+          "id": "common-cron_in_one_namespace_fires_while_another_fills_the_bulk_cap",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "cron_in_one_namespace_fires_while_another_fills_the_bulk_cap",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-680-hung_worker_api_does_not_stall_other_nodes_arrays",
+      "issue": 680,
+      "promise": "One leader tick commits one Raft entry for every running array, and a worker whose API hangs delays only its own grants.",
+      "supported_paths": [
+        "Task-array dispatch on a real three-node council with many concurrent arrays."
+      ],
+      "refused_paths": [
+        "A hung worker's chunks stay with it until the silence timeout, then go to other nodes at the next attempt."
+      ],
+      "boundaries": [
+        "Real multi-node consensus in the declared gate is required; synthetic evidence cannot qualify the dispatch cadence."
+      ],
+      "cases": [
+        {
+          "id": "dispatch-hung_worker_api_does_not_stall_other_nodes_arrays",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "hung_worker_api_does_not_stall_other_nodes_arrays",
           "requires": [
             "cluster-tests"
           ],
@@ -7957,6 +6656,1585 @@
           "requires": [
             "portable-linux",
             "portable-darwin"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-639-runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
+      "issue": 639,
+      "promise": "Compatible commands reuse one limited container, clean task state and return idle reservations beside application capacity.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "reusable-runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_reusable_commands_keep_the_container_but_retire_task_state_and_idle_resources",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Conflicting or uncertain original ownership cannot authorise reuse or cross-backend replacement."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate; protocol mocks do not prove cgroup or namespace isolation."
+      ]
+    },
+    {
+      "id": "issue-639-runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
+      "issue": 639,
+      "promise": "One node runs host and image workloads simultaneously and recovers each original backend before a positively retired backend change.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "reusable-runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_original_owners",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Conflicting or uncertain original ownership cannot authorise reuse or cross-backend replacement."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate; protocol mocks do not prove cgroup or namespace isolation."
+      ]
+    },
+    {
+      "id": "issue-639-runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
+      "issue": 639,
+      "promise": "Compatible warm capacity remains available with helper-inclusive reservations, yields to queued owners and refuses revoked queued credentials.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "reusable-runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_secrets",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A retired namespace key cannot authorise a queued command."
+      ],
+      "boundaries": [
+        "Real runtime and worker-ledger regression, not throughput or production Raft durability qualification."
+      ]
+    },
+    {
+      "id": "issue-639-cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+      "issue": 639,
+      "promise": "Native helpers reuse durable ownership while fresh host commands enforce CPU, memory and process-tree cleanup.",
+      "supported_paths": [
+        "Rootful Linux native executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "native-cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Uncertain original ownership cannot authorise reuse or release capacity."
+      ],
+      "boundaries": [
+        "Real runtime regression; this does not qualify sustained production throughput."
+      ]
+    },
+    {
+      "id": "issue-639-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
+      "issue": 639,
+      "promise": "A dropped native caller hands its executor to eviction, which retires it and frees its capacity without a restart; a later restart reuses only the originally retired identity.",
+      "supported_paths": [
+        "Rootful Linux native executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "native-cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Uncertain original ownership cannot authorise reuse or release capacity."
+      ],
+      "boundaries": [
+        "Real runtime regression; this does not qualify sustained production throughput."
+      ]
+    },
+    {
+      "id": "issue-639-native-host-executors-own-their-cgroups",
+      "issue": 639,
+      "promise": "Native host executors run each command in a limited cgroup, drain and retire it positively, and keep uncertain slots quarantined.",
+      "supported_paths": [
+        "Rootful Linux process nodes with cgroup v2 and the native host executor"
+      ],
+      "cases": [
+        {
+          "id": "host-executor-cgroup_host_executor_never_reuses_a_killed_task_cgroup",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_never_reuses_a_killed_task_cgroup",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "host-executor-cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "host-executor-cgroup_host_executor_drains_output_buffered_at_exit",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_drains_output_buffered_at_exit",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "host-executor-cgroup_host_executor_sockets_cannot_be_blocked_by_other_users",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_sockets_cannot_be_blocked_by_other_users",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "host-executor-cgroup_host_arrays_advertise_running_commands_not_queued_callers",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_arrays_advertise_running_commands_not_queued_callers",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "host-executor-cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_busy_slots_count_checked_out_slots_before_the_command_starts",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "host-executor-cgroup_host_executor_adds_no_drain_wait_to_quiet_commands",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "cgroup_host_executor_adds_no_drain_wait_to_quiet_commands",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Unenforceable host limits, container runtimes on rootful process nodes and reuse of a killed task group are refused."
+      ],
+      "boundaries": [
+        "These cases need root and cgroup v2 in the Linux gate; portable runs cannot substitute."
+      ]
+    },
+    {
+      "id": "issue-682-cold-preparation-is-interruptible",
+      "issue": 682,
+      "promise": "Cancellation and the attempt deadline interrupt a reusable executor's cold preparation, and the half-started executor is retired with its slot and reservation returned.",
+      "supported_paths": [
+        "Rootful Linux native host executors on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "cold-preparation-cgroup_cancel_during_cold_preparation_retires_the_context",
+          "binary": "reliaburger",
+          "test": "bun::reusable_executor::pool::tests::cgroup_cancel_during_cold_preparation_retires_the_context",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/reusable_executor/pool.rs"
+          ]
+        },
+        {
+          "id": "cold-preparation-cgroup_deadline_during_cold_preparation_retires_the_context",
+          "binary": "reliaburger",
+          "test": "bun::reusable_executor::pool::tests::cgroup_deadline_during_cold_preparation_retires_the_context",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/reusable_executor/pool.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A runtime call is never abandoned halfway; preparation stops only between runtime calls or while waiting for the helper to connect."
+      ],
+      "boundaries": [
+        "The helper never connects in these cases; a slow image pull shares the same interruption but isn't exercised by the gate."
+      ]
+    },
+    {
+      "id": "issue-681",
+      "issue": 681,
+      "promise": "App placement counts the capacity job leases hold, and every job, leased or not, takes the common job lifecycle.",
+      "supported_paths": [
+        "State reports carry task and executor reservations apart from app requests; the leader adds them to each node's allocated total.",
+        "A node that cannot fit a placement reports the refusal and the leader moves the replica.",
+        "Job test leases live in Raft with a council; their jobs join the lease before admission and cleanup stops and forgets them."
+      ],
+      "refused_paths": [
+        "The pre-0.2.0 node-to-node batch routes are gone.",
+        "A job in a test lease namespace is refused unless an active job lease owns it."
+      ],
+      "boundaries": [
+        "Single scheduling passes, the in-process leader scheduler and a real three-node cluster with a shared executor budget; leadership change through a snapshot reload."
+      ],
+      "cases": [
+        {
+          "id": "issue-681-job_reservations_count_task_and_executor_leases_but_not_apps",
+          "binary": "reliaburger",
+          "test": "bun::execution_budget::tests::job_reservations_count_task_and_executor_leases_but_not_apps",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/execution_budget.rs"
+          ]
+        },
+        {
+          "id": "issue-681-state_report_carries_task_and_executor_reservations",
+          "binary": "reliaburger",
+          "test": "reporting::worker::tests::state_report_carries_task_and_executor_reservations",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/reporting/worker.rs",
+            "src/reporting/types.rs"
+          ]
+        },
+        {
+          "id": "issue-681-capacity_refusal_and_job_reservations_reach_the_state_snapshot",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::capacity_refusal_and_job_reservations_reach_the_state_snapshot",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/status.rs",
+            "src/bun/agent/deploy_ops.rs"
+          ]
+        },
+        {
+          "id": "issue-681-app_replica_avoids_a_node_whose_budget_is_held_by_job_leases",
+          "binary": "reliaburger",
+          "test": "cluster::orchestrate::tests::app_replica_avoids_a_node_whose_budget_is_held_by_job_leases",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/cluster/orchestrate.rs"
+          ]
+        },
+        {
+          "id": "issue-681-capacity_refusal_from_the_agent_moves_the_replica",
+          "binary": "reliaburger",
+          "test": "cluster::orchestrate::tests::capacity_refusal_from_the_agent_moves_the_replica",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/cluster/orchestrate.rs",
+            "src/meat/cluster_state.rs"
+          ]
+        },
+        {
+          "id": "issue-681-leased_apply_with_jobs_uses_the_common_job_lifecycle",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::leased_apply_with_jobs_uses_the_common_job_lifecycle",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api/apply.rs",
+            "src/bun/job_apply.rs",
+            "src/testkit/lease.rs"
+          ]
+        },
+        {
+          "id": "issue-681-standalone_job_lease_owns_its_jobs_and_cleanup_forgets_them",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::standalone_job_lease_owns_its_jobs_and_cleanup_forgets_them",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/job_apply.rs",
+            "src/testkit/lease.rs"
+          ]
+        },
+        {
+          "id": "issue-681-legacy_batch_routes_are_gone",
+          "binary": "reliaburger",
+          "test": "bun::api::tests::legacy_batch_routes_are_gone",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/api.rs",
+            "src/bun/batch.rs"
+          ]
+        },
+        {
+          "id": "issue-681-leased_job_apply_survives_leader_change_without_reserving_capacity",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::leased_job_apply_survives_leader_change_without_reserving_capacity",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs",
+            "src/meat/admission.rs"
+          ]
+        },
+        {
+          "id": "issue-681-a_job_in_a_lease_namespace_needs_the_lease_to_own_it",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::a_job_in_a_lease_namespace_needs_the_lease_to_own_it",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-681-an_app_deploys_beside_a_job_filled_node_on_another_node",
+          "binary": "reliaburger::suite",
+          "test": "agent_cluster::an_app_deploys_beside_a_job_filled_node_on_another_node",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/agent_cluster.rs",
+            "src/cluster/orchestrate.rs"
+          ]
+        },
+        {
+          "id": "issue-681-app_replica_lands_on_the_idle_node_while_another_runs_an_array",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "app_replica_lands_on_the_idle_node_while_another_runs_an_array",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-694-recovery-fencing-and-odd-councils",
+      "issue": 694,
+      "promise": "No two recoveries share an epoch and recovery id; two that land on one epoch both fence as a split, a fenced data directory needs --force and lands above the fencing epoch, a restarted old voter serves nothing before gossip has synced and had its probe window, and a two-node cluster keeps one voter.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime and the in-memory Raft router"
+      ],
+      "cases": [
+        {
+          "id": "recovery-fencing-recovering_two_survivors_independently_fences_one",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "recovering_two_survivors_independently_fences_one",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "recovery-fencing-slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+          "binary": "reliaburger::council_disaster_recovery",
+          "test": "slow_gossip_restart_never_acknowledges_on_the_old_epoch",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_disaster_recovery.rs"
+          ]
+        },
+        {
+          "id": "odd-council-two_node_cluster_survives_losing_the_non_voter",
+          "binary": "reliaburger::council_self_healing",
+          "test": "two_node_cluster_survives_losing_the_non_voter",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_self_healing.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Recovering a data directory whose fence record says it was fenced is refused without --force."
+      ],
+      "boundaries": [
+        "Old voters that can reach only each other, never a node on the newer epoch, still can't learn of the recovery."
+      ]
+    },
+    {
+      "id": "issue-696-gossip-datagram-budget",
+      "issue": 696,
+      "promise": "Gossip probes from nodes with the longest names and a full label set fit the 1,400-byte datagram, so those nodes keep acknowledging and stay alive through churn.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime over loopback UDP"
+      ],
+      "cases": [
+        {
+          "id": "gossip-budget-nodes_with_maximal_labels_stay_alive_during_churn",
+          "binary": "reliaburger::cluster_gossip",
+          "test": "nodes_with_maximal_labels_stay_alive_during_churn",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_gossip.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A directory extension that cannot fit beside the header is left off the datagram rather than sent oversize."
+      ],
+      "boundaries": [
+        "A maximally labelled node piggybacks fewer updates per probe; anti-entropy, which carries no extension, makes up the difference."
+      ]
+    },
+    {
+      "id": "issue-759-executor-start-retries-on-a-fresh-executor",
+      "issue": 759,
+      "promise": "An executor start that misses a runtime command's bound retires that executor and runs the command once on a fresh one, within the command's deadline.",
+      "supported_paths": [
+        "Rootful Linux shared-runc executors"
+      ],
+      "cases": [
+        {
+          "id": "executor-start-runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A start that fails again is refused after one retry, and an executor that has not positively retired is never replaced."
+      ],
+      "boundaries": [
+        "The runtime failure is injected after a real start; a configuration refusal is never retried."
+      ]
+    },
+    {
+      "id": "issue-790-warm-pinned-cold-starts-read-no-registry",
+      "issue": 790,
+      "promise": "Cold shared-runc executors for a digest-pinned image this node has already verified and unpacked send no registry request, so a burst of them survives a registry that rate-limits every request.",
+      "supported_paths": [
+        "Rootful Linux shared-runc executors"
+      ],
+      "cases": [
+        {
+          "id": "warm-pin-runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_warm_pinned_executor_cold_starts_make_no_registry_requests",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Local metadata that no longer hashes to its digest is ignored and refetched, and a tag reference always asks the registry."
+      ],
+      "boundaries": [
+        "The first pull of an image on a node still reads the registry, and a cold pin fails as before once the registry's retries run out."
+      ]
+    },
+    {
+      "id": "issue-678-runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
+      "issue": 678,
+      "promise": "Retired shared-runc executors across namespaces leave no runtime journals, identities or route files behind.",
+      "supported_paths": [
+        "Rootful Linux shared-runc executors"
+      ],
+      "cases": [
+        {
+          "id": "storage-runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_retirement",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "An identity that might still own a live executor keeps its metadata."
+      ],
+      "boundaries": [
+        "Real runtime regression; ordinary app instances are not collected."
+      ]
+    },
+    {
+      "id": "issue-687-version-form-upgrades-with-the-nodes-platform-build",
+      "issue": 687,
+      "promise": "relish upgrade start <version> downloads the release build for the platform the nodes report, countersigns it with the operator's external key, and the rolling upgrade completes; a release with other cluster formats is refused before anything is recorded.",
+      "supported_paths": [
+        "Cluster upgrades started from relish against release metadata"
+      ],
+      "cases": [
+        {
+          "id": "self-upgrade-cluster-version_form_rolls_the_nodes_platform_build_countersigned_by_relish",
+          "binary": "reliaburger::self_upgrade_cluster",
+          "test": "version_form_rolls_the_nodes_platform_build_countersigned_by_relish",
+          "requires": [
+            "upgrade-cluster"
+          ],
+          "sources": [
+            "tests/self_upgrade_cluster.rs",
+            "src/relish/upgrade.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A release whose metadata names another protocol or state pair is refused with a fresh-cluster message and no run is recorded."
+      ],
+      "boundaries": [
+        "Every node in the harness runs on the test host's platform, so mixed-architecture selection is covered by the relish, orchestrator and plan unit tests."
+      ]
+    },
+    {
+      "id": "issue-676-host-path-sources-need-a-node-allowlist",
+      "issue": 676,
+      "promise": "A node refuses a volume or config-file host path outside [storage] allowed_host_paths, and always refuses its own storage and security directories, before any runtime state exists.",
+      "supported_paths": [
+        "Rootful Linux runc nodes"
+      ],
+      "cases": [
+        {
+          "id": "host-path-runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted",
+          "binary": "reliaburger",
+          "test": "bun::supervisor::tests::runc_refuses_to_start_an_app_whose_host_path_is_not_allowlisted",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/supervisor.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "An unlisted host path, and another namespace's managed volume under a listed parent, are refused with no bundle or container created."
+      ],
+      "boundaries": [
+        "This case needs runc in the Linux gate; the portable supervisor tests cover the same policy with a mock runtime."
+      ]
+    },
+    {
+      "id": "issue-684-shared-profile-usage-from-cgroups",
+      "issue": 684,
+      "promise": "A running shared-runc profile reports CPU and memory from its executor cgroup, labelled by namespace, definition, profile and node, for Mayo and relish top.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images on cgroup v2"
+      ],
+      "cases": [
+        {
+          "id": "job-usage-runc_shared_profile_reports_cgroup_cpu_and_memory",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_shared_profile_reports_cgroup_cpu_and_memory",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A task index or run id never becomes a metric label."
+      ],
+      "boundaries": [
+        "The executor's cgroup includes its helper, so the sample carries the helper's small overhead."
+      ]
+    },
+    {
+      "id": "issue-686-leader-loss-mid-array",
+      "issue": 686,
+      "promise": "An array whose leader is lost while that leader runs its own share finishes with every task accepted once, replaying only the chunks the lost leader held.",
+      "supported_paths": [
+        "Three-node councils with fake runners at a hundred thousand tasks",
+        "Three in-process nodes with real shared-runc and cgroup host executors on rootful Linux"
+      ],
+      "cases": [
+        {
+          "id": "leader-loss-a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run",
+          "binary": "reliaburger::cluster_task_arrays",
+          "test": "a_task_array_finishes_exactly_once_after_the_leader_is_killed_mid_run",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "leader-loss-leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_shared_runc_executors",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        },
+        {
+          "id": "leader-loss-leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "leader_loss_mid_array_loses_and_duplicates_nothing_with_cgroup_host_executors",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A report from the lost leader's still-running executor is never accepted once its chunks are taken back."
+      ],
+      "boundaries": [
+        "The in-process leader stops its control plane rather than receiving SIGKILL; the release job qualification (qualify-jobs-sustained.sh) SIGKILLs Bun on real VMs."
+      ]
+    },
+    {
+      "id": "issue-780-root-cleanup-mounts",
+      "issue": 780,
+      "promise": "An OCI test's root is unmounted and removed when the test ends, whether it passed or panicked.",
+      "supported_paths": [
+        "Rootful runs that leave workload identity tmpfs mounted beneath the root"
+      ],
+      "cases": [
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_and_removes_the_root",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        },
+        {
+          "id": "root-cleanup-root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::oci_crash",
+          "test": "root_cleanup_unmounts_leaked_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A root that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
+      "id": "issue-852-capacity-harness-volumes",
+      "issue": 852,
+      "promise": "The owned-runc capacity harness keeps its volumes directory until it stops, then unmounts and removes it, whether the test passed or panicked.",
+      "supported_paths": [
+        "Rootful agents that leave workload identity tmpfs mounted beneath the harness's volumes directory"
+      ],
+      "cases": [
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        },
+        {
+          "id": "capacity-harness-runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "binary": "reliaburger::owned_runc",
+          "test": "capacity_contract::runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs",
+            "tests/support/fixture_dir.rs",
+            "tests/support/task_harness.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A volumes directory that can't be removed fails a passing test instead of being left behind."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production removal of identity mounts is cleanup_identity_dir's job."
+      ]
+    },
+    {
+      "id": "issue-734-rootless-test-cleanup",
+      "issue": 734,
+      "promise": "A failed rootless OCI test leaves none of its network helpers running.",
+      "supported_paths": [
+        "Rootless runc nodes whose owners supervise slirp4netns helpers"
+      ],
+      "cases": [
+        {
+          "id": "rootless-cleanup-normal_rootless_bun_cleanup_leaves_no_network_helper_behind",
+          "binary": "reliaburger::oci_crash",
+          "test": "normal_rootless_bun_cleanup_leaves_no_network_helper_behind",
+          "requires": [
+            "rootless-linux"
+          ],
+          "sources": [
+            "tests/oci_crash.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A helper whose command line names only its generation directory is still found through the root's runtime intents."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; production retirement of rootless helpers is covered by the owned_rootless cases."
+      ]
+    },
+    {
+      "id": "issue-777-unrunnable-runs-fail-fast",
+      "issue": 777,
+      "promise": "A job run no node can run (host commands under mount_isolation, a binary on no node's allowlist) is refused at standalone admission, or failed by the leader with the nodes' reason, instead of staying queued until its deadline.",
+      "supported_paths": [
+        "Standalone nodes and councils on every platform"
+      ],
+      "cases": [
+        {
+          "id": "issue-777-host_runs_under_mount_isolation_are_refused_with_the_reason",
+          "binary": "reliaburger::suite",
+          "test": "task_arrays::host_runs_under_mount_isolation_are_refused_with_the_reason",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-777-a_run_no_node_may_run_fails_with_the_nodes_reason",
+          "binary": "reliaburger::suite",
+          "test": "task_arrays::a_run_no_node_may_run_fails_with_the_nodes_reason",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-777-a_run_every_eligible_node_refuses_for_good_fails_with_the_reason",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::a_run_every_eligible_node_refuses_for_good_fails_with_the_reason",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-777-a_run_waits_while_any_eligible_node_could_still_take_it",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::a_run_waits_while_any_eligible_node_could_still_take_it",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A run that one eligible node can still take, or that a node refuses only for a passing fault, keeps waiting."
+      ],
+      "boundaries": [
+        "Running host tasks under mount isolation is #714; until then host jobs need mount_isolation = false."
+      ]
+    },
+    {
+      "id": "issue-788-cluster-admission-refuses-unrunnable-jobs",
+      "issue": 788,
+      "promise": "In a cluster the leader refuses a job run no live node can take at submission, with HTTP 422 and the reason the leader's tick would give, from a compact job-capability summary every node advertises over gossip.",
+      "supported_paths": [
+        "Councils on every platform"
+      ],
+      "cases": [
+        {
+          "id": "issue-788-a_cluster_refuses_a_run_no_live_node_can_take_at_submission",
+          "binary": "reliaburger::suite",
+          "test": "task_arrays::a_cluster_refuses_a_run_no_live_node_can_take_at_submission",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "tests/suite/task_arrays.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_refuses_a_run_every_live_node_advertises_it_cannot_take",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_refuses_a_run_every_live_node_advertises_it_cannot_take",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_quotes_the_reasons_the_tick_would",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_quotes_the_reasons_the_tick_would",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-admission_admits_a_run_any_live_node_might_take",
+          "binary": "reliaburger",
+          "test": "bun::task_array_leader::tests::admission_admits_a_run_any_live_node_might_take",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_leader.rs"
+          ]
+        },
+        {
+          "id": "issue-788-what_a_node_advertises_reaches_its_own_verdict_on_every_run",
+          "binary": "reliaburger",
+          "test": "bun::task_array_node::tests::what_a_node_advertises_reaches_its_own_verdict_on_every_run",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/task_array_node.rs"
+          ]
+        },
+        {
+          "id": "issue-788-probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram",
+          "binary": "reliaburger",
+          "test": "mustard::protocol::tests::probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/mustard/protocol.rs"
+          ]
+        },
+        {
+          "id": "issue-788-advertised_job_capabilities_reach_a_remote_member_via_gossip",
+          "binary": "reliaburger",
+          "test": "mustard::protocol::tests::advertised_job_capabilities_reach_a_remote_member_via_gossip",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/mustard/protocol.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A run any live node might take, or one a node hasn't advertised its capabilities for, is admitted and left to the nodes and the leader's tick."
+      ],
+      "boundaries": [
+        "Gossip says whether a node's allowed_binaries names anything; the paths come from its capability report, and until it has reported, a binary missing from a non-empty allowlist is caught by the tick, as are nodes that leave or change configuration after admission."
+      ]
+    },
+    {
+      "id": "issue-699-faults-revert-after-bun-restart",
+      "issue": 699,
+      "promise": "A chaos fault never outlives the Bun that injected it: CPU and memory caps, paused processes and pinned eBPF fault entries are undone when the next Bun adopts its workloads, and CPU and memory faults restore the workload's own cgroup values when they expire.",
+      "supported_paths": [
+        "Rootful Linux with cgroup v2, through the agent's adoption of recorded instances",
+        "The owned eBPF loader with maps pinned in bpffs"
+      ],
+      "cases": [
+        {
+          "id": "issue-699-cpu_fault_round_trip_restores_cpu_max",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_round_trip_restores_cpu_max",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-memory_fault_round_trip_restores_memory_high",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::memory_fault_round_trip_restores_memory_high",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-cpu_fault_is_reverted_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::cpu_fault_is_reverted_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-paused_instance_resumes_after_bun_is_killed",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::cgroup_faults::paused_instance_resumes_after_bun_is_killed",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/bun/agent/tests/cgroup_faults.rs"
+          ]
+        },
+        {
+          "id": "issue-699-owned_loader_clears_stale_fault_connect_entries",
+          "binary": "reliaburger::ebpf",
+          "test": "owned_loader_clears_stale_fault_connect_entries",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "The pinned egress policy is not cleared along with the fault entries."
+      ],
+      "boundaries": [
+        "Dropping an in-process agent stands in for a SIGKILL of Bun; the cgroup and the workload process are real."
+      ]
+    },
+    {
+      "id": "issue-697-image_survives_loss_of_the_pushing_node",
+      "issue": 697,
+      "promise": "A pushed image survives losing the node it was pushed to: heal counts only live copies and re-replicates from a survivor.",
+      "supported_paths": [
+        "Three-node TLS council with redundancy 2, each node on its own loopback address and the shared registry port."
+      ],
+      "refused_paths": [
+        "A dead node's recorded copy never counts towards redundancy, and the image is never reported Lost while a live copy exists."
+      ],
+      "boundaries": [
+        "Linux only: the fixture needs 127.0.0.2 and 127.0.0.3. It proves the OCI pull a deploy performs, not an app start under the process runtime."
+      ],
+      "cases": [
+        {
+          "id": "durability-image_survives_loss_of_the_pushing_node",
+          "binary": "reliaburger::registry_durability",
+          "test": "image_survives_loss_of_the_pushing_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/registry_durability.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-698-standard-clients",
+      "issue": 698,
+      "promise": "docker, podman, skopeo and crane log in to Pickle with an API token, verify the cluster CA, push an image and pull its layers back.",
+      "supported_paths": [
+        "A Pickle TLS listener on a non-loopback address under a name its node certificate carries, with the cluster root CA in /etc/docker/certs.d, /etc/containers/certs.d, skopeo --cert-dir or crane's SSL_CERT_FILE."
+      ],
+      "refused_paths": [
+        "A wrong token, a registry certificate from another CA, and a namespace-scoped token pushing outside its namespace are each refused by the client."
+      ],
+      "boundaries": [
+        "Linux only, on a host prepared by scripts/standard-clients-host.sh; client versions are whatever the runner image ships and are logged by the gate. oras is not exercised."
+      ],
+      "cases": [
+        {
+          "id": "standard-clients-docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_refuses_a_registry_signed_by_another_ca",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_refuses_a_registry_signed_by_another_ca",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::docker_push_with_a_scoped_token_outside_its_namespace_is_denied",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::podman_logs_in_pushes_and_pulls_layers_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-skopeo_copies_between_repositories_over_verified_tls",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::skopeo_copies_between_repositories_over_verified_tls",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        },
+        {
+          "id": "standard-clients-crane_pulls_layers_back_with_ca_verification",
+          "binary": "reliaburger::suite",
+          "test": "registry_standard_clients::crane_pulls_layers_back_with_ca_verification",
+          "requires": [
+            "standard-clients"
+          ],
+          "sources": [
+            "tests/suite/registry_standard_clients.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-823-runc-launches-survive-a-switch-to-the-mixed-runtime",
+      "issue": 823,
+      "promise": "A node restarted from the runc runtime to the mixed runtime routes each running container to the runc owner that launched it, so startup recovery reads it instead of stopping Bun.",
+      "supported_paths": [
+        "Rootful Linux owned runtimes with digest-pinned images"
+      ],
+      "cases": [
+        {
+          "id": "runtime-switch-runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent",
+          "binary": "reliaburger::owned_task_arrays",
+          "test": "runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/owned_task_arrays.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A launch both backends claim stays unrouted, and recovery refuses it as before."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate; the portable mixed-runtime tests cover the routing rules with mock backends."
+      ]
+    },
+    {
+      "id": "issue-692-rollout-safety",
+      "issue": 692,
+      "promise": "A cluster spec change reaches one node at a time, a failed rollout is marked RolloutFailed and never retried until the spec changes, and rollback targets survive every node restarting.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs"
+      ],
+      "cases": [
+        {
+          "id": "rollout-safety-three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "binary": "reliaburger::placement",
+          "test": "three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "binary": "reliaburger::placement",
+          "test": "bad_version_in_cluster_becomes_rollout_failed_and_stops_retrying",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        },
+        {
+          "id": "rollout-safety-rollback_works_after_every_node_restarts",
+          "binary": "reliaburger::placement",
+          "test": "rollback_works_after_every_node_restarts",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "Re-applying the identical failed spec keeps RolloutFailed; only a different spec clears it."
+      ],
+      "boundaries": [
+        "Rollout progress comes from node reports; full leader-coordinated rollouts with a cluster-wide budget are not claimed."
+      ]
+    },
+    {
+      "id": "issue-700-one-bad-ingress-route",
+      "issue": 700,
+      "promise": "One app whose ingress route no node can install never stops the cluster catalogue: every node skips that route, logs it, and keeps publishing discovery and ingress for every other app.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime, with the invalid spec written straight to the council"
+      ],
+      "cases": [
+        {
+          "id": "issue-700-invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+          "binary": "reliaburger::cluster_failover",
+          "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "relish apply and relish lint refuse an ingress with an unsupported TLS mode, a zero rate or burst, or a rate whose default burst overflows."
+      ],
+      "boundaries": [
+        "The skipped route stays uninstalled until its app is reapplied with a valid ingress."
+      ]
+    },
+    {
+      "id": "issue-695-interrupted-snapshot-is-cleaned-up",
+      "issue": 695,
+      "promise": "A volume snapshot whose create was cut between the Btrfs subvolume and its metadata never leaks a hidden subvolume: the next start deletes it, and a metadata-less subvolume without an intent is reported, never silently skipped.",
+      "supported_paths": [
+        "Rootful Linux with Btrfs-backed managed volumes"
+      ],
+      "cases": [
+        {
+          "id": "interrupted-snapshot-btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+          "binary": "reliaburger",
+          "test": "grill::snapshot::tests::btrfs_interrupted_snapshot_is_cleaned_up_on_restart",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/snapshot.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "A metadata-less subvolume with no intent file is reported and kept, because nothing proves it is safe to delete."
+      ],
+      "boundaries": [
+        "Run through the real Linux gate on a loop-mounted Btrfs; the portable tests cover every intent decision with plain directories. The power cut itself stays with the Btrfs power-cut fixture of #287."
+      ]
+    },
+    {
+      "id": "issue-702-stale-node-grace",
+      "issue": 702,
+      "promise": "A node alive in gossip whose reports stopped keeps its replicas for the stale-node grace, then loses them to the survivors.",
+      "supported_paths": [
+        "Three-node ProcessGrill clusters wired as bun --cluster runs, with one node's agent stopped while its gossip and Raft carry on"
+      ],
+      "refused_paths": [
+        "The silent node's replica never moves before its reports have been stale for the grace."
+      ],
+      "boundaries": [
+        "The grace is measured on the leader's clock from when the node's reports went stale; a node the leader never heard from counts from when it started listening."
+      ],
+      "cases": [
+        {
+          "id": "stale-node-grace-replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "binary": "reliaburger::placement",
+          "test": "replicas_move_off_a_node_whose_reports_stopped_after_the_grace",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs",
+            "tests/support/cluster.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-701",
+      "issue": 701,
+      "promise": "Every [app.*] field is honoured as written or refused with a reason; none is parsed and then silently dropped.",
+      "supported_paths": [
+        "An init container runs its own image (or the app's) with the app's env, decrypted secrets, and volume and config-file mounts.",
+        "Inline config files are per instance and keyed on the container path, and go with the instance.",
+        "health.port without an app port is probed at deploy and by the rollout gate.",
+        "Removing [autoscale] clears its override; narrowing its bounds clamps it."
+      ],
+      "refused_paths": [
+        "volumes, config_file, run_as_user and run_as_group on exec or script apps.",
+        "A health check with no port, a zero interval, timeout or threshold, or a timeout longer than the interval.",
+        "gpu above 0 and egress.allow_franchise.",
+        "A volume size the node cannot enforce, or a changed size on an existing volume."
+      ],
+      "boundaries": [
+        "Running an init container's own image needs the provisioned Linux root gate; portable cases check the generated spec and the agent's wiring.",
+        "Volume size is refused on the node at deploy, not at apply."
+      ],
+      "cases": [
+        {
+          "id": "issue-701-runc_init_container_runs_its_own_image_with_app_env",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_init_container_runs_its_own_image_with_app_env",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_spec_uses_its_own_image",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::init_spec_uses_its_own_image",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_spec_gets_app_env_and_volume_mounts",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::init_spec_gets_app_env_and_volume_mounts",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-init_container_runs_its_own_image_with_the_app_env_and_mounts",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::init_container_runs_its_own_image_with_the_app_env_and_mounts",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/deploy_worker.rs"
+          ]
+        },
+        {
+          "id": "issue-701-inline_config_files_with_same_basename_do_not_collide",
+          "binary": "reliaburger",
+          "test": "grill::oci::tests::inline_config_files_with_same_basename_do_not_collide",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/oci.rs"
+          ]
+        },
+        {
+          "id": "issue-701-stop_removes_each_instances_inline_config_files",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::stop_removes_each_instances_inline_config_files",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/retirement.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_volume_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_volume_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_config_file_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_config_file_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-process_app_with_run_as_user_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::process_app_with_run_as_user_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-removing_autoscale_clears_the_override",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::removing_autoscale_clears_the_override",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-701-narrowing_autoscale_bounds_clamps_the_override",
+          "binary": "reliaburger",
+          "test": "council::state_machine::tests::narrowing_autoscale_bounds_clamps_the_override",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/council/state_machine.rs"
+          ]
+        },
+        {
+          "id": "issue-701-health_port_without_app_port_is_valid",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::health_port_without_app_port_is_valid",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-zero_health_timeout_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::zero_health_timeout_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-rollout_gate_probes_health_port_without_app_port",
+          "binary": "reliaburger",
+          "test": "bun::agent::tests::rollout_gate_probes_health_port_without_app_port",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/bun/agent/health_checks.rs"
+          ]
+        },
+        {
+          "id": "issue-701-changing_size_of_existing_volume_is_refused",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::changing_size_of_existing_volume_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-701-unenforceable_size_is_refused",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::unenforceable_size_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-701-gpu_request_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::gpu_request_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
+          ]
+        },
+        {
+          "id": "issue-701-allow_franchise_is_refused",
+          "binary": "reliaburger",
+          "test": "config::validate::tests::allow_franchise_is_refused",
+          "requires": [
+            "portable-linux",
+            "portable-darwin"
+          ],
+          "sources": [
+            "src/config/validate.rs"
           ]
         }
       ]

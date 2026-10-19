@@ -3,19 +3,25 @@
 use crate::bun::capabilities::Capability;
 use crate::relish::client::LogOptions;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
-/// A batch job runs to completion and reports a success exit.
+/// A job's run is a cluster record whose id starts `run-`; a `scheduled`
+/// row is the cron definition itself.
+fn is_run(row: &crate::bun::agent::JobStatus) -> bool {
+    row.instance_id.starts_with("run-")
+}
+
+/// A batch job runs to completion and reports a success exit. A run is
+/// `stopped` only once every task exited zero; a failed one says `failed`.
 async fn job_runs_to_completion_and_reports_exit(ctx: TestContext) -> Result<(), String> {
     let job = "batch";
     ctx.apply(&ctx.process_job_spec(job, &["/bin/sh", "-c", "echo done"]))
         .await?;
-    ctx.wait_for_cluster(job, "stopped with exit 0", |instances| {
-        instances
-            .iter()
-            .any(|i| i.state == "stopped" && i.exit_code == Some(0))
+    ctx.wait_for_job_runs(job, "a run stopped with exit 0", |rows| {
+        rows.iter().any(|row| is_run(row) && row.state == "stopped")
     })
     .await
 }
@@ -24,19 +30,17 @@ async fn job_runs_to_completion_and_reports_exit(ctx: TestContext) -> Result<(),
 async fn scheduled_job_fires_on_its_schedule(ctx: TestContext) -> Result<(), String> {
     let job = "cron";
     // Every minute (the finest cron granularity). The default per-case timeout
-    // gives it two windows to fire.
+    // gives it two windows to fire. A host job, like the case's requirement
+    // says: an image job needs a container runtime, and a cluster with none
+    // refuses it at admission (#788).
     let spec = format!(
-        "[job.{job}]\n\
-         image = \"proc-grill:image-ignored\"\n\
-         command = [\"/bin/sh\", \"-c\", \"echo tick\"]\n\
-         schedule = \"* * * * *\"\n\
-         namespace = \"{ns}\"\n",
-        ns = ctx.namespace,
+        "{}schedule = \"* * * * *\"\n",
+        ctx.process_job_spec(job, &["/bin/sh", "-c", "echo tick"])
     );
     ctx.apply(&spec).await?;
-    // A fired schedule leaves at least one instance behind.
-    ctx.wait_for_cluster(job, "at least one scheduled run", |instances| {
-        !instances.is_empty()
+    // A fired schedule leaves at least one run behind.
+    ctx.wait_for_job_runs(job, "at least one scheduled run", |rows| {
+        rows.iter().any(is_run)
     })
     .await
 }
@@ -47,8 +51,8 @@ async fn job_logs_are_retrievable_after_completion(ctx: TestContext) -> Result<(
     let job = "logged";
     ctx.apply(&ctx.process_job_spec(job, &["/bin/sh", "-c", "echo hello-from-job"]))
         .await?;
-    ctx.wait_for_cluster(job, "stopped", |instances| {
-        instances.iter().any(|i| i.state == "stopped")
+    ctx.wait_for_job_runs(job, "a stopped run", |rows| {
+        rows.iter().any(|row| is_run(row) && row.state == "stopped")
     })
     .await?;
 
@@ -80,18 +84,21 @@ pub fn cases() -> Vec<TestCase> {
             name: "job_runs_to_completion_and_reports_exit",
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(job_runs_to_completion_and_reports_exit),
         },
         TestCase {
             name: "scheduled_job_fires_on_its_schedule",
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(scheduled_job_fires_on_its_schedule),
         },
         TestCase {
             name: "job_logs_are_retrievable_after_completion",
             group: TestGroup::Jobs,
             requires: &[Capability::Logs, Capability::ProcessRuntime],
+            lease: LeaseScope::NodeJobs,
             run: testkit_case!(job_logs_are_retrievable_after_completion),
         },
     ]
@@ -102,7 +109,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    async fn completion_case(exit_code: Option<i32>) -> Result<(), String> {
+    /// `/v1/jobs?cluster=true` answering one run of `name` in `namespace`.
+    fn jobs_route(
+        name: &'static str,
+        namespace: &'static str,
+        state: &'static str,
+    ) -> axum::routing::MethodRouter {
+        axum::routing::get(move || async move {
+            axum::Json(serde_json::json!({
+                "jobs": [{
+                    "node": "cluster", "name": name, "namespace": namespace,
+                    "instance_id": "run-7", "image": "app:v1",
+                    "state": state, "restart_count": 0, "age_seconds": 1,
+                }],
+                "warnings": [],
+            }))
+        })
+    }
+
+    async fn completion_case(state: &'static str) -> Result<(), String> {
         let router = axum::Router::new()
             .route(
                 "/v1/apply",
@@ -117,16 +142,7 @@ mod tests {
                     )
                 }),
             )
-            .route(
-                "/v1/status",
-                axum::routing::get(move || async move {
-                    axum::Json(serde_json::json!([{
-                        "id":"batch-0", "app_name":"batch", "namespace":"rbtest-node-exit",
-                        "state":"stopped", "restart_count":0, "host_port":null,
-                        "exit_code": exit_code,
-                    }]))
-                }),
-            );
+            .route("/v1/jobs", jobs_route("batch", "rbtest-node-exit", state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -161,14 +177,14 @@ mod tests {
     #[tokio::test]
     async fn completion_case_requires_an_observed_zero_exit() {
         assert!(
-            completion_case(None).await.is_err(),
-            "missing exit evidence passed the catalogue"
+            completion_case("running").await.is_err(),
+            "an unfinished run passed the catalogue"
         );
         assert!(
-            completion_case(Some(7)).await.is_err(),
+            completion_case("failed").await.is_err(),
             "failed job passed the catalogue"
         );
-        completion_case(Some(0)).await.unwrap();
+        completion_case("stopped").await.unwrap();
     }
 
     async fn logs_case(publish_after: usize) -> Result<(), String> {
@@ -192,13 +208,8 @@ mod tests {
                 }),
             )
             .route(
-                "/v1/status",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!([{
-                        "id":"logged-0", "app_name":"logged", "namespace":"rbtest-node-logs",
-                        "state":"stopped", "restart_count":0, "host_port":null, "exit_code":0,
-                    }]))
-                }),
+                "/v1/jobs",
+                jobs_route("logged", "rbtest-node-logs", "stopped"),
             )
             .route(
                 "/v1/logs/logged/rbtest-node-logs",

@@ -36,49 +36,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for id in instances {
             // LOOP-INLINE: in-memory lock, no I/O
             self.supervisor.retire_instance(&id).await;
+            self.forget_runtime_metadata(&id);
         }
         self.deployed_specs
             .remove(&(app_name.to_string(), namespace.to_string()));
-        let mut inventory = crate::bun::jobs::JobInventory {
-            jobs: self.recorded_jobs.clone(),
-            retired: self.retired_batch_executions.clone(),
-        };
-        let retiring: Vec<_> = inventory
-            .jobs
-            .iter()
-            .filter(|(_, job)| job.name == app_name && job.namespace == namespace)
-            .map(|(id, job)| (id.clone(), job.clone()))
-            .collect();
-        for (id, job) in retiring {
-            if let Some(owner) = &job.batch_execution {
-                if !job.runtime_absent {
-                    return Err(BunError::JobState(
-                        "batch execution retirement lacks positive runtime absence".into(),
-                    ));
-                }
-                // Only current-attempt terminal evidence becomes a terminal proof.
-                // An interrupted retry or explicit unknown stop remains unknown.
-                let phase = job
-                    .batch_terminal_exit()
-                    .map_or(crate::bun::jobs::JobPhase::Unknown, |code| {
-                        crate::bun::jobs::JobPhase::Exited { code }
-                    });
-                inventory.retired.insert(
-                    id.clone(),
-                    crate::bun::jobs::RetiredBatchExecution {
-                        name: job.name.clone(),
-                        namespace: job.namespace.clone(),
-                        generation: job.generation,
-                        restart_count: job.restart_count,
-                        batch_execution: owner.clone(),
-                        runtime_absent: true,
-                        phase,
-                    },
-                );
-            }
-            inventory.jobs.remove(&id);
-        }
-        self.commit_job_inventory(inventory).await?;
         Ok(())
     }
 
@@ -203,6 +164,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await?;
         }
         let identity_dir = self.instance_identity_dir(instance_id);
+        // The instance's own copies of its inline config files (#701).
+        let config_dir = self.supervisor.get_instance(instance_id).map(|instance| {
+            crate::grill::oci::inline_config_dir(
+                &self.volumes_dir,
+                &instance.namespace,
+                &instance.app_name,
+                &instance_id.0,
+            )
+        });
         let records_dir = self.records_dir.clone();
         let id = instance_id.0.clone();
         #[cfg(test)]
@@ -212,6 +182,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             stalls.hold(LoopStall::ArtifactCleanup).await;
             tokio::task::spawn_blocking(move || {
                 crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+                if let Some(directory) = config_dir {
+                    match std::fs::remove_dir_all(&directory) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(directory) = records_dir {
                     crate::grill::records::remove_record(&directory, &id)?;
                 }
@@ -260,6 +238,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Retire an instance's artifacts outside the loop (startup adoption),
     /// where nothing else is waiting, so a slow disk is simply waited out.
+    /// Nothing adopts the instance afterwards, so its runtime metadata goes
+    /// too.
     pub(super) async fn retire_instance_artifacts_fully(
         &mut self,
         instance_id: &InstanceId,
@@ -267,9 +247,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         loop {
             match self.retire_instance_artifacts(instance_id).await {
                 Err(BunError::StillRunning { .. }) => continue,
-                result => return result,
+                Ok(()) => {
+                    self.forget_runtime_metadata(instance_id);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Ask the runtime to forget an instance whose retirement is proven and
+    /// that nothing owns any more: its ownership journal, its route and their
+    /// lock files (#738). Without this, every app instance ever deleted,
+    /// scaled away or replaced left them behind.
+    ///
+    /// Call it only once the supervisor has let the instance go, or startup
+    /// has decided not to adopt it. A stopped replica that `relish stop`
+    /// keeps owned must keep its metadata, since a later apply rolls over it.
+    ///
+    /// Its init containers go too (#850), each by the generation it
+    /// launched: an immediate redeploy can reuse an initialiser's identity,
+    /// and its own init container's exit code must survive a forget that
+    /// lands late. One a live or pending parent has registered again is
+    /// left alone.
+    ///
+    /// The deletion runs in a task, so no turn waits on its fsyncs. The
+    /// runtime refuses, and keeps everything, while the identity may still
+    /// own a process or an address, including when a successor generation
+    /// of the same identity has started since. What a refusal or a crash
+    /// leaves is retired and forgotten again by the next start's adoption.
+    pub(super) fn forget_runtime_metadata(&mut self, instance_id: &InstanceId) {
+        let initialisers: Vec<_> = self
+            .initialiser_generations
+            .remove(instance_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(initialiser, _)| {
+                !self
+                    .initialisers
+                    .values()
+                    .any(|children| children.contains(initialiser))
+            })
+            .collect();
+        let grill = self.supervisor.grill().clone();
+        let id = instance_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = grill.forget_retired(&id).await {
+                eprintln!("bun: {id}: runtime metadata kept: {error}");
+            }
+            for (initialiser, generation) in initialisers {
+                if let Err(error) = grill
+                    .forget_retired_generation(&initialiser, &generation)
+                    .await
+                {
+                    eprintln!("bun: {initialiser}: runtime metadata kept: {error}");
+                }
+            }
+        });
     }
 
     /// Force-kill `id` and confirm its exit from a task, as `key`'s work
@@ -278,6 +312,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Ownership stays put until the kill is confirmed: the outer `Err` is
     /// `StillRunning` while it isn't yet, and the inner one says why the
     /// runtime didn't confirm it.
+    #[cfg_attr(
+        not(any(test, all(feature = "ebpf", target_os = "linux"))),
+        allow(dead_code)
+    )]
     pub(super) async fn kill_off_the_loop(
         &mut self,
         key: off_loop_work::WorkKey,
@@ -289,10 +327,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             self.take_back_from_restart(id)
         };
-        let runtime_absent = self
-            .recorded_jobs
-            .get(&id.0)
-            .is_some_and(|job| job.runtime_absent);
         let grill = self.supervisor.grill().clone();
         let confirmation = self.stop_confirmation_timeout;
         let target = id.clone();
@@ -302,9 +336,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .settle(confirmation)
                     .await
                     .map_err(|error| error.to_string())?;
-            }
-            if runtime_absent {
-                return Ok(());
             }
             kill_runtime_instance(&grill, &target, confirmation)
                 .await
@@ -320,7 +351,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn kill_and_wait_for_exit(&mut self, id: &InstanceId) -> Result<(), BunError> {
         loop {
             match self
-                .kill_off_the_loop(off_loop_work::WorkKey::ClearJobRun(id.clone()), id)
+                .kill_off_the_loop(off_loop_work::WorkKey::FenceExecution(id.clone()), id)
                 .await
             {
                 Err(BunError::StillRunning { .. }) => tokio::task::yield_now().await,
@@ -369,6 +400,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.retire_instance_artifacts(old_id).await?;
         // LOOP-INLINE: in-memory lock, no I/O
         self.supervisor.retire_instance(old_id).await;
+        self.forget_runtime_metadata(old_id);
         self.sync_firewall_ebpf().await;
         self.rebuild_routing_table().await;
         Ok(())

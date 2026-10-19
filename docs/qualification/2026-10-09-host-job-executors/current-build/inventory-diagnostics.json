@@ -1,0 +1,12 @@
+{
+  "scope": "Entire original fixture lifetime, including all matrices, pilots, demo and one-hour window; source stderr has no per-line timestamps",
+  "fixture_started_utc": "2026-10-09T10:42:08.601953+00:00",
+  "fixture_retired_utc": "2026-10-09T12:16:45.388287+00:00",
+  "unique_inventory_timeout_lines": 0,
+  "literal_counts": {
+    "inventory preflight timed out before publication": 0,
+    "publication runtime inventory timed out": 0,
+    "runtime inventory timed out": 0
+  },
+  "raw_private_node_log_not_published": true
+}

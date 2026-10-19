@@ -13,6 +13,7 @@ use tokio::sync::watch;
 
 use super::CouncilError;
 use super::fence::{FenceSnapshot, RecoveryFence};
+use super::handover::{ElectionHold, campaign_round, leader_after_handover};
 #[cfg(test)]
 use super::log_store::MemLogStore;
 use super::state_machine::CouncilStateMachine;
@@ -74,6 +75,9 @@ pub struct CouncilNode {
     /// The recovery fence (#424) and the Raft metrics as the rest of the node
     /// should see them: a fenced node never claims a leader.
     fence: Option<(RecoveryFence, watch::Receiver<RaftMetrics>)>,
+    /// Whether this voter is holding its elections while leadership moves
+    /// off it (#755).
+    election_hold: ElectionHold,
     /// Test hook: writes and linearizable reads never return, as they don't
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
@@ -116,9 +120,11 @@ impl CouncilNode {
         .await
         .map_err(|e| CouncilError::Fatal(e.to_string()))?;
 
+        let election_hold = ElectionHold::new(raft.clone(), raft_id);
         Ok(Self {
             raft,
             raft_id,
+            election_hold,
             state_machine,
             node_fault_membership: tokio::sync::Mutex::new(()),
             consumer_contacts: tokio::sync::Mutex::new(crate::onion::lease::ConsumerContacts::new(
@@ -166,6 +172,11 @@ impl CouncilNode {
     /// The fence error, when this node is fenced.
     fn fenced_error(&self) -> Option<CouncilError> {
         let snapshot = self.recovery_fence()?.snapshot();
+        if snapshot.split_with().is_some() {
+            return Some(CouncilError::Split {
+                epoch: snapshot.epoch,
+            });
+        }
         snapshot
             .fenced_by()
             .map(|newer_epoch| CouncilError::Fenced {
@@ -250,6 +261,108 @@ impl CouncilNode {
         self.raft.ensure_linearizable().await.is_ok()
     }
 
+    /// Return `true` once this node proves it leads, trying until `within`
+    /// passes while it still believes it leads.
+    ///
+    /// One [`is_leader`](Self::is_leader) round gives each follower a single
+    /// heartbeat interval to answer. On a loaded host both can miss it, and
+    /// a settled leader then reads as "not leader" (#1009). A node that
+    /// names another voter, or no leader at all, returns `false` straight
+    /// away: it has nothing to confirm.
+    pub async fn confirm_leadership(&self, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        let retry_pause = std::time::Duration::from_millis(self.raft.config().heartbeat_interval);
+        loop {
+            match tokio::time::timeout_at(deadline, self.is_leader()).await {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => return false,
+            }
+            let believes_it_leads = {
+                let metrics = self.metrics();
+                let metrics = metrics.borrow();
+                metrics.current_leader == Some(metrics.id)
+            };
+            if !believes_it_leads || tokio::time::Instant::now() + retry_pause >= deadline {
+                return false;
+            }
+            tokio::time::sleep(retry_pause).await;
+        }
+    }
+
+    /// Stop this voter campaigning until another voter leads or `until`
+    /// passes (#755).
+    ///
+    /// openraft 0.9 has no leadership transfer: another voter's campaign
+    /// deposes the leader, but the election that follows favours the longest
+    /// log, which is usually the old leader's. A leader that must give way
+    /// holds its elections first, so it can't win that election. It still
+    /// votes, and it still leads until a higher term deposes it. Calling this
+    /// again pushes the deadline out.
+    pub fn hold_elections_until(&self, until: std::time::Instant) {
+        self.election_hold.hold_until(until);
+    }
+
+    /// Whether this voter is holding its elections
+    /// ([`hold_elections_until`](Self::hold_elections_until)).
+    pub fn elections_held(&self) -> bool {
+        self.election_hold.is_held()
+    }
+
+    /// Campaign until a voter other than `previous` leads, and return it.
+    ///
+    /// The first campaign deposes `previous` at a higher term. Followers
+    /// refuse every candidate while the leader lease runs, so this campaigns
+    /// again each [`campaign_round`] until leadership moves. The winner may
+    /// be another voter with a longer log than this one; Raft's vote rule
+    /// picks it, and that's still a handover. `previous` should be holding
+    /// its elections, or it may win the election its deposition starts.
+    pub async fn campaign_until_leadership_moves(
+        &self,
+        previous: Option<u64>,
+        deadline: std::time::Instant,
+    ) -> Result<u64, CouncilError> {
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
+        let started = std::time::Instant::now();
+        let round = campaign_round(std::time::Duration::from_millis(
+            self.raft.config().election_timeout_max,
+        ));
+        let mut metrics = self.raft.metrics();
+        loop {
+            let leader = metrics.borrow().current_leader;
+            if let Some(leader) = leader_after_handover(previous, leader) {
+                return Ok(leader);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let previous = previous
+                    .and_then(|id| {
+                        let metrics = metrics.borrow();
+                        let membership = metrics.membership_config.membership();
+                        membership.get_node(&id).map(|node| node.name.clone())
+                    })
+                    .unwrap_or_else(|| "no known leader".to_string());
+                return Err(CouncilError::HandoverTimedOut {
+                    previous,
+                    waited: now.duration_since(started),
+                });
+            }
+            self.raft
+                .trigger()
+                .elect()
+                .await
+                .map_err(|e| CouncilError::Fatal(e.to_string()))?;
+            let round_end = tokio::time::Instant::from_std((now + round).min(deadline));
+            let moved =
+                metrics.wait_for(|m| leader_after_handover(previous, m.current_leader).is_some());
+            // A timeout ends the round; a closed watch means Raft stopped, and
+            // the next campaign reports that.
+            let _ = tokio::time::timeout_at(round_end, moved).await;
+        }
+    }
+
     /// The leader's volatile record of when it last served each endpoint
     /// consumer. Serving a consumer and discharging one both take this lock,
     /// so a discharge can never race a poll that renews the same lease.
@@ -312,8 +425,13 @@ impl CouncilNode {
 
     /// Add a learner node to the cluster.
     ///
-    /// The learner receives log replication but does not vote.
-    /// Use `change_membership()` to promote learners to voters.
+    /// The learner receives log replication but does not vote. This returns
+    /// once the membership entry that adds it has committed, which takes the
+    /// existing voters a commit or two. It does not wait for the learner to
+    /// catch up: on a slow disk that takes as long as the learner's log gap
+    /// needs (#779). Replication carries on in the background; promote the
+    /// learner with `change_membership()` once its replication metrics show
+    /// it close behind the leader, as the council planner does.
     pub async fn add_learner(&self, id: u64, info: CouncilNodeInfo) -> Result<(), CouncilError> {
         let _guard = self.guard_membership_change().await?;
         if self
@@ -326,7 +444,7 @@ impl CouncilNode {
             return Err(CouncilError::WriteFailed("node identity is retired".into()));
         }
         self.raft
-            .add_learner(id, info, true)
+            .add_learner(id, info, false)
             .await
             .map_err(|e| CouncilError::WriteFailed(e.to_string()))?;
         Ok(())
@@ -364,6 +482,41 @@ impl CouncilNode {
             .await
             .map_err(|e| CouncilError::WriteFailed(e.to_string()))?;
         Ok(())
+    }
+
+    /// The voter set a committed but unfinished membership change is heading
+    /// for, or `None` when the membership is uniform or its joint step has
+    /// not committed yet.
+    ///
+    /// openraft changes voters in two steps, and the second (uniform) step is
+    /// proposed by the caller's future once the joint step commits. A caller
+    /// that gives up in between, such as the council reconciler's bounded
+    /// operation, leaves the council in the joint config, and nothing in
+    /// openraft finishes it (#673).
+    pub fn unfinished_membership_change(&self) -> Option<BTreeSet<u64>> {
+        let metrics = self.metrics().borrow().clone();
+        let configs = metrics.membership_config.membership().get_joint_config();
+        if configs.len() < 2 {
+            return None;
+        }
+        let membership_index = metrics.membership_config.log_id().map(|id| id.index);
+        let applied_index = metrics.last_applied.map(|id| id.index);
+        if applied_index < membership_index {
+            return None;
+        }
+        configs.last().cloned()
+    }
+
+    /// Propose the uniform step of an unfinished membership change, so the
+    /// council reaches the voter set the original change asked for. Returns
+    /// whether a change was proposed. Demoted voters are kept as learners: the
+    /// reconciler removes any that are dead once the council is whole again.
+    pub async fn finish_membership_change(&self) -> Result<bool, CouncilError> {
+        let Some(target) = self.unfinished_membership_change() else {
+            return Ok(false);
+        };
+        self.change_membership(target).await?;
+        Ok(true)
     }
 
     async fn refuse_retired_voters(&self, members: &BTreeSet<u64>) -> Result<(), CouncilError> {
@@ -461,6 +614,45 @@ impl CouncilNode {
             .await
             .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
         Ok(self.state_machine.desired_state().await.security_state)
+    }
+
+    /// [`Self::security_state_linearizable`], but a leader gets `within` to
+    /// prove it leads, as [`Self::confirm_leadership`] does.
+    ///
+    /// One leadership round gives each follower a single heartbeat interval
+    /// to answer, so on a loaded host a settled leader can fail it and refuse
+    /// a read it should serve (#1009). A follower, or a node that names no
+    /// leader, fails at once.
+    pub async fn security_state_confirmed(
+        &self,
+        within: std::time::Duration,
+    ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
+        #[cfg(test)]
+        self.hang_if_asked().await;
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
+        if !self.confirm_leadership(within).await {
+            return Err(CouncilError::ReadFailed(
+                "this node can't prove it leads the council".into(),
+            ));
+        }
+        Ok(self.state_machine.desired_state().await.security_state)
+    }
+
+    /// The desired state, confirmed fresh with a quorum first, as
+    /// [`Self::security_state_linearizable`] does. Fails on a follower and
+    /// on a leader that has been deposed and doesn't know it yet. The
+    /// council backup exports this, so a stale leader never ships old state.
+    pub async fn desired_state_linearizable(&self) -> Result<DesiredState, CouncilError> {
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
+        Ok(self.state_machine.desired_state().await)
     }
 
     /// Read the current Pickle manifest catalogue from the state machine.
@@ -810,17 +1002,11 @@ mod tests {
         mut request: crate::council::RaftRequest,
     ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
         let previous = council.desired_state().await.last_applied_log;
-        match &mut request {
-            crate::council::RaftRequest::BatchRegister {
-                expected_log_id, ..
-            } => *expected_log_id = previous,
-            crate::council::RaftRequest::SchedulingDecision(decision) => {
-                request = crate::council::RaftRequest::SchedulingDecisions {
-                    expected_log_id: previous,
-                    decisions: vec![decision.clone()],
-                }
+        if let crate::council::RaftRequest::SchedulingDecision(decision) = &request {
+            request = crate::council::RaftRequest::SchedulingDecisions {
+                expected_log_id: previous,
+                decisions: vec![decision.clone()],
             }
-            _ => {}
         }
         council.write(request).await
     }
@@ -972,6 +1158,92 @@ mod tests {
         // A follower should not be leader.
         let follower_idx = if leader_id == 1 { 1 } else { 0 };
         assert!(!nodes[follower_idx].is_leader().await);
+    }
+
+    #[tokio::test]
+    async fn settled_leader_confirms_after_its_quorum_misses_a_heartbeat_round() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        // The followers must not depose the leader while it can't reach
+        // them: this models slow heartbeats, not a lost leader (#1009).
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        // One confirmation round can't reach a quorum.
+        assert!(!leader.is_leader().await);
+
+        let healer = router.clone();
+        let heal = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            healer.heal().await;
+        };
+        let (confirmed, ()) = tokio::join!(leader.confirm_leadership(Duration::from_secs(5)), heal);
+        assert!(confirmed, "a settled leader gave up after one missed round");
+    }
+
+    #[tokio::test]
+    async fn settled_leader_serves_security_state_after_its_quorum_misses_a_heartbeat_round() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Slow heartbeats, not a lost leader: the followers must not depose
+        // it while it can't reach them (#1009).
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        // One confirmation round can't reach a quorum, so the single-round
+        // read the registry routes used to make answers 503.
+        assert!(leader.security_state_linearizable().await.is_err());
+
+        let healer = router.clone();
+        let heal = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            healer.heal().await;
+        };
+        let (read, ()) = tokio::join!(
+            leader.security_state_confirmed(Duration::from_secs(5)),
+            heal
+        );
+        assert!(
+            read.is_ok(),
+            "a settled leader refused a security read after one missed round"
+        );
+
+        let follower = &nodes[if leader_id == 1 { 1 } else { 0 }];
+        let started = std::time::Instant::now();
+        assert!(
+            follower
+                .security_state_confirmed(Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn follower_does_not_wait_to_confirm_leadership() {
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let follower = &nodes[if leader_id == 1 { 1 } else { 0 }];
+        let started = std::time::Instant::now();
+        assert!(!follower.confirm_leadership(Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -1365,6 +1637,168 @@ mod tests {
         assert_eq!(voters, BTreeSet::from([1, 2, 3]));
     }
 
+    /// A one-voter council whose promotion of learner 2 committed its joint
+    /// step after the caller had given up: the shape #673 left behind when the
+    /// reconciler's five-second bound dropped `change_membership` mid-flight.
+    async fn abandoned_promotion() -> (Vec<CouncilNode>, InMemoryRaftRouter) {
+        let (mut nodes, router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let network = InMemoryRaftNetworkFactory::new(2, router.clone());
+        let node2 = CouncilNode::new(
+            2,
+            fast_config(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(2, node2.raft().clone()).await;
+        nodes.push(node2);
+        nodes[0].add_learner(2, node_info(2)).await.unwrap();
+
+        // The joint config {[1], [1, 2]} needs node 2's acknowledgement, so
+        // a partition holds it uncommitted past the caller's bound.
+        router.partition(1, 2).await;
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(500),
+            nodes[0].change_membership(BTreeSet::from([1, 2])),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the promotion should still be pending");
+        router.heal().await;
+
+        let committed_joint = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if nodes[0].unfinished_membership_change().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(committed_joint.is_ok(), "the joint step never committed");
+        (nodes, router)
+    }
+
+    fn voter_configs(node: &CouncilNode) -> Vec<BTreeSet<u64>> {
+        node.metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_promotion_stays_joint_until_finished() {
+        let (nodes, _router) = abandoned_promotion().await;
+        // Nothing in openraft proposes the uniform step on its own: the
+        // council would sit in the joint config, and the reconciler's
+        // change-in-flight gate would hold every later change, forever.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            voter_configs(&nodes[0]),
+            vec![BTreeSet::from([1]), BTreeSet::from([1, 2])]
+        );
+
+        assert!(nodes[0].finish_membership_change().await.unwrap());
+        assert_eq!(voter_configs(&nodes[0]), vec![BTreeSet::from([1, 2])]);
+        assert_eq!(nodes[0].unfinished_membership_change(), None);
+    }
+
+    #[tokio::test]
+    async fn finishing_a_uniform_membership_proposes_nothing() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let before = nodes[0].metrics().borrow().last_log_index;
+        assert_eq!(nodes[0].unfinished_membership_change(), None);
+        assert!(!nodes[0].finish_membership_change().await.unwrap());
+        assert_eq!(nodes[0].metrics().borrow().last_log_index, before);
+    }
+
+    #[tokio::test]
+    async fn adding_a_learner_does_not_wait_for_a_slow_learner_to_catch_up() {
+        // #779: on a slow disk, catching a new learner up takes as long as
+        // its log gap needs, and the reconciler's bounded operation dropped
+        // the wait. Adding the learner is one commit by the existing voters;
+        // the catch-up carries on afterwards, and promotion waits for it.
+        // No snapshot: the learner must replay the whole log gap. openraft's
+        // blocking add waits until the learner trails by at most its
+        // `replication_lag_threshold` (5,000 entries), so a gap of 8,000 on
+        // a disk that takes half a millisecond per entry holds it for 1.5 s.
+        let config = CouncilConfig {
+            snapshot_threshold: 10_000,
+            ..fast_config()
+        };
+        let router = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        for id in 1..=2 {
+            let log_store = MemLogStore::new();
+            if id == 2 {
+                log_store.slow_entry_writes(Duration::from_micros(500));
+            }
+            let node = CouncilNode::new(
+                id,
+                config.clone(),
+                InMemoryRaftNetworkFactory::new(id, router.clone()),
+                log_store,
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        init_cluster(&nodes[..1]).await;
+        wait_for_leader(&nodes[..1], Duration::from_secs(5))
+            .await
+            .unwrap();
+        for _ in 0..8_000 {
+            nodes[0].write(RaftRequest::Noop).await.unwrap();
+        }
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            nodes[0].add_learner(2, node_info(2)),
+        )
+        .await
+        .expect("adding the learner waited for its catch-up")
+        .unwrap();
+        let membership = nodes[0].metrics().borrow().membership_config.clone();
+        assert!(membership.membership().get_node(&2).is_some());
+        assert!(!membership.membership().voter_ids().any(|id| id == 2));
+
+        // Replication carries on in the background until the learner holds
+        // the leader's log.
+        let mut metrics = nodes[0].metrics();
+        let last = nodes[0].metrics().borrow().last_log_index;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            metrics.wait_for(|m| {
+                m.replication
+                    .as_ref()
+                    .and_then(|r| r.get(&2).copied().flatten())
+                    .map(|log_id| log_id.index)
+                    >= last
+            }),
+        )
+        .await
+        .expect("the learner never caught up")
+        .unwrap();
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn write_on_follower_returns_forward_error() {
         let (nodes, _router) = create_cluster(3).await;
@@ -1671,5 +2105,173 @@ mod tests {
         let claims =
             crate::sesame::oidc::verify_jwt(result.jwt_token.as_ref().unwrap(), oidc).unwrap();
         assert_eq!(claims.sub, "spiffe://test-cluster/ns/default/app/api");
+    }
+
+    // -----------------------------------------------------------------------
+    // Leadership handover (#755)
+    // -----------------------------------------------------------------------
+
+    /// The highest term at which `id` was seen leading, sampled from `nodes`.
+    fn leading_term(nodes: &[CouncilNode], id: u64) -> Option<u64> {
+        nodes
+            .iter()
+            .map(|node| node.raft().metrics().borrow().clone())
+            .filter(|metrics| metrics.current_leader == Some(id))
+            .map(|metrics| metrics.current_term)
+            .max()
+    }
+
+    /// The scenario #646 hit: the leader holds an entry one follower lacks,
+    /// that follower's campaign deposes it, and the election that follows
+    /// favours the longest log, which is the old leader's. Holding the old
+    /// leader's elections leaves the other up-to-date follower as the only
+    /// voter that can win.
+    #[tokio::test]
+    async fn a_deposed_leader_holding_its_elections_does_not_win_back_leadership() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let leader = &nodes[(leader_id - 1) as usize];
+        let lagging = (1..=3).find(|id| *id != leader_id).unwrap();
+        let successor = (1..=3)
+            .find(|id| *id != leader_id && *id != lagging)
+            .unwrap();
+        leader.write(RaftRequest::Noop).await.unwrap();
+
+        // The lagging follower misses the next entry and campaigns while cut
+        // off from the leader, so it carries a higher term and a shorter log.
+        router.partition(leader_id, lagging).await;
+        leader.write(RaftRequest::Noop).await.unwrap();
+        let term_before = leader.raft().metrics().borrow().current_term;
+        leader.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        assert!(leader.elections_held());
+        nodes[(lagging - 1) as usize]
+            .raft()
+            .trigger()
+            .elect()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Healing lets the leader meet the higher term, which deposes it.
+        router.heal().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let regained = leading_term(&nodes, leader_id).is_some_and(|term| term > term_before);
+            assert!(!regained, "the deposed leader won leadership back");
+            if nodes
+                .iter()
+                .all(|node| node.raft().metrics().borrow().current_leader == Some(successor))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "leadership never reached the up-to-date follower"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Someone else leads, so the old leader may campaign again.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while leader.elections_held() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the hold outlived the handover");
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_election_hold_ends_at_its_deadline_when_nobody_takes_over() {
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let leader = &nodes[(leader_id - 1) as usize];
+        leader.hold_elections_until(std::time::Instant::now() + Duration::from_millis(300));
+        assert!(leader.elections_held());
+        // A later hold extends the deadline; an earlier one doesn't cut it.
+        leader.hold_elections_until(std::time::Instant::now() + Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            leader.elections_held(),
+            "an earlier deadline cut the hold short"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while leader.elections_held() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the hold outlived its deadline");
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn campaigning_against_a_held_leader_moves_leadership_off_it() {
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let leader = &nodes[(leader_id - 1) as usize];
+        leader.write(RaftRequest::Noop).await.unwrap();
+        let term_before = leader.raft().metrics().borrow().current_term;
+        let candidate_id = (1..=3).find(|id| *id != leader_id).unwrap();
+        let candidate = &nodes[(candidate_id - 1) as usize];
+
+        leader.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        let new_leader = candidate
+            .campaign_until_leadership_moves(
+                Some(leader_id),
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_ne!(new_leader, leader_id);
+        assert!(
+            leading_term(&nodes, leader_id).is_none_or(|term| term <= term_before),
+            "the old leader won leadership back"
+        );
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_campaign_that_cannot_move_leadership_gives_up_at_its_deadline() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let candidate_id = (1..=3).find(|id| *id != leader_id).unwrap();
+        // Cut off from both peers, the candidate can never win.
+        for peer in (1..=3).filter(|id| *id != candidate_id) {
+            router.partition(candidate_id, peer).await;
+        }
+        let error = nodes[(candidate_id - 1) as usize]
+            .campaign_until_leadership_moves(
+                Some(leader_id),
+                std::time::Instant::now() + Duration::from_millis(800),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CouncilError::HandoverTimedOut { .. }),
+            "{error:?}"
+        );
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
     }
 }

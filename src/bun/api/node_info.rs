@@ -5,9 +5,37 @@ use std::collections::HashSet;
 
 use super::*;
 
-/// Liveness check.
-pub(super) async fn health_handler() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+/// Liveness check. Also says whether this node is an unfenced voter of a
+/// council (#694): `relish council recover` probes every voter a stopped
+/// node's stores name, before it starts a rival council, and has no token
+/// to ask anything that needs one. Gossip already advertises council
+/// membership, so this reveals nothing new.
+pub(super) async fn health_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let council_voter = state
+        .council
+        .as_deref()
+        .is_some_and(serves_as_council_voter);
+    Json(serde_json::json!({ "status": "ok", "council_voter": council_voter }))
+}
+
+/// Whether `council` holds a voter's seat in its membership and isn't
+/// fenced. A restarting voter still probing its peers counts: it is about
+/// to serve the council it belongs to.
+pub(super) fn serves_as_council_voter(council: &crate::council::CouncilNode) -> bool {
+    if council
+        .recovery_fence()
+        .is_some_and(|fence| fence.is_fenced())
+    {
+        return false;
+    }
+    let metrics = council.metrics();
+    let metrics = metrics.borrow();
+    let own_id = metrics.id;
+    metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .any(|id| id == own_id)
 }
 
 /// Return live critical-subsystem evidence. Unlike `/v1/health`, this is an
@@ -306,7 +334,11 @@ pub(super) async fn desired_apps_handler(
     directory: Option<axum::Extension<LeaderDirectory>>,
     headers: HeaderMap,
 ) -> Response {
-    let source = if headers.contains_key(DESIRED_APPS_FORWARDED_HEADER) {
+    // Either marker means another node forwarded this read here; it is
+    // never forwarded again.
+    let source = if headers.contains_key(DESIRED_APPS_FORWARDED_HEADER)
+        || headers.contains_key(LEADER_FORWARDED_HEADER)
+    {
         DesiredAppsSource::ForwardedRequest
     } else {
         DesiredAppsSource::Caller(directory.as_deref())
@@ -357,10 +389,16 @@ pub(super) fn council_app_evidence(
                     crate::cluster::orchestrate::volume_home_away(desired, app_id, spec, live)
                         .map(|node| node.0)
                 }),
+                unschedulable: desired.unschedulable.get(app_id).copied(),
                 volume_homes: crate::cluster::orchestrate::volume_homes(desired, app_id, spec)
                     .into_iter()
                     .map(|node| node.0)
                     .collect(),
+                rollout_failed: desired.rollouts.get(app_id).and_then(|rollouts| {
+                    rollouts
+                        .failed_for(&crate::meat::deploy_types::rollout_fingerprint(spec))
+                        .cloned()
+                }),
             },
         )
         .collect::<Vec<_>>();
@@ -451,23 +489,23 @@ async fn desired_apps_from_leader(
     council: &crate::council::CouncilNode,
     directory: Option<&LeaderDirectory>,
 ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
-    let advertised = directory.and_then(|LeaderDirectory(directory)| {
-        let metrics = council.metrics();
-        let metrics = metrics.borrow();
-        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
-    });
-    let leader_url = match advertised {
-        Some(address) => state.cluster_http.url(&address.to_string(), ""),
-        None => leader_api_url(state, council).await.ok_or_else(|| {
-            "desired cluster state requires a current leader, and none is known yet; retry shortly"
-                .to_string()
-        })?,
-    };
-    let mut request = state
-        .cluster_http
-        .client()
-        .get(format!("{leader_url}/v1/diagnostics/apps"))
-        .header(DESIRED_APPS_FORWARDED_HEADER, "1");
+    // A read another node forwarded never gets here (it is refused
+    // first), so there's no inbound marker to check.
+    let leader_url = super::upgrade::leader_base_url(state, council, directory, &HeaderMap::new())
+        .await
+        .map_err(|refusal| match refusal {
+            NoLeaderRoute::Unknown => "desired cluster state requires a current leader, \
+                    and none is known yet; retry shortly"
+                .to_string(),
+            other => other.to_string(),
+        })?;
+    let mut request = mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .get(format!("{leader_url}/v1/diagnostics/apps"))
+            .header(DESIRED_APPS_FORWARDED_HEADER, "1"),
+    );
     if let Some(token) = &state.service_token {
         request = request.bearer_auth(token);
     }
@@ -707,6 +745,9 @@ async fn version_body(state: &ApiState) -> serde_json::Value {
             // with the same version are told apart at a glance.
             "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
+            // Which release artefact fits this node: `relish upgrade`
+            // picks each node's build by it, not by the CLI host's.
+            "platform": crate::upgrade::metadata::platform_key(),
             "upgrade_in_flight": manager.upgrade_in_flight(),
             // Ids this node attempted and reverted — the orchestrator
             // reads these to detect node-side reverts.
@@ -723,6 +764,7 @@ async fn version_body(state: &ApiState) -> serde_json::Value {
             "version": crate::upgrade::version::compiled_version().to_string(),
             "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
+            "platform": crate::upgrade::metadata::platform_key(),
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
             // No upgrade manager, so no way to apply a directive at all.

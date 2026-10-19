@@ -1,0 +1,11 @@
+{
+  "source_commit": "ed87f20b5f73b754fce0427261a03c14705d1cfe",
+  "started_utc": "2026-10-09T11:08:35.204903+00:00",
+  "public_tiers": [
+    1000,
+    10000,
+    500000
+  ],
+  "baseline": 1000000,
+  "continuous_hour_runs_after_demo": true
+}

@@ -57,7 +57,7 @@ pub struct NodeReadinessEvidence {
 }
 
 /// HTTP and Phase 15 view of live placement capabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilityEvidence {
     /// Whether the complete critical subsystem set is ready.
     pub ready: bool,
@@ -195,7 +195,7 @@ impl ReadinessTracker {
             ready,
             egress: inner.capabilities.egress,
             dns: inner.capabilities.dns,
-            registry: inner.registry,
+            registry: inner.registry.clone(),
             observed_at_unix_ms,
         };
         (readiness, placement)
@@ -446,8 +446,11 @@ mod tests {
             known_nodes: 3,
             redundancy_possible: true,
             under_replicated_layers: 1,
+            lost_images: vec!["web:v1".into()],
+            lost_image_count: 1,
+            needs_mtls: false,
         };
-        evidence.set_registry(registry).await;
+        evidence.set_registry(registry.clone()).await;
 
         assert_eq!(evidence.capability_snapshot().await.registry, registry);
     }

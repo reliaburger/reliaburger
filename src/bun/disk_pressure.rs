@@ -62,6 +62,55 @@ pub fn dir_parquet_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Default share of the filesystem, in percent, that task-array data (ledgers,
+/// result indexes, kept failure output) may use before a worker stops taking
+/// new grants.
+pub const TASK_DATA_MAX_PERCENT: u64 = 25;
+
+/// Free space below which a worker stops taking new task grants, whatever
+/// its task data holds. Absolute, not a percentage: 5% of a large disk is
+/// tens of gigabytes, millions of tasks of headroom.
+pub const TASK_GRANT_MIN_FREE_BYTES: u64 = 1 << 30;
+
+/// Disk space allocated to every regular file under `dir`, at any depth.
+/// Allocated, not apparent, size: a sparse result index pays only for the
+/// slots it wrote. A missing or unreadable entry counts as empty; this is
+/// an estimate for pressure, not an audit.
+pub fn dir_total_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dir_total_size(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |m| {
+                use std::os::unix::fs::MetadataExt;
+                // st_blocks counts 512-byte units whatever the block size.
+                m.blocks().saturating_mul(512)
+            }),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The node data that counts against task-data pressure: everything under
+/// `task_root` plus the audit log in `audit_dir`, when the node keeps one.
+/// The audit log stays within `[storage] audit_max_bytes`, but it shares the
+/// data filesystem with task data, so it counts too (#798).
+pub fn node_data_bytes(task_root: &Path, audit_dir: Option<&Path>) -> u64 {
+    dir_total_size(task_root).saturating_add(audit_dir.map_or(0, dir_total_size))
+}
+
+/// Whether a worker holding `task_bytes` of task data on `filesystem` must
+/// stop taking new task grants: the data is over `max_percent` of the
+/// filesystem, or less than [`TASK_GRANT_MIN_FREE_BYTES`] is free.
+pub fn task_data_pressured(task_bytes: u64, filesystem: FilesystemUsage, max_percent: u64) -> bool {
+    filesystem.available_bytes < TASK_GRANT_MIN_FREE_BYTES
+        || u128::from(task_bytes) * 100
+            > u128::from(filesystem.total_bytes) * u128::from(max_percent)
+}
+
 /// Check disk pressure and export-then-prune if needed.
 ///
 /// When the total Parquet size in `source_dir` exceeds `max_bytes`,
@@ -321,6 +370,64 @@ impl DiskPressureResignation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_output_counts_toward_disk_pressure() {
+        let root = tempfile::tempdir().unwrap();
+        let array = root.path().join("7");
+        std::fs::create_dir_all(array.join("output")).unwrap();
+        std::fs::write(array.join("ledger"), vec![0xab; 100_000]).unwrap();
+        std::fs::write(array.join("ledger.index"), vec![0xab; 100_000]).unwrap();
+        let filesystem = FilesystemUsage {
+            total_bytes: 1_000_000,
+            available_bytes: TASK_GRANT_MIN_FREE_BYTES,
+        };
+        let before = dir_total_size(root.path());
+        assert!((200_000..220_000).contains(&before), "{before}");
+        assert!(!task_data_pressured(before, filesystem, 25));
+
+        std::fs::write(array.join("output/0-99-1.seg"), vec![0xab; 100_000]).unwrap();
+        let bytes = dir_total_size(root.path());
+        assert!(bytes >= before + 100_000, "kept output is task data too");
+        assert!(task_data_pressured(bytes, filesystem, 25));
+
+        // A filesystem short of free space refuses grants whatever task data holds.
+        let full = FilesystemUsage {
+            total_bytes: 1_000_000,
+            available_bytes: 100,
+        };
+        assert!(task_data_pressured(0, full, 25));
+    }
+
+    #[test]
+    fn audit_log_counts_toward_disk_pressure() {
+        let data = tempfile::tempdir().unwrap();
+        let tasks = data.path().join("task-arrays");
+        let audit = data.path().join(crate::bun::audit::AUDIT_DIRECTORY);
+        std::fs::create_dir_all(tasks.join("7")).unwrap();
+        std::fs::create_dir_all(&audit).unwrap();
+        std::fs::write(tasks.join("7/ledger"), vec![0xab; 100_000]).unwrap();
+        let filesystem = FilesystemUsage {
+            total_bytes: 1_000_000,
+            available_bytes: TASK_GRANT_MIN_FREE_BYTES,
+        };
+        let tasks_only = node_data_bytes(&tasks, Some(&audit));
+        assert!(!task_data_pressured(tasks_only, filesystem, 25));
+
+        std::fs::write(
+            audit.join("audit-00000000000000000001.jsonl"),
+            vec![b'x'; 200_000],
+        )
+        .unwrap();
+        let bytes = node_data_bytes(&tasks, Some(&audit));
+        assert!(
+            bytes >= tasks_only + 200_000,
+            "the audit log is node data too"
+        );
+        assert!(task_data_pressured(bytes, filesystem, 25));
+        // A node that keeps no audit log counts task data alone.
+        assert_eq!(node_data_bytes(&tasks, None), tasks_only);
+    }
 
     #[tokio::test]
     async fn failed_export_is_reported_and_unexported_data_is_preserved() {

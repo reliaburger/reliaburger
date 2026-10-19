@@ -5,8 +5,8 @@ completion (retried up to 3 times with backoff).
 
 ```toml
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
 
 [app.web.health]
@@ -15,12 +15,17 @@ interval = 10             # seconds between probes (default 10)
 timeout = 5               # seconds per probe (default 5)
 ```
 
-ProcessGrill runs `command` directly and ignores `image`; runc pulls `image`
-from a registry and runs it the way Kubernetes would (`command` replaces the
-image's entrypoint, `args` its default arguments). Try it from a source
-checkout, with `bun --runtime process` running:
+An app runs either a host binary (`exec`, or an inline `script`) or an
+`image`. A host app runs on the node itself, and only if the node allows the
+binary in `[process_workloads] allowed_binaries`. An image app needs a
+container runtime: runc pulls `image` from a registry and runs it the way
+Kubernetes would (`command` replaces the image's entrypoint, `args` its default
+arguments). The process runtime (`bun --runtime process`) runs host apps only
+and refuses an image app with `needs a container runtime`. Try it from a
+source checkout, with Bun started from the repository root:
 
 ```sh
+bun --runtime process --config examples/node/process-runtime.toml
 relish apply examples/phase-1/proc-minimal-app.toml
 relish status
 ```
@@ -57,7 +62,75 @@ and the limit to the same thing.
 
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
-`networking`, metrics scraping in `observability`.
+`networking`, metrics scraping in `observability`. Every `[app.*]` field is
+listed in `reference`.
+
+## Health checks
+
+```toml
+[app.api.health]
+path = "/healthz"
+port = 8081               # default: the app's `port`
+interval = 10             # seconds between probes (default 10)
+timeout = 5               # seconds per probe (default 5), at most interval
+threshold_unhealthy = 3   # failed probes before Unhealthy (default 3)
+threshold_healthy = 1     # passing probes before Running (default 1)
+initial_delay = 0         # seconds before the first probe (default 0)
+```
+
+`health.port` works without an app `port`, so an app can probe a separate
+admin listener. `relish apply` refuses a health check with neither, a zero
+interval, timeout or threshold, and a `timeout` longer than the
+`interval`. A new instance that never passes is given up after 60 failed
+probes (about ten minutes at the default interval) and restarted.
+
+## Init containers
+
+```toml
+[[app.api.init]]
+image = "ghcr.io/example/migrate:2.1"   # default: the app's image
+command = ["migrate", "up"]
+```
+
+Init containers run one after another before the app starts, each to
+completion; a failure (or 300 seconds without finishing) fails the instance.
+Each runs its own `image` (pulled, trust-checked and pinned to a digest like
+the app's), or the app's when it has none. It gets the app's environment,
+with secrets decrypted, and the app's volume and config-file mounts, so a
+migration can read `DATABASE_URL` and a config generator can write a volume.
+The volume stays the app's: an init container doesn't take it over, so run it
+as root (most images do) or as the app's user.
+
+## Config files
+
+```toml
+[[app.api.config_file]]
+path = "/etc/api/config.yaml"
+content = """
+log_level: info
+"""
+```
+
+Each instance gets its own read-only copy, so two files with the same name in
+different directories don't clash, and a rollout never changes the file under
+an instance that's already running. The copy goes when the instance does.
+`source` instead of `content` mounts a file from the node itself; see
+`images-and-volumes`.
+
+## What a field can't do
+
+`relish apply` refuses a field it can't honour, rather than run something
+different from the config:
+
+- `gpu` above 0: GPU workloads aren't supported yet
+  ([#359](https://github.com/reliaburger/reliaburger/issues/359)).
+- `egress.allow_franchise`: cross-cluster egress doesn't exist yet.
+- `volumes`, `config_file`, `run_as_user` and `run_as_group` on an `exec` or
+  `script` app: a process workload runs on the host, with no mounts and no
+  user switch.
+- A volume `size` the node can't enforce (see `images-and-volumes`), or a
+  changed `size` on a volume that already exists. Those fail the deploy on
+  that node.
 
 ## Autoscaling
 
@@ -111,9 +184,89 @@ council, so any node gives the same answer. Raise the budget, or shrink or
 delete other apps in the namespace, and the next scheduling pass (a few seconds
 later) places the app and clears the reason.
 
+The same budget covers jobs. The leader charges each job attempt it lets start
+against the namespace's `cpu`, `memory` and GPU budget, after the namespace's
+apps, so a job never displaces an app that fits. A job with no room waits
+instead of failing, and `relish batch-status ID` says why (`waiting for quota:
+namespace "shop" would exceed CPU quota: …`). Running attempts are never
+stopped; new ones start as old ones finish. `max_apps` and `max_replicas`
+count apps only. See "Execution and capacity limits" in the batch jobs chapter.
+
 A `[namespace]` block can also give the namespace its own secret key with
 `secret_key = true`, so its encrypted values don't decrypt anywhere else. See
 "A key per namespace" in the security chapter.
+
+## When some replicas don't fit
+
+The scheduler places every replica it can find a node for. Ask for three when
+the cluster only has room for two, and you get two, plus a reason that stays
+until the third finds a home:
+
+```text
+$ relish status
+...
+
+web (namespace default) is unschedulable: placed 2 of 3 replicas: no node that can run it has room
+
+$ relish inspect web
+App: web (namespace default)
+  Replicas:  3 desired, 2 running
+  Placed:    node-1 1, node-2 1
+  Unplaced:  placed 2 of 3 replicas: no node that can run it has room
+```
+
+The reason is the first rule no node passes, in the order the scheduler checks
+them: no node is ready, no ready node has the app's `required` labels, none can
+enforce its egress or DNS needs or run its host binary, or none has room.
+`relish wtf` raises an `unschedulable` warning with the same reason, and the
+leader logs it and records a `placement` event once when it starts and once
+when it clears. Add a node, free some room, or relax the constraint, and the
+next scheduling pass places the rest.
+
+An `exec` or `script` app only goes to nodes that would run it: the node's
+`[process_workloads] allowed_binaries` must name the `exec` path (`/bin/sh` for
+a script), and `mount_isolation` must be off. A node whose allowlist stops
+covering the binary loses the replica to one that still does.
+
+## When the binary isn't there
+
+The allowlist says a node may run a binary. It doesn't say the binary is
+installed. Bun checks just before it launches a process app: if the `exec`
+path, or the first word of `command`, doesn't exist or isn't executable, the
+deploy fails at once with the reason, and the instance goes to `failed`:
+
+```text
+$ relish apply ghost.toml
+  deploying app ghost (replicas: 1)
+  creating instance default__ghost-0
+error: API error (status 500): instance default__ghost-0 cannot launch: binary not found: /usr/local/bin/ghost-server
+
+$ relish status
+...
+
+default__ghost-0 (ghost, namespace default) failed on node-1: binary not found: /usr/local/bin/ghost-server
+```
+
+A bare name like `bun` is looked up on the app's `PATH`, the way a shell would.
+A directory, or a file without an execute bit, fails with `binary not
+executable` instead. `relish wtf` raises a critical `launch-failed` finding
+with the same reason. The same goes for a binary deleted while the deploy is
+starting it, and for a running app whose binary is deleted: the app keeps
+running, but when it exits, its restart fails at once with the reason instead
+of using up its restart attempts. Waiting won't fix this one, so nothing
+waits: install the binary, or fix the spec and apply it again. In a cluster,
+the node's placement reconciler tries the deploy again on its usual backoff
+(five seconds, doubling to five minutes), so installing the binary is enough
+on its own.
+
+## When a node stops reporting
+
+A node can stay alive in gossip while its reports stop, say because its
+report worker wedged. Its replicas may still be serving, so the leader leaves
+them for `[reporting_tree] stale_node_grace_secs` (five minutes by default)
+after the reports go stale, then places them elsewhere. Daemon sets get the
+same grace. An app with a managed volume never moves off its node this way;
+see `images-and-volumes`.
 
 ## The everyday loop
 
@@ -194,6 +347,16 @@ Apply a changed app and Bun replaces its instances one at a time, waiting for
 each new one to pass its health check. `relish deploy app.toml` makes the
 same request and reports it as a deploy.
 
+In a cluster the change reaches one node at a time. The leader hands the new
+spec to the first node (by node id) that doesn't run it yet and keeps the other
+nodes on the previous version until that node's replicas are all running and
+healthy on the new one; then the next node goes. Each node rolls its own share
+of the replicas with the app's `[deploy]` table, so `max_surge` and
+`max_unavailable` count that node's instances, not the whole app's. An app
+with one replica per node therefore keeps every other replica serving while
+one node rolls. A brand-new app, a node getting its first replica and a change
+to `replicas` alone don't wait.
+
 ```toml
 [app.web.deploy]
 strategy = "rolling"      # or "blue-green"
@@ -226,19 +389,58 @@ relish cancel-deploy <OPERATION_ID>
 get one row per node per deploy, with a NODE column. A node that doesn't answer
 prints `warning: history incomplete: …` on stderr.
 
-`relish rollback` reads the same cluster-wide history, from whichever node you
-ask. The previous version is the newest one that differs from what the app
-runs now, so the copies of the current deploy that every node recorded don't
-count. A rollback changes the version and keeps the scale: an app running
-three replicas still runs three, and a deploy that only changed `replicas`
-isn't a version to roll back to.
+Each node keeps its last 50 deploys per app.
+
+In a cluster, `relish rollback` takes its target from the council, which keeps
+the last ten versions of each app that rolled out healthy on every node, so it
+works from whichever node you ask and after every node has restarted. The
+previous version is the newest one there that differs from what the app runs
+now. Without one (a single node, or an app that never finished a rollout) it
+falls back to the cluster-wide history. A rollback changes the version and
+keeps the scale: an app running three replicas still runs three, and a deploy
+that only changed `replicas` isn't a version to roll back to.
 
 A new instance that doesn't turn healthy within `health_timeout` fails the
-deploy, and with `auto_rollback` (the default) Bun restores the previous
-version. With `auto_rollback = false` the deploy stops where it failed.
+deploy. With `auto_rollback` (the default) the node puts the previous version
+back without ever running fewer replicas than it started with: if old
+instances had already retired, it restarts them on the previous spec first and
+only then stops the new ones. If even the previous spec won't start, it keeps
+the healthy new instances serving and reports the rollout halted. With
+`auto_rollback = false` the deploy stops where it failed, both versions
+running.
+
+In a cluster a failed rollout also marks the app `RolloutFailed`. The leader
+keeps the desired spec as you applied it but stops handing it to nodes: the
+nodes that already run it keep it, the rest stay on the previous version, and
+nothing retries it. `relish status` prints the node and the reason:
+
+```text
+web (namespace default) RolloutFailed on node-2: default__web-g3-0 failed its health check; apply a different spec or roll back
+```
+
+`relish wtf` reports it as a warning. Applying the same spec again (a GitOps
+re-sync, say) doesn't clear it, since it would only fail the same way, and
+`relish apply` says so:
+
+```text
+warning: app 'web' in namespace 'default' is RolloutFailed on node-2 (default__web-g3-0 failed its health check); the same spec again isn't retried. Change the spec, or run relish rollback
+```
+
+Any change to the spec clears the mark and starts a new rollout: a fixed image,
+`relish rollback web`, or even just a different `replicas`. A scale change
+releases the same version node by node again, so if it's still broken it fails
+again and is marked again.
+
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
-in-flight step to finish. `examples/phase-1/proc-restarts.toml` shows the
-health checker restarting an app that goes unhealthy.
+in-flight step to finish. It works on a single node only: a cluster `apply`
+returns once the council has recorded the spec, and prints no operation id,
+because each node runs its own deploy later. `examples/phase-1/proc-restarts.toml`
+shows the health checker restarting an app that goes unhealthy.
+
+`relish lint` and `apply` refuse a `[deploy]` table they can't honour: a
+`strategy` other than `rolling` or `blue-green`, and a `drain_timeout` or
+`health_timeout` that isn't a whole number of seconds, minutes or hours
+(`"90s"`, `"5m"`, `"1h"`; not `"1m30s"` or `"500ms"`).
 
 ## Jobs and cron
 
@@ -261,27 +463,44 @@ revision. A failed migration leaves the old revision in place and does not
 retry automatically. A corrected apply can start a new generation after a
 known failure is settled.
 
-Cluster migration cancellation is checked after job settlement and immediately before desired-state publication is proposed. A transaction already submitted to Raft may still commit. Ownership-write timeouts return uncertainty and retain the fence; they do not authorize automatic reruns or imply that the proposal was rejected.
+The apply is a durable deployment operation. If the client disconnects or the
+leader changes, the new leader resumes it from the same runs. Cancellation is
+checked after the migration settles and immediately before the new revision is
+published; a publication already submitted to Raft may still commit. A write
+timeout returns uncertainty rather than a refusal, and never authorises an
+automatic rerun.
 
-The cron example is for a standalone node. Cluster apply refuses any manifest
-containing recurring schedules before changing desired state or launching work.
-It also refuses an overlapping app or job while an earlier cluster job claim
-has an uncertain outcome. Leadership changes or recovery preserve that fence;
-there is no automatic expiry or replay of an uncertain migration.
+The cron example works on a cluster as well as a standalone node. Once the
+apply publishes its apps, the leader registers each schedule as a durable
+definition and claims every matching UTC minute itself, so a leader change
+neither loses nor repeats an occurrence. An app or job whose name an unsettled
+deployment still owns is refused until that deployment settles, and apply
+refuses an overlapping app or job while an earlier run of it still has an
+uncertain outcome. Leadership changes or recovery preserve that fence; there is no automatic expiry or replay of an
+uncertain migration.
 
-A failed ordinary job retries up to three times. A job whose exit Bun couldn't observe
-(say, the node crashed) is `unknown`, and an ordinary apply won't rerun it,
-because it may already have done its work. Check, then ask explicitly:
+A failed ordinary job gets four attempts in all, unless it sets `max_attempts`.
+A job whose exit Bun couldn't observe (say, the node crashed) is `unknown`, and
+nothing reruns it automatically, because it may already have done its work.
+Cron skips that job's occurrences until the outcome is settled. Check what the
+job did, then acknowledge the exact grant the status shows:
 
 ```sh
-relish apply jobs.toml --rerun-jobs
+relish --output json batch-status 42
+relish batch replay 42 --node worker-2 --grant-digest DIGEST --acknowledge-side-effects
 ```
 
-Cron doesn't catch up: firings missed while a node was down are skipped.
+`relish apply jobs.toml --rerun-jobs` is a different thing: it starts a fresh
+apply operation, so jobs that already succeeded run again. It doesn't clear an
+unknown outcome; while one remains, the cluster refuses the new run with
+"acknowledge replay before another admission".
+
+Cron doesn't catch up: firings missed while the cluster had no leader are
+skipped. The policy fields (`max_attempts`, `task_timeout_secs`, `overlap` and
+`replay_unknown`) and the cron dialect are in [Batch jobs](14_batch-jobs.md).
 
 ## Task arrays
 
-Development preview for 0.2.0: use matching PR #266 binaries and a fresh cluster.
 When the same program needs to run thousands or millions of times, submit one
 template and a count, with `{index}` wherever the task's number goes.
 
@@ -310,60 +529,29 @@ lost with a worker's disk; accepted aggregate counts remain replicated.
 - Jobs: `examples/phase-1/proc-job-success.toml`,
   `proc-job-failure.toml` (watch the retries)
 - Init containers: `examples/phase-1/proc-init-container.toml`
-- Volumes (managed + host path): `examples/phase-1/proc-volumes.toml`
+- Volumes (managed + host path): `examples/phase-1/container-volumes.toml`
+  (volumes need a container runtime)
 - Several apps per file: `examples/phase-1/proc-multi-app.toml`
 - Batch scheduling: `relish batch examples/phase-8/batch-jobs.toml`, then
   `relish batch-status <ID> --wait`
   Batch jobs must be non-scheduled and have no `run_before` declarations. Use
   ordinary apply for cron schedules and jobs that gate apps in the same manifest.
 
-Repeated batches may reuse a logical job label; each gets a distinct execution
-identity. Status and logs retain the original namespace and label for token
-scope. Select an explicit instance to read one run, especially when a label also
-names an older opaque execution. The cluster retains execution ownership after
-terminal progress records expire, and each runner retains replay proof after
-retirement. This history is finite: the cluster index is limited to 131,072
-entries or 32 MiB, and each runner's checkpoint to 16 MiB. Full history refuses
-new admissions while preserving existing runs and their replay fences. Further
-admissions then require a fresh cluster.
+Every job, whether it comes from `relish apply`, `relish batch` or a cron
+schedule, runs through the same lifecycle: the leader records it as a run and
+grants its tasks to nodes with room. Repeated batches may reuse a job name;
+each submission gets its own run ID. Select `--instance run-ID` to read or
+follow one run's logs; a follow goes to the node that holds the run's task.
 
-Clustered batches require fresh capacity reports received in the current
-leadership term from a live report publisher. Batch reservations and committed
-app placements share one capacity budget, including work not yet reported by a
-worker. Missing or expired reports return 503 rather than assuming spare
-capacity. Durably retired workers cannot receive new assignments or delayed
-first launches.
-
-Planning and registration are bounded to five seconds. A registration timeout
-returns 503 without dispatching; a late committed reservation remains held.
-Unknown dispatch or runtime outcomes also retain capacity until positive exit
-evidence or explicit fenced retirement. Repeated public submissions receive
-new execution identities; a 503 does not prove an earlier reservation vanished.
-
-A batch admission response of 503 can mean its acknowledgement was lost after
-publication started. That original owned attempt may still run. Retrying the
-same internal dispatch preserves the attempt and cannot launch a second one.
-An ownership metadata timeout admits no work. OCI executions whose container
-resource absence is unproven retain their full replay record, using more of
-the finite node history than compact retirement proofs.
+Apps and jobs share each node's capacity. A node keeps one execution budget for
+its CPU and memory requests: app replicas, running task attempts and reusable
+executors all lease from it, and a queued task holds nothing until it starts.
+Each node's state report carries what its task attempts and executors hold,
+apart from its app requests, and the leader adds both together before it places
+a replica. So a node that jobs have filled looks full, and the leader puts the
+replica somewhere else. If jobs take the room after a replica was placed, the
+node can't start it: its agent reports the refusal, and the leader moves the
+replica to another node instead of waiting there. Running attempts are never
+stopped to make room for an app.
 
 Directory defaults support `image`, `memory`, `cpu`, `[env]` and `[deploy]`. Child directories override individual fields; environment and deployment tables merge by key, and explicit workload values win. Common fields apply to jobs too, while deployment strategies apply to apps. Unknown defaults keys fail compilation.
-
-For a batch log follow, select the execution's instance ID. A cluster reader
-checks the committed allocation and follows that worker, even when an ordinary
-app has the same submitted label. It refuses a missing or unadvertised worker,
-or an allocation whose progress record has already been pruned, before opening
-an SSE or WebSocket stream. Stored log queries still use the original logical
-label; retained replay ownership does not itself supply a remote follow route.
-Predictable node policy rejection happens before the whole group's checkpoint,
-so correcting a rejected member does not leave healthy jobs permanently fenced.
-
-Held migration and ordinary-job claims also protect placement capacity. These
-jobs run on the receiving leader; the claim records no authoritative worker
-assignment. Both app and batch planners therefore reserve the complete held
-CPU/memory request on every candidate, without crediting a guessed replica or
-an unrelated report. Before app publication this includes all jobs; afterwards
-it includes only the ordinary tail. This can over-reserve capacity, including
-capacity already reported locally. It prevents new placements from spending
-uncertain commitments; it does not add initial job capacity or quota admission.
-Positive terminal settlement releases the corresponding held request.

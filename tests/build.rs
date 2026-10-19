@@ -83,9 +83,12 @@ impl Harness {
                         timestamp: std::time::SystemTime::UNIX_EPOCH,
                         running_apps: vec![],
                         cached_specs: vec![],
+                        rollouts: Vec::new(),
                         resource_usage: Default::default(),
                         event_log: vec![],
                         has_buildah: true,
+                        job_reservations: Default::default(),
+                        capacity_refusals: Vec::new(),
                     },
                 );
             }
@@ -645,11 +648,13 @@ async fn builder_failure_retries_on_another_builder() {
                 node_id: reliaburger::meat::NodeId("bad-builder".to_string()),
                 address: bad_addr,
                 api_advertised: true,
+                jobs: None,
             },
             NodeMembershipInfo {
                 node_id: reliaburger::meat::NodeId("good-builder".to_string()),
                 address: good_addr,
                 api_advertised: true,
+                jobs: None,
             },
         ]),
         builder_nodes: vec!["bad-builder".to_string(), "good-builder".to_string()],
@@ -706,7 +711,7 @@ async fn build_records_survive_an_api_restart_and_ids_stay_monotonic() {
             "name": "app",
             "runner_node": "some-other-node",
             "state": { "status": "running" },
-            "created_at_epoch_secs": reliaburger::meat::batch_tracker::epoch_now_secs(),
+            "created_at_epoch_secs": reliaburger::meat::batch_ids::epoch_now_secs(),
         },
     });
     let response = reqwest::Client::new()
@@ -761,7 +766,8 @@ async fn interrupted_build_reports_an_honest_failure() {
                 name: "app".to_string(),
                 runner_node: Some("n1".to_string()),
                 state: reliaburger::bun::build_runner::BuildState::Running,
-                created_at_epoch_secs: reliaburger::meat::batch_tracker::epoch_now_secs(),
+                created_at_epoch_secs: reliaburger::meat::batch_ids::epoch_now_secs(),
+                repository: None,
             },
         })
         .await
@@ -820,7 +826,8 @@ async fn cli_build_wait_times_out_with_the_last_known_state() {
                 name: "stuck".to_string(),
                 runner_node: Some("somewhere-else".to_string()),
                 state: reliaburger::bun::build_runner::BuildState::Running,
-                created_at_epoch_secs: reliaburger::meat::batch_tracker::epoch_now_secs(),
+                created_at_epoch_secs: reliaburger::meat::batch_ids::epoch_now_secs(),
+                repository: None,
             },
         })
         .await
@@ -1381,7 +1388,8 @@ async fn register_build(
                 name: "app".to_string(),
                 runner_node: Some("node-2".to_string()),
                 state,
-                created_at_epoch_secs: reliaburger::meat::batch_tracker::epoch_now_secs(),
+                created_at_epoch_secs: reliaburger::meat::batch_ids::epoch_now_secs(),
+                repository: None,
             },
         })
         .await
@@ -1577,6 +1585,7 @@ async fn a_build_on_a_follower_is_signed_by_the_leader() {
             node_id: reliaburger::meat::NodeId::new(&leader_name),
             address: leader_address,
             api_advertised: true,
+            jobs: None,
         }]),
         ..Default::default()
     })

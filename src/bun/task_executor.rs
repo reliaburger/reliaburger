@@ -1,18 +1,18 @@
 //! The node-side executor for task arrays.
 //!
-//! A task array's tasks are short and numerous, so they skip everything
-//! the ordinary job path does per job: no owner helper, no checkpoint
-//! rewrite, no per-job log files. A [`TaskPool`] runs the tasks of the
+//! A task array checkpoints bounded grant progress and indexed outcomes. Its
+//! production runner retains durable runtime ownership; bulk output is bounded
+//! rather than persisted as ordinary per-job log files. A [`TaskPool`] runs the tasks of the
 //! chunks this node holds through a shared set of slots (a semaphore),
 //! retries failures inside the pool, and hands back per-task
 //! [`TaskRecord`]s plus a per-chunk [`ChunkResult`] for the leader.
 //!
 //! Running a task is behind the [`TaskRunner`] trait, with two
-//! implementations: [`ProcessRunner`] spawns a real host process, and
+//! fixtures: [`ProcessRunner`] spawns a real host process, and
 //! [`FakeRunner`] computes an outcome from the index, for tests and
 //! in-process benchmarks.
 //!
-//! Nothing here is wired into the agent yet; see the million-jobs plan.
+//! The agent uses the owned runtime runner for both singleton and array jobs.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::meat::index_set::IndexRangeSet;
 use crate::meat::task_array::{ChunkId, TaskArraySpec, expand_argv, task_env};
-use crate::meat::task_array_state::ChunkResult;
+use crate::meat::task_array_state::{ChunkResult, RetryCauses};
 
 /// Bytes of output kept from the start of a task's stdout and stderr
 /// together, and again from the end.
@@ -52,6 +52,38 @@ pub struct TaskInvocation {
     pub args: Vec<String>,
     /// Environment: the template's plain variables plus the task identity.
     pub env: Vec<(String, String)>,
+    /// The run this attempt belongs to, for runners that log or track per
+    /// run. The command sees the same facts as `RELIABURGER_*` variables.
+    pub run: Option<RunIdentity>,
+}
+
+/// Typed copy of the run facts a runner needs, parsed once where the
+/// invocation is built rather than searched for in `env` by every runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIdentity {
+    /// The task array (batch) id.
+    pub batch_id: u64,
+    /// Tasks in the whole array; 1 means a singleton job run.
+    pub task_count: u32,
+    /// The job's name, when the leader supplied one.
+    pub job_name: Option<String>,
+}
+
+/// The job an assignment's tasks run for: the leader appends
+/// `RELIABURGER_JOB_NAME` after the template's own variables, so the last
+/// one wins.
+pub fn job_name(env: &[(String, String)]) -> Option<&str> {
+    env.iter()
+        .rev()
+        .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
+        .map(|(_, value)| value.as_str())
+}
+
+impl RunIdentity {
+    /// A single-task run, whose output and logs are kept as the job's own.
+    pub fn is_singleton(&self) -> bool {
+        self.task_count == 1
+    }
 }
 
 /// How one attempt ended.
@@ -63,8 +95,16 @@ pub enum AttemptOutcome {
     Signalled { signal: i32 },
     /// The attempt ran past the task timeout and was killed.
     TimedOut,
-    /// The process couldn't be started. Retrying can't fix that.
-    SpawnFailed { reason: String },
+    /// The attempt was refused before its command ran, because the job's
+    /// spec is invalid or unsupported here: a missing binary, an image
+    /// reference that doesn't parse, a runtime this node lacks. Retrying
+    /// can't fix that, so the task fails at once.
+    Refused { reason: String },
+    /// The runtime, the host or a registry failed before the command ran:
+    /// an image pull, a runc call, network or capture setup. The command
+    /// never started, so another attempt can't run it twice, and it may
+    /// get past the fault. Retried like any failed attempt (#889).
+    LaunchFailed { reason: String },
     /// Execution may have occurred, but its exit status could not be established.
     Unknown { reason: String },
     /// The array was cancelled while the attempt ran.
@@ -81,7 +121,11 @@ impl AttemptOutcome {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Exited { .. } | Self::Signalled { .. } | Self::TimedOut | Self::Unknown { .. }
+            Self::Exited { .. }
+                | Self::Signalled { .. }
+                | Self::TimedOut
+                | Self::Unknown { .. }
+                | Self::LaunchFailed { .. }
         ) && !self.succeeded()
     }
 }
@@ -120,6 +164,51 @@ pub struct Attempt {
     pub outcome: AttemptOutcome,
     /// What it wrote.
     pub output: CapturedOutput,
+    /// How long the command itself ran, when the runner can tell that apart
+    /// from waiting for a slot, admission and setup. `None` means the caller's
+    /// own measurement around [`TaskRunner::run`] is the best available.
+    pub ran: Option<Duration>,
+}
+
+impl Attempt {
+    /// An attempt refused before its command ran. The reason is its only
+    /// output, so a failed task always says why (#786).
+    pub fn refused(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            output: Self::reason_output(&reason),
+            outcome: AttemptOutcome::Refused { reason },
+            ran: None,
+        }
+    }
+
+    /// An attempt whose launch failed transiently before its command ran,
+    /// with the reason as its output.
+    pub fn launch_failed(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            output: Self::reason_output(&reason),
+            outcome: AttemptOutcome::LaunchFailed { reason },
+            ran: None,
+        }
+    }
+
+    fn reason_output(reason: &str) -> CapturedOutput {
+        let mut output = CapturedOutput::default();
+        output.push(reason.as_bytes());
+        output.push(b"\n");
+        output
+    }
+}
+
+/// One sample of a run's verified commands and its executor callers on a
+/// node, read at the same instant so that `active` never exceeds `callers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandActivity {
+    /// Commands whose start was verified and whose cleanup is not yet proved.
+    pub active: u64,
+    /// The run's executor callers, including preparation and resource wait.
+    pub callers: u64,
 }
 
 /// Runs one attempt of one task.
@@ -127,6 +216,45 @@ pub struct Attempt {
 /// A trait because there are two real implementations: the process
 /// runner the node uses, and the fake the tests and benchmarks use.
 pub trait TaskRunner: Send + Sync + 'static {
+    /// Reusable slots retain a profile reservation, including idle time.
+    fn owns_admission(&self, _task: &TaskInvocation) -> bool {
+        false
+    }
+
+    /// Commands whose start was verified and whose cleanup is not yet proved.
+    /// Unknown on backends without a command-level receipt; callers include
+    /// resource wait and preparation, so their count cannot substitute for this.
+    fn active_commands(
+        &self,
+        _batch_id: u64,
+        _template: Option<&crate::config::job::JobSpec>,
+    ) -> impl Future<Output = Option<u64>> + Send {
+        async { None }
+    }
+
+    /// [`Self::active_commands`] together with the run's `callers` counter,
+    /// both read at one instant. A command's caller is counted from before
+    /// its start until after its cleanup, so a node that read the two apart
+    /// could report a command without its caller (V02 candidate 5).
+    fn command_activity(
+        &self,
+        _batch_id: u64,
+        _template: Option<&crate::config::job::JobSpec>,
+        _callers: &std::sync::atomic::AtomicU64,
+    ) -> impl Future<Output = Option<CommandActivity>> + Send {
+        async { None }
+    }
+
+    /// Reusable-pool slots this run's callers hold, from checkout to release.
+    /// `None` when the runner doesn't run this template through a pool.
+    fn busy_slots(
+        &self,
+        _batch_id: u64,
+        _template: Option<&crate::config::job::JobSpec>,
+    ) -> impl Future<Output = Option<u64>> + Send {
+        async { None }
+    }
+
     /// Run `task`, killing it after a nonzero `timeout` or when `cancel` fires.
     fn run(
         &self,
@@ -177,14 +305,7 @@ impl TaskRunner for ProcessRunner {
             .kill_on_drop(true);
         let mut child = match command.spawn() {
             Ok(child) => child,
-            Err(error) => {
-                return Attempt {
-                    outcome: AttemptOutcome::SpawnFailed {
-                        reason: error.to_string(),
-                    },
-                    output: CapturedOutput::default(),
-                };
-            }
+            Err(error) => return Attempt::refused(error.to_string()),
         };
         let output = Arc::new(tokio::sync::Mutex::new(CapturedOutput::default()));
         let mut readers = JoinSet::new();
@@ -198,7 +319,8 @@ impl TaskRunner for ProcessRunner {
         let outcome = tokio::select! {
             status = child.wait() => match status {
                 Ok(status) => outcome_of(status),
-                Err(error) => AttemptOutcome::SpawnFailed { reason: error.to_string() },
+                // The process started, so whether it finished is unknown.
+                Err(error) => AttemptOutcome::Unknown { reason: error.to_string() },
             },
             () = wait_deadline((!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout)) => {
                 kill_now(&mut child).await;
@@ -217,7 +339,11 @@ impl TaskRunner for ProcessRunner {
         .await;
         readers.abort_all();
         let output = output.lock().await.clone();
-        Attempt { outcome, output }
+        Attempt {
+            outcome,
+            output,
+            ran: None,
+        }
     }
 }
 
@@ -344,6 +470,7 @@ impl TaskRunner for FakeRunner {
         Attempt {
             outcome,
             output: CapturedOutput::default(),
+            ran: None,
         }
     }
 }
@@ -376,7 +503,7 @@ pub struct ChunkWork {
 pub enum TaskFinal {
     /// An attempt exited 0.
     Succeeded,
-    /// Every allowed attempt failed, or the binary couldn't be started.
+    /// Every allowed attempt failed, or an attempt was refused.
     Failed,
     /// The array was cancelled before the task finished.
     NotRun,
@@ -394,12 +521,16 @@ pub struct TaskRecord {
     /// How it ended.
     pub outcome: TaskFinal,
     /// The last attempt's exit code, or the negated signal; `None` when
-    /// there was no exit status (not run, timed out, spawn failure).
+    /// there was no exit status (not run, timed out, never launched).
     pub exit_code: Option<i32>,
     /// Wall time of the last attempt, in milliseconds.
     pub run_ms: u32,
     /// The last failed attempt's output; kept only for failures.
     pub output: Option<CapturedOutput>,
+    /// Why each earlier attempt failed, for the chunk report. The ledger
+    /// doesn't store it: a record read back after a restart has none, and
+    /// its retries are reported as unrecorded.
+    pub retry_causes: RetryCauses,
 }
 
 /// What running one chunk produced.
@@ -459,8 +590,72 @@ pub struct PoolCounters {
     pub failed: AtomicU64,
     /// Retries (attempts after the first).
     pub retried: AtomicU64,
+    /// Start lag of pooled commands: from the pool taking the attempt to the
+    /// command starting, in the same power-of-two millisecond buckets as the
+    /// final-attempt durations. Only runners that time their command (the
+    /// reusable executors) contribute.
+    pub start_lag_counts: [AtomicU64; 16],
     /// An ambiguous attempt is waiting for an operator decision.
     pub unknown: std::sync::atomic::AtomicBool,
+}
+
+/// Launch failures one pool logs per window before it only counts them.
+const LAUNCH_LOGS_PER_WINDOW: u32 = 20;
+
+/// How long one window of launch-failure logging lasts.
+const LAUNCH_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// Rate limit for logging launch failures. An array of a million tasks
+/// whose image can't be pulled would otherwise write millions of lines.
+#[derive(Debug, Default)]
+struct LaunchLog {
+    window: std::sync::Mutex<LaunchLogWindow>,
+}
+
+#[derive(Debug, Default)]
+struct LaunchLogWindow {
+    opened: Option<Instant>,
+    logged: u32,
+    suppressed: u64,
+}
+
+/// Whether to log one launch failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchLogAdmission {
+    /// Log it, after saying how many the previous window left out.
+    Log { suppressed: u64 },
+    /// This window has logged its share; only count it.
+    Suppress,
+}
+
+impl LaunchLog {
+    fn admit(&self, now: Instant) -> LaunchLogAdmission {
+        // A std mutex is fine here: the critical section is a few integer
+        // updates in a synchronous call, and it is never held across an await.
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut suppressed = 0;
+        if window
+            .opened
+            .is_none_or(|opened| now.saturating_duration_since(opened) >= LAUNCH_LOG_WINDOW)
+        {
+            suppressed = window.suppressed;
+            *window = LaunchLogWindow {
+                opened: Some(now),
+                logged: 0,
+                suppressed: 0,
+            };
+        }
+        if window.logged < LAUNCH_LOGS_PER_WINDOW {
+            window.logged += 1;
+            LaunchLogAdmission::Log { suppressed }
+        } else {
+            window.suppressed += 1;
+            LaunchLogAdmission::Suppress
+        }
+    }
 }
 
 /// Runs the tasks of any number of chunks through one shared set of
@@ -474,6 +669,7 @@ pub struct TaskPool<R: TaskRunner> {
     counters: Arc<PoolCounters>,
     budget: Option<Arc<super::execution_budget::ExecutionBudget>>,
     resources: crate::meat::Resources,
+    launch_log: Arc<LaunchLog>,
 }
 
 impl<R: TaskRunner> TaskPool<R> {
@@ -497,6 +693,7 @@ impl<R: TaskRunner> TaskPool<R> {
             counters: Arc::new(PoolCounters::default()),
             budget: None,
             resources: crate::meat::Resources::default(),
+            launch_log: Arc::default(),
         }
     }
 
@@ -590,6 +787,7 @@ impl<R: TaskRunner> TaskPool<R> {
                 resources: self.resources,
                 work: Arc::clone(&work),
                 cancel: cancel.clone(),
+                launch_log: Arc::clone(&self.launch_log),
             };
             let outcomes = outcomes.clone();
             let task_grant = work.grant_attempt;
@@ -638,6 +836,7 @@ fn not_run(index: u32) -> TaskRecord {
         exit_code: None,
         run_ms: 0,
         output: None,
+        retry_causes: RetryCauses::default(),
     }
 }
 
@@ -651,6 +850,7 @@ fn summarise<'a>(work: &ChunkWork, records: impl Iterator<Item = &'a TaskRecord>
         failed_indices: IndexRangeSet::new(),
         not_run: 0,
         retried: 0,
+        retry_causes: Default::default(),
     };
     for record in records {
         match record.outcome {
@@ -666,13 +866,33 @@ fn summarise<'a>(work: &ChunkWork, records: impl Iterator<Item = &'a TaskRecord>
             TaskFinal::NotRun => result.not_run += 1,
         }
         if record.outcome != TaskFinal::NotRun {
-            let bucket =
-                (32 - record.run_ms.max(1).saturating_sub(1).leading_zeros()).min(15) as usize;
-            result.duration_counts[bucket] += 1;
+            result.duration_counts[millisecond_bucket(record.run_ms)] += 1;
         }
-        result.retried += u32::from(record.attempts.saturating_sub(1));
+        let retried = record.attempts.saturating_sub(1);
+        result.retried += u32::from(retried);
+        result.retry_causes.add(&record.retry_causes);
+        let known = record.retry_causes.total().unwrap_or(u64::MAX);
+        result.retry_causes.unrecorded += u64::from(retried).saturating_sub(known);
     }
     result
+}
+
+/// The power-of-two bucket (1, 2, 4, ... 16384 ms, then +Inf) holding `ms`.
+pub fn millisecond_bucket(ms: u32) -> usize {
+    (32 - ms.max(1).saturating_sub(1).leading_zeros()).min(15) as usize
+}
+
+/// Count why a failed attempt is about to be retried.
+fn count_retry_cause(causes: &mut RetryCauses, failed: &AttemptOutcome) {
+    match failed {
+        AttemptOutcome::Exited { .. } => causes.exit_code += 1,
+        AttemptOutcome::Signalled { .. } => causes.signal += 1,
+        AttemptOutcome::TimedOut => causes.timeout += 1,
+        AttemptOutcome::Unknown { .. } => causes.unknown += 1,
+        AttemptOutcome::LaunchFailed { .. } => causes.launch += 1,
+        // Neither is retried, so neither ever reaches a later attempt.
+        AttemptOutcome::Refused { .. } | AttemptOutcome::Cancelled => {}
+    }
 }
 
 /// One task's attempts, owned so it can run as its own tokio task.
@@ -686,6 +906,7 @@ struct TaskAttempts<R: TaskRunner> {
     resources: crate::meat::Resources,
     work: Arc<ChunkWork>,
     cancel: CancellationToken,
+    launch_log: Arc<LaunchLog>,
 }
 
 impl<R: TaskRunner> TaskAttempts<R> {
@@ -694,6 +915,10 @@ impl<R: TaskRunner> TaskAttempts<R> {
         let timeout = Duration::from_secs(u64::from(spec.task_timeout_secs));
         let mut permit = Some(first_permit);
         let mut attempt = 0u8;
+        // Counted only once a later attempt really starts, so the causes
+        // always sum to the record's `attempts - 1`.
+        let mut causes = RetryCauses::default();
+        let mut previous: Option<AttemptOutcome> = None;
         loop {
             attempt += 1;
             if permit.is_none() {
@@ -709,6 +934,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 if permit.is_none() {
                     return TaskRecord {
                         attempts: attempt - 1,
+                        retry_causes: causes,
                         ..not_run(index)
                     };
                 }
@@ -722,29 +948,44 @@ impl<R: TaskRunner> TaskAttempts<R> {
             let Some(node_permit) = node_permit else {
                 return TaskRecord {
                     attempts: attempt - 1,
+                    retry_causes: causes,
                     ..not_run(index)
                 };
             };
+            let invocation = self.invocation(index, attempt);
             let mut resource_lease = match &self.budget {
+                _ if self.runner.owns_admission(&invocation) => None,
                 Some(budget) => match budget.acquire(self.resources, &self.cancel).await {
                     Some(lease) => Some(lease.quarantine_on_drop()),
                     None => {
                         return TaskRecord {
                             attempts: attempt - 1,
+                            retry_causes: causes,
                             ..not_run(index)
                         };
                     }
                 },
                 None => None,
             };
-            let invocation = self.invocation(index, attempt);
+            if let Some(failed) = previous.take() {
+                count_retry_cause(&mut causes, &failed);
+            }
             self.counters
                 .attempts_started
                 .fetch_add(1, Ordering::Relaxed);
             self.counters.running.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
             let result = self.runner.run(&invocation, timeout, &self.cancel).await;
-            let run_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            if let Some(ran) = result.ran {
+                let lag = started.elapsed().saturating_sub(ran);
+                let lag_ms = u32::try_from(lag.as_millis()).unwrap_or(u32::MAX);
+                self.counters.start_lag_counts[millisecond_bucket(lag_ms)]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // A pool-run task waits for its slot and admission inside `run`, so
+            // prefer the runner's own measurement of the command.
+            let ran = result.ran.unwrap_or_else(|| started.elapsed());
+            let run_ms = u32::try_from(ran.as_millis()).unwrap_or(u32::MAX);
             self.counters.running.fetch_sub(1, Ordering::Relaxed);
             if let Some(lease) = resource_lease.as_mut() {
                 lease.confirm_retired();
@@ -752,6 +993,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
             drop(permit.take());
             drop(node_permit);
             drop(resource_lease);
+            self.log_launch_failure(index, attempt, &result.outcome);
 
             if !self.work.replay_unknown
                 && matches!(
@@ -763,6 +1005,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 self.cancel.cancelled().await;
                 return TaskRecord {
                     attempts: attempt,
+                    retry_causes: causes,
                     ..not_run(index)
                 };
             }
@@ -779,6 +1022,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 exit_code,
                 run_ms,
                 output: None,
+                retry_causes: causes,
             };
             if result.outcome.succeeded() {
                 self.counters.succeeded.fetch_add(1, Ordering::Relaxed);
@@ -801,6 +1045,38 @@ impl<R: TaskRunner> TaskAttempts<R> {
                     ..record
                 };
             }
+            previous = Some(result.outcome);
+        }
+    }
+
+    /// Say on stderr why an attempt never launched, so the cause outlives
+    /// the run's retained details (#889). Other failures ran the command,
+    /// and their output already says what happened.
+    fn log_launch_failure(&self, index: u32, attempt: u8, outcome: &AttemptOutcome) {
+        let (reason, verdict) = match outcome {
+            AttemptOutcome::LaunchFailed { reason } if attempt < self.work.spec.max_attempts => {
+                (reason, "launch failed, will retry")
+            }
+            AttemptOutcome::LaunchFailed { reason } => (reason, "launch failed, no attempts left"),
+            AttemptOutcome::Refused { reason } => (reason, "refused, not retrying"),
+            _ => return,
+        };
+        let batch = self.work.batch_id;
+        match self.launch_log.admit(Instant::now()) {
+            LaunchLogAdmission::Suppress => {}
+            LaunchLogAdmission::Log { suppressed } => {
+                if suppressed > 0 {
+                    eprintln!(
+                        "batch {batch}: {suppressed} earlier launch failures were not logged \
+                         (at most {LAUNCH_LOGS_PER_WINDOW} every {}s)",
+                        LAUNCH_LOG_WINDOW.as_secs()
+                    );
+                }
+                eprintln!(
+                    "batch {batch} task {index} attempt {attempt}/{}: {verdict}: {reason}",
+                    self.work.spec.max_attempts
+                );
+            }
         }
     }
 
@@ -812,6 +1088,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value)),
         );
+        let job_name = job_name(&work.env).map(str::to_string);
         TaskInvocation {
             template: work.template.clone(),
             index,
@@ -819,6 +1096,11 @@ impl<R: TaskRunner> TaskAttempts<R> {
             program: work.program.clone(),
             args: expand_argv(&work.args, index),
             env,
+            run: Some(RunIdentity {
+                batch_id: work.batch_id,
+                task_count: work.spec.count,
+                job_name,
+            }),
         }
     }
 }
@@ -860,6 +1142,7 @@ mod tests {
             program: PathBuf::from(program),
             args: args.iter().map(|a| a.to_string()).collect(),
             env: vec![("GREETING".to_string(), "hello".to_string())],
+            run: None,
         }
     }
 
@@ -1001,7 +1284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_runner_reports_a_missing_binary_as_a_spawn_failure() {
+    async fn process_runner_refuses_a_missing_binary_and_keeps_the_reason() {
         let runner = ProcessRunner::default();
         let attempt = runner
             .run(
@@ -1010,11 +1293,15 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await;
-        assert!(matches!(
-            attempt.outcome,
-            AttemptOutcome::SpawnFailed { .. }
-        ));
+        let AttemptOutcome::Refused { reason } = &attempt.outcome else {
+            panic!("a missing binary was not refused: {attempt:?}");
+        };
         assert!(!attempt.outcome.is_retryable());
+        // The command never ran, so the reason is all its output says.
+        assert_eq!(
+            String::from_utf8_lossy(&attempt.output.head),
+            format!("{reason}\n")
+        );
     }
 
     #[tokio::test]
@@ -1029,6 +1316,7 @@ mod tests {
                         tail: vec![b'y'; OUTPUT_KEEP_BYTES],
                         total_bytes: (OUTPUT_KEEP_BYTES * 2) as u64,
                     },
+                    ran: None,
                 }
             }
         }
@@ -1056,6 +1344,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_run_tasks_record_the_command_time_not_their_slot_wait() {
+        // A reusable pool waits for a slot and admission inside `run`.
+        struct Queued;
+        impl TaskRunner for Queued {
+            fn owns_admission(&self, _: &TaskInvocation) -> bool {
+                true
+            }
+            async fn run(&self, _: &TaskInvocation, _: Duration, _: &CancellationToken) -> Attempt {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 0 },
+                    output: CapturedOutput::default(),
+                    ran: Some(Duration::from_millis(5)),
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(Queued), fast(1));
+        let result = pool
+            .run_chunk(&work(1, 1, 0), &CancellationToken::new())
+            .await;
+        assert_eq!(result.records[0].run_ms, 5);
+    }
+
+    #[tokio::test]
+    async fn start_lag_counts_the_wait_before_a_pooled_command_starts() {
+        struct Queued;
+        impl TaskRunner for Queued {
+            fn owns_admission(&self, _: &TaskInvocation) -> bool {
+                true
+            }
+            async fn run(&self, _: &TaskInvocation, _: Duration, _: &CancellationToken) -> Attempt {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 0 },
+                    output: CapturedOutput::default(),
+                    ran: Some(Duration::from_millis(5)),
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(Queued), fast(1));
+        pool.run_chunk(&work(1, 1, 0), &CancellationToken::new())
+            .await;
+        let counts: Vec<u64> = pool
+            .counters()
+            .start_lag_counts
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
+        // About 195 ms of waiting lands in the 129-256 ms bucket.
+        assert_eq!(counts[8], 1, "{counts:?}");
+        assert_eq!(counts.iter().sum::<u64>(), 1);
+
+        // A runner that doesn't time its command contributes nothing.
+        let unmeasured = TaskPool::new(Arc::new(FakeRunner::always_succeeds()), fast(1));
+        unmeasured
+            .run_chunk(&work(4, 4, 0), &CancellationToken::new())
+            .await;
+        assert!(
+            unmeasured
+                .counters()
+                .start_lag_counts
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 0)
+        );
+    }
+
+    #[test]
+    fn millisecond_buckets_match_the_published_bounds() {
+        assert_eq!(millisecond_bucket(0), 0);
+        assert_eq!(millisecond_bucket(1), 0);
+        assert_eq!(millisecond_bucket(2), 1);
+        assert_eq!(millisecond_bucket(3), 2);
+        assert_eq!(millisecond_bucket(256), 8);
+        assert_eq!(millisecond_bucket(257), 9);
+        assert_eq!(millisecond_bucket(16_384), 14);
+        assert_eq!(millisecond_bucket(16_385), 15);
+        assert_eq!(millisecond_bucket(u32::MAX), 15);
+    }
+
+    #[tokio::test]
     async fn singleton_success_preserves_selected_output() {
         struct Writes;
         impl TaskRunner for Writes {
@@ -1067,6 +1435,7 @@ mod tests {
                         tail: vec![],
                         total_bytes: 6,
                     },
+                    ran: None,
                 }
             }
         }
@@ -1106,6 +1475,7 @@ mod tests {
                 exit_code: Some((index % 2 == 0) as i32),
                 run_ms: 1,
                 output: None,
+                retry_causes: RetryCauses::default(),
             })
             .collect();
         let result = summarise(&work, records.iter());
@@ -1207,6 +1577,7 @@ mod tests {
             exit_code: Some(i32::from(outcome == TaskFinal::Failed)),
             run_ms: 1,
             output: None,
+            retry_causes: RetryCauses::default(),
         };
         let finished = vec![
             earlier(100, TaskFinal::Succeeded),
@@ -1282,6 +1653,13 @@ mod tests {
         assert!(result.failed_indices.contains(42));
         // 10 tasks retried once, 10 tasks retried twice (3 attempts).
         assert_eq!(result.retried, 10 + 20);
+        assert_eq!(
+            result.retry_causes,
+            RetryCauses {
+                exit_code: 30,
+                ..RetryCauses::default()
+            }
+        );
         assert_eq!(runner.attempts(), 80 + 10 * 2 + 10 * 3);
         let failed = outcome.records.iter().find(|r| r.index == 42).unwrap();
         assert_eq!(failed.attempts, 3);
@@ -1294,9 +1672,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_failures_are_not_retried() {
+    async fn retry_causes_record_why_each_recovered_attempt_failed() {
+        // Each index fails its first attempt a different way, then succeeds.
+        let runner = Arc::new(FakeRunner::new(Duration::ZERO, |task| {
+            if task.attempt > 1 {
+                return AttemptOutcome::Exited { code: 0 };
+            }
+            match task.index % 5 {
+                0 => AttemptOutcome::Exited { code: 3 },
+                1 => AttemptOutcome::Signalled { signal: 9 },
+                2 => AttemptOutcome::TimedOut,
+                3 => AttemptOutcome::Unknown {
+                    reason: "lost helper".into(),
+                },
+                _ => AttemptOutcome::LaunchFailed {
+                    reason: "registry unavailable".into(),
+                },
+            }
+        }));
+        let pool = TaskPool::new(Arc::clone(&runner), fast(4));
+        let outcome = pool
+            .run_chunk(&work(10, 10, 0), &CancellationToken::new())
+            .await;
+        assert_eq!(outcome.result.succeeded, 10);
+        assert_eq!(outcome.result.retried, 10);
+        assert_eq!(
+            outcome.result.retry_causes,
+            RetryCauses {
+                exit_code: 2,
+                signal: 2,
+                timeout: 2,
+                unknown: 2,
+                launch: 2,
+                unrecorded: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_read_back_from_the_ledger_count_as_unrecorded() {
+        let runner = Arc::new(FakeRunner::always_succeeds());
+        let pool = TaskPool::new(Arc::clone(&runner), fast(4));
+        // Decoded ledger records keep their attempt count but not the causes.
+        let earlier = TaskRecord {
+            grant_attempt: 1,
+            index: 3,
+            attempts: 3,
+            outcome: TaskFinal::Succeeded,
+            exit_code: Some(0),
+            run_ms: 1,
+            output: None,
+            retry_causes: RetryCauses::default(),
+        };
+        let outcome = pool
+            .resume_chunk(&work(10, 10, 0), vec![earlier], &CancellationToken::new())
+            .await;
+        assert_eq!(outcome.result.retried, 2);
+        assert_eq!(outcome.result.retry_causes.unrecorded, 2);
+        assert_eq!(outcome.result.retry_causes.total(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn refused_attempts_are_not_retried() {
         let runner = Arc::new(FakeRunner::new(Duration::ZERO, |_| {
-            AttemptOutcome::SpawnFailed {
+            AttemptOutcome::Refused {
                 reason: "no such file".to_string(),
             }
         }));
@@ -1307,6 +1746,172 @@ mod tests {
         assert_eq!(outcome.result.failed_indices.len(), 10);
         assert_eq!(outcome.result.retried, 0);
         assert_eq!(runner.attempts(), 10);
+        assert_eq!(pool.counters().failed.load(Ordering::Relaxed), 10);
+    }
+
+    // -- #889: launch failures --------------------------------------------
+
+    fn launch_failed() -> AttemptOutcome {
+        AttemptOutcome::LaunchFailed {
+            reason: "registry leader refused proposal: 503".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_launch_failure_is_retryable_and_a_refusal_is_not() {
+        assert!(launch_failed().is_retryable());
+        assert!(!launch_failed().succeeded());
+        let refused = AttemptOutcome::Refused {
+            reason: "invalid image reference".to_string(),
+        };
+        assert!(!refused.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn a_launch_failure_retries_until_max_attempts() {
+        let runner = Arc::new(FakeRunner::new(Duration::ZERO, |_| launch_failed()));
+        let pool = TaskPool::new(Arc::clone(&runner), fast(2));
+        let mut chunk = work(4, 4, 0);
+        chunk.spec.max_attempts = 3;
+        let outcome = pool.run_chunk(&chunk, &CancellationToken::new()).await;
+        assert_eq!(outcome.result.failed_count, 4);
+        assert_eq!(outcome.result.retried, 8);
+        assert_eq!(outcome.result.retry_causes.launch, 8);
+        assert_eq!(outcome.result.retry_causes.total(), Some(8));
+        assert_eq!(runner.attempts(), 12);
+        for record in &outcome.records {
+            assert_eq!(record.attempts, 3);
+            assert_eq!(record.outcome, TaskFinal::Failed);
+            assert_eq!(record.exit_code, None);
+        }
+        let counters = pool.counters();
+        assert_eq!(counters.retried.load(Ordering::Relaxed), 8);
+        assert_eq!(counters.attempts_started.load(Ordering::Relaxed), 12);
+        assert_eq!(counters.failed.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_first_launch_failed_succeeds_on_its_retry() {
+        let runner = Arc::new(FakeRunner::new(Duration::ZERO, |task| {
+            if task.attempt == 1 {
+                launch_failed()
+            } else {
+                AttemptOutcome::Exited { code: 0 }
+            }
+        }));
+        let pool = TaskPool::new(Arc::clone(&runner), fast(2));
+        let outcome = pool
+            .run_chunk(&work(6, 6, 0), &CancellationToken::new())
+            .await;
+        assert_eq!(outcome.result.succeeded, 6);
+        assert_eq!(outcome.result.retried, 6);
+        assert_eq!(outcome.result.retry_causes.launch, 6);
+    }
+
+    #[tokio::test]
+    async fn a_singleton_retries_a_launch_failure_without_waiting_for_replay() {
+        // The command never ran, so retrying can't run it twice: unlike an
+        // unknown outcome, this needs no operator decision.
+        let runner = Arc::new(FakeRunner::new(Duration::ZERO, |task| {
+            if task.attempt == 1 {
+                launch_failed()
+            } else {
+                AttemptOutcome::Exited { code: 0 }
+            }
+        }));
+        let pool = TaskPool::new(Arc::clone(&runner), fast(1));
+        let mut chunk = work(1, 1, 0);
+        chunk.replay_unknown = false;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.run_chunk(&chunk, &CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.result.succeeded, 1);
+        assert_eq!(outcome.records[0].attempts, 2);
+        assert!(!pool.counters().unknown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_a_launch_retry_backoff_runs_no_further_attempt() {
+        let runner = Arc::new(FakeRunner::new(Duration::ZERO, |_| launch_failed()));
+        let config = PoolConfig {
+            concurrency: 1,
+            backoff_base: Duration::from_secs(60),
+            backoff_cap: Duration::from_secs(60),
+        };
+        let pool = Arc::new(TaskPool::new(Arc::clone(&runner), config));
+        let cancel = CancellationToken::new();
+        let running = {
+            let pool = Arc::clone(&pool);
+            let cancel = cancel.clone();
+            tokio::spawn(async move { pool.run_chunk(&work(1, 1, 0), &cancel).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runner.attempts() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(runner.attempts(), 1);
+        assert_eq!(outcome.records[0].outcome, TaskFinal::NotRun);
+        assert_eq!(outcome.records[0].attempts, 1);
+        assert_eq!(outcome.result.retried, 0);
+        assert_eq!(pool.counters().retried.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_task_that_never_launches_keeps_the_last_reason_as_its_output() {
+        struct Unpullable;
+        impl TaskRunner for Unpullable {
+            async fn run(
+                &self,
+                task: &TaskInvocation,
+                _: Duration,
+                _: &CancellationToken,
+            ) -> Attempt {
+                Attempt::launch_failed(format!("pull failed on attempt {}", task.attempt))
+            }
+        }
+        let pool = TaskPool::new(Arc::new(Unpullable), fast(1));
+        let mut chunk = work(1, 1, 0);
+        chunk.spec.max_attempts = 2;
+        let outcome = pool.run_chunk(&chunk, &CancellationToken::new()).await;
+        let record = &outcome.records[0];
+        assert_eq!(record.outcome, TaskFinal::Failed);
+        assert_eq!(record.attempts, 2);
+        let output = record.output.as_ref().unwrap();
+        assert_eq!(output.head, b"pull failed on attempt 2\n");
+    }
+
+    #[test]
+    fn launch_failure_logs_are_limited_per_window_and_count_the_rest() {
+        let log = LaunchLog::default();
+        let start = Instant::now();
+        for _ in 0..LAUNCH_LOGS_PER_WINDOW {
+            assert_eq!(log.admit(start), LaunchLogAdmission::Log { suppressed: 0 });
+        }
+        assert_eq!(log.admit(start), LaunchLogAdmission::Suppress);
+        assert_eq!(
+            log.admit(start + LAUNCH_LOG_WINDOW / 2),
+            LaunchLogAdmission::Suppress
+        );
+        // The next window logs again and says how many the last one hid.
+        assert_eq!(
+            log.admit(start + LAUNCH_LOG_WINDOW),
+            LaunchLogAdmission::Log { suppressed: 2 }
+        );
+        assert_eq!(
+            log.admit(start + LAUNCH_LOG_WINDOW),
+            LaunchLogAdmission::Log { suppressed: 0 }
+        );
     }
 
     #[tokio::test]

@@ -51,7 +51,7 @@ impl Default for PerimeterConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host_port_range: (10000, 60000),
+            host_port_range: (10000, 32767),
             cluster_ports: vec![9443, 9444, 9445],
             operator_cidrs: Vec::new(),
             management_port: 9117,
@@ -519,7 +519,7 @@ mod tests {
         );
         assert!(rules.contains("ip6 saddr fd00::5 tcp dport { 9117, 9443, 9444, 9445 } accept"));
         assert!(!rules.contains("ip saddr 192.168.104.5 accept"));
-        assert!(rules.contains("tcp dport 10000-60000 drop"));
+        assert!(rules.contains("tcp dport 10000-32767 drop"));
         assert!(rules.contains("tcp dport 9117 drop"));
         assert!(
             rules.find("ip saddr 192.168.104.5").unwrap()
@@ -539,7 +539,7 @@ mod tests {
         );
         assert!(rules.contains("ip6 saddr fd00::/64 tcp dport { 9117, 9443, 9444, 9445 } accept"));
         assert!(!rules.contains("ip saddr 192.168.104.0/24 accept"));
-        assert!(rules.contains("tcp dport 10000-60000 drop"));
+        assert!(rules.contains("tcp dport 10000-32767 drop"));
     }
 
     #[test]
@@ -631,7 +631,7 @@ mod tests {
         let nodes = ClusterNodes::new();
         let rules = generate(&config, &nodes);
 
-        assert!(rules.contains("tcp dport 10000-60000 drop"));
+        assert!(rules.contains("tcp dport 10000-32767 drop"));
     }
 
     #[test]
@@ -679,7 +679,7 @@ mod tests {
 
         // The accept rule must come before the drop rules
         let accept_pos = rules.find("10.0.1.1, 10.0.1.2 } accept").unwrap();
-        let drop_pos = rules.find("10000-60000 drop").unwrap();
+        let drop_pos = rules.find("10000-32767 drop").unwrap();
         assert!(accept_pos < drop_pos);
     }
 
@@ -717,13 +717,13 @@ mod tests {
         let rules = generate(&config, &nodes);
 
         assert!(rules.contains("tcp dport 40000-41000 drop"));
-        assert!(!rules.contains("10000-60000"));
+        assert!(!rules.contains("10000-32767"));
     }
 
     #[test]
     fn default_config_values() {
         let config = default_config();
-        assert_eq!(config.host_port_range, (10000, 60000));
+        assert_eq!(config.host_port_range, (10000, 32767));
         assert_eq!(config.cluster_ports, vec![9443, 9444, 9445]);
         assert_eq!(config.management_port, 9117);
     }
@@ -789,7 +789,7 @@ mod tests {
         // leaves every drop rule void for v6 traffic.
         let ip6_start = rules.find("table ip6 reliaburger_fw {\n").unwrap();
         let ip6_rules = &rules[ip6_start..];
-        assert!(ip6_rules.contains("tcp dport 10000-60000 drop"));
+        assert!(ip6_rules.contains("tcp dport 10000-32767 drop"));
         assert!(ip6_rules.contains("tcp dport 9117 drop"));
         assert!(ip6_rules.contains("udp dport 9443 drop"));
     }
@@ -845,7 +845,7 @@ mod tests {
             ]
         );
         // Operators never get a blanket accept, UDP, or the cluster ports.
-        for port in ["9443", "9444", "9445", "10000-60000"] {
+        for port in ["9443", "9444", "9445", "10000-32767"] {
             assert!(
                 operator_lines.iter().all(|line| !line.contains(port)),
                 "operator rule mentions {port}"

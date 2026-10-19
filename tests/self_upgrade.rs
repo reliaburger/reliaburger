@@ -16,6 +16,9 @@ use tokio::sync::watch;
 use reliaburger::upgrade::signing::{self, encode_public_key};
 use reliaburger::upgrade::types::{BinarySource, UpgradeDirective};
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
+
 /// How long to wait for slow conditions (binary boots, verification).
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -38,6 +41,8 @@ struct RealNodeHarness {
     release_pkcs8: Vec<u8>,
     external_pkcs8: Vec<u8>,
     deployed_apps: Vec<(String, String)>,
+    /// The fixed ports every exec and respawn rebinds, leased for the test.
+    _held_ports: Vec<bun_process::PortBlockReservation>,
 }
 
 impl RealNodeHarness {
@@ -62,11 +67,15 @@ impl RealNodeHarness {
         install_version(&bin_dir, "v0.2.0");
         std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
-        // Keep the API reservation while allocating the cluster transports;
-        // early release can select the same TCP port for two services. Pickle
-        // is not addressed by this fixture, so Bun can bind its actual port zero.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let api = listener.local_addr().unwrap().to_string();
+        // Every upgrade exec and respawn closes the API socket and binds the
+        // same port again. A `bind(0)` port comes from the ephemeral range,
+        // where another test can take it in that gap (#734); the shared
+        // allocator's range lies below it and its lease keeps other fixtures
+        // off. Pickle is not addressed by this fixture, so Bun can bind its
+        // actual port zero.
+        let api_port = bun_process::reserve_port_block_lease(1);
+        let api = format!("127.0.0.1:{}", api_port.base);
+        let mut held_ports = vec![api_port];
 
         let config_path = root.path().join("node.toml");
         std::fs::write(
@@ -84,6 +93,11 @@ volumes = "{root}/volumes"
 registry_bind = "127.0.0.1"
 registry_port = 0
 
+# The process runtime runs host apps only (#914): allow testapp.
+[process_workloads]
+allowed_binaries = ["{testapp}"]
+mount_isolation = false
+
 [upgrades]
 binary_dir = "{bin}"
 external_signing_key = "{external}"
@@ -98,25 +112,21 @@ retain_versions = 3
                 bin = bin_dir.display(),
                 external = encode_public_key(&external_public),
                 release = encode_public_key(&release_public),
+                testapp = env!("CARGO_BIN_EXE_testapp"),
             ),
         )
         .unwrap();
 
-        let cluster_sockets = if cluster {
+        if cluster {
             // A real cluster-mode process with no reachable peer. Local API
             // health must not allow its replacement to commit an upgrade.
             use std::io::Write;
-            let gossip = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let reporting = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let ports = bun_process::reserve_port_block_lease(3);
             writeln!(std::fs::OpenOptions::new().append(true).open(&config_path).unwrap(),
-                "\n[cluster]\ngossip_port = {}\nraft_port = {}\nreporting_port = {}\n[network]\nadvertise_address = \"127.0.0.1\"",
-                gossip.local_addr().unwrap().port(), raft.local_addr().unwrap().port(),
-                reporting.local_addr().unwrap().port()).unwrap();
-            Some((gossip, raft, reporting))
-        } else {
-            None
-        };
+                "\n[cluster]\ngossip_port = {}\nraft_port = {}\nreporting_port = {}\n[network]\nadvertise_address = \"127.0.0.1\"\n[security]\nrequire_mtls = false",
+                ports.base, ports.base + 1, ports.base + 2).unwrap();
+            held_ports.push(ports);
+        }
 
         // The supervisor: spawn the symlink, respawn on exit. On a
         // successful upgrade the exec keeps the pid, so wait() simply keeps
@@ -126,10 +136,6 @@ retain_versions = 3
         let listen = api.clone();
         let supervisor_config = config_path.clone();
         let supervisor = tokio::spawn(async move {
-            // Release only once every fixed address is chosen and immediately
-            // before launch. Replacements deliberately reuse those addresses.
-            drop(listener);
-            drop(cluster_sockets);
             loop {
                 let mut command = tokio::process::Command::new(&symlink);
                 if cluster {
@@ -173,6 +179,7 @@ retain_versions = 3
             release_pkcs8,
             external_pkcs8,
             deployed_apps: Vec::new(),
+            _held_ports: held_ports,
         };
         harness.wait_healthy().await;
         harness
@@ -225,8 +232,8 @@ retain_versions = 3
         let config = format!(
             r#"
 [app.{app}]
-image = "proc-grill:image-ignored"
-command = ["{testapp}", "--mode", "healthy", "--port", "{port}"]
+exec = "{testapp}"
+command = ["--mode", "healthy", "--port", "{port}"]
 "#,
             testapp = env!("CARGO_BIN_EXE_testapp"),
         );

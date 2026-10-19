@@ -445,6 +445,43 @@ impl RuncGrill {
             _ => None,
         };
         let cleanup = context.seal(Duration::from_secs(15)).await?;
+        if record.spec.reusable_executor {
+            let helper = record
+                .spec
+                .linux
+                .host_cgroup_path()
+                .ok_or_else(|| io::Error::other("invalid reusable helper cgroup"))?;
+            if helper.file_name().and_then(|name| name.to_str()) != Some("helper") {
+                return Err(io::Error::other(
+                    "reusable executor does not own the expected helper leaf",
+                ));
+            }
+            let task = helper
+                .parent()
+                .ok_or_else(|| io::Error::other("missing executor cgroup branch"))?
+                .join("task");
+            if tokio::fs::try_exists(&task).await? {
+                if previous_boot {
+                    return Err(io::Error::other(
+                        "prior-boot executor has a conflicting task cgroup",
+                    ));
+                }
+                // The original launch is sealed and its entire descendant tree
+                // reaped. Retain intent until the independently limited sibling
+                // is empty; recovery must never clear this obligation early.
+                let group = task.clone();
+                tokio::task::spawn_blocking(move || {
+                    let method = crate::grill::kernel::executor_support().group_kill;
+                    crate::grill::kernel::kill_group(&group, method)
+                })
+                .await
+                .map_err(io::Error::other)?
+                .map_err(|error| {
+                    io::Error::other(format!("reusable task cgroup has not retired: {error}"))
+                })?;
+                tokio::fs::remove_dir(&task).await?;
+            }
+        }
         let state = self.state_dir.join(&id.0);
         if tokio::fs::try_exists(&state).await? {
             if previous_boot {
@@ -828,7 +865,162 @@ impl RuncGrill {
         .await
     }
 
+    /// Bind a socket peer to the original helper launch, rather than a numeric
+    /// PID alone. Retain proc/cgroup descriptors across owner confirmation.
+    pub(crate) async fn authenticate_executor(
+        &self,
+        instance: &InstanceId,
+        peer: u32,
+    ) -> Result<(), GrillError> {
+        self.owned_operation(instance, move |runtime, id, context| async move {
+            let intent = context.intent().await?;
+            if intent.phase != IntentPhase::Owned
+                || !intent.spec.reusable_executor
+                || runtime.rootless
+            {
+                return Err(io::Error::other("socket peer has no reusable owned launch"));
+            }
+            let Some(CommandState::Running { pid: launcher }) =
+                context.role_state(RuntimeRole::Launcher).await?
+            else {
+                return Err(io::Error::other("executor launcher is not running"));
+            };
+            if runtime.owned_running_pid(&id, &context).await? != Some(peer) {
+                return Err(io::Error::other(
+                    "socket peer differs from the owned container init",
+                ));
+            }
+            let path = intent
+                .spec
+                .linux
+                .host_cgroup_path()
+                .ok_or_else(|| io::Error::other("invalid helper cgroup"))?;
+            let (_process, _cgroup) = tokio::task::spawn_blocking(move || {
+                use std::os::fd::AsRawFd;
+                let process = std::fs::File::open(format!("/proc/{peer}"))?;
+                let base = format!("/proc/self/fd/{}", process.as_raw_fd());
+                let status = std::fs::read_to_string(format!("{base}/status"))?;
+                let field = |name| status.lines().find_map(|line| line.strip_prefix(name));
+                let parent = field("PPid:").and_then(|value| value.trim().parse::<u32>().ok());
+                let nested = field("NSpid:").is_some_and(|value| {
+                    value.split_whitespace().count() >= 2
+                        && value.split_whitespace().last() == Some("1")
+                });
+                let internal = field("Uid:").is_some_and(|value| {
+                    value.split_whitespace().all(|uid| {
+                        uid.parse::<u32>().ok() == Some(crate::grill::userns::EXECUTOR_HOST_UID)
+                    })
+                });
+                let membership = std::fs::read_to_string(format!("{base}/cgroup"))?;
+                let expected = format!(
+                    "/{}",
+                    path.strip_prefix("/sys/fs/cgroup")
+                        .map_err(io::Error::other)?
+                        .display()
+                );
+                if parent != Some(launcher)
+                    || !nested
+                    || !internal
+                    || !membership
+                        .lines()
+                        .any(|line| line.strip_prefix("0::") == Some(&expected))
+                {
+                    return Err(io::Error::other(
+                        "executor socket source conflicts with its original owner",
+                    ));
+                }
+                let cgroup = std::fs::File::open(path)?;
+                Ok::<_, io::Error>((process, cgroup))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            if context.role_state(RuntimeRole::Launcher).await?
+                != Some(CommandState::Running { pid: launcher })
+            {
+                return Err(io::Error::other(
+                    "executor owner retired during socket binding",
+                ));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Return original requests independently of agent adoption records.
+    /// Delete a retired instance's bundle, journal and lock file (#678).
+    /// Refuses, deleting nothing, while its generation is unretired, still
+    /// cached as live, holds an address or has OCI state or a mounted rootfs,
+    /// and, when the caller names `generation`, while any other generation
+    /// owns the identity (#850).
+    pub(super) async fn owned_forget_retired(
+        &self,
+        instance: &InstanceId,
+        generation: Option<&crate::grill::RuntimeGeneration>,
+    ) -> io::Result<()> {
+        let expected = self.intent_journal()?.observe(instance).await?;
+        if let Some(generation) = generation
+            && expected.as_ref().is_some_and(|current| {
+                crate::grill::RuntimeGeneration::runc(current.as_str()) != *generation
+            })
+        {
+            return Err(io::Error::other(
+                "a successor runtime generation owns the identity",
+            ));
+        }
+        let runtime = self.clone();
+        let id = instance.clone();
+        tokio::spawn(async move {
+            let _lifecycle = runtime.lock_lifecycle(&id).await;
+            let ownership = runtime.ownership()?;
+            if ownership.contexts.lock().await.contains_key(&id) {
+                return Err(io::Error::other("runtime generation still owns resources"));
+            }
+            let claim = runtime.intent_journal()?.claim(&id, expected).await?;
+            if claim
+                .record()
+                .is_some_and(|record| !matches!(record.phase, IntentPhase::Retired { .. }))
+            {
+                return Err(io::Error::other("runtime generation has not retired"));
+            }
+            let state = runtime.state_dir.join(&id.0);
+            let bundle = runtime.bundle_base.join(&id.0);
+            tokio::task::spawn_blocking(move || {
+                if std::fs::symlink_metadata(&state).is_ok() {
+                    return Err(io::Error::other("retired instance still has OCI state"));
+                }
+                match std::fs::symlink_metadata(&bundle) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
+                    Ok(_) => {}
+                }
+                // remove_dir_all would descend into a live overlay.
+                if crate::grill::rootfs::is_mountpoint(&bundle.join("rootfs")) {
+                    return Err(io::Error::other("retired instance still mounts its rootfs"));
+                }
+                std::fs::remove_dir_all(&bundle)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            claim.forget().await?;
+            runtime.forget_launcher(&id).await;
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// The generation of the instance's current runtime intent, if any.
+    pub(super) async fn owned_launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> io::Result<Option<crate::grill::RuntimeGeneration>> {
+        Ok(self
+            .intent_journal()?
+            .observe(instance)
+            .await?
+            .map(|generation| crate::grill::RuntimeGeneration::runc(generation.as_str())))
+    }
+
     pub(super) async fn owned_inventory(
         &self,
     ) -> Result<Option<Vec<crate::grill::RuntimeLaunch>>, GrillError> {

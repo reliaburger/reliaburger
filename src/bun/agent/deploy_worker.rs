@@ -13,8 +13,6 @@ use super::*;
 /// loop as a `DeployOp` through `ops`, so the loop stays the single owner of
 /// supervisor / service-map / networking state.
 pub(super) struct DeployWorker<G: Grill> {
-    pub(super) rerun_unknown_jobs: bool,
-    pub(super) prepared_batch_jobs: Option<BTreeMap<String, u64>>,
     pub(super) grill: G,
     pub(super) ops: DeployOps,
     /// Shared drain tracker, so the worker can drain-and-stop a retiring
@@ -27,6 +25,40 @@ pub(super) struct DeployWorker<G: Grill> {
     /// Resolves an instance's egress allowlist before the loop programs
     /// it, so the loop never waits on DNS (#419).
     pub(super) egress: launch_evidence::EgressResolver,
+}
+
+/// The replacement instances a rollout, or the restoration of an aborted
+/// one, started, and what launching them recorded.
+#[derive(Debug, Default)]
+pub(super) struct Replacements {
+    /// Started, healthy and published as backends, in start order.
+    pub(super) healthy: Vec<InstanceId>,
+    pub(super) ports: std::collections::HashMap<InstanceId, Option<u16>>,
+    pub(super) specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
+    pub(super) ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
+    /// Every reservation, healthy or not: what an abort must clean up.
+    pub(super) prepared: Vec<InstanceId>,
+    /// Reservations whose runtime create was attempted.
+    pub(super) runtime_attempted: std::collections::HashSet<InstanceId>,
+}
+
+/// Everything [`DeployWorker::abort_rollout`] needs to know about a rollout
+/// that failed part-way.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AbortedRollout<'a> {
+    pub(super) app_name: &'a str,
+    pub(super) namespace: &'a str,
+    /// The spec the rollout was rolling out.
+    pub(super) spec: &'a AppSpec,
+    /// The spec the old instances run, when this node knows it.
+    pub(super) previous: Option<&'a AppSpec>,
+    pub(super) started: &'a Replacements,
+    /// Old instances the rollout hadn't retired yet.
+    pub(super) remaining_old: &'a [InstanceId],
+    /// How many old instances it had retired.
+    pub(super) retired: usize,
+    pub(super) replica_count: u32,
+    pub(super) config: &'a crate::meat::deploy_types::DeployConfig,
 }
 
 /// The last few hundred bytes of a runtime's captured stderr (`{stem}.stderr`),
@@ -118,21 +150,24 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
     }
 
-    /// Deploy all apps and jobs from a config, streaming progress events. The
+    /// Deploy all apps from a config, streaming progress events. The
     /// mirror of the former `BunAgent::deploy`, but off the command loop.
-    pub(super) async fn run_deploy(self, mut config: Config, events: mpsc::Sender<ApplyEvent>) {
+    pub(super) async fn run_deploy(self, config: Config, events: mpsc::Sender<ApplyEvent>) {
         if self.report_cancellation(&events).await {
             return;
         }
-        if let Err(message) = self.preflight_prerequisites(&mut config).await {
-            let _ = events.send(ApplyEvent::Error { message }).await;
+        // Jobs take the common job lifecycle; a node's deploy runs apps only.
+        if !config.job.is_empty() {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: "jobs run through the common job lifecycle, not a node's app deploy"
+                        .into(),
+                })
+                .await;
             return;
         }
         let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
-        // Jobs already run as `run_before` prerequisites, so the regular jobs
-        // loop below doesn't run them a second time.
-        let mut ran_prereqs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deployed_apps: Vec<(String, String)> = config
             .app
             .iter()
@@ -164,37 +199,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
             let namespace = spec.namespace.as_deref().unwrap_or("default");
 
-            // run_before (E): jobs declaring `run_before = ["app.<name>"]` must
-            // run to completion before this app's deploy begins — migrations are
-            // the classic case. A prerequisite failure aborts the whole deploy.
-            let target = format!("app.{app_name}");
-            for (job_name, job_spec) in &config.job {
-                // Cron-scheduled jobs fire on their schedule, never as a
-                // deploy-time prerequisite.
-                if ran_prereqs.contains(job_name)
-                    || job_spec.schedule.is_some()
-                    || !job_spec.run_before.contains(&target)
-                {
-                    continue;
-                }
-                let job_ns = job_spec.namespace.as_deref().unwrap_or("default");
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!(
-                            "running prerequisite job {job_name} before app {app_name}"
-                        ),
-                    })
-                    .await;
-                if let Err(e) = self.run_prerequisite_job(job_name, job_ns, job_spec).await {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-                ran_prereqs.insert(job_name.clone());
-            }
             if self.report_cancellation(&events).await {
                 return;
             }
@@ -213,47 +217,54 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
             }
 
-            // Gate on image signature first (IMG1). A verified image comes back
+            // Gate on image signature first (IMG1), for the app's image and
+            // each init container's own (#701). A verified image comes back
             // pinned to its manifest digest; the pinned spec shadows the
             // original for the rest of this iteration.
-            let pinned_spec;
-            let spec = match self.ops.enforce_image_signature(spec).await {
-                Ok(None) => spec,
-                Ok(Some(pinned_image)) => {
-                    let mut with_pin = spec.clone();
-                    with_pin.image = Some(pinned_image);
-                    pinned_spec = with_pin;
-                    &pinned_spec
-                }
+            let pinned_spec = match self.pin_images(spec).await {
+                Ok(pinned) => pinned,
                 Err(reason) => {
                     let _ = events.send(ApplyEvent::Error { message: reason }).await;
                     return;
                 }
             };
+            let spec = pinned_spec.as_ref().unwrap_or(spec);
 
             // Asked before the new spec replaces the one the replicas run.
             let in_place = self
                 .ops
                 .replicas_to_add_in_place(app_name, namespace, spec)
                 .await;
-            if let Err(error) = self
+            // The spec the running replicas came from: what an aborted
+            // rollout restores.
+            let previous = match self
                 .ops
                 .store_deployed_spec(app_name, namespace, spec)
                 .await
             {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
-                return;
-            }
+                Ok(previous) => previous,
+                Err(error) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
 
             let existing = self.ops.list_existing_owned(app_name, namespace).await;
 
             if let Some(count) = in_place.filter(|_| !existing.is_empty()) {
                 if self
-                    .add_replicas_in_place(app_name, namespace, spec, count, &events)
+                    .add_replicas_in_place(
+                        app_name,
+                        namespace,
+                        spec,
+                        previous.as_ref(),
+                        count,
+                        &events,
+                    )
                     .await
                     .is_break()
                 {
@@ -293,12 +304,28 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 let strategy = crate::meat::deploy_types::DeployConfig::for_app(spec).strategy;
                 let outcome = match strategy {
                     crate::meat::deploy_types::DeployStrategy::BlueGreen => {
-                        self.blue_green_redeploy(app_name, namespace, spec, existing, &events, now)
-                            .await
+                        self.blue_green_redeploy(
+                            app_name,
+                            namespace,
+                            spec,
+                            previous.as_ref(),
+                            existing,
+                            &events,
+                            now,
+                        )
+                        .await
                     }
                     crate::meat::deploy_types::DeployStrategy::Rolling => {
-                        self.rolling_redeploy(app_name, namespace, spec, existing, &events, now)
-                            .await
+                        self.rolling_redeploy(
+                            app_name,
+                            namespace,
+                            spec,
+                            previous.as_ref(),
+                            existing,
+                            &events,
+                            now,
+                        )
+                        .await
                     }
                 };
                 if outcome.is_break() {
@@ -389,9 +416,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     return;
                 }
 
-                self.ops
-                    .provision_identity(app_name, namespace, id, false)
-                    .await;
+                self.ops.provision_identity(app_name, namespace, id).await;
 
                 let _ = events
                     .send(ApplyEvent::InstanceCreated {
@@ -423,103 +448,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
-        if !config.job.is_empty()
-            && let Some(operation) = &self.operation
-        {
-            operation
-                .advance(
-                    crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
-                    None,
-                    format!("deploying {} job(s)", config.job.len()),
-                )
-                .await;
-        }
-
-        for (job_name, spec) in &config.job {
-            if self.report_cancellation(&events).await {
-                return;
-            }
-            // Already run to completion as a run_before prerequisite above, or a
-            // cron-scheduled job that fires on its schedule rather than now.
-            if ran_prereqs.contains(job_name) || spec.schedule.is_some() {
-                continue;
-            }
-            let namespace = spec.namespace.as_deref().unwrap_or("default");
-            if let Some(operation) = &self.operation {
-                operation
-                    .advance(
-                        crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
-                        Some(crate::bun::deploy_operations::DeployTarget {
-                            kind: crate::bun::deploy_operations::DeployTargetKind::Job,
-                            name: job_name.clone(),
-                            namespace: namespace.to_string(),
-                        }),
-                        format!("deploying job {namespace}/{job_name}"),
-                    )
-                    .await;
-            }
-            let _ = events
-                .send(ApplyEvent::Progress {
-                    message: format!("deploying job {job_name}"),
-                })
-                .await;
-
-            let admission = match &self.prepared_batch_jobs {
-                Some(prepared) => match prepared.get(job_name) {
-                    Some(generation) => {
-                        self.ops
-                            .prepared_batch_job(job_name, namespace, *generation, spec)
-                            .await
-                    }
-                    None => Err(BunError::BatchConflict(
-                        "worker lacks the exact prepared generation".into(),
-                    )),
-                },
-                None => {
-                    self.ops
-                        .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
-                        .await
-                }
-            };
-            let ids = match admission {
-                Ok(ids) => ids,
-                Err(e) => {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            for id in &ids {
-                let _ = events
-                    .send(ApplyEvent::Progress {
-                        message: format!("creating instance {}", id.0),
-                    })
-                    .await;
-
-                if let Err(e) = self.drive_job(id, job_name, namespace, spec).await {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-
-                let _ = events
-                    .send(ApplyEvent::InstanceCreated {
-                        id: id.0.clone(),
-                        app: job_name.to_string(),
-                    })
-                    .await;
-            }
-
-            all_ids.extend(ids.iter().map(|id| id.0.clone()));
-        }
-
         if self.report_cancellation(&events).await {
             return;
         }
@@ -545,13 +473,45 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
     }
 
+    /// Check every image `spec` runs against the trust policy: the app's and
+    /// each init container's own. Returns the spec with each verified image
+    /// pinned to its digest, or `None` when nothing needed pinning.
+    async fn pin_images(&self, spec: &AppSpec) -> Result<Option<AppSpec>, String> {
+        let mut pinned: Option<AppSpec> = None;
+        if let Some(image) = self
+            .ops
+            .enforce_image_signature(spec.image.as_deref())
+            .await?
+        {
+            pinned.get_or_insert_with(|| spec.clone()).image = Some(image);
+        }
+        for (index, init) in spec.init.iter().enumerate() {
+            // An init without an image runs the app's, checked above.
+            if init.image.is_none() {
+                continue;
+            }
+            if let Some(image) = self
+                .ops
+                .enforce_image_signature(init.image.as_deref())
+                .await?
+                && let Some(slot) = pinned
+                    .get_or_insert_with(|| spec.clone())
+                    .init
+                    .get_mut(index)
+            {
+                slot.image = Some(image);
+            }
+        }
+        Ok(pinned)
+    }
+
     /// Run the same owned init chain for fresh and rolling replacements.
     pub(super) async fn drive_initialisers(
         &self,
         instance_id: &InstanceId,
         app_name: &str,
-        namespace: &str,
         spec: &AppSpec,
+        app_oci: &crate::grill::oci::OciSpec,
         cgroup_path: &std::path::Path,
     ) -> Result<(), BunError> {
         if spec.init.is_empty() {
@@ -562,16 +522,26 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
         for (i, init_spec) in spec.init.iter().enumerate() {
             let init_id = self.ops.register_initialiser(instance_id, i).await?;
-            let init_oci = crate::grill::oci::generate_init_oci_spec(
-                &init_spec.command,
-                namespace,
-                app_name,
-                spec.image.as_deref(),
-                &cgroup_path.to_string_lossy(),
-                None,
-            );
-            self.grill.create(&init_id, &init_oci).await?;
-            self.grill.start(&init_id).await?;
+            // Its own image, the app's env and mounts (#701).
+            let init_oci = crate::grill::oci::generate_init_oci_spec(init_spec, app_oci);
+            if let Err(error) = self.grill.create(&init_id, &init_oci).await {
+                // A missing init binary fails its parent the way its own would.
+                if let Some(problem) = error.launch_problem() {
+                    self.ops
+                        .record_launch_failure(instance_id, problem.to_string())
+                        .await;
+                }
+                return Err(error.into());
+            }
+            // The parent's retirement forgets this launch's journal by its
+            // generation. One the runtime can't say is kept, for the next
+            // start's adoption to forget.
+            if let Ok(Some(generation)) = self.grill.launch_generation(&init_id).await {
+                self.ops
+                    .record_initialiser_generation(instance_id, &init_id, generation)
+                    .await;
+            }
+            self.start_or_fail(&init_id, instance_id).await?;
 
             // Bounded wait: a hung init can't wedge the deploy forever (and
             // no longer wedges the loop at all — this poll is off it).
@@ -622,6 +592,44 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         Ok(())
     }
 
+    /// Create `instance_id` in the runtime. A launch the runtime refuses
+    /// (#881) fails the instance with the reason before the error returns.
+    async fn create_or_fail(
+        &self,
+        instance_id: &InstanceId,
+        spec: &crate::grill::oci::OciSpec,
+    ) -> Result<(), BunError> {
+        let Err(error) = self.grill.create(instance_id, spec).await else {
+            return Ok(());
+        };
+        if let Some(problem) = error.launch_problem() {
+            self.ops
+                .record_launch_failure(instance_id, problem.to_string())
+                .await;
+        }
+        Err(error.into())
+    }
+
+    /// Start `launched` in the runtime. A launch the runtime refuses at
+    /// `exec`, because the binary vanished after `create`'s check (#905),
+    /// fails `instance_id` with the reason before the error returns. The two
+    /// differ for an init container, whose refusal fails its parent.
+    async fn start_or_fail(
+        &self,
+        launched: &InstanceId,
+        instance_id: &InstanceId,
+    ) -> Result<(), BunError> {
+        let Err(error) = self.grill.start(launched).await else {
+            return Ok(());
+        };
+        if let Some(problem) = error.launch_problem() {
+            self.ops
+                .record_launch_failure(instance_id, problem.to_string())
+                .await;
+        }
+        Err(error.into())
+    }
+
     /// Drive a fresh instance through create → egress → init → start →
     /// HealthWait. The blocking grill calls (create/init/start) run here on
     /// the task; the loop applies the state transitions and bookkeeping.
@@ -638,9 +646,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
 
         // The image pull happens here, off the loop.
-        self.grill.create(instance_id, &prepared.oci_spec).await?;
+        self.create_or_fail(instance_id, &prepared.oci_spec).await?;
         self.ops
-            .store_oci_spec(instance_id, prepared.oci_spec)
+            .store_oci_spec(instance_id, prepared.oci_spec.clone())
             .await;
 
         // create → program → start: the workload never runs ahead of its
@@ -652,8 +660,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             self.drive_initialisers(
                 instance_id,
                 app_name,
-                namespace,
                 spec,
+                &prepared.oci_spec,
                 &prepared.cgroup_path,
             )
             .await?;
@@ -662,7 +670,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         self.ops
             .transition_state(instance_id, ContainerState::Starting)
             .await?;
-        self.grill.start(instance_id).await?;
+        self.start_or_fail(instance_id, instance_id).await?;
 
         let evidence = launch_evidence::LaunchEvidence::read(&self.grill, instance_id).await;
         self.ops
@@ -670,149 +678,36 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
     }
 
-    /// Drive a job through create → source policy → start → Running.
-    /// Jobs have no external allowlist or health checks.
-    pub(super) async fn drive_job(
-        &self,
-        instance_id: &InstanceId,
-        job_name: &str,
-        namespace: &str,
-        spec: &JobSpec,
-    ) -> Result<(), BunError> {
-        self.ops
-            .transition_state(instance_id, ContainerState::Preparing)
-            .await?;
-
-        let cgroup_path =
-            crate::grill::cgroup::instance_cgroup_path(namespace, job_name, instance_id)?;
-        let cgroup_str = cgroup_path.to_string_lossy();
-        let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str, None);
-
-        self.grill.create(instance_id, &oci_spec).await?;
-        self.ops.store_oci_spec(instance_id, oci_spec.clone()).await;
-        self.prepare_network(instance_id, job_name, None, &cgroup_path)
-            .await?;
-        self.ops
-            .transition_state(instance_id, ContainerState::Starting)
-            .await?;
-        self.grill.start(instance_id).await?;
-        let evidence = launch_evidence::LaunchEvidence::read(&self.grill, instance_id).await;
-        self.ops
-            .finish_job_instance(instance_id, job_name, namespace, oci_spec, evidence)
-            .await
-    }
-
-    /// Verify and pin every referenced image before a migration can execute.
-    /// Ordinary applies with no prerequisites retain their existing admission.
-    pub(super) async fn preflight_prerequisites(&self, config: &mut Config) -> Result<(), String> {
-        if !config.job.values().any(|job| !job.run_before.is_empty()) {
-            return Ok(());
-        }
-        for spec in config.app.values_mut() {
-            if let Some(image) = self
-                .ops
-                .enforce_image_reference(spec.image.as_deref())
-                .await?
-            {
-                spec.image = Some(image);
-            }
-            for init in &mut spec.init {
-                let reference = init.image.as_deref().or(spec.image.as_deref());
-                if let Some(image) = self.ops.enforce_image_reference(reference).await? {
-                    init.image = Some(image);
-                }
-            }
-        }
-        for job in config.job.values_mut() {
-            if let Some(image) = self
-                .ops
-                .enforce_image_reference(job.image.as_deref())
-                .await?
-            {
-                job.image = Some(image);
-            }
-        }
-        Ok(())
-    }
-
-    /// Run a `run_before` prerequisite job to completion for dependency
-    /// ordering. Deploys the job, then polls the runtime until every instance
-    /// exits. Returns `Ok(())` only when all instances exit cleanly (code 0);
-    /// a non-zero exit or a timeout is an error that aborts the gated deploy.
-    pub(super) async fn run_prerequisite_job(
-        &self,
-        job_name: &str,
-        namespace: &str,
-        spec: &JobSpec,
-    ) -> Result<(), BunError> {
-        let ids = self
-            .ops
-            .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
-            .await?;
-        for id in &ids {
-            self.drive_job(id, job_name, namespace, spec).await?;
-
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(RUN_BEFORE_TIMEOUT_SECS);
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let state = self.grill.state(id).await?;
-                if state == ContainerState::Stopped {
-                    let exit_code = self.grill.exit_code(id).await?;
-                    if exit_code == Some(0) {
-                        self.ops.confirm_job_success(id).await?;
-                        break;
-                    }
-                    if let Some(code) = exit_code {
-                        self.ops.confirm_job_exit(id, code).await?;
-                        return Err(BunError::PrerequisiteFailed {
-                            app_name: job_name.to_string(),
-                            code,
-                        });
-                    }
-                    return Err(BunError::DeployFailed {
-                        app_name: job_name.to_string(),
-                        reason: format!(
-                            "run_before job exited with {}",
-                            exit_code
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "unknown status".to_string())
-                        ),
-                    });
-                }
-                if std::time::Instant::now() >= deadline {
-                    let _ = self.grill.kill(id).await;
-                    return Err(BunError::DeployFailed {
-                        app_name: job_name.to_string(),
-                        reason: format!(
-                            "run_before job timed out after {RUN_BEFORE_TIMEOUT_SECS}s"
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Start `count` more replicas beside the ones an app already runs, the
     /// way a fresh deploy starts its replicas. The running ones aren't
     /// touched. Returns `Break` when the caller must stop the whole deploy.
+    ///
+    /// An admission refused here (no room, say) starts nothing, so the node
+    /// still runs `previous`, and that's the spec it records again. The
+    /// retry then adds the same replicas in place, rather than seeing its
+    /// own spec already stored and rolling every replica, which would need
+    /// room for all of them twice over (#971).
     pub(super) async fn add_replicas_in_place(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        previous: Option<&AppSpec>,
         count: u32,
         events: &mpsc::Sender<ApplyEvent>,
     ) -> std::ops::ControlFlow<()> {
-        let _ = events
-            .send(ApplyEvent::Progress {
-                message: format!(
-                    "adding {count} replica(s) of {app_name} beside the running ones (replicas: {})",
-                    spec.replicas
-                ),
-            })
-            .await;
+        let message = if count == 0 {
+            format!(
+                "{app_name} already runs its replicas (replicas: {})",
+                spec.replicas
+            )
+        } else {
+            format!(
+                "adding {count} replica(s) of {app_name} beside the running ones (replicas: {})",
+                spec.replicas
+            )
+        };
+        let _ = events.send(ApplyEvent::Progress { message }).await;
         let ids = match self
             .ops
             .add_app_replicas(app_name, namespace, spec, count)
@@ -820,6 +715,16 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         {
             Ok(ids) => ids,
             Err(error) => {
+                if let Some(previous) = previous
+                    && let Err(restore) = self
+                        .ops
+                        .store_deployed_spec(app_name, namespace, previous)
+                        .await
+                {
+                    eprintln!(
+                        "deploy: could not record {namespace}/{app_name}'s previous spec: {restore}"
+                    );
+                }
                 let _ = events
                     .send(ApplyEvent::Error {
                         message: error.to_string(),
@@ -847,9 +752,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
                 return std::ops::ControlFlow::Break(());
             }
-            self.ops
-                .provision_identity(app_name, namespace, id, false)
-                .await;
+            self.ops.provision_identity(app_name, namespace, id).await;
             let _ = events
                 .send(ApplyEvent::InstanceCreated {
                     id: id.0.clone(),
@@ -881,12 +784,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     /// Rolling redeploy: start generation-tagged new instances, health check
     /// them off the loop, then retire the old ones. Returns `Break` when the
     /// caller must stop the whole deploy. On new-instance failure it keeps the
-    /// old instances and returns `Continue`.
+    /// old capacity (see [`DeployWorker::abort_rollout`]) and returns `Break`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn rolling_redeploy(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        previous: Option<&AppSpec>,
         existing: Vec<InstanceId>,
         events: &mpsc::Sender<ApplyEvent>,
         now: Instant,
@@ -918,15 +823,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let ordinals = spec.replica_ordinals();
         let replica_count = ordinals.len() as u32;
 
-        let mut new_ids: Vec<InstanceId> = Vec::new();
-        let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
-            std::collections::HashMap::new();
-        let mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec> =
-            std::collections::HashMap::new();
-        let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
-            std::collections::HashMap::new();
-        let mut new_prepared: Vec<InstanceId> = Vec::new();
-        let mut runtime_attempted = std::collections::HashSet::new();
+        let mut started = Replacements::default();
         let mut new_failed = false;
 
         // M7: drive the rollout through `plan_rolling_step` rather than
@@ -948,7 +845,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
             let step = crate::meat::deploy_types::plan_rolling_step(
                 replica_count,
-                new_ids.len() as u32,
+                started.healthy.len() as u32,
                 0, // the start path health-waits inline, so nothing is ever pending here
                 (existing.len() - retired) as u32,
                 deploy_config.max_surge,
@@ -990,7 +887,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     {
                         let retention = self
                             .retain_started_replacements(
-                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                                app_name,
+                                namespace,
+                                spec,
+                                &started.healthy,
+                                &started.ports,
+                                &started.specs,
                             )
                             .await;
                         let _ = events
@@ -1021,7 +923,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         Err(error) => {
                             let retention = self
                                 .retain_started_replacements(
-                                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                                    app_name,
+                                    namespace,
+                                    spec,
+                                    &started.healthy,
+                                    &started.ports,
+                                    &started.specs,
                                 )
                                 .await;
                             let detail = match retention {
@@ -1056,202 +963,38 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     message: format!("starting new instance {}", new_id.0),
                 })
                 .await;
-
-            let host_port = match self
-                .ops
-                .reserve_rolling_instance(&new_id, app_name, namespace, spec)
-                .await
-            {
-                Ok(port) => port,
-                Err(error) => {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: error.to_string(),
-                        })
-                        .await;
-                    new_failed = true;
-                    break;
-                }
-            };
-
-            new_ports.insert(new_id.clone(), host_port);
-            new_prepared.push(new_id.clone());
-            let oci_spec = match self
-                .ops
-                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port)
-                .await
-            {
-                Ok(oci_spec) => oci_spec,
-                Err(e) => {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    new_failed = true;
-                    break;
-                }
-            };
-            let Some(cgroup_path) = oci_spec.linux.host_cgroup_path() else {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!(
-                            "replacement {} has no valid original cgroup path",
-                            new_id.0
-                        ),
-                    })
-                    .await;
-                new_failed = true;
-                break;
-            };
-
-            runtime_attempted.insert(new_id.clone());
-            if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!("failed to create {}: {e}", new_id.0),
-                    })
-                    .await;
-                new_failed = true;
-                break;
-            }
-            // Same create → program → start ordering as the fresh path (#86).
-            if let Err(e) = self
-                .prepare_network(&new_id, app_name, Some(spec), &cgroup_path)
-                .await
-            {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!("failed to program egress for {}: {e}", new_id.0),
-                    })
-                    .await;
-                new_failed = true;
-                break;
-            }
-            let initialised = async {
-                self.drive_initialisers(&new_id, app_name, namespace, spec, &cgroup_path)
-                    .await?;
-                self.ops
-                    .transition_state(&new_id, ContainerState::Starting)
-                    .await
-            }
-            .await;
-            if let Err(error) = initialised {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!("failed to initialise {}: {error}", new_id.0),
-                    })
-                    .await;
-                new_failed = true;
-                break;
-            }
-            if let Err(e) = self.grill.start(&new_id).await {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!("failed to start {}: {e}", new_id.0),
-                    })
-                    .await;
-                new_failed = true;
-                break;
-            }
-            let launch = launch_evidence::LaunchEvidence::read(&self.grill, &new_id).await;
-            if let Err(error) = self
-                .ops
-                .register_rolling_instance(RollingInstance {
-                    instance_id: new_id.clone(),
-                    app_name: app_name.to_string(),
-                    namespace: namespace.to_string(),
-                    spec: spec.clone(),
-                    oci_spec: oci_spec.clone(),
-                    host_port,
-                    launch,
-                })
-                .await
-            {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
-                new_failed = true;
-                break;
-            }
-
-            let container_ip = self.grill.container_ip(&new_id).await;
-
-            // Health wait, off the command loop (this runs on the spawned
-            // per-deploy task, so the full configured `health_timeout` is
-            // honoured — M7). Waits for Running, then for the app's own HTTP
-            // probe to pass (M5): a replacement is only announced healthy —
-            // and only published as a backend below — once it answers the
-            // health check the operator configured, not merely because its
-            // process came up.
             let wait = effective_health_wait(&deploy_config);
-            match self
-                .wait_for_deploy_health(&new_id, spec, container_ip, wait)
-                .await
-            {
-                Ok(()) => {
-                    let _ = events
-                        .send(ApplyEvent::Progress {
-                            message: format!("{} healthy ✓", new_id.0),
-                        })
-                        .await;
-                    self.ops
-                        .provision_identity(app_name, namespace, &new_id, false)
-                        .await;
-                }
-                Err(message) => {
-                    let _ = events.send(ApplyEvent::Error { message }).await;
-                    new_failed = true;
-                    break;
-                }
-            }
-
-            new_ports.insert(new_id.clone(), host_port);
-            new_specs.insert(new_id.clone(), oci_spec);
-            new_ips.insert(new_id.clone(), container_ip);
-            // DEP5/M7: route traffic onto the replacement the moment it's
-            // healthy, before the planner is allowed to retire anything. With
-            // `max_unavailable = 0` this is what makes the guarantee real —
-            // retiring first and publishing later would leave a gap however
-            // carefully the counts were tracked.
-            if let Err(error) = self
-                .ops
-                .publish_new_backend(
+            if let Err(message) = self
+                .start_replacement(
                     app_name,
                     namespace,
+                    spec,
                     &new_id,
-                    host_port,
-                    container_ip,
-                    spec.port.is_some(),
+                    wait,
+                    &mut started,
+                    events,
                 )
                 .await
             {
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
+                let _ = events.send(ApplyEvent::Error { message }).await;
                 new_failed = true;
                 break;
             }
-            new_ids.push(new_id);
         }
 
         if new_failed {
             self.abort_rollout(
-                app_name,
-                namespace,
-                spec,
-                &new_ids,
-                &new_prepared,
-                &runtime_attempted,
-                &new_ports,
-                &new_specs,
-                deploy_config.auto_rollback,
-                retired,
-                replica_count,
+                AbortedRollout {
+                    app_name,
+                    namespace,
+                    spec,
+                    previous,
+                    started: &started,
+                    remaining_old: &existing[retired..],
+                    retired,
+                    replica_count,
+                    config: &deploy_config,
+                },
                 events,
             )
             .await;
@@ -1276,7 +1019,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let retention = self
                     .retain_started_replacements(
-                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                        app_name,
+                        namespace,
+                        spec,
+                        &started.healthy,
+                        &started.ports,
+                        &started.specs,
                     )
                     .await;
                 let _ = events
@@ -1295,6 +1043,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
         }
 
+        let new_ids = started.healthy.clone();
         if let Err(error) = self
             .ops
             .finalise_rolling_deploy(
@@ -1303,16 +1052,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 spec,
                 outstanding,
                 new_ids.clone(),
-                new_ports.clone(),
-                new_ips,
-                new_specs.clone(),
+                started.ports.clone(),
+                started.ips.clone(),
+                started.specs.clone(),
                 now,
             )
             .await
         {
             let retention = self
                 .retain_started_replacements(
-                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    app_name,
+                    namespace,
+                    spec,
+                    &new_ids,
+                    &started.ports,
+                    &started.specs,
                 )
                 .await;
             let detail = match retention {
@@ -1339,50 +1093,183 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         std::ops::ControlFlow::Continue(())
     }
 
+    /// Start one rolling replacement under `new_id` from `spec`, wait for its
+    /// health check, and publish it as a backend. Everything it reserves or
+    /// learns goes into `started`, so an abort can clean it up. `Err` carries
+    /// the reason the replacement didn't come up healthy.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn abort_rollout(
+    pub(super) async fn start_replacement(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-        healthy: &[InstanceId],
-        prepared: &[InstanceId],
-        runtime_attempted: &std::collections::HashSet<InstanceId>,
-        ports: &std::collections::HashMap<InstanceId, Option<u16>>,
-        specs: &std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
-        auto_rollback: bool,
-        retired: usize,
-        replica_count: u32,
+        new_id: &InstanceId,
+        wait: std::time::Duration,
+        started: &mut Replacements,
+        events: &mpsc::Sender<ApplyEvent>,
+    ) -> Result<(), String> {
+        let host_port = self
+            .ops
+            .reserve_rolling_instance(new_id, app_name, namespace, spec)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        started.ports.insert(new_id.clone(), host_port);
+        started.prepared.push(new_id.clone());
+        let oci_spec = self
+            .ops
+            .prepare_rolling_instance(new_id, app_name, namespace, spec, host_port)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(cgroup_path) = oci_spec.linux.host_cgroup_path() else {
+            return Err(format!(
+                "replacement {} has no valid original cgroup path",
+                new_id.0
+            ));
+        };
+
+        started.runtime_attempted.insert(new_id.clone());
+        self.grill
+            .create(new_id, &oci_spec)
+            .await
+            .map_err(|error| format!("failed to create {}: {error}", new_id.0))?;
+        // Same create → program → start ordering as the fresh path (#86).
+        self.prepare_network(new_id, app_name, Some(spec), &cgroup_path)
+            .await
+            .map_err(|error| format!("failed to program egress for {}: {error}", new_id.0))?;
+        let initialised = async {
+            self.drive_initialisers(new_id, app_name, spec, &oci_spec, &cgroup_path)
+                .await?;
+            self.ops
+                .transition_state(new_id, ContainerState::Starting)
+                .await
+        }
+        .await;
+        initialised.map_err(|error| format!("failed to initialise {}: {error}", new_id.0))?;
+        self.grill
+            .start(new_id)
+            .await
+            .map_err(|error| format!("failed to start {}: {error}", new_id.0))?;
+        let launch = launch_evidence::LaunchEvidence::read(&self.grill, new_id).await;
+        self.ops
+            .register_rolling_instance(RollingInstance {
+                instance_id: new_id.clone(),
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+                spec: spec.clone(),
+                oci_spec: oci_spec.clone(),
+                host_port,
+                launch,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let container_ip = self.grill.container_ip(new_id).await;
+
+        // Health wait, off the command loop (this runs on the spawned
+        // per-deploy task, so the full configured `health_timeout` is
+        // honoured — M7). Waits for Running, then for the app's own HTTP
+        // probe to pass (M5): a replacement is only announced healthy —
+        // and only published as a backend below — once it answers the
+        // health check the operator configured, not merely because its
+        // process came up.
+        self.wait_for_deploy_health(new_id, spec, container_ip, wait)
+            .await?;
+        let _ = events
+            .send(ApplyEvent::Progress {
+                message: format!("{} healthy ✓", new_id.0),
+            })
+            .await;
+        self.ops
+            .provision_identity(app_name, namespace, new_id)
+            .await;
+
+        started.specs.insert(new_id.clone(), oci_spec);
+        started.ips.insert(new_id.clone(), container_ip);
+        // DEP5/M7: route traffic onto the replacement the moment it's
+        // healthy, before the planner is allowed to retire anything. With
+        // `max_unavailable = 0` this is what makes the guarantee real —
+        // retiring first and publishing later would leave a gap however
+        // carefully the counts were tracked.
+        self.ops
+            .publish_new_backend(
+                app_name,
+                namespace,
+                new_id,
+                host_port,
+                container_ip,
+                spec.port.is_some(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        started.healthy.push(new_id.clone());
+        Ok(())
+    }
+
+    /// Clean up after a rollout that failed part-way, without ending below
+    /// the capacity it started from.
+    ///
+    /// Replacements that never went healthy are always torn down. What
+    /// happens to the healthy ones depends on `auto_rollback`:
+    ///
+    /// - Off: they keep serving beside the old instances (`Halted`).
+    /// - On, nothing retired yet: the old instances are all still there, so
+    ///   the replacements go (`RolledBack`).
+    /// - On, some old instances already retired: killing the replacements
+    ///   would leave the app short, so the retired capacity comes back first,
+    ///   on the previous spec, and only then do the replacements go. If the
+    ///   previous spec can't come back, the healthy replacements stay and the
+    ///   result is `Halted` with the reason (#692).
+    pub(super) async fn abort_rollout(
+        &self,
+        rollout: AbortedRollout<'_>,
         events: &mpsc::Sender<ApplyEvent>,
     ) {
+        let AbortedRollout {
+            app_name,
+            namespace,
+            spec,
+            previous,
+            started,
+            remaining_old,
+            retired,
+            replica_count,
+            config,
+        } = rollout;
+        let auto_rollback = config.auto_rollback;
+        let restore = auto_rollback && retired > 0;
+        let keep_healthy = !auto_rollback || restore;
         let mut errors = Vec::new();
-        if !auto_rollback
+        if keep_healthy
             && let Err(error) = self
-                .retain_started_replacements(app_name, namespace, spec, healthy, ports, specs)
+                .retain_started_replacements(
+                    app_name,
+                    namespace,
+                    spec,
+                    &started.healthy,
+                    &started.ports,
+                    &started.specs,
+                )
                 .await
         {
             errors.push(error.to_string());
         }
-        for id in prepared {
-            if !auto_rollback && healthy.contains(id) {
+        for id in &started.prepared {
+            if keep_healthy && started.healthy.contains(id) {
                 continue;
             }
-            let cleanup = async {
-                if let Some(restart) = self.ops.begin_retire(id).await? {
-                    restart.settle(self.stop_confirmation_timeout).await?;
-                }
-                // A failed create may already own runtime resources. Only a
-                // reservation that never attempted create proves their absence.
-                if runtime_attempted.contains(id) {
-                    kill_runtime_instance(&self.grill, id, self.stop_confirmation_timeout).await?;
-                }
-                self.ops.finish_retire(id).await
-            }
-            .await;
-            if let Err(error) = cleanup {
+            if let Err(error) = self
+                .discard_replacement(id, started.runtime_attempted.contains(id))
+                .await
+            {
                 errors.push(format!("{id}: {error}"));
             }
         }
+        let restoration = if restore && errors.is_empty() {
+            Some(self.restore_previous_capacity(&rollout, events).await)
+        } else {
+            None
+        };
         let (result, message) = if !errors.is_empty() {
             (
                 crate::meat::deploy_types::DeployResult::Failed,
@@ -1396,15 +1283,49 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 crate::meat::deploy_types::DeployResult::RolledBack,
                 "rolled back — old instances preserved".to_string(),
             )
+        } else if let Some(restoration) = restoration {
+            match restoration {
+                Ok(restored) => (
+                    crate::meat::deploy_types::DeployResult::RolledBack,
+                    format!(
+                        "rolled back — {restored} instance(s) restarted on the previous spec \
+                         beside {} old instance(s)",
+                        remaining_old.len()
+                    ),
+                ),
+                Err(reason) => (
+                    crate::meat::deploy_types::DeployResult::Halted,
+                    format!(
+                        "deploy halted: could not restore the previous spec ({reason}); \
+                         healthy new instances left running beside {} old instance(s)",
+                        remaining_old.len()
+                    ),
+                ),
+            }
         } else {
             (
                 crate::meat::deploy_types::DeployResult::Halted,
                 format!(
                     "deploy halted: {} healthy new instance(s) left running; {retired} old instance(s) already retired",
-                    if auto_rollback { 0 } else { healthy.len() }
+                    if auto_rollback {
+                        0
+                    } else {
+                        started.healthy.len()
+                    }
                 ),
             )
         };
+        // Every instance runs the previous spec again, so that's the spec
+        // this node runs: what a restart, a report or the next rollout reads.
+        if result == crate::meat::deploy_types::DeployResult::RolledBack
+            && let Some(previous) = previous
+            && let Err(error) = self
+                .ops
+                .store_deployed_spec(app_name, namespace, previous)
+                .await
+        {
+            eprintln!("deploy: could not record {namespace}/{app_name}'s previous spec: {error}");
+        }
         self.ops
             .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
                 id: crate::meat::deploy_types::DeployId(
@@ -1418,12 +1339,198 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 result,
                 created_at: SystemTime::now(),
                 completed_at: SystemTime::now(),
-                steps_completed: healthy.len(),
+                steps_completed: started.healthy.len(),
                 steps_total: replica_count as usize,
                 spec: Some(Box::new(spec.clone())),
             })
             .await;
+        // An operator's cancellation isn't evidence that the spec is bad.
+        let cancelled = self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.cancellation_requested());
+        if !cancelled {
+            let _ = events
+                .send(ApplyEvent::RolloutAborted {
+                    app: app_name.to_string(),
+                    rolled_back: result == crate::meat::deploy_types::DeployResult::RolledBack,
+                    reason: message.clone(),
+                })
+                .await;
+        }
         let _ = events.send(ApplyEvent::Error { message }).await;
+    }
+
+    /// Bring an aborted rollout back to its old capacity on the previous
+    /// spec: start previous-spec instances for the ordinals no old instance
+    /// holds, retiring a healthy replacement only once one has come up, in
+    /// the same surge and unavailable budget as the rollout. Answers how many
+    /// previous-spec instances now run, or why it stopped.
+    async fn restore_previous_capacity(
+        &self,
+        rollout: &AbortedRollout<'_>,
+        events: &mpsc::Sender<ApplyEvent>,
+    ) -> Result<usize, String> {
+        let Some(previous) = rollout.previous else {
+            return Err("this node doesn't know the spec its old instances ran".into());
+        };
+        let ordinal_of = |id: &InstanceId| {
+            crate::grill::InstanceIdentity::parse(&id.0).map(|identity| identity.ordinal)
+        };
+        let held: std::collections::HashSet<u32> = rollout
+            .remaining_old
+            .iter()
+            .filter_map(ordinal_of)
+            .collect();
+        // Ordinals no remaining old instance holds: first the ones nothing
+        // runs (their old instance retired and its replacement failed), then
+        // the ones a healthy replacement holds, which it gives back.
+        let mut ordinals: Vec<u32> = rollout
+            .spec
+            .replica_ordinals()
+            .into_iter()
+            .filter(|ordinal| !held.contains(ordinal))
+            .collect();
+        ordinals.sort_by_key(|ordinal| {
+            rollout
+                .started
+                .healthy
+                .iter()
+                .any(|id| ordinal_of(id) == Some(*ordinal))
+        });
+        let deploy_gen = self
+            .ops
+            .next_deploy_gen(rollout.app_name)
+            .await
+            .map_err(|error| error.to_string())?;
+        let wait =
+            effective_health_wait(&crate::meat::deploy_types::DeployConfig::for_app(previous));
+        let mut restored = Replacements::default();
+        let mut to_retire: std::collections::VecDeque<InstanceId> =
+            rollout.started.healthy.iter().cloned().collect();
+        let mut next_ordinal = ordinals.iter();
+        let outcome: Result<(), String> = loop {
+            let step = crate::meat::deploy_types::plan_rolling_step(
+                ordinals.len() as u32,
+                restored.healthy.len() as u32,
+                0,
+                to_retire.len() as u32,
+                rollout.config.max_surge,
+                rollout.config.max_unavailable,
+            );
+            match step {
+                crate::meat::deploy_types::RollingStep::Done => break Ok(()),
+                crate::meat::deploy_types::RollingStep::Wait
+                | crate::meat::deploy_types::RollingStep::Stuck => {
+                    break Err("the rollout's surge and unavailable bounds leave no move".into());
+                }
+                crate::meat::deploy_types::RollingStep::RetireOld => {
+                    let Some(id) = to_retire.pop_front() else {
+                        break Err("no replacement left to retire".into());
+                    };
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("stopping new instance {}", id.0),
+                        })
+                        .await;
+                    if let Err(error) = self
+                        .retire_old_instance(&id, rollout.config.drain_timeout)
+                        .await
+                    {
+                        break Err(format!("could not stop {id}: {error}"));
+                    }
+                    match self.ops.finish_retire(&id).await {
+                        Err(BunError::ProducerReleasePending { .. }) => {
+                            self.ops.defer_retire(&id).await;
+                        }
+                        Ok(()) => {}
+                        Err(error) => break Err(format!("could not retire {id}: {error}")),
+                    }
+                }
+                crate::meat::deploy_types::RollingStep::StartNew => {
+                    let Some(&ordinal) = next_ordinal.next() else {
+                        break Err("no ordinal left to restore".into());
+                    };
+                    let id = crate::grill::InstanceIdentity::canary(
+                        rollout.namespace,
+                        rollout.app_name,
+                        deploy_gen,
+                        ordinal,
+                    )
+                    .instance_id();
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("restarting the previous spec as {}", id.0),
+                        })
+                        .await;
+                    if let Err(reason) = self
+                        .start_replacement(
+                            rollout.app_name,
+                            rollout.namespace,
+                            previous,
+                            &id,
+                            wait,
+                            &mut restored,
+                            events,
+                        )
+                        .await
+                    {
+                        break Err(reason);
+                    }
+                }
+            }
+        };
+        // Restored instances are owned like any retained replacement, on the
+        // spec they run. Ones that never came up go.
+        let retained = self
+            .retain_started_replacements(
+                rollout.app_name,
+                rollout.namespace,
+                previous,
+                &restored.healthy,
+                &restored.ports,
+                &restored.specs,
+            )
+            .await;
+        let mut errors = Vec::new();
+        for id in &restored.prepared {
+            if restored.healthy.contains(id) {
+                continue;
+            }
+            if let Err(error) = self
+                .discard_replacement(id, restored.runtime_attempted.contains(id))
+                .await
+            {
+                errors.push(format!("{id}: {error}"));
+            }
+        }
+        outcome?;
+        retained.map_err(|error| error.to_string())?;
+        if !errors.is_empty() {
+            return Err(format!(
+                "failed restorations retained for cleanup: {}",
+                errors.join("; ")
+            ));
+        }
+        Ok(restored.healthy.len())
+    }
+
+    /// Stop and forget a replacement that never served. A reservation that
+    /// never attempted a runtime create has nothing in the runtime to kill.
+    async fn discard_replacement(
+        &self,
+        id: &InstanceId,
+        runtime_attempted: bool,
+    ) -> Result<(), BunError> {
+        if let Some(restart) = self.ops.begin_retire(id).await? {
+            restart.settle(self.stop_confirmation_timeout).await?;
+        }
+        // A failed create may already own runtime resources. Only a
+        // reservation that never attempted create proves their absence.
+        if runtime_attempted {
+            kill_runtime_instance(&self.grill, id, self.stop_confirmation_timeout).await?;
+        }
+        self.ops.finish_retire(id).await
     }
 
     /// Publish retirement intent before runtime exit can trigger the restart driver.
@@ -1482,11 +1589,13 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     /// entire time green is coming up, so a failure anywhere in green tears the
     /// green fleet down and leaves blue untouched. Returns `Break` when the
     /// caller must stop the whole deploy.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn blue_green_redeploy(
         &self,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        previous: Option<&AppSpec>,
         existing: Vec<InstanceId>,
         events: &mpsc::Sender<ApplyEvent>,
         now: Instant,
@@ -1521,15 +1630,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let ordinals = spec.replica_ordinals();
         let replica_count = ordinals.len() as u32;
 
-        let mut new_ids: Vec<InstanceId> = Vec::new();
-        let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
-            std::collections::HashMap::new();
-        let mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec> =
-            std::collections::HashMap::new();
-        let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
-            std::collections::HashMap::new();
-        let mut new_prepared: Vec<InstanceId> = Vec::new();
-        let mut runtime_attempted = std::collections::HashSet::new();
+        let mut green = Replacements::default();
+        let Replacements {
+            healthy: new_ids,
+            ports: new_ports,
+            specs: new_specs,
+            ips: new_ips,
+            prepared: new_prepared,
+            runtime_attempted,
+        } = &mut green;
         let mut new_failed = false;
 
         // Start and health check the entire green fleet before touching blue.
@@ -1669,7 +1778,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         })
                         .await;
                     self.ops
-                        .provision_identity(app_name, namespace, &new_id, false)
+                        .provision_identity(app_name, namespace, &new_id)
                         .await;
                 }
                 Err(message) => {
@@ -1688,24 +1797,29 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         if !new_failed && self.report_cancellation(events).await {
             new_failed = true;
         }
+        // Nothing of blue has retired yet, so an abort only tears green down.
+        let aborted = |green| AbortedRollout {
+            app_name,
+            namespace,
+            spec,
+            previous,
+            started: green,
+            remaining_old: &existing,
+            retired: 0,
+            replica_count,
+            config: &deploy_config,
+        };
         if new_failed {
-            self.abort_rollout(
-                app_name,
-                namespace,
-                spec,
-                &new_ids,
-                &new_prepared,
-                &runtime_attempted,
-                &new_ports,
-                &new_specs,
-                deploy_config.auto_rollback,
-                0,
-                replica_count,
-                events,
-            )
-            .await;
+            self.abort_rollout(aborted(&green), events).await;
             return std::ops::ControlFlow::Break(());
         }
+        let Replacements {
+            healthy: new_ids,
+            ports: new_ports,
+            specs: new_specs,
+            ips: new_ips,
+            ..
+        } = &green;
 
         // The whole green fleet is healthy. Cut over: publish every green
         // backend so routing picks them up while blue still serves, then
@@ -1713,7 +1827,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // to run inside finalise on the command loop, freezing every agent
         // command for up to fleet-size × drain_timeout), and finally send the
         // fast bookkeeping to the loop.
-        for new_id in &new_ids {
+        for new_id in new_ids {
             if let Err(error) = self
                 .ops
                 .publish_new_backend(
@@ -1731,21 +1845,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: error.to_string(),
                     })
                     .await;
-                self.abort_rollout(
-                    app_name,
-                    namespace,
-                    spec,
-                    &new_ids,
-                    &new_prepared,
-                    &runtime_attempted,
-                    &new_ports,
-                    &new_specs,
-                    deploy_config.auto_rollback,
-                    0,
-                    replica_count,
-                    events,
-                )
-                .await;
+                self.abort_rollout(aborted(&green), events).await;
                 return std::ops::ControlFlow::Break(());
             }
         }
@@ -1756,7 +1856,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let retention = self
                     .retain_started_replacements(
-                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                        app_name, namespace, spec, new_ids, new_ports, new_specs,
                     )
                     .await;
                 let _ = events
@@ -1783,7 +1883,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 existing,
                 new_ids.clone(),
                 new_ports.clone(),
-                new_ips,
+                new_ips.clone(),
                 new_specs.clone(),
                 now,
             )
@@ -1791,7 +1891,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         {
             let retention = self
                 .retain_started_replacements(
-                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    app_name, namespace, spec, new_ids, new_ports, new_specs,
                 )
                 .await;
             let detail = match retention {
@@ -1806,7 +1906,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             return std::ops::ControlFlow::Break(());
         }
 
-        for new_id in &new_ids {
+        for new_id in new_ids {
             let _ = events
                 .send(ApplyEvent::InstanceCreated {
                     id: new_id.0.clone(),

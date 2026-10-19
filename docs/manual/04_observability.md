@@ -60,7 +60,20 @@ Retention and export are node config:
 retention_days = 7                # default
 export_path = "s3://bucket/logs/" # optional: a local path, file://, s3:// or gs://
 export_interval_secs = 3600       # default
+max_storage_mb = 2048             # default; 0 = no size cap
+
+[metrics]
+max_storage_mb = 1024             # default; 0 = no size cap
 ```
+
+Both stores are capped by size as well as age. Past the cap, Bun prunes the
+oldest Parquet files on its five-minute disk check; with an `export_path` it
+prunes only files that have already shipped. A cap of `0` turns the size limit
+off, leaving only `retention_days`, so set it only when something else watches
+the disk. Bun refuses to start with a cap larger than the filesystem holding
+its data directory, because such a cap would never prune before the disk
+filled. Singleton jobs stream their output into the log store, so a busy job
+node reaches the log cap well within the seven days.
 
 Exported Parquet archives answer SQL:
 
@@ -82,8 +95,11 @@ The TUI and the web dashboard (Brioche) chart live CPU and memory. The CLI
 `relish top` is a one-shot table of every workload on every node: node, app,
 namespace, state, PID, restarts, and the latest CPU and memory sample each
 node's collector took (`process_cpu_percent`, `process_memory_bytes`). A `-`
-means no sample yet. A node that doesn't answer becomes a
-`warning:` line rather than an error:
+means no sample yet. Array tasks run outside the app supervisor, so they get
+one row per job definition and profile on each node instead: the PID column
+shows how many tasks run there (`tasks:27`), and CPU and memory come from the
+tasks' cgroups on Linux (`job_cpu_percent`, `job_memory_bytes`). A node that
+doesn't answer becomes a `warning:` line rather than an error:
 
 ```sh
 relish top                       # every node's workloads, with CPU and memory
@@ -179,6 +195,13 @@ severity = ["critical"]           # empty: every severity
 secret = "shared-hmac-secret"     # optional
 ```
 
+The same destinations get a built-in critical alert for every job run that
+fails (`job_run_failed`) or whose outcome becomes unknown because a node
+holding its work went quiet (`job_run_unknown_outcome`). The leader sends one
+per run, never one per task, labelled with `job`, `namespace` and `run`. The
+[batch jobs chapter](14_batch-jobs.md#job-history-metrics-and-events) lists
+the job metrics.
+
 Council members hold cluster-wide rollups, so one node can answer for the
 fleet.
 
@@ -202,14 +225,20 @@ short list never passes for a complete one. On the web dashboard, a node's
 page lists that node's apps (or says it didn't answer) and charts CPU and
 memory only on the node's own dashboard.
 
+Each job run records one event on the leader when it ends (`job-completed`,
+`job-failed`, `job-cancelled`), when its outcome becomes unknown
+(`job-unknown`) or when a cron occurrence is skipped for want of capacity
+(`job-skipped`), however many tasks it has.
+
 Besides deploys, restarts, health, jobs, alerts and faults, the events record
 who changed trust: creating or revoking an API token (`token.created`,
-`token.revoked`), creating a join token (`join_token.created`), and rotating
+`token.revoked`), creating or revoking a join token (`join_token.created`, `join_token.revoked`), and rotating
 or finalising the secret key (`secret.rotated`, `secret.rotation_finalised`).
 Each names the credential that did it, as the token's name in its details and
 a stable `principal`, and never carries a secret. Events are kept per node, in
-memory (the newest 1024), so they're a recent record rather than a durable
-audit log.
+memory (the newest 1024), so they're a recent record. The durable record of
+who did what, which a restart or a busy job queue can't wipe, is the audit
+log: `relish audit` (see the audit log section of `security`).
 
 `relish dashboard` serves the web dashboard (Brioche) on a loopback port and
 opens a one-time link to it. It forwards read-only requests using the CLI's own

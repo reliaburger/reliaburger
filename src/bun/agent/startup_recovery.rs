@@ -90,6 +90,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // so it waits for the next tick: four in one turn come near
                 // two runtime budgets on a slow disk (#422).
                 self.startup_retirements.pop_front();
+                self.forget_runtime_metadata(&original.instance_id);
             }
             // Its disk cleanup is running off the loop; the next tick
             // collects it. Nothing is wrong, so readiness stays as it is.

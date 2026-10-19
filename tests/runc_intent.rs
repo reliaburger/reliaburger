@@ -638,3 +638,46 @@ async fn a_retired_intent_keeps_no_decrypted_secret_on_disk() {
     drop(claim.retire(Some(0)).await.unwrap());
     assert!(original.matches_journal(&journal.inventory().await.unwrap()[0].spec));
 }
+
+/// An executor pool forgets each retired executor as it goes idle, while
+/// the agent and the other forgets read the inventory. A record forgotten
+/// between being listed and being read has left: the inventory leaves it
+/// out instead of failing, which left the forget that read it with its
+/// route and lock behind (#924).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inventory_leaves_out_intents_forgotten_while_it_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = IntentJournal::new(root.path().join("intents"), configuration(root.path()));
+    // Without the fix, these four rounds failed every run on macOS.
+    for round in 0..4 {
+        let mut retired = Vec::new();
+        for index in 0..32 {
+            let id = InstanceId(format!("default__executor-{round}-{index}"));
+            let guard = journal
+                .claim(&id, None)
+                .await
+                .unwrap()
+                .publish(&spec("task"))
+                .await
+                .unwrap();
+            retired.push(guard.retire(Some(0)).await.unwrap());
+        }
+        let forgets: Vec<_> = retired
+            .into_iter()
+            .map(|guard| tokio::spawn(guard.forget()))
+            .collect();
+        let reader = journal.clone();
+        let reads = tokio::spawn(async move {
+            loop {
+                let inventory = reader.inventory().await?;
+                if inventory.is_empty() {
+                    return Ok::<_, std::io::Error>(());
+                }
+            }
+        });
+        for forget in forgets {
+            forget.await.unwrap().unwrap();
+        }
+        reads.await.unwrap().unwrap();
+    }
+}

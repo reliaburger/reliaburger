@@ -1,14 +1,17 @@
 //! Invalid development-cluster inputs must fail before touching a VM.
 #![cfg(unix)]
 
-use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 fn fixture(root: &Path) {
     std::fs::create_dir_all(root.join("bin")).unwrap();
     let lima = root.join("bin/limactl");
-    std::fs::write(&lima, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/calls\"\ncase \"$1\" in --version) echo fake;; list) echo unrelated-vm;; esac\n").unwrap();
-    std::fs::set_permissions(lima, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Shared, already-launched scripts rather than new files (#582).
+    crate::first_launch::install_script(
+        &lima,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/calls\"\ncase \"$1\" in --version) echo fake;; list) echo unrelated-vm;; esac\n",
+    );
 }
 
 fn command(root: &Path) -> tokio::process::Command {
@@ -143,9 +146,7 @@ async fn checkout_and_filter_shell_metacharacters_remain_literal_arguments() {
         ("mkdir", "#!/bin/sh\nexit 0\n"),
     ];
     for (name, script) in scripts {
-        let path = tools.join(name);
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::first_launch::install_script(&tools.join(name), script);
     }
     std::fs::create_dir(root.path().join(".cargo")).unwrap();
     std::fs::write(root.path().join(".cargo/env"), "# fixture\n").unwrap();

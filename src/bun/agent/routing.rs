@@ -71,6 +71,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.publish_backend_kernel(id, services).await
     }
 
+    /// Take the eBPF handle's lock, timing the wait as the turn's kernel
+    /// lock wait: job tasks, faults and traces hold it too (#890).
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) async fn lock_kernel<'a>(
+        &self,
+        handle: &'a tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>,
+    ) -> tokio::sync::MutexGuard<'a, crate::onion::ebpf::loader::OnionEbpf> {
+        let started = std::time::Instant::now();
+        let guard = handle.lock().await;
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::KernelLock,
+            started.elapsed(),
+        );
+        guard
+    }
+
     /// Publish a validated candidate before exposing it to userspace readers.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn publish_backend_kernel(
@@ -89,7 +105,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .as_ref()
                 .map_or("", |cluster| cluster.local_node_id.0.as_str()),
         );
-        let mut ebpf = handle.lock().await;
+        let mut ebpf = self.lock_kernel(handle).await;
         bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
             .map_err(|error| BunError::BackendPublication {
                 service: id.clone(),
@@ -134,7 +150,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let id = crate::onion::service_id::ServiceId::new(&entry.namespace, &entry.app_name);
         let (vip, port, destination) = (entry.vip, entry.port, entry.app_id);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
-        let mut ebpf = handle.lock().await;
+        let mut ebpf = self.lock_kernel(handle).await;
         bpf.remove_backends_bpf(&mut ebpf, vip, port)
             .map_err(|error| BunError::BackendRetirement {
                 service: id.clone(),
@@ -168,17 +184,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
-    ///
+    /// Reconcile the namespace-firewall eBPF maps against current state
+    /// (NET5), timed as the turn's firewall sync (#890).
+    pub(super) async fn sync_firewall_ebpf(&mut self) {
+        let started = std::time::Instant::now();
+        self.reconcile_namespace_firewall().await;
+        self.loop_meter.add_part(
+            crate::bun::loop_meter::TurnPart::FirewallSync,
+            started.elapsed(),
+        );
+    }
+
     /// Writes `cgroup_namespace_map` (cgroup → namespace) for every running
     /// instance — which is what makes the connect hook enforce cross-namespace
     /// isolation at all: with the source's namespace unknown the hook lets
     /// every connection through. Writes `firewall_map` for each explicit
-    /// cross-namespace `allow_from` rule. Both maps are rebuilt from scratch
+    /// cross-namespace `allow_from` rule: one per source cgroup for an app,
+    /// and one per named job's run identity, which matches every task cgroup
+    /// the delegated runtime bound to it. Both maps are rebuilt from scratch
     /// each call (a new instance of app A changes rules wherever A is a
     /// *source*), deleting keys no longer desired. A no-op without eBPF.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    pub(super) async fn sync_firewall_ebpf(&mut self) {
+    async fn reconcile_namespace_firewall(&mut self) {
         if self.egress_store_uncertain {
             return;
         }
@@ -248,27 +275,139 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .into_iter()
             .cloned()
             .collect();
+        // LOOP-INLINE: in-memory lock held only to copy a small map, no I/O
+        let delegated = self.delegated_network.snapshot().await;
+        // Every job runs as a delegated task, so its address and grants live
+        // in the delegated network.
+        let jobs: Vec<(String, String, Vec<String>)> = delegated
+            .addresses
+            .values()
+            .filter_map(|task| {
+                Some((
+                    task.namespace.clone(),
+                    task.owner.clone(),
+                    task.allow_from.clone()?,
+                ))
+            })
+            .collect();
+        let destinations: Vec<_> = services
+            .iter()
+            .map(crate::sesame::firewall::IsolatedDestination::from)
+            .chain(jobs.iter().map(|(namespace, name, allow_from)| {
+                crate::sesame::firewall::IsolatedDestination {
+                    namespace,
+                    name,
+                    app_id: crate::sesame::firewall::workload_app_id(namespace, name),
+                    allow_from: Some(allow_from),
+                }
+            }))
+            .collect();
         let ns_entries = crate::sesame::firewall::resolve_cgroup_namespace_entries(&cgroup_ids);
-        let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(
-            &crate::sesame::firewall::resolve_firewall_rules(&services, &cgroup_ids),
+        // Apps are granted by their cgroups; a job's tasks by the run
+        // identity their runtime binds each task cgroup to (#737).
+        let mut rules =
+            crate::sesame::firewall::resolve_destination_rules(&destinations, &cgroup_ids);
+        rules.extend(crate::sesame::firewall::resolve_job_source_rules(
+            &destinations,
+        ));
+        let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(&rules);
+        let mut workloads = self.local_workloads(&services);
+        workloads.extend(
+            delegated
+                .addresses
+                .iter()
+                .map(|(address, task)| task.local_workload(*address)),
+        );
+        let addresses = crate::sesame::firewall::destination_entries(
+            &services,
+            &self.cluster_catalog,
+            &workloads,
+        );
+        let isolation = crate::firewall::isolation::generate_ruleset(
+            &crate::sesame::firewall::isolation_plan(&workloads, &destinations),
         );
 
-        let mut ebpf = handle.lock().await;
-        if let Err(error) = crate::sesame::firewall::reconcile_firewall_maps(
+        let mut ebpf = self.lock_kernel(&handle).await;
+        // Grants and source identities first, then the destinations they
+        // protect: a new destination never appears before its grants.
+        let reconciled = crate::sesame::firewall::reconcile_firewall_maps(
             &mut ebpf.bpf,
             &ns_entries,
             &fw_entries,
             &mut self.cgroup_ns_bpf_keys,
             &mut self.firewall_bpf_keys,
-        ) {
+        )
+        .and_then(|()| {
+            crate::sesame::firewall::reconcile_destination_map(
+                &mut ebpf.bpf,
+                &addresses,
+                &mut self.destination_bpf_keys,
+            )
+        });
+        drop(ebpf);
+        if let Err(error) = reconciled {
             eprintln!("sesame: firewall reconciliation failed: {error}");
         } else {
             self.namespace_firewall_stale = false;
         }
+        self.apply_isolation_rules(isolation);
+    }
+
+    /// Every local workload address and its owner: each instance with its
+    /// own container address belongs, on every port, to its namespace. A
+    /// workload that publishes a service carries the service's identity, so
+    /// one `allow_from` grant covers its VIP and its real addresses alike.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn local_workloads(
+        &self,
+        services: &[crate::onion::types::ServiceEntry],
+    ) -> Vec<crate::sesame::firewall::LocalWorkload> {
+        self.supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| !matches!(instance.state, ContainerState::Stopped))
+            .filter_map(|instance| {
+                let address = instance.container_ip?;
+                let app_id = services
+                    .iter()
+                    .find(|service| {
+                        service.namespace == instance.namespace
+                            && service.app_name == instance.app_name
+                    })
+                    .map_or_else(
+                        || {
+                            crate::sesame::firewall::workload_app_id(
+                                &instance.namespace,
+                                &instance.app_name,
+                            )
+                        },
+                        |service| service.app_id,
+                    );
+                Some(crate::sesame::firewall::LocalWorkload {
+                    address,
+                    namespace: instance.namespace.clone(),
+                    name: instance.app_name.clone(),
+                    app_id,
+                })
+            })
+            .collect()
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    pub(super) async fn sync_firewall_ebpf(&mut self) {}
+    async fn reconcile_namespace_firewall(&mut self) {}
+
+    /// Whether a delegated job runtime changed its addresses or allowlists
+    /// since the last look, so the kernel maps need reconciling.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) fn delegated_network_changed(&self) -> bool {
+        self.delegated_network.take_changed()
+    }
+
+    /// No delegated runtime shares network state without the eBPF data path.
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    pub(super) fn delegated_network_changed(&self) -> bool {
+        false
+    }
 
     /// Register a rolled-out app's service and its replacement backends. The
     /// caller restores the previous reservation if this refuses.
@@ -356,9 +495,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut ingress = self.ingress_configs.clone();
         ingress.extend(cluster_ingress.clone());
         let mut candidate = crate::wrapper::routing::RoutingTable::new();
-        candidate
-            .rebuild(&merged, &ingress)
-            .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
+        // One app's invalid route must not refuse the whole generation: that
+        // froze discovery and ingress for every app in the cluster (#700).
+        // The rebuild already left the bad route out.
+        if let Err(error) = candidate.rebuild(&merged, &ingress) {
+            eprintln!("wrapper: cluster catalogue {generation} skipped invalid routes: {error}");
+        }
 
         // Readers may retain old request guards. This commits the new views,
         // but is not evidence that those older requests have drained.

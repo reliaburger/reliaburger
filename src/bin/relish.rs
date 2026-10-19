@@ -44,6 +44,84 @@ fn parse_endpoint(value: &str) -> Result<String, String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
+// Separating this parser keeps Clap's generated enum parser within the ordinary
+// Rust test-thread stack even as the scenario arguments grow.
+#[derive(clap::Args)]
+struct BenchOptions {
+    /// Timed job scenario instead of the ordinary suite (60s, concurrency 27).
+    #[arg(long, value_enum, conflicts_with_all = ["quick", "capacity", "disruptive", "yes"])]
+    scenario: Option<reliaburger::relish::bench_jobs::JobScenario>,
+    /// Measurement window for job scenarios; positive drain follows it.
+    #[arg(long, default_value_t = 60, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=86400))]
+    seconds: u32,
+    /// Per-node job cap, or local child cap for the VM baseline.
+    #[arg(long, default_value_t = 27, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=256))]
+    concurrency: u32,
+    /// Per-command CPU request in millicores; limit is one core, memory 32Mi.
+    #[arg(long, default_value_t = 25, requires = "scenario", value_parser = clap::value_parser!(u32).range(1..=1000))]
+    cpu_request: u32,
+    /// Digest-pinned BusyBox image for container job scenarios.
+    #[arg(long, default_value = reliaburger::relish::bench_jobs::DEFAULT_IMAGE, requires = "scenario")]
+    image: String,
+    /// BusyBox override: workers default to /bin/busybox; baseline extracts the pinned image.
+    #[arg(long, env = "RELIABURGER_BENCH_EXEC", requires = "scenario")]
+    exec: Option<PathBuf>,
+    /// Namespace for this benchmark's own job submission.
+    #[arg(long, default_value = "default", requires = "scenario")]
+    namespace: String,
+    /// Save strict JSON evidence without overwriting an existing file.
+    #[arg(long, env = "RELIABURGER_BENCH_REPORT", requires = "scenario")]
+    report: Option<PathBuf>,
+    /// Abbreviated suite for development and CI.
+    #[arg(long)]
+    quick: bool,
+    /// Compare with a previous JSON benchmark report (a suite report, or a
+    /// `--report` file from the same job scenario).
+    #[arg(long)]
+    compare: Option<PathBuf>,
+    /// Largest drop in a job scenario's rate, in percent, that `--compare` passes.
+    #[arg(long, default_value_t = reliaburger::relish::bench_jobs::DEFAULT_TOLERANCE_PERCENT, requires_all = ["scenario", "compare"], value_parser = clap::value_parser!(u32).range(1..=90))]
+    tolerance: u32,
+    /// Deliberately schedule minimal workloads until the cluster is full.
+    #[arg(long, requires = "yes")]
+    capacity: bool,
+    /// Include the leader-failure reconstruction benchmark.
+    #[arg(long, requires = "yes")]
+    disruptive: bool,
+    /// Acknowledge capacity saturation and disruptive benchmark effects.
+    #[arg(long)]
+    yes: bool,
+}
+
+// Its own parser, boxed, like `BenchOptions`: inline fields would grow the
+// generated `Command` parser past the test-thread stack.
+// Filters for `relish audit`.
+#[derive(clap::Args)]
+struct AuditOptions {
+    /// Records at or after this time: epoch seconds, or a duration
+    /// before now (e.g. "30m", "2h", "7d").
+    #[arg(long)]
+    since: Option<String>,
+    /// Records at or before this time, in the same forms as --since.
+    #[arg(long)]
+    until: Option<String>,
+    /// One action (e.g. "app.deleted"), or a family ("fault.*").
+    #[arg(long)]
+    action: Option<String>,
+    /// A token name or principal id.
+    #[arg(long)]
+    principal: Option<String>,
+    /// Only actions on this namespace.
+    #[arg(long)]
+    namespace: Option<String>,
+    /// How many of the newest records to show (default 100, at most 10000).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Read every node's log, not just this node's, merged by time.
+    #[arg(long)]
+    cluster: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Launch the interactive terminal UI.
@@ -191,6 +269,10 @@ enum Command {
         /// Namespace the app lives in. Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Delete an app GitOps manages. The next sync recreates it while
+        /// the repository declares it.
+        #[arg(long)]
+        force: bool,
     },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init {
@@ -265,6 +347,9 @@ enum Command {
         #[command(subcommand)]
         action: FaultAction,
     },
+    /// Show who did what: the durable audit log of applies, deletes, execs,
+    /// upgrades, faults, tokens and the other changes to the cluster.
+    Audit(Box<AuditOptions>),
     /// Manage volume snapshots (Btrfs-backed volumes only).
     Snapshot {
         #[command(subcommand)]
@@ -299,6 +384,10 @@ enum Command {
         /// directory). Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Roll back an app GitOps manages. The next sync puts back what
+        /// the repository declares.
+        #[arg(long)]
+        force: bool,
     },
     /// Validate a config file without deploying.
     Lint {
@@ -346,8 +435,13 @@ enum Command {
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
     },
-    /// List images in the local Pickle registry.
-    Images,
+    /// List images in the Pickle registry, or delete a tag.
+    // `relish image` is the appliance OS command, so the registry's
+    // `image delete` spelling lives there as a subcommand, not an alias.
+    Images {
+        #[command(subcommand)]
+        action: Option<ImagesAction>,
+    },
     /// Build an OCI image and push to Pickle.
     Build {
         /// Path to a TOML config file with [build.*] sections.
@@ -362,7 +456,7 @@ enum Command {
         #[arg(long, default_value_t = 960)]
         timeout: u64,
     },
-    /// List bounded job run summaries and rates, or durable schedule definitions.
+    /// List bounded job run summaries and rates, or durable definitions with their last outcomes.
     Jobs {
         #[arg(long)]
         definitions: bool,
@@ -374,19 +468,28 @@ enum Command {
         action: Option<BatchAction>,
         /// Path to a TOML config file with [job.*] sections.
         path: Option<PathBuf>,
+        /// Reuse the key printed by an earlier submission that timed out, so
+        /// the retry returns its runs instead of admitting the jobs again.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
     },
     /// Run a resource-aware task array from an image or allowlisted host binary.
     ///
-    /// Every task runs the same binary with `{index}` in its arguments
+    /// Every task runs the same command with `{index}` in its arguments
     /// replaced by its own index, from 0 to COUNT-1, and gets
     /// RELIABURGER_TASK_INDEX, RELIABURGER_TASK_COUNT,
     /// RELIABURGER_TASK_ATTEMPT and RELIABURGER_BATCH_ID in its
-    /// environment. The binary must be in the nodes' [process_workloads]
-    /// allowed_binaries.
+    /// environment. With --image, the tasks run in containers; with
+    /// --runtime process --exec, the binary must be in the nodes'
+    /// [process_workloads] allowed_binaries.
     ///
     /// Tasks run at least once, not exactly once: a task that finished
     /// just before its node crashed can run again. Make tasks safe to
     /// repeat.
+    ///
+    /// Each submission prints an idempotency key before it is sent. If the
+    /// submission times out, retry with --idempotency-key KEY: the cluster
+    /// returns the run it already admitted rather than starting a second.
     Run {
         /// Name for the array (required: task arrays are the only kind of
         /// run so far).
@@ -395,7 +498,8 @@ enum Command {
         /// Number of tasks; one uses the same indexed executor.
         #[arg(long, default_value_t = 1)]
         count: u32,
-        /// Register a durable five-field UTC cron schedule instead of running now.
+        /// Register a durable UTC cron schedule (five fields, or a macro such
+        /// as @daily) instead of running now.
         #[arg(long)]
         schedule: Option<String>,
         /// Host binary every task runs.
@@ -404,6 +508,9 @@ enum Command {
         /// OCI image executed by the owned Linux runtime.
         #[arg(long, required_unless_present = "exec", conflicts_with = "exec")]
         image: Option<String>,
+        /// Job backend: runc (default), process (requires --exec), or shared-runc.
+        #[arg(long, value_enum, default_value_t = reliaburger::config::job::JobRuntime::Runc)]
+        runtime: reliaburger::config::job::JobRuntime,
         /// CPU request-limit range, such as 250m-500m.
         #[arg(long)]
         cpu: Option<String>,
@@ -419,7 +526,7 @@ enum Command {
         /// Stop the whole array once more than this many tasks have failed.
         #[arg(long)]
         max_failed: Option<u32>,
-        /// Per-attempt timeout, in seconds.
+        /// Per-attempt timeout, in seconds; 0 means no deadline.
         #[arg(long, default_value_t = reliaburger::meat::task_array::DEFAULT_TASK_TIMEOUT_SECS)]
         timeout: u32,
         /// Most tasks one node runs at once (default: 256, bounded by requests).
@@ -431,6 +538,9 @@ enum Command {
         /// An environment variable for every task (repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Reuse the key printed by an earlier submission that timed out.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
         /// Arguments after `--`; `{index}` becomes the task's index.
         #[arg(last = true)]
         args: Vec<String>,
@@ -443,8 +553,8 @@ enum Command {
         /// Poll until the batch reaches a terminal state.
         #[arg(long)]
         wait: bool,
-        /// Give up waiting after this many seconds (jobs time out
-        /// server-side after 3600s; the margin covers reporting).
+        /// Give up waiting after this many seconds. This only bounds the
+        /// wait: the run keeps going, under its own per-attempt timeout.
         #[arg(long, default_value_t = 3660)]
         timeout: u64,
     },
@@ -452,6 +562,11 @@ enum Command {
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+    /// Show or change the cluster's GitOps configuration.
+    Gitops {
+        #[command(subcommand)]
+        action: GitopsAction,
     },
     /// Back up the cluster's root CA, check the backup, and rotate intermediates.
     Ca {
@@ -654,7 +769,7 @@ enum Command {
     },
     /// Run the built-in integration test suite against the cluster.
     Test {
-        /// Comma-separated groups, or exact scenario names with --chaos. Omit for all.
+        /// Comma-separated groups or exact case names (scenario names with --chaos). Omit for all.
         #[arg(long)]
         filter: Option<String>,
         /// Maximum concurrently running tests.
@@ -677,23 +792,7 @@ enum Command {
         namespace: Option<String>,
     },
     /// Run reproducible performance benchmarks against the real data plane.
-    Bench {
-        /// Abbreviated suite for development and CI.
-        #[arg(long)]
-        quick: bool,
-        /// Compare with a previous JSON benchmark report.
-        #[arg(long)]
-        compare: Option<PathBuf>,
-        /// Deliberately schedule minimal workloads until the cluster is full.
-        #[arg(long, requires = "yes")]
-        capacity: bool,
-        /// Include the leader-failure reconstruction benchmark.
-        #[arg(long, requires = "yes")]
-        disruptive: bool,
-        /// Acknowledge capacity saturation and disruptive benchmark effects.
-        #[arg(long)]
-        yes: bool,
-    },
+    Bench(Box<BenchOptions>),
     /// Diagnose cluster health and correlate likely causes.
     Wtf {
         /// Scope application checks and log correlation to one app.
@@ -767,19 +866,42 @@ enum CouncilCommand {
         data_dir: std::path::PathBuf,
         /// Restore from a sealed backup at this object-store URL
         /// (`file://`, `s3://`, `gs://`). Omit to restore from the node's own
-        /// snapshot and committed Raft log under `data_dir`.
+        /// snapshot and committed Raft log under `data_dir`. Credentials and
+        /// region come from the backend's standard environment variables
+        /// (`AWS_*`, `GOOGLE_*`). Without `--backup`, the newest backup
+        /// that unseals is restored; unusable ones are skipped and logged.
         #[arg(long)]
         from: Option<String>,
+        /// Restore exactly this backup object (a name from `relish council
+        /// backups`) instead of the newest usable one.
+        #[arg(long, requires = "from")]
+        backup: Option<String>,
         /// Path to the cluster master key file (32-byte hex), needed to
         /// unseal a backup or read an encrypted Raft log. Defaults to
         /// `/etc/reliaburger/master.key`.
         #[arg(long)]
         master_key: Option<std::path::PathBuf>,
-        /// Skip the "is a council still alive?" safety check. Only pass this
-        /// when you are certain every voter is gone; recovering a live cluster
-        /// splits the brain.
+        /// The API port the cluster's nodes listen on. Before recovering,
+        /// relish asks every voter the restored state names, on this port,
+        /// whether it still serves a council.
+        #[arg(long, default_value_t = 9117)]
+        api_port: u16,
+        /// Skip the safety checks: the probe of the old voters, and the
+        /// refusal to recover a data directory another recovery already
+        /// fenced. Only pass this when you are certain every voter is gone;
+        /// recovering a live cluster splits the brain.
         #[arg(long)]
         force: bool,
+    },
+    /// List the sealed council backups at an object-store URL.
+    ///
+    /// Newest first, in the order `council recover --from` tries them:
+    /// by recovery epoch, then Raft term, then log index. The names are
+    /// what `council recover --backup` takes. Needs no master key.
+    Backups {
+        /// The backup destination (`file://`, `s3://`, `gs://`).
+        #[arg(long)]
+        from: String,
     },
     /// Re-enrol a voter fenced out by `council recover`.
     ///
@@ -813,9 +935,15 @@ enum UpgradeAction {
         /// Local binary to upgrade from instead (expects {path}.sig).
         #[arg(long)]
         binary: Option<std::path::PathBuf>,
-        /// Signature envelope path (default: {binary}.sig).
+        /// Signature envelope path: the countersigned `.sig` for --binary
+        /// (default: {binary}.sig), or for the version form when the nodes
+        /// share one platform.
         #[arg(long)]
         sig: Option<std::path::PathBuf>,
+        /// Your external (operator) private key: countersign each downloaded
+        /// release binary with it before pushing (version form).
+        #[arg(long, conflicts_with = "sig")]
+        external_key: Option<std::path::PathBuf>,
         /// Worker upgrade parallelism.
         #[arg(long, default_value = "1")]
         parallel: u32,
@@ -1014,6 +1142,11 @@ enum ImageAction {
         /// Each machine as MAC@IP.
         #[arg(required = true, value_parser = parse_machine)]
         machines: Vec<(String, std::net::IpAddr)>,
+    },
+    /// Delete a registry tag: the same as `relish images delete`.
+    Delete {
+        /// The tag to delete, as `repository:tag` (e.g. `team/web:v1`).
+        reference: String,
     },
 }
 
@@ -1235,6 +1368,10 @@ enum BatchAction {
         /// Validate the manifest locally without submitting work.
         #[arg(long)]
         dry_run: bool,
+        /// Reuse the key printed by an earlier submission that timed out, so
+        /// the retry returns its runs instead of admitting the manifest again.
+        #[arg(long, value_name = "KEY", conflicts_with = "dry_run")]
+        idempotency_key: Option<String>,
     },
     /// Acknowledge repeating side effects for the exact unknown owner grants.
     Replay {
@@ -1274,7 +1411,8 @@ enum BatchAction {
         #[arg(long, conflicts_with = "after")]
         index: Option<u32>,
     },
-    /// Print a failed task's output (the first and last 2 KiB).
+    /// Print a task's retained output (the first and last 2 KiB): any
+    /// singleton's, or a failed task's in a larger array.
     Logs {
         /// Batch id from `relish run --batch`.
         id: u64,
@@ -1282,6 +1420,23 @@ enum BatchAction {
         #[arg(long)]
         index: u32,
     },
+}
+
+#[derive(Subcommand)]
+enum GitopsAction {
+    /// Show the cluster's GitOps configuration, sync status and what GitOps
+    /// owns. Credentials are never shown.
+    Status,
+    /// Replace the cluster's GitOps configuration from a TOML file holding
+    /// a `[gitops]` section (admin only; audited). Credentials in it are
+    /// sealed with the cluster master key before they reach Raft.
+    Set {
+        /// TOML file with a `[gitops]` section, such as a node's `node.toml`.
+        path: PathBuf,
+    },
+    /// Turn GitOps off for the whole cluster (admin only; audited). What
+    /// GitOps wrote stays in place.
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -1425,6 +1580,17 @@ enum LocalAction {
     Start,
     Stop,
     Destroy,
+}
+
+#[derive(Subcommand)]
+enum ImagesAction {
+    /// Delete a tag (`repository:tag`). The image stays pullable by digest
+    /// until it has been untagged for `[images] gc_retain_days`; then it
+    /// expires, unless an app or job pins it, and GC reclaims its layers.
+    Delete {
+        /// The tag to delete, as `repository:tag` (e.g. `team/web:v1`).
+        reference: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1645,7 +1811,7 @@ enum FaultAction {
         #[command(flatten)]
         targeting: reliaburger::relish::fault::FaultTargeting,
     },
-    /// Throttle bandwidth to a service.
+    /// Throttle bandwidth to a service (not implemented yet: Bun refuses it, #366).
     Bandwidth {
         /// Target service name.
         target: String,
@@ -1937,7 +2103,8 @@ async fn main() -> ExitCode {
         Command::Delete {
             ref app,
             ref namespace,
-        } => commands::delete(app, namespace).await,
+            force,
+        } => commands::delete(app, namespace, force).await,
         Command::Init {
             ref dir,
             ref cluster_name,
@@ -1964,14 +2131,26 @@ async fn main() -> ExitCode {
             Some(CouncilCommand::ReEnrol { data_dir, force }) => {
                 commands::council_reenrol(data_dir, *force)
             }
+            Some(CouncilCommand::Backups { from }) => {
+                commands::council_backups(from, cli.output).await
+            }
             Some(CouncilCommand::Recover {
                 data_dir,
                 from,
+                backup,
                 master_key,
+                api_port,
                 force,
             }) => {
-                commands::council_recover(data_dir, from.as_deref(), master_key.as_deref(), *force)
-                    .await
+                commands::council_recover(
+                    data_dir,
+                    from.as_deref(),
+                    backup.as_deref(),
+                    master_key.as_deref(),
+                    *api_port,
+                    *force,
+                )
+                .await
             }
         },
         Command::Join {
@@ -2030,6 +2209,30 @@ async fn main() -> ExitCode {
                 volume,
             } => commands::snapshot_delete(app, namespace, name, volume.as_deref()).await,
         },
+        Command::Audit(options) => {
+            let AuditOptions {
+                since,
+                until,
+                action,
+                principal,
+                namespace,
+                limit,
+                cluster,
+            } = *options;
+            reliaburger::relish::audit_cmd::audit(
+                reliaburger::relish::audit_cmd::AuditFlags {
+                    since,
+                    until,
+                    action,
+                    principal,
+                    namespace,
+                    limit,
+                    cluster,
+                },
+                cli.output,
+            )
+            .await
+        }
         Command::Fault { ref action } => match action {
             FaultAction::Delay {
                 target,
@@ -2211,7 +2414,8 @@ async fn main() -> ExitCode {
         Command::Rollback {
             ref app,
             ref namespace,
-        } => commands::rollback(app, namespace).await,
+            force,
+        } => commands::rollback(app, namespace, force).await,
         Command::Lint { ref path } => commands::lint(path),
         Command::Compile { ref path } => commands::compile(path),
         Command::Diff {
@@ -2223,16 +2427,28 @@ async fn main() -> ExitCode {
         Command::Import { ref files, strict } => commands::import_k8s(files, strict),
         #[cfg(feature = "kubernetes")]
         Command::Export { ref file } => commands::export_k8s(file),
-        Command::Images => commands::images(cli.output).await,
+        Command::Images { action: None } => commands::images(cli.output).await,
+        Command::Images {
+            action: Some(ImagesAction::Delete { reference }),
+        } => commands::image_delete(&reference).await,
         Command::Build {
             ref path,
             registry_port,
             timeout,
         } => commands::build(path, registry_port, timeout).await,
-        Command::Batch { action, path } => match (action, path) {
-            (Some(BatchAction::Submit { path, dry_run }), _) => {
-                commands::submit_task_manifest(&path, cli.output, dry_run).await
-            }
+        Command::Batch {
+            action,
+            path,
+            idempotency_key,
+        } => match (action, path) {
+            (
+                Some(BatchAction::Submit {
+                    path,
+                    dry_run,
+                    idempotency_key,
+                }),
+                _,
+            ) => commands::submit_task_manifest(&path, cli.output, dry_run, idempotency_key).await,
             (Some(BatchAction::Watch { id, timeout }), _) => {
                 commands::watch_task_batch(id, timeout).await
             }
@@ -2259,7 +2475,7 @@ async fn main() -> ExitCode {
             (Some(BatchAction::Logs { id, index }), _) => {
                 commands::batch_task_logs(id, index).await
             }
-            (None, Some(path)) => commands::batch(&path).await,
+            (None, Some(path)) => commands::batch(&path, idempotency_key).await,
             (None, None) => Err(reliaburger::relish::RelishError::InvalidFlag {
                 flag: "file".to_string(),
                 reason: "give a [job.*] TOML file, or one of: cancel, results, logs".to_string(),
@@ -2267,6 +2483,7 @@ async fn main() -> ExitCode {
         },
         Command::Jobs { definitions } => commands::jobs(definitions, cli.output).await,
         Command::Run {
+            runtime,
             schedule,
             batch,
             count,
@@ -2281,9 +2498,11 @@ async fn main() -> ExitCode {
             concurrency,
             namespace,
             env,
+            idempotency_key,
             args,
         } => {
             commands::run_task_array(commands::TaskArrayRun {
+                runtime,
                 schedule,
                 name: batch,
                 namespace,
@@ -2301,6 +2520,7 @@ async fn main() -> ExitCode {
                     task_timeout_secs: timeout,
                     per_node_concurrency: concurrency,
                 },
+                idempotency_key,
             })
             .await
         }
@@ -2316,6 +2536,11 @@ async fn main() -> ExitCode {
                 finalize,
                 namespace,
             } => commands::secret_rotate(*finalize, namespace.as_deref()).await,
+        },
+        Command::Gitops { action } => match &action {
+            GitopsAction::Status => commands::gitops_status(cli.output).await,
+            GitopsAction::Set { path } => commands::gitops_set(path).await,
+            GitopsAction::Disable => commands::gitops_disable().await,
         },
         Command::Ca { action } => match &action {
             CaAction::Backup {
@@ -2472,6 +2697,7 @@ async fn main() -> ExitCode {
                     println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
                 })
             }
+            ImageAction::Delete { reference } => commands::image_delete(&reference).await,
             ImageAction::Seed {
                 directory,
                 ttl,
@@ -2667,6 +2893,7 @@ async fn main() -> ExitCode {
                     version,
                     binary,
                     sig,
+                    external_key,
                     parallel,
                     registry,
                     url,
@@ -2679,6 +2906,7 @@ async fn main() -> ExitCode {
                             version,
                             binary,
                             sig,
+                            external_key,
                             parallel,
                             registry,
                             metadata_url: url,
@@ -2799,13 +3027,43 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
-        Command::Bench {
-            quick,
-            compare,
-            capacity,
-            disruptive,
-            yes,
-        } => {
+        Command::Bench(options) => {
+            let BenchOptions {
+                scenario,
+                seconds,
+                concurrency,
+                cpu_request,
+                image,
+                exec,
+                namespace,
+                report,
+                quick,
+                compare,
+                tolerance,
+                capacity,
+                disruptive,
+                yes,
+            } = *options;
+            if let Some(scenario) = scenario {
+                return finish_outcome(
+                    reliaburger::relish::bench_jobs::run(
+                        reliaburger::relish::bench_jobs::JobBenchArgs {
+                            scenario,
+                            seconds,
+                            concurrency,
+                            cpu_request,
+                            image,
+                            exec,
+                            namespace,
+                            report,
+                            compare,
+                            tolerance_percent: tolerance,
+                            output: cli.output,
+                        },
+                    )
+                    .await,
+                );
+            }
             return finish_outcome(
                 reliaburger::relish::bench_cmd::run(reliaburger::relish::bench_cmd::BenchArgs {
                     quick,
@@ -2959,12 +3217,26 @@ mod tests {
     fn readme_command_list_matches_the_cli() {
         use clap::CommandFactory;
         use reliaburger::relish::command_reference::{
-            GROUPS, REGENERATE_COMMAND, render, replace_region,
+            Availability, GROUPS, REGENERATE_COMMAND, render, replace_region,
         };
+        use reliaburger::relish::released_cli::ReleasedCli;
 
-        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme_path = repository.join("README.md");
         let readme = std::fs::read_to_string(&readme_path).unwrap();
-        let section = render(&Cli::command(), GROUPS).unwrap_or_else(|e| panic!("{e}"));
+        // Commands the installer's release lacks are labelled with this
+        // build's version (0.2.0-dev labels them "0.2.0").
+        let released = ReleasedCli::parse(
+            &std::fs::read_to_string(repository.join("scripts/release/released-cli.tsv")).unwrap(),
+        )
+        .unwrap();
+        let upcoming = env!("CARGO_PKG_VERSION").split('-').next().unwrap();
+        let availability = Availability {
+            released: &released,
+            label: released.unreleased_label(upcoming),
+        };
+        let section =
+            render(&Cli::command(), GROUPS, Some(&availability)).unwrap_or_else(|e| panic!("{e}"));
         let updated = replace_region(&readme, &section).unwrap_or_else(|e| panic!("{e}"));
 
         if std::env::var_os("RELIABURGER_UPDATE_README").is_some() {
@@ -3422,6 +3694,44 @@ mod tests {
     }
 
     #[test]
+    fn audit_flags_parse() {
+        let cli = parse(&[
+            "relish",
+            "audit",
+            "--since",
+            "2h",
+            "--action",
+            "fault.*",
+            "--principal",
+            "alice",
+            "--namespace",
+            "team-a",
+            "--limit",
+            "50",
+            "--cluster",
+        ])
+        .unwrap();
+        let Command::Audit(options) = cli.command else {
+            panic!("expected relish audit");
+        };
+        let AuditOptions {
+            since,
+            action,
+            principal,
+            namespace,
+            limit,
+            cluster,
+            ..
+        } = *options;
+        assert_eq!(since.as_deref(), Some("2h"));
+        assert_eq!(action.as_deref(), Some("fault.*"));
+        assert_eq!(principal.as_deref(), Some("alice"));
+        assert_eq!(namespace.as_deref(), Some("team-a"));
+        assert_eq!(limit, Some(50));
+        assert!(cluster);
+    }
+
+    #[test]
     fn fault_run_is_an_alias_for_scenario() {
         let via_alias = parse(&["relish", "fault", "run", "scenario.toml"]).unwrap();
         assert!(matches!(
@@ -3539,16 +3849,114 @@ mod tests {
     }
 
     #[test]
+    fn job_bench_scenarios_have_usable_defaults_and_bounded_overrides() {
+        use reliaburger::relish::bench_jobs::JobScenario;
+        for (name, expected) in [
+            ("jobs-containers", JobScenario::Containers),
+            ("jobs-shared-containers", JobScenario::SharedContainers),
+            ("jobs-host-processes", JobScenario::HostProcesses),
+            ("jobs-vm-baseline", JobScenario::VmBaseline),
+        ] {
+            let cli = parse(&["relish", "bench", "--scenario", name]).unwrap();
+            let Command::Bench(options) = cli.command else {
+                panic!("expected bench");
+            };
+            assert!(matches!(*options, BenchOptions {
+                scenario: Some(scenario), seconds: 60, concurrency: 27,
+                cpu_request: 25, exec: None, ..
+            } if scenario == expected));
+        }
+        for args in [
+            vec!["--seconds", "0"],
+            vec!["--seconds", "86401"],
+            vec!["--concurrency", "0"],
+            vec!["--concurrency", "257"],
+            vec!["--cpu-request", "0"],
+            vec!["--cpu-request", "1001"],
+            vec!["--quick"],
+            vec!["--tolerance", "0"],
+            vec!["--tolerance", "91"],
+            vec!["--tolerance", "20"],
+            vec!["--capacity", "--yes"],
+            vec!["--disruptive", "--yes"],
+        ] {
+            let mut command = vec!["relish", "bench", "--scenario", "jobs-shared-containers"];
+            command.extend(args);
+            assert!(parse(&command).is_err(), "{command:?}");
+        }
+        assert!(parse(&["relish", "bench", "--seconds", "20"]).is_err());
+        assert!(
+            parse(&[
+                "relish",
+                "bench",
+                "--compare",
+                "old.json",
+                "--tolerance",
+                "20"
+            ])
+            .is_err()
+        );
+        let cli = parse(&[
+            "relish",
+            "bench",
+            "--scenario",
+            "jobs-host-processes",
+            "--compare",
+            "baseline.json",
+            "--tolerance",
+            "15",
+        ])
+        .unwrap();
+        let Command::Bench(options) = cli.command else {
+            panic!("expected bench");
+        };
+        assert!(matches!(
+            *options,
+            BenchOptions {
+                compare: Some(ref path),
+                tolerance: 15,
+                ..
+            } if path == std::path::Path::new("baseline.json")
+        ));
+        let cli = parse(&[
+            "relish",
+            "bench",
+            "--scenario=jobs-shared-containers",
+            "--seconds",
+            "10",
+            "--concurrency",
+            "8",
+        ])
+        .unwrap();
+        let Command::Bench(options) = cli.command else {
+            panic!("expected bench");
+        };
+        assert!(matches!(
+            *options,
+            BenchOptions {
+                seconds: 10,
+                concurrency: 8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn parse_bench_command_defaults_and_explicit_risk_flags() {
         let bare = parse(&["relish", "bench"]).unwrap();
+        let Command::Bench(options) = bare.command else {
+            panic!("expected bench");
+        };
         assert!(matches!(
-            bare.command,
-            Command::Bench {
+            *options,
+            BenchOptions {
                 quick: false,
                 compare: None,
                 capacity: false,
                 disruptive: false,
                 yes: false,
+                scenario: None,
+                ..
             }
         ));
         assert!(parse(&["relish", "bench", "--capacity"]).is_err());
@@ -3565,14 +3973,19 @@ mod tests {
             "--yes",
         ])
         .unwrap();
+        let Command::Bench(options) = full.command else {
+            panic!("expected bench");
+        };
         assert!(matches!(
-            full.command,
-            Command::Bench {
+            *options,
+            BenchOptions {
                 quick: true,
                 compare: Some(ref path),
                 capacity: true,
                 disruptive: true,
                 yes: true,
+                scenario: None,
+                ..
             } if path == std::path::Path::new("base.json")
         ));
     }
@@ -3768,7 +4181,32 @@ mod tests {
         let cli = parse(&["relish", "delete", "web", "--namespace", "team-a"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Delete { ref app, ref namespace } if app == "web" && namespace == "team-a"
+            Command::Delete { ref app, ref namespace, force: false } if app == "web" && namespace == "team-a"
+        ));
+    }
+
+    /// #693: `--force` deletes or rolls back an app that GitOps manages.
+    #[test]
+    fn delete_and_rollback_take_force() {
+        let cli = parse(&["relish", "delete", "web", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Delete { force: true, .. }));
+        let cli = parse(&["relish", "rollback", "web", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Rollback { force: true, .. }));
+    }
+
+    #[test]
+    fn gitops_subcommands_parse() {
+        let cli = parse(&["relish", "gitops", "set", "node.toml"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gitops { action: GitopsAction::Set { ref path } } if path == std::path::Path::new("node.toml")
+        ));
+        let cli = parse(&["relish", "gitops", "disable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gitops {
+                action: GitopsAction::Disable
+            }
         ));
     }
 
@@ -3948,6 +4386,53 @@ mod tests {
                 action: Some(CouncilCommand::Recover { force: true, .. })
             }
         ));
+    }
+
+    #[test]
+    fn parse_council_recover_of_a_named_backup_needs_its_destination() {
+        let cli = parse(&[
+            "relish",
+            "council",
+            "recover",
+            "--data-dir",
+            "/var/lib/reliaburger/data",
+            "--from",
+            "s3://backups/council",
+            "--backup",
+            "council-e1.backup",
+        ])
+        .unwrap();
+        let Command::Council {
+            action: Some(CouncilCommand::Recover { backup, .. }),
+        } = cli.command
+        else {
+            panic!("expected council recover");
+        };
+        assert_eq!(backup.as_deref(), Some("council-e1.backup"));
+        assert!(
+            parse(&[
+                "relish",
+                "council",
+                "recover",
+                "--data-dir",
+                "/d",
+                "--backup",
+                "council-e1.backup",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_council_backups_command() {
+        let cli = parse(&["relish", "council", "backups", "--from", "gs://b/council"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Council {
+                action: Some(CouncilCommand::Backups { .. })
+            }
+        ));
+        assert!(parse(&["relish", "council", "backups"]).is_err());
     }
 
     #[test]
@@ -4348,7 +4833,27 @@ mod tests {
     #[test]
     fn parse_images_command() {
         let cli = parse(&["relish", "images"]).unwrap();
-        assert!(matches!(cli.command, Command::Images));
+        assert!(matches!(cli.command, Command::Images { action: None }));
+    }
+
+    /// #697: `relish images delete`, and `relish image delete` beside the
+    /// appliance OS image commands.
+    #[test]
+    fn parse_image_delete_under_either_spelling() {
+        let cli = parse(&["relish", "images", "delete", "team/web:v1"]).unwrap();
+        match cli.command {
+            Command::Images {
+                action: Some(ImagesAction::Delete { reference }),
+            } => assert_eq!(reference, "team/web:v1"),
+            _ => panic!("expected images delete"),
+        }
+        let cli = parse(&["relish", "image", "delete", "team/web:v1"]).unwrap();
+        match cli.command {
+            Command::Image {
+                action: ImageAction::Delete { reference },
+            } => assert_eq!(reference, "team/web:v1"),
+            _ => panic!("expected image delete"),
+        }
     }
 
     #[test]
@@ -4811,9 +5316,14 @@ mod tests {
     fn parse_batch_command() {
         let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
         match cli.command {
-            Command::Batch { action, path } => {
+            Command::Batch {
+                action,
+                path,
+                idempotency_key,
+            } => {
                 assert!(action.is_none());
                 assert_eq!(path, Some(PathBuf::from("jobs.toml")));
+                assert!(idempotency_key.is_none());
             }
             _ => panic!("expected Batch"),
         }
@@ -4826,7 +5336,8 @@ mod tests {
             cli.command,
             Command::Batch {
                 action: Some(BatchAction::Cancel { id: 7 }),
-                path: None
+                path: None,
+                ..
             }
         ));
         let cli = parse(&["relish", "batch", "results", "7", "--failed"]).unwrap();
@@ -4909,6 +5420,43 @@ mod tests {
         assert!(
             parse(&["relish", "run", "--count", "3", "--exec", "/bin/true"]).is_err(),
             "--batch is required"
+        );
+    }
+
+    #[test]
+    fn parse_run_container_isolation() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "many",
+            "--image",
+            "fixture",
+            "--runtime",
+            "shared-runc",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                runtime: reliaburger::config::job::JobRuntime::SharedRunc,
+                ..
+            }
+        ));
+        assert!(
+            parse(&[
+                "relish",
+                "run",
+                "--batch",
+                "many",
+                "--image",
+                "fixture",
+                "--runtime",
+                "unknown"
+            ])
+            .is_err()
         );
     }
 
@@ -5186,5 +5734,87 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn job_submissions_accept_an_idempotency_key_for_a_retry() {
+        let cli = parse(&[
+            "relish",
+            "run",
+            "--batch",
+            "render",
+            "--image",
+            "fixture:v1",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run { idempotency_key: Some(ref key), .. } if key == "retry-7"
+        ));
+        let cli = parse(&[
+            "relish",
+            "batch",
+            "jobs.toml",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch { idempotency_key: Some(ref key), .. } if key == "retry-7"
+        ));
+        let cli = parse(&[
+            "relish",
+            "batch",
+            "submit",
+            "jobs.toml",
+            "--idempotency-key",
+            "retry-7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Batch {
+                action: Some(BatchAction::Submit { idempotency_key: Some(ref key), .. }),
+                ..
+            } if key == "retry-7"
+        ));
+        // A dry run sends nothing, so a key would be meaningless.
+        assert!(
+            parse(&[
+                "relish",
+                "batch",
+                "submit",
+                "jobs.toml",
+                "--dry-run",
+                "--idempotency-key",
+                "k",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn job_help_text_matches_what_the_commands_do() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let mut help = String::new();
+        for path in [
+            &["run"][..],
+            &["batch-status"],
+            &["batch", "logs"],
+            &["batch", "submit"],
+        ] {
+            let mut command = &mut cli;
+            for name in path {
+                command = command.find_subcommand_mut(name).unwrap();
+            }
+            help.push_str(&format!("=== relish {} ===\n", path.join(" ")));
+            help.push_str(&command.render_long_help().to_string());
+            help.push('\n');
+        }
+        insta::assert_snapshot!(help);
     }
 }

@@ -63,6 +63,25 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// How much of a file [`sha256_file`] reads at a time.
+const HASH_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Hex-encoded SHA-256 of the file at `path`, read in fixed pieces so
+/// hashing a release-sized binary never holds it in memory. Blocks.
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hex::encode(hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
 /// Parse an `ed25519:BASE64` public key string into raw bytes.
 pub fn parse_public_key(input: &str) -> Result<PublicKey, UpgradeError> {
     let invalid = |reason: &str| UpgradeError::InvalidKey {
@@ -275,6 +294,18 @@ mod tests {
             embedded: sign(&keys.release_pkcs8, bytes).unwrap(),
             external: external.then(|| sign(&keys.external_pkcs8, bytes).unwrap()),
         }
+    }
+
+    #[test]
+    fn a_file_hashes_like_its_bytes_across_read_pieces() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("binary");
+        let bytes: Vec<u8> = (0..HASH_CHUNK_BYTES * 2 + 12_345)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(sha256_file(&path).unwrap(), sha256_hex(&bytes));
     }
 
     #[test]

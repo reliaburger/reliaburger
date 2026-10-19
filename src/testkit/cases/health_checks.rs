@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -48,7 +49,7 @@ async fn hanging_health_check_marks_instance_unhealthy(ctx: TestContext) -> Resu
 /// does not flap.
 async fn slow_but_within_timeout_app_stays_running(ctx: TestContext) -> Result<(), String> {
     let app = "slow";
-    // Responds after 500 ms; the probe timeout is 2 s, so every probe passes.
+    // Responds after 500 ms; the probe timeout is 1 s, so every probe passes.
     ctx.apply(&ctx.testapp_spec_args(app, "slow", 1, &["--delay", "500"]))
         .await?;
     ctx.wait_running_cluster(app, 1).await?;
@@ -71,18 +72,21 @@ pub fn cases() -> Vec<TestCase> {
             name: "unhealthy_app_is_restarted",
             group: TestGroup::HealthChecks,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(unhealthy_app_is_restarted),
         },
         TestCase {
             name: "hanging_health_check_marks_instance_unhealthy",
             group: TestGroup::HealthChecks,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(hanging_health_check_marks_instance_unhealthy),
         },
         TestCase {
             name: "slow_but_within_timeout_app_stays_running",
             group: TestGroup::HealthChecks,
             requires: &[Capability::ProcessRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(slow_but_within_timeout_app_stays_running),
         },
     ]

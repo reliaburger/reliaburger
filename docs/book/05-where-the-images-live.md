@@ -98,7 +98,7 @@ One subtlety worth keeping: the registry stores the manifest's *raw bytes*, not 
 
 ## Replication
 
-When you push an image, Pickle doesn't just store it locally. It replicates the layers to N peer nodes (default: 2 total copies) before returning success. If a node dies, the image is still available elsewhere.
+When you push an image, Pickle doesn't just store it locally. The leader's heal loop copies the layers to more nodes (default: 2 total copies) shortly afterwards. If a node dies, the image is still available elsewhere. (The first version replicated before returning success; *Honest push semantics* below explains why it stopped, and *Copies that can still answer* how heal copies now.)
 
 Replication uses the same OCI Distribution API that clients use. Each peer already runs the `/v2/` handlers, so the replicating node simply acts as a push client to its peers. No custom protocol, no new code paths to test.
 
@@ -122,13 +122,13 @@ The state machine applies it: stores the manifest, creates the tag→digest mapp
 
 ## Garbage collection
 
-Disk space isn't infinite. Pickle runs a periodic GC sweep that deletes unreferenced layers, with three safety rails:
+Disk space isn't infinite. Cleanup comes in two steps, and keeping them apart is the point. **Expiry** decides an *image* is gone: a manifest that has had no tag for `gc_retain_days` (default 7) leaves the Raft catalogue, unless an app or job pins it. **GC** then deletes *blobs* nothing references any more, with three safety rails:
 
-1. **Active reference protection.** If an app in `DesiredState` uses an image, none of its layers are touched.
-2. **Sole-copy protection.** If this node is the only one holding a layer, it's never deleted, even if unreferenced. You can't accidentally destroy the last copy.
-3. **Retention window.** Recently pushed images are kept for `gc_retain_days` (default 7) even if no tags reference them. This gives you time to notice and re-tag.
+1. **Reference protection.** A blob any catalogued manifest references is never deleted. The Raft state machine checks this when it approves a deletion, not just the node that asked.
+2. **Sole-copy protection.** A blob is deleted from a node only while some other node also holds it. You can't accidentally destroy the last copy.
+3. **Orphan grace.** A blob with no holder record that's younger than an hour is left alone: it's probably part of a push still in flight.
 
-After deletion, the node proposes a `GcReport` to Raft, which removes it from the layer holder sets. Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete.
+After deletion, the node proposes a `GcReport` to Raft, which removes it from the layer holder sets. Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete. "Expiry, then GC" is the 0.2.1 design; the story of how the first version never collected anything is in *Copies that can still answer*, below.
 
 ## Reachability is the whole game
 
@@ -259,6 +259,102 @@ fn chown_tree(
 Host-path volumes (`source = "/srv/import"`) get none of this. They're the operator's directories, and silently chowning `/srv/import` to uid 2,000,000,999 is exactly the kind of surprise an orchestrator shouldn't spring. Bun checks the mode bits instead and, if the container's user plainly can't write, logs which host uid to `chown` the directory to. It still starts the container, because plenty of host mounts are only ever read.
 
 The proof is a gated test that runs the real Redis image with `--appendonly yes` over a managed volume: first as uid 999 directly (so no entrypoint `chown` can paper over a missing hand-over), writes a key, restarts, reads it back, then restarts as image root and reads it again.
+
+### A host path is a tenant boundary
+
+That shared id range has a sharp edge, and the 0.2.0 audit found it. Every rootful container on a node maps into the same 2,000,000,000 range: that's what keeps the unpacked image cache shareable. Managed volumes are chowned into that range. So container root in team A's app and container root in team B's database are the same host uid. Now picture a deployer whose token only reaches namespace `team-a`:
+
+```toml
+[app.thief]
+image = "busybox:1.36"
+namespace = "team-a"
+
+[[app.thief.volumes]]
+path = "/steal"
+source = "/var/lib/reliaburger/volumes/team-b/db"
+```
+
+Apply checked only `deploy` in `team-a`, which the token has. The node bind-mounted `source` exactly as written, read-write, and the files were already owned by the uid container root runs as. Team B's database was team A's to read or rewrite. The namespace boundary held everywhere except on the disk.
+
+We closed it with two gates, because each covers a different hole. The first is at apply: an app with any `source` (on a volume or a `config_file`) now counts as host access, the same as an `exec` binary or an inline `script`, so a token with a `[permission]` block needs `host-exec` as well as `deploy`. `AppSpec` grew two small methods for it:
+
+```rust
+pub fn host_path_sources(&self) -> impl Iterator<Item = &std::path::Path> {
+    self.volumes
+        .iter()
+        .filter_map(|volume| volume.source.as_deref())
+        .chain(
+            self.config_file
+                .iter()
+                .filter_map(|file| file.source.as_deref().map(std::path::Path::new)),
+        )
+}
+
+pub fn needs_host_access(&self) -> bool {
+    self.exec.is_some() || self.script.is_some() || self.host_path_sources().next().is_some()
+}
+```
+
+`impl Iterator<Item = &Path>` in return position means "some iterator type I won't name". The real type is a long nest of `Chain<FilterMap<...>>` adaptors, and the caller doesn't care. Nothing runs until somebody pulls from it, so `needs_host_access` asks for one item with `.next()` and stops: it doesn't build a list just to check whether it's empty.
+
+Permissions are opt-in, though. A token with no `[permission]` block passes `authorize_permission` untouched, so the first gate does nothing for most clusters. The real default-deny is the second gate, on the node. `[storage] allowed_host_paths` in `node.toml` lists the prefixes a `source` may come from, empty by default, the way `[process_workloads] allowed_binaries` lists the host binaries an `exec` app may run. The supervisor checks every `source` before it creates an instance, through a `HostPathPolicy` built from the node config:
+
+```rust
+pub fn admit(&self, source: &Path) -> Result<ApprovedHostPath, HostPathRefusal> {
+    // ... refuse a relative path or any `..` component first ...
+    let resolved = resolve(source);
+    if let Some(directory) = self
+        .protected
+        .iter()
+        .find(|directory| resolved.starts_with(directory) || directory.starts_with(&resolved))
+    {
+        return Err(HostPathRefusal::Protected {
+            path: source.to_path_buf(),
+            directory: directory.clone(),
+        });
+    }
+    if self.allowed.iter().any(|prefix| resolved.starts_with(prefix)) {
+        Ok(ApprovedHostPath(resolved))
+    } else {
+        Err(HostPathRefusal::NotAllowed {
+            path: source.to_path_buf(),
+        })
+    }
+}
+```
+
+Three details carry the weight. `Path::starts_with` compares whole components, not bytes, so `/srv/import-evil` isn't under `/srv/import`; a string `starts_with` would have let it through, which is exactly the bug you'd write in C with `strncmp`. `resolve` canonicalises the longest part of the path that exists, so a symlink planted inside an allowed directory counts as the place it points at. And the protected check runs both ways. The node's own directories (the five `[storage]` ones, the identity and script directories, wherever the master key lives) are refused when the `source` sits under them, and also when the `source` *contains* them. An operator who lists `/var/lib` for convenience still can't hand anyone `/var/lib/reliaburger`.
+
+The first version stopped there: it checked the resolved path and then let runc mount `source` as written. Anyone who could write inside an allowlisted directory could point a symlink somewhere harmless, wait for the check, and swap it before the mount. So `admit` doesn't answer yes or no any more. It hands back the path it checked, wrapped in a newtype:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedHostPath(PathBuf);
+```
+
+The field is private to the module, so nothing outside `host_paths.rs` can build one. In C you'd pass a `char *` and trust a comment that it had been checked; here, holding an `ApprovedHostPath` is the proof, because `admit` is the only way to get one. `approve_app` runs `admit` over every `source` and returns the spec to build the container from:
+
+```rust
+pub fn approve_app<'a>(&self, spec: &'a AppSpec) -> Result<Cow<'a, AppSpec>, HostPathRefusal> {
+    if spec.host_path_sources().next().is_none() {
+        return Ok(Cow::Borrowed(spec));
+    }
+    let mut approved = spec.clone();
+    for volume in &mut approved.volumes {
+        if let Some(source) = &mut volume.source {
+            *source = self.admit(source)?.0;
+        }
+    }
+    // ... the same for each config_file source ...
+    Ok(Cow::Owned(approved))
+}
+```
+
+`Cow` ("clone on write", from `std::borrow`) is an enum holding either a borrow or an owned value. Most apps have no host path, so they come back as `Cow::Borrowed` and cost nothing; only an app with a `source` pays for a copy, whose sources are the resolved paths. The lifetime `'a` says the borrowed case lives as long as the `spec` passed in. A `Cow<AppSpec>` derefs to `&AppSpec`, so the caller hands `&spec` to the OCI builder whichever case it got. A config-file `source` is a `String`, so a resolved path that isn't valid UTF-8 is refused rather than mangled.
+
+The agent calls this through `WorkloadSupervisor::approve_host_paths` right before it builds each OCI spec: for a fresh instance, and for every rolling or blue-green replacement. That second call site fixed a hole of its own. Replacements never went through `admit_app`, so adding a `source` to an app that was already running skipped the allowlist entirely. Now there is one rule: no OCI spec for an app is built from a `source` the policy hasn't just approved.
+
+That shrinks the race without closing it. The mounted path has no symlinks when it's checked, but runc mounts it by name later, after the image pull, and again on every restart, which reuses the stored spec. If someone with write access to an allowlisted directory replaces a directory on the resolved path with a symlink in between (or creates a source that didn't exist yet as one), the kernel still follows it. Closing that would mean opening the source component by component without following links (`openat2` with `RESOLVE_NO_SYMLINKS`) and handing runc the open file descriptor instead of a name, which runc's bundle format doesn't offer. We accept the remainder: it needs write access inside a directory the operator chose to trust, and the refusals that matter, another tenant's volume and the node's own secrets, hold for the path that's checked.
 
 ## Under the hood: key patterns
 
@@ -517,7 +613,7 @@ only the holder sets prove whether the catalogue has achieved it.
 
 TLS comes for free from the same PKI: when the node has an mTLS identity, the registry serves with `build_api_server_config` — the very config the agent API listener uses — and peers address each other as `https://`. The scheme is threaded through one function (`pickle_peers_scheme`) so the server and every peer-URL derivation always agree.
 
-Two resource limits ride along. Storage **quotas** cap bytes per repository and across the whole registry (`0` means unlimited, the default). And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings — a registry with no quota and no session expiry is a disk-exhaustion waiting to happen.
+Two resource limits ride along. A storage **quota** caps the bytes each node's blob store holds (`[images] max_storage`, `0` meaning unlimited, the default). And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings. A registry with no quota and no session expiry is a disk-exhaustion waiting to happen. (There used to be a per-repository quota too. Nothing could configure it, so 0.2.1 deleted it rather than keep a feature that existed only in this chapter.)
 
 One more thing moved off the hot path: whole-blob hashing. Verifying a digest re-hashes the entire blob, which for a 500 MB layer is real CPU work. Running it on a Tokio worker would stall every other request on that thread, so it now runs under `spawn_blocking`:
 
@@ -582,8 +678,12 @@ backpressure: a slow disk slows the sender. Completion hashes the file with a
 content-addressed store. The digest must match before the blob becomes visible.
 Manifests still need parsing in memory, so they have a separate 4 MiB limit.
 
-A semaphore allows four simultaneous write requests. A fifth receives HTTP 429
-with `Retry-After: 1`; it doesn't sit in a queue retaining its body. Each upload
+A semaphore allows four simultaneous write requests. A fifth waits up to a
+minute for a slot, then receives HTTP 429 with `Retry-After: 1`. While it waits
+its body stays unread on the socket, so the queue costs a connection, not
+memory. (It used to get the 429 at once. Then docker pushed its layers in
+parallel and gave up on the whole image. "Four clients, no `--insecure`"
+below has the story.) Each upload
 also owns a one-permit semaphore, so a PATCH can't change a file while a PUT
 verifies it. An `OwnedSemaphorePermit` holds its semaphore through an `Arc`
 (shared ownership), rather than borrowing the request's stack. Moving it into
@@ -968,6 +1068,45 @@ That test failed on its first run, and not on authentication. crane asks `HEAD /
 
 That's why the crane test exists at all. The spec says a registry "MUST" support manifest `HEAD`, and we could have read that sentence a dozen times and still missed that we didn't. A real client doesn't miss it.
 
+### Four clients, no `--insecure`
+
+Look at that crane test again, though. It passed `--insecure`, so crane never checked the certificate. It pushed with `append` and read back only the manifest, never a layer. And it ran behind a gate. Meanwhile the manual promised `docker push`, and the design doc added podman, skopeo and oras for good measure. For anyone wiring Reliaburger into their own CI, `docker push` is the first thing they'll try. So in 0.2.1 we made the claim earn its keep: CI now runs docker, podman, skopeo and crane against a Pickle TLS listener. Each one verifies the cluster CA the way a user would set it up, logs in with an API token, pushes a two-layer image, pulls every layer back and compares digests. Each is also refused three ways: a wrong token, another cluster's CA, and a scoped token pushing outside its namespace.
+
+Setting that up honestly took more thought than the tests did. docker treats every registry on `127.0.0.0/8` as insecure. It skips the certificate check and falls back to plaintext, which would hide exactly the failure we wanted to catch. So the tests can't use `localhost`. `scripts/standard-clients-host.sh --provision` maps `pickle-clients.test` to the machine's own LAN address in `/etc/hosts`, and each test issues a node certificate with that name, listens on that address, and drops its root CA into `/etc/docker/certs.d/<host:port>/ca.crt` (or the podman equivalent) for the length of the test.
+
+That last step is a nice excuse for `Drop`. The test holds a `TrustedCa` value, and Rust runs its `drop` method when the value goes out of scope, panic or no panic:
+
+```rust
+impl Drop for TrustedCa {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+```
+
+A C programmer would write a `goto cleanup`; Go has `defer`. Here the cleanup belongs to the type, so no test can forget it. A failed assertion unwinds the stack, every value on it is dropped, and the CA leaves `certs.d` either way.
+
+How do you prove a pull downloaded the layers rather than finding them in a local cache? Ask the server. The test wraps Pickle's router in one more `from_fn` layer that records every successful blob `GET` into an `Arc<Mutex<Vec<String>>>`. The mutex is `std::sync::Mutex`, not tokio's: the critical section is a single `push`, and nothing awaits while holding it. podman pulls into a second, empty image store. docker deletes the image and prunes its build cache first. Then each test asserts that every layer digest shows up in the log.
+
+docker found two bugs, and neither was one we were looking for.
+
+The first showed up only on CI's docker 28, which still uses the classic image store and pushes Docker's own schema 2 manifest, not an OCI one. Pickle stored it faithfully and then served it back as `application/vnd.oci.image.manifest.v1+json`, because the code that picked a `Content-Type` only knew two answers: an OCI index or an OCI manifest. docker compares the header with the `mediaType` inside the body and refused the pull: `mediaType in manifest should be 'application/vnd.oci.image.manifest.v1+json' not 'application/vnd.docker.distribution.manifest.v2+json'`. The push had worked. The pull of the very same image didn't. Now a manifest that names its own media type is served as that type, and `a_docker_schema_2_manifest_is_served_as_its_own_media_type` pins it for `GET` and `HEAD`.
+
+The second needed docker 29. With the containerd image store, docker 29 opens an upload for every blob of the image at once and streams them in parallel. Our little image was enough to fill all four of Pickle's write slots. The next request got a 429, and docker didn't retry it: the whole image failed with `unexpected status ... 429 Too Many Requests`. The slots were there to bound memory, not to turn clients away. A request waiting for a slot hasn't read its body, so it holds a socket and nothing else. So admission now waits:
+
+```rust
+match tokio::time::timeout(WRITE_ADMISSION_WAIT, writers.acquire_owned()).await {
+    Ok(Ok(permit)) => Some(permit),
+    Ok(Err(_)) | Err(_) => { /* 429 with Retry-After: 1, as before */ }
+}
+```
+
+`acquire_owned` returns a future that resolves when a permit frees up. `tokio::time::timeout` races it against a one-minute clock and gives back `Err(Elapsed)` if the clock wins. The inner `Result` is the semaphore's own: it fails only if someone closes the semaphore, which nobody does, but the type says it can happen, so the `match` handles it. The unit test `an_excess_writer_waits_for_a_free_slot_instead_of_failing` holds all four slots with uploads whose bodies never arrive, starts a fifth, then frees one slot and checks the fifth is admitted. It uses `#[tokio::test(start_paused = true)]`, so the minute-long timeout in its sibling test takes no wall-clock time at all.
+
+The rest were already right, and now there are tests to keep them that way. docker's anonymous `GET /v2/` gets the `Basic` challenge and an OCI error body. It now also gets `Docker-Distribution-API-Version: registry/2.0`, which the spec asks for and docker reads to tell a v2 registry from anything else. A blob `HEAD` returns the digest and the real length. And when skopeo copies an image between two repositories, it offers a cross-repository mount (`POST …/blobs/uploads/?mount=<digest>&from=<repo>`). Pickle doesn't mount. It answers `202` with an ordinary upload location, which the spec allows, and skopeo uploads the bytes instead. All three have portable tests next to the client ones, so you don't need docker installed to break them.
+
+oras speaks the same API, but nothing runs it, so the manual calls it untested. A claim you haven't checked belongs in the docs as a guess.
+
 The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients need a TLS listener, which a cluster node with an identity has and a plaintext node doesn't. Node certificates name the node rather than an address, so a hostname-verifying client has to reach the registry by the node's name and trust the cluster root CA. And a loopback-only TLS listener answers docker's anonymous probe with 200, so docker never learns to send credentials there. Clustered listeners are routable, so that last one only bites hand-built setups.
 
 Opening the door to docker also showed us who else could walk through it. The Basic middleware makes every client take the bearer path, and the bearer path checked the token's role but never its scope, so a Deployer scoped to one namespace could push to any repository. Repositories now map to namespaces (`team-a/web` belongs to `team-a`), and a scoped token can only push and pull inside its own. Chapter 10 has the rule and the awkward cases, like what a bare `web` belongs to.
@@ -1082,6 +1221,112 @@ Queuing costs little. Builds are rare, each stage still has its timeout, and the
 
 A `RUN` step that fetches packages makes Buildah (netavark, on Ubuntu 24.04) create a `podman0` bridge on `10.88.0.0/16` with firewall rules of its own. We read our nftables code to see whether the two collide. They don't, in the ways that matter. The perimeter firewall lives in its own tables, filters only the `input` hook with an `accept` policy, and deletes only its own tables when it reloads. Container networking masquerades `10.0.0.0/8`, which covers Buildah's range too, and a second masquerade is harmless. A build step that tries to reach the node's API or registry comes from `10.88.x.x`, which the perimeter treats as a stranger. One node in 256 draws a container subnet inside `10.88.0.0/16`, but every Reliaburger container has its own `/32` route, so traffic still finds it. So we left Buildah's network alone, and the manual suggests `RUN --network=none` for steps that don't need it, as the burger's Dockerfile does.
 
+## Copies that can still answer
+
+The 0.2.0 audit asked a simple question: push an image, let heal copy it to a second node, then lose that node for good. What happens?
+
+Nothing happened, and that was the problem. Heal counted the holders Raft had recorded, {A, B}, which met `redundancy = 2`, so it did nothing. `relish wtf` counted the same sets and reported zero under-replicated layers. A dead node left a holder set only through a GC approval or a repository retirement, and a dead node proposes neither. Lose A as well, and the image was gone without a single warning on the way.
+
+The fix is a definition. An image's **effective holders** are the recorded holders that are live right now: Alive or Suspect in gossip. Suspect still counts, because a node that missed a few probes is usually back a moment later, and copying everything it holds every time it hiccups would be a storm of its own. Dead and Left don't count.
+
+```rust
+pub fn effective_holders(&self, digest: &str, live: &BTreeSet<u64>) -> BTreeSet<u64> {
+    self.layer_locations
+        .iter()
+        .find(|(d, _)| d == digest)
+        .map(|(_, holders)| holders.intersection(live).copied().collect())
+        .unwrap_or_default()
+}
+```
+
+`intersection` doesn't build a set. It returns an iterator that walks both sorted sets together and yields *references* to the shared elements, `&u64`. `.copied()` turns each `&u64` into a `u64` (fine for any `Copy` type), and `collect` builds the new `BTreeSet` because that's the return type. In Go you'd write the loop by hand; in Python, `a & b`. Rust gives you the lazy version and lets the type decide what to build.
+
+Notice what the function *doesn't* do: read membership. The live set comes in as an argument. `plan_heal`, the capability count and `lost_images` all take it the same way, so they stay pure functions of the catalogue and a set of numbers, and the tests that prove them need no gossip at all. `plan_heal_ignores_holders_that_are_not_live` builds a catalogue where node 2 holds a copy, leaves node 2 out of the live set, and checks that heal now wants another copy. The caller, `live_registry_nodes`, owns the one decision about which gossip states count. Decommissioning a node goes further and removes it from every holder set in the same Raft entry that retires it.
+
+Once you count live copies, *Lost* falls out almost for free. The design doc always promised it and nothing implemented it: an image is lost when some blob it needs has no effective holder. The capability evidence lists lost images by `repository:tag`, `relish wtf` turns them into a critical finding, `relish status` prints a line, and a pull fails with `image … is lost: no live node holds 1 of its blobs; re-push it` instead of a generic transfer error. Nothing can repair a lost image, so the useful thing is to say so plainly and say what to do.
+
+### The leader plans, the nodes copy
+
+Heal had a second habit the audit didn't like: it pulled every missing layer onto the *leader* and pushed onwards from there. With `redundancy = 2` that made the leader a holder of every image in the cluster. It filled its `max_storage` first, and from then on every heal failed at the pull step while the followers had room to spare.
+
+Now the leader only plans. It picks targets among live nodes without a full copy, putting itself last, and sends each one `POST /v2/<name>/replicas/<digest>` with the holders it may copy from. The target pulls each blob straight from a holder, checks every digest, and confirms its own copy through Raft, the same `ConfirmImageCopy` a deploy's pull uses. The leader copies only when it's the chosen target. The route answers only the cluster's service principal, so nobody outside the cluster can point a node at an arbitrary URL. `heal_copies_from_holder_to_target_without_the_leader` runs three registries and counts the requests the leader's registry receives: zero.
+
+### An image leaves by losing its tags
+
+The other audit finding was worse because it was slow. Pushing `:latest` again moved the tag and left the old manifest in the catalogue with no tags. Nothing ever removed it. The GC arbiter refused every blob a catalogued manifest referenced, so only abandoned uploads were ever reclaimed, and `gc_retain_days` (measured from the push, of all things) did nothing. A CI job pushing a few times a day would fill the disk until every push, pull and heal copy got a 413.
+
+We considered declaring "no image deletion before 1.0" and documenting disk sizing. That would have been honest, and useless to anyone running CI against the cluster. So 0.2.1 adds expiry:
+
+1. When a manifest loses its last tag (a tag moved, or someone ran `relish images delete web:v1`, which is the OCI `DELETE /v2/web/manifests/v1`), the catalogue records `untagged_at`. The time travels inside the Raft entry: the new push's timestamp, or the leader's clock stamped before proposing a deletion. A replica applying the entry never reads its own clock, because `apply` must produce the same state on every node.
+2. Once a manifest has been untagged for `gc_retain_days`, the leader proposes `ExpireManifest`. The state machine checks again *at apply time*: still untagged since that exact moment, not pinned by any app or job in desired state, not a platform of a multi-platform index that's still catalogued. If any of that changed between the plan and the commit, the entry is refused and nothing moves.
+3. Expiry drops the holder records of blobs nothing else references, and the existing two-phase GC reclaims them on every node.
+
+Step 3's holder records are the subtle part. The arbiter never approves deleting a blob's last advertised holder. Leave the records in place after expiry and one copy of every expired blob survives forever, which is exactly the leak we set out to fix.
+
+"Pinned" needed one more fix of its own. Apply binds tags to digests, so a running instance reports its image as `web:v1@sha256:…`. The GC's active-image check compared that string with `web:v1` and with a bare digest, and never matched either. `image_pin_digest` reads the digest out properly:
+
+```rust
+pub fn image_pin_digest(image: &str) -> Option<&str> {
+    image
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+        .filter(|digest| is_digest_tag(digest))
+}
+```
+
+`rsplit_once` splits at the *last* `@` and gives back `Option<(&str, &str)>`, both halves borrowed from `image`: no allocation, and the lifetime in the signature says the result lives as long as the input does. `map` keeps the right half, and `filter` turns an `Option` into `None` when the predicate fails, so a reference with a stray `@` but no digest pins nothing.
+
+Deleting by digest answers `405 UNSUPPORTED`. The OCI spec allows a registry to refuse, and refusing keeps one rule: an image leaves by losing its tags, and only after the retention window. That window is your undo. An untagged image stays pullable by digest for a week by default, and `relish rollback` can still reach it.
+
+### A plaintext cluster has no registry
+
+While building all this we kept seeing one line in the upgrade fixture's logs, once a second, forever: `pickle: registry cleanup pending: replication failed: registry leader refused proposal: 403 Forbidden`. A missing token? No. The fixture runs a cluster with a master key but no node certificates, like every `relish dev` cluster did back then. A node sends its registry proposals and queries to the leader's `/v1/registry/propose` and `/v1/registry/query`, and the leader works out *which node is asking* from the TLS client certificate. No certificate, no answer. The lease reaper asks every second, so it got refused every second.
+
+We had three ways out. Accept the service token alone on plaintext clusters, and any holder of the token could claim to be any node and report copies it doesn't have. Have the leader answer its own queries locally, and the followers stay broken. Or keep the endpoints mTLS-only and say so clearly. We took the last one. A plaintext cluster is a development convenience, and a registry that trusts whoever claims to be node 3 isn't something we want to grow a second code path for.
+
+Saying so clearly turned out to be most of the work. The forwarder already knows its transport, so it refuses before sending anything:
+
+```rust
+pub fn requires_mtls(&self) -> bool {
+    #[cfg(test)]
+    if self.plaintext_stand_in {
+        return false;
+    }
+    self.http.scheme() != "https"
+}
+```
+
+`#[cfg(test)]` isn't only for whole modules. It can sit on a struct field, a statement or an `if`, and the compiler drops whatever it marks from a normal build, so production code has no way to switch the check off. The unit tests that drive the forwarder against a plaintext stand-in for the leader (an axum handler that takes no certificate) opt in with `against_plaintext_stand_in()`.
+
+Every proposal and query on a plaintext cluster now ends in `PickleError::RegistryNeedsMtls`, whose message names the fix: start the cluster with TLS, `relish init` then `relish join`. A push answers 503 with that text, `relish status` prints `registry: needs mTLS`, and `relish wtf` raises one `registry-needs-mtls` warning listing the nodes, rather than one per node.
+
+That leaves the once-a-second log line. The reaper keeps running (a transient leader loss should still clear itself up), but it logs through a small struct that remembers the last thing it said:
+
+```rust
+pub fn record(&mut self, result: &Result<(), PickleError>) -> Option<String> {
+    match result {
+        Ok(()) => self
+            .last
+            .take()
+            .map(|_| "pickle: registry cleanup resumed".to_string()),
+        Err(error) => {
+            let line = format!("pickle: registry cleanup pending: {error}");
+            if self.last.as_ref() == Some(&line) {
+                return None;
+            }
+            self.last = Some(line.clone());
+            Some(line)
+        }
+    }
+}
+```
+
+`Option::take` moves the value out and leaves `None` behind, in one step. It's how you empty an `Option` you only borrow mutably: the borrow checker won't let you move out of `&mut self` and leave a hole, so `take` swaps in a valid value as it goes. `as_ref` turns `&Option<String>` into `Option<&String>`, so the comparison borrows instead of cloning. A new problem prints, a repeat prints nothing, and the first success afterwards prints once. `plaintext_cluster_registry_cleanup_is_refused_once_with_the_mtls_answer` serves the real Bun API without TLS, counts the requests it receives, runs six reaper ticks and checks for exactly one line and zero requests. Over mTLS, `worker_and_follower_pushes_commit_through_the_advertised_leader` runs the same tick and watches the retirement apply.
+
+That left one awkward consequence. Pickle is also the pull-through cache for Docker Hub, and the image store asks it first for every short name such as `nginx:1.27`. On a plaintext cluster that question fails with "the registry needs mTLS", and nothing falls back to Docker Hub directly. So a plaintext cluster with a container runtime couldn't run short-name images at all, and `relish dev` clusters were plaintext.
+
+We could have added the fallback on plaintext clusters only. We didn't (#870). The no-fallback rule exists so a cluster never quietly bypasses its own cache and image policy, and a rule with an "except when security is off" clause is a strange rule. We fixed the cause instead: clusters are mTLS by default now (chapter 4 has the details), `relish dev create` enrols every VM, and plaintext survives only as the explicit `relish init --development-plaintext`. On such a cluster you name the registry host in full (`ghcr.io/...`), or you don't use short names.
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.
@@ -1093,7 +1338,7 @@ The 104 tests in `src/pickle/` cover:
 - **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
 - **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
 - **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
-- **Standard clients** — a Deployer token as a Basic password over TLS pushes (`deployer_token_as_basic_password_over_tls_may_push`), a ReadOnly one is forbidden, an unknown one gets a 401 with a fresh `Basic` challenge, and a valid token over plaintext is still refused (`basic_credentials_over_plaintext_are_refused_even_with_a_valid_token`). `tests/suite/registry_standard_clients.rs` repeats the push through the real TLS listener, and its ignored `crane` test runs with `cargo nextest run --test suite --run-ignored=only -E 'test(crane)'` on a machine with crane installed.
+- **Standard clients** — a Deployer token as a Basic password over TLS pushes (`deployer_token_as_basic_password_over_tls_may_push`), a ReadOnly one is forbidden, an unknown one gets a 401 with a fresh `Basic` challenge, and a valid token over plaintext is still refused (`basic_credentials_over_plaintext_are_refused_even_with_a_valid_token`). `tests/suite/registry_standard_clients.rs` repeats the push through the real TLS listener and pins what docker relies on: the anonymous probe's challenge and version header, `HEAD` on a blob, and the mount fallback. Its ignored tests run real docker, podman, skopeo and crane with `make test-standard-clients` on a Linux host prepared by `scripts/standard-clients-host.sh`.
 - **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/suite/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
 - **Multi-platform builds** — fake OCI layouts written by the tests drive `read_oci_layout` (an index lists every platform; a missing, platformless or nested entry is refused) and `check_exported_platforms` (`an_export_missing_a_requested_platform_fails` is the original bug), and `drop_foreign_platform_variants` (`a_builder_stage_variant_is_dropped_from_the_foreign_architecture` is the Buildah one). `registry_routable_push::a_multi_platform_layout_publishes_every_platform` uploads a two-platform layout to a real registry and pulls each platform by digest, and `pickle_cluster::a_multi_platform_image_pulls_the_nodes_own_platform` pulls the same image as an amd64 node and as an arm64 one. The gated `buildah_build_lands_in_the_catalog` runs the real Buildah on CI's privileged Linux job and checks the index, both platform manifests, and that no containers or images stay behind.
 
@@ -1116,10 +1361,11 @@ An explicitly requested suite asserts its prerequisites and fails if they are mi
 never returns early and appears green without running. Chapter 15 explains the distinction
 between `#[cfg]`, `#[ignore]` and an executed test in detail.
 
-For an end-to-end smoke test of a real push and pull through Pickle on macOS:
+For an end-to-end push and pull with real clients, on Linux:
 
 ```sh
-make pickle-test-macos    # push/pull a real Docker image through Pickle (needs Docker Desktop)
+sudo scripts/standard-clients-host.sh --provision   # once per machine
+make test-standard-clients                          # docker, podman, skopeo, crane
 ```
 
 ### Running them
@@ -1142,6 +1388,8 @@ A registry request used to call the synchronous Argon2 verifier directly. The to
 Pickle now uses the same asynchronous verifier as the API and browser login. It rejects malformed tokens before hashing, waits for one of four process-wide permits, and runs the expensive verification with `spawn_blocking`. A permit is a borrowed place in that shared budget; holding it inside the blocking closure keeps the place occupied until the hash really finishes, even if the HTTP caller disconnects.
 
 The regression holds every verification permit and sends real registry reads and uploads, with both Bearer and TLS Basic credentials. Each request waits until admission opens, while malformed credentials return 401 immediately. Role and repository scope checks still happen after authentication. A different HTTP port doesn't buy a second CPU budget.
+
+In 0.2.1 the budget itself went away: API tokens are stored as SHA-256 digests rather than Argon2id hashes (Chapter 4 says why), so a verification takes microseconds and runs inline. What's left of this section is the part that mattered most. The registry still calls the same `sesame::auth::authenticate` as the API, so malformed credentials are refused before any hashing, and `registry_reads_and_writes_authenticate_bearer_and_basic_credentials` checks that Bearer and Basic both work on reads and uploads.
 
 ### A shared digest needs repository authority
 
@@ -1230,8 +1478,8 @@ uploads and repository authority receipt payloads, including atomic-write copies
 It also limits the directory to 65,536 payload files, which bounds empty uploads
 and small receipts. This is a payload-byte policy, not filesystem block
 allocation. Unpacked root filesystems, catalogue files and filesystem overhead
-need their own disk capacity. Logical per-repository limits remain a separate
-policy.
+need their own disk capacity. There's no per-repository limit: expiry (below)
+is what keeps the store from filling.
 
 The tests fill the cap with bare blobs, reject a chunk before it grows the disk,
 race two upload reservations, restart with existing payloads, and hide an upload

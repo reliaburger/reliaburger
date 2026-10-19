@@ -1,0 +1,14 @@
+{
+  "source_commit": "ed87f20b5f73b754fce0427261a03c14705d1cfe",
+  "portable_gate": "6177 Rust tests, 2 doctests, 355 Python tests (7 Linux-only skips), both strict lint modes and ignored-owner reasons passed before commit",
+  "cluster_gate": "46 passed in 403.607s with fresh TMPDIR; failed fixed-directory and isolated retry receipts retained",
+  "native_gate": "Earlier native runtime/recovery gate and actual Linux protocol discovery are retained; implementation unchanged by the planner-only follow-through",
+  "fixture_limitation": "Existing cluster helper ignores failed fixed-directory removal; mounted identity tmpfs retained stale Raft state on the isolated retry. Clean roots avoid reuse without modifying tests or their deadlines.",
+  "final_review_checks": {
+    "integrated_main": "b2affe936dfef400aa38156b1c6d9c0d71918d11",
+    "portable": "6178 passed, 2 doctests, 355 Python checks (7 Linux-only skips), both strict lint modes; final-macos-ci.log",
+    "linux_lint": "Both strict modes passed; final-linux-lint.log",
+    "runtime": "src/build/Cargo production code remains identical to frozen ed87; future example report label corrects fresh OCI PID-policy metadata; no measurement rewritten",
+    "focused_native_gate": "2 passed on final integrated tree in 1.533s; final-native-gate.log; make test-linux narrowed to cgroup_host_ cases, no image mirror needed"
+  }
+}

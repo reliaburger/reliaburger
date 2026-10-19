@@ -2,7 +2,7 @@
 #
 # This app runs a host binary directly (no container image needed).
 # The binary must be in the node's process_workloads.allowed_binaries
-# list, or the allowlist must be empty (allow all).
+# list: host execution is deny-by-default, so an empty list allows nothing.
 #
 # Deploy: relish apply examples/phase-8/proc-exec-app.toml
 

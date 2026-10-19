@@ -56,10 +56,20 @@ impl IngressHarness {
         let shutdown = CancellationToken::new();
 
         let grill = ProcessGrill::new();
-        let port_allocator = PortAllocator::new(range_start, range_end);
+        // The test app already listens on the port the "container" gets.
+        let port_allocator = PortAllocator::new(range_start, range_end).without_host_probe();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // The process runtime runs host workloads only (#914): fixture apps are
+        // `script` apps through `/bin/sh`.
+        agent.set_process_config(
+            reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                ..Default::default()
+            },
+        );
 
         // The proxy shares the routing table the agent rebuilds on deploys.
         let routing_table = agent.routing_table_handle();
@@ -173,7 +183,7 @@ async fn ingress_routes_request_to_healthy_backend() {
     let config = Config::parse(&format!(
         r#"
         [app.web]
-        image = "test:v1"
+        script = "exec sleep 86400"
         port = {}
 
         [app.web.ingress]
@@ -214,7 +224,7 @@ async fn ingress_returns_502_when_backend_unreachable() {
     let config = Config::parse(
         r#"
         [app.dead]
-        image = "test:v1"
+        script = "exec sleep 86400"
         port = 1
 
         [app.dead.ingress]
@@ -237,7 +247,7 @@ async fn ingress_rate_limit_returns_429_with_retry_after() {
     let config = Config::parse(&format!(
         r#"
         [app.api]
-        image = "test:v1"
+        script = "exec sleep 86400"
         port = {}
 
         [app.api.ingress]
@@ -318,7 +328,7 @@ async fn ingress_reframes_chunked_backend_response() {
     let config = Config::parse(&format!(
         r#"
         [app.chunk]
-        image = "test:v1"
+        script = "exec sleep 86400"
         port = {port}
 
         [app.chunk.ingress]
@@ -366,7 +376,7 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
     let config = Config::parse(&format!(
         r#"
         [app.ws]
-        image = "test:v1"
+        script = "exec sleep 86400"
         port = {port}
 
         [app.ws.ingress]
@@ -428,7 +438,7 @@ async fn ingress_serves_https_with_self_signed_cert() {
     let config = Config::parse(&format!(
         r#"
         [app.secure]
-        image = "test:v1"
+        script = "exec sleep 86400"
         port = {}
 
         [app.secure.ingress]

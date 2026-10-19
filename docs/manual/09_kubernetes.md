@@ -43,7 +43,11 @@ From the pod template it takes the first container's image, `command`, `args`,
 The report warns about everything it approximates or drops. The usual ones:
 
 - sidecars: only the first container is imported;
-- pod volumes and `fsGroup`: declare Reliaburger volumes instead;
+- pod volumes and `fsGroup`: declare Reliaburger volumes instead. A `hostPath`
+  volume gets a warning of its own, because its replacement, a hand-written
+  `source`, needs the `host-exec` permission and a `[storage]
+  allowed_host_paths` entry on every node that runs it (see
+  `images-and-volumes`);
 - `livenessProbe`, and `exec`, `tcpSocket` or gRPC readiness probes;
 - `env` from `valueFrom`: set the value, or encrypt it with
   `relish secret encrypt` (see `security`);
@@ -68,4 +72,7 @@ relish import -f deployment.yaml --strict      # non-zero exit on any warning
 DaemonSets), Services, Ingresses, HPAs, Jobs, CronJobs and Namespaces as
 multi-document YAML. It reports what it can't express: firewall and egress
 rules, process workloads, `run_before`, and for now health checks, metrics,
-volumes, init containers, config files and placement.
+volumes, init containers, config files and placement. A `runtime = "process"`
+job produces no Job at all, since Kubernetes needs an image. A
+`runtime = "shared-runc"` job becomes an ordinary Job, which starts a fresh Pod
+for every attempt.

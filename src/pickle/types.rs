@@ -227,12 +227,69 @@ pub struct GcReport {
 }
 
 /// Delete a tag from the manifest catalog.
+///
+/// The manifest it pointed at stays in the catalogue, untagged, until
+/// [`ExpireManifest`] removes it after the retention window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeleteTag {
     /// Repository name.
     pub repository: String,
     /// Tag to delete.
     pub tag: String,
+    /// When the tag was deleted, in Unix milliseconds. Carried in the Raft
+    /// entry (the leader stamps it) so every replica records the same
+    /// untagging time.
+    pub deleted_at_unix_ms: u64,
+}
+
+/// Remove one untagged manifest from the catalogue once it has been
+/// untagged for longer than `[images] gc_retain_days`.
+///
+/// The leader proposes it; the state machine rechecks everything at apply
+/// time, so a manifest tagged again, or pinned by an app or job, survives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireManifest {
+    /// Repository holding the manifest.
+    pub repository: String,
+    /// The manifest's content digest.
+    pub digest: Digest,
+    /// The untagging time the leader saw when it planned expiry. Apply
+    /// refuses if the manifest was tagged or untagged again since.
+    pub untagged_at_unix_ms: u64,
+}
+
+/// Whether a catalogue "tag" is really a digest. Pushing by digest
+/// (`PUT /v2/<name>/manifests/sha256:…`) records the digest in the tag
+/// position, and a platform manifest of a multi-platform image only ever
+/// has one of these. Such a manifest counts as untagged.
+pub fn is_digest_tag(tag: &str) -> bool {
+    tag.starts_with("sha256:")
+}
+
+/// The digest an image reference pins, if any: `web:v1@sha256:…` and
+/// `localhost:5050/web@sha256:…` both pin `sha256:…`; `web:v1` pins nothing.
+pub fn image_pin_digest(image: &str) -> Option<&str> {
+    image
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
+        .filter(|digest| is_digest_tag(digest))
+}
+
+/// Unix milliseconds for a time, zero before the epoch.
+pub fn unix_millis(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Whether a manifest carries at least one real (non-digest) tag.
+fn has_real_tag(manifest: &ImageManifest) -> bool {
+    manifest.tags.iter().any(|tag| !is_digest_tag(tag))
+}
+
+/// The key of a manifest's untagging time: `repository@digest`.
+fn untagged_key(repository: &str, digest: &str) -> String {
+    format!("{repository}@{digest}")
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +342,11 @@ pub struct ManifestCatalog {
     pub tags: Vec<(String, String)>,
     /// Layer→holders mappings. Key is digest string, value is set of node IDs.
     pub layer_locations: Vec<(String, BTreeSet<u64>)>,
+    /// When each untagged manifest lost its last real tag, in Unix
+    /// milliseconds, keyed `repository@digest`. Expiry counts
+    /// `gc_retain_days` from here, not from the push.
+    #[serde(default)]
+    pub untagged_at: BTreeMap<String, u64>,
 }
 
 impl ManifestCatalog {
@@ -441,6 +503,15 @@ impl ManifestCatalog {
                 .cloned()
                 .collect(),
             layer_locations: Vec::new(),
+            untagged_at: self
+                .untagged_at
+                .iter()
+                .filter(|(key, _)| {
+                    key.rsplit_once('@')
+                        .is_some_and(|(name, _)| name == repository)
+                })
+                .map(|(key, at)| (key.clone(), *at))
+                .collect(),
         };
         let referenced = view.referenced_digest_set();
         view.layer_locations = self
@@ -450,19 +521,6 @@ impl ManifestCatalog {
             .cloned()
             .collect();
         view
-    }
-
-    /// Logical stored image sizes used by repository and aggregate quota admission.
-    pub fn stored_sizes(&self, repository: &str) -> (u64, u64) {
-        let mut repository_bytes = 0u64;
-        let mut total_bytes = 0u64;
-        for (_, manifest) in &self.manifests {
-            total_bytes = total_bytes.saturating_add(manifest.total_size);
-            if manifest.repository == repository {
-                repository_bytes = repository_bytes.saturating_add(manifest.total_size);
-            }
-        }
-        (repository_bytes, total_bytes)
     }
 
     /// Look up shared content by digest, without selecting repository metadata.
@@ -526,12 +584,19 @@ impl ManifestCatalog {
         // A pull may already have verified and pinned the old digest. Moving
         // its tag must not discard the metadata needed to finish that pull.
         self.tags.retain(|(key, _)| key != &tag_key);
-        for (_, manifest) in self
+        // The push time travels in the Raft entry, so every replica records
+        // the same untagging time for a manifest that loses its last tag.
+        let committed_at = unix_millis(commit.manifest.pushed_at);
+        for (digest, manifest) in self
             .manifests
             .iter_mut()
             .filter(|(_, manifest)| manifest.repository == commit.manifest.repository)
         {
-            manifest.tags.remove(&commit.tag);
+            if manifest.tags.remove(&commit.tag) && !has_real_tag(manifest) {
+                self.untagged_at
+                    .entry(untagged_key(&manifest.repository, digest))
+                    .or_insert(committed_at);
+            }
         }
         self.tags.push((tag_key, digest_str.clone()));
 
@@ -544,6 +609,19 @@ impl ManifestCatalog {
             manifest.tags = BTreeSet::from([commit.tag.clone()]);
             manifest.signature = signature;
             self.manifests.push((digest_str.clone(), manifest));
+        }
+        let key = untagged_key(&commit.manifest.repository, &digest_str);
+        if is_digest_tag(&commit.tag) {
+            // Pushed by digest only: untagged from the moment it arrives,
+            // unless it already carries a real tag.
+            let tagged = self
+                .get_repository_manifest(&commit.manifest.repository, &digest_str)
+                .is_some_and(has_real_tag);
+            if !tagged {
+                self.untagged_at.entry(key).or_insert(committed_at);
+            }
+        } else {
+            self.untagged_at.remove(&key);
         }
 
         // Update holder locations for everything this tag pins — the
@@ -697,6 +775,10 @@ impl ManifestCatalog {
         let prefix = format!("{repository}:");
         self.tags
             .retain(|(reference, _)| !reference.starts_with(&prefix));
+        self.untagged_at.retain(|key, _| {
+            key.rsplit_once('@')
+                .is_none_or(|(name, _)| name != repository)
+        });
         let referenced = self.referenced_digest_set();
         // Otherwise the normal last-copy guard would preserve unreferenced test
         // bytes forever. This changes metadata only; blob GC still rechecks refs.
@@ -756,32 +838,202 @@ impl ManifestCatalog {
         found
     }
 
-    /// Apply a DeleteTag.
-    pub fn apply_delete_tag(&mut self, delete: &DeleteTag) {
+    /// Apply a DeleteTag: remove the tag and, when the manifest has no real
+    /// tag left, start its expiry clock. The manifest itself stays, still
+    /// pullable by digest, until [`Self::apply_expire_manifest`] removes it.
+    ///
+    /// Returns whether the tag existed.
+    pub fn apply_delete_tag(&mut self, delete: &DeleteTag) -> bool {
         let tag_key = format!("{}:{}", delete.repository, delete.tag);
-
-        // Find the digest this tag pointed to
-        let digest = self
+        let Some(digest_str) = self
             .tags
             .iter()
             .find(|(k, _)| k == &tag_key)
-            .map(|(_, v)| v.clone());
-
-        // Remove the tag
+            .map(|(_, v)| v.clone())
+        else {
+            return false;
+        };
         self.tags.retain(|(k, _)| k != &tag_key);
-
-        if let Some(digest_str) = digest {
-            for (_, manifest) in self.manifests.iter_mut().filter(|(digest, manifest)| {
-                digest == &digest_str && manifest.repository == delete.repository
-            }) {
-                manifest.tags.remove(&delete.tag);
+        for (digest, manifest) in self.manifests.iter_mut().filter(|(digest, manifest)| {
+            digest == &digest_str && manifest.repository == delete.repository
+        }) {
+            if manifest.tags.remove(&delete.tag) && !has_real_tag(manifest) {
+                self.untagged_at
+                    .entry(untagged_key(&manifest.repository, digest))
+                    .or_insert(delete.deleted_at_unix_ms);
             }
-            self.manifests.retain(|(digest, manifest)| {
-                digest != &digest_str
-                    || manifest.repository != delete.repository
-                    || !manifest.tags.is_empty()
-            });
         }
+        true
+    }
+
+    /// When a manifest lost its last real tag, if it has none now.
+    pub fn untagged_since(&self, repository: &str, digest: &Digest) -> Option<u64> {
+        self.untagged_at
+            .get(&untagged_key(repository, digest.as_str()))
+            .copied()
+    }
+
+    /// The manifests the leader should propose to expire at `now_unix_ms`:
+    /// untagged for at least `retain`, and not refused by any of the checks
+    /// [`Self::apply_expire_manifest`] makes. `pinned` holds every digest an
+    /// app or job in desired state pins.
+    pub fn expirable_manifests(
+        &self,
+        now_unix_ms: u64,
+        retain: std::time::Duration,
+        pinned: &std::collections::HashSet<String>,
+    ) -> Vec<ExpireManifest> {
+        let retain_ms = u64::try_from(retain.as_millis()).unwrap_or(u64::MAX);
+        self.manifests
+            .iter()
+            .filter_map(|(digest, manifest)| {
+                let untagged_at = *self
+                    .untagged_at
+                    .get(&untagged_key(&manifest.repository, digest))?;
+                (now_unix_ms.saturating_sub(untagged_at) >= retain_ms).then(|| ExpireManifest {
+                    repository: manifest.repository.clone(),
+                    digest: manifest.digest.clone(),
+                    untagged_at_unix_ms: untagged_at,
+                })
+            })
+            .filter(|expire| self.expiry_refusal(expire, pinned).is_none())
+            .collect()
+    }
+
+    /// Why this manifest must not expire now, or `None` when it may.
+    fn expiry_refusal(
+        &self,
+        expire: &ExpireManifest,
+        pinned: &std::collections::HashSet<String>,
+    ) -> Option<&'static str> {
+        let digest = expire.digest.as_str();
+        let Some(manifest) = self.get_repository_manifest(&expire.repository, digest) else {
+            return Some("manifest no longer exists");
+        };
+        if has_real_tag(manifest) {
+            return Some("manifest is tagged");
+        }
+        if self.untagged_since(&expire.repository, &expire.digest)
+            != Some(expire.untagged_at_unix_ms)
+        {
+            return Some("manifest was tagged or untagged again since expiry was planned");
+        }
+        if pinned.contains(digest) {
+            return Some("an app or job pins this image");
+        }
+        // A platform manifest stays while its multi-platform index is
+        // catalogued: the index names it, and a pull resolves through it.
+        let in_index = self.manifests.iter().any(|(_, index)| {
+            index.repository == expire.repository
+                && index.is_index()
+                && index.digest != expire.digest
+                && index
+                    .layers
+                    .iter()
+                    .any(|entry| entry.digest.as_str() == digest)
+        });
+        if in_index {
+            return Some("manifest is a platform of a catalogued image index");
+        }
+        None
+    }
+
+    /// Apply an ExpireManifest: recheck that the manifest is still untagged
+    /// since the same moment, not pinned (`pinned` holds every digest an
+    /// app or job in desired state pins) and not a platform of a catalogued
+    /// index, then remove it.
+    ///
+    /// Blobs no other manifest references lose their holder records too, the
+    /// way repository retirement drops them: otherwise the last-copy guard in
+    /// [`Self::apply_gc_report`] would keep one copy of each forever. The
+    /// two-phase GC then reclaims them as orphans.
+    pub fn apply_expire_manifest(
+        &mut self,
+        expire: &ExpireManifest,
+        pinned: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.expiry_refusal(expire, pinned) {
+            return Err(reason.to_string());
+        }
+        let digest = expire.digest.as_str();
+        let candidates: std::collections::HashSet<String> = self
+            .get_repository_manifest(&expire.repository, digest)
+            .map(|manifest| {
+                manifest
+                    .referenced_digests()
+                    .into_iter()
+                    .map(|digest| digest.0.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.manifests.retain(|(stored, manifest)| {
+            stored != digest || manifest.repository != expire.repository
+        });
+        self.untagged_at
+            .remove(&untagged_key(&expire.repository, digest));
+        let referenced = self.referenced_digest_set();
+        self.layer_locations
+            .retain(|(digest, _)| !candidates.contains(digest) || referenced.contains(digest));
+        Ok(())
+    }
+
+    /// Forget a node in every holder set: it was decommissioned, and its
+    /// copies will never serve again.
+    pub fn remove_node_holdings(&mut self, node_id: u64) {
+        for (_, holders) in &mut self.layer_locations {
+            holders.remove(&node_id);
+        }
+    }
+
+    /// The recorded holders of a blob that are live right now. `live` is the
+    /// set of nodes gossip reports Alive or Suspect (plus the caller itself).
+    pub fn effective_holders(&self, digest: &str, live: &BTreeSet<u64>) -> BTreeSet<u64> {
+        self.layer_locations
+            .iter()
+            .find(|(d, _)| d == digest)
+            .map(|(_, holders)| holders.intersection(live).copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether some blob this manifest pins has no live holder.
+    fn blob_lost(&self, manifest: &ImageManifest, live: &BTreeSet<u64>) -> bool {
+        manifest
+            .referenced_digests()
+            .into_iter()
+            .any(|digest| self.effective_holders(digest.as_str(), live).is_empty())
+    }
+
+    /// Every catalogued image that can no longer be pulled because some
+    /// blob it needs has no live holder (design §7.3, "Lost"). A
+    /// multi-platform image is lost when its index or any of its platforms
+    /// is. Names are `repository:tag` for each real tag, or
+    /// `repository@digest` for an untagged manifest; sorted, no duplicates.
+    pub fn lost_images(&self, live: &BTreeSet<u64>) -> Vec<String> {
+        let mut lost = BTreeSet::new();
+        for (digest, manifest) in &self.manifests {
+            let platform_lost = manifest.is_index()
+                && manifest.layers.iter().any(|entry| {
+                    entry.digest != manifest.digest
+                        && self
+                            .get_repository_manifest(&manifest.repository, entry.digest.as_str())
+                            .is_some_and(|platform| self.blob_lost(platform, live))
+                });
+            if !platform_lost && !self.blob_lost(manifest, live) {
+                continue;
+            }
+            let tags: Vec<&String> = manifest
+                .tags
+                .iter()
+                .filter(|tag| !is_digest_tag(tag))
+                .collect();
+            if tags.is_empty() {
+                lost.insert(format!("{}@{digest}", manifest.repository));
+            }
+            for tag in tags {
+                lost.insert(format!("{}:{tag}", manifest.repository));
+            }
+        }
+        lost.into_iter().collect()
     }
 }
 
@@ -869,6 +1121,26 @@ pub enum PickleError {
     DigestMismatch { expected: Digest, actual: Digest },
     #[error("replication failed: {0}")]
     ReplicationFailed(String),
+    /// The cluster runs plaintext transports, and the registry leader's
+    /// propose and query endpoints accept only mTLS node certificates
+    /// (#792), so this node can't forward or replicate registry state.
+    #[error(
+        "the registry needs mTLS: its leader accepts replication and forwarded queries only \
+         from nodes with a cluster certificate, and this cluster runs plaintext transports; \
+         start the cluster with TLS (`relish init`, then `relish join` on each node)"
+    )]
+    RegistryNeedsMtls,
+    /// No live node holds some blob the image needs (design §7.3): only a
+    /// fresh push brings it back.
+    #[error(
+        "image {repository}@{} is lost: no live node holds {missing} of its blobs; re-push it",
+        digest.as_str()
+    )]
+    ImageLost {
+        repository: String,
+        digest: Digest,
+        missing: usize,
+    },
     #[error("catalog persistence failed: {0}")]
     CatalogPersist(String),
     #[error("signature verification failed: {0}")]
@@ -1522,7 +1794,6 @@ mod tests {
             view.layer_holders(test_digest("shared").as_str()),
             BTreeSet::from([1, 2])
         );
-        assert_eq!(catalog.stored_sizes("rbtest-a/web"), (31744, 3 * 31744));
         let empty = catalog.repository_view("absent");
         assert!(
             empty.manifests.is_empty()
@@ -1679,12 +1950,20 @@ mod tests {
             assert_eq!(manifest.repository, repository);
             assert_eq!(manifest.tags, BTreeSet::from(["latest".into()]));
         }
-        // An operator/test tag deletion must retire only its repository's row.
+        // An operator/test tag deletion must untag only its repository's row.
         catalog.apply_delete_tag(&DeleteTag {
             repository: "rbtest-owned/app".into(),
             tag: "latest".into(),
+            deleted_at_unix_ms: 1,
         });
-        assert_eq!(catalog.manifests.len(), 1);
+        assert_eq!(
+            catalog.untagged_since("production/app", &ordinary.digest),
+            None
+        );
+        assert_eq!(
+            catalog.untagged_since("rbtest-owned/app", &ordinary.digest),
+            Some(1)
+        );
         let retained = catalog
             .get_manifest_by_tag("production/app", "latest")
             .unwrap();
@@ -1807,27 +2086,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_catalog_delete_tag_removes_manifest_when_no_tags() {
-        let mut catalog = ManifestCatalog::default();
-        let m = test_manifest("myapp", "mfst1");
-
-        catalog.apply_manifest_commit(&ManifestCommit {
-            observed_gc_generation: 0,
-            manifest: m.clone(),
-            tag: "latest".to_string(),
-            holder_nodes: BTreeSet::from([1]),
-        });
-
-        catalog.apply_delete_tag(&DeleteTag {
-            repository: "myapp".to_string(),
-            tag: "latest".to_string(),
-        });
-
-        assert!(catalog.get_manifest_by_tag("myapp", "latest").is_none());
-        assert!(catalog.get_manifest(m.digest.as_str()).is_none());
-    }
-
-    #[test]
     fn manifest_catalog_delete_tag_keeps_manifest_with_other_tags() {
         let mut catalog = ManifestCatalog::default();
         let m = test_manifest("myapp", "mfst1");
@@ -1848,11 +2106,14 @@ mod tests {
         catalog.apply_delete_tag(&DeleteTag {
             repository: "myapp".to_string(),
             tag: "latest".to_string(),
+            deleted_at_unix_ms: 1,
         });
 
         assert!(catalog.get_manifest_by_tag("myapp", "latest").is_none());
         assert!(catalog.get_manifest_by_tag("myapp", "v1.0").is_some());
         assert!(catalog.get_manifest(m.digest.as_str()).is_some());
+        // Still tagged, so no expiry clock.
+        assert_eq!(catalog.untagged_since("myapp", &m.digest), None);
     }
 
     #[test]
@@ -1999,5 +2260,327 @@ mod tests {
         let json = serde_json::to_string(&attach).unwrap();
         let decoded: AttachSignature = serde_json::from_str(&json).unwrap();
         assert_eq!(attach, decoded);
+    }
+
+    // -- #697: untagging, expiry, holder pruning and Lost --------------------
+
+    fn commit_at(catalog: &mut ManifestCatalog, manifest: &ImageManifest, tag: &str, at_ms: u64) {
+        let mut manifest = manifest.clone();
+        manifest.pushed_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(at_ms);
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest,
+            tag: tag.to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+    }
+
+    fn expire(repository: &str, digest: &Digest, untagged_at_unix_ms: u64) -> ExpireManifest {
+        ExpireManifest {
+            repository: repository.to_string(),
+            digest: digest.clone(),
+            untagged_at_unix_ms,
+        }
+    }
+
+    fn no_pins() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    #[test]
+    fn moving_a_tag_records_untagged_at() {
+        let mut catalog = ManifestCatalog::default();
+        let old = test_manifest("web", "old");
+        let new = test_manifest("web", "new");
+        commit_at(&mut catalog, &old, "latest", 1_000);
+        assert_eq!(catalog.untagged_since("web", &old.digest), None);
+
+        commit_at(&mut catalog, &new, "latest", 5_000);
+
+        // The time comes from the Raft entry (the new push), never from
+        // the applying node's clock.
+        assert_eq!(catalog.untagged_since("web", &old.digest), Some(5_000));
+        assert_eq!(catalog.untagged_since("web", &new.digest), None);
+        // Untagged, not gone: a pull by digest still resolves.
+        assert!(
+            catalog
+                .get_repository_manifest("web", old.digest.as_str())
+                .is_some()
+        );
+
+        // Tagging the old manifest again clears its clock.
+        commit_at(&mut catalog, &old, "stable", 9_000);
+        assert_eq!(catalog.untagged_since("web", &old.digest), None);
+    }
+
+    #[test]
+    fn deleting_a_tag_untags_the_manifest_without_removing_it() {
+        let mut catalog = ManifestCatalog::default();
+        let image = test_manifest("web", "one");
+        commit_at(&mut catalog, &image, "v1", 1_000);
+
+        assert!(catalog.apply_delete_tag(&DeleteTag {
+            repository: "web".into(),
+            tag: "v1".into(),
+            deleted_at_unix_ms: 7_000,
+        }));
+
+        assert!(catalog.get_manifest_by_tag("web", "v1").is_none());
+        assert!(
+            catalog
+                .get_repository_manifest("web", image.digest.as_str())
+                .is_some()
+        );
+        assert_eq!(catalog.untagged_since("web", &image.digest), Some(7_000));
+        // An unknown tag reports that nothing was deleted.
+        assert!(!catalog.apply_delete_tag(&DeleteTag {
+            repository: "web".into(),
+            tag: "v1".into(),
+            deleted_at_unix_ms: 8_000,
+        }));
+    }
+
+    #[test]
+    fn expiry_plans_only_manifests_untagged_for_longer_than_retention() {
+        let mut catalog = ManifestCatalog::default();
+        let old = test_manifest("web", "old");
+        let newer = test_manifest("web", "newer");
+        let current = test_manifest("web", "current");
+        commit_at(&mut catalog, &old, "latest", 1_000);
+        commit_at(&mut catalog, &newer, "latest", 2_000);
+        commit_at(&mut catalog, &current, "latest", 10_000);
+        let retain = std::time::Duration::from_millis(5_000);
+
+        let plan = catalog.expirable_manifests(12_000, retain, &no_pins());
+
+        // `old` lost its tag at 2s (10s ago); `newer` at 10s (2s ago).
+        assert_eq!(plan, vec![expire("web", &old.digest, 2_000)]);
+    }
+
+    #[test]
+    fn expire_manifest_removes_it_and_unpins_its_exclusive_blobs() {
+        let mut catalog = ManifestCatalog::default();
+        let mut old = test_manifest("web", "old");
+        old.layers = vec![test_layer("only-old", 10)];
+        let current = test_manifest("web", "current");
+        commit_at(&mut catalog, &old, "latest", 1_000);
+        commit_at(&mut catalog, &current, "latest", 2_000);
+
+        catalog
+            .apply_expire_manifest(&expire("web", &old.digest, 2_000), &no_pins())
+            .unwrap();
+
+        assert!(
+            catalog
+                .get_repository_manifest("web", old.digest.as_str())
+                .is_none()
+        );
+        assert_eq!(catalog.untagged_since("web", &old.digest), None);
+        // Blobs only the expired manifest pinned leave the holder records,
+        // so the last-copy guard can't keep them forever; the shared
+        // config stays tracked.
+        assert!(catalog.layer_holders(old.digest.as_str()).is_empty());
+        assert!(
+            catalog
+                .layer_holders(test_digest("only-old").as_str())
+                .is_empty()
+        );
+        assert_eq!(
+            catalog.layer_holders(test_digest("cfg1").as_str()),
+            BTreeSet::from([1])
+        );
+    }
+
+    #[test]
+    fn expire_manifest_refuses_a_manifest_referenced_by_an_app() {
+        let mut catalog = ManifestCatalog::default();
+        let old = test_manifest("web", "old");
+        commit_at(&mut catalog, &old, "latest", 1_000);
+        commit_at(&mut catalog, &test_manifest("web", "new"), "latest", 2_000);
+        let pinned = std::collections::HashSet::from([old.digest.as_str().to_string()]);
+
+        let refused = catalog
+            .apply_expire_manifest(&expire("web", &old.digest, 2_000), &pinned)
+            .unwrap_err();
+
+        assert!(refused.contains("pins"), "{refused}");
+        assert!(
+            catalog
+                .get_repository_manifest("web", old.digest.as_str())
+                .is_some()
+        );
+        assert!(
+            catalog
+                .expirable_manifests(u64::MAX, std::time::Duration::ZERO, &pinned)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expire_manifest_refuses_a_retagged_manifest() {
+        let mut catalog = ManifestCatalog::default();
+        let old = test_manifest("web", "old");
+        commit_at(&mut catalog, &old, "latest", 1_000);
+        commit_at(&mut catalog, &test_manifest("web", "new"), "latest", 2_000);
+        let planned = expire("web", &old.digest, 2_000);
+        // Retagged after the leader planned expiry …
+        commit_at(&mut catalog, &old, "rollback", 3_000);
+        assert!(catalog.apply_expire_manifest(&planned, &no_pins()).is_err());
+        // … and untagged again: a different untagging, still refused.
+        catalog.apply_delete_tag(&DeleteTag {
+            repository: "web".into(),
+            tag: "rollback".into(),
+            deleted_at_unix_ms: 4_000,
+        });
+        assert!(catalog.apply_expire_manifest(&planned, &no_pins()).is_err());
+        assert!(
+            catalog
+                .get_repository_manifest("web", old.digest.as_str())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn expiry_keeps_the_platforms_of_a_catalogued_index() {
+        let mut catalog = ManifestCatalog::default();
+        commit_multi_platform(&mut catalog, "burger", "v1");
+        let platform = test_digest("a1");
+        // Platform manifests are pushed by digest only, so they count as
+        // untagged from the moment they arrive.
+        assert_eq!(catalog.untagged_since("burger", &platform), Some(0));
+
+        let refused = catalog
+            .apply_expire_manifest(&expire("burger", &platform, 0), &no_pins())
+            .unwrap_err();
+        assert!(refused.contains("index"), "{refused}");
+        assert!(
+            catalog
+                .expirable_manifests(u64::MAX, std::time::Duration::ZERO, &no_pins())
+                .is_empty()
+        );
+
+        // Once the index itself is untagged and expired, its platforms go too.
+        catalog.apply_delete_tag(&DeleteTag {
+            repository: "burger".into(),
+            tag: "v1".into(),
+            deleted_at_unix_ms: 1,
+        });
+        for _ in 0..2 {
+            for planned in
+                catalog.expirable_manifests(u64::MAX, std::time::Duration::ZERO, &no_pins())
+            {
+                catalog.apply_expire_manifest(&planned, &no_pins()).unwrap();
+            }
+        }
+        assert!(catalog.manifests.is_empty());
+        assert!(catalog.layer_locations.is_empty());
+    }
+
+    #[test]
+    fn a_pinned_index_keeps_its_platform_manifests() {
+        let mut catalog = ManifestCatalog::default();
+        commit_multi_platform(&mut catalog, "burger", "v1");
+        catalog.apply_delete_tag(&DeleteTag {
+            repository: "burger".into(),
+            tag: "v1".into(),
+            deleted_at_unix_ms: 1,
+        });
+        let pinned = std::collections::HashSet::from([test_digest("1d").as_str().to_string()]);
+
+        assert!(
+            catalog
+                .expirable_manifests(u64::MAX, std::time::Duration::ZERO, &pinned)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn decommission_removes_the_node_from_every_holder_set() {
+        let mut catalog = ManifestCatalog::default();
+        let image = test_manifest("web", "one");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: image.clone(),
+            tag: "v1".into(),
+            holder_nodes: BTreeSet::from([1, 2]),
+        });
+
+        catalog.remove_node_holdings(2);
+
+        for digest in image.referenced_digests() {
+            assert_eq!(catalog.layer_holders(digest.as_str()), BTreeSet::from([1]));
+        }
+    }
+
+    #[test]
+    fn effective_holders_are_recorded_holders_that_are_live() {
+        let mut catalog = ManifestCatalog::default();
+        let image = test_manifest("web", "one");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: image.clone(),
+            tag: "v1".into(),
+            holder_nodes: BTreeSet::from([1, 2]),
+        });
+
+        let effective = catalog.effective_holders(image.digest.as_str(), &BTreeSet::from([2, 3]));
+
+        assert_eq!(effective, BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn an_image_is_lost_when_any_blob_has_no_live_holder() {
+        let mut catalog = ManifestCatalog::default();
+        let lost = test_manifest("web", "lost");
+        let mut safe = test_manifest("api", "safe");
+        safe.config = test_layer("api-cfg", 10);
+        safe.layers = vec![test_layer("api-layer", 10)];
+        for (manifest, tag, holder) in [(&lost, "v1", 1), (&safe, "v2", 2), (&lost, "v1-again", 1)]
+        {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                manifest: manifest.clone(),
+                tag: tag.into(),
+                holder_nodes: BTreeSet::from([holder]),
+            });
+        }
+
+        assert!(catalog.lost_images(&BTreeSet::from([1, 2])).is_empty());
+        assert_eq!(
+            catalog.lost_images(&BTreeSet::from([2])),
+            vec!["web:v1".to_string(), "web:v1-again".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_untagged_lost_manifest_is_named_by_digest() {
+        let mut catalog = ManifestCatalog::default();
+        let image = test_manifest("web", "one");
+        commit_at(&mut catalog, &image, "v1", 1);
+        catalog.apply_delete_tag(&DeleteTag {
+            repository: "web".into(),
+            tag: "v1".into(),
+            deleted_at_unix_ms: 2,
+        });
+
+        assert_eq!(
+            catalog.lost_images(&BTreeSet::new()),
+            vec![format!("web@{}", image.digest.as_str())]
+        );
+    }
+
+    #[test]
+    fn image_pins_are_read_from_pinned_references_only() {
+        let digest = test_digest("pin");
+        assert_eq!(
+            image_pin_digest(&format!("web:v1@{}", digest.as_str())),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            image_pin_digest(&format!("localhost:5050/team/web@{}", digest.as_str())),
+            Some(digest.as_str())
+        );
+        assert_eq!(image_pin_digest("web:v1"), None);
+        assert_eq!(image_pin_digest("localhost:5050/web:v1"), None);
     }
 }

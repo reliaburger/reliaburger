@@ -50,6 +50,12 @@ pub struct AggregatedState {
     /// Nodes whose last report was *received* longer ago than
     /// `stale_report_timeout` (receive time, not sender wall clock).
     pub stale_nodes: Vec<NodeId>,
+    /// When each node in `stale_nodes` went stale: the last time this
+    /// leadership epoch heard from it, or for a node it never heard from,
+    /// when it started listening, plus `stale_report_timeout`. The leader
+    /// holds a stale node's placements for a grace period counted from here
+    /// (#702).
+    pub stale_since: HashMap<NodeId, Instant>,
     /// Latest capability evidence from each node. Absence means no
     /// schedulable security capabilities, never an optimistic guess.
     pub capabilities: HashMap<NodeId, NodeCapabilityReport>,
@@ -171,18 +177,6 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                                 self.store_report(report);
                                 self.publish();
                             }
-                        }
-                        Some((_, _peer, ReportingMessage::AggregatedReport { reports })) => {
-                            // Merge reports from another council member (leader
-                            // aggregation). This bundles many nodes' reports, so
-                            // it isn't bound to a single node id. Under mTLS the
-                            // reporting acceptor requires a client cert, so an
-                            // unauthenticated peer never reaches here; a
-                            // legitimate council member is trusted to forward.
-                            for (_, report) in reports {
-                                self.store_report(report);
-                            }
-                            self.publish();
                         }
                         Some((_, _, ReportingMessage::Ack { .. })) => {
                             // Workers don't send Acks to the aggregator
@@ -417,6 +411,19 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             }
         }
 
+        let stale_since = stale_nodes
+            .iter()
+            .filter_map(|node| {
+                let heard = self
+                    .report_freshness
+                    .get(node)
+                    .or_else(|| self.entries.get(node).map(|entry| &entry.received_at))?;
+                heard
+                    .checked_add(stale_timeout)
+                    .map(|since| (node.clone(), since))
+            })
+            .collect();
+
         let capabilities: HashMap<NodeId, NodeCapabilityReport> = self
             .capability_entries
             .iter()
@@ -449,6 +456,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                 .collect(),
             reports,
             stale_nodes,
+            stale_since,
             capabilities,
             readiness,
         }
@@ -488,8 +496,11 @@ mod tests {
             timestamp: SystemTime::now(),
             running_apps: vec![],
             cached_specs: vec![],
+            rollouts: Vec::new(),
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
         }
     }
 
@@ -505,6 +516,8 @@ mod tests {
                     pre_start: true,
                 },
                 dns: Default::default(),
+                process: Default::default(),
+                containers: true,
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,
@@ -528,6 +541,7 @@ mod tests {
             report_interval_secs: 1,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 
@@ -557,15 +571,61 @@ mod tests {
         let honest = net.register_as(addr(3), Some(NodeId::new("honest"))).await;
         let council_transport = net.register(addr(2)).await;
         let shutdown = CancellationToken::new();
+        let rollup_dir = tempfile::tempdir().unwrap();
+        let rollups = Arc::new(RwLock::new(crate::mayo::rollup_store::RollupStore::new(
+            rollup_dir.path().to_path_buf(),
+        )));
 
         let (mut aggregator, mut watch_rx) = ReportAggregator::new(
             council_transport,
             test_config(),
             shutdown.clone(),
-            None,
+            Some(Arc::clone(&rollups)),
             None,
             None,
         );
+
+        // #696: every message type that carries node state is bound to the
+        // peer's identity. (`AggregatedReport`, which bundled many nodes'
+        // reports with no binding at all, is gone.) Rollups and capability
+        // reports go first, so they're processed by the time the reports
+        // below are visible.
+        let rollup = |name: &str| crate::mayo::rollup::NodeRollup {
+            node_id: NodeId::new(name),
+            timestamp: 60,
+            entries: vec![crate::mayo::rollup::RollupEntry {
+                metric_name: "node_cpu_usage_percent".to_string(),
+                labels: std::collections::BTreeMap::new(),
+                aggregate: crate::mayo::rollup::RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        };
+        attacker
+            .send(addr(2), &ReportingMessage::MetricsRollup(rollup("victim")))
+            .await
+            .unwrap();
+        attacker
+            .send(
+                addr(2),
+                &ReportingMessage::CapabilityReport(capability("victim")),
+            )
+            .await
+            .unwrap();
+        honest
+            .send(addr(2), &ReportingMessage::MetricsRollup(rollup("honest")))
+            .await
+            .unwrap();
+        honest
+            .send(
+                addr(2),
+                &ReportingMessage::CapabilityReport(capability("honest")),
+            )
+            .await
+            .unwrap();
 
         // The attacker tries to overwrite "victim"'s entry, and to report as
         // itself; the honest node reports as itself.
@@ -627,6 +687,17 @@ mod tests {
         assert!(
             !state.readiness.contains_key(&NodeId::new("victim")),
             "readiness evidence must have the same mTLS identity binding"
+        );
+        assert!(state.capabilities.contains_key(&NodeId::new("honest")));
+        assert!(
+            !state.capabilities.contains_key(&NodeId::new("victim")),
+            "capability reports must have the same mTLS identity binding"
+        );
+        drop(state);
+        assert_eq!(
+            rollups.read().await.buffer_len(),
+            1,
+            "only the honest node's rollup may be ingested"
         );
 
         shutdown.cancel();
@@ -1042,5 +1113,42 @@ mod tests {
         assert!(aggregator.build_aggregated_state().stale_nodes.is_empty());
         tokio::time::advance(Duration::from_secs(31)).await;
         assert_eq!(aggregator.build_aggregated_state().stale_nodes.len(), 2);
+    }
+
+    /// #702: the leader counts a stale node's grace from when it went
+    /// stale: its last report plus the stale timeout, or for a member this
+    /// epoch never heard from, when the epoch started listening.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_node_says_when_it_went_stale() {
+        let net = InMemoryReportingNetwork::new();
+        let (_members, membership) = watch::channel(vec![member("reported"), member("silent")]);
+        let (_epoch, epoch_rx) = watch::channel(1);
+        let (mut aggregator, _view) = ReportAggregator::new(
+            net.register(addr(2)).await,
+            test_config(),
+            CancellationToken::new(),
+            None,
+            Some(epoch_rx),
+            Some(membership),
+        );
+        let listening = Instant::now();
+        aggregator.publish();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let reported = Instant::now();
+        aggregator.store_report(report("reported"));
+        assert!(aggregator.build_aggregated_state().stale_since.is_empty());
+
+        tokio::time::advance(Duration::from_secs(45)).await;
+        let state = aggregator.build_aggregated_state();
+
+        let timeout = Duration::from_secs(30);
+        assert_eq!(
+            state.stale_since.get(&NodeId::new("reported")),
+            Some(&(reported + timeout))
+        );
+        assert_eq!(
+            state.stale_since.get(&NodeId::new("silent")),
+            Some(&(listening + timeout))
+        );
     }
 }

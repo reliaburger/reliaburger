@@ -148,7 +148,7 @@ pub fn import_from_yaml(yaml: &str) -> Result<ImportResult, RelishError> {
 
 /// Parse a multi-document YAML string into typed K8s resources.
 ///
-/// Uses `serde_yaml::Deserializer` to split documents (M28) rather than a naive
+/// Uses `yaml_serde::Deserializer` to split documents (M28) rather than a naive
 /// `split("---")`: the latter shredded any document with an embedded `---` (a
 /// PEM block or a `|`-scalar), and skipping documents that *start with* `#`
 /// dropped every Helm-rendered manifest, since Helm prefixes each with a
@@ -160,8 +160,8 @@ fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError
 
     let mut resources = Vec::new();
 
-    for document in serde_yaml::Deserializer::from_str(yaml) {
-        let value = serde_yaml::Value::deserialize(document)
+    for document in yaml_serde::Deserializer::from_str(yaml) {
+        let value = yaml_serde::Value::deserialize(document)
             .map_err(|e| RelishError::FormatFailed(format!("YAML parse error: {e}")))?;
 
         // A comment-only or empty document deserialises to null — skip it.
@@ -177,57 +177,57 @@ fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError
 
         let resource = match kind.as_str() {
             "Deployment" => {
-                let d: Deployment = serde_yaml::from_value(value.clone())
+                let d: Deployment = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Deployment(name, d)
             }
             "DaemonSet" => {
-                let d: DaemonSet = serde_yaml::from_value(value.clone())
+                let d: DaemonSet = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::DaemonSet(name, d)
             }
             "StatefulSet" => {
-                let d: StatefulSet = serde_yaml::from_value(value.clone())
+                let d: StatefulSet = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::StatefulSet(name, d)
             }
             "Service" => {
-                let s: Service = serde_yaml::from_value(value.clone())
+                let s: Service = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Service(name, s)
             }
             "Ingress" => {
-                let i: Ingress = serde_yaml::from_value(value.clone())
+                let i: Ingress = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Ingress(name, i)
             }
             "HorizontalPodAutoscaler" => {
-                let h: HorizontalPodAutoscaler = serde_yaml::from_value(value.clone())
+                let h: HorizontalPodAutoscaler = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Hpa(name, h)
             }
             "ConfigMap" => {
-                let c: ConfigMap = serde_yaml::from_value(value.clone())
+                let c: ConfigMap = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::ConfigMap(name, c)
             }
             "Secret" => {
-                let s: Secret = serde_yaml::from_value(value.clone())
+                let s: Secret = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Secret(name, s)
             }
             "Job" => {
-                let j: Job = serde_yaml::from_value(value.clone())
+                let j: Job = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Job(name, j)
             }
             "CronJob" => {
-                let c: CronJob = serde_yaml::from_value(value.clone())
+                let c: CronJob = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::CronJob(name, c)
             }
             "Namespace" => {
-                let n: Namespace = serde_yaml::from_value(value.clone())
+                let n: Namespace = yaml_serde::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Namespace(name, n)
             }
@@ -581,6 +581,22 @@ fn pod_spec_to_app(
                     .to_string(),
             });
         }
+        // A hostPath volume is the one kind a hand-written replacement can't
+        // just declare: a `source` needs the host-exec permission and an
+        // allowlist entry on every node that runs it.
+        for volume in ps.volumes.iter().flatten() {
+            if let Some(host_path) = &volume.host_path {
+                report.warnings.push(MigrationWarning {
+                    resource: resource.to_string(),
+                    message: format!(
+                        "hostPath volume {:?} ({}) is not imported; a hand-written `source` \
+                         needs the host-exec permission and a [storage] allowed_host_paths \
+                         entry in node.toml on every node that runs it",
+                        volume.name, host_path.path
+                    ),
+                });
+            }
+        }
     }
     if container.and_then(|c| c.liveness_probe.as_ref()).is_some() {
         report.warnings.push(MigrationWarning {
@@ -896,7 +912,7 @@ fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationRepo
     if let Some(strategy) = spec.and_then(|s| s.strategy.as_ref()) {
         if let Some(rolling) = &strategy.rolling_update {
             app.deploy = Some(DeploySpec {
-                strategy: Some("rolling".to_string()),
+                strategy: Some(crate::meat::deploy_types::DeployStrategy::Rolling),
                 max_surge: rolling.max_surge.as_ref().and_then(|v| match v {
                     k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i) => {
                         Some(*i as u32)
@@ -1441,6 +1457,7 @@ fn pod_to_jobspec(
     };
 
     JobSpec {
+        runtime: Default::default(),
         image: container.and_then(|c| c.image.clone()),
         command,
         schedule: None,
@@ -1451,6 +1468,12 @@ fn pod_to_jobspec(
         namespace: metadata_namespace.cloned(),
         exec: None,
         script: None,
+        firewall: None,
+        egress: None,
+        max_attempts: None,
+        task_timeout_secs: None,
+        overlap: None,
+        replay_unknown: false,
     }
 }
 
@@ -2722,6 +2745,40 @@ spec:
         // Pod-level runAsUser, container-level runAsGroup.
         assert_eq!(app.run_as_user, Some(100));
         assert_eq!(app.run_as_group, Some(101));
+    }
+
+    #[test]
+    fn host_path_volume_is_named_in_the_import_warning() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+spec:
+  template:
+    spec:
+      containers:
+      - name: agent
+        image: fluent-bit:3
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: scratch
+        emptyDir: {}
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(result.config.app["agent"].volumes.is_empty());
+        let warnings = warnings_of(&result);
+        let host_path: Vec<_> = warnings.iter().filter(|w| w.contains("hostPath")).collect();
+        assert_eq!(host_path.len(), 1, "{warnings:?}");
+        assert!(
+            host_path[0].starts_with("Deployment/agent")
+                && host_path[0].contains("\"varlog\" (/var/log)")
+                && host_path[0].contains("host-exec")
+                && host_path[0].contains("allowed_host_paths"),
+            "{warnings:?}"
+        );
     }
 
     #[test]

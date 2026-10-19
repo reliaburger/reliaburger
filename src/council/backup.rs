@@ -7,16 +7,19 @@
 //! external storage, sealed so the blob is useless without the cluster
 //! master key.
 //!
-//! The payload is the state machine's JSON `DesiredState` (the same bytes the
-//! #83 snapshot envelope carries, version and checksum already inside). We
-//! seal it with a key derived from the cluster master key via HKDF, using a
+//! The payload is the state machine's JSON `DesiredState`, the same bytes
+//! the #83 snapshot envelope carries. We seal it with a key derived from the cluster master key via HKDF, using a
 //! backup-specific info string so the wrapping key can't be confused with any
 //! other derived key (CA wrapping, secrets). Every node holds the master key
 //! under `/etc/reliaburger`, so any survivor can restore.
 //!
 //! Upload rides `object_store`, exactly like `bun::snapshot_worker`: one
 //! interface over `file://`, `s3://` and `gs://`, credentials from each
-//! backend's standard environment variables.
+//! backend's standard environment variables (see [`crate::object_storage`]).
+//!
+//! Each object is named by its [`BackupKey`]: recovery epoch, term and log
+//! index of the state inside, so restore and retention follow the council's
+//! history rather than whichever leader's clock ran fastest.
 
 use std::time::{Duration, SystemTime};
 
@@ -25,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::council::node::CouncilNode;
+use crate::council::types::{DesiredState, RecoveryId};
 use crate::sesame::crypto::{self, CryptoError};
 
 /// HKDF info string that scopes the backup-sealing key. Binding the derived
@@ -119,6 +123,8 @@ pub enum BackupError {
     InvalidUrl { url: String, reason: String },
     #[error("object store: {0}")]
     ObjectStore(String),
+    #[error("not a confirmed leader, skipping the export: {0}")]
+    NotLeader(String),
 }
 
 /// Seal `payload` (the snapshot JSON bytes) with a key derived from
@@ -176,6 +182,129 @@ pub fn decode_backup(bytes: &[u8]) -> Result<SealedBackup, BackupError> {
     serde_json::from_slice(bytes).map_err(|e| BackupError::Serialise(e.to_string()))
 }
 
+/// Every backup object's name starts with this.
+const BACKUP_PREFIX: &str = "council-";
+/// Every backup object's name ends with this.
+const BACKUP_SUFFIX: &str = ".backup";
+
+/// Where a backup sits in the council's history, and so its object name.
+///
+/// Backups order by recovery epoch, then Raft term, then the last applied
+/// log index: the position of the state they hold, which every leader
+/// agrees on. The leader's wall clock only breaks ties. Ordering by the
+/// clock alone let a former leader whose clock ran fast keep the "newest"
+/// backups, so restores picked its stale state and pruning deleted every
+/// correct backup straight after upload (#695).
+///
+/// The recovery id is in the name too, after everything that orders it. Two
+/// recoveries run independently from the same backup land on the same epoch
+/// with fresh Raft logs, so their councils can produce backups with the same
+/// epoch, term, index and even millisecond. Without the id those would share
+/// one object name and the second upload would silently replace the first;
+/// with it, both survive and the listing shows which council wrote each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupKey {
+    /// The council's recovery epoch when the backup was taken.
+    pub recovery_epoch: u64,
+    /// The term of the last log entry the backed-up state applied.
+    pub term: u64,
+    /// The index of the last log entry the backed-up state applied.
+    pub index: u64,
+    /// Milliseconds since the Unix epoch on the exporting leader's clock.
+    pub millis: u64,
+    /// The recovery that started `recovery_epoch` (`None` at epoch 0).
+    pub recovery_id: Option<RecoveryId>,
+}
+
+impl BackupKey {
+    /// The key for a backup of `state`, exported at `now`.
+    pub fn for_state(state: &DesiredState, now: SystemTime) -> Self {
+        let millis = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let applied = state.last_applied_log;
+        Self {
+            recovery_epoch: state.recovery_epoch,
+            term: applied.map_or(0, |log_id| log_id.leader_id.get_term()),
+            index: applied.map_or(0, |log_id| log_id.index),
+            millis: u64::try_from(millis).unwrap_or(u64::MAX),
+            recovery_id: state.recovery_id,
+        }
+    }
+
+    /// The object name, e.g.
+    /// `council-e00000000000000000001-t…-i…-m…-r….backup`. Every number is
+    /// zero-padded to its full width, so names sort in key order.
+    pub fn object_name(&self) -> String {
+        format!(
+            "{BACKUP_PREFIX}e{:020}-t{:020}-i{:020}-m{:020}-r{:032x}{BACKUP_SUFFIX}",
+            self.recovery_epoch,
+            self.term,
+            self.index,
+            self.millis,
+            self.recovery_id.map_or(0, |id| id.0),
+        )
+    }
+
+    /// Parse an object name written by [`Self::object_name`]. `None` for
+    /// anything else, including an older release's `council-{millis}.backup`.
+    pub fn parse(name: &str) -> Option<Self> {
+        let body = name
+            .strip_prefix(BACKUP_PREFIX)?
+            .strip_suffix(BACKUP_SUFFIX)?;
+        let fields: Vec<&str> = body.split('-').collect();
+        let [epoch, term, index, millis, id] = fields.as_slice() else {
+            return None;
+        };
+        let number = |field: &str, tag: char| -> Option<u64> {
+            let digits = field.strip_prefix(tag)?;
+            (digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| digits.parse().ok())?
+        };
+        let id = id.strip_prefix('r')?;
+        if id.len() != 32 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        let id = u128::from_str_radix(id, 16).ok()?;
+        Some(Self {
+            recovery_epoch: number(epoch, 'e')?,
+            term: number(term, 't')?,
+            index: number(index, 'i')?,
+            millis: number(millis, 'm')?,
+            recovery_id: (id != 0).then_some(RecoveryId(id)),
+        })
+    }
+
+    fn order(&self) -> (u64, u64, u64, u64, u128) {
+        (
+            self.recovery_epoch,
+            self.term,
+            self.index,
+            self.millis,
+            self.recovery_id.map_or(0, |id| id.0),
+        )
+    }
+}
+
+impl Ord for BackupKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+impl PartialOrd for BackupKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for BackupKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.object_name())
+    }
+}
+
 /// An object-store destination for sealed backups, built from a URL.
 pub struct BackupStore {
     store: Box<dyn object_store::ObjectStore>,
@@ -197,78 +326,83 @@ impl BackupStore {
         Ok(Self { store, prefix })
     }
 
-    /// Object key for the backup taken at `now`. Millisecond-precision epoch
-    /// timestamps sort lexicographically in creation order, which is exactly
-    /// what the retention prune relies on.
-    fn key_for(&self, now: SystemTime) -> object_store::path::Path {
-        let millis = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        // Zero-pad so string order matches time order for the next ~300 years.
-        self.prefix
-            .clone()
-            .join(format!("council-{millis:016}.backup"))
-    }
-
-    /// Upload one sealed backup.
-    pub async fn put(&self, sealed: &SealedBackup, now: SystemTime) -> Result<(), BackupError> {
+    /// Upload one sealed backup under `key`.
+    pub async fn put(&self, key: &BackupKey, sealed: &SealedBackup) -> Result<(), BackupError> {
         let bytes = encode_backup(sealed)?;
         self.store
-            .put(&self.key_for(now), object_store::PutPayload::from(bytes))
+            .put(&self.location(key), object_store::PutPayload::from(bytes))
             .await
             .map_err(|e| BackupError::ObjectStore(e.to_string()))?;
         Ok(())
     }
 
-    /// List stored backup keys, oldest first (lexicographic == chronological).
-    pub async fn list_keys(&self) -> Result<Vec<object_store::path::Path>, BackupError> {
+    fn location(&self, key: &BackupKey) -> object_store::path::Path {
+        self.prefix.clone().join(key.object_name())
+    }
+
+    /// Every stored backup, oldest first by [`BackupKey`] order: recovery
+    /// epoch, then term, then log index, with the wall clock only breaking
+    /// ties. An object whose name isn't a backup key (an older binary's
+    /// `council-{millis}.backup`, say) is left alone and logged once per
+    /// listing, never restored or pruned.
+    pub async fn list(&self) -> Result<Vec<BackupKey>, BackupError> {
         use futures_util::StreamExt;
-        let mut keys: Vec<object_store::path::Path> = Vec::new();
+        let mut keys = Vec::new();
         let mut stream = self.store.list(Some(&self.prefix));
         while let Some(entry) = stream.next().await {
             let meta = entry.map_err(|e| BackupError::ObjectStore(e.to_string()))?;
-            if meta
-                .location
-                .filename()
-                .is_some_and(|f| f.ends_with(".backup"))
-            {
-                keys.push(meta.location);
+            let Some(name) = meta.location.filename() else {
+                continue;
+            };
+            if !name.ends_with(BACKUP_SUFFIX) {
+                continue;
+            }
+            match BackupKey::parse(name) {
+                Some(key) => keys.push(key),
+                None => eprintln!(
+                    "council: ignoring backup object {} whose name is not an epoch-ordered \
+                     backup key (written by an older release?)",
+                    meta.location
+                ),
             }
         }
         keys.sort();
         Ok(keys)
     }
 
-    /// Fetch and decode the newest stored backup, `None` if the destination
-    /// holds none. Used by the recovery path when the operator points at a
-    /// backup URL rather than a local data directory.
-    pub async fn latest(&self) -> Result<Option<SealedBackup>, BackupError> {
-        let keys = self.list_keys().await?;
-        let Some(newest) = keys.last() else {
-            return Ok(None);
-        };
+    /// Fetch and decode the backup stored under `key`.
+    pub async fn fetch(&self, key: &BackupKey) -> Result<SealedBackup, BackupError> {
         let result = self
             .store
-            .get(newest)
+            .get(&self.location(key))
             .await
             .map_err(|e| BackupError::ObjectStore(e.to_string()))?;
         let bytes = result
             .bytes()
             .await
             .map_err(|e| BackupError::ObjectStore(e.to_string()))?;
-        Ok(Some(decode_backup(&bytes)?))
+        decode_backup(&bytes)
     }
 
-    /// Prune every backup beyond the newest `retain`. Pure decision, real
-    /// deletes: returns how many were removed.
+    /// Fetch and decode the newest stored backup, `None` if the destination
+    /// holds none.
+    pub async fn latest(&self) -> Result<Option<SealedBackup>, BackupError> {
+        let keys = self.list().await?;
+        let Some(newest) = keys.last() else {
+            return Ok(None);
+        };
+        Ok(Some(self.fetch(newest).await?))
+    }
+
+    /// Prune every backup beyond the newest `retain`, by [`BackupKey`]
+    /// order. Returns how many were removed.
     pub async fn prune(&self, retain: usize) -> Result<usize, BackupError> {
-        let keys = self.list_keys().await?;
+        let keys = self.list().await?;
         let doomed = prune_plan(&keys, retain);
         let mut removed = 0;
         for key in doomed {
             self.store
-                .delete(&key)
+                .delete(&self.location(&key))
                 .await
                 .map_err(|e| BackupError::ObjectStore(e.to_string()))?;
             removed += 1;
@@ -277,22 +411,26 @@ impl BackupStore {
     }
 }
 
-/// Keys to delete: everything before the newest `retain`. `keys` must be
-/// sorted oldest-first. Pure so the retention rule is unit-testable without
+/// Keys to delete: everything but the newest `retain` by [`BackupKey`]
+/// order, oldest first. Pure so the retention rule is unit-testable without
 /// touching a store.
-pub fn prune_plan(
-    keys: &[object_store::path::Path],
-    retain: usize,
-) -> Vec<object_store::path::Path> {
-    if keys.len() <= retain {
-        return Vec::new();
-    }
-    keys[..keys.len() - retain].to_vec()
+pub fn prune_plan(keys: &[BackupKey], retain: usize) -> Vec<BackupKey> {
+    let mut sorted = keys.to_vec();
+    sorted.sort();
+    let doomed = sorted.len().saturating_sub(retain);
+    sorted.truncate(doomed);
+    sorted
 }
 
-/// One backup export: read the leader's desired state, seal it, upload, prune.
-/// Called from the loop with the wall clock; returns an error string per
-/// failure so the loop can log without aborting.
+/// One backup export: read the leader's desired state, seal it, upload under
+/// the key of that state's position, prune. Called from the loop with the
+/// wall clock; returns an error per failure so the loop can log without
+/// aborting.
+///
+/// The read is linearizable: a leader that has been deposed and doesn't know
+/// it yet fails here instead of exporting stale state. The key's term and
+/// index come from the state that read returned, so they always describe
+/// the bytes in the backup.
 pub async fn backup_tick(
     council: &CouncilNode,
     master_key: &[u8; 32],
@@ -300,11 +438,15 @@ pub async fn backup_tick(
     config: &BackupConfig,
     now: SystemTime,
 ) -> Result<(), BackupError> {
-    let desired = council.desired_state().await;
+    let desired = council
+        .desired_state_linearizable()
+        .await
+        .map_err(|e| BackupError::NotLeader(e.to_string()))?;
+    let key = BackupKey::for_state(&desired, now);
     let payload =
         serde_json::to_vec(&desired).map_err(|e| BackupError::Serialise(e.to_string()))?;
     let sealed = seal_snapshot(master_key, &payload, config)?;
-    store.put(&sealed, now).await?;
+    store.put(&key, &sealed).await?;
     store.prune(config.retain).await?;
     Ok(())
 }
@@ -431,29 +573,183 @@ mod tests {
         assert_eq!(decoded, sealed);
     }
 
-    fn path(name: &str) -> object_store::path::Path {
-        object_store::path::Path::from(name)
+    fn backup_key(recovery_epoch: u64, term: u64, index: u64, millis: u64) -> BackupKey {
+        BackupKey {
+            recovery_epoch,
+            term,
+            index,
+            millis,
+            recovery_id: None,
+        }
+    }
+
+    fn file_store(dest: &tempfile::TempDir) -> BackupStore {
+        BackupStore::from_url(&format!("file://{}", dest.path().display())).unwrap()
+    }
+
+    fn applied_at(term: u64, index: u64) -> Option<openraft::LogId<u64>> {
+        Some(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(term, 1),
+            index,
+        ))
     }
 
     #[test]
-    fn prune_plan_keeps_newest_retain() {
-        let keys = vec![
-            path("council-001.backup"),
-            path("council-002.backup"),
-            path("council-003.backup"),
-            path("council-004.backup"),
+    fn backup_keys_order_by_epoch_then_term_then_index() {
+        let mut keys = vec![
+            backup_key(1, 1, 1, 0),
+            backup_key(0, 9, 99, 9_000),
+            backup_key(0, 9, 100, 1),
+            backup_key(0, 10, 1, 1),
+            backup_key(2, 0, 0, 0),
         ];
-        let doomed = prune_plan(&keys, 2);
+        keys.sort();
         assert_eq!(
-            doomed,
-            vec![path("council-001.backup"), path("council-002.backup")]
+            keys,
+            vec![
+                backup_key(0, 9, 99, 9_000),
+                backup_key(0, 9, 100, 1),
+                backup_key(0, 10, 1, 1),
+                backup_key(1, 1, 1, 0),
+                backup_key(2, 0, 0, 0),
+            ]
+        );
+        // The object names sort the same way, so a plain listing agrees.
+        let ordered: Vec<String> = keys.iter().map(BackupKey::object_name).collect();
+        let mut names = ordered.clone();
+        names.sort();
+        assert_eq!(names, ordered);
+    }
+
+    #[test]
+    fn a_fast_clock_does_not_win_against_a_higher_term() {
+        // A former leader whose clock ran a year fast, and the current
+        // leader one term later with a correct clock.
+        let year_ms = 365 * 24 * 3600 * 1000;
+        let stale = backup_key(0, 4, 500, 1_790_000_000_000 + year_ms);
+        let current = backup_key(0, 5, 501, 1_790_000_000_000);
+        assert!(current > stale);
+        assert_eq!(prune_plan(&[current, stale.clone()], 1), vec![stale]);
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_by_epoch_and_term() {
+        let keys = vec![
+            backup_key(1, 1, 10, 100),
+            backup_key(0, 7, 900, 999_999),
+            backup_key(1, 2, 3, 50),
+            backup_key(0, 8, 1, 999_998),
+        ];
+        assert_eq!(
+            prune_plan(&keys, 2),
+            vec![backup_key(0, 7, 900, 999_999), backup_key(0, 8, 1, 999_998)]
+        );
+        assert!(prune_plan(&keys, 7).is_empty());
+    }
+
+    #[test]
+    fn a_key_round_trips_through_its_object_name() {
+        let key = BackupKey {
+            recovery_epoch: 3,
+            term: u64::MAX,
+            index: 42,
+            millis: 1_790_000_000_123,
+            recovery_id: Some(RecoveryId(0xdead_beef)),
+        };
+        assert_eq!(BackupKey::parse(&key.object_name()), Some(key));
+        let epoch_zero = backup_key(0, 1, 2, 3);
+        assert_eq!(
+            BackupKey::parse(&epoch_zero.object_name()),
+            Some(epoch_zero)
         );
     }
 
     #[test]
-    fn prune_plan_keeps_all_under_retain() {
-        let keys = vec![path("council-001.backup"), path("council-002.backup")];
-        assert!(prune_plan(&keys, 7).is_empty());
+    fn malformed_names_are_not_backup_keys() {
+        let good = backup_key(1, 2, 3, 4).object_name();
+        for name in [
+            "council-0001790000000000.backup".to_string(),
+            good.replace(".backup", ".tmp"),
+            good.replace("-t", "-x"),
+            good.replace("e0000", "e000x"),
+            good.replace("-r0", "-rg"),
+            format!("{good}.backup"),
+        ] {
+            assert_eq!(BackupKey::parse(&name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_key_comes_from_the_state_being_backed_up() {
+        let state = DesiredState {
+            recovery_epoch: 2,
+            recovery_id: Some(RecoveryId(7)),
+            last_applied_log: applied_at(6, 1234),
+            ..Default::default()
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(55);
+        assert_eq!(
+            BackupKey::for_state(&state, now),
+            BackupKey {
+                recovery_epoch: 2,
+                term: 6,
+                index: 1234,
+                millis: 55,
+                recovery_id: Some(RecoveryId(7)),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn old_format_keys_are_ignored() {
+        let dest = tempfile::tempdir().unwrap();
+        let store = file_store(&dest);
+        let master = key(8);
+        let sealed = seal_snapshot(&master, b"old", &BackupConfig::default()).unwrap();
+        let old = dest.path().join("council-9999999999999999.backup");
+        std::fs::write(&old, encode_backup(&sealed).unwrap()).unwrap();
+        let current = backup_key(0, 1, 1, 1);
+        let sealed = seal_snapshot(&master, b"new", &BackupConfig::default()).unwrap();
+        store.put(&current, &sealed).await.unwrap();
+
+        assert_eq!(store.list().await.unwrap(), vec![current]);
+        let latest = store.latest().await.unwrap().unwrap();
+        assert_eq!(unseal_snapshot(&master, &latest).unwrap(), b"new");
+        // Retention never touches what it can't order.
+        assert_eq!(store.prune(1).await.unwrap(), 0);
+        assert!(old.exists());
+    }
+
+    /// Two recoveries run independently from one backup land on the same
+    /// epoch with fresh logs. Their first backups can agree on epoch, term,
+    /// index and millisecond; the recovery id keeps them apart, so neither
+    /// overwrites the other at a shared destination.
+    #[tokio::test]
+    async fn two_recoveries_on_one_epoch_never_share_a_backup_object() {
+        let dest = tempfile::tempdir().unwrap();
+        let store = file_store(&dest);
+        let master = key(10);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_000_000_000);
+        let mut names = Vec::new();
+        for (byte, payload) in [(1u8, b"first".as_slice()), (2, b"second")] {
+            let mut state = DesiredState::default();
+            state.enter_recovery_epoch(0);
+            state.recovery_id = Some(RecoveryId(u128::from(byte)));
+            state.last_applied_log = applied_at(1, 3);
+            let key = BackupKey::for_state(&state, now);
+            names.push(key.object_name());
+            let sealed = seal_snapshot(&master, payload, &BackupConfig::default()).unwrap();
+            store.put(&key, &sealed).await.unwrap();
+        }
+        assert_ne!(names[0], names[1]);
+        let listed = store.list().await.unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let mut payloads = Vec::new();
+        for key in &listed {
+            payloads.push(unseal_snapshot(&master, &store.fetch(key).await.unwrap()).unwrap());
+        }
+        payloads.sort();
+        assert_eq!(payloads, vec![b"first".to_vec(), b"second".to_vec()]);
     }
 
     #[test]
@@ -464,34 +760,62 @@ mod tests {
     #[tokio::test]
     async fn store_uploads_lists_and_prunes() {
         let dest = tempfile::tempdir().unwrap();
-        let store = BackupStore::from_url(&format!("file://{}", dest.path().display())).unwrap();
+        let store = file_store(&dest);
         let master = key(9);
 
-        // Three backups at distinct timestamps.
-        for secs in [1000u64, 2000, 3000] {
-            let sealed = seal_snapshot(&master, b"state", &BackupConfig::default()).unwrap();
-            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-            store.put(&sealed, now).await.unwrap();
+        // Three backups at rising log positions.
+        for index in [1000u64, 2000, 3000] {
+            let payload = index.to_be_bytes();
+            let sealed = seal_snapshot(&master, &payload, &BackupConfig::default()).unwrap();
+            store
+                .put(&backup_key(0, 1, index, 0), &sealed)
+                .await
+                .unwrap();
         }
-
-        let keys = store.list_keys().await.unwrap();
-        assert_eq!(keys.len(), 3);
+        assert_eq!(store.list().await.unwrap().len(), 3);
 
         // Retain 1: the two oldest are pruned; the newest restores.
-        let removed = store.prune(1).await.unwrap();
-        assert_eq!(removed, 2);
-        assert_eq!(store.list_keys().await.unwrap().len(), 1);
-
+        assert_eq!(store.prune(1).await.unwrap(), 2);
+        assert_eq!(store.list().await.unwrap(), vec![backup_key(0, 1, 3000, 0)]);
         let latest = store.latest().await.unwrap().expect("a backup survives");
         let restored = unseal_snapshot(&master, &latest).unwrap();
-        assert_eq!(restored, b"state");
+        assert_eq!(restored, 3000u64.to_be_bytes());
     }
 
     #[tokio::test]
     async fn latest_is_none_on_empty_store() {
         let dest = tempfile::tempdir().unwrap();
-        let store = BackupStore::from_url(&format!("file://{}", dest.path().display())).unwrap();
-        assert!(store.latest().await.unwrap().is_none());
+        assert!(file_store(&dest).latest().await.unwrap().is_none());
+    }
+
+    /// `make test-s3`: a council backup goes up to a real bucket, lists,
+    /// prunes and restores by key, with credentials and region taken from
+    /// the standard `AWS_*` variables.
+    #[tokio::test]
+    #[ignore = "requires AWS credentials and RELIABURGER_TEST_S3_URL; run with make test-s3"]
+    async fn council_backup_round_trips_through_real_s3() {
+        let Ok(base) = std::env::var("RELIABURGER_TEST_S3_URL") else {
+            panic!("set RELIABURGER_TEST_S3_URL=s3://bucket/prefix to run this suite");
+        };
+        let run = format!(
+            "{}/council-backup-{}",
+            base.trim_end_matches('/'),
+            RecoveryId::random()
+        );
+        let store = BackupStore::from_url(&run).unwrap();
+        let master = key(11);
+        let older = backup_key(0, 1, 10, u64::MAX);
+        let newer = backup_key(0, 2, 11, 1);
+        for (key, payload) in [(&older, b"older".as_slice()), (&newer, b"newer")] {
+            let sealed = seal_snapshot(&master, payload, &BackupConfig::default()).unwrap();
+            store.put(key, &sealed).await.unwrap();
+        }
+        assert_eq!(store.list().await.unwrap(), vec![older, newer.clone()]);
+        assert_eq!(store.prune(1).await.unwrap(), 1);
+        let latest = store.latest().await.unwrap().unwrap();
+        assert_eq!(unseal_snapshot(&master, &latest).unwrap(), b"newer");
+        store.store.delete(&store.location(&newer)).await.unwrap();
+        assert!(store.list().await.unwrap().is_empty());
     }
 
     /// Pruning deletes older backups on the strength of the new one, so the

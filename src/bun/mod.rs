@@ -5,12 +5,14 @@
 /// backoff, detecting GPU hardware, and serving a local HTTP API.
 pub mod agent;
 pub mod api;
+pub mod audit;
 pub mod authz;
 pub mod batch;
 pub mod build_runner;
 pub mod capabilities;
 pub mod cluster_view;
 pub mod consumer_owners;
+mod control_fence;
 pub mod deploy_operations;
 pub mod diagnostics;
 pub mod discovery_owners;
@@ -18,15 +20,18 @@ pub mod disk_pressure;
 mod egress_owners;
 pub mod events;
 pub mod execution_budget;
+mod fence_file;
 pub mod gpu;
+mod grant_fence;
 pub mod health;
-pub(crate) mod jobs;
+pub mod host_paths;
+pub mod job_events;
 pub mod loop_meter;
 pub mod namespace_keys;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
-mod schedules;
+pub mod reusable_executor;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod task_array_api;
@@ -36,6 +41,7 @@ pub mod task_executor;
 pub mod task_ledger;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod task_namespace;
+pub mod task_output;
 pub mod task_rates;
 pub mod task_result_index;
 pub mod task_runtime;
@@ -64,7 +70,7 @@ pub enum BunError {
     BatchCapacity(String),
 
     /// Admission could not reserve all requested resource dimensions.
-    #[error("node capacity cannot admit {requested}; available {available}")]
+    #[error("{}", capacity_refusal(.requested, .available))]
     Capacity {
         requested: crate::meat::Resources,
         available: crate::meat::Resources,
@@ -229,8 +235,75 @@ pub enum BunError {
     UpgradesUnavailable,
 }
 
+impl BunError {
+    /// Why the runtime refused to launch, if a refused launch is what failed
+    /// (#881, #905).
+    pub fn launch_problem(&self) -> Option<&crate::grill::LaunchProblem> {
+        match self {
+            BunError::Grill(error) => error.launch_problem(),
+            _ => None,
+        }
+    }
+}
+
+/// The message for [`BunError::Capacity`]. A node's budget doesn't limit
+/// GPUs (GPU admission is a separate check), so it holds `u32::MAX` of them.
+/// Printing that read as a corrupt value, so the GPU count shows only when
+/// the request asks for GPUs.
+fn capacity_refusal(
+    requested: &crate::meat::Resources,
+    available: &crate::meat::Resources,
+) -> String {
+    let text = |resources: &crate::meat::Resources| {
+        let cpu_and_memory = format!(
+            "cpu={}m mem={}Mi",
+            resources.cpu_millicores,
+            resources.memory_bytes / (1024 * 1024)
+        );
+        if requested.gpus == 0 {
+            cpu_and_memory
+        } else {
+            format!("{cpu_and_memory} gpus={}", resources.gpus)
+        }
+    };
+    format!(
+        "node capacity cannot admit {}; available {}",
+        text(requested),
+        text(available)
+    )
+}
+
 #[cfg(test)]
-mod job_lifecycle_tests;
+mod capacity_message_tests {
+    use super::BunError;
+    use crate::meat::Resources;
+
+    /// #967: the refusal printed `gpus=4294967295`, the budget's
+    /// unlimited-GPU value, for an app that asked for none.
+    #[test]
+    fn capacity_refusal_leaves_out_gpus_the_app_does_not_request() {
+        let error = BunError::Capacity {
+            requested: Resources::new(100, 32 << 20, 0),
+            available: Resources::new(95, 6 << 20, u32::MAX),
+        };
+        assert_eq!(
+            error.to_string(),
+            "node capacity cannot admit cpu=100m mem=32Mi; available cpu=95m mem=6Mi"
+        );
+    }
+
+    #[test]
+    fn capacity_refusal_shows_gpus_when_the_app_requests_them() {
+        let error = BunError::Capacity {
+            requested: Resources::new(100, 32 << 20, 2),
+            available: Resources::new(95, 6 << 20, 1),
+        };
+        assert_eq!(
+            error.to_string(),
+            "node capacity cannot admit cpu=100m mem=32Mi gpus=2; available cpu=95m mem=6Mi gpus=1"
+        );
+    }
+}
 
 pub mod job_api;
 /// Common deployment admission and durable hook settlement.

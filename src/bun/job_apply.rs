@@ -19,7 +19,27 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// An acknowledged rerun admits fresh runs of the manifest's jobs, so it
+/// must not replay unrelated declarative resources or recurring schedules.
+pub(crate) fn validate_rerun(config: &Config) -> Result<(), &'static str> {
+    if config.job.is_empty()
+        || !config.app.is_empty()
+        || !config.namespace.is_empty()
+        || !config.permission.is_empty()
+        || !config.build.is_empty()
+        || config.job.values().any(|spec| spec.schedule.is_some())
+    {
+        return Err("explicit rerun requires a manifest containing only non-scheduled jobs");
+    }
+    Ok(())
+}
+
 /// Normal apply admission fixes encrypted work before publishing runnable intent.
+///
+/// `lease` is the caller's job test lease, already checked against the
+/// manifest by the apply handler. Its jobs join the lease before their
+/// deployment is admitted, so the lease's cleanup always finds them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply(
     state: ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
@@ -28,6 +48,7 @@ pub(crate) async fn apply(
     headers: &HeaderMap,
     body: String,
     rerun: bool,
+    lease: Option<&crate::testkit::lease::TestLease>,
 ) -> Response {
     if let Some(council) = &state.council
         && !council.is_leader().await
@@ -58,40 +79,6 @@ pub(crate) async fn apply(
         )
             .into_response();
     }
-    let identities = config
-        .app
-        .iter()
-        .map(|(name, spec)| {
-            (
-                name.clone(),
-                spec.namespace.clone().unwrap_or_else(|| "default".into()),
-            )
-        })
-        .chain(config.job.iter().map(|(name, spec)| {
-            (
-                name.clone(),
-                spec.namespace.clone().unwrap_or_else(|| "default".into()),
-            )
-        }))
-        .collect();
-    let owned = match super::api::ask_agent_bounded(&state.cmd_tx, |response| {
-        AgentCommand::BatchOwnedExecutions {
-            identities,
-            response,
-        }
-    })
-    .await
-    {
-        Ok(owned) => owned,
-        Err(response) => return response,
-    };
-    if !owned.is_empty() {
-        return (
-            StatusCode::CONFLICT,
-            "workload identity belongs to a retained local batch execution",
-        )
-            .into_response();
-    }
     if let Some(binder) = binder
         && let Err(response) = super::api::apply::bind_images(&state, binder, &mut config).await
     {
@@ -107,6 +94,7 @@ pub(crate) async fn apply(
             name,
             &namespace,
             &mut definition,
+            lease,
         )
         .await
         {
@@ -138,12 +126,19 @@ pub(crate) async fn apply(
             hex::encode(Sha256::digest(bytes))[..32].to_string()
         }
     };
+    let _lease_operation = match lease {
+        Some(lease) => match join_lease(&state, lease, &config).await {
+            Ok(operation) => operation,
+            Err(response) => return response,
+        },
+        None => None,
+    };
     match write_task_array(
         &state,
         TaskArrayWrite::DeployBegin {
             operation_id: operation_id.clone(),
             config: Box::new(config),
-            now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+            now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
         },
     )
     .await
@@ -213,8 +208,69 @@ pub(crate) async fn apply(
     .into_response()
 }
 
+/// Make every job in `config` a resource of `lease`. With a council that is a
+/// Raft write the leader's state machine checks; standalone, the node's own
+/// lease store records it and holds off expiry cleanup until the returned
+/// operation drops.
+#[allow(clippy::result_large_err)]
+async fn join_lease(
+    state: &ApiState,
+    lease: &crate::testkit::lease::TestLease,
+    config: &Config,
+) -> Result<Option<crate::testkit::lease::LocalLeaseOperation>, Response> {
+    let jobs: Vec<_> = config
+        .job
+        .iter()
+        .map(|(name, spec)| {
+            crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
+        })
+        .collect();
+    let now = crate::testkit::lease::now_unix_millis();
+    let Some(council) = &state.council else {
+        return state
+            .local_test_leases
+            .begin_job_operation(&lease.lease_id, &lease.owner_id, jobs, now)
+            .await
+            .map(Some)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response());
+    };
+    let written = tokio::time::timeout(
+        WRITE_TIMEOUT,
+        council.write(RaftRequest::TestLeaseJobs {
+            lease_id: lease.lease_id.clone(),
+            observed_at_unix_ms: now,
+            jobs,
+        }),
+    )
+    .await;
+    match written {
+        Ok(Ok(CouncilResponse::Refused { reason })) => {
+            Err((StatusCode::CONFLICT, reason).into_response())
+        }
+        Ok(Ok(_)) => Ok(None),
+        Ok(Err(error)) => Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()),
+        Err(_) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the lease ownership write timed out",
+        )
+            .into_response()),
+    }
+}
+
 /// A replacement leader completes durable intent using accepted results, never launch receipts.
 pub(crate) async fn settle(state: &ApiState) {
+    // The leader calls this every tick, and most ticks have nothing to
+    // settle: look before copying every array.
+    let pending = super::task_array_leader::read_control(state, |view| {
+        view.arrays
+            .deployments()
+            .any(|(_, record)| !record.completed)
+    })
+    .await
+    .unwrap_or(false);
+    if !pending {
+        return;
+    }
     let arrays = read_task_arrays(state).await;
     for (id, record) in arrays
         .deployments()
@@ -226,7 +282,7 @@ pub(crate) async fn settle(state: &ApiState) {
         {
             return;
         }
-        let now = crate::meat::batch_tracker::epoch_now_secs();
+        let now = crate::meat::batch_ids::epoch_now_secs();
         let failed = record.hook_runs.values().any(|run| {
             arrays.get(*run).is_some_and(|run| {
                 run.state.status().is_terminal() && run.state.status() != TaskArrayStatus::Succeeded
@@ -332,7 +388,7 @@ pub(crate) async fn settle(state: &ApiState) {
                                 &state,
                                 TaskArrayWrite::DeployCommitted {
                                     operation_id: id.clone(),
-                                    now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                                    now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
                                 },
                             )
                             .await;
@@ -343,7 +399,7 @@ pub(crate) async fn settle(state: &ApiState) {
                                 &state,
                                 TaskArrayWrite::DeployCancel {
                                     operation_id: id.clone(),
-                                    now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                                    now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
                                 },
                             )
                             .await;

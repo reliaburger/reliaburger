@@ -294,11 +294,20 @@ pub(super) async fn local_top_rows(
         }
         None => std::collections::HashMap::new(),
     };
-    Ok(crate::bun::top::node_rows(
-        &local_node_name(state),
-        statuses,
-        &usage,
-    ))
+    let node = local_node_name(state);
+    let mut rows = crate::bun::top::node_rows(&node, statuses, &usage);
+    // Array tasks run outside the supervisor, so they have no instance
+    // status; the executor's telemetry says what runs here and what it uses.
+    if let Some(executor) = &state.task_arrays.node {
+        let telemetry = executor.telemetry();
+        let running = telemetry
+            .usage_targets()
+            .into_iter()
+            .map(|(labels, (running, _))| (labels, running))
+            .collect();
+        crate::bun::top::add_job_rows(&node, &mut rows, running, &telemetry.usage());
+    }
+    Ok(rows)
 }
 
 /// Singleton runs retain the ordinary status view without expanding indexed jobs.
@@ -320,7 +329,8 @@ pub(super) async fn common_local_statuses(state: &ApiState) -> Vec<InstanceStatu
             || record
                 .state
                 .accepted_grant(ChunkId(0))
-                .is_some_and(|(owner, _)| owner == local);
+                .and_then(|grant| grant.owner)
+                .is_some_and(|owner| owner == local);
         if state.council.is_some() && !owned {
             continue;
         }
@@ -336,6 +346,7 @@ pub(super) async fn common_local_statuses(state: &ApiState) -> Vec<InstanceStatu
             pid: None,
             runtime_unknown: !run.unknown_owners.is_empty(),
             status_age_ms: None,
+            reason: None,
         };
         if let Some((runtime, physical, binding)) = node.singleton_runtime(id) {
             let index = rows.len();
@@ -427,7 +438,7 @@ pub(super) async fn jobs_handler(
     let mut common = Vec::new();
     if !query.local {
         let arrays = crate::bun::task_array_leader::read_task_arrays(&state).await;
-        let now = crate::meat::batch_tracker::epoch_now_secs();
+        let now = crate::meat::batch_ids::epoch_now_secs();
         for (id, run) in arrays.jobs().runs() {
             let Some(record) = arrays.get(id) else {
                 continue;
@@ -481,31 +492,14 @@ pub(super) async fn jobs_handler(
         }
         common.retain(visible);
     }
-    let local = match ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
-        response,
-    })
-    .await
-    {
-        Ok(local) => local,
-        Err(_) if !common.is_empty() => Vec::new(),
-        Err(_) => return agent_unavailable(),
-    };
+    // Every job runs through the common lifecycle, so the cluster's run and
+    // definition records are the whole answer: no node keeps jobs of its own.
     if !query.cluster {
-        common.extend(local.into_iter().filter(visible));
         return Json(common).into_response();
     }
-    let (peers, warnings) = fan_out_to_peers::<Vec<crate::bun::agent::JobStatus>>(
-        &state,
-        "/v1/jobs?local=true",
-        CLUSTER_STATUS_TIMEOUT,
-    )
-    .await;
-    let mut answers: Vec<_> = std::iter::once((local_node_name(&state), local))
-        .chain(peers)
-        .collect();
-    answers.push(("cluster".into(), common));
-    let mut jobs = crate::bun::cluster_view::merge_jobs(answers);
+    let mut jobs = crate::bun::cluster_view::merge_jobs(vec![("cluster".into(), common)]);
     jobs.retain(|job| visible(&job.row));
+    let warnings = Vec::new();
     Json(crate::bun::cluster_view::ClusterJobs { jobs, warnings }).into_response()
 }
 

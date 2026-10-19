@@ -42,8 +42,15 @@ pub struct CouncilNodeObservation {
     pub role: CouncilRole,
     /// The recovery epoch it holds, if any.
     pub recovery_epoch: Option<u64>,
-    /// The newer epoch that fenced it, when it is fenced.
+    /// The epoch that fenced it, when it is fenced: the newer epoch that
+    /// replaced its council, or its own epoch when a split fenced it.
     pub fenced_by: Option<u64>,
+    /// The other council's recovery id, when a split fenced it (#694).
+    #[serde(default)]
+    pub split_with: Option<String>,
+    /// Why it could not write its recovery fence to disk, while it retries.
+    #[serde(default)]
+    pub fence_persist_error: Option<String>,
     /// The leader it names.
     pub leader: Option<String>,
     /// Its Raft term.
@@ -68,6 +75,8 @@ impl CouncilNodeObservation {
             role: status.role,
             recovery_epoch: status.recovery_epoch,
             fenced_by: status.fenced_by,
+            split_with: status.split_with.map(|id| id.to_string()),
+            fence_persist_error: status.fence_persist_error.clone(),
             leader: status.leader.clone(),
             term: status.term,
             last_applied: status.last_applied_log,
@@ -92,6 +101,8 @@ impl CouncilNodeObservation {
             role: CouncilRole::Worker,
             recovery_epoch: None,
             fenced_by: None,
+            split_with: None,
+            fence_persist_error: None,
             leader: None,
             term: 0,
             last_applied: None,
@@ -153,8 +164,27 @@ pub struct FencedNode {
     pub node_id: String,
     /// The epoch of the council it belonged to.
     pub epoch: u64,
-    /// The newer epoch that replaced it.
+    /// The newer epoch that replaced it, or its own epoch for a split.
     pub fenced_by: u64,
+    /// The other council's recovery id when a split fenced it (#694): two
+    /// recoveries landed on `epoch`, and neither council is the real one.
+    #[serde(default)]
+    pub split_with: Option<String>,
+}
+
+impl FencedNode {
+    fn describe(&self) -> String {
+        match &self.split_with {
+            Some(other) => format!(
+                "{} (epoch {}, split: recovery {other} claims the same epoch)",
+                self.node_id, self.epoch
+            ),
+            None => format!(
+                "{} (epoch {}, replaced by {})",
+                self.node_id, self.epoch, self.fenced_by
+            ),
+        }
+    }
 }
 
 /// A voter that answers but trails the council's applied log (#480).
@@ -191,6 +221,10 @@ pub struct CouncilSummary {
     pub lagging: Vec<LaggingVoter>,
     /// Nodes that did not answer, with the reason.
     pub unanswered: Vec<(String, String)>,
+    /// Nodes whose recovery fence is not on disk, with the write error:
+    /// they keep retrying, but a restart now would forget the fence.
+    #[serde(default)]
+    pub fence_unpersisted: Vec<(String, String)>,
 }
 
 impl CouncilSummary {
@@ -231,20 +265,46 @@ impl CouncilSummary {
                 self.leaders.join(", ")
             ));
         }
-        if !self.fenced.is_empty() {
-            let names = self
-                .fenced
+        let split: Vec<&FencedNode> = self
+            .fenced
+            .iter()
+            .filter(|node| node.split_with.is_some())
+            .collect();
+        if !split.is_empty() {
+            let names = split
                 .iter()
-                .map(|node| {
-                    format!(
-                        "{} (epoch {}, replaced by {})",
-                        node.node_id, node.epoch, node.fenced_by
-                    )
-                })
+                .map(|node| node.describe())
+                .collect::<Vec<_>>()
+                .join(", ");
+            warnings.push(format!(
+                "split: two recoveries share an epoch: {names}; recover one side again with \
+                 `relish council recover --force` and re-enrol the other side's nodes"
+            ));
+        }
+        let replaced: Vec<&FencedNode> = self
+            .fenced
+            .iter()
+            .filter(|node| node.split_with.is_none())
+            .collect();
+        if !replaced.is_empty() {
+            let names = replaced
+                .iter()
+                .map(|node| node.describe())
                 .collect::<Vec<_>>()
                 .join(", ");
             warnings.push(format!(
                 "fenced: {names}; re-enrol each with `relish council re-enrol`"
+            ));
+        }
+        if !self.fence_unpersisted.is_empty() {
+            let names = self
+                .fence_unpersisted
+                .iter()
+                .map(|(node, error)| format!("{node} ({error})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            warnings.push(format!(
+                "recovery fence not on disk, retrying: {names}; a restart now would forget it"
             ));
         }
         let missing = self.voters_missing();
@@ -339,6 +399,7 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
                 node_id: o.node_id.clone(),
                 epoch: o.recovery_epoch.unwrap_or_default(),
                 fenced_by,
+                split_with: o.split_with.clone(),
             })
         })
         .collect();
@@ -378,6 +439,15 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
         })
         .collect();
 
+    let fence_unpersisted = observations
+        .iter()
+        .filter_map(|o| {
+            o.fence_persist_error
+                .as_ref()
+                .map(|error| (o.node_id.clone(), error.clone()))
+        })
+        .collect();
+
     CouncilSummary {
         epoch,
         epochs,
@@ -387,6 +457,7 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
         voters_answering,
         lagging,
         unanswered,
+        fence_unpersisted,
     }
 }
 
@@ -490,6 +561,7 @@ pub fn render_council_status(
             continue;
         }
         let epoch = match (node.recovery_epoch, node.fenced_by) {
+            (Some(epoch), Some(_)) if node.split_with.is_some() => format!("{epoch} split"),
             (Some(epoch), Some(newer)) => format!("{epoch} < {newer}"),
             (Some(epoch), None) => epoch.to_string(),
             (None, _) => "-".to_string(),
@@ -561,6 +633,8 @@ mod tests {
             role,
             recovery_epoch: epoch,
             fenced_by: None,
+            split_with: None,
+            fence_persist_error: None,
             leader: leader.map(str::to_string),
             term: 4,
             last_applied: Some(120),
@@ -619,6 +693,38 @@ mod tests {
         let warnings = summary.warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("node-2 (epoch 0, replaced by 1)"));
+    }
+
+    /// #694: two recoveries landed on epoch 1. Both halves fenced
+    /// themselves; status names each as a split, not as replaced.
+    #[test]
+    fn a_same_epoch_split_is_named_with_the_other_recovery() {
+        let mut a = node("node-1", CouncilRole::Fenced, Some(1), None);
+        a.fenced_by = Some(1);
+        a.split_with = Some("bb".repeat(16));
+        let mut b = node("node-2", CouncilRole::Fenced, Some(1), None);
+        b.fenced_by = Some(1);
+        b.split_with = Some("aa".repeat(16));
+        let observations = vec![a, b];
+        let summary = summarise(&observations);
+        assert_eq!(summary.fenced.len(), 2);
+        let warnings = summary.warnings();
+        assert!(warnings[0].starts_with("split: two recoveries share an epoch"));
+        assert!(warnings[0].contains("node-1 (epoch 1, split"));
+        assert!(!warnings.iter().any(|w| w.contains("replaced by")));
+        let table = render_council_status(&observations, &summary);
+        assert!(table.contains("1 split"), "council status:\n{table}");
+    }
+
+    #[test]
+    fn an_unpersisted_fence_is_a_warning() {
+        let mut nodes = healthy();
+        nodes[1].fence_persist_error = Some("No space left on device".to_string());
+        let summary = summarise(&nodes);
+        let warnings = summary.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("recovery fence not on disk"));
+        assert!(warnings[0].contains("node-2 (No space left on device)"));
     }
 
     #[test]

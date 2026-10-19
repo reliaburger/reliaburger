@@ -47,6 +47,23 @@ the nodes that answered run and names the one that didn't. If the nodes that
 answered disagree, the `version-skew` warning carries the silent node in its
 details.
 
+When desired apps span more than one namespace, `wtf` checks that every node
+can keep them apart. A node without the live eBPF hooks (rootless runc,
+ProcessGrill, eBPF off) gets a `namespace-isolation` warning naming it: there,
+any namespace's workloads reach any other's, and `allow_from` is refused.
+
+When the cluster has a GitOps configuration, `wtf` asks every node how it
+sees it. A secret-looking `env` value that's plaintext in the repository is a
+`gitops-plaintext-secret` warning naming the app and the key (never the
+value); GitOps still applies it, so encrypt it with `relish secret encrypt`.
+A node whose own `[gitops]` in `node.toml` differs from the cluster's gets a
+`gitops-local-config` warning listing the settings that differ: the cluster's
+configuration in Raft is the one that runs, and the node's is ignored. A node
+that can't unseal the cluster's GitOps credentials (no master key) gets a
+`gitops-config-unreadable` warning, since as leader it couldn't sync. With none
+of these, the `gitops` OK row says so. See
+[GitOps](12_operations.md#gitops).
+
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
 fenced out of a council `relish council recover` replaced, when nodes serve
@@ -59,6 +76,15 @@ warning too: it counts towards quorum but isn't applying the log, which is
 what a voter whose disk filled up looks like. `relish council status` shows
 the same comparison as a table.
 
+For the image registry, `wtf` warns (`registry-redundancy`) when a node's
+registry isn't listening, peers can't reach it, or some layers have fewer live
+copies than `[images] redundancy` asks for. Heal fixes the last on its own
+within a minute or two. A *lost* image is worse: some layer it needs has no
+live copy anywhere, so nothing can pull it. That's a CRITICAL
+`registry-lost-images` finding listing each `repository:tag`, and the only fix
+is to push the image again (or bring back the node that held it). `relish
+status` prints the same list on one line. See `images-and-volumes`.
+
 `relish inspect <app>` uses the same relay to list every instance of an app on
 every node, with the node it runs on, under a `desired` vs `running` replica
 count. A node that doesn't answer, or that gossip already considers dead, gets
@@ -66,6 +92,26 @@ a warning line naming it instead of silently shrinking the list. An app its
 namespace quota keeps unplaced gets a `Blocked:` line with the quota it would
 break (see `deploy-an-app`), and `wtf` reports it as a `quota-blocked` warning
 rather than a generic under-replication.
+
+An app the scheduler could place only in part gets an `Unplaced:` line saying
+how many of its replicas found a node and why the rest didn't: no ready node,
+no node with its required labels, none that can enforce its needs or run its
+host binary, or no room. `relish status` prints the same line, and `wtf`
+reports it as an `unschedulable` warning with that reason (see
+`deploy-an-app`).
+
+An app whose current spec failed to roll out on a node is marked
+`RolloutFailed`: the leader holds its other nodes on the previous version and
+won't try the failed spec again. `wtf` reports it as a `rollout-failed`
+warning naming the node and the reason, and `relish status` prints the same
+line. Applying a different spec (a scale change counts), or `relish rollback`,
+clears it; applying the same spec again doesn't (see `deploy-an-app`).
+
+An instance whose binary isn't on its node, or isn't executable, is `failed`
+with the reason, such as `binary not found: /usr/local/bin/ghost-server`.
+`relish status` prints it under the table, and `wtf` reports a critical
+`launch-failed` finding naming each instance, its node and the reason, in place
+of a generic under-replication (see `deploy-an-app`).
 
 ## `relish path`: can A reach B?
 
@@ -139,11 +185,21 @@ workload identity, ingress, volumes, process workloads, jobs, the image
 registry and cluster coordination. Each case runs in its own leased `rbtest-*`
 namespace and cleans up after itself. While the council changes leader, the
 server refuses new leases with a 503 "retry shortly"; the runner asks again
-for up to 30 seconds before it gives up on the case.
+for up to 30 seconds before it gives up on the case. The image-registry cases
+do the same with the registry: a push the registry refuses with 503, because
+it can't confirm the write with the council leader just then, is made again
+every half second for up to 30 seconds. Any other refusal fails the case at
+once. Every case that runs a job holds a job lease, in the `jobs` group and
+the `process-workloads` group alike, because an application lease refuses
+jobs. Its jobs run through the cluster's common job lifecycle like any other
+job, and releasing the lease cancels their runs and forgets their
+definitions. With a council the lease itself lives in Raft, so any node can
+check it.
 
 ```sh
 relish test                                  # every group, four at a time
 relish test --filter scheduling,firewall     # just these groups
+relish test --filter process_job_with_exit_zero_succeeds   # just this case
 relish test --profile full-runc              # stricter acceptance profile
 relish --output json test                    # report for CI
 ```
@@ -151,8 +207,14 @@ relish --output json test                    # report for CI
 Group names are `scheduling`, `service-discovery`, `deployments`,
 `health-checks`, `secrets-config`, `firewall`, `workload-identity`, `ingress`,
 `volumes`, `process-workloads`, `jobs`, `image-registry` and
-`cluster-coordination`. The default `development` profile accepts a skip with
-a known reason, such as a capability this node lacks. The full profiles
+`cluster-coordination`. A `--filter` entry can also be an exact case name,
+as the report prints it, to run one case on its own; groups and case names
+mix. The default `development` profile accepts a skip with
+a known reason, such as a capability this node lacks. A node with
+`[process_workloads] mount_isolation` on, the Linux default, doesn't advertise
+host workloads, because it refuses them until #714 lands; its host
+`process-workloads` and `jobs` cases skip with that reason rather than
+waiting for work that never starts. The full profiles
 (`full-runc`, `process-grill`) fail on required skips, unknown evidence,
 timeouts and unconfirmed cleanup. The server must grant
 `provision_isolated_workloads`. Any failure exits non-zero. `--chaos` runs the
@@ -190,6 +252,14 @@ run, stops on a typed placement refusal, and rechecks all counted workloads.
 An API failure, incomplete evidence or deadline expiry is a failed measurement.
 Once a suite has started, a timeout, API error or uncertain cleanup fails the
 run (non-zero exit) instead of becoming a green skip.
+
+For job throughput, select a fixed-window scenario instead of the ordinary
+suite. For example, `relish bench --scenario jobs-shared-containers` runs for
+60 seconds with concurrency 27 by default. The `jobs-containers`,
+`jobs-host-processes` and `jobs-vm-baseline` scenarios provide the other isolation
+levels and a local Linux raw reference. See `relish manual batch` for the
+resource profile, binary allowlist, matched-node requirements and cutoff/cleanup
+semantics. Daily rates are explicitly extrapolated from the measured window.
 
 ## When the CLI can't reach anything
 

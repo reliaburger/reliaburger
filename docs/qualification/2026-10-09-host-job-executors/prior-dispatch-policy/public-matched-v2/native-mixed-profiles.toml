@@ -1,0 +1,26 @@
+name = "native-mixed-profiles"
+namespace = "default"
+[[cohort]]
+name = "small"
+count = 1000
+chunk_size = 1000
+max_attempts = 1
+per_node_concurrency = 27
+[cohort.template]
+runtime = "process"
+cpu = "100m-1000m"
+memory = "32Mi"
+exec = "/tmp/rb-host-executor-v1/host/busybox"
+command = ["true"]
+[[cohort]]
+name = "large"
+count = 100
+chunk_size = 1000
+max_attempts = 1
+per_node_concurrency = 27
+[cohort.template]
+runtime = "process"
+cpu = "1000m-2000m"
+memory = "64Mi"
+exec = "/tmp/rb-host-executor-v1/host/busybox"
+command = ["sh", "-c", "i=0; while [ $i -lt 10000 ]; do i=$((i+1)); done"]

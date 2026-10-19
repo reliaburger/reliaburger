@@ -9,6 +9,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -107,12 +108,14 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Identity,
                 Capability::Council,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(encrypted_env_value_is_decrypted_in_workload),
         },
         TestCase {
             name: "config_file_is_mounted_with_contents",
             group: TestGroup::SecretsConfig,
             requires: &[Capability::ContainerRuntime],
+            lease: LeaseScope::Applications,
             run: testkit_case!(config_file_is_mounted_with_contents),
         },
         TestCase {
@@ -123,6 +126,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Identity,
                 Capability::Council,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(cluster_pubkey_encrypt_roundtrip),
         },
     ]

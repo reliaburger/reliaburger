@@ -112,10 +112,9 @@ pub(super) async fn token_list_handler(
     // service token. That principal stays off user management (AUTH4), so
     // it may read only this node's answer, never start a cluster-wide one.
     let system_reads_local = query.local
-        && auth.as_deref().is_some_and(|ctx| {
-            ctx.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL
-                && ctx.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL
-        });
+        && auth
+            .as_deref()
+            .is_some_and(crate::sesame::auth::is_system_principal);
     if !system_reads_local {
         if let Err(resp) = crate::sesame::auth::authorize_user(
             auth.as_deref(),
@@ -269,7 +268,7 @@ pub(super) async fn token_revoke_handler(
 
 /// Create an API token and persist it via Raft.
 ///
-/// The token is minted server-side (Argon2 hashing) and written to the
+/// The token is minted and hashed server-side and written to the
 /// SecurityState in one step, so the stored hash always matches the plaintext
 /// returned to the caller. The plaintext is shown once and never stored.
 pub(super) async fn token_create_handler(
@@ -481,27 +480,14 @@ pub(super) async fn token_create_handler(
         expires_at = Some(expires_at.map_or(bound, |expiry| expiry.min(bound)));
     }
 
-    // Argon2id hashing is deliberately slow + memory-hungry (M7): run it on the
-    // blocking pool so it doesn't stall the async runtime worker.
-    let name = req.name.clone();
+    // Minting costs one SHA-256 (#912), so it runs inline: no blocking pool.
     let expires_unix = expires_at.map(unix_seconds);
-    let created = match tokio::task::spawn_blocking(move || {
-        crate::sesame::token::create_token(&name, role, scope, expires_at)
-    })
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
+    let created = match crate::sesame::token::create_token(&req.name, role, scope, expires_at) {
+        Ok(created) => created,
+        Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "token hashing task failed" })),
             )
                 .into_response();
         }
@@ -658,28 +644,18 @@ pub(super) async fn token_rotate_handler(
             .into_response();
     };
 
-    // Argon2id hashing runs on the blocking pool (M7), as in create.
-    let rotated = match tokio::task::spawn_blocking(move || {
-        crate::sesame::token::rotate_token(&stored, std::time::SystemTime::now(), grace)
-    })
-    .await
-    {
-        Ok(Ok(rotated)) => rotated,
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "token hashing task failed" })),
-            )
-                .into_response();
-        }
-    };
+    // Hashing the new secret is one SHA-256 (#912), so it runs inline.
+    let rotated =
+        match crate::sesame::token::rotate_token(&stored, std::time::SystemTime::now(), grace) {
+            Ok(rotated) => rotated,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        };
     let expires_at = rotated.rotation.expires_at.map(unix_seconds);
     let previous_valid_until = rotated.rotation.previous_valid_until.map(unix_seconds);
 
@@ -842,6 +818,22 @@ pub(super) async fn join_token_revoke_handler(
                 .into_response();
         }
     }
+    record_caller_audit(
+        &state,
+        auth.as_deref(),
+        crate::bun::events::EventKind::Token,
+        "join_token.revoked",
+        std::collections::BTreeMap::from([
+            ("node_id".to_string(), req.node_id.clone()),
+            ("revoked".to_string(), hashes.len().to_string()),
+        ]),
+        format!(
+            "{} join token(s) revoked for node {}",
+            hashes.len(),
+            req.node_id
+        ),
+    )
+    .await;
     Json(serde_json::json!({ "node_id": req.node_id, "revoked": hashes.len() })).into_response()
 }
 

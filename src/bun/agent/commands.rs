@@ -22,6 +22,16 @@ pub enum ApplyEvent {
         created: usize,
         instances: Vec<String>,
     },
+    /// A rollout over running instances failed part-way and was cleaned
+    /// up. `rolled_back` says whether every instance runs the previous spec
+    /// again (`false`: the rollout halted with both specs running). The
+    /// `Error` that ends the stream follows it. The placement reconciler
+    /// reports it to the leader, which marks the spec `RolloutFailed`.
+    RolloutAborted {
+        app: String,
+        rolled_back: bool,
+        reason: String,
+    },
     /// The deploy failed.
     Error { message: String },
 }
@@ -58,52 +68,11 @@ pub enum AgentCommand {
         tail: Option<usize>,
         response: oneshot::Sender<Result<String, BunError>>,
     },
-    /// Internal authenticated dispatch; admission must be durable before acknowledgement.
-    RunJobsWithLabels {
-        batch_id: u64,
-        config: Config,
-        execution_labels: BTreeMap<String, crate::bun::batch::BatchExecutionLabel>,
-        events: mpsc::Sender<ApplyEvent>,
-        response: oneshot::Sender<Result<BTreeMap<String, i32>, BunError>>,
-    },
-    /// Query explicit local ownership before enforcing first-launch allocation.
-    BatchOwnedExecutions {
-        identities: Vec<(String, String)>,
-        response: oneshot::Sender<std::collections::BTreeSet<String>>,
-    },
     /// Deploy workloads from a parsed Config.
     ///
     /// Progress events are streamed over the `events` channel so the
     /// API can relay them to the client in real time.
     Deploy {
-        config: Config,
-        events: mpsc::Sender<ApplyEvent>,
-    },
-    /// Admit and prepare migration images without launching any workload.
-    PreparePrerequisites {
-        config: Config,
-        response: oneshot::Sender<
-            Result<(Config, crate::bun::deploy_operations::DeployOperationHandle), String>,
-        >,
-    },
-    /// Execute the prepared migrations under the operation's existing ownership.
-    RunPrerequisites {
-        config: Config,
-        operation: crate::bun::deploy_operations::DeployOperationHandle,
-        response: oneshot::Sender<Result<(), super::launch::PrerequisiteFailure>>,
-    },
-    /// Bind startup acknowledgement to the actual ordinary job generations.
-    CaptureClusterJobs {
-        config: Config,
-        response: oneshot::Sender<Result<Arc<super::cluster_jobs::ClusterJobReceipt>, String>>,
-    },
-    /// Read positive completion or retirement evidence for that exact receipt.
-    ClusterJobsSettlement {
-        receipt: Arc<super::cluster_jobs::ClusterJobReceipt>,
-        response: oneshot::Sender<super::cluster_jobs::ClusterJobSettlement>,
-    },
-    /// Explicit operator authorisation to rerun unknown node-local jobs.
-    RerunJobs {
         config: Config,
         events: mpsc::Sender<ApplyEvent>,
     },
@@ -139,6 +108,12 @@ pub enum AgentCommand {
         spec: Box<AppSpec>,
         response: oneshot::Sender<bool>,
     },
+    /// The placement reconciler's record of the app versions it last
+    /// finished deploying here, for the state report (#692). Replaces the
+    /// previous record.
+    RecordConvergedRollouts {
+        rollouts: Vec<crate::reporting::types::RolloutReport>,
+    },
     /// Get the local desired application specs for standalone diagnostics.
     DesiredApps {
         response: oneshot::Sender<Vec<crate::bun::diagnostics::DesiredAppEvidence>>,
@@ -152,10 +127,6 @@ pub enum AgentCommand {
     /// "job.{name}") with their images, for `relish --dry-run` diffing.
     CurrentResources {
         response: oneshot::Sender<Vec<CurrentResourceStatus>>,
-    },
-    /// Get status of run-to-completion workload instances.
-    JobStatus {
-        response: oneshot::Sender<Vec<JobStatus>>,
     },
     /// Get the image references of all current instances (for GC
     /// protection: actively deployed images must not be collected).
@@ -405,25 +376,18 @@ impl AgentCommand {
     /// The variant's name, for the loop meter's slow-turn log.
     pub(super) fn name(&self) -> &'static str {
         match self {
-            AgentCommand::RunJobsWithLabels { .. } => "run_jobs_with_labels",
-            AgentCommand::BatchOwnedExecutions { .. } => "batch_owned_executions",
             AgentCommand::ResolveExecutionLogs { .. } => "resolve_execution_logs",
             AgentCommand::LogCaptures { .. } => "log_captures",
             AgentCommand::Deploy { .. } => "deploy",
-            AgentCommand::PreparePrerequisites { .. } => "prepare_prerequisites",
-            AgentCommand::CaptureClusterJobs { .. } => "capture_cluster_jobs",
-            AgentCommand::ClusterJobsSettlement { .. } => "cluster_jobs_settlement",
-            AgentCommand::RunPrerequisites { .. } => "run_prerequisites",
-            AgentCommand::RerunJobs { .. } => "rerun_jobs",
             AgentCommand::Stop { .. } => "stop",
             AgentCommand::Retire { .. } => "retire",
             AgentCommand::RetireTestResources { .. } => "retire_test_resources",
             AgentCommand::Status { .. } => "status",
             AgentCommand::AdoptedPlacementMatches { .. } => "adopted_placement_matches",
+            AgentCommand::RecordConvergedRollouts { .. } => "record_converged_rollouts",
             AgentCommand::DesiredApps { .. } => "desired_apps",
             AgentCommand::ScrapeTargets { .. } => "scrape_targets",
             AgentCommand::CurrentResources { .. } => "current_resources",
-            AgentCommand::JobStatus { .. } => "job_status",
             AgentCommand::ActiveImages { .. } => "active_images",
             AgentCommand::DeployOperations { .. } => "deploy_operations",
             AgentCommand::CancelDeploy { .. } => "cancel_deploy",
@@ -512,45 +476,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     response,
                 );
             }
-            AgentCommand::RunJobsWithLabels {
-                batch_id,
-                config,
-                execution_labels,
-                events,
-                response,
-            } => {
-                let result = self
-                    .begin_owned_batch(batch_id, config, execution_labels, events)
-                    .await;
-                let _ = response.send(result);
-            }
-            AgentCommand::BatchOwnedExecutions {
-                identities,
-                response,
-            } => {
-                let _ = response.send(self.batch_owned_identities(&identities));
-            }
-            AgentCommand::CaptureClusterJobs { config, response } => {
-                let _ = response.send(self.capture_cluster_jobs(&config));
-            }
-            AgentCommand::ClusterJobsSettlement { receipt, response } => {
-                let _ = response.send(self.cluster_jobs_settlement(&receipt));
-            }
-            AgentCommand::PreparePrerequisites { config, response } => {
-                self.prepare_prerequisites(config, response).await;
-            }
-            AgentCommand::RunPrerequisites {
-                config,
-                operation,
-                response,
-            } => {
-                self.run_prepared_prerequisites(config, operation, response);
-            }
             AgentCommand::Deploy { config, events } => {
-                self.begin_deploy(config, events, true, false).await;
-            }
-            AgentCommand::RerunJobs { config, events } => {
-                self.begin_deploy(config, events, true, true).await;
+                self.begin_deploy(config, events).await;
             }
             AgentCommand::Stop {
                 app_name,
@@ -601,13 +528,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .list_instances()
                     .iter()
                     .filter(|instance| {
-                        !instance.is_job
-                            && matches!(
-                                instance.state,
-                                ContainerState::HealthWait
-                                    | ContainerState::Running
-                                    | ContainerState::Unhealthy
-                            )
+                        matches!(
+                            instance.state,
+                            ContainerState::HealthWait
+                                | ContainerState::Running
+                                | ContainerState::Unhealthy
+                        )
                     })
                     .filter_map(|instance| {
                         let spec = self
@@ -631,6 +557,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 response,
             } => {
                 let _ = response.send(self.adopted_instances_match(&app_name, &namespace, &spec));
+            }
+            AgentCommand::RecordConvergedRollouts { rollouts } => {
+                self.converged_rollouts = rollouts;
             }
             AgentCommand::DesiredApps { response } => {
                 let mut apps = self
@@ -658,6 +587,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             service_port: spec.port,
                             blocked: None,
                             volume_home_away: None,
+                            unschedulable: None,
+                            rollout_failed: None,
                             volume_homes: Vec::new(),
                         },
                     )
@@ -679,36 +610,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         ),
                     })
                     .collect();
-                for job in self.get_job_status() {
-                    resources.push(CurrentResourceStatus {
-                        resource: crate::config::fingerprint::job_resource_key(
-                            &job.name,
-                            &job.namespace,
-                        ),
-                        image: Some(job.image),
-                        fingerprint: self.recorded_jobs.get(&job.instance_id).and_then(|record| {
-                            crate::config::fingerprint::job_fingerprint(&record.spec)
-                        }),
-                    });
-                }
                 resources.sort_by(|a, b| a.resource.cmp(&b.resource));
-                resources.dedup_by(|a, b| {
-                    if a.resource != b.resource {
-                        return false;
-                    }
-                    if a.fingerprint != b.fingerprint || a.image != b.image {
-                        // Different executions of one logical job cannot prove
-                        // a single current specification.
-                        b.fingerprint = None;
-                        b.image = None;
-                    }
-                    true
-                });
                 let _ = response.send(resources);
-            }
-            AgentCommand::JobStatus { response } => {
-                let statuses = self.get_job_status();
-                let _ = response.send(statuses);
             }
             AgentCommand::ActiveImages { response } => {
                 let images: std::collections::HashSet<String> = self

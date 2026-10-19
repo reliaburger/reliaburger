@@ -8,6 +8,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::TestCase;
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -115,19 +116,39 @@ pub fn cases() -> Vec<TestCase> {
             name: "allow_from_permits_listed_app",
             group: TestGroup::Firewall,
             requires: &[Capability::ContainerRuntime, Capability::Ebpf],
+            lease: LeaseScope::Applications,
             run: testkit_case!(allow_from_permits_listed_app),
         },
         TestCase {
             name: "unlisted_app_is_denied",
             group: TestGroup::Firewall,
             requires: &[Capability::ContainerRuntime, Capability::Ebpf],
+            lease: LeaseScope::Applications,
             run: testkit_case!(unlisted_app_is_denied),
         },
         TestCase {
             name: "firewall_reflects_allow_from_change",
             group: TestGroup::Firewall,
             requires: &[Capability::ContainerRuntime, Capability::Ebpf],
+            lease: LeaseScope::Applications,
             run: testkit_case!(firewall_reflects_allow_from_change),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firewall_targets_pass_the_validation_the_api_applies() {
+        let ctx = TestContext::offline("rbtest-firewall-00");
+        for allowed in [&["fw-client"][..], &["fw-first", "fw-second"]] {
+            let spec = target_allowing(&ctx, "fw-target", allowed);
+            let config = crate::config::Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this firewall target: {error}\n{spec}");
+            }
+        }
+    }
 }

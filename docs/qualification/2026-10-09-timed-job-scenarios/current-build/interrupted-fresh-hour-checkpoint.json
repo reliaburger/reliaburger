@@ -1,0 +1,21 @@
+{
+  "reason": "User requested a commit/push checkpoint; required CI is separated from timed measurements",
+  "interrupted_phase": "hour-runc",
+  "benchmark_pid": 2882383,
+  "benchmark_start_ticks": 120254226,
+  "controller_pid": 780875,
+  "controller_start_ticks": 120222009,
+  "benchmark_drained": true,
+  "cleanup_failed_submissions": [],
+  "post_cutoff_drain_proofs": [
+    {
+      "batch_id": 85,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "original_bun_and_service_retained": true,
+  "service_http_status": 200,
+  "verified_utc": "2026-10-09T17:37:34.538967+00:00"
+}

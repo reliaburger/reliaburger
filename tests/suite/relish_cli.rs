@@ -18,9 +18,10 @@ fn run(args: &[&str]) -> Output {
 fn version_reports_the_compiled_binary() {
     let output = run(&["--version"]);
     assert!(output.status.success());
+    let version = env!("CARGO_PKG_VERSION");
     let expected = match reliaburger::upgrade::version::build_commit() {
-        Some(commit) => format!("relish 0.1.6 ({})\n", &commit[..7]),
-        None => "relish 0.1.6\n".to_string(),
+        Some(commit) => format!("relish {version} ({})\n", &commit[..7]),
+        None => format!("relish {version}\n"),
     };
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     assert!(output.stderr.is_empty());
@@ -42,8 +43,7 @@ fn apply_dry_run_succeeds_without_an_agent() {
         &config,
         r#"
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["true"]
+script = "exec true"
 "#,
     )
     .unwrap();
@@ -238,6 +238,78 @@ async fn cancel_deploy_waits_for_terminal_evidence_and_refuses_unknown_success()
     }
 }
 
+/// #697: `relish image delete repo:tag` finds the registry through the
+/// agent's capabilities and sends the OCI tag deletion there.
+#[tokio::test]
+async fn image_delete_parses_repo_and_tag() {
+    use axum::{
+        Json, Router,
+        extract::{OriginalUri, State},
+        routing::{delete, get},
+    };
+    use std::sync::{Arc, Mutex};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut capabilities = reliaburger::bun::capabilities::ClusterCapabilities::default();
+    capabilities.service_endpoints.registry = Some(endpoint.clone());
+    let deleted: Arc<Mutex<Vec<String>>> = Arc::default();
+    let app =
+        Router::new()
+            .route(
+                "/v1/capabilities",
+                get(move || async move { Json(capabilities) }),
+            )
+            .route(
+                "/v2/{*rest}",
+                delete(
+                    |State(deleted): State<Arc<Mutex<Vec<String>>>>,
+                     OriginalUri(uri): OriginalUri| async move {
+                        deleted.lock().unwrap().push(uri.path().to_string());
+                        axum::http::StatusCode::ACCEPTED
+                    },
+                ),
+            )
+            .with_state(deleted.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(["image", "delete", "localhost:5050/team/web:v1"])
+            .env("RELIABURGER_ENDPOINT", &endpoint)
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        *deleted.lock().unwrap(),
+        vec!["/v2/team/web/manifests/v1".to_string()]
+    );
+    // A bare name is refused before anything is sent.
+    let refused = run(&[
+        "--endpoint",
+        "http://127.0.0.1:1",
+        "images",
+        "delete",
+        "web",
+    ]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("repository:tag"));
+}
+
 #[test]
 fn job_rerun_rejects_non_job_manifests_before_contacting_the_agent() {
     let directory = tempfile::tempdir().unwrap();
@@ -390,4 +462,87 @@ fn directory_compile_refuses_partial_output_when_an_input_is_invalid() {
         );
         assert!(String::from_utf8_lossy(&output.stderr).contains(invalid_file));
     }
+}
+
+/// Submit `jobs` (TOML) with the compiled `relish batch` against `endpoint`
+/// and return the admitted batch id, checking the key went to stderr.
+async fn relish_batch(endpoint: &str, jobs: &str) -> u64 {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jobs.toml");
+    std::fs::write(&path, jobs).unwrap();
+    let endpoint = endpoint.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_relish"))
+            .arg("batch")
+            .arg(&path)
+            .env("RELIABURGER_ENDPOINT", endpoint)
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("--idempotency-key"), "{stderr}");
+    stdout
+        .split_whitespace()
+        .nth(1)
+        .and_then(|word| word.parse().ok())
+        .unwrap_or_else(|| panic!("no batch id in {stdout:?}"))
+}
+
+/// A TOML job's `task_timeout_secs` reaches the cluster: `relish batch`
+/// submits jobs that would sleep for a minute, and the cluster stops each
+/// after one second instead of letting it run for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hung_toml_job_times_out() {
+    let harness = crate::batch::Harness::start().await;
+    let hang = "runtime = \"process\"\nexec = \"/bin/sleep\"\ncommand = [\"60\"]\ntask_timeout_secs = 1\nmax_attempts = 1\n";
+    let started = std::time::Instant::now();
+
+    // A job that is safe to repeat counts the timeout as a failed attempt.
+    let id = relish_batch(
+        &harness.base_url,
+        &format!("[job.hang]\n{hang}replay_unknown = true\n"),
+    )
+    .await;
+    let summary = harness.wait_done(id, 30).await;
+    assert_eq!(summary["failed"], 1, "{summary}");
+    assert_eq!(summary["succeeded"], 0, "{summary}");
+
+    // By default a timed-out attempt is an unknown outcome: the command is
+    // stopped, and the run waits for `relish batch replay` instead of retrying.
+    let id = relish_batch(&harness.base_url, &format!("[job.hang-once]\n{hang}")).await;
+    let http = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let summary: serde_json::Value = http
+            .get(format!("{}/v1/batch/{id}", harness.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let cohort = &summary["cohorts"][0];
+        if cohort["unknown_owners"]
+            .as_array()
+            .is_some_and(|owners| !owners.is_empty())
+            && cohort["active_commands"] == 0
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the timeout never stopped the command: {summary}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }

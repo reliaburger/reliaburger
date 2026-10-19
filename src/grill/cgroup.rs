@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use crate::config::types::ResourceRange;
 
 /// The cgroup v2 root directory for Reliaburger workloads.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/reliaburger";
+pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/reliaburger";
 
 /// The default cgroup CPU period in microseconds.
 const CGROUP_PERIOD_US: u64 = 100_000;

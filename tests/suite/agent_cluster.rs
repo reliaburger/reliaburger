@@ -99,8 +99,12 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         council.clone(),
         membership_rx,
         reports_rx,
-        false,
-        Default::default(),
+        reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+            dns_required: false,
+            reconstruction: Default::default(),
+            stale_node_grace: Duration::from_secs(300),
+        },
+        None,
         None,
         shutdown.clone(),
     );
@@ -159,6 +163,167 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
 }
 
 /// Agent nodes endpoint returns gossip membership when cluster is wired.
+/// A node whose execution budget job attempts and executors already hold.
+/// Its app requests are zero, so before 0.2.0's fix the leader saw an empty
+/// node; now its state report carries the job reservations and the leader
+/// counts them.
+fn job_filled_report(
+    name: &str,
+    jobs_cpu_millicores: u64,
+) -> reliaburger::reporting::types::StateReport {
+    reliaburger::reporting::types::StateReport {
+        has_buildah: false,
+        node_id: NodeId::new(name),
+        timestamp: std::time::SystemTime::now(),
+        running_apps: vec![],
+        cached_specs: vec![],
+        rollouts: Vec::new(),
+        resource_usage: reliaburger::reporting::types::ResourceUsage {
+            cpu_total_millicores: 4000,
+            memory_total_mb: 8192,
+            ..Default::default()
+        },
+        event_log: vec![],
+        job_reservations: reliaburger::reporting::types::JobReservations {
+            cpu_millicores: jobs_cpu_millicores,
+            memory_bytes: 0,
+        },
+        capacity_refusals: Vec::new(),
+    }
+}
+
+/// Apps and jobs share each node's execution budget. With one node full of
+/// job attempts and another idle, the leader puts a new app replica on the
+/// idle one instead of on the node where it could never start.
+#[tokio::test]
+async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
+    use reliaburger::cluster::orchestrate::spawn_leader_scheduler;
+
+    let router = InMemoryRaftRouter::new();
+    let council = std::sync::Arc::new(
+        CouncilNode::new(
+            1,
+            fast_council_config(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    router.register(1, council.raft().clone()).await;
+    council
+        .initialize(BTreeMap::from([(1, node_info(1, 9445))]))
+        .await
+        .unwrap();
+    let mut metrics = council.metrics();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.borrow().current_leader != Some(1) {
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    let members: Vec<_> = [("full", 7001), ("idle", 7002)]
+        .into_iter()
+        .map(|(name, port)| MembershipSnapshot {
+            node_id: NodeId::new(name),
+            address: addr(port),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: BTreeMap::new(),
+            first_seen: std::time::Instant::now(),
+            resources: None,
+        })
+        .collect();
+    let mut reports = reliaburger::reporting::aggregator::AggregatedState {
+        leadership_epoch: Some(council.current_term()),
+        ..Default::default()
+    };
+    for (name, jobs) in [("full", 4000), ("idle", 0)] {
+        let node = NodeId::new(name);
+        reports
+            .reports
+            .insert(node.clone(), job_filled_report(name, jobs));
+        reports.receive_deadlines.insert(
+            node.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(300),
+        );
+        // Both nodes run containers, so the image app may go to either
+        // (#914).
+        reports.capabilities.insert(
+            node.clone(),
+            reliaburger::reporting::types::NodeCapabilityReport {
+                node_id: node.clone(),
+                capabilities: reliaburger::meat::cluster_state::NodeCapabilities {
+                    containers: true,
+                    ..Default::default()
+                },
+                egress_enforcement: Vec::new(),
+                egress_degraded: false,
+                egress_affected_workloads: Vec::new(),
+            },
+        );
+        reports.readiness.insert(
+            node.clone(),
+            reliaburger::reporting::types::NodeReadinessReport {
+                node_id: node,
+                evidence: reliaburger::bun::readiness::NodeReadinessEvidence {
+                    ready: true,
+                    observed_at_unix_ms: 1,
+                    subsystems: Vec::new(),
+                },
+            },
+        );
+    }
+    let (_members, membership_rx) = watch::channel(members);
+    let (_reports, reports_rx) = watch::channel(reports);
+    let shutdown = CancellationToken::new();
+    let _admission = spawn_leader_scheduler(
+        council.clone(),
+        membership_rx,
+        reports_rx,
+        reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+            dns_required: false,
+            reconstruction: Default::default(),
+            stale_node_grace: Duration::from_secs(300),
+        },
+        None,
+        None,
+        shutdown.clone(),
+    );
+
+    let app = reliaburger::meat::AppId::new("web", "default");
+    council
+        .write(RaftRequest::AppSpec {
+            app_id: app.clone(),
+            spec: Box::new(toml::from_str("image = 'example:v1'\ncpu = '1000m'").unwrap()),
+        })
+        .await
+        .unwrap();
+    let placed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(placements) = council.desired_state().await.scheduling.get(&app)
+                && !placements.is_empty()
+            {
+                return placements
+                    .iter()
+                    .map(|placement| placement.node_id.0.clone())
+                    .collect::<Vec<_>>();
+            }
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await;
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+    assert_eq!(placed.expect("the app was never placed"), ["idle"]);
+}
+
 #[tokio::test]
 async fn agent_nodes_returns_membership() {
     let shutdown = CancellationToken::new();
@@ -349,7 +514,7 @@ async fn udp_gossip_transport_round_trip() {
     let t1 = UdpMustardTransport::bind(addr(0)).await.unwrap();
     let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
 
-    let t2_addr = t2.local_addr();
+    let t2_addr = t2.local_addr().unwrap();
 
     let msg = GossipMessage::new(
         NodeId::new("sender"),
@@ -386,8 +551,11 @@ async fn tcp_reporting_transport_round_trip() {
         timestamp: SystemTime::now(),
         running_apps: vec![],
         cached_specs: vec![],
+        rollouts: Vec::new(),
         resource_usage: ResourceUsage::default(),
         event_log: vec![],
+        job_reservations: Default::default(),
+        capacity_refusals: Vec::new(),
     };
     let msg = ReportingMessage::Report(report);
 

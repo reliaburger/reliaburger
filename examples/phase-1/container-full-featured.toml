@@ -40,7 +40,8 @@ command = ["echo", "running pre-start checks"]
 path = "/data"
 size = "5Gi"
 
-# HostPath volume for shared config.
+# HostPath volume for shared config. The node mounts it only if its
+# node.toml allows the prefix: [storage] allowed_host_paths = ["/etc/myapp"].
 [[app.myapp.volumes]]
 source = "/etc/myapp"
 path = "/etc/myapp"

@@ -5,6 +5,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
+use crate::testkit::lease::LeaseScope;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
@@ -200,18 +201,21 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Council,
                 Capability::Identity,
             ],
+            lease: LeaseScope::Applications,
             run: testkit_case!(workload_receives_spiffe_certificate),
         },
         TestCase {
             name: "jwks_endpoint_serves_signing_keys",
             group: TestGroup::WorkloadIdentity,
             requires: &[Capability::Council, Capability::Identity],
+            lease: LeaseScope::Applications,
             run: testkit_case!(jwks_endpoint_serves_signing_keys),
         },
         TestCase {
             name: "namespace_scoped_token_is_rejected_elsewhere",
             group: TestGroup::WorkloadIdentity,
             requires: &[Capability::Council, Capability::Identity],
+            lease: LeaseScope::Applications,
             run: testkit_case!(namespace_scoped_token_is_rejected_elsewhere),
         },
     ]

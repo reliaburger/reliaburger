@@ -6,6 +6,23 @@ agent, holds the desired state and schedules work; it starts on the first node
 and grows as nodes join, up to seven voters, or to the council size the
 cluster was created with (appliance clusters default to five).
 
+The council always holds an odd number of voters: the largest odd number the
+live nodes allow, up to seven. An even council survives no more failures than
+the odd one below it and makes every write wait for one more acknowledgement.
+
+| Live nodes | Voters | Survives losing |
+|------------|--------|-----------------|
+| 1          | 1      | nothing         |
+| 2          | 1      | the other node, not the voter |
+| 3 or 4     | 3      | any one node    |
+| 5 or 6     | 5      | any two nodes   |
+| 7 or more  | 7      | any three nodes |
+
+A 2-node cluster has one voter. Losing the other node costs nothing; losing the
+voter stops scheduling and writes (apps keep running) until it comes back or
+you recover the council on the survivor. Raft can't do better with two
+machines. For high availability, run three nodes.
+
 A container cluster needs Linux with rootful runc and eBPF (kernel 5.8+,
 cgroup v2, bpffs at `/sys/fs/bpf`). Bun refuses `--cluster` under rootless
 runc. On a laptop, `relish setup --quickstart` builds exactly this inside VMs;
@@ -17,11 +34,15 @@ the rest of this chapter is for servers.
 `app.toml` and an mTLS-required `reliaburger.toml`:
 
 ```sh
-relish init cluster --cluster-name prod --node-id node-01
+sudo relish init cluster --cluster-name prod --node-id node-01
 ```
 
-Open `cluster/reliaburger.toml` and set `enabled = true` under `[ebpf]` (and
-under `[dns]` and `[ingress]` if you want them; see `networking`). Back up
+Run as root on Linux with `runc` installed, `relish init` writes `[ebpf]` and
+`[dns]` with `enabled = true`: namespace isolation and egress allowlists need
+the eBPF data path, and Bun refuses to start this node if it can't load it.
+Anywhere else it leaves both off, and the node refuses `allow_from` and egress
+allowlists rather than run them unenforced. Turn on `[ingress]` if you want it
+(see `networking`). Back up
 `cluster/prod-master.key`: every node needs it, and it unlocks the cluster's
 CA and secret keys. Then start the node:
 
@@ -97,8 +118,8 @@ leaders. A cluster created with a council size shows it on a `Size:` line
 (`up to 5 voters`). `--output json` gives the same report to scripts. `relish
 status` opens with a one-line summary of it.
 
-The council heals itself: lose a voter and the reconciler promotes a caught-up
-node in its place. A voter whose disk is at least 95% full for ten minutes
+The council heals itself: lose a voter and the reconciler swaps a caught-up
+node in for it, in one membership change, so the voter count stays odd. A voter whose disk is at least 95% full for ten minutes
 (measured on the filesystem holding `<data>/raft`) asks to be replaced the same
 way, and a leader hands over first. The `max_storage_mb` caps on logs and
 metrics only decide what gets pruned; they never move a council seat. If a
@@ -142,12 +163,13 @@ still be sending traffic to addresses the cluster would then hand out again.
 ## Contributors: clusters from a checkout
 
 `relish dev create` builds `bun` and `relish` from your source tree inside a
-Lima build VM and starts a cluster from them. It's for working on Reliaburger
-itself; everyone else wants the quickstart.
+Lima build VM and starts a cluster from them. Like any cluster it runs mTLS:
+it creates the CA on your machine and enrols each VM with `relish join`. It's
+for working on Reliaburger itself; everyone else wants the quickstart.
 
 ```sh
 relish dev create --nodes 3
-relish dev shell reliaburger-1
+relish dev shell reliaburger-default-1
 relish dev destroy
 ```
 

@@ -16,9 +16,9 @@ use crate::meat::NodeId;
 use super::assignment::assign_parent;
 use super::transport::ReportingTransport;
 use super::types::{
-    AppResourceUsage, EgressAffectedWorkload, EgressEnforcementEvidence, EgressEnforcementStatus,
-    NodeCapabilityReport, NodeReadinessReport, ReportHealthStatus, ReportingMessage, ResourceUsage,
-    RunningApp, StateReport,
+    AppResourceUsage, CapacityRefusal, EgressAffectedWorkload, EgressEnforcementEvidence,
+    EgressEnforcementStatus, JobReservations, NodeCapabilityReport, NodeReadinessReport,
+    ReportHealthStatus, ReportingMessage, ResourceUsage, RolloutReport, RunningApp, StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -73,6 +73,13 @@ pub struct AgentSnapshot {
     pub egress_degraded: bool,
     /// Workloads fenced during the active incident.
     pub egress_affected_workloads: Vec<EgressAffectedWorkload>,
+    /// Execution-budget capacity held by task attempts and reusable
+    /// executors (app replicas excluded).
+    pub job_reservations: JobReservations,
+    /// Apps whose placement here failed for lack of capacity.
+    pub capacity_refusals: Vec<CapacityRefusal>,
+    /// The app versions the placement reconciler last finished deploying.
+    pub rollouts: Vec<RolloutReport>,
 }
 
 /// How many stale windows (`stale_report_timeout_secs`) a busy agent loop
@@ -390,6 +397,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
             timestamp: SystemTime::now(),
             running_apps,
             cached_specs: vec![],
+            rollouts: snapshot.rollouts,
             resource_usage: ResourceUsage {
                 cpu_used_millicores: cpu_used,
                 memory_used_mb: memory_used,
@@ -399,6 +407,8 @@ impl<T: ReportingTransport> ReportWorker<T> {
                 cpu_total_millicores: snapshot.capacity_cpu_millicores,
                 memory_total_mb: snapshot.capacity_memory_mb,
             },
+            job_reservations: snapshot.job_reservations,
+            capacity_refusals: snapshot.capacity_refusals,
             event_log: vec![],
             has_buildah: self.has_buildah,
         }
@@ -408,7 +418,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
     fn build_capability_report(&self, snapshot: &AgentSnapshot) -> NodeCapabilityReport {
         NodeCapabilityReport {
             node_id: self.node_id.clone(),
-            capabilities: snapshot.capabilities,
+            capabilities: snapshot.capabilities.clone(),
             egress_enforcement: snapshot
                 .instances
                 .iter()
@@ -454,6 +464,7 @@ mod tests {
             report_interval_secs: 1,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 
@@ -497,6 +508,9 @@ mod tests {
             allocated_ports: vec![8080],
             capacity_cpu_millicores: 7500,
             capacity_memory_mb: 15_872,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         }
     }
 
@@ -561,6 +575,7 @@ mod tests {
             report_interval_secs: 5,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 
@@ -785,7 +800,7 @@ mod tests {
             app_name: name.to_string(),
             namespace: "default".to_string(),
             instance_id: 0,
-            image: "proc-grill:image-ignored".to_string(),
+            image: "app:v1".to_string(),
             port: None,
             container_state: state,
             consecutive_unhealthy: 0,
@@ -825,8 +840,56 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         });
         assert_eq!(report.running_apps[0].execution, Some(execution));
+    }
+
+    #[tokio::test]
+    async fn state_report_carries_task_and_executor_reservations() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let (snapshot_tx, _snapshot_rx) = mpsc::channel(16);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let worker = ReportWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        );
+        let jobs = JobReservations {
+            cpu_millicores: 3000,
+            memory_bytes: 6 << 30,
+        };
+        let refusal = CapacityRefusal {
+            app_name: "api".to_string(),
+            namespace: "default".to_string(),
+            ordinals: vec![0, 2],
+        };
+
+        let report = worker.build_report(AgentSnapshot {
+            instances: vec![instance("web", ContainerState::Running, 250, 128)],
+            capabilities: Default::default(),
+            readiness: None,
+            egress_degraded: false,
+            egress_affected_workloads: vec![],
+            allocated_ports: vec![],
+            capacity_cpu_millicores: 8000,
+            capacity_memory_mb: 16384,
+            job_reservations: jobs,
+            capacity_refusals: vec![refusal.clone()],
+            rollouts: Vec::new(),
+        });
+
+        assert_eq!(report.job_reservations, jobs);
+        assert_eq!(report.capacity_refusals, vec![refusal]);
+        // App requests stay separate: admission reconciles those per instance.
+        assert_eq!(report.resource_usage.cpu_used_millicores, 250);
+        assert_eq!(report.resource_usage.memory_used_mb, 128);
     }
 
     #[tokio::test]
@@ -863,6 +926,9 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         };
         let report = worker.build_report(snapshot);
 
@@ -903,6 +969,9 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
         };
         let report = worker.build_report(snapshot);
         // A draining instance still holds its resources.

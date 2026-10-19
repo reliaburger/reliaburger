@@ -11,12 +11,16 @@
 //! the leader re-points every survivor at the new leader, whose aggregator
 //! recovers full coverage in a fresh epoch and still reconciles placements.
 //!
+//! Every test is hermetic (#721): a [`Fixture`] gives it a fresh data
+//! directory and leased port blocks, and the tests ask the cluster which
+//! node leads instead of assuming the bootstrap node still does.
+//!
 //! Gated behind `RELIABURGER_CLUSTER_TESTS=1` (the
 //! `RELIABURGER_UPGRADE_TESTS` precedent): nine nodes with seven-voter Raft
 //! elections are far past a 2-core CI budget. Run via
 //! `RELIABURGER_CLUSTER_TESTS=1 cargo test --test cluster_failover`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -24,18 +28,24 @@ use tokio_util::sync::CancellationToken;
 
 use reliaburger::cluster::orchestrate::spawn_placement_reconciler;
 use reliaburger::council::types::RaftRequest;
+use reliaburger::council::{CouncilError, CouncilResponse};
 use reliaburger::meat::{AppId, NodeId};
 use reliaburger::reporting::aggregator::AggregatedState;
 
+#[path = "support/bun_process.rs"]
+mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
+use bun_process::{PortBlockReservation, reserve_port_block_lease};
 use cluster_support::{
-    MembershipSource, WiredNode, WiredNodeOptions, cluster_tests_enabled, local, start_wired_node,
+    MembershipSource, WiredNode, WiredNodeOptions, clear_fixture_dir, cluster_tests_enabled, local,
+    start_wired_node,
 };
 
 const RETIREMENT_SERVICE_TOKEN: &str = "cluster-test-retirement-service";
 const NODE_COUNT: usize = 9;
-const BASE_PORT: u16 = 19510;
+/// Gossip, Raft, reporting and API: `start_wired_node`'s port block.
+const PORTS_PER_NODE: u16 = 4;
 
 impl WiredNode {
     /// Resolve a service by name against this node's agent — the merged
@@ -50,6 +60,20 @@ impl WiredNode {
             .await
             .ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// The ingress routes this node's Wrapper would serve.
+    async fn routes(&self) -> Vec<reliaburger::wrapper::types::RouteInfo> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(reliaburger::bun::agent::AgentCommand::Routes { response: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     async fn is_leader(&self) -> bool {
@@ -72,6 +96,102 @@ impl WiredNode {
             .membership()
             .voter_ids()
             .collect()
+    }
+}
+
+/// One test's cluster resources, shared with nothing else.
+///
+/// Each node keeps its data under the fixture's own temporary directory and
+/// binds a port block leased from the range the other suites lease from, so
+/// a parallel suite can't hold one of its ports and an earlier run can't
+/// leave state where this one looks (#721).
+struct Fixture {
+    /// Cancelling this kills every node; each node also has a child token.
+    root: CancellationToken,
+    data: tempfile::TempDir,
+    /// Leased port blocks by node index, held until the test ends so a
+    /// killed node's ports stay ours.
+    ports: BTreeMap<usize, PortBlockReservation>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        Self {
+            root: CancellationToken::new(),
+            data: tempfile::Builder::new()
+                .prefix("rb-failover-")
+                .tempdir()
+                .unwrap(),
+            ports: BTreeMap::new(),
+        }
+    }
+
+    /// The first (gossip) port of node `index`'s block, leased on first use.
+    fn gossip_port(&mut self, index: usize) -> u16 {
+        self.ports
+            .entry(index)
+            .or_insert_with(|| reserve_port_block_lease(PORTS_PER_NODE))
+            .base
+    }
+
+    fn gossip(&mut self, index: usize) -> SocketAddr {
+        local(self.gossip_port(index))
+    }
+
+    /// Start one fully wired node: the same subsystems `bun --cluster` runs.
+    async fn start_node(
+        &mut self,
+        index: usize,
+        seeds: Vec<SocketAddr>,
+        schedule: bool,
+        operator: Option<reliaburger::sesame::types::ApiToken>,
+    ) -> WiredNode {
+        start_wired_node(WiredNodeOptions {
+            name: format!("fo{index}"),
+            gossip_port: self.gossip_port(index),
+            seeds,
+            // Cancelling a node's own token kills that node only.
+            shutdown: self.root.child_token(),
+            data_dir_prefix: "rb-failover",
+            data_root: Some(self.data.path().to_path_buf()),
+            stale_report_timeout_secs: 10,
+            stale_node_grace: None,
+            metrics_rollup: None,
+            scheduler: schedule.then_some(reliaburger::config::node::ReconstructionSection {
+                report_threshold_percent: 80,
+                learning_period_timeout_secs: 5,
+                large_cluster_timeout_secs: 10,
+                large_cluster_node_count: 5000,
+            }),
+            lease_reaper: false,
+            // The two worker nodes have no Raft view, so peers come from the
+            // gossip directory.
+            membership: MembershipSource::Directory,
+            service_identity: Some(RETIREMENT_SERVICE_TOKEN.into()),
+            operator_token: operator,
+            fault_injection: false,
+            labels: Default::default(),
+            keep_data_dir: false,
+            task_arrays: None,
+            task_arrays_on_agent_budget: None,
+            process_only: false,
+        })
+        .await
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.root.cancel();
+        // A node that ran as root may leave an identity tmpfs mounted, which
+        // `TempDir` alone can't remove. Panicking here could abort a test
+        // that is already unwinding, so a failure is only reported.
+        if let Err(error) = clear_fixture_dir(self.data.path()) {
+            eprintln!(
+                "cannot clear fixture directory {}: {error}",
+                self.data.path().display()
+            );
+        }
     }
 }
 
@@ -107,54 +227,81 @@ fn settled_voters(nodes: &[&WiredNode]) -> Option<BTreeSet<u64>> {
     agreed.map(|(_, voters)| voters)
 }
 
-/// Start one fully wired node: the same subsystems `bun --cluster` runs.
-async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationToken) -> WiredNode {
-    start_node_with_scheduler(index, seeds, root, true).await
+/// The nodes at `indexes`, for helpers that take a slice of references.
+fn pick<'a>(nodes: &'a [WiredNode], indexes: &[usize]) -> Vec<&'a WiredNode> {
+    indexes.iter().map(|&index| &nodes[index]).collect()
 }
 
-async fn start_node_with_scheduler(
-    index: usize,
-    seeds: Vec<SocketAddr>,
-    root: &CancellationToken,
-    schedule: bool,
-) -> WiredNode {
-    start_node_for_test(index, seeds, root, schedule, None).await
+/// The index of whichever node in `among` leads right now, if one does.
+///
+/// Leadership can move at any moment under load (an election timeout on a
+/// busy host is enough), so tests ask each time rather than assuming the
+/// bootstrap node, or the last leader they saw, still leads.
+async fn leader_of(nodes: &[WiredNode], among: &[usize]) -> Option<usize> {
+    for &index in among {
+        if nodes[index].is_leader().await {
+            return Some(index);
+        }
+    }
+    None
 }
 
-async fn start_node_for_test(
-    index: usize,
-    seeds: Vec<SocketAddr>,
-    root: &CancellationToken,
-    schedule: bool,
-    operator: Option<reliaburger::sesame::types::ApiToken>,
-) -> WiredNode {
-    start_wired_node(WiredNodeOptions {
-        name: format!("fo{index}"),
-        gossip_port: BASE_PORT + (index as u16) * 10,
-        seeds,
-        // Cancelling a node's own token kills that node only.
-        shutdown: root.child_token(),
-        data_dir_prefix: "rb-failover",
-        stale_report_timeout_secs: 10,
-        metrics_rollup: None,
-        scheduler: schedule.then_some(reliaburger::config::node::ReconstructionSection {
-            report_threshold_percent: 80,
-            learning_period_timeout_secs: 5,
-            large_cluster_timeout_secs: 10,
-            large_cluster_node_count: 5000,
-        }),
-        lease_reaper: false,
-        // The two worker nodes have no Raft view, so peers come from the
-        // gossip directory.
-        membership: MembershipSource::Directory,
-        service_identity: Some(RETIREMENT_SERVICE_TOKEN.into()),
-        operator_token: operator,
-        fault_injection: false,
-        labels: Default::default(),
-        keep_data_dir: false,
-        task_arrays: None,
-    })
-    .await
+async fn wait_for_leader(nodes: &[WiredNode], among: &[usize], timeout: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(leader) = leader_of(nodes, among).await {
+            return leader;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no leader among {:?} within {timeout:?}",
+            pick(nodes, among)
+                .iter()
+                .map(|node| &node.name)
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The current leader's aggregated reports, if a node in `among` leads.
+async fn leader_state(nodes: &[WiredNode], among: &[usize]) -> Option<AggregatedState> {
+    let leader = leader_of(nodes, among).await?;
+    Some(nodes[leader].aggregated_rx.borrow().clone())
+}
+
+/// Write `request` through whichever node in `among` leads, retrying while
+/// leadership moves. A `SchedulingDecision` is wrapped in the leader's own
+/// `SchedulingDecisions` precondition at each attempt.
+async fn write_through_leader(
+    nodes: &[WiredNode],
+    among: &[usize],
+    request: RaftRequest,
+) -> CouncilResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let leader = wait_for_leader(nodes, among, Duration::from_secs(30)).await;
+        let council = &nodes[leader].council;
+        let attempt = match &request {
+            RaftRequest::SchedulingDecision(decision) => RaftRequest::SchedulingDecisions {
+                expected_log_id: council.desired_state().await.last_applied_log,
+                decisions: vec![decision.clone()],
+            },
+            request => request.clone(),
+        };
+        match council.write(attempt).await {
+            Ok(response) => return response,
+            // Not appended anywhere, so the retry can't apply it twice.
+            Err(error @ CouncilError::ForwardToLeader { .. }) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "leadership kept moving: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => panic!("write through {} failed: {error}", nodes[leader].name),
+        }
+    }
 }
 
 async fn wait_until(what: &str, timeout: Duration, mut cond: impl AsyncFnMut() -> bool) {
@@ -183,8 +330,7 @@ fn nodes_reporting_app(state: &AggregatedState, app: &str) -> usize {
 fn daemonset_spec(command_seconds: u32) -> reliaburger::config::app::AppSpec {
     toml::from_str(&format!(
         r#"
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "{command_seconds}"]
+        script = "exec sleep {command_seconds}"
         replicas = "*"
         "#
     ))
@@ -196,8 +342,7 @@ fn daemonset_spec(command_seconds: u32) -> reliaburger::config::app::AppSpec {
 fn ported_service_spec(name_port: u16) -> reliaburger::config::app::AppSpec {
     toml::from_str(&format!(
         r#"
-        image = "proc-grill:image-ignored"
-        command = ["sleep", "600"]
+        script = "exec sleep 600"
         replicas = 1
         port = {name_port}
         "#
@@ -214,6 +359,33 @@ fn node_running_app(state: &AggregatedState, app: &str) -> Option<String> {
         .map(|(node_id, _)| node_id.0.clone())
 }
 
+/// Kill `node` the way `kill -9` would: its spawned tasks and its
+/// in-process Raft core both stop.
+async fn kill(node: &WiredNode) {
+    node.shutdown.cancel();
+    // The cancellation token stops the node's spawned tasks (RPC server,
+    // gossip, reporting), but the in-process Raft core only dies with an
+    // explicit shutdown.
+    node.council.shutdown().await.ok();
+}
+
+/// A three-voter cluster's roles once its membership settles: the leader and
+/// the two other nodes, so a test never assumes which node won.
+async fn settled_roles(nodes: &[WiredNode]) -> (usize, [usize; 2]) {
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&pick(nodes, &[0, 1, 2])).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    let leader = wait_for_leader(nodes, &[0, 1, 2], Duration::from_secs(30)).await;
+    let mut others = (0..3).filter(|&index| index != leader);
+    let (Some(first), Some(second)) = (others.next(), others.next()) else {
+        unreachable!("three nodes have two that don't lead");
+    };
+    (leader, [first, second])
+}
+
 /// 12b.4: a service deployed on node B resolves + routes from node A. Every
 /// node overlays the leader's replicated endpoint catalogue onto its local
 /// service map, so cross-node resolution works even though the backend runs
@@ -226,15 +398,17 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
 
-    let root = CancellationToken::new();
+    let mut fixture = Fixture::new();
     // Three nodes, all voters (cap is seven): killing the leader leaves a
     // two-node quorum, so a survivor takes over cleanly. Three keeps the
     // election light while still proving cross-node resolve + failover.
     const N: usize = 3;
+    let all: Vec<usize> = (0..N).collect();
     let mut nodes = Vec::with_capacity(N);
-    nodes.push(start_node(100, vec![], &root).await);
+    nodes.push(fixture.start_node(100, vec![], true, None).await);
     for index in 101..(100 + N) {
-        nodes.push(start_node(index, vec![local(BASE_PORT + 1000)], &root).await);
+        let seed = fixture.gossip(100);
+        nodes.push(fixture.start_node(index, vec![seed], true, None).await);
     }
 
     // Wait for the council to commit all three as voters before deploying:
@@ -243,38 +417,45 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
     wait_until(
         "three settled voters",
         Duration::from_secs(60),
-        async || {
-            settled_voters(&nodes.iter().collect::<Vec<_>>())
-                .is_some_and(|voters| voters.len() == N)
-        },
+        async || settled_voters(&pick(&nodes, &all)).is_some_and(|voters| voters.len() == N),
     )
     .await;
     wait_until(
         "all nodes reporting to the leader",
         Duration::from_secs(60),
-        async || nodes[0].aggregated_rx.borrow().reports.len() == N,
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| state.reports.len() == N)
+        },
     )
     .await;
 
     // Deploy one replica of a ported service via the leader.
-    assert!(nodes[0].is_leader().await, "bootstrap node should lead");
-    nodes[0]
-        .council
-        .write(RaftRequest::AppSpec {
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
             app_id: AppId::new("redis", "default"),
             spec: Box::new(ported_service_spec(6379)),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
 
     // Wait until exactly one node reports it running.
+    let mut host_node = None;
     wait_until(
         "redis running on some node",
         Duration::from_secs(90),
-        async || node_running_app(&nodes[0].aggregated_rx.borrow(), "redis").is_some(),
+        async || {
+            host_node = leader_state(&nodes, &all)
+                .await
+                .and_then(|state| node_running_app(&state, "redis"));
+            host_node.is_some()
+        },
     )
     .await;
-    let host_node = node_running_app(&nodes[0].aggregated_rx.borrow(), "redis").unwrap();
+    let host_node = host_node.unwrap();
     eprintln!("redis landed on {host_node}");
 
     // Pick a DIFFERENT node and resolve the service from it. The catalogue is
@@ -299,33 +480,18 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
 
     // Kill the leader; a survivor takes over. The replicated catalogue must
     // survive the leader change: the same other-node resolution still works.
-    let old_leader = nodes[0].name.clone();
-    nodes[0].shutdown.cancel();
-    nodes[0].council.shutdown().await.ok();
-
-    let survivors: Vec<&WiredNode> = nodes.iter().filter(|n| n.name != old_leader).collect();
-    let mut new_leader: Option<&WiredNode> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    while new_leader.is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no new leader elected"
-        );
-        for node in &survivors {
-            if node.is_leader().await {
-                new_leader = Some(node);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    // A surviving node that isn't the (possibly-relocated) host still resolves
-    // redis from the post-failover catalogue.
-    let resolver = survivors
+    let old_leader = wait_for_leader(&nodes, &all, Duration::from_secs(30)).await;
+    kill(&nodes[old_leader]).await;
+    let survivors: Vec<usize> = all
         .iter()
-        .find(|n| n.name != old_leader)
-        .expect("a surviving resolver");
+        .copied()
+        .filter(|&index| index != old_leader)
+        .collect();
+    wait_for_leader(&nodes, &survivors, Duration::from_secs(90)).await;
+
+    // A surviving node still resolves redis from the post-failover catalogue,
+    // whether or not the replica had to move.
+    let resolver = &nodes[survivors[0]];
     wait_until(
         "redis still resolves after the leader change",
         Duration::from_secs(90),
@@ -336,7 +502,136 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
     )
     .await;
 
-    root.cancel();
+    fixture.root.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// A ported service with an ingress route on `host`, plus `extra` ingress
+/// settings.
+fn ingress_service_spec(port: u16, host: &str, extra: &str) -> reliaburger::config::app::AppSpec {
+    toml::from_str(&format!(
+        r#"
+        script = "exec sleep 600"
+        replicas = 1
+        port = {port}
+        [ingress]
+        host = "{host}"
+        {extra}
+        "#
+    ))
+    .unwrap()
+}
+
+/// #700: one app with an ingress route no node can install (`tls =
+/// "acme"`) made every node refuse every later catalogue, so discovery and
+/// ingress froze cluster-wide. `relish apply` now refuses that spec; the
+/// test writes it straight to the council to stand for one admitted before
+/// the check. Every node must skip that one route and keep publishing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+
+    let mut fixture = Fixture::new();
+    const N: usize = 3;
+    let all: Vec<usize> = (0..N).collect();
+    let mut nodes = Vec::with_capacity(N);
+    nodes.push(fixture.start_node(200, vec![], true, None).await);
+    for index in 201..(200 + N) {
+        let seed = fixture.gossip(200);
+        nodes.push(fixture.start_node(index, vec![seed], true, None).await);
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&pick(&nodes, &all)).is_some_and(|voters| voters.len() == N),
+    )
+    .await;
+    wait_until(
+        "all nodes reporting to the leader",
+        Duration::from_secs(60),
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| state.reports.len() == N)
+        },
+    )
+    .await;
+
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
+            app_id: AppId::new("broken", "default"),
+            spec: Box::new(ingress_service_spec(6380, "broken.local", "tls = \"acme\"")),
+        },
+    )
+    .await;
+    wait_until(
+        "broken running on some node",
+        Duration::from_secs(90),
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .and_then(|state| node_running_app(&state, "broken"))
+                .is_some()
+        },
+    )
+    .await;
+
+    // Deployed after the bad route: it reaches every node only if the
+    // catalogue keeps advancing past it.
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
+            app_id: AppId::new("redis", "default"),
+            spec: Box::new(ingress_service_spec(6379, "redis.local", "")),
+        },
+    )
+    .await;
+    wait_until(
+        "redis resolves and routes on every node",
+        Duration::from_secs(90),
+        async || {
+            for node in &nodes {
+                let resolves = node
+                    .resolve("redis")
+                    .await
+                    .is_some_and(|info| info.healthy_backends >= 1);
+                let routes = node.routes().await;
+                let routed = routes
+                    .iter()
+                    .any(|route| route.host == "redis.local" && route.healthy_backends >= 1);
+                if !resolves || !routed {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    for node in &nodes {
+        assert!(
+            node.resolve("broken").await.is_some(),
+            "{}: the bad app's own service must still resolve",
+            node.name
+        );
+        assert!(
+            !node
+                .routes()
+                .await
+                .iter()
+                .any(|route| route.host == "broken.local"),
+            "{}: the invalid route must never be installed",
+            node.name
+        );
+    }
+
+    fixture.root.cancel();
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
@@ -348,45 +643,54 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
 
-    let root = CancellationToken::new();
+    let mut fixture = Fixture::new();
+    let all: Vec<usize> = (0..NODE_COUNT).collect();
     let mut nodes = Vec::with_capacity(NODE_COUNT);
-    nodes.push(start_node(0, vec![], &root).await);
+    nodes.push(fixture.start_node(0, vec![], true, None).await);
     for index in 1..NODE_COUNT {
-        nodes.push(start_node(index, vec![local(BASE_PORT)], &root).await);
+        let seed = fixture.gossip(0);
+        nodes.push(fixture.start_node(index, vec![seed], true, None).await);
     }
 
     // The council reconciler grows the voter set to its cap of seven; the
     // remaining two nodes stay workers — the H1 subjects.
-    wait_until("seven voters", Duration::from_secs(60), async || {
-        nodes[0].voter_count() == 7
-    })
+    wait_until(
+        "seven voters",
+        Duration::from_secs(60),
+        async || match leader_of(&nodes, &all).await {
+            Some(leader) => nodes[leader].voter_count() == 7,
+            None => false,
+        },
+    )
     .await;
 
     // (a) EVERY node reports to the leader — including the two outside the
     // council, which can only have found it through the gossip directory.
     wait_until(
-        "all 9 nodes reporting to the bootstrap leader",
+        "all 9 nodes reporting to the leader",
         Duration::from_secs(60),
-        async || nodes[0].aggregated_rx.borrow().reports.len() == NODE_COUNT,
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| state.reports.len() == NODE_COUNT)
+        },
     )
     .await;
 
     // The leader's committed membership is authoritative. Individual nodes'
     // metrics watches can trail that commit briefly, so counting each node's
     // local opinion here produced a false third "worker" in CI.
-    let voter_ids = nodes[0].voter_ids();
+    let leader = wait_for_leader(&nodes, &all, Duration::from_secs(30)).await;
+    let voter_ids = nodes[leader].voter_ids();
     let workers: Vec<&WiredNode> = nodes
         .iter()
         .filter(|node| !voter_ids.contains(&node.raft_id))
         .collect();
     assert_eq!(workers.len(), 2, "expected exactly two non-voter workers");
+    let reports = nodes[leader].aggregated_rx.borrow().reports.clone();
     for worker in &workers {
         assert!(
-            nodes[0]
-                .aggregated_rx
-                .borrow()
-                .reports
-                .contains_key(&NodeId::new(&worker.name)),
+            reports.contains_key(&NodeId::new(&worker.name)),
             "non-voter {} must appear in the leader's aggregated reports",
             worker.name
         );
@@ -394,20 +698,24 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
 
     // (b) A daemonset app converges everywhere — on the workers too, which
     // requires their placement reconcilers to reach the leader's API.
-    assert!(nodes[0].is_leader().await, "bootstrap node should lead");
-    nodes[0]
-        .council
-        .write(RaftRequest::AppSpec {
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
             app_id: AppId::new("web", "default"),
             spec: Box::new(daemonset_spec(600)),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
 
     wait_until(
         "web running on all 9 nodes (per aggregated reports)",
         Duration::from_secs(90),
-        async || nodes_reporting_app(&nodes[0].aggregated_rx.borrow(), "web") == NODE_COUNT,
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| nodes_reporting_app(&state, "web") == NODE_COUNT)
+        },
     )
     .await;
 
@@ -415,32 +723,18 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
     // re-point its reporting and placement polling at it (without restart),
     // and coverage must recover in the new epoch — pre-failover reports
     // cannot satisfy it (CP5), so what we see below is all fresh truth.
-    let old_leader_name = nodes[0].name.clone();
-    nodes[0].shutdown.cancel();
-    // The cancellation token stops the node's spawned tasks (RPC server,
-    // gossip, reporting), but the in-process Raft core only dies with an
-    // explicit shutdown — a real `kill -9` takes both out at once.
-    nodes[0].council.shutdown().await.ok();
-
-    let survivors: Vec<&WiredNode> = nodes.iter().filter(|n| n.name != old_leader_name).collect();
-
-    let mut new_leader: Option<&WiredNode> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while new_leader.is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no new leader elected after the old one was killed"
-        );
-        for node in &survivors {
-            if node.is_leader().await {
-                new_leader = Some(node);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    let new_leader = new_leader.unwrap();
-    eprintln!("new leader: {}", new_leader.name);
+    let old_leader = wait_for_leader(&nodes, &all, Duration::from_secs(30)).await;
+    kill(&nodes[old_leader]).await;
+    let survivors: Vec<usize> = all
+        .iter()
+        .copied()
+        .filter(|&index| index != old_leader)
+        .collect();
+    let new_leader = wait_for_leader(&nodes, &survivors, Duration::from_secs(60)).await;
+    eprintln!(
+        "killed leader {}, new leader {}",
+        nodes[old_leader].name, nodes[new_leader].name
+    );
 
     // Reporting coverage recovers on the NEW leader: all 8 survivors,
     // still running their daemonset instances.
@@ -448,32 +742,38 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
         "all 8 survivors reporting to the new leader with web running",
         Duration::from_secs(90),
         async || {
-            let state = new_leader.aggregated_rx.borrow().clone();
-            state.reports.len() == NODE_COUNT - 1
-                && nodes_reporting_app(&state, "web") == NODE_COUNT - 1
+            leader_state(&nodes, &survivors).await.is_some_and(|state| {
+                state.reports.len() == NODE_COUNT - 1
+                    && nodes_reporting_app(&state, "web") == NODE_COUNT - 1
+            })
         },
     )
     .await;
 
     // Placements still reconcile through the new leader: a fresh app
     // lands on every survivor, workers included.
-    new_leader
-        .council
-        .write(RaftRequest::AppSpec {
+    write_through_leader(
+        &nodes,
+        &survivors,
+        RaftRequest::AppSpec {
             app_id: AppId::new("web2", "default"),
             spec: Box::new(daemonset_spec(600)),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await;
 
     wait_until(
         "web2 running on all 8 survivors after failover",
         Duration::from_secs(90),
-        async || nodes_reporting_app(&new_leader.aggregated_rx.borrow(), "web2") == NODE_COUNT - 1,
+        async || {
+            leader_state(&nodes, &survivors)
+                .await
+                .is_some_and(|state| nodes_reporting_app(&state, "web2") == NODE_COUNT - 1)
+        },
     )
     .await;
 
-    root.cancel();
+    fixture.root.cancel();
     // Give agents a moment to stop their sleep processes.
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
@@ -488,23 +788,14 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
         LeaseError, TestLease, cleanup_cluster_lease, now_unix_millis,
     };
     assert!(cluster_tests_enabled());
-    let root = CancellationToken::new();
-    let mut nodes = Vec::new();
-    nodes.push(start_node_with_scheduler(200, vec![], &root, false).await);
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![fixture.start_node(200, vec![], false, None).await];
     for index in 201..203 {
-        nodes.push(
-            start_node_with_scheduler(index, vec![local(BASE_PORT + 2000)], &root, false).await,
-        );
+        let seed = fixture.gossip(200);
+        nodes.push(fixture.start_node(index, vec![seed], false, None).await);
     }
-    wait_until(
-        "three committed voters",
-        Duration::from_secs(60),
-        async || {
-            settled_voters(&nodes.iter().collect::<Vec<_>>())
-                .is_some_and(|voters| voters.len() == 3)
-        },
-    )
-    .await;
+    let (leader, [follower, worker]) = settled_roles(&nodes).await;
+    let all = [0, 1, 2];
     let now = now_unix_millis();
     let lease = TestLease::new(
         "failover".into(),
@@ -529,49 +820,48 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
         RaftRequest::SchedulingDecision(SchedulingDecision {
             app_id: app_id.clone(),
             placements: vec![Placement {
-                node_id: NodeId::new(&nodes[2].name),
+                node_id: NodeId::new(&nodes[worker].name),
                 resources: Resources::new(500, 1024 * 1024, 0),
                 ordinal: 0,
             }],
         }),
     ] {
-        let request = match request {
-            RaftRequest::SchedulingDecision(decision) => RaftRequest::SchedulingDecisions {
-                expected_log_id: nodes[0].council.desired_state().await.last_applied_log,
-                decisions: vec![decision],
-            },
-            request => request,
-        };
         assert!(!matches!(
-            nodes[0].council.write(request).await.unwrap(),
-            reliaburger::council::CouncilResponse::Refused { .. }
+            write_through_leader(&nodes, &all, request).await,
+            CouncilResponse::Refused { .. }
         ));
     }
     wait_until(
         "worker running leased process",
         Duration::from_secs(30),
         async || {
-            nodes[2]
+            nodes[worker]
                 .resolve("cleanup")
                 .await
                 .is_some_and(|view| view.total_backends == 1)
         },
     )
     .await;
-    nodes[2].reconciler.abort();
-    let _ = (&mut nodes[2].reconciler).await;
+    nodes[worker].reconciler.abort();
+    let _ = (&mut nodes[worker].reconciler).await;
+    let current = wait_for_leader(&nodes, &all, Duration::from_secs(30)).await;
     assert!(matches!(
-        cleanup_cluster_lease(&nodes[0].council, "failover", None).await,
+        cleanup_cluster_lease(&nodes[current].council, "failover", None).await,
         Err(LeaseError::CleanupPending)
     ));
     let client = reqwest::Client::new();
     // A follower must never turn its possibly stale empty view into an
     // authoritative instruction to retire local work.
+    let follower = if current == follower {
+        leader
+    } else {
+        follower
+    };
     assert_eq!(
         client
             .get(format!(
                 "http://127.0.0.1:{}/v1/placements/{}",
-                nodes[1].api_port, nodes[2].name
+                nodes[follower].api_port, nodes[worker].name
             ))
             .bearer_auth(RETIREMENT_SERVICE_TOKEN)
             .send()
@@ -580,26 +870,21 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
             .status(),
         reqwest::StatusCode::SERVICE_UNAVAILABLE
     );
-    nodes[0].shutdown.cancel();
-    nodes[0].council.shutdown().await.unwrap();
-    let mut leader = None;
-    wait_until("successor leader", Duration::from_secs(60), async || {
-        for (index, node) in nodes.iter().enumerate().skip(1) {
-            if node.is_leader().await {
-                leader = Some(index);
-                return true;
-            }
-        }
-        false
-    })
-    .await;
-    let leader = leader.unwrap();
+    let old_leader = wait_for_leader(&nodes, &all, Duration::from_secs(30)).await;
+    nodes[old_leader].shutdown.cancel();
+    nodes[old_leader].council.shutdown().await.unwrap();
+    let survivors: Vec<usize> = all
+        .iter()
+        .copied()
+        .filter(|&index| index != old_leader)
+        .collect();
+    let successor = wait_for_leader(&nodes, &survivors, Duration::from_secs(60)).await;
     assert!(matches!(
-        cleanup_cluster_lease(&nodes[leader].council, "failover", None).await,
+        cleanup_cluster_lease(&nodes[successor].council, "failover", None).await,
         Err(LeaseError::CleanupPending)
     ));
     assert_eq!(
-        nodes[leader].council.desired_state().await.test_leases["failover"]
+        nodes[successor].council.desired_state().await.test_leases["failover"]
             .placements
             .len(),
         1
@@ -608,13 +893,13 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
     // retirement instruction. No local inventory is available on this restart.
     let checkpoint = tempfile::tempdir().unwrap();
     let resumed = spawn_placement_reconciler(
-        nodes[2].name.clone(),
-        nodes[2].metrics_rx.clone(),
-        nodes[2].directory_rx.clone(),
+        nodes[worker].name.clone(),
+        nodes[worker].metrics_rx.clone(),
+        nodes[worker].directory_rx.clone(),
         2,
         Some(RETIREMENT_SERVICE_TOKEN.into()),
-        nodes[2].cmd_tx.clone(),
-        nodes[2].shutdown.clone(),
+        nodes[worker].cmd_tx.clone(),
+        nodes[worker].shutdown.clone(),
         reliaburger::cluster::ClusterHttp::plaintext(),
         Some(checkpoint.path().into()),
         reliaburger::config::node::RuntimeSection::default().stop_confirmation_timeout(),
@@ -623,30 +908,34 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
         "confirmed worker retirement",
         Duration::from_secs(30),
         async || {
-            nodes[leader].council.desired_state().await.test_leases["failover"]
+            let Some(current) = leader_of(&nodes, &survivors).await else {
+                return false;
+            };
+            nodes[current].council.desired_state().await.test_leases["failover"]
                 .placements
                 .is_empty()
         },
     )
     .await;
     assert!(
-        nodes[2]
+        nodes[worker]
             .resolve("cleanup")
             .await
             .is_none_or(|view| view.total_backends == 0)
     );
-    cleanup_cluster_lease(&nodes[leader].council, "failover", None)
+    let current = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
+    cleanup_cluster_lease(&nodes[current].council, "failover", None)
         .await
         .unwrap();
     assert!(
-        !nodes[leader]
+        !nodes[current]
             .council
             .desired_state()
             .await
             .test_leases
             .contains_key("failover")
     );
-    root.cancel();
+    fixture.root.cancel();
     resumed.await.unwrap();
 }
 
@@ -668,30 +957,24 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
         None,
     )
     .unwrap();
-    let root = CancellationToken::new();
-    let mut nodes =
-        vec![start_node_for_test(300, vec![], &root, false, Some(operator.token.clone())).await];
-    for index in 301..303 {
-        nodes.push(
-            start_node_for_test(
-                index,
-                vec![local(BASE_PORT + 3000)],
-                &root,
-                false,
-                Some(operator.token.clone()),
-            )
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(300, vec![], false, Some(operator.token.clone()))
             .await,
+    ];
+    for index in 301..303 {
+        let seed = fixture.gossip(300);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
         );
     }
-    wait_until(
-        "three settled voters",
-        Duration::from_secs(60),
-        async || {
-            settled_voters(&nodes.iter().collect::<Vec<_>>())
-                .is_some_and(|voters| voters.len() == 3)
-        },
-    )
-    .await;
+    // The worker to decommission is one that doesn't lead; the other
+    // survivor is the follower the operator's request goes through.
+    let (leader, [follower, worker]) = settled_roles(&nodes).await;
+    let survivors = [leader, follower];
     let now = now_unix_millis();
     let lease = TestLease::new(
         "decommission".into(),
@@ -716,125 +999,110 @@ async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_c
         RaftRequest::SchedulingDecision(SchedulingDecision {
             app_id,
             placements: vec![Placement {
-                node_id: NodeId::new(&nodes[2].name),
+                node_id: NodeId::new(&nodes[worker].name),
                 resources: Resources::new(500, 1024 * 1024, 0),
                 ordinal: 0,
             }],
         }),
     ] {
-        let request = match request {
-            RaftRequest::SchedulingDecision(decision) => RaftRequest::SchedulingDecisions {
-                expected_log_id: nodes[0].council.desired_state().await.last_applied_log,
-                decisions: vec![decision],
-            },
-            request => request,
-        };
         assert!(!matches!(
-            nodes[0].council.write(request).await.unwrap(),
-            reliaburger::council::CouncilResponse::Refused { .. }
+            write_through_leader(&nodes, &[0, 1, 2], request).await,
+            CouncilResponse::Refused { .. }
         ));
     }
     wait_until("worker workload", Duration::from_secs(30), async || {
-        nodes[2]
+        nodes[worker]
             .resolve("cleanup")
             .await
             .is_some_and(|view| view.total_backends == 1)
     })
     .await;
     // This is the operator's external shutdown, before the attestation.
-    nodes[2].shutdown.cancel();
-    nodes[2].council.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), nodes[2].cmd_tx.closed())
+    nodes[worker].shutdown.cancel();
+    nodes[worker].council.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), nodes[worker].cmd_tx.closed())
         .await
         .unwrap();
+    let current = wait_for_leader(&nodes, &survivors, Duration::from_secs(60)).await;
     assert!(matches!(
-        cleanup_cluster_lease(&nodes[0].council, &lease.lease_id, None).await,
+        cleanup_cluster_lease(&nodes[current].council, &lease.lease_id, None).await,
         Err(LeaseError::CleanupPending)
     ));
     let request = DecommissionRequest {
-        node_id: nodes[2].name.clone(),
+        node_id: nodes[worker].name.clone(),
         workloads_stopped: true,
         reason: "stopped for maintenance".into(),
     };
-    // Use the real client and a follower to cover credential-preserving forwarding.
+    // Use the real client and a follower to cover credential-preserving
+    // forwarding (the API forwards whichever node leads by then).
     let client = reliaburger::relish::client::BunClient::new_with_token(
-        &format!("http://127.0.0.1:{}", nodes[1].api_port),
+        &format!("http://127.0.0.1:{}", nodes[follower].api_port),
         Some(&operator.plaintext),
     );
     let record = client.decommission_node(&request).await.unwrap();
     assert_eq!(record.released_placements.get(&lease.lease_id), Some(&1));
     assert_eq!(client.decommission_node(&request).await.unwrap(), record);
-    cleanup_cluster_lease(&nodes[0].council, &lease.lease_id, None)
+    let current = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
+    cleanup_cluster_lease(&nodes[current].council, &lease.lease_id, None)
         .await
         .unwrap();
     wait_until(
         "retired voter removed on both survivors",
         Duration::from_secs(30),
         async || {
-            settled_voters(&[&nodes[0], &nodes[1]])
-                .is_some_and(|voters| !voters.contains(&nodes[2].raft_id))
+            settled_voters(&pick(&nodes, &survivors))
+                .is_some_and(|voters| !voters.contains(&nodes[worker].raft_id))
         },
     )
     .await;
+    let worker_raft = local(fixture.gossip_port(300 + worker) + 1);
+    let current = wait_for_leader(&nodes, &survivors, Duration::from_secs(30)).await;
     assert!(
-        nodes[0]
+        nodes[current]
             .council
             .add_learner(
-                nodes[2].raft_id,
-                reliaburger::council::CouncilNodeInfo::new(
-                    local(BASE_PORT + 3020 + 1),
-                    nodes[2].name.clone()
-                )
+                nodes[worker].raft_id,
+                reliaburger::council::CouncilNodeInfo::new(worker_raft, nodes[worker].name.clone())
             )
             .await
             .unwrap_err()
             .to_string()
             .contains("retired")
     );
+    let seeds = vec![fixture.gossip(300 + leader), fixture.gossip(300 + follower)];
     nodes.push(
-        start_node_for_test(
-            303,
-            vec![local(BASE_PORT + 3000)],
-            &root,
-            false,
-            Some(operator.token.clone()),
-        )
-        .await,
+        fixture
+            .start_node(303, seeds, false, Some(operator.token.clone()))
+            .await,
     );
+    let replacement = 3;
+    let members = [leader, follower, replacement];
     // Every survivor, not just the leader, must have applied the promotion
     // before the leader dies, or the election below can never be won.
     wait_until(
         "fresh replacement voter applied by every member",
         Duration::from_secs(60),
         async || {
-            settled_voters(&[&nodes[0], &nodes[1], &nodes[3]]).is_some_and(|voters| {
-                voters == BTreeSet::from([nodes[0].raft_id, nodes[1].raft_id, nodes[3].raft_id])
+            settled_voters(&pick(&nodes, &members)).is_some_and(|voters| {
+                voters == members.iter().map(|&index| nodes[index].raft_id).collect()
             })
         },
     )
     .await;
-    nodes[0].shutdown.cancel();
-    nodes[0].council.shutdown().await.unwrap();
-    let mut leader = None;
-    wait_until(
-        "successor after decommission",
-        Duration::from_secs(60),
-        async || {
-            for index in [1, 3] {
-                if nodes[index].is_leader().await {
-                    leader = Some(index);
-                    return true;
-                }
-            }
-            false
-        },
-    )
-    .await;
-    let state = nodes[leader.unwrap()].council.desired_state().await;
+    let old_leader = wait_for_leader(&nodes, &members, Duration::from_secs(30)).await;
+    nodes[old_leader].shutdown.cancel();
+    nodes[old_leader].council.shutdown().await.unwrap();
+    let remaining: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|&index| index != old_leader)
+        .collect();
+    let successor = wait_for_leader(&nodes, &remaining, Duration::from_secs(60)).await;
+    let state = nodes[successor].council.desired_state().await;
     assert_eq!(
-        state.security_state.crl.retired_nodes[&nodes[2].name],
+        state.security_state.crl.retired_nodes[&nodes[worker].name],
         record
     );
     assert!(!state.test_leases.contains_key(&lease.lease_id));
-    root.cancel();
+    fixture.root.cancel();
 }

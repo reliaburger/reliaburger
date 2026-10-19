@@ -176,6 +176,11 @@ pub struct TickReport {
     pub uploaded: usize,
     /// Snapshots kept past retention because they haven't shipped yet.
     pub held: usize,
+    /// Half-made snapshots of interrupted creates that the sweep deleted.
+    pub interrupted_removed: usize,
+    /// Snapshot subvolumes with no metadata and no intent: never listed,
+    /// uploaded or pruned, so reported every sweep until someone looks.
+    pub unexplained: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -198,6 +203,18 @@ pub async fn snapshot_tick(
         let mut report = TickReport::default();
         let volumes = VolumeManager::new(&dir);
         let snapshots = SnapshotManager::new(&dir);
+
+        // Phase 0: settle creates a crash or failure interrupted (#695).
+        let interrupted = snapshots.sweep_interrupted();
+        report.interrupted_removed = interrupted.removed.len();
+        report.unexplained = interrupted
+            .unexplained
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        report
+            .errors
+            .extend(interrupted.errors.iter().map(ToString::to_string));
 
         // Phase 1: snapshot every provisioned volume of every app.
         for (namespace, app) in volumes.provisioned_apps() {
@@ -685,6 +702,19 @@ pub async fn run_snapshot_loop(
         for error in &report.errors {
             eprintln!("bun: snapshot sweep: {error}");
         }
+        if report.interrupted_removed > 0 {
+            eprintln!(
+                "bun: snapshot sweep: deleted {} half-made snapshot(s) of interrupted creates",
+                report.interrupted_removed
+            );
+        }
+        for path in &report.unexplained {
+            eprintln!(
+                "bun: snapshot sweep: {path} is a snapshot subvolume with no metadata and no \
+                 intent; it is never listed, uploaded or pruned. Inspect it and delete it with \
+                 `btrfs subvolume delete` if nothing needs it"
+            );
+        }
         if report.held > 0 {
             eprintln!(
                 "bun: snapshot sweep: keeping {} snapshot(s) past retention until they upload",
@@ -1115,6 +1145,23 @@ mod tests {
             .filter(|error| error.starts_with("prune"))
             .count();
         assert_eq!(prunes, 3, "{:?}", report.errors);
+    }
+
+    /// #695: a snapshot subvolume with no metadata used to be skipped in
+    /// silence. Without an intent nobody can say it's safe to delete, so
+    /// every sweep reports it.
+    #[tokio::test]
+    async fn sweep_reports_a_snapshot_subvolume_without_metadata() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        fake_snapshot(volumes_dir.path(), &meta("db", "/data", "100", 100), b"x");
+        let orphan = SnapshotManager::new(volumes_dir.path())
+            .snapshot_path(&meta("db", "/data", "200", 200));
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        let report = tick(volumes_dir.path(), 5, None).await;
+        assert_eq!(report.unexplained, vec![orphan.display().to_string()]);
+        assert_eq!(report.interrupted_removed, 0);
+        assert!(orphan.exists());
     }
 
     #[tokio::test]

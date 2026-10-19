@@ -1,20 +1,20 @@
-//! Real Bun death preserves job outcomes and retires interrupted initialisers.
+//! Real Bun death retires interrupted initialisers and API execs.
 //!
-//! The same contract covers cron registrations, node-local test-job leases and
-//! the ownership records Bun reads at startup: a SIGKILL must neither lose nor
-//! resurrect them, and corrupt records stop Bun before its API listens.
+//! The same contract covers cron registrations and the ownership records Bun
+//! reads at startup: a SIGKILL must neither lose nor resurrect them, and
+//! corrupt records stop Bun before its API listens.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use reliaburger::config::{Config, types::EnvValue};
+use reliaburger::config::Config;
 use reliaburger::relish::client::BunClient;
 
 #[path = "support/bun_process.rs"]
 mod bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
-    spawn_bun_with_port_retry, wait_for_relish, write_portable_node_config,
+    BunProcess, WAIT, assert_success, reserve_address, run_relish, spawn_bun_with_port_retry,
+    wait_for_relish, write_portable_node_config,
 };
 
 struct Node {
@@ -92,40 +92,6 @@ impl Drop for ReleaseJob {
 /// keeps a loaded runner from failing a correct recovery.
 const STATE_DEADLINE: Duration = Duration::from_secs(60);
 
-async fn wait_job(client: &BunClient, expected_state: &str, restarts: u32) {
-    let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
-    loop {
-        let last_observed = match client.jobs().await {
-            Ok(jobs) => {
-                let work: Vec<_> = jobs
-                    .jobs
-                    .iter()
-                    .map(|job| &job.row)
-                    .filter(|job| job.name == "work")
-                    .collect();
-                if work
-                    .iter()
-                    .any(|job| job.state == expected_state && job.restart_count == restarts)
-                {
-                    return;
-                }
-                let states: Vec<_> = work
-                    .iter()
-                    .map(|job| format!("{} with {} retries", job.state, job.restart_count))
-                    .collect();
-                format!("{states:?}")
-            }
-            Err(error) => format!("jobs request failed: {error}"),
-        };
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "job must become {expected_state} with {restarts} retries within \
-             {STATE_DEADLINE:?}; last observed {last_observed}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 async fn wait_app_state(client: &BunClient, expected: &str) {
     tokio::time::timeout(STATE_DEADLINE, async {
         loop {
@@ -149,15 +115,17 @@ async fn wait_app_state(client: &BunClient, expected: &str) {
 ///
 /// Status reads each pid from the process owner and marks an answer it
 /// couldn't complete in time `runtime_unknown` rather than hold the reply,
-/// so only that answer (or a failed request) is worth asking again. A
-/// complete answer with no pid is a running job reported without a process,
+/// so that answer (or a failed request) is worth asking again. A pending
+/// retry has no runtime binding yet, even if an earlier job-summary read
+/// reported its run as active. A complete running answer with no pid is a
+/// running job reported without a process,
 /// the product bug #358 fixed, and fails at once.
 async fn job_pid(client: &BunClient) -> u32 {
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     loop {
         let last_observed = match client.status().await {
             Ok(statuses) => match statuses.first() {
-                Some(status) if !status.runtime_unknown => {
+                Some(status) if status.state == "running" && !status.runtime_unknown => {
                     return status
                         .pid
                         .unwrap_or_else(|| panic!("a running job had no pid: {status:?}"));
@@ -172,187 +140,6 @@ async fn job_pid(client: &BunClient) -> u32 {
             "the runtime never answered for the job within {STATE_DEADLINE:?}; last observed {last_observed}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-#[tokio::test]
-async fn killed_bun_fences_unknown_job_side_effects_until_exact_owner_replay() {
-    let root = tempfile::tempdir().unwrap();
-    let config_path = root.path().join("node.toml");
-    let log = root.path().join("bun.log");
-    let data = root.path().join("data");
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"
-[storage]
-data = "{data}"
-images = "{root}/images"
-logs = "{root}/logs"
-metrics = "{root}/metrics"
-volumes = "{root}/volumes"
-[images]
-registry_bind = "127.0.0.1"
-registry_port = 0
-"#,
-            data = data.display(),
-            root = root.path().display()
-        ),
-    )
-    .unwrap();
-    let count = root.path().join("runs");
-    let release = root.path().join("release");
-    let start_retry = root.path().join("start-retry");
-    let _release = ReleaseJob(release.clone());
-    let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
-    let job = config.job.get_mut("work").unwrap();
-    job.command = Some(vec!["/bin/sh".into(), "-c".into(),
-        "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 2400 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 2400 ]; do if [ -f \"$RELEASE_FILE\" ]; then if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 2 ]; then kill -TERM $$; else exit 0; fi; fi; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
-    job.env.insert(
-        "RUN_FILE".into(),
-        EnvValue::Plain(count.display().to_string()),
-    );
-    job.env.insert(
-        "RELEASE_FILE".into(),
-        EnvValue::Plain(release.display().to_string()),
-    );
-    job.env.insert(
-        "START_RETRY".into(),
-        EnvValue::Plain(start_retry.display().to_string()),
-    );
-    let manifest = root.path().join("job.toml");
-    std::fs::write(&manifest, toml::to_string(&config).unwrap()).unwrap();
-
-    let mut node = Node::start(&config_path, &log).await;
-    let client = &node.client;
-    client.apply(&config).await.unwrap();
-    wait_job(client, "running", 1).await;
-    let _pid = job_pid(client).await;
-    // Running proves spawn succeeded, not that the child has executed printf.
-    // The gate deliberately exercises that scheduling gap before the crash.
-    std::fs::write(&start_retry, "start").unwrap();
-    tokio::time::timeout(STATE_DEADLINE, async {
-        loop {
-            let runs = std::fs::read_to_string(&count).unwrap();
-            if runs.lines().count() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("retry must execute its workload before injecting Bun death");
-    assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
-    node.crash().await;
-
-    let mut node = Node::start(&config_path, &log).await;
-    let client = &node.client;
-    wait_job(client, "unknown", 0).await;
-    std::fs::write(&release, "release").unwrap();
-    // Repeating the same admission returns the existing run, never a new attempt.
-    client.apply(&config).await.unwrap();
-    assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
-    let summary = client.job_summaries(false).await.unwrap();
-    let row = summary["batches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "work")
-        .unwrap();
-    let id = row["batch_id"].as_u64().unwrap();
-    node.crash().await;
-
-    let mut node = Node::start(&config_path, &log).await;
-    let client = &node.client;
-    wait_job(client, "unknown", 0).await;
-    let summary = client.batch_status(id).await.unwrap();
-    let owner = summary["unknown_owners"]
-        .as_array()
-        .unwrap()
-        .first()
-        .unwrap();
-    let worker = owner["node"].as_str().unwrap();
-    let digest = owner["grant_digest"].as_str().unwrap();
-    assert!(
-        client
-            .replay_job(id, worker, &"0".repeat(64))
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
-    client.replay_job(id, worker, digest).await.unwrap();
-    wait_job(client, "stopped", 0).await;
-    assert_eq!(client.status().await.unwrap()[0].exit_code, Some(0));
-    assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 3);
-    client.stop("work", "default").await.unwrap();
-    node.crash().await;
-}
-
-#[tokio::test]
-async fn completed_job_survives_bun_death_with_or_without_adoption_record() {
-    for remove_adoption_record in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let config_path = root.path().join("node.toml");
-        let log = root.path().join("bun.log");
-        let data = root.path().join("data");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-[storage]
-data = "{data}"
-images = "{root}/images"
-logs = "{root}/logs"
-metrics = "{root}/metrics"
-volumes = "{root}/volumes"
-[images]
-registry_bind = "127.0.0.1"
-registry_port = 0
-"#,
-                data = data.display(),
-                root = root.path().display()
-            ),
-        )
-        .unwrap();
-        let release = root.path().join("release");
-        let _release = ReleaseJob(release.clone());
-        let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
-        let job = config.job.get_mut("work").unwrap();
-        job.command = Some(vec!["/bin/sh".into(), "-c".into(),
-            "i=0; while [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; [ -f \"$RELEASE_FILE\" ]".into()]);
-        job.env.insert(
-            "RELEASE_FILE".into(),
-            EnvValue::Plain(release.display().to_string()),
-        );
-        let mut node = Node::start(&config_path, &log).await;
-        node.client.apply(&config).await.unwrap();
-        wait_job(&node.client, "running", 0).await;
-        std::fs::write(&release, "release").unwrap();
-        wait_job(&node.client, "stopped", 0).await;
-        let run_id = node.client.status().await.unwrap()[0].id.clone();
-        node.crash().await;
-        if remove_adoption_record {
-            // Accepted outcomes belong to the durable run, independent of runtime records.
-            for entry in std::fs::read_dir(data.join("instances")).unwrap() {
-                let path = entry.unwrap().path();
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "json")
-                {
-                    std::fs::remove_file(path).unwrap();
-                }
-            }
-        }
-        let mut recovered = Node::start(&config_path, &log).await;
-        wait_job(&recovered.client, "stopped", 0).await;
-        recovered.client.apply(&config).await.unwrap();
-        assert_eq!(recovered.client.status().await.unwrap()[0].id, run_id);
-        assert_eq!(
-            recovered.client.status().await.unwrap()[0].exit_code,
-            Some(0)
-        );
-        recovered.client.stop("work", "default").await.unwrap();
-        recovered.crash().await;
     }
 }
 
@@ -372,6 +159,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -382,9 +172,8 @@ registry_port = 0
     .unwrap();
     let release = root.path().join("release");
     let _release = ReleaseJob(release.clone());
-    let mut config = Config::parse("[app.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    let mut config = Config::parse("[app.work]\nexec = '/bin/sh'\n").unwrap();
     config.app.get_mut("work").unwrap().command = vec![
-        "/bin/sh".into(),
         "-c".into(),
         format!(
             "n=0; while [ ! -f '{}' ] && [ $n -lt 2400 ]; do sleep 0.05; n=$((n+1)); done",
@@ -484,6 +273,9 @@ images = "{root}/images"
 logs = "{root}/logs"
 metrics = "{root}/metrics"
 volumes = "{root}/volumes"
+[process_workloads]
+allowed_binaries = ["/bin/sh"]
+mount_isolation = false
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
@@ -498,8 +290,7 @@ registry_port = 0
     let successor = root.path().join("second-init-runs");
     let main = root.path().join("main-runs");
     let _release = ReleaseJob(release.clone());
-    let mut config =
-        Config::parse("[app.init-crash]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    let mut config = Config::parse("[app.init-crash]\nexec = '/bin/sh'\n").unwrap();
     let app = config.app.get_mut("init-crash").unwrap();
     app.init = vec![
         InitContainerSpec {
@@ -514,7 +305,6 @@ registry_port = 0
         },
     ];
     app.command = vec![
-        "/bin/sh".into(),
         "-c".into(),
         "printf 'main\\n' >> \"$1\"; exec sleep 60".into(),
         "main".into(),
@@ -570,7 +360,15 @@ registry_port = 0
     let stopped = recovered.client.stop("init-crash", "default").await;
     recovered.crash().await;
     assert!(original_process.is_some());
-    assert_eq!(retired.unwrap(), ContainerState::Stopped);
+    // Recovery retires the unadopted initialiser and then forgets its
+    // journal (#738), which the runtime does only for a retired generation.
+    assert!(
+        matches!(
+            retired,
+            Ok(ContainerState::Stopped) | Err(reliaburger::grill::GrillError::NotFound { .. })
+        ),
+        "{retired:?}"
+    );
     assert!(
         original_gone,
         "the interrupted initialiser survived recovery"
@@ -609,7 +407,7 @@ fn cron_registration_and_retirement_survive_bun_sigkill() {
     let endpoint = format!("http://{address}");
     wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
     let config = root.path().join("jobs.toml");
-    std::fs::write(&config, "[job.keep]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n[job.remove]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n").unwrap();
+    std::fs::write(&config, "[job.keep]\nimage = 'app:v1'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n[job.remove]\nimage = 'app:v1'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n").unwrap();
     assert_success(
         &run_relish(&["--endpoint", &endpoint, "apply", config.to_str().unwrap()]),
         "register cron jobs",
@@ -674,209 +472,78 @@ fn corrupt_workload_ownership_refuses_startup_before_the_api_listens() {
     assert!(!output.contains("API server listening"), "{output}");
 }
 
-#[tokio::test]
-async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
-    let root = tempfile::tempdir().unwrap();
-    let cluster_dir = root.path().join("cluster");
-    assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "token-lease",
-            "--node-id",
-            "node-01",
-        ]),
-        "initialise scoped-token fixture",
-    );
-    let node_path = cluster_dir.join("reliaburger.toml");
-    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
-    node.node.name = Some("node-01".into());
-    node.network.advertise_address = Some("127.0.0.1".into());
-    node.storage.data = root.path().join("data");
-    node.storage.images = root.path().join("images");
-    node.storage.logs = root.path().join("logs");
-    node.storage.metrics = root.path().join("metrics");
-    node.storage.volumes = root.path().join("volumes");
-    node.images.registry_port = 0;
-    node.process_workloads.allowed_binaries =
-        vec!["/bin/sh".into(), "/bin/sleep".into(), "/bin/true".into()];
-    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
-    node.testing
-        .allowed_operations
-        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
-    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
-        let [gossip, raft, reporting] = reserve_ports();
-        node.cluster.gossip_port = gossip;
-        node.cluster.raft_port = raft;
-        node.cluster.reporting_port = reporting;
-        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
-        (
-            node_path.clone(),
-            reserve_address(),
-            root.path().join("token-lease-bun.log"),
-        )
-    });
-    let endpoint = format!("https://{address}");
-    let ca = cluster_dir.join("identity/root-ca.crt");
-    let ca = ca.to_str().unwrap();
-    wait_for_relish(
-        &mut bun,
-        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
-    );
-    let token = run_relish(&[
-        "--endpoint",
-        &endpoint,
-        "--ca-cert",
-        ca,
-        "token",
-        "create",
-        "--name",
-        "test-admin",
-        "--role",
-        "admin",
-    ]);
-    assert_success(&token, "create catalogue admin");
-    let token = String::from_utf8(token.stdout).unwrap();
-    let token = token.trim();
-    let deadline = Instant::now() + WAIT;
-    // The auth-store refresh is asynchronous; wait until anonymous management
-    // is refused, so the probe cannot accidentally run in bootstrap mode.
-    loop {
-        let anonymous = run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"]);
-        if !anonymous.status.success() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "auth store did not adopt the admin token"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+/// Serve successive status snapshots without depending on child scheduling.
+struct PidStatusFixture {
+    client: BunClient,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PidStatusFixture {
+    fn drop(&mut self) {
+        self.server.abort();
     }
-    let ca_bytes = std::fs::read(ca).unwrap();
-    let client =
-        reliaburger::relish::client::BunClient::new_with_ca(&endpoint, Some(token), &ca_bytes)
-            .unwrap();
-    let lease = client.create_node_job_lease(60).await.unwrap();
-    let manifest = reliaburger::config::Config::parse(&format!(
-        "[job.survivor]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/sleep', '45']\nnamespace = '{}'\n[job.cron]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '* * * * *'\nnamespace = '{}'\n",
-        lease.namespace, lease.namespace,
-    )).unwrap();
-    client
-        .apply_with_lease(&manifest, &lease.lease_id)
-        .await
-        .unwrap();
-    let records_dir = node.storage.data.join("instances");
-    let record = reliaburger::grill::records::load_records(&records_dir)
-        .unwrap()
-        .into_iter()
-        .find(|record| record.app_name == "survivor" && record.namespace == lease.namespace)
-        .unwrap();
-    assert!(record.is_job);
-    assert!(reliaburger::grill::records::is_live(&record));
-    client.renew_test_lease(&lease.lease_id, 3).await.unwrap();
-    bun.child.kill().unwrap();
-    bun.child.wait().unwrap();
-    assert!(
-        reliaburger::grill::records::is_live(&record),
-        "job did not survive Bun's crash"
-    );
-    let lease_path = node.storage.data.join("node-test-leases.json");
-    let persisted = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        persisted
-            .get(&lease.lease_id)
-            .await
-            .unwrap()
-            .resources
-            .len(),
-        2
-    );
-    drop(persisted);
-    tokio::time::sleep(Duration::from_millis(3100)).await;
-    // The dead Bun's four ports stay free for the lease to expire and for the
-    // restart to reach its Raft bind (several seconds), long enough for a
-    // concurrent test to reserve one of them. Restart on the same ports, and
-    // only if that loses the race move the node to freshly reserved ones.
-    let mut first_attempt = true;
-    let (mut restarted, address) = spawn_bun_with_port_retry(true, || {
-        let api = if std::mem::take(&mut first_attempt) {
-            address
-        } else {
-            let [gossip, raft, reporting] = reserve_ports();
-            node.cluster.gossip_port = gossip;
-            node.cluster.raft_port = raft;
-            node.cluster.reporting_port = reporting;
-            std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
-            reserve_address()
+}
+
+impl PidStatusFixture {
+    async fn start(states: Vec<serde_json::Value>) -> Self {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
         };
-        (
-            node_path.clone(),
-            api,
-            root.path().join("job-restarted.log"),
-        )
-    });
-    let client = reliaburger::relish::client::BunClient::new_with_ca(
-        &format!("https://{address}"),
-        Some(token),
-        &ca_bytes,
-    )
-    .unwrap();
-    let recovered = tokio::time::timeout(Duration::from_secs(25), async {
-        loop {
-            restarted.assert_running();
-            let leases = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path.clone())
-                .await
-                .unwrap();
-            if leases.get(&lease.lease_id).await.is_none() {
-                assert!(
-                    !reliaburger::grill::records::is_live(&record),
-                    "cleanup acknowledged a live process"
-                );
-                assert!(
-                    reliaburger::grill::records::load_records(&records_dir)
-                        .unwrap()
-                        .iter()
-                        .all(|record| record.namespace != lease.namespace)
-                );
-                let instances = client.status().await.unwrap();
-                assert!(
-                    instances
-                        .iter()
-                        .all(|instance| instance.namespace != lease.namespace)
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await;
-    if recovered.is_err() {
-        let leases = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path)
-            .await
-            .unwrap();
-        let lease_state = leases.get(&lease.lease_id).await.map(|lease| lease.state);
-        let process =
-            reliaburger::grill::records::poll_adopted_process(record.pid, record.pid_started_at);
-        let log = std::fs::read_to_string(root.path().join("job-restarted.log")).unwrap();
-        let recovery_lines = log
-            .lines()
-            .filter(|line| {
-                ["lease", "retir", "adopt", "ownership", "failed", "error"]
-                    .iter()
-                    .any(|word| line.contains(word))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let jobs: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(records_dir.join("job-attempts.checkpoint")).unwrap(),
-        )
-        .unwrap();
-        let attempts: Vec<_> = jobs["jobs"].as_array().unwrap().iter().map(|job| serde_json::json!({"name": job["name"], "phase": job["phase"], "runtime_absent": job["runtime_absent"]})).collect();
-        panic!(
-            "expired job lease did not recover: state={lease_state:?}, process={process:?}, attempts={attempts:?}\n{recovery_lines}"
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let states = Arc::new(states);
+        let router = axum::Router::new().route(
+            "/v1/status",
+            axum::routing::get(move || {
+                let states = states.clone();
+                let cursor = cursor.clone();
+                async move {
+                    let index = cursor.fetch_add(1, Ordering::SeqCst).min(states.len() - 1);
+                    axum::Json(vec![states[index].clone()])
+                }
+            }),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self {
+            client: BunClient::new(&format!("http://{address}")),
+            server,
+        }
     }
+}
+
+fn pid_status(state: &str, pid: Option<u32>, unknown: bool) -> serde_json::Value {
+    serde_json::json!({"id":"run-1", "app_name":"work", "namespace":"default",
+        "state":state, "restart_count":1, "host_port":null, "pid":pid,
+        "runtime_unknown":unknown})
+}
+
+#[tokio::test]
+async fn pid_wait_accepts_a_pending_retry_before_its_running_process() {
+    let fixture = PidStatusFixture::start(vec![
+        pid_status("pending", None, false),
+        pid_status("running", Some(123), false),
+    ])
+    .await;
+    assert_eq!(job_pid(&fixture.client).await, 123);
+}
+
+#[tokio::test]
+async fn pid_wait_keeps_unknown_runtime_evidence_pending() {
+    let fixture = PidStatusFixture::start(vec![
+        pid_status("running", None, true),
+        pid_status("running", Some(123), false),
+    ])
+    .await;
+    assert_eq!(job_pid(&fixture.client).await, 123);
+}
+
+#[tokio::test]
+#[should_panic(expected = "a running job had no pid")]
+async fn pid_wait_still_refuses_a_known_running_process_without_a_pid() {
+    let fixture = PidStatusFixture::start(vec![pid_status("running", None, false)]).await;
+    job_pid(&fixture.client).await;
 }

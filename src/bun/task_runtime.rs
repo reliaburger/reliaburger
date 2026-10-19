@@ -13,12 +13,13 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-struct SingletonRuntime {
-    instance: crate::grill::InstanceId,
-    accepting: std::sync::atomic::AtomicBool,
-    followers: std::sync::atomic::AtomicUsize,
-    changed: Notify,
-    retired: CancellationToken,
+pub(crate) struct SingletonRuntime {
+    pub(crate) instance: crate::grill::InstanceId,
+    pub(crate) accepting: std::sync::atomic::AtomicBool,
+    pub(crate) followers: std::sync::atomic::AtomicUsize,
+    pub(crate) changed: Notify,
+    pub(crate) retired: CancellationToken,
+    pub(crate) command_logs: Option<std::sync::Arc<super::reusable_executor::CommandLogStream>>,
 }
 
 /// A follower is bound to one run, never to a subsequent occupant of its slot.
@@ -35,10 +36,14 @@ impl SingletonLogBinding {
         lines: tokio::sync::mpsc::Sender<crate::ketchup::types::CapturedLine>,
         offsets: &crate::ketchup::types::CaptureOffsets,
     ) {
-        tokio::select! {
-            biased;
-            () = self.0.retired.cancelled() => {},
-            () = runtime.follow_logs(instance, lines, offsets) => {},
+        if let Some(stream) = &self.0.command_logs {
+            stream.follow(lines, &self.0.retired).await;
+        } else {
+            tokio::select! {
+                biased;
+                () = self.0.retired.cancelled() => {},
+                () = runtime.follow_logs(instance, lines, offsets) => {},
+            }
         }
     }
 }
@@ -51,12 +56,69 @@ impl Drop for SingletonLogBinding {
     }
 }
 
+/// Fresh-runtime attempts running now: run id, then instance id to cgroup.
+type RunningAttempts =
+    BTreeMap<u64, std::collections::HashMap<crate::grill::InstanceId, std::path::PathBuf>>;
+
+/// Lists one fresh-runtime attempt in [`OwnedRunner`]'s running attempts
+/// for as long as it lives, however `run` returns.
+struct AttemptListing<'a> {
+    attempts: &'a Mutex<RunningAttempts>,
+    run: u64,
+    id: crate::grill::InstanceId,
+}
+
+impl<'a> AttemptListing<'a> {
+    fn new(
+        attempts: &'a Mutex<RunningAttempts>,
+        run: u64,
+        id: crate::grill::InstanceId,
+        cgroup: std::path::PathBuf,
+    ) -> Self {
+        attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(run)
+            .or_default()
+            .insert(id.clone(), cgroup);
+        Self { attempts, run, id }
+    }
+}
+
+impl Drop for AttemptListing<'_> {
+    fn drop(&mut self) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(run) = attempts.get_mut(&self.run) {
+            run.remove(&self.id);
+            if run.is_empty() {
+                attempts.remove(&self.run);
+            }
+        }
+    }
+}
+
 /// Owned execution backend; host execution retains its separate admission policy.
 pub struct OwnedRunner<G: Grill + Clone> {
     runtime: G,
+    #[cfg(target_os = "linux")]
+    reusable: std::sync::OnceLock<std::sync::Arc<super::reusable_executor::ReusablePool<G>>>,
+    #[cfg(target_os = "linux")]
+    host: std::sync::OnceLock<std::sync::Arc<super::reusable_executor::ReusablePool<G>>>,
+    #[cfg(target_os = "linux")]
+    host_runtime: Option<crate::grill::ProcessGrill>,
+    budget: Mutex<std::sync::Arc<super::execution_budget::ExecutionBudget>>,
     slots: Mutex<VecDeque<u32>>,
     prefix: String,
+    /// Where the kernel keeps workload cgroups: the startup sweep looks for
+    /// executor slot groups a previous Bun left behind under it.
+    cgroup_root: std::path::PathBuf,
     singletons: Mutex<BTreeMap<u64, std::sync::Arc<SingletonRuntime>>>,
+    /// Fresh-runtime attempts running now, by run: their instance and cgroup,
+    /// so the metrics loop can measure them.
+    attempts: Mutex<RunningAttempts>,
     available: Notify,
     secrets: Option<(std::sync::Arc<crate::council::CouncilNode>, [u8; 32])>,
     log_sink: Option<tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -70,11 +132,28 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         Self::with_prefix(runtime, format!("{:032x}", rand::random::<u128>()))
     }
     fn with_prefix(runtime: G, prefix: String) -> Self {
+        // A kernel the host helper can't run on gets no host pool, so host
+        // jobs take the fresh path instead of leaking executor slots.
+        #[cfg(target_os = "linux")]
+        let host_runtime = runtime
+            .host_executor_runtime()
+            .filter(|_| crate::grill::kernel::executor_support().host());
         Self {
             runtime,
+            #[cfg(target_os = "linux")]
+            reusable: std::sync::OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            host: std::sync::OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            host_runtime,
+            budget: Mutex::new(super::execution_budget::ExecutionBudget::new(
+                crate::meat::Resources::new(256_000, u64::MAX, 0),
+            )),
             slots: Mutex::new((0..256).collect()),
             prefix,
+            cgroup_root: crate::grill::cgroup::CGROUP_ROOT.into(),
             singletons: Mutex::new(BTreeMap::new()),
+            attempts: Mutex::new(BTreeMap::new()),
             available: Notify::new(),
             secrets: None,
             log_sink: None,
@@ -83,15 +162,180 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             namespace_policy: None,
         }
     }
+    /// Sweep `root` instead of the kernel's cgroup tree, so a test can stand
+    /// in for it with plain directories.
+    #[cfg(test)]
+    fn with_cgroup_root(mut self, root: &std::path::Path) -> Self {
+        self.cgroup_root = root.to_path_buf();
+        self
+    }
+    /// Whether this runner can hold `template`'s network policy. An egress
+    /// allowlist or `allow_from` needs a container in its own cgroup and the
+    /// eBPF namespace policy; a host command has neither, so it can't carry
+    /// one. A template without a policy runs anywhere.
+    pub fn enforces_network_policy(&self, template: &crate::config::job::JobSpec) -> bool {
+        let wants_policy = !egress_allow(template).is_empty()
+            || allow_from(template).is_some_and(|sources| !sources.is_empty());
+        !wants_policy
+            || (template.runtime != crate::config::job::JobRuntime::Process
+                && self.enforces_container_network_policy())
+    }
+    /// Whether this runner enforces a container task's egress allowlist and
+    /// `allow_from` before it starts: eBPF namespace policy, and a runtime
+    /// that puts each container in its own cgroup.
+    pub fn enforces_container_network_policy(&self) -> bool {
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        {
+            self.namespace_policy.is_some() && self.runtime.honours_cgroup_path()
+        }
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+        false
+    }
+    async fn resolve_template(
+        &self,
+        template: &crate::config::job::JobSpec,
+    ) -> Result<crate::config::job::JobSpec, String> {
+        let resolved = template.clone();
+        if !resolved.env.values().any(|value| value.is_encrypted()) {
+            return Ok(resolved);
+        }
+        let identities = match &self.secrets {
+            Some((council, ikm)) => crate::sesame::secret::namespace_identities(
+                &council.security_state().await,
+                resolved.namespace.as_deref().unwrap_or("default"),
+                ikm,
+            ),
+            None => Vec::new(),
+        };
+        tokio::task::spawn_blocking(move || decrypt_template(resolved, identities))
+            .await
+            .map_err(|_| "namespace secret resolution stopped".to_string())?
+    }
+    /// Whether host jobs can use owned executors with enforced Linux limits.
+    pub fn supports_host_limits(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.host_runtime.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+    /// Cumulative phase distributions, bounded independently of completed jobs.
+    /// Callers compare snapshots from the same pool lifetime and binary.
+    #[cfg(target_os = "linux")]
+    pub fn executor_timings(
+        &self,
+        runtime: crate::config::job::JobRuntime,
+    ) -> Option<super::reusable_executor::timings::TimingSnapshot>
+    where
+        G: 'static,
+    {
+        match runtime {
+            crate::config::job::JobRuntime::Process => self.host.get(),
+            crate::config::job::JobRuntime::SharedRunc => self.reusable.get(),
+            _ => None,
+        }
+        .map(|pool| pool.timings())
+    }
+    /// The runtime shared-runc executors use here: none when the runtime
+    /// can't own them or the kernel is too old for the executor helper.
+    #[cfg(target_os = "linux")]
+    fn reusable_runtime(&self) -> Option<crate::grill::runc::RuncGrill> {
+        self.runtime
+            .reusable_runtime()
+            .filter(|_| crate::grill::kernel::executor_support().shared_runc())
+    }
+    /// The reusable pool that runs `template`: `Some(None)` before that pool
+    /// exists, `None` when the template doesn't run through a pool here.
+    #[cfg(target_os = "linux")]
+    fn pool_for(
+        &self,
+        template: &crate::config::job::JobSpec,
+    ) -> Option<Option<&std::sync::Arc<super::reusable_executor::ReusablePool<G>>>> {
+        use crate::config::job::JobRuntime;
+        if template.runtime == JobRuntime::SharedRunc && self.reusable_runtime().is_some() {
+            Some(self.reusable.get())
+        } else if template.runtime == JobRuntime::Process && self.supports_host_limits() {
+            Some(self.host.get())
+        } else {
+            None
+        }
+    }
+
+    /// Compatible idle contexts already own their complete resource request.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn reusable_capacity(
+        &self,
+        template: &crate::config::job::JobSpec,
+        job: Option<&str>,
+    ) -> u32
+    where
+        G: 'static,
+    {
+        use super::reusable_executor::{ExecutorKey, ExecutorProfile, MAX_EXECUTOR_SLOTS};
+        let Ok(profile) = ExecutorProfile::new(template) else {
+            return 0;
+        };
+        let pool = if template.runtime == crate::config::job::JobRuntime::Process {
+            self.host.get()
+        } else {
+            self.reusable.get()
+        };
+        if let Some(pool) = pool {
+            let key = self
+                .resolve_template(template)
+                .await
+                .ok()
+                .and_then(|resolved| ExecutorKey::new(&resolved).ok())
+                .map(|key| key.for_job(job));
+            return pool.available_slots(key, profile.reservation).await;
+        }
+        let budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if budget.has_waiters() {
+            return 0;
+        }
+        let available = budget.available();
+        (available.cpu_millicores / profile.reservation.cpu_millicores)
+            .min(available.memory_bytes / profile.reservation.memory_bytes)
+            .min(MAX_EXECUTOR_SLOTS as u64) as u32
+    }
+    /// Share application and idle executor commitments on this node.
+    pub fn with_budget(
+        self,
+        budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
+    ) -> Self {
+        self.set_budget(budget);
+        self
+    }
+    pub(crate) fn set_budget(
+        &self,
+        budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
+    ) {
+        *self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = budget;
+    }
     /// A smaller executor pool for constrained nodes and real-runtime tests.
     pub fn with_slot_count(runtime: G, slots: u32) -> Self {
         let runner = Self::new(runtime);
-        *runner.slots.lock().expect("executor slots poisoned") = (0..slots.clamp(1, 256)).collect();
+        *runner
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (0..slots.clamp(1, 256)).collect();
         runner
     }
-    /// Persist a private executor identity so runtime artifacts remain bounded
-    /// by pool size across node restarts. The agent retires old launches before
-    /// task admission starts; runtime create replaces only retired generations.
+    /// Persist a private executor identity so each namespace reuses its bounded
+    /// slot identities across restarts. Historical namespace journals still need
+    /// retention accounting; this is not a global metadata bound. The agent
+    /// retires old launches before admission; create replaces retired generations.
     pub fn for_data_dir(runtime: G, data_dir: &std::path::Path) -> std::io::Result<Self> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -144,6 +388,127 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         self.log_sink = sink;
         self.capture_offsets = offsets;
         self
+    }
+
+    /// Where to measure the attempts of `run` running on this node: each
+    /// reusable executor it holds, and each fresh runtime it started. A
+    /// runtime that places attempts in cgroups is read there; one that
+    /// doesn't (the macOS process runtime) is measured by process.
+    pub(crate) async fn usage_targets(
+        &self,
+        run: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Vec<crate::mayo::job_metrics::UsageTarget>
+    where
+        G: 'static,
+    {
+        use crate::mayo::job_metrics::UsageTarget;
+        let mut targets = Vec::new();
+        #[cfg(target_os = "linux")]
+        if let Some(Some(pool)) = template.and_then(|template| self.pool_for(template)) {
+            targets.extend(
+                pool.run_cgroups(run)
+                    .await
+                    .into_iter()
+                    .map(UsageTarget::Cgroup),
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = template;
+        let fresh: Vec<_> = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&run)
+            .map(|attempts| {
+                attempts
+                    .iter()
+                    .map(|(id, cgroup)| (id.clone(), cgroup.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (id, cgroup) in fresh {
+            if cfg!(target_os = "linux") && self.runtime.honours_cgroup_path() {
+                targets.push(UsageTarget::Cgroup(cgroup));
+            } else if let Ok(Some(pid)) = self.runtime.pid(&id).await {
+                targets.push(UsageTarget::Pid(pid));
+            }
+        }
+        targets
+    }
+
+    /// Forget the metadata of this node's retired executor identities, and of
+    /// runtime routes no launch owns, so a restart reclaims what an
+    /// interrupted retirement kept (#678). Then remove the executor slot
+    /// cgroups no launch owns any more (#952). Call it before the first task:
+    /// anything unretired or live is skipped and kept. Returns how many
+    /// identities were forgotten.
+    pub async fn forget_retired_executors(&self) -> usize {
+        let app = format!("executor-{}", self.prefix);
+        let ours = |id: &crate::grill::InstanceId| {
+            crate::grill::InstanceIdentity::parse(&id.0).is_some_and(|identity| {
+                identity.app == app
+                    || identity
+                        .app
+                        .strip_prefix(app.as_str())
+                        .is_some_and(|rest| rest.starts_with('-'))
+            })
+        };
+        let mut candidates: Vec<_> = match self.runtime.launch_inventory().await {
+            Ok(launches) => launches
+                .unwrap_or_default()
+                .into_iter()
+                .map(|launch| launch.instance_id)
+                .filter(|id| ours(id))
+                .collect(),
+            Err(error) => {
+                eprintln!("bun: executor metadata sweep: inventory unavailable: {error}");
+                Vec::new()
+            }
+        };
+        match self.runtime.unlaunched_metadata().await {
+            Ok(ids) => candidates.extend(ids),
+            Err(error) => eprintln!("bun: executor metadata sweep: routes unavailable: {error}"),
+        }
+        let mut forgotten = 0;
+        for id in candidates {
+            if self.runtime.forget_retired(&id).await.is_ok() {
+                forgotten += 1;
+            }
+        }
+        // A slot's parent group belongs to the pool that ran it, and a killed
+        // Bun's pool died with it. Startup retirement removed the runtime's
+        // own groups beneath it, so each one left is empty, and nothing else
+        // would remove it until a task happened to need that slot again (#952).
+        // Only a complete inventory proves which slots no launch still owns.
+        match self.runtime.launch_inventory().await {
+            Ok(Some(launches)) => {
+                let live = launches
+                    .into_iter()
+                    .map(|launch| launch.instance_id.0)
+                    .collect();
+                let root = self.cgroup_root.clone();
+                let prefix = self.prefix.clone();
+                match tokio::task::spawn_blocking(move || {
+                    remove_vacant_executor_cgroups(&root, &prefix, &live)
+                })
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(removed) => {
+                        eprintln!("bun: removed {removed} vacant executor slot cgroup(s)");
+                    }
+                    Err(error) => {
+                        eprintln!("bun: executor cgroup sweep stopped: {error}");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("bun: executor cgroup sweep: inventory unavailable: {error}");
+            }
+        }
+        forgotten
     }
 
     /// Resolve an active singleton without exposing a reusable slot as its public identity.
@@ -211,6 +576,14 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             .remove(&run);
     }
 
+    fn return_slot(&self, slot: u32) {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(slot);
+        self.available.notify_one();
+    }
+
     async fn slot(&self, cancel: &CancellationToken) -> Option<u32> {
         loop {
             let available = self.available.notified();
@@ -222,7 +595,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             if let Some(id) = self
                 .slots
                 .lock()
-                .expect("executor slots poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop_front()
             {
                 return Some(id);
@@ -234,28 +607,94 @@ impl<G: Grill + Clone> OwnedRunner<G> {
 impl OwnedRunner<AnyGrill> {
     /// Container isolation and cgroup limits require rootful Linux execution.
     pub fn supports_host(&self) -> bool {
-        matches!(&self.runtime, AnyGrill::Process(_))
+        self.runtime
+            .supports_runtime(crate::grill::records::RuntimeKind::Process)
     }
-    /// A singleton preserves the configured runtime's existing workload contract.
-    pub fn supports_singleton_image(&self, template: &crate::config::job::JobSpec) -> bool {
-        let limits = template.cpu.is_some() || template.memory.is_some();
+    /// Whether this runner runs a single container task, with CPU or memory
+    /// `limits` or without. A singleton preserves the configured runtime's
+    /// existing workload contract, so rootless runc runs one only without
+    /// limits it can't enforce.
+    pub fn supports_singleton_images(&self, limits: bool) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        let _ = limits;
         match &self.runtime {
-            AnyGrill::Process(_) => !limits,
+            AnyGrill::Process(_) => false,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => !runtime.is_rootless() || !limits,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(runtime) => !runtime.container().is_rootless() || !limits,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => true,
         }
     }
     pub fn supports_containers(&self) -> bool {
         #[cfg(target_os = "linux")]
-        if let AnyGrill::Runc(runtime) = &self.runtime {
+        if let Some(runtime) = self.runtime.runc_runtime() {
             return !runtime.is_rootless();
         }
         false
     }
 }
 impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
+    async fn active_commands(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = self.pool_for(template?) {
+            return Some(match pool {
+                Some(pool) => pool.active_commands(batch_id).await,
+                None => 0,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (batch_id, template);
+        None
+    }
+    async fn command_activity(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+        callers: &std::sync::atomic::AtomicU64,
+    ) -> Option<super::task_executor::CommandActivity> {
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = self.pool_for(template?) {
+            return Some(match pool {
+                Some(pool) => pool.command_activity(batch_id, callers).await,
+                None => super::task_executor::CommandActivity {
+                    active: 0,
+                    callers: callers.load(std::sync::atomic::Ordering::Relaxed),
+                },
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (batch_id, template, callers);
+        None
+    }
+    async fn busy_slots(
+        &self,
+        batch_id: u64,
+        template: Option<&crate::config::job::JobSpec>,
+    ) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = self.pool_for(template?) {
+            return Some(match pool {
+                Some(pool) => pool.busy_slots(batch_id).await,
+                None => 0,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (batch_id, template);
+        None
+    }
+    fn owns_admission(&self, task: &TaskInvocation) -> bool {
+        task.template.as_ref().is_some_and(|job| {
+            job.runtime == crate::config::job::JobRuntime::SharedRunc
+                || (job.runtime == crate::config::job::JobRuntime::Process
+                    && self.supports_host_limits())
+        })
+    }
     async fn run(
         &self,
         task: &TaskInvocation,
@@ -263,40 +702,107 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         cancel: &CancellationToken,
     ) -> Attempt {
         let Some(template) = task.template.as_ref() else {
-            return Attempt {
-                outcome: AttemptOutcome::SpawnFailed {
-                    reason: "owned tasks require a runtime template".into(),
-                },
-                output: CapturedOutput::default(),
-            };
+            return Attempt::refused("owned tasks require a runtime template");
         };
-        let mut resolved = template.as_ref().clone();
-        if resolved.env.values().any(|value| value.is_encrypted()) {
-            let identities = match &self.secrets {
-                Some((council, ikm)) => crate::sesame::secret::namespace_identities(
-                    &council.security_state().await,
-                    resolved.namespace.as_deref().unwrap_or("default"),
-                    ikm,
-                ),
-                None => Vec::new(),
-            };
-            match tokio::task::spawn_blocking(move || decrypt_template(resolved, identities)).await
-            {
-                Ok(Ok(template)) => resolved = template,
-                _ => {
-                    return Attempt {
-                        outcome: AttemptOutcome::SpawnFailed {
-                            reason: "cannot decrypt this job's namespace secrets".into(),
-                        },
-                        output: CapturedOutput::default(),
-                    };
-                }
+        let resolved = match self.resolve_template(template).await {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                return Attempt::refused("cannot decrypt this job's namespace secrets");
             }
+        };
+        let backend = match resolved.runtime {
+            crate::config::job::JobRuntime::Process => crate::grill::records::RuntimeKind::Process,
+            crate::config::job::JobRuntime::Runc | crate::config::job::JobRuntime::SharedRunc => {
+                crate::grill::records::RuntimeKind::Runc
+            }
+        };
+        if let Err(reason) = resolved.validate_runtime() {
+            return Attempt::refused(reason);
+        }
+        if !self.runtime.supports_runtime(backend) {
+            return Attempt::refused("selected job runtime is unavailable on this node");
+        }
+        if !self.enforces_network_policy(&resolved) {
+            return Attempt::refused(NETWORK_POLICY_UNENFORCEABLE);
+        }
+        if resolved.runtime == crate::config::job::JobRuntime::SharedRunc
+            || (resolved.runtime == crate::config::job::JobRuntime::Process
+                && self.supports_host_limits())
+        {
+            #[cfg(target_os = "linux")]
+            if let Some(pool) = {
+                let count = self
+                    .slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+                    .clamp(1, 32);
+                let budget = self
+                    .budget
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if resolved.runtime == crate::config::job::JobRuntime::Process {
+                    self.host_runtime.as_ref().map(|runtime| {
+                        self.host.get_or_init(|| {
+                            super::reusable_executor::ReusablePool::new_host(
+                                runtime.clone(),
+                                self.runtime.clone(),
+                                self.prefix.clone(),
+                                count,
+                                budget,
+                                #[cfg(feature = "ebpf")]
+                                self.namespace_policy.clone(),
+                            )
+                        })
+                    })
+                } else {
+                    self.reusable_runtime().map(|runtime| {
+                        self.reusable.get_or_init(|| {
+                            super::reusable_executor::ReusablePool::new(
+                                runtime,
+                                self.runtime.clone(),
+                                self.prefix.clone(),
+                                count,
+                                budget,
+                                #[cfg(feature = "ebpf")]
+                                self.namespace_policy.clone(),
+                            )
+                        })
+                    })
+                }
+            } {
+                let result = pool
+                    .run(
+                        task,
+                        resolved,
+                        timeout,
+                        cancel,
+                        template
+                            .env
+                            .values()
+                            .any(|value| value.is_encrypted())
+                            .then_some(|| self.resolve_template(template)),
+                        super::reusable_executor::CommandReporting {
+                            sink: self.log_sink.as_ref(),
+                            singletons: &self.singletons,
+                        },
+                    )
+                    .await;
+                if let Some(run) = task.run.as_ref().filter(|run| run.is_singleton()) {
+                    self.retire_singleton(run.batch_id).await;
+                }
+                return result;
+            }
+            return Attempt::refused(
+                "shared-runc requires the owned rootful Linux runtime on Linux 5.8 or later",
+            );
         }
         let Some(slot) = self.slot(cancel).await else {
             return Attempt {
                 outcome: AttemptOutcome::Cancelled,
                 output: CapturedOutput::default(),
+                ran: None,
             };
         };
         let namespace = template.namespace.as_deref().unwrap_or("default");
@@ -320,23 +826,14 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         if let Some(script) = &mut spec.script {
             *script = script.replace("{index}", &task.index.to_string());
         }
-        let singleton = task
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "RELIABURGER_TASK_COUNT")
-            .is_some_and(|(_, value)| value == "1");
-        let run_id = singleton
-            .then(|| {
-                task.env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                    .and_then(|(_, value)| value.parse::<u64>().ok())
-            })
-            .flatten();
+        let run_id = task
+            .run
+            .as_ref()
+            .filter(|run| run.is_singleton())
+            .map(|run| run.batch_id);
+        let singleton = run_id.is_some();
         // Omitted requests have concrete conservative defaults, including limits.
-        if !singleton || self.runtime.honours_cgroup_path() {
+        if template.image.is_some() && (!singleton || self.runtime.honours_cgroup_path()) {
             spec.cpu.get_or_insert(crate::config::types::ResourceRange {
                 request: 1000,
                 limit: 1000,
@@ -347,17 +844,27 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                     limit: 64 << 20,
                 });
         }
+        // The identity is built from a validated namespace and a hex prefix,
+        // so this only fails if those checks are ever loosened.
         let cgroup = crate::grill::cgroup::instance_cgroup_path(
             namespace,
             &format!("executor-{}", self.prefix),
             &id,
         )
-        .expect("validated executor identity");
+        .ok()
+        .filter(|cgroup| cgroup.to_str().is_some());
+        let Some(cgroup) = cgroup else {
+            self.return_slot(slot);
+            return Attempt::refused(format!("executor {id} has no valid UTF-8 cgroup path"));
+        };
+        let _listing = task.run.as_ref().map(|run| {
+            AttemptListing::new(&self.attempts, run.batch_id, id.clone(), cgroup.clone())
+        });
         let mut oci = crate::grill::oci::generate_job_oci_spec(
             "task",
             namespace,
             &spec,
-            cgroup.to_str().expect("executor cgroup is UTF-8"),
+            &cgroup.to_string_lossy(),
             None,
         );
         if template.image.is_some() && !singleton {
@@ -367,7 +874,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 soft: 1 << 20,
             });
         }
-        if !singleton {
+        if template.image.is_some() && !singleton {
             // Reusing a runtime slot must not carry writable files between tasks.
             oci.root.readonly = true;
             oci.mounts.push(crate::grill::oci::OciMount {
@@ -388,10 +895,12 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         let mut namespace_lease = None;
         let captures_ready = std::sync::atomic::AtomicBool::new(false);
         let execution_authorised = std::sync::atomic::AtomicBool::new(false);
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        let namespace_enforced = self.runtime.honours_cgroup_path_for(&oci);
         let launch_outcome = {
             let launch = async {
                 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-                if let Some(policy) = &self.namespace_policy {
+                if namespace_enforced && let Some(policy) = &self.namespace_policy {
                     namespace_lease =
                         Some(policy.acquire(namespace, &cgroup).await.map_err(|error| {
                             crate::grill::GrillError::StartFailed {
@@ -401,6 +910,36 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         })?);
                 }
                 self.runtime.create(&id, &oci).await?;
+                // The task's allowlist, run identity and address ownership
+                // go in before its process exists.
+                #[cfg(all(feature = "ebpf", target_os = "linux"))]
+                if let Some(lease) = namespace_lease.as_mut() {
+                    let failed = |error: std::io::Error| crate::grill::GrillError::StartFailed {
+                        instance: id.clone(),
+                        reason: error.to_string(),
+                    };
+                    // Owned runc only stages the bundle at create: its cgroup
+                    // appears when `start` runs the container, too late to
+                    // bind. So make the leaf now. runc joins an existing
+                    // `cgroupsPath` directory untouched, so its inode, the id
+                    // the hooks see, is the one bound below (#1021).
+                    tokio::fs::create_dir_all(&cgroup).await.map_err(failed)?;
+                    lease
+                        .enforce_egress(&cgroup, egress_allow(template))
+                        .await
+                        .map_err(failed)?;
+                    // Another namespace's `allow_from` names the task by
+                    // its job, so bind the cgroup to that before it runs.
+                    if let Some(job) = task.run.as_ref().and_then(|run| run.job_name.as_deref()) {
+                        lease.bind_source(&cgroup, job).await.map_err(failed)?;
+                    }
+                    if let Some(address) = self.runtime.container_ip(&id).await {
+                        lease
+                            .publish_address(address, &id.0, allow_from(template))
+                            .await
+                            .map_err(failed)?;
+                    }
+                }
                 if let Some(stem) = self.runtime.log_stem(&id).await {
                     tokio::task::spawn_blocking(move || reset_captures(&stem))
                         .await
@@ -416,15 +955,22 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 if interrupted.is_cancelled()
                     || deadline.is_some_and(|at| tokio::time::Instant::now() >= at)
                 {
-                    return Ok::<_, crate::grill::GrillError>(false);
+                    return Ok::<_, LaunchError>(false);
                 }
                 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-                if let Some(policy) = &self.namespace_policy {
+                if namespace_enforced && let Some(policy) = &self.namespace_policy {
                     policy.check(namespace).await.map_err(|error| {
                         crate::grill::GrillError::StartFailed {
                             instance: id.clone(),
                             reason: error.to_string(),
                         }
+                    })?;
+                }
+                if template.env.values().any(|value| value.is_encrypted()) {
+                    self.resolve_template(template).await.map_err(|_| {
+                        LaunchError::Refused(
+                            "namespace credentials no longer authorise this command",
+                        )
                     })?;
                 }
                 execution_authorised.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -436,6 +982,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         .insert(
                             run,
                             std::sync::Arc::new(SingletonRuntime {
+                                command_logs: None,
                                 instance: id.clone(),
                                 accepting: std::sync::atomic::AtomicBool::new(true),
                                 followers: std::sync::atomic::AtomicUsize::new(0),
@@ -455,9 +1002,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 result = &mut launch => match result {
                     Ok(true) => None,
                     Ok(false) => Some(AttemptOutcome::Cancelled),
-                    Err(error) => Some(if execution_authorised.load(std::sync::atomic::Ordering::Relaxed) {
-                        AttemptOutcome::Unknown { reason: error.to_string() }
-                    } else { AttemptOutcome::SpawnFailed { reason: error.to_string() } }),
+                    Err(error) => Some(error.outcome(
+                        execution_authorised.load(std::sync::atomic::Ordering::Relaxed),
+                    )),
                 },
             }
         };
@@ -466,19 +1013,14 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 let runtime = self.runtime.clone();
                 let id = id.clone();
                 let app = task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_JOB_NAME")
-                    .map(|(_, value)| value.clone())
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.job_name.clone())
                     .unwrap_or_else(|| "job".into());
                 let log_instance = task
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == "RELIABURGER_BATCH_ID")
-                    .and_then(|(_, value)| value.parse::<u64>().ok())
-                    .map_or_else(|| id.0.clone(), |id| format!("run-{id}"));
+                    .run
+                    .as_ref()
+                    .map_or_else(|| id.0.clone(), |run| format!("run-{}", run.batch_id));
                 let namespace = namespace.to_string();
                 let offsets = self.capture_offsets.clone();
                 tokio::spawn(async move {
@@ -515,7 +1057,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             let observe = async {
                 loop {
                     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-                    if let Some(policy) = &self.namespace_policy {
+                    if namespace_enforced && let Some(policy) = &self.namespace_policy {
                         policy.check(namespace).await.map_err(|error| {
                             crate::grill::GrillError::StateUnavailable {
                                 instance: id.clone(),
@@ -562,8 +1104,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let mut output = CapturedOutput::default();
-        if let AttemptOutcome::SpawnFailed { reason } | AttemptOutcome::Unknown { reason } =
-            &outcome
+        if let AttemptOutcome::Refused { reason }
+        | AttemptOutcome::LaunchFailed { reason }
+        | AttemptOutcome::Unknown { reason } = &outcome
         {
             output.push(reason.as_bytes());
             output.push(b"\n");
@@ -612,16 +1155,65 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         if let Some(lease) = namespace_lease {
             lease.retired().await;
+            remove_unused_task_cgroup(&cgroup).await;
         }
         if let Some(run) = run_id {
             self.retire_singleton(run).await;
         }
-        self.slots
-            .lock()
-            .expect("executor slots poisoned")
-            .push_back(slot);
-        self.available.notify_one();
-        Attempt { outcome, output }
+        // The generation has retired and its output and followers are done,
+        // so its journal and routing files own nothing. Keeping them would
+        // leave a slot's worth per namespace that ever ran a job (#678).
+        if let Err(error) = self.runtime.forget_retired(&id).await {
+            eprintln!("batch executor {id}: metadata kept: {error}");
+        }
+        self.return_slot(slot);
+        Attempt {
+            outcome,
+            output,
+            ran: None,
+        }
+    }
+}
+
+/// Remove a retired attempt's task cgroup if it is still there. runc removes
+/// the cgroup of a container it ran; one made for an attempt that stopped
+/// before `start` would otherwise stay behind, empty, until the next sweep.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+async fn remove_unused_task_cgroup(cgroup: &std::path::Path) {
+    match tokio::fs::remove_dir(cgroup).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // The startup sweep removes any empty slot group left behind.
+        Err(error) => eprintln!("batch task cgroup {} kept: {error}", cgroup.display()),
+    }
+}
+
+/// Why a fresh launch stopped early.
+#[derive(Debug, thiserror::Error)]
+enum LaunchError {
+    /// The runtime failed: creating, preparing or starting the container.
+    #[error(transparent)]
+    Runtime(#[from] crate::grill::GrillError),
+    /// The job can't run as specified, whatever the runtime does.
+    #[error("{0}")]
+    Refused(&'static str),
+}
+
+impl LaunchError {
+    /// How this error ends the attempt. Once the command was authorised to
+    /// start it may have run, so the outcome is unknown. Before that it
+    /// never ran: a spec the runtime can't accept refuses the task, and
+    /// anything else (an image pull, runc, disk, network or capture setup)
+    /// is a launch failure the task pool retries within `max_attempts`
+    /// (#889).
+    fn outcome(self, authorised: bool) -> AttemptOutcome {
+        let reason = self.to_string();
+        match self {
+            _ if authorised => AttemptOutcome::Unknown { reason },
+            Self::Refused(_) => AttemptOutcome::Refused { reason },
+            Self::Runtime(error) if error.refuses_spec() => AttemptOutcome::Refused { reason },
+            Self::Runtime(_) => AttemptOutcome::LaunchFailed { reason },
+        }
     }
 }
 
@@ -643,6 +1235,25 @@ fn reset_captures(stem: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Why a template's network policy can't run on this node.
+pub(crate) const NETWORK_POLICY_UNENFORCEABLE: &str = "egress and allow_from need a container task on rootful Linux runc with [ebpf] enabled; host commands can't carry them";
+
+/// A template's egress allowlist; empty when it declares none.
+pub(crate) fn egress_allow(template: &crate::config::job::JobSpec) -> &[String] {
+    template
+        .egress
+        .as_ref()
+        .map_or(&[][..], |policy| policy.allow.as_slice())
+}
+
+/// The sources a template's `allow_from` admits from other namespaces.
+pub(crate) fn allow_from(template: &crate::config::job::JobSpec) -> Option<Vec<String>> {
+    template
+        .firewall
+        .as_ref()
+        .map(|firewall| firewall.allow_from.clone())
+}
+
 fn decrypt_template(
     mut spec: crate::config::job::JobSpec,
     identities: Vec<age::x25519::Identity>,
@@ -659,19 +1270,83 @@ fn decrypt_template(
     Ok(spec)
 }
 
+/// Remove the slot cgroups of this node's executors (`prefix`) under `root`
+/// that no launch in `live` owns, with their `helper` and `task` leaves.
+/// Returns how many slots it removed.
+///
+/// Only empty groups go: the kernel refuses to remove a cgroup that still
+/// has processes or child groups, so a slot something still uses stays, as
+/// does every group of another Bun's executors or of an app.
+fn remove_vacant_executor_cgroups(
+    root: &std::path::Path,
+    prefix: &str,
+    live: &std::collections::HashSet<String>,
+) -> usize {
+    let apps = [
+        format!("executor-{prefix}"),
+        format!("executor-{prefix}-reuse"),
+        format!("executor-{prefix}-host"),
+    ];
+    // `remove_dir` on a missing path is fine: the slot may have no leaves.
+    let removed = |path: &std::path::Path| match std::fs::remove_dir(path) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let directories = |path: &std::path::Path| {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+    };
+    let mut count = 0;
+    for namespace in directories(root) {
+        let Ok(namespace_name) = namespace.file_name().into_string() else {
+            continue;
+        };
+        for app in &apps {
+            for slot in directories(&namespace.path().join(app)) {
+                // Slot names are canonical decimal ordinals; skip anything else.
+                let Some(ordinal) = slot
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u32>().ok().filter(|n| n.to_string() == name))
+                else {
+                    continue;
+                };
+                let id = crate::grill::InstanceIdentity::new(
+                    namespace_name.as_str(),
+                    app.as_str(),
+                    ordinal,
+                )
+                .instance_id();
+                if live.contains(&id.0) {
+                    continue;
+                }
+                let path = slot.path();
+                if removed(&path.join("task")) && removed(&path.join("helper")) && removed(&path) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn invocation() -> TaskInvocation {
         TaskInvocation {
             template: Some(Box::new(
-                toml::from_str("image='fixture:v1'\nnamespace='tenant-a'").unwrap(),
+                toml::from_str("runtime='process'\nexec='/unused'\nnamespace='tenant-a'").unwrap(),
             )),
             index: 0,
             attempt: 1,
             program: "/unused".into(),
             args: vec!["worker".into()],
             env: vec![],
+            run: None,
         }
     }
     #[tokio::test]
@@ -680,17 +1355,18 @@ mod tests {
         let runner = std::sync::Arc::new(OwnedRunner::new(runtime));
         let mut task = invocation();
         task.template = Some(Box::new(
-            toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+            toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
-        task.args = vec![
-            "sh".into(),
-            "-c".into(),
-            "printf live; exec sleep 30".into(),
-        ];
+        task.args = vec!["-c".into(), "printf live; exec sleep 30".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -714,10 +1390,11 @@ mod tests {
         let result = work.await.unwrap();
         assert_eq!(result.outcome, AttemptOutcome::Cancelled);
         assert!(runner.singleton_instance(42).is_none());
-        assert_eq!(
-            runner.runtime.state(&id).await.unwrap(),
-            ContainerState::Stopped
-        );
+        // Retired and then forgotten: the slot identity keeps no metadata.
+        assert!(matches!(
+            runner.runtime.state(&id).await,
+            Err(crate::grill::GrillError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -728,17 +1405,18 @@ mod tests {
         ));
         let mut task = invocation();
         task.template = Some(Box::new(
-            toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+            toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
-        task.args = vec![
-            "sh".into(),
-            "-c".into(),
-            "echo original; exec sleep 30".into(),
-        ];
+        task.args = vec!["-c".into(), "echo original; exec sleep 30".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -793,13 +1471,18 @@ mod tests {
         for id in [1, 2] {
             let mut task = invocation();
             task.template = Some(Box::new(
-                toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+                toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
             ));
-            task.args = vec!["sh".into(), "-c".into(), format!("echo output-{id}")];
+            task.args = vec!["-c".into(), format!("echo output-{id}")];
             task.env = vec![
                 ("RELIABURGER_TASK_COUNT".into(), "1".into()),
                 ("RELIABURGER_BATCH_ID".into(), id.to_string()),
             ];
+            task.run = Some(crate::bun::task_executor::RunIdentity {
+                batch_id: id,
+                task_count: 1,
+                job_name: None,
+            });
             let attempt = runner
                 .run(&task, Duration::ZERO, &CancellationToken::new())
                 .await;
@@ -817,17 +1500,18 @@ mod tests {
         let runner = std::sync::Arc::new(OwnedRunner::new(crate::grill::ProcessGrill::new()));
         let mut task = invocation();
         task.template = Some(Box::new(
-            toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'").unwrap(),
+            toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
-        task.args = vec![
-            "sh".into(),
-            "-c".into(),
-            "printf 'live-output\n'; sleep 30".into(),
-        ];
+        task.args = vec!["-c".into(), "printf 'live-output\n'; sleep 30".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: None,
+        });
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let worker = runner.clone();
@@ -866,13 +1550,18 @@ mod tests {
         let runtime = crate::grill::ProcessGrill::new();
         let runner = OwnedRunner::new(runtime).with_log_sink(Some(sink), Default::default());
         let mut task = invocation();
-        task.template = Some(Box::new(toml::from_str("image='proc-grill:image-ignored'\nnamespace='tenant-a'\ncommand=['sh','-c','echo output']").unwrap()));
-        task.args = vec!["sh".into(), "-c".into(), "echo output".into()];
+        task.template = Some(Box::new(toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'\ncommand=['-c','echo output']").unwrap()));
+        task.args = vec!["-c".into(), "echo output".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),
             ("RELIABURGER_BATCH_ID".into(), "42".into()),
             ("RELIABURGER_JOB_NAME".into(), "migrate".into()),
         ];
+        task.run = Some(crate::bun::task_executor::RunIdentity {
+            batch_id: 42,
+            task_count: 1,
+            job_name: Some("migrate".into()),
+        });
         let result = runner
             .run(&task, Duration::from_secs(5), &CancellationToken::new())
             .await;
@@ -893,7 +1582,7 @@ mod tests {
         )
         .unwrap();
         let mut spec: crate::config::job::JobSpec =
-            toml::from_str("exec='/bin/true'\nnamespace='team-a'").unwrap();
+            toml::from_str("runtime='process'\nexec='/bin/true'\nnamespace='team-a'").unwrap();
         spec.env.insert(
             "TOKEN".into(),
             crate::config::types::EnvValue::Encrypted(sealed),
@@ -924,11 +1613,109 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await;
-        let AttemptOutcome::SpawnFailed { reason } = result.outcome else {
-            panic!("expected runtime refusal");
+        // A runtime failure before the command ran is transient (#889).
+        let AttemptOutcome::LaunchFailed { reason } = result.outcome else {
+            panic!("expected a launch failure: {result:?}");
         };
         assert!(String::from_utf8_lossy(&result.output.head).contains(&reason));
         assert_eq!(runner.slots.lock().unwrap().len(), 256);
+    }
+
+    async fn launch_with_image_error(error: fn() -> crate::grill::image::ImageError) -> Attempt {
+        let runtime = crate::grill::mock::MockGrill::new();
+        runtime.set_create_image_error(Some(error));
+        let runner = OwnedRunner::new(runtime);
+        let result = runner
+            .run(
+                &invocation(),
+                Duration::from_secs(1),
+                &CancellationToken::new(),
+            )
+            .await;
+        // Either way the slot came back, so a retry can take it.
+        assert_eq!(runner.slots.lock().unwrap().len(), 256);
+        result
+    }
+
+    #[tokio::test]
+    async fn a_registry_failure_during_launch_is_a_retryable_launch_failure() {
+        let result = launch_with_image_error(|| crate::grill::image::ImageError::ManifestPull {
+            image: "public.ecr.aws/docker/library/busybox".into(),
+            reason: "registry leader refused proposal: 503 Service Unavailable".into(),
+        })
+        .await;
+        let AttemptOutcome::LaunchFailed { reason } = &result.outcome else {
+            panic!("a registry failure was not transient: {result:?}");
+        };
+        assert!(reason.contains("503 Service Unavailable"), "{reason}");
+        assert!(result.outcome.is_retryable());
+        assert_eq!(
+            String::from_utf8_lossy(&result.output.head),
+            format!("{reason}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_image_reference_refuses_the_task() {
+        let result = launch_with_image_error(|| {
+            crate::grill::image::ImageError::InvalidReference("empty image reference".into())
+        })
+        .await;
+        let AttemptOutcome::Refused { reason } = &result.outcome else {
+            panic!("an invalid image was retried: {result:?}");
+        };
+        assert!(reason.contains("empty image reference"), "{reason}");
+        assert!(!result.outcome.is_retryable());
+        assert_eq!(
+            String::from_utf8_lossy(&result.output.head),
+            format!("{reason}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_the_runtime_refuses_refuses_the_task_without_a_retry() {
+        // An image task on a `--runtime process` node (#914), or a missing
+        // binary (#881), fails the same way on every attempt (#889).
+        for problem in [
+            crate::grill::LaunchProblem::NeedsContainerRuntime("busybox:1.36".into()),
+            crate::grill::LaunchProblem::BinaryNotFound("/missing".into()),
+            crate::grill::LaunchProblem::NoCommand,
+        ] {
+            let runtime = crate::grill::mock::MockGrill::new();
+            runtime.set_refused_launch(Some(problem.clone()));
+            let runner = OwnedRunner::new(runtime);
+            let result = runner
+                .run(
+                    &invocation(),
+                    Duration::from_secs(1),
+                    &CancellationToken::new(),
+                )
+                .await;
+            let AttemptOutcome::Refused { reason } = &result.outcome else {
+                panic!("{problem} was retried: {result:?}");
+            };
+            assert!(reason.contains(&problem.to_string()), "{reason}");
+            assert!(!result.outcome.is_retryable());
+            assert_eq!(runner.slots.lock().unwrap().len(), 256);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_without_a_template_is_refused_with_the_reason_as_output() {
+        let runtime = crate::grill::mock::MockGrill::new();
+        let runner = OwnedRunner::new(runtime);
+        let mut task = invocation();
+        task.template = None;
+        let result = runner
+            .run(&task, Duration::from_secs(1), &CancellationToken::new())
+            .await;
+        let AttemptOutcome::Refused { reason } = &result.outcome else {
+            panic!("a task without a template was not refused: {result:?}");
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&result.output.head),
+            format!("{reason}\n")
+        );
     }
 
     #[tokio::test]
@@ -1009,5 +1796,93 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(runner.slots.lock().unwrap().len(), 256);
+    }
+
+    /// A runtime launch of `id`, as the startup inventory lists a live executor.
+    fn executor_launch(id: &str) -> crate::grill::RuntimeLaunch {
+        crate::grill::RuntimeLaunch {
+            generation: crate::grill::RuntimeGeneration::process("live"),
+            instance_id: crate::grill::InstanceId(id.into()),
+            spec: serde_json::from_value(serde_json::json!({
+                "root": {"path": "/fixture", "readonly": true},
+                "process": {"args": ["/helper"], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                "mounts": [], "linux": {"namespaces": []}
+            }))
+            .unwrap(),
+            network_reference: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_removes_executor_slot_cgroups_a_killed_bun_left_behind() {
+        // A killed Bun's startup retirement stops its executors and removes
+        // their runtime cgroups, but each slot's parent group belonged to
+        // the dead process's pool. Nothing else removed it until a task
+        // happened to need that slot again, minutes later under a light
+        // load, so the node looked unsettled for that long.
+        let prefix = "ed580d8edc2f1746f4cf3b8ae09e40e1";
+        let root = tempfile::tempdir().unwrap();
+        let slot = |namespace: &str, app: &str, index: &str| {
+            root.path().join(namespace).join(app).join(index)
+        };
+        let reuse = format!("executor-{prefix}-reuse");
+        let host = format!("executor-{prefix}-host");
+        let fresh = format!("executor-{prefix}");
+        // Vacant leftovers: an empty slot, and one with empty leaves.
+        let vacant = [
+            slot("default", &reuse, "3"),
+            slot("default", &host, "2"),
+            slot("tenant-a", &fresh, "17"),
+        ];
+        std::fs::create_dir_all(&vacant[0]).unwrap();
+        std::fs::create_dir_all(vacant[1].join("helper")).unwrap();
+        std::fs::create_dir_all(vacant[1].join("task")).unwrap();
+        std::fs::create_dir_all(&vacant[2]).unwrap();
+        // Kept: a live executor, a group something still holds, another
+        // Bun's executor and an app replica.
+        let live = slot("default", &reuse, "0");
+        std::fs::create_dir_all(&live).unwrap();
+        let busy = slot("default", &reuse, "1");
+        std::fs::create_dir_all(busy.join("helper")).unwrap();
+        std::fs::write(busy.join("helper/cgroup.procs"), "42\n").unwrap();
+        let foreign = slot(
+            "default",
+            "executor-00000000000000000000000000000000-reuse",
+            "2",
+        );
+        std::fs::create_dir_all(&foreign).unwrap();
+        let app = slot("default", "web", "0");
+        std::fs::create_dir_all(&app).unwrap();
+
+        let runtime = crate::grill::mock::MockGrill::new();
+        runtime
+            .set_launch_inventory(vec![executor_launch(&format!(
+                "default__executor-{prefix}-reuse-0"
+            ))])
+            .await;
+        let runner = OwnedRunner::with_prefix(runtime, prefix.into()).with_cgroup_root(root.path());
+        runner.forget_retired_executors().await;
+
+        for path in &vacant {
+            assert!(!path.exists(), "{} was left behind", path.display());
+        }
+        for path in [&live, &busy, &foreign, &app] {
+            assert!(path.exists(), "{} was removed", path.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_keeps_executor_cgroups_without_a_runtime_inventory() {
+        // Without the inventory nothing proves a slot vacant.
+        let prefix = "ed580d8edc2f1746f4cf3b8ae09e40e1";
+        let root = tempfile::tempdir().unwrap();
+        let leftover = root
+            .path()
+            .join(format!("default/executor-{prefix}-reuse/3"));
+        std::fs::create_dir_all(&leftover).unwrap();
+        let runner = OwnedRunner::with_prefix(crate::grill::mock::MockGrill::new(), prefix.into())
+            .with_cgroup_root(root.path());
+        runner.forget_retired_executors().await;
+        assert!(leftover.exists());
     }
 }

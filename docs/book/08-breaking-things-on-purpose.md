@@ -82,6 +82,8 @@ Cleanup happens through two independent mechanisms:
 
 The reversal is the part that's easy to get wrong, and it's worth being blunt about why. A chaos experiment that can't undo itself isn't an experiment, it's an outage you scheduled. Every persistent fault records what it needs to restore at the moment it's applied — the saved cgroup value, the list of PIDs it froze — and stashes that on the registry entry. When the fault is cleared (`relish fault clear <id>`), cleared en masse, or expires on its own, the same reversal runs. Three doors, one exit.
 
+Each door leaves a mark in the audit log, too. A clear is someone's request, so the API records `fault.cleared` under the caller's credential. An expiry is nobody's request: the agent notices the deadline and reverses the effect itself, so it records `fault.expired` with principal `system`, the fault's id and type, and who injected it. For a long time expiry only printed a line to stderr, which made "who undid this, and when?" a question for whoever still had the node's logs. The agent loop doesn't wait for the record to reach the disk (it has a node to run), so it drops the receipt the audit log hands back; an API handler waits on its receipt before answering. Chapter 10 has the audit log itself. The record of an injection also names its namespace and whether `--include-leader` or `--override-safety` was used, and an injection with either is recorded as critical rather than as a warning, so a game day that overrode a rail stands out when you read the log back.
+
 The registry is wrapped in `Arc<tokio::sync::Mutex<FaultRegistry>>` because the agent event loop and the expiry background task both need access. We use `tokio::sync::Mutex`, not `std::sync::Mutex`. In async code, a standard mutex can block the tokio runtime if the lock is held across an `.await` point. The tokio mutex yields instead.
 
 ## Process faults: the easy ones
@@ -325,6 +327,45 @@ Dry-run mode prints the timeline without executing:
 ```bash
 relish fault scenario payment-cascade.toml --dry-run
 ```
+
+The first version of the runner had three habits that made it useless in CI.
+It parsed each step only when its turn came, so a typo in step three surfaced
+after steps one and two were already injected. Its `kill` step sent `Kill {
+count: 0 }`, which means every replica, so the replica rail refused every
+single one. And when a step was refused it printed `FAILED`, then "Scenario
+complete", and exited 0.
+
+Now `build_timeline` turns every step into a `FaultRequest` before anything
+runs, and the first bad step fails the whole file with its number and
+description. The step struct carries `#[serde(deny_unknown_fields)]`, so
+`namepsace = "shop"` is a parse error rather than a silently ignored line.
+Steps also gained the scope the CLI flags always had: `namespace`, `from` (a
+`delay` or `partition` from one caller), `count` (a `kill`, one by default)
+and `instance`. A field the step's fault can't use is refused, rather than
+quietly dropped.
+
+The runner itself takes the injection as a closure, so a test can stand in
+for the network:
+
+```rust
+async fn run_scenario<F, Fut>(
+    timeline: Vec<TimelineEntry>,
+    acknowledged: bool,
+    mut inject: F,
+) -> Result<(), RelishError>
+where
+    F: FnMut(FaultRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<FaultSummary, RelishError>>,
+```
+
+Rust has no `async` closures that are this easy to name in a bound, so the
+usual trick is two type parameters. `F` is a closure that, called with a
+request, returns some future `Fut`, and `Fut` is anything that resolves to
+the injection's result. The real command passes `|request| async move {
+client.inject_fault(&request).await }`. The test passes a closure that
+refuses kills, and checks that the run ends in an error naming that step
+while the later steps still ran. A refused step no longer stops the
+timeline, but it does make `relish fault scenario` exit non-zero.
 
 ## The chaos test suite
 
@@ -679,6 +720,65 @@ Clearing the fault brought it back to 42 ms. The test also kills a frontend
 replica mid-fault and waits for its replacement to carry the netem qdisc
 again, which it does within a tick.
 
+### A fault never outlives its Bun
+
+The `fa01:` sweep fixed one case of a wider problem, and for a while it was
+the only case we'd fixed. Every fault keeps its undo information in the fault
+registry, and the registry lives in Bun's memory. A CPU fault saves the
+workload's old `cpu.max` there, a pause saves the pids it froze, and clearing
+or expiring the fault reads them back. Now SIGKILL Bun halfway through `relish
+fault cpu web 80%`. The new Bun adopts `web`, which is still running, with its
+registry empty. `relish fault list` shows nothing, `relish fault clear` clears
+nothing, and `web` keeps 20% of a core for the rest of its life. A paused
+instance with no health check stays frozen just as long. On the rootful runc
+path the eBPF maps are pinned in bpffs so that egress policy survives a
+restart, and the fault map rode along: a `drop redis 50% --duration 1h` kept
+dropping for the rest of its hour with nothing on screen to explain it.
+
+A chaos tool that can leave production degraded with no visible cause is worse
+than no chaos tool. We could have written each fault's undo information to
+disk, but there's a simpler source of truth already there. Every adopted
+instance has a record with the OCI specification it was started from, and that
+says exactly what its limits should be. So adoption puts them back, whether or
+not there was a fault:
+
+```rust
+pub fn restore_recorded_limits(
+    cgroup_path: &Path,
+    resources: Option<&OciResources>,
+) -> Result<(), ResourceFaultError> {
+    write_if_present(&cgroup_path.join("cpu.max"), &recorded_cpu_max(resources))?;
+    write_if_present(
+        &cgroup_path.join("memory.high"),
+        &recorded_memory_high(resources),
+    )?;
+    // ...and every device in io.max goes back to rbps=max wbps=max
+}
+```
+
+`recorded_cpu_max` turns the spec's quota and period into the string runc
+wrote at start-up (`"50000 100000"` for a 500m limit, `"max 100000"` with no
+limit), and `recorded_memory_high` reads the soft limit back out of the
+`unified` map. `write_if_present` opens the file with
+`std::fs::OpenOptions::new().write(true).truncate(true)`. `OpenOptions` is
+Rust's builder for `open(2)` flags: you switch on the ones you want, and
+leaving out `.create(true)` means a missing file is an error (`NotFound`, which
+we skip) rather than a new file. A cgroup whose CPU controller isn't enabled
+has no `cpu.max`, and we'd rather leave it that way than invent one.
+
+The pause gets the same treatment: adoption reads the instance's
+`cgroup.procs` and sends every process SIGCONT, plus the main pid the runtime
+names (the process runtime keeps no cgroup of its own). A running process
+ignores SIGCONT, so it's safe to send unconditionally. And the owned eBPF
+loader now calls the same `cleanup_all_fault_maps` the throwaway loader always
+did, after it has checked the pinned maps and before it re-attaches the
+programs. The egress maps in the same pin directory stay, since keeping them
+is the whole point of pinning.
+
+So the rule is now simple to state: a fault dies with the Bun that injected
+it, and the next Bun tidies up after it. If you still want the fault, inject
+it again.
+
 ## One experiment at a time
 
 The quorum rail counts faults on the node that receives the request. Now picture
@@ -851,6 +951,18 @@ config, and retries that one refusal (and only that one, word for word) for a
 bounded 30 seconds in case the self-healing loop moves membership again in
 between. Anything else still fails the test.
 
+The partition test that proves the quorum rail fell into the same trap from the
+other side ([#801](https://github.com/reliaburger/reliaburger/issues/801)). It
+waited until *any* node's metrics listed three voters, then sent the first
+partition to a follower. The rail runs on the node that serves the request and
+reads that node's own Raft metrics and membership table. On a loaded CI runner
+that follower evidently hadn't appended the promotion yet. It still counted two
+voters and worked out a budget of `(2-1)/2 = 0`: "max allowed is 0". The refusal was
+right for what that node knew, and it errs on the safe side; a user who hits
+it retries a heartbeat later. The test now waits on the views the rail reads:
+every node on the same applied, uniform three-voter config, and every node's
+membership table listing all three members.
+
 ## Process workloads
 
 Not everything runs in a container. Monitoring agents, log shippers, custom exporters — these are host binaries that need to run alongside your containerised apps. Until now, you'd manage them separately with systemd or supervisord. Process workloads make them first-class citizens.
@@ -873,6 +985,7 @@ Or for inline scripts:
 
 ```toml
 [job.db-backup]
+runtime = "process"
 script = """
 #!/bin/sh
 pg_dump production > /tmp/backup.sql
@@ -1054,6 +1167,116 @@ signal succeeds while the process runs or exits and fails only on a real
 permission refusal. Retirement still lists every group member before it writes
 `Retiring`, so accepting the refusal can't publish a false absence.
 
+That fix stayed in the exec owner, and the same refusal turned up later in the
+process runtime's own `stop` and `kill` ([#723](https://github.com/reliaburger/reliaburger/issues/723)).
+Now and then on a loaded Mac, a log-capture test failed with
+`StopFailed … Operation not permitted` while killing a `printf` child. Both
+calls work in two steps. First `try_wait` asks whether the child has already
+exited; if so there's nothing to signal. Otherwise they signal its group with
+`kill(-pid, signal)`, treating `ESRCH` ("no such process") as "already gone".
+A `printf` lives for about a millisecond, so once in a while it exited between
+those two steps. It was a zombie when the signal went out, and macOS refused a
+group of zombies with `EPERM`, not `ESRCH`.
+
+`nix` hands back the C `errno` as a Rust enum, `nix::errno::Errno`, so each
+error code is a variant we can `match` on, not a magic integer. The arm that
+handles the refusal has the same shape as the exec owner's:
+
+```rust
+match nix::sys::signal::kill(group, signal) {
+    Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+    #[cfg(target_os = "macos")]
+    Err(nix::errno::Errno::EPERM) => {
+        observe_child_exit(entry)?;
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    Err(error) => Err(error.into()),
+}
+```
+
+Ignoring `EPERM` outright would have been one line, and it would hide a real
+refusal, such as a group member running as another user. Instead the refusal
+makes us look again. If `try_wait` now reports the exit, we record the exit
+code and the stop has nothing left to do. If the child still hasn't exited, we
+signal it directly, which succeeds while it runs or exits, so an error from
+that second `kill` really is a permission problem and goes back to the caller.
+On Linux the arm doesn't exist: `#[cfg(target_os = "macos")]` removes it at
+compile time, and a Linux `EPERM` still fails the stop as before.
+
+The window between the two steps lasts microseconds, far too short to aim a
+test at through `stop` itself. So the regression,
+`signalling_a_child_that_exited_after_the_exit_check_is_not_an_error`, builds
+the race's end state directly. It starts a child that exits at once, waits
+with `waitid(…, WNOWAIT)` until the exit is visible *without* reaping it, then
+runs the signalling step that `stop` and `kill` share. Before the fix it failed
+on every run on macOS with `Operation not permitted`; afterwards the original
+test passed 400 loaded iterations in a row.
+
+### Kill the shell before its children
+
+Both fallbacks above answered "why did the signal fail?". The next macOS
+surprise came from a signal that worked. A test retires a command,
+`/bin/sh -c 'sleep 60 & wait'`, and expects `Retired { exit_code: None }`,
+because a killed process has no exit code. Once, in a CI run, it recorded
+`Some(0)` instead ([#916](https://github.com/reliaburger/reliaburger/issues/916)).
+That's not a cosmetic difference. A job whose root was killed would read as a
+job that succeeded.
+
+The owner kills a workload with one `kill(-pid, SIGKILL)`, the whole group in
+one call. On Linux that's effectively atomic: the kernel walks the group
+holding a lock that a dying process needs before its parent can hear about
+it. XNU walks the group one member at a time, newest first, and it doesn't
+hold anything that stops the earlier victims from finishing. So the `sleep`
+dies first. The shell, blocked in `wait`, wakes up, sees its only child gone
+and exits with status 0, all before the signal loop gets round to it. By the
+time SIGKILL arrives, the shell is already exiting, and the kernel skips it.
+
+Can you make that window big enough to see? Give the shell 400 older
+siblings to signal in between. A shell that starts them, then one more
+`sleep` it waits for with `wait $!; exit 0`, recorded `Some(0)` in about one
+retirement in thirteen on a loaded Mac. The in-memory process runtime, which
+kills from inside Bun without the owner's 10 ms tick, failed in the first
+round or two of every run.
+
+The fix is an ordering, not a lock. Both signalling paths now signal the root
+first and the group second:
+
+```rust
+match kill(Pid::from_raw(root), signal) {
+    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+    Err(error) => return Err(error.into()),
+}
+match kill(Pid::from_raw(-root), signal) {
+    Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+    #[cfg(target_os = "macos")]
+    Err(nix::errno::Errno::EPERM) => Ok(()),
+    Err(error) => Err(error.into()),
+}
+```
+
+The root's exit status is the one retirement records, and once it has a
+SIGKILL pending it never runs user code again, so it can't turn its
+children's deaths into a clean exit. If it had already exited on its own
+before the kill, that exit is real and we report it. The direct signal also
+makes the old `EPERM` dance simpler. It succeeds while the root runs or
+exits, so a real permission refusal surfaces there, and a group that then
+refuses with `EPERM` has nothing left in it that needs the signal.
+Retirement still lists every group member before it writes `Retiring`.
+
+Two regression tests, one per path,
+`retirement_records_a_shell_waiting_on_killed_children_as_killed` and
+`kill_records_a_shell_waiting_on_killed_children_as_killed`, each run that
+400-sibling shell thirty times. Linux was never exposed, and neither were the
+task runner's own kills: it decides "timed out" or "cancelled" before it kills
+anything and never reads an exit code afterwards. A kill from somewhere else
+while a task ran on a Mac, though, could have been read as a success.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill
@@ -1082,7 +1305,7 @@ advance the durable cursor. It survives leadership changes, definition updates,
 pruning and clock rollback. Standalone uses the same state machine with private
 fsync'd JSON. Deployment hooks create common runs too; app publication waits for
 accepted success even after the submitting leader leaves.
-[Chapter 12](12-squeezing-every-drop.md#definitions-runs-and-durable-trigger-identities)
+[Chapter 17](17-a-million-jobs.md#definitions-runs-and-durable-trigger-identities)
 walks through these contracts.
 
 A cron step can be larger than the field it advances. `59/255` still means
@@ -1093,6 +1316,128 @@ expression into every minute. The regression checks single values, ranges
 and wildcards with the largest accepted step. Configuration admission parses
 the expression too, so a malformed schedule fails before it reaches the
 agent's command loop.
+
+### A missing binary fails at once
+
+The owner and its gate bought us durability, and they cost us an error
+message. The gate is what finally calls `exec`. By then `start` has returned
+`Ok`, because start only waits for the owner to record the gate's PID. So when
+the binary wasn't there, the gate's `exec` failed, the owner retired the
+generation, and Bun learned about it sideways: it went to record the instance
+for adoption, found the PID already gone, and said `runtime process identity
+could not be observed`. The instance sat in `starting`, and in a cluster the
+placement reconciler tried the whole deploy again on its backoff (#881). The
+real reason, a missing file, appeared nowhere.
+
+The fix checks before launching anything. `ProcessGrill::create` resolves the
+program the way `execvp` would: a path with a `/` in it is looked at directly,
+and a bare name is searched for on the workload's own `PATH`, the one Bun hands
+the gate, not Bun's. It looks at the file's metadata on a blocking thread
+(`tokio::task::spawn_blocking`), since a stat on a hung network filesystem
+mustn't stall the runtime. Only two answers refuse the launch, and both are
+facts about the file that retrying can't change:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaunchProblem {
+    #[error("binary not found: {}", .0.display())]
+    BinaryNotFound(PathBuf),
+    #[error("binary not executable: {}", .0.display())]
+    BinaryNotExecutable(PathBuf),
+}
+```
+
+`.0` is the first field of a tuple variant, and `thiserror` lets the format
+string reach it. Anything less certain, say a permission error on a parent
+directory, doesn't refuse: the launch goes ahead and reports what it finds.
+
+The problem travels as its own `GrillError::LaunchRefused` variant, not as a
+string inside `StartFailed`. That's what lets the deploy worker tell it apart
+with `error.launch_problem()`, a method returning `Option<&LaunchProblem>`,
+instead of matching on message text. When it gets `Some`, it moves the instance
+to `Failed` and keeps the reason on it. `relish status` prints the reason under
+the table, `--output json` carries it as `reason`, and `relish wtf` turns it
+into a critical `launch-failed` finding.
+
+Checking first has a gap: someone can delete the binary between the check and
+the `exec`. We shipped #881 with that race open, and closed it in #905 by
+letting the gate talk back.
+
+The owner used to activate the gate through a pipe on its stdin: write
+`activate`, close, done. Now the gate's stdin is one end of a socket pair, so
+the same channel carries an answer. The gate's first act is to copy it:
+
+```rust
+let report = io::stdin()
+    .as_fd()
+    .try_clone_to_owned()
+    .map(UnixStream::from)
+    .ok();
+```
+
+`as_fd()` borrows the file descriptor as a `BorrowedFd`, a handle the borrow
+checker won't let outlive stdin, and `try_clone_to_owned()` duplicates it into
+an `OwnedFd` that closes itself when dropped. Rust opens every descriptor
+close-on-exec, and this duplicate is no exception. That's the trick, and it's
+an old one from the C world. If `exec` works, the kernel closes the copy as it
+replaces the gate with the workload, and the owner reads end-of-file: silence
+means success. If `exec` fails, the gate is still there to write a
+`GateReport::Failed` with the `errno` before it exits. The owner waits for one
+or the other, at most five seconds, and writes the answer into its durable
+record as `gate`. `ProcessControl::start` waits for that field before it
+returns, and ENOENT becomes the same `LaunchRefused` that `create` would have
+returned (EACCES becomes "binary not executable").
+
+So `start` now waits a few milliseconds longer, for the `exec` itself rather
+than just the gate's PID. In return, a deploy never records a workload that
+was never there.
+
+The same `LaunchRefused` also changes restarts. A running app whose binary is
+deleted keeps running, since the kernel still has the file open. It's when the
+app exits that things go wrong: each restart's `create` finds nothing. Those
+restarts used to go through the restart budget, failing and backing off until
+it ran out, and then the instance ended `Failed` with no reason at all. Now the
+restart's step result goes through the same `launch_problem()` test, and a
+refusal moves the instance straight to `Failed` with the reason, as a fresh
+deploy does. Failures that might pass on a retry still take the budget path.
+
+What we didn't change is the cluster's placement reconciler. It still retries a
+refused deploy on its backoff, 5 s doubling to 5 min, so installing the binary
+is picked up without a re-apply. Each retry fails at once with the real
+reason, so it costs little. Stopping it until the spec changes would need a
+typed signal from the node rather than a match on message text, and we'll add
+that only if the retries turn out to be a nuisance.
+
+The same refusal path took one more problem in 0.2.1 (#914). ProcessGrill used
+to run an image app's `command` on the host, or `sleep 86400` for an app with
+no command, which made an app look healthy while its image never ran. Now an
+image needs a container runtime, and `create` says so before it checks any
+binary:
+
+```rust
+fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
+    use super::LaunchProblem;
+    if !spec.host_process && spec.root.path != super::oci::HOST_ROOT {
+        return Some(LaunchProblem::NeedsContainerRuntime(spec.root.path.clone()));
+    }
+    spec.process
+        .args
+        .is_empty()
+        .then_some(LaunchProblem::NoCommand)
+}
+```
+
+`host_process` is set only for an `exec` or `script` app, so anything else is
+a container. The exception is an init container of a host app that names no
+image of its own: it inherits the app's root, `HOST_ROOT`, and runs on the host
+like its app. The last expression uses `bool::then_some`, which turns `true`
+into `Some(LaunchProblem::NoCommand)` and `false` into `None`, so a spec with
+something to run has no problem. Both new variants ride the `LaunchRefused`
+path above: the deploy fails at once with `needs a container runtime to run
+image nginx:1.27, and this node's runtime is process`, and the instance shows
+`failed` with that reason in `relish status` and `relish wtf`. In a cluster the
+scheduler keeps image apps off such nodes in the first place (see "Finding
+Friends").
 
 ## Batch scheduling
 
@@ -1154,8 +1499,7 @@ The state machine compares that position with its previous applied entry
 before changing either placements or batches. If another admission got there
 first, the candidate is refused and the leader plans again. This is a
 compare-and-swap operation: Rust's `Option<LogId>` represents either the exact
-position we read or the absence of any applied entry. After a bounded number
-of competing writes, submission returns a retryable error. The entire placement
+position we read or the absence of any applied entry. The entire placement
 pass is one guarded transaction: an invalid later decision can't leave earlier
 apps committed. The old unguarded placement request is refused.
 
@@ -1168,12 +1512,20 @@ gap before the aggregator's next publication. These checks stay on the leader;
 Raft application never depends on a replica's clock. Missing evidence doesn't
 turn a cluster into an unlimited standalone node.
 
-Batch planning and registration have a five-second overall deadline and at
-most eight attempts after competing writes. If the acknowledgement is lost,
-submission returns 503 without dispatching. A late committed allocation stays
-reserved because timing out the caller doesn't prove Raft refused the write.
-The ordinary scheduler bounds its whole-pass proposal too and replans from
-committed state on the next tick.
+Nothing in production plans and registers a batch this way any more. Public
+jobs are admitted as runs in the job store (Chapter 17), and the guarded
+`BatchRegister` survives only to seed the retained ownership fixtures. A late
+committed reservation still stays reserved, because timing out the caller
+doesn't prove Raft refused the write. The ordinary scheduler bounds its
+whole-pass proposal and replans from committed state on the next tick.
+
+The fixtures taught us that "nobody else is writing" is never a safe
+assumption. A leader's job loop commits entries of its own, a cron observation
+on its first tick and again every minute. A fixture that read the position
+and then wrote now and then lost that race and was refused with "admission
+revision changed" ([#735](https://github.com/reliaburger/reliaburger/issues/735)).
+The state machine was right. The fixture now replans on that refusal, as the
+scheduler does.
 
 Durable retirement excludes a worker even while gossip and reports still call
 it alive. The planner filters it, and Raft refuses a registration assigned to
@@ -1193,7 +1545,7 @@ shared council, keep reports behind committed app placements, and lose a
 runner beyond the observation deadline. Each case checks the public outcome
 and the replicated state.
 
-The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
+The `BatchTracker` handled the async side until 0.2.0, which replaced it with task arrays and the common job lifecycle (Chapter 12, "One budget, two schedulers"). Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
 
 Each job name must be unique within its batch, including jobs in different namespaces. Submission builds a map keyed by that label before assigning execution identities. If you submit two jobs called `migration`, a map can keep only one of them while the tracker still expects two outcomes. We reject that batch before scheduling or dispatching anything. A regression test submits duplicate names both within one namespace and across two namespaces.
 
@@ -1590,6 +1942,8 @@ RELIABURGER_EBPF_TESTS=1 cargo test --features ebpf --test ebpf
 ```
 
 On a Mac, `relish dev test` runs them inside Lima. Process faults (signals) run on any Unix including macOS; resource faults (cgroups) are Linux-only and their config logic is unit-tested everywhere, returning `UnsupportedPlatform` off Linux.
+
+For a long time the cgroup tests wrote to temporary files that only looked like cgroups, and nothing ever killed Bun with a fault active, which is how the leftovers in "A fault never outlives its Bun" went unseen. `make test-linux` now runs four agent tests against a real cgroup v2 subtree with a real process in it: a CPU and a memory fault each injected and expired, then a CPU cap and a pause each left behind by an agent that's dropped mid-fault (what a SIGKILL leaves), and lifted by the next agent's adoption. `owned_loader_clears_stale_fault_connect_entries` does the same for the pinned eBPF fault map, and checks that the egress policy in the same pins survives. The V02 soak's chaos rotation also gained `cpu` and `memory` faults on the frontend.
 
 Killing Bun also frees its sockets. The registry recovery fixture waits for a
 lease to expire before restarting the same node, so another parallel test could

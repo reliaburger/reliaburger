@@ -70,10 +70,7 @@ fn merge_deploy(
         (None, inherited) => inherited.cloned(),
         (Some(explicit), None) => Some(explicit.clone()),
         (Some(explicit), Some(inherited)) => Some(DeploySpec {
-            strategy: explicit
-                .strategy
-                .clone()
-                .or_else(|| inherited.strategy.clone()),
+            strategy: explicit.strategy.or(inherited.strategy),
             max_surge: explicit.max_surge.or(inherited.max_surge),
             max_unavailable: explicit.max_unavailable.or(inherited.max_unavailable),
             drain_timeout: explicit

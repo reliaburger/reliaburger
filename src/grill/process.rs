@@ -28,10 +28,50 @@ use tokio::sync::Mutex;
 
 use super::oci::OciSpec;
 use super::process_control::ProcessControl;
-use super::process_owner::OwnerPhase;
+use super::process_owner::{GateReport, OwnerPhase, OwnerRecord};
 use super::records::{self, InstanceRecord};
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
+
+/// Variables a host command inherits from Bun, plus every `LC_*`.
+///
+/// Anything else in Bun's environment (cloud credentials, `RELIABURGER_*`
+/// settings) stays private to Bun. The workload's own `env` is applied on top.
+pub const HOST_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "LANG", "LANGUAGE", "TZ", "USER", "LOGNAME", "SHELL", "TMPDIR",
+];
+
+/// Whether a host command inherits this variable from Bun.
+pub fn inherited_by_host_commands(key: &str) -> bool {
+    HOST_ENVIRONMENT_ALLOWLIST.contains(&key) || key.starts_with("LC_")
+}
+
+/// The complete environment of a host command: Bun's allowlisted variables
+/// overlaid with the workload's `KEY=value` entries.
+///
+/// Every host backend (in-memory, owned and native executors) uses this, so a
+/// command sees the same environment wherever it runs.
+pub fn host_environment(workload: &[String]) -> std::collections::BTreeMap<String, String> {
+    host_environment_from(std::env::vars_os(), workload)
+}
+
+fn host_environment_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    workload: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut environment: std::collections::BTreeMap<String, String> = inherited
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| inherited_by_host_commands(key))
+        .collect();
+    environment.extend(
+        workload
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned())),
+    );
+    environment
+}
 
 #[cfg(test)]
 struct CaptureGate {
@@ -242,15 +282,148 @@ fn observe_child_exit(entry: &mut ProcessEntry) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Signal the group while the unreaped Child still owns its process identifier.
-fn signal_child_group(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
+/// Signal an owned child, then its process group, after
+/// `observe_child_exit` saw it still running.
+///
+/// The child goes first because its exit code is the one we record. macOS
+/// delivers a group signal one member at a time, newest first, so a
+/// group-only signal reaches a shell's children before the shell, which can
+/// wake from `wait` and `exit 0` before its own signal lands: a killed
+/// workload would read as a clean exit (#916). Signalled first, the child
+/// reports the signal unless it had already exited on its own.
+///
+/// The child is unreaped, so its process identifier (and the group named
+/// after it) can't be recycled while we hold it. A direct signal succeeds
+/// while the child runs or exits, so an error from it is a genuine
+/// permission refusal. The group signal can then still fail on macOS with
+/// EPERM, because XNU skips zombies and exiting processes and reports EPERM
+/// when no member of the group accepted the signal (#723). That refusal
+/// only re-checks the child, recording its exit if it has one.
+fn signal_child_group(
+    entry: &mut ProcessEntry,
+    signal: nix::sys::signal::Signal,
+) -> std::io::Result<()> {
+    let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) else {
+        return Ok(());
+    };
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => return Err(error.into()),
+    }
     #[cfg(unix)]
-    let pid = nix::unistd::Pid::from_raw(-(pid as i32));
+    let group = nix::unistd::Pid::from_raw(-(pid as i32));
     #[cfg(not(unix))]
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
-    match nix::sys::signal::kill(pid, signal) {
+    let group = nix::unistd::Pid::from_raw(pid as i32);
+    match nix::sys::signal::kill(group, signal) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(nix::errno::Errno::EPERM) => observe_child_exit(entry),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Why the process runtime can never launch `spec`, judged from the spec
+/// alone: it runs an image, or it names nothing to run.
+///
+/// The process runtime runs host workloads (`exec` and `script` apps, and
+/// the init containers of such an app that name no image of their own) and
+/// nothing else (#914). It used to run an image app's `command` on the host,
+/// or `sleep 86400` when it had none, so the app looked as though it ran.
+fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
+    use super::LaunchProblem;
+    if !spec.host_process && spec.root.path != super::oci::HOST_ROOT {
+        return Some(LaunchProblem::NeedsContainerRuntime(spec.root.path.clone()));
+    }
+    spec.process
+        .args
+        .is_empty()
+        .then_some(LaunchProblem::NoCommand)
+}
+
+/// Whether `program` names something this node can execute, resolving a bare
+/// name on the workload's `PATH` the way `execvp` does.
+///
+/// Only answers that can't change by retrying are refusals. A path that
+/// can't be inspected for another reason (a permission on a parent
+/// directory, say) is left for the launch itself to report.
+fn check_launchable(
+    program: &str,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<(), super::LaunchProblem> {
+    use super::LaunchProblem;
+    if program.contains('/') {
+        let path = PathBuf::from(program);
+        return match executable(&path) {
+            Some(true) => Ok(()),
+            Some(false) => Err(LaunchProblem::BinaryNotExecutable(path)),
+            None if absent(&path) => Err(LaunchProblem::BinaryNotFound(path)),
+            None => Ok(()),
+        };
+    }
+    // Bun clears the workload's environment, so only its own PATH counts.
+    // Without one, `execvp` falls back to the default search path.
+    let search = environment
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or("/usr/local/bin:/bin:/usr/bin");
+    let mut found_unexecutable = None;
+    for directory in search.split(':') {
+        let directory = if directory.is_empty() { "." } else { directory };
+        let candidate = Path::new(directory).join(program);
+        match executable(&candidate) {
+            Some(true) => return Ok(()),
+            // Uncertain evidence never refuses a launch.
+            None if !absent(&candidate) => return Ok(()),
+            Some(false) if found_unexecutable.is_none() => found_unexecutable = Some(candidate),
+            _ => {}
+        }
+    }
+    Err(match found_unexecutable {
+        Some(path) => LaunchProblem::BinaryNotExecutable(path),
+        None => LaunchProblem::BinaryNotFound(PathBuf::from(program)),
+    })
+}
+
+/// `Some(true)` for an executable file, `Some(false)` for a directory or a
+/// file without any execute bit, `None` when the path can't be inspected.
+fn executable(path: &Path) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether the path certainly doesn't exist: it, or one of its parents, is
+/// missing or isn't a directory.
+fn absent(path: &Path) -> bool {
+    matches!(
+        std::fs::metadata(path),
+        Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    )
+}
+
+/// What a started generation's execution gate reported, as a start result.
+///
+/// A binary that vanished after `create`'s check is a refused launch, as one
+/// missing at `create` is (#905). Another gate failure fails the start with
+/// the gate's reason. Silence, or no report at all, means the command runs.
+fn gate_result(instance: &InstanceId, record: &OwnerRecord) -> Result<(), GrillError> {
+    let Some(report @ GateReport::Failed { reason, .. }) = &record.gate else {
+        return Ok(());
+    };
+    // Loading the record proved its command non-empty.
+    let program = record.command.first().map(String::as_str).unwrap_or("");
+    match report.launch_problem(program) {
+        Some(problem) => Err(GrillError::LaunchRefused {
+            instance: instance.clone(),
+            problem,
+        }),
+        None => Err(GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("execution gate failed: {reason}"),
+        }),
     }
 }
 
@@ -329,6 +502,17 @@ impl ProcessGrill {
             #[cfg(test)]
             file_eof_gate: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn executor_directory(&self) -> Result<PathBuf, GrillError> {
+        self.log_dir
+            .as_ref()
+            .map(|path| path.join("host-executors"))
+            .ok_or_else(|| GrillError::StateUnavailable {
+                instance: InstanceId("host-executor".into()),
+                reason: "host executor requires durable ownership".into(),
+            })
     }
 
     /// Owner-backed lifecycle operations that are still running, including
@@ -440,7 +624,49 @@ impl Default for ProcessGrill {
 }
 
 impl super::Grill for ProcessGrill {
+    /// The owned execution gate joins the spec's cgroup before it runs the
+    /// command, on rootful cgroup v2 Linux.
+    fn places_host_processes(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.host_executor_runtime().is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<Self> {
+        (self.control.is_some()
+            && nix::unistd::geteuid().is_root()
+            && Path::new("/sys/fs/cgroup/cgroup.controllers").exists())
+        .then(|| self.clone())
+    }
+
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+        // A launch that can never work fails here, before any generation
+        // exists, so the caller can fail the instance with the reason.
+        let refused = |problem| GrillError::LaunchRefused {
+            instance: instance.clone(),
+            problem,
+        };
+        if let Some(problem) = spec_problem(spec) {
+            return Err(refused(problem));
+        }
+        // A missing binary would only show once the owner's gate tried to
+        // exec it, after start had already succeeded (#881).
+        let Some(program) = spec.process.args.first().cloned() else {
+            return Err(refused(super::LaunchProblem::NoCommand));
+        };
+        let environment = host_environment(&spec.process.env);
+        let checked = program.clone();
+        let check = tokio::task::spawn_blocking(move || check_launchable(&checked, &environment))
+            .await
+            .map_err(|error| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("binary check for {program} did not finish: {error}"),
+            })?;
+        if let Err(problem) = check {
+            return Err(refused(problem));
+        }
         if let Some(control) = &self.control {
             return control.prepare(instance, spec).await.map_err(|error| {
                 GrillError::StartFailed {
@@ -479,13 +705,15 @@ impl super::Grill for ProcessGrill {
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
         if let Some(control) = &self.control {
-            return control
-                .start(instance)
-                .await
-                .map_err(|error| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: error.to_string(),
-                });
+            let record =
+                control
+                    .start(instance)
+                    .await
+                    .map_err(|error| GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: error.to_string(),
+                    })?;
+            return gate_result(instance, &record);
         }
         let mut procs = self.processes.lock().await;
         let entry = procs
@@ -501,18 +729,14 @@ impl super::Grill for ProcessGrill {
             });
         }
 
-        let args = &entry.spec.process.args;
-
-        // If no command specified, use a long sleep as a placeholder.
-        // Real containers get their entrypoint from the image; ProcessGrill
-        // doesn't have images, so we fall back to keeping the process alive.
-        let default_args;
-        let effective_args = if args.is_empty() {
-            default_args = vec!["sleep".to_string(), "86400".to_string()];
-            &default_args
-        } else {
-            args
-        };
+        // `create` refused a spec with nothing to run.
+        let effective_args = &entry.spec.process.args;
+        if effective_args.is_empty() {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem: super::LaunchProblem::NoCommand,
+            });
+        }
 
         let mut cmd = Command::new(&effective_args[0]);
         cmd.kill_on_drop(entry.cleanup_on_drop);
@@ -525,12 +749,8 @@ impl super::Grill for ProcessGrill {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        // Set environment variables from OCI spec
-        for env_str in &entry.spec.process.env {
-            if let Some((key, value)) = env_str.split_once('=') {
-                cmd.env(key, value);
-            }
-        }
+        cmd.env_clear();
+        cmd.envs(host_environment(&entry.spec.process.env));
 
         // File-backed mode: append to log files that outlive this process
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
@@ -563,9 +783,26 @@ impl super::Grill for ProcessGrill {
             cmd.stderr(std::process::Stdio::piped());
         }
 
-        let mut child = cmd.spawn().map_err(|e| GrillError::StartFailed {
-            instance: instance.clone(),
-            reason: e.to_string(),
+        let mut child = cmd.spawn().map_err(|error| {
+            // The binary can vanish after `create`'s check (#905).
+            let program = PathBuf::from(&effective_args[0]);
+            let problem = match error.kind() {
+                std::io::ErrorKind::NotFound => Some(super::LaunchProblem::BinaryNotFound(program)),
+                std::io::ErrorKind::PermissionDenied => {
+                    Some(super::LaunchProblem::BinaryNotExecutable(program))
+                }
+                _ => None,
+            };
+            match problem {
+                Some(problem) => GrillError::LaunchRefused {
+                    instance: instance.clone(),
+                    problem,
+                },
+                None => GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                },
+            }
         })?;
 
         let capture = if self.log_dir.is_none() {
@@ -680,9 +917,11 @@ impl super::Grill for ProcessGrill {
         if entry.state == ContainerState::Stopped {
             return Ok(());
         }
-        if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
-            signal_child_group(pid, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
-            entry.state = ContainerState::Stopping;
+        if entry.child.as_ref().and_then(|child| child.id()).is_some() {
+            signal_child_group(entry, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
+            if entry.state != ContainerState::Stopped {
+                entry.state = ContainerState::Stopping;
+            }
         } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
                 .map_err(error)?
@@ -721,10 +960,11 @@ impl super::Grill for ProcessGrill {
         if entry.state == ContainerState::Stopped {
             return Ok(());
         }
+        signal_child_group(entry, nix::sys::signal::Signal::SIGKILL).map_err(error)?;
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
         if let Some(ref mut child) = entry.child {
-            if let Some(pid) = child.id() {
-                signal_child_group(pid, nix::sys::signal::Signal::SIGKILL).map_err(error)?;
-            }
             entry.state = ContainerState::Stopping;
             child.start_kill().map_err(error)?;
             let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
@@ -756,9 +996,12 @@ impl super::Grill for ProcessGrill {
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
         if let Some(control) = &self.control {
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Prepared => ContainerState::Pending,
                 OwnerPhase::Retiring { .. } => ContainerState::Stopping,
@@ -797,6 +1040,52 @@ impl super::Grill for ProcessGrill {
         }
 
         Ok(entry.state)
+    }
+
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &super::RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        // Without an owner journal there is no generation to compare, and
+        // `launch_generation` never handed one out.
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        control
+            .forget_retired(instance, Some(generation))
+            .await
+            .map_err(|error| owner_error(instance, error))
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::RuntimeGeneration>, GrillError> {
+        let Some(control) = &self.control else {
+            return Ok(None);
+        };
+        control
+            .generation(instance)
+            .await
+            .map_err(|error| owner_error(instance, error))
+    }
+
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if let Some(control) = &self.control {
+            control
+                .forget_retired(instance, None)
+                .await
+                .map_err(|error| owner_error(instance, error))?;
+        }
+        let mut processes = self.processes.lock().await;
+        if processes
+            .get(instance)
+            .is_some_and(|entry| entry.state == ContainerState::Stopped)
+        {
+            processes.remove(instance);
+        }
+        Ok(())
     }
 
     async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
@@ -878,9 +1167,12 @@ impl super::Grill for ProcessGrill {
             // An owner that didn't answer leaves the pid unknown, never
             // "no process" (#358).
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Running { pid } => Some(pid),
                 _ => None,
@@ -914,9 +1206,12 @@ impl super::Grill for ProcessGrill {
             // An owner that didn't answer leaves the exit code unknown,
             // never "hasn't exited" (#389).
             let record = control
-                .status(instance)
+                .status_if_present(instance)
                 .await
-                .map_err(|error| owner_error(instance, error))?;
+                .map_err(|error| owner_error(instance, error))?
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             return Ok(match record.phase {
                 OwnerPhase::Retired { exit_code } => exit_code,
                 _ => None,
@@ -952,7 +1247,9 @@ impl super::Grill for ProcessGrill {
                 .exec(instance, command)
                 .await
                 .map_err(|error| owner_error(instance, error));
-        } else {
+        }
+        // The same environment as the workload itself (see `host_environment`).
+        let environment = {
             let procs = self.processes.lock().await;
             let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
@@ -963,7 +1260,8 @@ impl super::Grill for ProcessGrill {
                     reason: format!("instance is not running (state: {})", entry.state),
                 });
             }
-        }
+            host_environment(&entry.spec.process.env)
+        };
 
         if command.is_empty() {
             return Err(GrillError::StartFailed {
@@ -975,6 +1273,8 @@ impl super::Grill for ProcessGrill {
         // Spawn the command directly (no namespace entry for ProcessGrill)
         let output = Command::new(&command[0])
             .args(&command[1..])
+            .env_clear()
+            .envs(environment)
             .output()
             .await
             .map_err(|e| GrillError::StartFailed {
@@ -1132,8 +1432,12 @@ mod tests {
     use crate::grill::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
     use crate::grill::records::{self, InstanceRecord, RuntimeKind};
 
+    /// A host workload's spec: the only kind the process runtime runs.
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
+            reusable_executor: false,
+            host_process: true,
+            initialiser: false,
             port_mapping: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
@@ -1146,6 +1450,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
@@ -1187,7 +1492,6 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "test".to_string(),
             replica_index: 0,
-            is_job: false,
             image: String::new(),
             runtime: RuntimeKind::Process,
             pid,
@@ -1202,6 +1506,44 @@ mod tests {
         }
     }
 
+    /// Wait until the child `pid` has exited, without reaping it.
+    ///
+    /// WNOWAIT observes the exit but leaves the zombie in place, preserving
+    /// the exact zombie-group state that macOS refuses to signal.
+    async fn wait_until_exited_unreaped(pid: u32) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+                // SAFETY: pid belongs to a child this test spawned; info points
+                // to correctly sized, initialised storage. WNOHANG bounds the
+                // call and WNOWAIT preserves ownership.
+                let result = unsafe {
+                    nix::libc::waitid(
+                        nix::libc::P_PID,
+                        pid as nix::libc::id_t,
+                        info.as_mut_ptr(),
+                        nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(
+                    result,
+                    0,
+                    "waitid failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: the POD buffer was zero-initialised and waitid
+                // succeeded; si_pid reads the process-event member.
+                let observed_pid = unsafe { info.assume_init().si_pid() };
+                if observed_pid == pid as nix::libc::pid_t {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn stop_and_kill_reap_already_exited_children_without_signalling_zombies() {
         for operation in ["stop", "kill"] {
@@ -1213,39 +1555,7 @@ mod tests {
                 grill.create(&id, &spec).await.unwrap();
                 grill.start(&id).await.unwrap();
                 let pid = grill.pid(&id).await.unwrap().unwrap();
-                // WNOWAIT observes exit without reaping the child, preserving
-                // the exact zombie-group state that macOS refuses to signal.
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
-                        // SAFETY: pid belongs to the child just spawned above;
-                        // info points to correctly sized, initialised storage.
-                        // WNOHANG bounds the call and WNOWAIT preserves ownership.
-                        let result = unsafe {
-                            nix::libc::waitid(
-                                nix::libc::P_PID,
-                                pid as nix::libc::id_t,
-                                info.as_mut_ptr(),
-                                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
-                            )
-                        };
-                        assert_eq!(
-                            result,
-                            0,
-                            "waitid failed: {}",
-                            std::io::Error::last_os_error()
-                        );
-                        // SAFETY: the POD buffer was zero-initialised and waitid
-                        // succeeded; si_pid reads the process-event member.
-                        let observed_pid = unsafe { info.assume_init().si_pid() };
-                        if observed_pid == pid as nix::libc::pid_t {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                wait_until_exited_unreaped(pid).await;
                 let result = if operation == "stop" {
                     grill.stop(&id).await
                 } else {
@@ -1255,6 +1565,44 @@ mod tests {
                     result.is_ok(),
                     "{operation} on exited child failed: {result:?}"
                 );
+                assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+                assert_eq!(grill.exit_code(&id).await.unwrap(), Some(exit));
+            }
+        }
+    }
+
+    /// `stop` and `kill` first look for an exit, then signal the group. A
+    /// child that exits between those two steps is an unreaped zombie when
+    /// the signal goes out, and macOS refuses a group of zombies with EPERM
+    /// rather than ESRCH (#723). That window can't be hit on demand through
+    /// `stop` or `kill`, so this drives their signalling step directly on a
+    /// zombie whose exit nobody has observed yet.
+    #[tokio::test]
+    async fn signalling_a_child_that_exited_after_the_exit_check_is_not_an_error() {
+        for signal in [
+            nix::sys::signal::Signal::SIGTERM,
+            nix::sys::signal::Signal::SIGKILL,
+        ] {
+            for exit in [0, 7] {
+                let grill = ProcessGrill::new();
+                let id = InstanceId(format!("raced-{signal}-{exit}"));
+                let spec =
+                    spec_with_args(vec!["/bin/sh".into(), "-c".into(), format!("exit {exit}")]);
+                grill.create(&id, &spec).await.unwrap();
+                grill.start(&id).await.unwrap();
+                let pid = grill.pid(&id).await.unwrap().unwrap();
+                wait_until_exited_unreaped(pid).await;
+
+                let result = {
+                    let mut procs = grill.processes.lock().await;
+                    signal_child_group(procs.get_mut(&id).unwrap(), signal)
+                };
+                assert!(
+                    result.is_ok(),
+                    "{signal} to an exited child failed: {result:?}"
+                );
+                // Whether the platform delivered the signal to the zombie or
+                // refused it, the next look reports the child's real exit.
                 assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
                 assert_eq!(grill.exit_code(&id).await.unwrap(), Some(exit));
             }
@@ -1365,12 +1713,55 @@ mod tests {
         .expect("stopping the workload left its shell descendant alive");
     }
 
+    /// A killed shell that was waiting on its children must record the kill,
+    /// not the `exit 0` it runs if a group signal reaches its children first.
+    /// macOS signals a group one member at a time, newest first, so the
+    /// kill goes to the shell before its group (#916).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_records_a_shell_waiting_on_killed_children_as_killed() {
+        for round in 0..30 {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let script = format!(
+                "i=0; while [ $i -lt 400 ]; do sleep 60 & i=$((i+1)); done; \
+                 sleep 60 & touch '{}'; wait $!; exit 0",
+                ready.display()
+            );
+            let grill = ProcessGrill::new();
+            let id = InstanceId(format!("killed-shell-{round}"));
+            grill
+                .create(
+                    &id,
+                    &spec_with_args(vec!["sh".to_string(), "-c".to_string(), script]),
+                )
+                .await
+                .unwrap();
+            grill.start(&id).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !ready.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shell never started its children");
+            grill.kill(&id).await.unwrap();
+            wait_for_state(&grill, &id, ContainerState::Stopped).await;
+            assert_eq!(grill.exit_code(&id).await.unwrap(), None, "round {round}");
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn panicking_owner_terminates_in_memory_process_tree() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("child.pid");
-        let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        // Write then rename: the redirection creates the file before `echo` fills
+        // it, and the wait below only checks that the file exists.
+        let script = format!(
+            "sleep 60 & echo $! > {0}.tmp && mv {0}.tmp {0}; wait",
+            pid_file.display()
+        );
         let task = tokio::spawn(async move {
             let grill = ProcessGrill::new();
             let id = InstanceId("panic-cleanup-0".to_string());
@@ -1612,6 +2003,95 @@ mod tests {
         let logs = grill.logs(&id).await.unwrap();
         assert!(logs.contains("to-out"), "{logs:?}");
         assert!(logs.contains("to-err"), "{logs:?}");
+    }
+
+    #[test]
+    fn host_environment_keeps_the_allowlist_and_lets_the_workload_override_it() {
+        let inherited = [
+            ("PATH", "/usr/local/bin:/usr/bin"),
+            ("HOME", "/root"),
+            ("LC_ALL", "C.UTF-8"),
+            ("AWS_SECRET_ACCESS_KEY", "bun-only"),
+            ("RELIABURGER_JOIN_TOKEN", "bun-only"),
+        ]
+        .map(|(key, value)| (key.into(), value.into()));
+        let environment =
+            super::host_environment_from(inherited, &["PATH=/opt/job/bin".into(), "JOB=1".into()]);
+        assert_eq!(
+            environment.into_iter().collect::<Vec<_>>(),
+            [
+                ("HOME", "/root"),
+                ("JOB", "1"),
+                ("LC_ALL", "C.UTF-8"),
+                ("PATH", "/opt/job/bin"),
+            ]
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        );
+    }
+
+    /// One variable in this test process's environment that host commands
+    /// must not inherit (nextest sets `CARGO_*`, sudo sets `SUDO_*`).
+    pub(crate) fn private_variable() -> String {
+        std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .find(|key| !super::inherited_by_host_commands(key))
+            .expect("the test environment has a variable outside the allowlist")
+    }
+
+    #[tokio::test]
+    async fn exec_gets_the_workloads_environment_and_none_of_buns() {
+        use std::os::unix::fs::PermissionsExt;
+        let private = private_variable();
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("rb-exec-tool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf found\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", root.path().display());
+        let grill = ProcessGrill::new();
+        let id = InstanceId("exec-env-1".to_string());
+        let mut spec = sleep_spec("30");
+        spec.process.env = vec!["JOB=1".into(), format!("PATH={path}")];
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let env = grill.exec(&id, &["env".to_string()]).await.unwrap();
+        let resolved = grill.exec(&id, &["rb-exec-tool".to_string()]).await;
+        grill.kill(&id).await.unwrap();
+        assert!(env.lines().any(|line| line == "JOB=1"), "{env}");
+        assert!(
+            env.lines().any(|line| line == format!("PATH={path}")),
+            "{env}"
+        );
+        assert!(
+            !env.lines()
+                .any(|line| line.starts_with(&format!("{private}="))),
+            "{private} leaked: {env}"
+        );
+        assert_eq!(resolved.unwrap().trim(), "found");
+    }
+
+    #[tokio::test]
+    async fn host_commands_see_the_allowlisted_environment_only() {
+        let private = private_variable();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("env-1".to_string());
+        let mut spec = spec_with_args(vec!["env".to_string()]);
+        spec.process.env = vec!["JOB=1".into()];
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        let logs = grill.logs(&id).await.unwrap();
+        let path = std::env::var("PATH").unwrap();
+        assert!(
+            logs.lines().any(|line| line == format!("PATH={path}")),
+            "{logs}"
+        );
+        assert!(logs.lines().any(|line| line == "JOB=1"), "{logs}");
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.starts_with(&format!("{private}="))),
+            "{private} leaked: {logs}"
+        );
     }
 
     /// Read the first `count` lines `follow_logs` produces for `id`, as a
@@ -2581,5 +3061,268 @@ mod tests {
     #[tokio::test]
     async fn resumed_file_follow_keeps_offsets_across_eof_before_actual_child_exit() {
         assert_file_follow_rescans_after_empty_read_then_child_exit(true).await;
+    }
+
+    /// #881: the error a create returns for a binary nobody can run.
+    fn refused_launch(error: GrillError) -> super::super::LaunchProblem {
+        match error {
+            GrillError::LaunchRefused { problem, .. } => problem,
+            other => panic!("expected a refused launch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_missing_binary_as_binary_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-installed");
+        let grill = ProcessGrill::new();
+        let id = InstanceId("missing-0".to_string());
+        let spec = spec_with_args(vec![missing.display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            format!("binary not found: {}", missing.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_binary_without_execute_permission() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("not-executable");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("not-executable-0".to_string());
+        let spec = spec_with_args(vec![script.display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            format!("binary not executable: {}", script.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_directory_as_a_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("directory-0".to_string());
+        let spec = spec_with_args(vec![root.path().display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            format!("binary not executable: {}", root.path().display())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_looks_a_bare_command_up_on_the_workloads_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("rb-path-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("path-0".to_string());
+        let mut spec = spec_with_args(vec!["rb-path-tool".to_string()]);
+        spec.process.env = vec![format!("PATH={}", root.path().display())];
+
+        grill.create(&id, &spec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_bare_command_missing_from_the_workloads_path() {
+        let root = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("path-missing-0".to_string());
+        let mut spec = spec_with_args(vec!["rb-no-such-tool".to_string()]);
+        spec.process.env = vec![format!("PATH={}", root.path().display())];
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(problem.to_string(), "binary not found: rb-no-such-tool");
+    }
+
+    /// #905: a binary deleted after the pre-launch check fails the start
+    /// as "binary not found", not as a generic spawn error.
+    #[tokio::test]
+    async fn start_refuses_a_binary_deleted_after_create_as_binary_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("vanishing-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("vanishing-0".to_string());
+        let spec = spec_with_args(vec![tool.display().to_string()]);
+        grill.create(&id, &spec).await.unwrap();
+        std::fs::remove_file(&tool).unwrap();
+
+        let problem = refused_launch(grill.start(&id).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::BinaryNotFound(tool.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_create_refuses_a_missing_binary_before_preparing_a_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let owners = root.path().join("owners");
+        let missing = root.path().join("not-installed");
+        let grill = ProcessGrill::with_owner(owners.clone(), "/bin/false".into());
+        let id = InstanceId("owned-missing-0".to_string());
+        let spec = spec_with_args(vec![missing.display().to_string()]);
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::BinaryNotFound(missing.clone())
+        );
+        assert!(
+            !owners.join(&id.0).exists(),
+            "a refused launch must not leave a prepared generation behind"
+        );
+    }
+
+    /// The OCI spec Bun builds for `app`, as a fresh deploy does.
+    fn app_spec(name: &str, app: &str) -> OciSpec {
+        let app: crate::config::app::AppSpec = toml::from_str(app).unwrap();
+        crate::grill::oci::generate_oci_spec(
+            name,
+            "default",
+            &app,
+            &format!("default__{name}-0"),
+            None,
+            &format!("/reliaburger/default/{name}/0"),
+            None,
+            None,
+        )
+    }
+
+    /// #914: an app that names an image needs a container runtime. The
+    /// process runtime refuses it, instead of running its `command` on the
+    /// host as though the image were a placeholder.
+    #[tokio::test]
+    async fn create_refuses_an_image_app_as_needing_a_container_runtime() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__web-0".to_string());
+        let spec = app_spec(
+            "web",
+            "image = \"nginx:1.27\"\ncommand = [\"sleep\", \"60\"]",
+        );
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::NeedsContainerRuntime("nginx:1.27".to_string())
+        );
+        assert_eq!(
+            problem.to_string(),
+            "needs a container runtime to run image nginx:1.27, and this node's runtime is process"
+        );
+        assert!(
+            matches!(grill.start(&id).await, Err(GrillError::NotFound { .. })),
+            "a refused image app must leave nothing to start"
+        );
+    }
+
+    /// #914: an image app without a command used to run `sleep 86400` as a
+    /// stand-in, and looked healthy while doing nothing.
+    #[tokio::test]
+    async fn create_refuses_an_image_app_without_a_command_instead_of_sleeping() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__idle-0".to_string());
+        let spec = app_spec("idle", "image = \"busybox:1.36\"");
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem,
+            super::super::LaunchProblem::NeedsContainerRuntime("busybox:1.36".to_string())
+        );
+    }
+
+    /// #914: an init container that names its own image needs a container
+    /// runtime too, even before an exec app. One that names none runs on the
+    /// host, like its app.
+    #[tokio::test]
+    async fn create_refuses_an_init_container_image_but_runs_a_host_apps_init() {
+        let grill = ProcessGrill::new();
+        let app = app_spec("tool", "exec = \"/bin/sleep\"\ncommand = [\"60\"]");
+
+        let id = InstanceId("default__tool-0-init-0".to_string());
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("image = \"migrate:2\"\ncommand = [\"migrate\"]").unwrap();
+        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            "needs a container runtime to run image migrate:2, and this node's runtime is process"
+        );
+
+        let id = InstanceId("default__tool-0-init-1".to_string());
+        let init: crate::config::app::InitContainerSpec =
+            toml::from_str("command = [\"echo\", \"migrating\"]").unwrap();
+        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
+        grill.create(&id, &spec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_create_refuses_an_image_app_before_preparing_a_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let owners = root.path().join("owners");
+        let grill = ProcessGrill::with_owner(owners.clone(), "/bin/false".into());
+        let id = InstanceId("default__web-0".to_string());
+        let spec = app_spec(
+            "web",
+            "image = \"nginx:1.27\"\ncommand = [\"sleep\", \"60\"]",
+        );
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert!(
+            matches!(
+                problem,
+                super::super::LaunchProblem::NeedsContainerRuntime(_)
+            ),
+            "{problem:?}"
+        );
+        assert!(
+            !owners.join(&id.0).exists(),
+            "a refused launch must not leave a prepared generation behind"
+        );
+    }
+
+    /// #914: host workloads are what the process runtime is for. An `exec`
+    /// app and a `script` app still run.
+    #[tokio::test]
+    async fn host_exec_and_script_apps_still_run_under_the_process_runtime() {
+        let grill = ProcessGrill::new();
+        for (name, app) in [
+            ("tool", "exec = \"/bin/sleep\"\ncommand = [\"60\"]"),
+            ("job", "script = \"sleep 60\""),
+        ] {
+            let id = InstanceId(format!("default__{name}-0"));
+            let spec = app_spec(name, app);
+            assert!(spec.host_process, "{name} must be a host workload");
+
+            grill.create(&id, &spec).await.unwrap();
+            grill.start(&id).await.unwrap();
+            assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+            grill.kill(&id).await.unwrap();
+        }
+    }
+
+    /// #914: the `sleep 86400` stand-in is gone. A host spec with nothing to
+    /// run is refused, not kept alive doing nothing.
+    #[tokio::test]
+    async fn create_refuses_a_host_spec_with_no_command() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("empty-0".to_string());
+        let mut spec = spec_with_args(Vec::new());
+        spec.host_process = true;
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(problem, super::super::LaunchProblem::NoCommand);
+        assert_eq!(problem.to_string(), "no command to run");
     }
 }
