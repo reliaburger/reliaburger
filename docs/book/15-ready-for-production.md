@@ -1086,6 +1086,23 @@ writes them back, byte for byte. A one-line `.gitattributes` keeps git from "fix
 fixtures' CRLFs, which would make the test check the wrong bytes. The bump also left one
 `pem` in `Cargo.lock` instead of two, since rcgen 0.14 had already moved to 4.
 
+One crate never showed up in `make outdated` at all. We were on `oci-distribution` 0.11,
+and upstream had renamed it `oci-client` and carried on publishing under the new name. No
+newer `oci-distribution` will ever exist, so `cargo update` saw nothing to do. A rename is
+invisible to every tool that compares version numbers; only reading the changelog, or the
+crate page, finds it
+([#1045](https://github.com/reliaburger/reliaburger/issues/1045)). Before we moved, we
+checked that `oci-client` 0.18 was a real, maintained release. bincode had just shown us
+that the next version can be a tombstone.
+
+`oci-client` 0.18 sits on reqwest 0.13, so the same three defaults moved, but
+`http_client::builder()` can't help: `oci-client` builds its reqwest client inside and
+takes only a config struct. That struct has a `tls_certs_only` field, so registry pulls
+trust the same bundled Mozilla roots, and we install ring before building the client. It
+has no HTTP version setting, so registry pulls offer HTTP/2 and use it when the registry
+agrees. Chapter 1 shows the code. A test pins the HTTP/2 offer, so the difference stays a
+known one rather than a surprise.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
