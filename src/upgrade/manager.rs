@@ -1232,8 +1232,21 @@ mod tests {
         let fixture = fixture();
         let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
         let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n").into_bytes();
-        binary.resize(binary.len() + 96 * 1024 * 1024, b'#');
-        let directive = directive_for(&fixture, &binary, "large");
+        // Build and sign the candidate on a thread of its own. That's
+        // seconds of CPU, and done on the runtime's thread it made the
+        // scheduler rank that thread below fresher ones for a while
+        // afterwards: on a host with hundreds of runnable threads it then
+        // waited up to 378 ms for a core, runnable but running nothing,
+        // and the ticker blamed `prepare` (#1078).
+        let directive = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    binary.resize(binary.len() + 96 * 1024 * 1024, b'#');
+                    directive_for(&fixture, &binary, "large")
+                })
+                .join()
+                .unwrap()
+        });
 
         let stop = CancellationToken::new();
         let ticker = tokio::spawn({
@@ -1249,6 +1262,10 @@ mod tests {
                 longest
             }
         });
+        // Let the ticker take its first reading: on this one-thread runtime
+        // it doesn't run until the test yields, so without this it would
+        // miss anything `prepare` blocked on before its first `.await`.
+        tokio::task::yield_now().await;
         let started = std::time::Instant::now();
         let prepared = fixture.manager.prepare(&directive, vec![]).await;
         let took = started.elapsed();
@@ -1576,8 +1593,15 @@ mod tests {
         // across the host, so 32 simultaneous probes measured that queue
         // (12.9 s for 32 fresh scripts) rather than the probe (#722). A node
         // runs one probe at a time.
+        //
+        // The race is Linux's: macOS runs a file that another process
+        // holds open for writing, so there it has nothing to catch, and
+        // each probe only pays for its assessment. With other new
+        // executables starting on the host, 32 assessments outlasted the
+        // test's whole minute (#1078), so a Mac runs one round of four.
+        const PROBES: usize = if cfg!(target_os = "linux") { 32 } else { 4 };
         use futures_util::StreamExt as _;
-        let probes: Vec<_> = (0..32)
+        let probes: Vec<_> = (0..PROBES)
             .map(|_| {
                 let fixture = fixture();
                 let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
