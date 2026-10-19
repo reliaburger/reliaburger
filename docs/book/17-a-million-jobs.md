@@ -214,6 +214,23 @@ Main's finite evidence registry now names both runtime cases and the cluster
 worker-loss case explicitly. A repository regression check catches missing
 bindings and stale reviewed OCI source fingerprints before aggregation.
 
+#### Ask the leader before saying "not found"
+
+The 0.2.1 jobs soak lost a live run to a 404 ([#1192](https://github.com/reliaburger/reliaburger/issues/1192)). After a graceful whole-cluster stop, node 1 came back first. Its API was listening, it had no Raft leader yet, and its log predated run 1589, because node 1 was already down when 1589 committed on the other two. The harness sent `POST /v1/batch/1589/cancel` to node 1 and got `404 task submission 1589 not found`. Nothing was lost: the run was safe on the quorum. But a client that believes a 404 drops a run that's still going.
+
+The cancel, results and task logs handlers each looked the run up in the node's own replica first and only then asked whether they should forward to the leader. A replica can lag, and a node that has just restarted can hold a log older than the run, so its "I don't have it" says nothing about the cluster. `GET /v1/batch/{id}` already had the right order. Now all three ask first:
+
+```rust
+if let Some(council) = council_to_forward_to(&state).await {
+    let path = format!("/v1/batch/{batch_id}/cancel");
+    return forward_to_leader(&state, council, &path, String::new(), &headers).await;
+}
+```
+
+`council_to_forward_to` returns `None` only when this node proves it leads with `confirm_leadership`, the 3-second check from [#1009](https://github.com/reliaburger/reliaburger/issues/1009) in chapter 2. A proved leader has applied everything the quorum committed, so its 404 is true. Anything else forwards, and `leader_api_url` turns "no leader known", "it's me but I can't prove it" and "this was already forwarded once" into a 503 the client retries. Authorisation moved after the forward too. The forwarded request carries the caller's token, so the node that serves it authorises it once, against its own current state, and a follower never refuses a caller on a stale permission map.
+
+Four tests pin it, all in `src/bun/api/tests.rs`. `a_follower_without_the_run_forwards_cancel_results_and_logs_to_the_leader` sends all three to a follower whose replica has no run, with a fake leader that records what reaches it, and expects each call there with the caller's token and the forwarded mark. `a_node_with_no_leader_or_a_closed_fence_answers_run_calls_503_not_404` sends them to a node that hasn't seen an election and to a leader behind a closed recovery fence, and expects 503 from both. `a_confirmed_leader_answers_404_for_a_run_it_does_not_hold` checks that the honest 404 survives. The three routes also joined `LEADER_ONLY_CALLS`, so the loop tests from chapter 2 cover them: a leader without a quorum and a follower handed an already-forwarded request both answer 503. Before the fix, every one of those calls came back 404.
+
 ### Definitions, runs and durable trigger identities
 
 A template and a count describe work, but not why it runs. A manually submitted

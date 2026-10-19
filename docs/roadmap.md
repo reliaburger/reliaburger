@@ -367,7 +367,7 @@ migration and no feature gate
   and 0.3.0's A/B OS updates draining and rebooting each node in turn. Moves join
   the V02 soak's fault kinds rather than getting a soak of their own.
   Managed-volume retirement and the Apple runtime (F10,
-  [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.x,
+  [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.3,
   outside the migration plan.
 - [ ] **0.4.2: "Plug in an AI SRE"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/18),
@@ -380,6 +380,20 @@ migration and no feature gate
   off-the-shelf agent with a read-only token diagnoses at least 4 of 5 runs of
   each eval scenario and never attempts a mutation
   ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)).
+- [ ] **0.4.3, 0.4.4 and 0.4.5: "Stronger walls"**
+  ([0.4.3](https://github.com/reliaburger/reliaburger/milestone/20),
+  [0.4.4](https://github.com/reliaburger/reliaburger/milestone/21),
+  [0.4.5](https://github.com/reliaburger/reliaburger/milestone/22),
+  [research](plans/2026-10-19-research-vm-runtime.md)). A `vm` runtime: change
+  an app to `runtime = "vm"` and it runs as a Linux VM on Cloud Hypervisor,
+  from the same OCI image, scheduled on the same hosts as containers. 0.4.3
+  ships VM apps, with service discovery, logs, exec, secrets and volumes
+  working as they do for runc, and brings back the Apple runtime (F10) on
+  macOS with cold moves only. 0.4.4 moves VMs (cold and checkpoint) through the
+  0.4.0 move plan and enforces egress policy for them. 0.4.5 boots cloud
+  images, persistent root disks and ISOs. Five spikes come first. Exit test
+  for 0.4.3: one Redis config switches from runc to vm on the quickstart and
+  keeps its data, discovery, logs, exec and health checks.
 - [ ] **After 0.4.0: book v2 and the full CLI tour.** Book v2: a distilled
   rewrite alongside v1; v1 keeps collecting until then. The rewrite reads
   properly from beginning to end: it cuts the fluff, keeps the design
@@ -396,7 +410,8 @@ migration and no feature gate
   addresses, live TCP handoff, pre-copy, and PostgreSQL keeping an open
   transaction across a move with the source switched off afterwards. It happens
   only if the network-ownership spike (S11) passes; otherwise it comes off this
-  page.
+  page. VMs are its first target if the VM migration spike passes first
+  ([#1185](https://github.com/reliaburger/reliaburger/issues/1185)).
 - [ ] **Later**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/9)). The
   fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265));
@@ -406,8 +421,11 @@ migration and no feature gate
   PromQL and the full metrics architecture (F06,
   [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
   faults (F09, [#366](https://github.com/reliaburger/reliaburger/issues/366));
-  and the remaining Kubernetes translations (F11,
-  [#368](https://github.com/reliaburger/reliaburger/issues/368)).
+  the remaining Kubernetes translations (F11,
+  [#368](https://github.com/reliaburger/reliaburger/issues/368)); gVisor for
+  hosts without KVM ([#1186](https://github.com/reliaburger/reliaburger/issues/1186));
+  and Windows Server guests
+  ([#1187](https://github.com/reliaburger/reliaburger/issues/1187)).
 
 ## Known gaps
 
@@ -432,7 +450,7 @@ what's shipped and what's scheduled.
   [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
   F04 R1–R4, F05 I3–I4, landed),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
-  [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
+  [0.4.3](https://github.com/reliaburger/reliaburger/milestone/20) (F10) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
   F06, F09, F11, and the rest of F03–F05).
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
