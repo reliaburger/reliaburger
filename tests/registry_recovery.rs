@@ -64,7 +64,9 @@ async fn abandoned_registry_upload_is_reclaimed_after_bun_sigkill() {
         false,
         root.path().join("upload-competing.log"),
     );
-    let status = tokio::time::timeout(Duration::from_secs(5), async {
+    // Startup waits up to ten seconds for a busy lock before refusing, so a
+    // child forked just before a self-upgrade exec can let go (#1198).
+    let status = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let Some(status) = competing.child.try_wait().unwrap() {
                 break status;
