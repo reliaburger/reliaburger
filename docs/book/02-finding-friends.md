@@ -698,10 +698,9 @@ Why a round cap at all? Because gossip propagation depends on random target sele
 
 It wasn't. In one full-suite run the test finished with one node seeing four members instead of five. More rounds would not have helped, and that's the interesting part. We ran twenty thousand unseeded schedules and about one in 1,700 got stuck for good (a hundred thousand gave 73, one in 1,370): every update about some member spent its bounded re-broadcasts before reaching one particular node, every dissemination queue drained, and from then on the PINGs carried nothing new. Nothing in Mustard resynchronised full membership, so a stranded node stayed stranded until something changed. That's a property of the protocol, not of the test, and the fix belongs in Mustard rather than in a longer test. We'll get to the fix in a moment. First, we needed to be able to replay a failure.
 
-Each `MustardNode` owns its random number generator instead of reaching for `rand::thread_rng()` on every probe:
+Each `MustardNode` owns its random number generator instead of reaching for `rand::rng()` on every probe:
 
 ```rust
-use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 pub struct MustardNode<T: MustardTransport> {
@@ -710,15 +709,16 @@ pub struct MustardNode<T: MustardTransport> {
 }
 
 // in MustardNode::new
-rng: StdRng::from_entropy(),
+rng: rand::make_rng(),
 
 #[cfg(test)]
 fn seed_rng(&mut self, seed: u64) {
+    use rand::SeedableRng;
     self.rng = StdRng::seed_from_u64(seed);
 }
 ```
 
-`StdRng::from_entropy()` seeds from the operating system, so production behaves exactly as before. `seed_from_u64` comes from the `SeedableRng` trait, and here's a Rust rule that surprises Go and Python programmers: a trait's methods are only callable when the trait is in scope. Without `use rand::SeedableRng;` the compiler reports that `StdRng` has no function called `seed_from_u64`, even though the type implements it. The `#[cfg(test)]` attribute compiles `seed_rng` only into test builds, so the seam doesn't leak into the public API.
+`rand::make_rng()` builds any seedable generator from fresh operating-system randomness, so production behaves exactly as before. It's generic over the generator type, and the compiler works out which one we want from the field's type, `StdRng`. `seed_from_u64` comes from the `SeedableRng` trait, and here's a Rust rule that surprises Go and Python programmers: a trait's methods are only callable when the trait is in scope. Without `use rand::SeedableRng;` the compiler reports that `StdRng` has no function called `seed_from_u64`, even though the type implements it. The `#[cfg(test)]` attribute compiles `seed_rng` only into test builds, so the seam doesn't leak into the public API. That's also why the `use` sits inside the function: at the top of the file it would be an unused import in every non-test build, and we treat warnings as errors.
 
 A seed alone wasn't enough. The membership table is a `HashMap`, and Rust's `HashMap` randomises its hashing per instance to resist denial-of-service attacks, so the candidate list came out in a different order every run. The same random index then picked a different peer. `pick_probe_target()` now sorts candidates by node ID before choosing. The choice is still uniform; it just depends only on the generator. With the generator seeded, a schedule that strands a member strands it every time, so we can study it, and later prove it rescued.
 
@@ -828,22 +828,24 @@ The five-node test now runs the simulation with an exchange every twenty rounds,
 ```rust
 #[tokio::test]
 async fn a_stranding_schedule_is_rescued_by_push_pull() {
-    assert_eq!(converge_five_node_ring(830, None).await, None);
-    let rounds = converge_five_node_ring(830, Some(PUSH_PULL_EVERY_ROUNDS)).await;
+    assert_eq!(converge_five_node_ring(160, None).await, None);
+    let rounds = converge_five_node_ring(160, Some(PUSH_PULL_EVERY_ROUNDS)).await;
     assert!(rounds.is_some_and(|round| round >= PUSH_PULL_EVERY_ROUNDS));
 }
 ```
 
-Seed 830 is the first of those 73 stranding schedules. The first assertion checks that it still strands without push-pull, so the test can't quietly stop exercising the failure. The second checks that it converges, and only once an exchange has happened.
+Seed 160 is the first of the stranding schedules. The first assertion checks that it still strands without push-pull, so the test can't quietly stop exercising the failure. The second checks that it converges, and only once an exchange has happened.
 
 The main convergence test went back to being unseeded, which is the whole point. Each run takes a random base from the operating system and drives 2,000 consecutive seeds from it, allowing two exchanges' worth of rounds. The seeds wrap on overflow with `base.wrapping_add(offset)`: Rust panics on integer overflow in debug builds instead of wrapping silently like C, so when wrapping is what you want you say so. A failure prints the seed, and the seed replays it. Here are the numbers, over the same 100,000 seeds:
 
 | | Stranded | Slowest to converge |
 |---|---:|---:|
-| Piggybacking only | 73 | never |
-| With push-pull | 0 | round 23 |
+| Piggybacking only | 82 | never |
+| With push-pull | 0 | round 22 |
 
-Round 23 is three rounds after the first exchange. Not "more rounds", which never helped. A different mechanism.
+Round 22 is two rounds after the first exchange. Not "more rounds", which never helped. A different mechanism.
+
+That first assertion has already earned its keep. The test originally replayed seed 830, the first of 73 stranding schedules under `rand` 0.8. Upgrading to `rand` 0.10 changed how `choose` turns random bits into an index, so every seed now produces a different schedule, and seed 830 converged in two rounds. Without the guard, the rescue test would have kept passing while rescuing nobody. Instead it failed and told us to pick another seed. A rescan of the same 100,000 seeds found 82 stranding schedules, the first of them seed 160, and the table above shows the new numbers. The rate barely moved, which is what you'd expect: the protocol didn't change, only which seeds land on the unlucky schedules.
 
 Last, a test for the join sync. A seed node knows three members it learnt long ago, so its dissemination queue is empty and has nothing left to say about them. A new node with only the seed's address runs one probe cycle while the test serves the seed:
 

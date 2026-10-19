@@ -649,8 +649,7 @@ impl ScopedDir {
     /// suffix means two concurrent builds of the *same* context digest
     /// never share a directory (the old digest-derived path did).
     fn new(base: &std::path::Path, build_id: u64) -> std::io::Result<Self> {
-        use rand::Rng as _;
-        let suffix: u64 = rand::thread_rng().r#gen();
+        let suffix: u64 = rand::random();
         let path = base.join(format!("{build_id}-{suffix:016x}"));
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })

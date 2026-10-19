@@ -1785,17 +1785,17 @@ kill(Pid::from_raw(container_pid), Signal::SIGCONT)?;
 **rand** -- PRNG for userspace operations (selecting random instances for `kill --count N`, jitter calculation in scenario timing). The eBPF programs use their own xorshift64 PRNG (BPF programs cannot call userspace random functions).
 
 ```rust
-use rand::Rng;
+use rand::RngExt;
 
 fn select_random_instances(
     instances: &[ContainerInstance],
     count: u32,
 ) -> Vec<&ContainerInstance> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut indices: Vec<usize> = (0..instances.len()).collect();
     // Fisher-Yates shuffle, take first `count`
     for i in 0..std::cmp::min(count as usize, indices.len()) {
-        let j = rng.gen_range(i..indices.len());
+        let j = rng.random_range(i..indices.len());
         indices.swap(i, j);
     }
     indices.iter()

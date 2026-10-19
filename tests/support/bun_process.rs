@@ -240,11 +240,11 @@ impl PortBlockReservation {
 
 /// Reserve a block until its returned guard is dropped, including downtime.
 pub fn reserve_port_block_lease(count: u16) -> PortBlockReservation {
-    use rand::Rng;
+    use rand::RngExt;
     assert!(count > 0 && count < TEST_PORTS.end - TEST_PORTS.start);
-    let mut random = rand::thread_rng();
+    let mut random = rand::rng();
     for _ in 0..1_000 {
-        let base = random.gen_range(TEST_PORTS.start..TEST_PORTS.end - count);
+        let base = random.random_range(TEST_PORTS.start..TEST_PORTS.end - count);
         if let Some(reservation) = PortBlockReservation::try_reserve(base, count) {
             return reservation;
         }

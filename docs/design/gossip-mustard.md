@@ -117,7 +117,7 @@ Each PING/ACK message piggybacks a bounded number of membership updates (new joi
 
 **Refutation first.** The dissemination queue sends this node's own refutation (Alive about itself at a raised incarnation) ahead of everything else, then Dead/Left, Suspect and Alive about others. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
 
-**Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 73 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
+**Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 82 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
 
 ```
 Node A                                   Node B (random live peer)
@@ -847,7 +847,7 @@ fn select_council_candidates(
     // (seeded by leader node_id + current term)
     let top = candidates.iter().take(needed * 3).collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(hash(leader_id, current_term));
-    let selected = top.choose_multiple(&mut rng, needed);
+    let selected = top.sample(&mut rng, needed);
 
     selected.map(|n| n.node_id).collect()
 }

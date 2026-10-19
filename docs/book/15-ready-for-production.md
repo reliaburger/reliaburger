@@ -960,7 +960,7 @@ Two Cargo mechanisms got us there, and both are doing their job. The first is th
 requirement. `redb = "2"` in `Cargo.toml` doesn't mean "version 2". It's a caret range,
 `>=2.0.0, <3.0.0`: any release that semantic versioning (semver) promises won't break our
 code. Below 1.0 the leftmost non-zero number counts as the major version, so `nix =
-"0.29"` takes any 0.29.x and never 0.30. If you know Go, this is close to a `go.mod`
+"0.31"` takes any 0.31.x and never 0.32. If you know Go, this is close to a `go.mod`
 line, which also never crosses a major version, though Go makes that a new import path
 (`/v2`) where Cargo just refuses. Python's `~=` operator is the nearest pip equivalent.
 
@@ -1118,6 +1118,105 @@ worked out once, outside our code. Those tests passed on 0.10 before the version
 they'd fail the moment a new crate changed a single byte. The HMACs on gossip and webhooks
 and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
 compares tags in constant time.
+
+`tokio-tungstenite`, the WebSocket client behind `relish logs -f` and the TUI's live log
+and event panes, went from 0.28 to 0.30 with nothing to fix. Its own source didn't change
+beyond a doc comment; it just follows `tungstenite`, whose two releases tightened the
+server's check on `Sec-WebSocket-Key` and let clients send header values that aren't
+visible ASCII. The question worth asking was the one reqwest raised: does a `wss://`
+connection still trust what it trusted before? With a cluster CA, `ws_connect` hands
+tokio-tungstenite our own rustls config, and two tests already prove it accepts the
+cluster's certificate and refuses an unrelated CA's. Without one, tokio-tungstenite builds
+its own config from the bundled `webpki-roots` (the `rustls-tls-webpki-roots` feature),
+using whichever crypto provider the process installed, and we install ring first. The new
+test `websocket_without_a_cluster_ca_refuses_a_private_certificate` pins that fallback: a
+server with a private certificate must fail verification, so a release that quietly
+stopped checking certificates would turn it red. A quiet switch to the OS store wouldn't,
+since a private CA isn't in that either, so for that we read the diff: the TLS code in
+0.30 is byte for byte the same as 0.28's. The bump also leaves two
+`tungstenite` versions in `Cargo.lock` for now. Our server side is axum's WebSocket
+support, which still uses 0.29, and the two meet only on the wire.
+
+`base64` 0.22 to 0.23 got the same treatment. base64 sits under values we store and
+send: every `ENC[AGE:...]` secret, the join and workload certificate bundles, registry
+Basic credentials, cosign signatures, and each segment of the workload JWTs we mint. If
+0.23 had changed its alphabet or how strictly it reads padding, an old secret could stop
+decrypting or a new token could stop verifying somewhere else. So known answers went in
+first, worked out with Python's `base64` rather than with our own encoder: `"f"` must
+encode to `Zg==` in the standard alphabet and to `Zg` in the unpadded URL-safe one, and
+the bytes `fb ff bf` must come out as `+/+/` and `-_-_`. Decoding must still refuse a
+missing or non-canonical pad. The tests passed on 0.22 and pass unchanged on 0.23. The
+release's headline is a SIMD engine, but we still name `general_purpose::STANDARD` and
+`URL_SAFE_NO_PAD`, the scalar engines, so nothing we run changed underneath. pem 4 had
+already brought 0.23 into the lockfile; 0.22 stays there for now, because age, axum,
+k8s-openapi and oci-client still use it.
+
+`rand` wasn't on the original list at all; it turned up when we reread `Cargo.toml`. Going
+from 0.8 to 0.10 crossed two releases of renames: `thread_rng()` became `rng()`, `gen` and
+`gen_range` became `random` and `random_range`, the `Rng` trait became `RngExt`,
+`choose_multiple` became `sample`, and `OsRng` became `SysRng`. The compiler finds every
+one of those. What it can't find is a secret quietly moving to a weaker source, so the PR
+checked where each random value goes. API tokens, join tokens, session keys, nonces and
+signing keys come from `ring`'s `SystemRandom`, which the bump doesn't touch. The
+`relish dashboard` launch and session tokens were the exception: they read `OsRng`
+directly. They now read `SysRng`, the same operating-system source under its new name.
+`SysRng` can fail where `OsRng` panicked, so `DashboardSession::new` returns the error
+instead. Everything else, from registry upload ids to temporary file names, comes from
+`rand::random()`, which uses the thread-local generator: still ChaCha12, still seeded from
+the operating system and reseeded every 64 KiB, exactly as in 0.8. Port and peer choice
+use the same generators.
+
+The seeded tests were the other thing to check, and one of them did care. Mustard's
+rescue test replays seed 830, a schedule that strands a gossip member until push-pull
+saves it. 0.10 changed how `choose` maps random bits to an index, so seed 830 now
+converges on its own. The test has a guard for exactly this, an assertion that the seed
+still strands without push-pull, and the guard failed. We rescanned the same 100,000
+seeds, picked the new first stranding schedule (seed 160) and updated the numbers in
+Chapter 2. What the test checks didn't change, only which seed it checks it with.
+
+And sometimes the compiler does all the reviewing. `nix`, our wrapper over Unix system
+calls, went from 0.29 to 0.31, and 0.30 moved its file-descriptor functions to *I/O
+safety*. In 0.29, `fcntl`, `fstat`, `fchown`, `syncfs` and the `*at` calls took a
+`RawFd`, a bare `i32`, so any integer would do, including one whose descriptor was already closed and
+reused. Now they take anything that implements the `AsFd` trait: a `File`, an `OwnedFd`,
+a `nix::dir::Dir`, or a `BorrowedFd` (Chapter 8 introduced the pair). The compiler refused
+eleven call sites, all in the same shape: we'd called `.as_raw_fd()` to hand nix an
+integer. The fix was to hand over the owner instead:
+
+```rust
+let stat = fstat(&top).map_err(io)?;
+// ...
+let stat = match fstatat(&*parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+```
+
+`&top` borrows the open `Dir`, and the borrow checker now proves it stays open for the
+call. `&*parent` reaches through the `Rc<Dir>` (a reference-counted pointer, so several
+children can share one parent directory) to borrow the `Dir` inside it. In C the same
+code would compile with a stale integer and fail at run time, if you were lucky. One call
+site, the `syncfs` that flushes an unpacked image, carried a comment promising "`directory`
+stays open for the whole call, so the descriptor is valid". That promise is now the
+compiler's job, so the comment went. The old `*at` signatures also took `Option<RawFd>`, where `None` meant "the current directory";
+the new ones take a descriptor and leave that case to `AT_FDCWD`. We never passed `None`,
+so nothing moved. Raw descriptors are still around where nix kept them, such as
+`connect`, and in our own `unsafe` blocks that call `libc` directly. nix 0.29 still has
+an entry in `Cargo.lock`, because `termwiz`, behind a ratatui backend we don't switch on,
+pins it. Cargo records every optional dependency it might need, but it compiles only
+those whose features are on, so `cargo tree -i nix@0.29.0` prints nothing.
+
+`dirs` 6 to 7 went the other way: nothing for the compiler to catch, and the kind of bump
+that's easiest to get wrong quietly. `dirs` answers "where is this user's home, data or
+cache directory?", and we build `~/.reliaburger` (contexts, tokens, dev clusters), bun's
+fallback stores and the job bench's image cache on its answers. If a new version returned a different directory,
+nothing would fail: users' files would just seem to vanish, because we'd be looking
+somewhere else. The 7.0 changelog has one breaking change, and it's Windows-only:
+`preference_dir` moved from local to roaming app data. We don't call `preference_dir`,
+and the macOS and Linux code didn't change. Even so, the tests came first.
+`tests/suite/user_directories.rs` re-runs its own test binary with a throwaway `HOME`
+(changing `HOME` inside a running test binary would race every other test) and pins each
+answer: the home directory is `$HOME`, the data and cache directories are
+`~/Library/Application Support` and `~/Library/Caches` on macOS and `~/.local/share` and
+`~/.cache` on Linux, the XDG overrides count on Linux only, and relish state and node data
+both land in `~/.reliaburger`. They passed on 6 before the version moved.
 
 `criterion` 0.5 to 0.8 is a dev-dependency, so no node ever runs it, and our benchmark code
 built unchanged. The risk sat somewhere else: the task-array gate doesn't read Criterion's

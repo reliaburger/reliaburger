@@ -703,10 +703,14 @@ default = ["kubernetes"]
 kubernetes = ["dep:k8s-openapi"]
 
 [dependencies]
-k8s-openapi = { version = "0.22", default-features = false, features = ["latest"], optional = true }
+k8s-openapi = { version = "0.28", default-features = false, features = ["std", "v1_36"], optional = true }
 ```
 
-We disable `default-features` on k8s-openapi because we only need the type definitions, not the API client operations. That shaves off a chunk of compile time.
+k8s-openapi builds its types for exactly one Kubernetes API version, picked by a feature: `v1_32` to `v1_36` in 0.28. We name the newest one, `v1_36`, rather than the `latest` alias. That alias moves under you: when we went from 0.22 to 0.28, `latest` quietly jumped from Kubernetes 1.30 to 1.36. Naming the version puts that choice in the diff, where a reviewer can see it.
+
+Why the newest? Because we only read the stable `v1` and `v2` kinds (Deployment, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, ConfigMap, Secret, Namespace and HorizontalPodAutoscaler), and Kubernetes doesn't remove fields from stable APIs. Each release only adds fields. A newer version reads every manifest an older one could, and it knows about fields like `Job.spec.successPolicy` too, which an older version would silently drop. We turn `default-features` off and switch `std` back on by name, so the feature list says everything we enable.
+
+The bump also took some `Option`s away. Kubernetes' OpenAPI document now marks `spec` as required on HorizontalPodAutoscaler and CronJob, and `name` as required on the `configMapRef` and `secretRef` of an `envFrom` entry, so k8s-openapi 0.28 makes them plain `HorizontalPodAutoscalerSpec`, `CronJobSpec` and `String`. A document that leaves one out still parses: the generated deserialiser fills in the type's default, an empty spec or an empty name. Our code lost an `if let Some(spec)` level in a few places, and the compiler found every one of them for us.
 
 ### Reading the YAML
 
