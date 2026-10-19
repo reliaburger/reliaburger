@@ -1119,6 +1119,25 @@ they'd fail the moment a new crate changed a single byte. The HMACs on gossip an
 and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
 compares tags in constant time.
 
+`criterion` 0.5 to 0.8 is a dev-dependency, so no node ever runs it, and our benchmark code
+built unchanged. The risk sat somewhere else: the task-array gate doesn't read Criterion's
+console output, it reads the files Criterion leaves behind. `bench_baseline.py` walks
+`target/criterion` for `new/estimates.json`, names each benchmark by its directory, and takes
+`mean.point_estimate`. The re-measure hands Criterion an anchored regular expression as its
+filter. Any of those could have moved in three major versions, and the gate would then have
+compared nothing, or re-measured nothing, without failing. So the PR checked each one against
+both versions' source, then ran the suite under 0.5, saved a baseline from it, ran it again
+under 0.8 and had `bench_baseline.py compare` read the new run against the old baseline.
+Every benchmark found its baseline under the same name, so `main`'s saved baseline carries
+over and no run starts from scratch. The 0.8 run's estimates and the 0.5 baseline are now a
+fixture, so `make test-ci-scripts` fails if a later Criterion moves them. A forced re-measure
+with a tighter limit ran exactly the two benchmarks named in its anchored filter, and not
+their `executor/process_true_256` siblings. (The ratios themselves said more about the laptop
+than about Criterion: the 0.5 run shared it with other release builds, and the whole 0.8 run
+came out at 0.42 of it. That's the runner factor doing its job.) What
+did change is inside the measurement: before each sample, 0.8 moves the stack by a different
+number of bytes, so that one lucky memory alignment can't flatter a whole run.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do

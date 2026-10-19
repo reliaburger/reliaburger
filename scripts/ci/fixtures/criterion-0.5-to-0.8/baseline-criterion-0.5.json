@@ -1,0 +1,17 @@
+{
+  "benchmarks": {
+    "executor/fake_64k": 756774404.1,
+    "executor/process_true_256/1": 2043218762.6,
+    "executor/process_true_256/16": 259698099.9,
+    "executor/process_true_256/4": 627941404.2,
+    "index_set/insert_sequential_1m": 47732916.13,
+    "index_set/insert_sparse_10k": 5145122.635,
+    "leader_tick/64_arrays_3_nodes": 11216687.274891855,
+    "leader_tick/one_task_chunks_10_nodes": 1231997.8815691343,
+    "state/json_encode_1m_x64": 78065652.69972222,
+    "state/plan_and_complete_1m/200": 19309097.31581349,
+    "state/plan_and_complete_1m/3": 12093309.29931746,
+    "storage/ledger_and_index_64k": 200355766.9
+  },
+  "schema": 1
+}
