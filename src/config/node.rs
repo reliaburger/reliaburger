@@ -39,6 +39,32 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// Refuse log or metric storage caps larger than the filesystem they
+    /// live on (`filesystem_bytes`): such a cap would never prune before the
+    /// disk filled. `0` (unlimited) is an explicit opt-out and passes.
+    pub fn validate_storage_caps(
+        &self,
+        filesystem_bytes: u64,
+    ) -> Result<(), super::error::ConfigError> {
+        for (context, cap_mb) in [
+            ("logs", self.logs.max_storage_mb),
+            ("metrics", self.metrics.max_storage_mb),
+        ] {
+            if cap_mb.saturating_mul(1024 * 1024) > filesystem_bytes {
+                return Err(super::error::ConfigError::Validation {
+                    field: "max_storage_mb".to_string(),
+                    context: context.to_string(),
+                    reason: format!(
+                        "{cap_mb} MB is larger than the {} MB filesystem holding the data directory; \
+                         lower it, or set 0 to opt out of the cap",
+                        filesystem_bytes / (1024 * 1024)
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Parse node configuration from a TOML string.
     pub fn parse(toml: &str) -> Result<Self, super::error::ConfigError> {
         Ok(toml::from_str(toml)?)
@@ -130,8 +156,11 @@ pub struct DnsSection {
     pub enabled: bool,
     /// Listen address, e.g. "0.0.0.0:53" for rootful runc.
     pub listen: String,
-    /// Upstream resolver for non-`.internal` names.
-    pub upstream: String,
+    /// Upstream resolver for non-`.internal` names, as `address:port`.
+    ///
+    /// `None` (the default) uses the host's own resolvers: the `nameserver`
+    /// lines of `/etc/resolv.conf`, tried in order.
+    pub upstream: Option<String>,
     /// Restrict the `.internal` zone to container-reachable (loopback /
     /// private-range) sources. On by default so the internal topology
     /// isn't exposed to public clients; disable only for debugging.
@@ -143,34 +172,74 @@ impl Default for DnsSection {
         Self {
             enabled: false,
             listen: "0.0.0.0:53".to_string(),
-            upstream: "8.8.8.8:53".to_string(),
+            upstream: None,
             restrict_sources: true,
         }
     }
 }
 
+/// The host's resolver configuration, read when `[dns] upstream` is unset.
+pub const HOST_RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// The port every `nameserver` in a resolver file answers on: the format
+/// can't name another one.
+pub const NAMESERVER_PORT: u16 = 53;
+
 impl DnsSection {
-    /// Convert into the Onion DNS responder's config type.
+    /// Convert into the Onion DNS responder's config type, reading the
+    /// host's resolvers from [`HOST_RESOLV_CONF`] when `upstream` is unset.
     ///
-    /// Fails when the listen or upstream addresses don't parse.
+    /// Fails when the listen or upstream addresses don't parse, or when no
+    /// upstream is usable.
     pub fn to_dns_config(&self) -> Result<crate::onion::dns::DnsConfig, super::error::ConfigError> {
-        let listen_addr =
+        self.to_dns_config_from(std::path::Path::new(HOST_RESOLV_CONF), NAMESERVER_PORT)
+    }
+
+    /// [`Self::to_dns_config`] with the resolver file at `resolv_conf`, whose
+    /// nameservers answer on `nameserver_port` ([`NAMESERVER_PORT`] outside
+    /// tests).
+    pub fn to_dns_config_from(
+        &self,
+        resolv_conf: &std::path::Path,
+        nameserver_port: u16,
+    ) -> Result<crate::onion::dns::DnsConfig, super::error::ConfigError> {
+        let listen_addr: std::net::SocketAddr =
             self.listen
                 .parse()
                 .map_err(|_| super::error::ConfigError::InvalidValue {
                     field: "dns.listen".to_string(),
                     value: self.listen.clone(),
                 })?;
-        let upstream =
-            self.upstream
-                .parse()
-                .map_err(|_| super::error::ConfigError::InvalidValue {
-                    field: "dns.upstream".to_string(),
-                    value: self.upstream.clone(),
-                })?;
+        let upstreams = match &self.upstream {
+            Some(upstream) => {
+                vec![
+                    upstream
+                        .parse()
+                        .map_err(|_| super::error::ConfigError::InvalidValue {
+                            field: "dns.upstream".to_string(),
+                            value: upstream.clone(),
+                        })?,
+                ]
+            }
+            None => {
+                // A missing file is the same as one with no nameservers.
+                let contents = std::fs::read_to_string(resolv_conf).unwrap_or_default();
+                resolv_conf_nameservers(&contents, nameserver_port, listen_addr)
+            }
+        };
+        if upstreams.is_empty() {
+            return Err(super::error::ConfigError::Validation {
+                field: "dns.upstream".to_string(),
+                context: "node config".to_string(),
+                reason: format!(
+                    "{} names no usable nameserver; set [dns] upstream",
+                    resolv_conf.display()
+                ),
+            });
+        }
         Ok(crate::onion::dns::DnsConfig {
             listen_addr,
-            upstream,
+            upstreams,
             upstream_timeout: std::time::Duration::from_secs(2),
             source_namespaces: tokio::sync::watch::channel(
                 crate::onion::dns::DnsSourceNamespaces::default(),
@@ -181,6 +250,30 @@ impl DnsSection {
             },
         })
     }
+}
+
+/// The `nameserver` addresses in a resolver file, in order, each on `port`.
+///
+/// Skips any equal to `own_listen`, Bun's own DNS address, so the responder
+/// never forwards to itself. Lines that aren't an IP address (comments, a
+/// link-local address with a `%zone`) are skipped too.
+pub fn resolv_conf_nameservers(
+    contents: &str,
+    port: u16,
+    own_listen: std::net::SocketAddr,
+) -> Vec<std::net::SocketAddr> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("nameserver"), Some(address)) => address.parse().ok(),
+                _ => None,
+            }
+        })
+        .map(|ip: std::net::IpAddr| std::net::SocketAddr::new(ip, port))
+        .filter(|address| *address != own_listen)
+        .collect()
 }
 
 /// eBPF data-path configuration (Onion service resolution, Smoker
@@ -298,7 +391,7 @@ impl IngressSection {
 /// clustered node needs `master_key_path` (to build its wrapping IKM); only the
 /// bootstrap node needs `bootstrap_path` (it seeds the initial `SecurityState`
 /// into Raft, which then replicates to everyone else).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecuritySection {
     /// Path to the hex-encoded 32-byte cluster master key (`{cluster}-master.key`).
@@ -312,7 +405,9 @@ pub struct SecuritySection {
     /// Require mTLS on the internal listeners (Raft RPC, agent API,
     /// reporting). With this set a node refuses to bootstrap without an
     /// identity on disk, and a joiner starts in enrollment mode until
-    /// `relish join` installs one.
+    /// `relish join` installs one. Defaults to `true`, so a config that
+    /// omits it fails closed; `false` is the explicit plaintext opt-in.
+    /// Single-node `bun` (no `--cluster`) doesn't read it.
     pub require_mtls: bool,
     /// Known joining peers allowed through the perimeter to management and cluster
     /// ports before membership exists. Does not change protocol authentication.
@@ -331,8 +426,8 @@ pub struct SecuritySection {
     /// address unless this is explicitly set — otherwise any host that can
     /// reach the ports could inject Raft RPCs, forge reports or gossip a
     /// poison leader hint. Loopback-only plaintext clusters (single-host dev)
-    /// don't need it; `relish init --development-plaintext` and `relish dev`
-    /// set it for their deliberately-insecure local clusters.
+    /// don't need it; `relish init --development-plaintext` sets it for its
+    /// deliberately-insecure local cluster.
     pub allow_insecure_cluster: bool,
 
     /// Development-only: shorten the node leaf and cluster-issued ingress leaf
@@ -346,6 +441,25 @@ pub struct SecuritySection {
 
     /// API token defaults (`[security.tokens]`).
     pub tokens: TokensSection,
+}
+
+// Written by hand rather than derived: a derived `Default` would give
+// `require_mtls` the `bool` default of `false`, and `#[serde(default)]` fills
+// a missing key from this value, so an omitted setting would mean plaintext.
+impl Default for SecuritySection {
+    fn default() -> Self {
+        Self {
+            master_key_path: None,
+            bootstrap_path: None,
+            identity_dir: None,
+            require_mtls: true,
+            bootstrap_peers: Vec::new(),
+            operator_cidrs: Vec::new(),
+            allow_insecure_cluster: false,
+            leaf_lifetime_override_secs: None,
+            tokens: TokensSection::default(),
+        }
+    }
 }
 
 /// API token defaults (`[security.tokens]`).
@@ -463,9 +577,11 @@ pub struct UpgradeSection {
     /// Defaults to the directory of the resolved current executable.
     pub binary_dir: Option<PathBuf>,
     /// Seconds the new binary must survive after an upgrade before the
-    /// swap counts as verified.
+    /// swap counts as verified, counted from when it can answer
+    /// `/v1/version` (its own binary hash is ready).
     pub boot_grace_secs: u64,
-    /// Seconds the new binary has to rejoin gossip (cluster mode only).
+    /// Seconds the new binary has to rejoin gossip (cluster mode only),
+    /// counted from the same moment as `boot_grace_secs`.
     /// Requires a direct peer acknowledgement from the replacement process;
     /// isolated cluster nodes revert even when their local API is healthy.
     pub gossip_rejoin_secs: u64,
@@ -524,6 +640,12 @@ pub struct ClusterSection {
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2
     /// D21/CP12). Off by default; set `url` to enable.
     pub backup: crate::council::backup::BackupConfig,
+    /// How long, in seconds, a restarted voter keeps listening for its
+    /// peers' recovery epochs after gossip has synced before it serves Raft
+    /// without having heard from every peer (#694). Unset means two gossip
+    /// anti-entropy intervals (20 s). Raise it on a network where gossip
+    /// converges slowly; lowering it shortens restarts but weakens the fence.
+    pub recovery_probe_window_secs: Option<u64>,
 }
 
 impl Default for ClusterSection {
@@ -536,6 +658,7 @@ impl Default for ClusterSection {
             reporting_port: 9445,
             environment: None,
             backup: crate::council::backup::BackupConfig::default(),
+            recovery_probe_window_secs: None,
         }
     }
 }
@@ -574,6 +697,17 @@ pub struct StorageSection {
     pub logs: PathBuf,
     pub metrics: PathBuf,
     pub volumes: PathBuf,
+    /// The bound, in bytes, on this node's durable audit log under
+    /// `{data}/audit`. When the log reaches it the oldest records go first.
+    /// Defaults to 64 MiB; at least 64 KiB.
+    pub audit_max_bytes: u64,
+    /// Absolute path prefixes a workload may bind-mount from this node with a
+    /// volume or config-file `source`. Empty (the default) refuses every host
+    /// path. Matching is by whole path component after resolving symlinks,
+    /// and the storage and security directories above are always refused,
+    /// even under a listed prefix.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_host_paths: Vec<PathBuf>,
     /// Scheduled volume snapshots (`[storage.snapshots]`).
     pub snapshots: SnapshotsSection,
 }
@@ -586,6 +720,8 @@ impl Default for StorageSection {
             logs: PathBuf::from("/var/lib/reliaburger/logs"),
             metrics: PathBuf::from("/var/lib/reliaburger/metrics"),
             volumes: PathBuf::from("/var/lib/reliaburger/volumes"),
+            audit_max_bytes: crate::bun::audit::DEFAULT_AUDIT_MAX_BYTES,
+            allowed_host_paths: Vec::new(),
             snapshots: SnapshotsSection::default(),
         }
     }
@@ -659,10 +795,16 @@ pub struct NetworkSection {
 }
 
 /// Port range for container port mapping.
+///
+/// The default, 10000 up to (not including) 32767, stays below Linux's
+/// ephemeral range (32768–60999), so a published port never collides with
+/// the source port of an outgoing connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortRange {
+    /// First allocatable port.
     pub start: u16,
+    /// One past the last allocatable port.
     pub end: u16,
 }
 
@@ -670,7 +812,7 @@ impl Default for PortRange {
     fn default() -> Self {
         Self {
             start: 10000,
-            end: 60000,
+            end: 32767,
         }
     }
 }
@@ -690,6 +832,11 @@ pub struct ReportingTreeSection {
     pub max_events_per_report: usize,
     /// Time after which a report is considered stale (seconds).
     pub stale_report_timeout_secs: u64,
+    /// How long the leader holds the placements of a node that gossip
+    /// still lists as alive but whose reports went stale, before it moves
+    /// them to other nodes (seconds). The node may only have a wedged
+    /// report worker, with its replicas still serving.
+    pub stale_node_grace_secs: u64,
 }
 
 impl Default for ReportingTreeSection {
@@ -698,6 +845,7 @@ impl Default for ReportingTreeSection {
             report_interval_secs: 5,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+            stale_node_grace_secs: 300,
         }
     }
 }
@@ -777,9 +925,11 @@ pub struct ImagesSection {
     pub max_storage: String,
     /// Number of replicas for each layer (including the original pusher).
     pub redundancy: u32,
-    /// Days to retain unreferenced images before GC.
+    /// Days an untagged image is kept before it expires: a manifest whose
+    /// last tag moved or was deleted this long ago leaves the registry,
+    /// unless an app or job pins it. GC then reclaims its layers.
     pub gc_retain_days: u32,
-    /// Hours between GC sweeps.
+    /// Hours between GC sweeps (and expiry checks).
     pub gc_interval_hours: u32,
     /// Port for the OCI Distribution API (Pickle registry).
     pub registry_port: u16,
@@ -1017,8 +1167,10 @@ pub struct MetricsSection {
     pub rollup_interval_secs: u64,
     /// How long to retain rollup data on council members (hours).
     pub rollup_retention_hours: u32,
-    /// Maximum local Parquet storage for metrics (MB). 0 means unlimited.
-    /// When exceeded, exported files are pruned oldest-first.
+    /// Maximum local Parquet storage for metrics (MB). Defaults to
+    /// [`DEFAULT_METRICS_STORAGE_MB`]; `0` explicitly means unlimited, so
+    /// only `retention_days` prunes. When exceeded, files are pruned
+    /// oldest-first (only once exported, when `export_path` is set).
     pub max_storage_mb: u64,
     /// Optional export destination for metrics Parquet files.
     pub export_path: Option<String>,
@@ -1036,7 +1188,7 @@ impl Default for MetricsSection {
             object_store_url: String::new(),
             rollup_interval_secs: 60,
             rollup_retention_hours: 24,
-            max_storage_mb: 0,
+            max_storage_mb: DEFAULT_METRICS_STORAGE_MB,
             export_path: None,
         }
     }
@@ -1053,6 +1205,13 @@ pub struct ScrapeTarget {
     pub url: String,
 }
 
+/// Default cap on local log storage, in MB. A node streaming job output at a
+/// million-jobs rate would otherwise fill its disk inside the retention window.
+pub const DEFAULT_LOG_STORAGE_MB: u64 = 2048;
+
+/// Default cap on local metric storage, in MB.
+pub const DEFAULT_METRICS_STORAGE_MB: u64 = 1024;
+
 /// Log collection configuration (Ketchup).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1066,8 +1225,10 @@ pub struct LogsSection {
     pub export_path: Option<String>,
     /// How often to export logs (seconds). Default: 3600 (1 hour).
     pub export_interval_secs: u64,
-    /// Maximum local Parquet storage for logs (MB). 0 means unlimited.
-    /// When exceeded, exported files are pruned oldest-first.
+    /// Maximum local Parquet storage for logs (MB). Defaults to
+    /// [`DEFAULT_LOG_STORAGE_MB`]; `0` explicitly means unlimited, so only
+    /// `retention_days` prunes. When exceeded, files are pruned oldest-first
+    /// (only once exported, when `export_path` is set).
     pub max_storage_mb: u64,
 }
 
@@ -1077,7 +1238,7 @@ impl Default for LogsSection {
             retention_days: 7,
             export_path: None,
             export_interval_secs: 3600,
-            max_storage_mb: 0,
+            max_storage_mb: DEFAULT_LOG_STORAGE_MB,
         }
     }
 }
@@ -1146,6 +1307,63 @@ pub struct AlertDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allowed_host_paths_defaults_to_empty() {
+        let config = NodeConfig::parse("").unwrap();
+        assert!(config.storage.allowed_host_paths.is_empty());
+        // An empty list stays out of a written node.toml.
+        let written = toml::to_string(&config.storage).unwrap();
+        assert!(!written.contains("allowed_host_paths"), "{written}");
+        let listed =
+            NodeConfig::parse("[storage]\nallowed_host_paths = [\"/srv/import\"]\n").unwrap();
+        assert_eq!(
+            listed.storage.allowed_host_paths,
+            vec![PathBuf::from("/srv/import")]
+        );
+    }
+
+    #[test]
+    fn allowed_host_paths_must_be_absolute() {
+        let config =
+            NodeConfig::parse("[storage]\nallowed_host_paths = [\"srv/import\"]\n").unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                super::super::error::ConfigError::NonAbsolutePath { ref field, .. }
+                    if field == "storage.allowed_host_paths"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn logs_and_metrics_have_a_default_storage_cap() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(config.logs.max_storage_mb, DEFAULT_LOG_STORAGE_MB);
+        assert_eq!(config.metrics.max_storage_mb, DEFAULT_METRICS_STORAGE_MB);
+        const { assert!(DEFAULT_LOG_STORAGE_MB > 0 && DEFAULT_METRICS_STORAGE_MB > 0) };
+        config.validate_storage_caps(64 << 30).unwrap();
+
+        // A cap the filesystem can't hold would never prune in time.
+        let error = config
+            .validate_storage_caps(1 << 30)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("logs"), "{error}");
+        assert!(error.contains("set 0"), "{error}");
+    }
+
+    #[test]
+    fn zero_storage_cap_means_explicitly_unlimited() {
+        let config =
+            NodeConfig::parse("[logs]\nmax_storage_mb = 0\n[metrics]\nmax_storage_mb = 0\n")
+                .unwrap();
+        assert_eq!(config.logs.max_storage_mb, 0);
+        assert_eq!(config.metrics.max_storage_mb, 0);
+        config.validate_storage_caps(1 << 20).unwrap();
+    }
 
     #[test]
     fn image_mirrors_parse_and_refuse_urls() {
@@ -1233,6 +1451,78 @@ mod tests {
         );
     }
 
+    /// Write `contents` as a resolver file in a fresh temp directory.
+    fn resolv_conf(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn dns_upstream_defaults_to_host_resolvers() {
+        // #700: the default was 8.8.8.8, which fails on networks that block
+        // outbound port 53 and leaks every lookup to Google.
+        let nc = NodeConfig::parse("[dns]\nenabled = true\n").unwrap();
+        assert_eq!(nc.dns.upstream, None);
+        let (_dir, path) = resolv_conf(
+            "# managed by the host\nsearch corp.example\nnameserver 10.0.0.2\n\
+             nameserver 10.0.0.3 # backup\noptions edns0\nnameserver fd00::53\n",
+        );
+        let config = nc.dns.to_dns_config_from(&path, 53).unwrap();
+        assert_eq!(
+            config.upstreams,
+            vec![
+                "10.0.0.2:53".parse::<std::net::SocketAddr>().unwrap(),
+                "10.0.0.3:53".parse().unwrap(),
+                "[fd00::53]:53".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_dns_upstream_overrides_host_resolvers() {
+        let nc =
+            NodeConfig::parse("[dns]\nenabled = true\nupstream = \"192.0.2.53:5353\"\n").unwrap();
+        let (_dir, path) = resolv_conf("nameserver 10.0.0.2\n");
+        let config = nc.dns.to_dns_config_from(&path, 53).unwrap();
+        assert_eq!(config.upstreams, vec!["192.0.2.53:5353".parse().unwrap()]);
+    }
+
+    #[test]
+    fn resolv_conf_parser_skips_own_listen_address() {
+        let own: std::net::SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let found = resolv_conf_nameservers(
+            "nameserver 10.0.0.1\nnameserver not-an-address\nnameserver fe80::1%eth0\n\
+             ;nameserver 10.0.0.9\nnameserver 10.0.0.2\n",
+            53,
+            own,
+        );
+        assert_eq!(found, vec!["10.0.0.2:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn dns_without_usable_upstream_refuses_to_start() {
+        let nc = NodeConfig::parse("[dns]\nenabled = true\nlisten = \"10.0.0.1:53\"\n").unwrap();
+        for contents in [
+            None,
+            Some(""),
+            Some("search example\n"),
+            Some("nameserver 10.0.0.1\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resolv.conf");
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            }
+            let error = nc.dns.to_dns_config_from(&path, 53).unwrap_err();
+            assert!(
+                error.to_string().contains("[dns] upstream"),
+                "{contents:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn dns_rejects_node_default_namespace_override() {
         let error = NodeConfig::parse("[dns]\ndefault_namespace = \"payments\"\n").unwrap_err();
@@ -1249,7 +1539,7 @@ mod tests {
             nc.network.port_range,
             PortRange {
                 start: 10000,
-                end: 60000
+                end: 32767
             }
         );
         assert!(nc.cluster.join.is_empty());
@@ -1790,11 +2080,37 @@ mod tests {
     }
 
     #[test]
-    fn security_section_defaults_to_none() {
+    fn security_section_defaults_to_no_paths_and_mtls_required() {
         let nc = NodeConfig::parse("").unwrap();
         assert!(nc.security.master_key_path.is_none());
         assert!(nc.security.bootstrap_path.is_none());
         assert!(nc.security.identity_dir.is_none());
+        assert!(nc.security.require_mtls, "clusters fail closed by default");
+        assert!(!nc.security.allow_insecure_cluster);
+    }
+
+    #[test]
+    fn a_security_section_that_omits_require_mtls_still_requires_it() {
+        let nc = NodeConfig::parse(
+            r#"
+            [security]
+            master_key_path = "/etc/reliaburger/master.key"
+        "#,
+        )
+        .unwrap();
+        assert!(nc.security.require_mtls);
+        assert!(NodeConfig::default().security.require_mtls);
+    }
+
+    #[test]
+    fn plaintext_cluster_transports_are_an_explicit_opt_in() {
+        let nc = NodeConfig::parse(
+            r#"
+            [security]
+            require_mtls = false
+        "#,
+        )
+        .unwrap();
         assert!(!nc.security.require_mtls);
     }
 

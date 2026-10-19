@@ -368,7 +368,7 @@ Kubernetes has Deployments, Services, Ingresses, ConfigMaps, Secrets, Persistent
 1. **App** — a long-running containerised process with replicas, health checks, ingress, autoscaling. Replaces Deployment + Service + Ingress + HPA.
 2. **Job** — a run-to-completion task, optionally on a cron schedule. Replaces Job + CronJob.
 3. **Secret** — not a separate resource type. Encrypted values in the `[env]` section, prefixed with `ENC[AGE:`. Lives inline, right next to the plain-text env vars.
-4. **ConfigFile** — a file injected into the container at a specific path. Inline content or a reference to a file in git.
+4. **ConfigFile** — a file injected into the container at a specific path. Inline content, or a `source` naming a file on the node (a host path, not a path in git, so the node gates it like a host-path volume).
 5. **Volume** — local persistent storage. One line: path and size.
 6. **Permission** — who can do what. Actions, apps, optionally scoped to namespaces.
 7. **Namespace** — resource quotas. CPU, memory, GPU limits, max app count.
@@ -984,6 +984,16 @@ for (key, value) in &spec.env {
 
 You might notice that encrypted values are passed through as the literal `ENC[AGE:...]` string. That's intentional. The decryption infrastructure (Sesame PKI) doesn't exist yet — that's Phase 4. Rather than stubbing it out or adding a no-op decrypt function, we pass the encrypted blob through and leave a `// TODO(Phase 4)` comment. The container will see the encrypted string as its environment variable. That's not useful, but it's honest — and it compiles, tests, and ships.
 
+Inline config files need somewhere on the host to live, because runc can only bind-mount a file that exists. The first version wrote each one to `.config/<namespace>/<app>/<basename>`, and that path had two bugs, both found in the 0.2.1 audit (#701). `/etc/a/config.yaml` and `/etc/b/config.yaml` share a basename, so both mounts got whichever was written last. And every instance of the app shared the file, so a rollout rewrote it under the old instances while they were still serving: they saw the new config before the new version had passed a single health check. Now the copy lives under the instance and a hash of its container path:
+
+```rust
+let digest = sha2::Sha256::digest(cf.path.as_os_str().as_encoded_bytes());
+let host_path = inline_config_dir(base, namespace, app_name, instance_id)
+    .join(hex::encode(&digest[..8]));
+```
+
+A hash rather than the path itself keeps the file name flat and safe however deep or strange the container path is. The directory is removed with the instance, alongside its identity directory.
+
 ## Designing for what doesn't exist yet
 
 Grill depends on systems we haven't built. The image registry (Pickle, Phase 5) stores and distributes container images. The eBPF service discovery (Onion, Phase 3) routes traffic to healthy containers. The PKI system (Sesame, Phase 4) decrypts secrets and issues workload identity certificates. None of these exist.
@@ -1260,18 +1270,28 @@ The `_spec` parameter has a leading underscore. That's Rust telling you the para
 
 ### The `command` field
 
-Both apps and jobs have an optional `command` field in their TOML config:
+Both apps and jobs have an optional `command` field in their TOML config. What it means depends on what the app runs. An app runs either a host binary or an image:
 
 ```toml
 [app.web]
-image = "proc-grill:image-ignored"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
 port = 8080
+
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+command = ["/app/server", "--port", "8080"]
 ```
 
-The `image` field is required by real container runtimes (runc, Apple Container) to know which rootfs to use. But ProcessGrill doesn't pull images. It spawns OS processes. So for ProcessGrill, `command` is what actually matters. If neither `command` nor `image` produces something to run, ProcessGrill falls back to `sleep 86400` as a placeholder.
+For an `exec` app, `command` holds the binary's arguments. For an image app, it overrides the image's `ENTRYPOINT`, the way Kubernetes's `command` field does. The `image` field tells a real container runtime (runc, Apple Container) which root filesystem to use. ProcessGrill doesn't pull images. It spawns OS processes, so it runs `exec` and `script` apps and nothing else.
 
-This split is honest about the difference between development and production. During development, you'll run with ProcessGrill and use `command` to point at local binaries. In production, the OCI image provides the command, and `command` becomes an override (like Kubernetes's `command` field overriding the image's `ENTRYPOINT`).
+It didn't always. In the early iterations we wanted to demo apps before any container runtime was wired up, so ProcessGrill quietly ran an image app's `command` on the host, and `sleep 86400` when there was no command. The examples spelt the image `proc-grill:image-ignored` to make the trick visible. It was handy, and it lied: an app showed as running while its image never ran, and its `command` ran as a host process that no `[process_workloads]` allowlist had approved. In 0.2.1 we took it out (#914). ProcessGrill now refuses an image app before it launches anything:
+
+```text
+instance default__web-0 cannot launch: needs a container runtime to run image nginx:1.27, and this node's runtime is process
+```
+
+A spec with no command at all gets `no command to run` instead of a `sleep`. The examples that relied on the trick became `exec` apps: `examples/phase-1/proc-*` run `target/debug/testapp` as a host binary, and `examples/node/process-runtime.toml` is the node config that allows it.
 
 ### The TestApp binary
 
@@ -1283,7 +1303,7 @@ cargo run --bin testapp -- --mode unhealthy-after --count 5 --port 8080
 cargo run --bin testapp -- --mode slow --delay 3000 --port 8080
 ```
 
-It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1/proc-minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
+It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs run it as an `exec` app, so when you `relish apply examples/phase-1/proc-minimal-app.toml` against a Bun started with `--runtime process --config examples/node/process-runtime.toml`, you get real health checks against a real HTTP server. No containers needed.
 
 ## Health checking: priority queues and state transitions
 
@@ -1663,7 +1683,7 @@ pub fn format_output<T: Serialize + fmt::Display>(
         OutputFormat::Human => Ok(value.to_string()),
         OutputFormat::Json => serde_json::to_string_pretty(value)
             .map_err(RelishError::SerialiseJson),
-        OutputFormat::Yaml => serde_yaml::to_string(value)
+        OutputFormat::Yaml => yaml_serde::to_string(value)
             .map_err(RelishError::SerialiseYaml),
     }
 }
@@ -1749,7 +1769,7 @@ $ relish --output json apply cluster.toml
 }
 ```
 
-YAML output is there for Kubernetes refugees who want the comfort of familiar syntax. `serde_yaml` makes it trivial — same `#[derive(Serialize)]`, different serialiser.
+YAML output is there for Kubernetes refugees who want the comfort of familiar syntax. `yaml_serde` (the maintained successor to `serde_yaml`; Chapter 9 explains the swap) makes it trivial — same `#[derive(Serialize)]`, different serialiser.
 
 The `Display` implementation for `ApplyPlan` uses `write!` and `writeln!` macros, which work like `format!` but write directly to a formatter instead of allocating a new string. The `+` prefix on each entry is the `Display` implementation for `PlanAction`:
 
@@ -1779,7 +1799,7 @@ pub enum RelishError {
     SerialiseJson(serde_json::Error),
 
     #[error("failed to serialise YAML: {0}")]
-    SerialiseYaml(serde_yaml::Error),
+    SerialiseYaml(yaml_serde::Error),
 
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
     AgentRequired { command: String },
@@ -1794,7 +1814,7 @@ pub enum RelishError {
 
 Two things worth pointing out. First, `#[from] ConfigError` generates a `From<ConfigError> for RelishError` implementation, which lets the `?` operator automatically convert config errors. When `Config::from_file(path)?` fails inside `apply()`, the `ConfigError` gets wrapped into `RelishError::Config` without any manual conversion.
 
-Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don't use `#[from]`. They can't, because `#[from]` generates `From<E>` implementations, and both `serde_json::Error` and `serde_yaml::Error` would conflict — Rust's orphan rules don't allow two blanket `From` impls that could overlap. Instead, we use `.map_err(RelishError::SerialiseJson)` at the call site. A small bit of ceremony, but it makes the error's origin unambiguous.
+Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don't use `#[from]`. They can't, because `#[from]` generates `From<E>` implementations, and both `serde_json::Error` and `yaml_serde::Error` would conflict — Rust's orphan rules don't allow two blanket `From` impls that could overlap. Instead, we use `.map_err(RelishError::SerialiseJson)` at the call site. A small bit of ceremony, but it makes the error's origin unambiguous.
 
 The binary's `main()` function doesn't use `anyhow::Result` anymore. Instead, it returns `ExitCode`:
 
@@ -2425,6 +2445,31 @@ Each init container gets its own `InstanceId` (e.g., `web-0-init-0`, `web-0-init
 
 The `loop { ... break ... }` pattern is how you write a polling loop in Rust. The `break` expression evaluates to a value (the boolean `failed`), which becomes the value of the `let failed = loop { ... }` expression. This is another case of "everything is an expression": `loop` produces a value via `break`, just like `if`/`else` produces a value via its branches. In C you'd declare `bool failed` before the loop and assign it inside, which is more fragile because the compiler can't verify that the variable is always assigned before the loop exits.
 
+That first version had a bug that hid for a long time. Look at what it passes: `spec.image`, the *app's* image, and a spec with no environment and only `/proc`, `/dev` and `/sys` mounted. So `[[app.api.init]] image = "migrate:v2"` ran its command in the app's image, couldn't see `DATABASE_URL`, and couldn't write the volume it was meant to prepare. Every use the whitepaper gives for init containers (migrations, config generation, waiting on a dependency) was broken, and the example config hid it by running `echo`, which works in any image. The 0.2.1 audit caught it (#701).
+
+The fix changes what an init spec is *built from*. Instead of the app's raw config, `generate_init_oci_spec` now takes the app's finished `OciSpec`:
+
+```rust
+pub fn generate_init_oci_spec(init: &InitContainerSpec, app: &OciSpec) -> OciSpec {
+    let image = init.image.clone().unwrap_or_else(|| app.root.path.clone());
+    OciSpec {
+        initialiser: true,
+        root: OciRoot { path: image, readonly: false },
+        process: OciProcess {
+            args: init.command.clone(),
+            env: app.process.env.clone(),
+            // ...
+        },
+        mounts: app.mounts.clone(),
+        // ...
+    }
+}
+```
+
+By the time the app's spec exists, its secrets are decrypted, its host paths have passed the node's allowlist, and its image is pinned to the digest the trust policy verified. Borrowing from the finished spec means the init container gets all of that for free, rather than a second copy of the logic that could drift. The deploy worker verifies and pins each init container's own image the same way it does the app's.
+
+`initialiser: true` stops runc handing the app's volumes to the init container's user. Runc gives each managed volume to whichever user a container runs as. If an `alpine` init (root) took the volume over from a `redis` app (uid 999), the app would start and find it couldn't write its own data. Root inside the container's user namespace can write files any mapped user owns, so the init doesn't need the volume to be its own.
+
 The state transition path for apps with init containers is: Pending → Preparing → Initialising → Starting → HealthWait → Running. Without init containers, it's: Pending → Preparing → Starting → HealthWait → Running. The state machine validates both paths because we added Preparing → Initialising and Initialising → Starting as valid transitions.
 
 ### Restart re-drive
@@ -3002,6 +3047,20 @@ The same incident fixed what happens on a mismatch. The check used to return an 
 
 One question remains: did the *machine* restart? Kill Bun and the container can keep running. Reboot Linux and it can't. Every intent and owner record stores the kernel's boot ID from `/proc/sys/kernel/random/boot_id`, a random UUID that changes on every boot. A different boot ID proves that every process from the old record is dead, so recovery records the execution as interrupted with no exit code and removes the stale runc state directly. It never passes the old PID to `runc delete --force`; that number might belong to something else by now.
 
+All this paperwork has to go somewhere when an instance goes for good. A retired generation keeps its intent record, its owner directory and, on a node that mixes containers with host processes, a small route file saying which runtime ran it. That's deliberate: the record is the proof that nothing still runs. But for a long time nothing ever deleted it. Delete an app, scale it down or roll it to a new version, and each retired instance left its files behind, forever. `Grill::forget_retired` deletes them, and it refuses to delete anything while the generation could still own a process or an address. Batch executors learned to call it in [Chapter 17](17-a-million-jobs.md). App instances didn't, until [#738](https://github.com/reliaburger/reliaburger/issues/738). The agent now calls it once the supervisor has let an instance go, which happens when its app is deleted, when a scale-down or a rollout retires it, and when startup retires a launch it won't adopt. A `relish stop` doesn't count, because its stopped replicas stay owned until the next apply rolls over them, and an adopted instance keeps its files.
+
+The call runs in its own task, so a slow disk never holds up an agent turn. Couldn't it race a new deploy of the same name, since `default__web-0` comes back the moment you apply the app again? It can, and that's fine. The runtime takes the instance's lifecycle lock and checks that the generation it's about to delete is the same retired one it saw, so a successor that got there first wins and keeps its files. If the delete is refused or Bun crashes halfway through, the files describe a retired launch with no adoption record, which the next start retires and forgets. `tests/process_recovery.rs` checks all of this against the real process runtime: deleting an app and scaling one down both empty its `process-owners` directory, and a restart keeps the adopted instance's journal while forgetting the one that died.
+
+Init containers were the awkward case, and #738 left them out on purpose. An initialiser runs as `default__web-0__init-0`, exits, and the deploy worker reads its exit code from the runtime's journal. Delete the app and apply it again straight away, and the new initialiser gets exactly the same name. Now the late forget from the deletion can arrive after the new initialiser has exited, when it's retired too, and delete the journal before the worker has read its exit code. The lifecycle lock doesn't help: the successor is retired, so as far as the runtime can tell it's fair game. The deploy then fails with "stopped without an exit code" for an init container that succeeded.
+
+The fix ([#850](https://github.com/reliaburger/reliaburger/issues/850)) is to say which generation you mean. The worker asks the runtime for the initialiser's generation (`Grill::launch_generation`) right after creating it and hands it to the loop, which keeps it next to the parent. When the parent retires, the agent calls `Grill::forget_retired_generation` with that generation, and the runtime refuses unless it's still the current one. A successor has a fresh generation, so it keeps its journal however late the forget arrives. The agent test for it parks the forget inside the mock runtime and releases it at the worst moment, between the redeploy's create and its exit-code read.
+
+Testing the same thing against the real process runtime turned up a second race, older than either fix and nothing to do with init containers. Delete an app, apply it again at once, and the redeploy's `create` failed with "No such file or directory". The process runtime prepares a new generation in two steps: it reads the old generation, then takes the identity's locks and replaces it. The forget could take those locks first and move the whole directory away, so the second step woke up holding the lock of a directory that no longer existed. Nothing owns the identity at that point, so `prepare` now simply starts again from nothing, as it would on a fresh node, and only gives up after three attempts. `tests/process_recovery.rs` deletes an app with an init container, redeploys it straight away and deletes it again, and checks that both journals go.
+
+"Runs in its own task" had one more consequence, and it took a CI flake to find it ([#877](https://github.com/reliaburger/reliaburger/issues/877)). Startup adoption walks the node's records one by one. When it retires a launch it won't adopt, it spawns the forget and moves on to the next record, and on a cluster node that next record starts by reading the runtime's whole inventory. The inventory lists the `records` directory, then reads each entry it found. If the forget renames an entry away between those two steps, the inventory used to find a name with nothing behind it, call that corruption, and refuse. Bun refuses to start on any adoption error, so a node in the middle of an upgrade exited instead of coming back. On CI it took down one node of the three-node upgrade-and-rollback qualification test, which then waited a minute for an upgrade that never settled.
+
+The forget isn't wrong to run there, and the inventory isn't wrong to be strict about corruption. It just had the wrong idea of what a vanished record means. Only a forget removes a published record, it only does that to a retired generation, and it renames the whole directory away in one step. So a record that disappears mid-read owned nothing, and the inventory now leaves it out, exactly as it would have a moment later. A directory that's still there but has no readable intent in it is still corruption, and still refuses. The process runtime's owner inventory had the same gap and got the same fix. `record_forgotten_after_enumeration_is_absent_from_the_inventory` and its process twin list a retired record, forget it, then read what they listed.
+
 For a while this owned path was opt-in, and rootful Runc without eBPF quietly took the old spawn-and-record path with all of the crash windows above still open. Nothing had been released, so nobody depended on it, and we deleted it (about 1,900 lines). `RuncGrill::new` now takes the owner executable as a plain argument:
 
 ```rust
@@ -3021,6 +3080,8 @@ An `Option` field set by a builder method would make every method ask "is it the
 Unit tests can edit records to exercise each decision, but that's not the same as a crash. `tests/oci_crash.rs` starts the real Bun binary with real runc, and wraps `ip` and `runc` in small scripts that pause at a known step (preparation, launch, namespace removal) while still running the real tool. Then it kills Bun with SIGKILL. Recovery must retire whatever wasn't adopted before serving a new apply, an already-adopted workload must survive with exactly one execution, and an explicit retry must run the payload once more. One window is too narrow to hit by pausing a script, so the fixture compiles a small `LD_PRELOAD` shim that pauses the file open for the intent lock itself. The shim exists only in the test; production code contains no injected waits.
 
 The reboot test taught us something about green ticks. It power-cycles a disposable Lima VM between two phases, and a driver script tells it where its state lives through an environment variable. Our first version said `let Ok(directory) = std::env::var(...) else { return; };`, and returning early made the test *pass*. The Linux suite runs every ignored test in the binary, so CI reported a green reboot test that had never rebooted anything. Now it calls `.expect("...")` (an `unwrap()` with our own panic message), the automated suites skip it, and a pass can only come from the driver that actually restarts the VM.
+
+A time budget can lie the other way. Each fixture waits for its workload to write a marker file, and it used to give up after 25 seconds. In the Lima VM the clustered fixture's first deploy then failed in streaks (#908). We timed it. Two init containers and the main one each get their own network, which is about forty `ip`, `nft` and `sysctl` calls, and every one runs under a freshly spawned process owner so it survives a Bun crash. That took about 9 seconds when the host was quiet, and 41 to 58 seconds while the Mac under the VM was saturated. Nothing was stuck; the deploy just finished after the test had stopped looking. The wait is 90 seconds now, and a timeout prints Bun's log, so a deploy that really is stuck still fails and says why.
 
 Real runc also caught a mistake that inspecting our generated JSON never would. We put the host path `/sys/fs/cgroup/reliaburger/default/web/0` into the OCI `cgroupsPath`. Runc accepted it and created the container under `/sys/fs/cgroup/sys/fs/cgroup/reliaburger/...`, because OCI treats absolute cgroup paths as relative to the cgroup mount. Our resource policy guarded an empty cgroup while the container ran somewhere else. The spec now carries `/reliaburger/default/web/0`, and the regression has the container print `/proc/self/cgroup` from the inside. Checking the JSON we generated would only have repeated our own wrong assumption.
 

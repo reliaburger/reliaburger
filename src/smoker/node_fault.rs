@@ -28,6 +28,9 @@ impl NodeTransportGate {
     ///
     /// An unmatched restore is harmless. This matters during best-effort
     /// cleanup, where an already-reversed fault may be visited again.
+    // Rust 1.99 renamed `fetch_update` to `try_update`; the 1.97 baseline
+    // doesn't have the new name yet, so keep the old one until it does.
+    #[allow(deprecated)]
     pub fn restore(&self) {
         let _ = self
             .active_faults
@@ -64,6 +67,9 @@ impl NodeDrainGate {
     }
 
     /// Finish one drain and return whether the final owner just left.
+    // Rust 1.99 renamed `fetch_update` to `try_update`; the 1.97 baseline
+    // doesn't have the new name yet, so keep the old one until it does.
+    #[allow(deprecated)]
     pub fn finish(&self) -> bool {
         let mut final_owner = false;
         let _ = self

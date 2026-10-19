@@ -23,6 +23,7 @@ pub mod orchestrate;
 pub mod producer;
 pub mod recovery_fence;
 pub mod retirement;
+pub mod rollout;
 pub mod runtime;
 pub mod workload_identity;
 

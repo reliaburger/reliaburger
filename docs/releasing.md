@@ -39,6 +39,27 @@ The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
 systems is not promised. macOS builds are not yet Developer ID signed or
 notarised; don't equate an Actions build with clean-host acceptance.
 
+## Merge trains and their CI
+
+Each release collects its changes on a merge-train branch named after the
+version (`release-0-2-1`), and one gate PR takes the train into `main`. CI
+treats the three kinds of run differently ([which jobs run](testing.md#which-jobs-a-pull-request-runs)):
+
+- **A PR into the train** gets the light set: lint and format, minimum Rust,
+  portable Linux with the coverage floor, the demo app and the optimised
+  contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
+  except the three macOS shards: privileged Linux, cluster, acceptance,
+  upgrades and benchmarks. macOS runs in the queue and on the push.
+- **The merge queue** on `release-*` runs every job, macOS shards and heavy
+  suites included, on the batch merged onto the train, before any of it
+  lands. The queue requires the single check `ignored-test evidence`, which
+  waits for every other job and demands every evidence owner.
+- **The push to the train**, and the gate PR into `main` (its head is a
+  train), run everything again on the result.
+
+So nothing reaches a train, or `main`, without the full set having passed on
+that exact commit.
+
 ## Compiler baseline
 
 The source minimum is Rust 1.97 (`Cargo.toml`); CI checks the locked dependency
@@ -101,8 +122,8 @@ names the binary's version (and commit, when the build recorded one), and
 links back here, because `journalctl` cuts long lines at the terminal's width:
 
 ```text
-incompatible state format: found 58; this binary (reliaburger v0.1.6 (465fdeb)) needs 63. Pre-1.0 builds don't migrate state: …
-incompatible cluster formats: found protocol 40, state 58; this binary (reliaburger v0.1.6 (465fdeb)) needs protocol 46, state 63. …
+incompatible state format: found 63; this binary (reliaburger v0.2.0 (465fdeb)) needs 68. Pre-1.0 builds don't migrate state: …
+incompatible cluster formats: found protocol 46, state 63; this binary (reliaburger v0.2.0 (465fdeb)) needs protocol 51, state 68. …
 ```
 
 Before 1.0 nothing migrates between generations, so there are two ways
@@ -117,14 +138,36 @@ backwards compatibility (maintainer decision, 28 September 2026). There are no
 migrations, no mixed-version clusters across a format change and no feature
 gates. Any incompatible wire or durable-state change bumps `protocol` or
 `state` in `src/compatibility.rs`; nodes then refuse old peers and old state,
-so an upgrade across that bump means starting a fresh cluster. Releases that
-don't bump still roll in place. The pre-1.0 rule for known harness artefacts in
+so an upgrade across that bump means starting a fresh cluster. So
+`relish upgrade` works only between builds of the same format (maintainer
+decision D31 in [#674](https://github.com/reliaburger/reliaburger/issues/674),
+10 October 2026). Every release from 0.1.0 to 0.2.0 bumped a format, so no
+rolling upgrade between two published releases has run yet. A release that
+keeps 0.2.0's pair could roll in place, and qualifying a real
+published-to-published rolling walk on such a patch release is a goal, not a
+0.2.0 gate. The pre-1.0 rule for known harness artefacts in
 the V02 soak (step 4 of [staging a candidate](#staging-a-candidate))
 stays as it is.
 
 Leader-last upgrade ordering does not make an unknown Raft request safe during
 elections. Qualify the actual old/new binary pair before advertising it as
 supported.
+
+### Versions on main
+
+Once main changes a format after a release, its `Cargo.toml` moves to the next
+version with a `-dev` suffix (after 0.1.6's formats changed, main became
+`0.2.0-dev` until the 0.2.0 release dropped the suffix; the first format
+change after 0.2.0 moves it to the next `-dev`, such as `0.2.1-dev`). A build
+from main then can't pass for the release before it: its refusals name the
+`-dev` version, its binaries don't collide with the real `bun-v0.2.0` in a
+binary store, and `relish setup --quickstart` refuses to download nodes for
+it, because no `-dev` release exists and the last published one speaks older
+formats. Pass `--development-binaries` (see the
+[quickstart](quickstart.md#development-qualification)) to run one.
+Drop the suffix in the change that prepares the release, before
+`build.yml` builds the candidate, since the build reads the tag from
+`Cargo.toml`.
 
 ### Upgrading from 0.1.0
 
@@ -145,8 +188,8 @@ paused run, because no node moved.
 
 From 0.1.2 the leader refuses before it records anything. It fetches the
 candidate, checks its signatures and runs `bun --compatibility` on it, and
-`start` fails with both format pairs. A 0.1.5 cluster refuses 0.1.6 like this:
-`refusing to upgrade to v0.1.6: incompatible binary: found protocol 46, state 63; this cluster (reliaburger v0.1.5 (…)) needs protocol 40, state 58`.
+`start` fails with both format pairs. A 0.1.6 cluster refuses 0.2.0 like this:
+`refusing to upgrade to v0.2.0: incompatible binary: found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63`.
 A cluster `relish upgrade rollback vX` is checked the same way: the leader
 asks every node which versions its binary store holds (`installed_versions`
 in `GET /v1/version`) and refuses a version any node lacks, naming those
@@ -281,6 +324,55 @@ Four things behave differently once you're on 0.1.6:
   with `relish secret pubkey --namespace X`, or the next apply puts the
   cluster-sealed ones back.
 
+### Upgrading from 0.1.6
+
+0.2.0 can't roll onto a 0.1.6 cluster. Its jobs live in the council:
+
+- task arrays replicate through Raft, with node ledgers on disk, recovery and
+  grant fences, ownership ranges and indexed result pages;
+- reusable job definitions, immutable run provenance and schedule
+  occurrence claims share one execution store;
+- every job names its runtime explicitly instead of having it inferred;
+- grant lookahead learns from a recent-duration histogram that travels in
+  Raft snapshots.
+
+So the protocol moved from 46 to 51 and the state format from 63 to 68. A
+0.1.6 leader refuses `relish upgrade start v0.2.0` before it records a run,
+with `found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63`.
+And a sealed council backup from 0.1.6 can't seed a 0.2.0 cluster:
+`relish council recover --from` refuses state of another generation. So the
+move is a fresh cluster, and nothing the old council held comes across:
+
+- **Secrets.** The new cluster has new keys, so values sealed to the old
+  cluster key or a namespace key don't decrypt. Re-encrypt each one with the
+  new cluster's `relish secret pubkey` (`--namespace X` for a namespace
+  with its own key) before re-applying.
+- **API and join tokens.** Create them again with `relish token create` and
+  update whatever holds them, such as CI secrets and GitOps webhooks.
+- **The CA.** `relish init` makes a new root and intermediates. Clients and
+  anything else that trusts the old root must trust the new one, and the new
+  root needs its own `relish ca backup`.
+- **Job history.** Runs, task arrays, schedules and their results lived in
+  Raft. Export anything you need (`relish jobs`, `relish batch results`)
+  before you stop the old cluster.
+- **Volumes.** Snapshot them with `relish snapshot` and restore them into the
+  new cluster; the data directories you move aside still hold them too.
+
+The steps:
+
+1. Export what you want to keep: secrets in your config are already there;
+   job results, token holders and volume snapshots are not.
+2. Stop bun on every node and move each data directory aside (or run
+   `relish local destroy --yes` for a laptop cluster).
+3. Install 0.2.0 on every node and create the cluster as you did the first
+   time (`relish init`, then join the other nodes).
+4. Re-create tokens, re-encrypt secrets to the new keys, restore volume
+   snapshots and re-apply your apps and jobs.
+5. Back up the new root CA with `relish ca backup`.
+
+`relish upgrade check` from 0.2.0 on reads each release's pair from the
+metadata and says when a release needs this instead of a rolling upgrade.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -369,7 +461,13 @@ GitHub documents the [default-branch requirement for manual workflows](https://d
 and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
 
 - `metadata.json` selects **Bun** by platform, preserving the existing schema
-  and upgrade reader.
+  and upgrade reader. From 0.2.0 each release entry also carries
+  `compatibility`, the `protocol` and `state` pair `package.py` reads from
+  `CURRENT` in `src/compatibility.rs`, so `relish upgrade check` and `start`
+  can tell a release that needs a fresh cluster from one that can roll.
+  `external_signature` is always `null` in published metadata: only the
+  operator holds that key, so `relish upgrade start <version>` takes
+  `--external-key` (or a countersigned `--sig`) and adds it.
 - `cli-metadata.json` uses the same schema to select **Relish**. Keeping the
   documents separate prevents an older agent from interpreting a CLI as an
   upgrade candidate.
@@ -380,7 +478,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.1.6` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.0` today), so
 bump that default in the same change that announces a newer release.
 
 Before tagging a release, complete the managed-cluster and clean-install
@@ -477,7 +575,7 @@ the real `curl … | sh` install against it on every host we advertise.
 4. **Soak it (V02)** on Apple silicon, in two tiers
    ([plan](plans/2026-09-25-v02-sustained.md), D3). Build and sign the soak
    bun first (D2). After each round of fixes, run the fast tier: every fault
-   kind and every special on the compressed schedule, in about 90 minutes.
+   kind and every special on the compressed schedule, in about an hour.
 
    ```sh
    scripts/release/qualify-sustained.sh --tier fast \
@@ -485,15 +583,16 @@ the real `curl … | sh` install against it on every host we advertise.
      --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1
    ```
 
-   Once the fast tier is clean on the final candidate, run the final tier
-   once: 8 hours on the full schedule, which catches slow accumulation.
-
-   ```sh
-   scripts/release/qualify-sustained.sh --tier final \
-     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT \
-     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.1.0-soak.1 \
-     --record docs/qualification/DATE-sustained-v02.md
-   ```
+   The final tier is 8 hours on the full schedule, which catches slow
+   accumulation. The release gate runs it once, as the job final below
+   (`qualify-jobs-sustained.sh --tier final`): that's the same soak with the
+   job campaign and a node fault added to each cycle, so it checks
+   everything the V02 final does, plus the jobs. All the final soaks fit in
+   one 8-hour slot that way (maintainer decision, 17 October 2026,
+   [#991](https://github.com/reliaburger/reliaburger/issues/991)).
+   `qualify-sustained.sh --tier final` still runs the V02 final on its own,
+   for example to separate a job problem from a cluster one, but it isn't a
+   release step.
 
    The record's second paragraph states the verdict. A fast run can only say
    "fast tier: clean"; only a clean final-tier run, 8 hours on the full
@@ -504,6 +603,93 @@ the real `curl … | sh` install against it on every host we advertise.
    record](qualification/2026-09-27-v0.1.0-release-closure.md) shows what these
    runs found for 0.1.0, candidate by candidate, and the PR that fixed each
    failure.
+
+   The [job-soak extension plan](plans/2026-10-10-plan-release-job-soak.md)
+   runs fresh-container, shared-container and native host work alongside these
+   apps and faults. Accounting, independent effects, heartbeat/progress, exact
+   owner inventory, fault coverage and positive cleanup affect the verdict.
+   A six-run campaign uses a 2/3/3 per-node command budget, with separate finite
+   cron/hooks/publication fixtures. It opts the disposable nodes into mixed
+   runtime and allowlists a host BusyBox copy from the pinned container image.
+   The verifier binds each private VM address on TCP 8189 with a separate token.
+   Drain begins inside the final two minutes; tier and recovery budgets stay
+   unchanged. Missing support or incomplete coverage fails instead of skipping
+   a mode. A local smoke check is not staged fast/final acceptance, and global
+   storage bounds remain #668.
+
+   **The 0.2.0 job gate (decision D18-C).** A release that claims sustained
+   job throughput also needs the job qualification: #668's list on at least
+   three nodes, at 1,158 accepted successes a second or more (the rate of
+   100 million a day) plus headroom, with concurrent apps, several resource
+   profiles, worker and leader loss, delayed messages and disk faults. The
+   final tier runs 8 hours on the 3-node quickstart cluster, with every fault
+   and at the default 1,390 a second, and it is the release gate's only final
+   soak ([#991](https://github.com/reliaburger/reliaburger/issues/991),
+   above). `qualify-jobs-sustained.sh` runs it through the same soak,
+   with the job campaign at the target load and a node-level fault in every
+   cycle (inter-node delay, a full disk, slow fsync). Faults stay node-level in
+   0.2.0 (D19-B): nothing targets an individual job. While slow fsync caps a
+   node's writes at 20 IOPS, that node's agent-loop turns over the 1 s budget
+   are recorded as info, not failures: a turn that journals there is slow by
+   construction (#972). Every other node's turns, and that node's once the
+   window closes, still fail the tier.
+   The soak VMs use Lima's default gRPC port forwarder, the one quickstart
+   users run; the harness unsets `LIMA_SSH_PORT_FORWARDER` so a caller's
+   shell can't switch it. 0.2.0's soaks forwarded over SSH instead, because
+   Lima 2.1's gRPC forwarder leaked a guest-agent socket per forwarded
+   connection ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210))
+   and at the job tier's API rate the API node's guest agent grew to 1 GiB in
+   six hours, until the kernel killed Bun
+   ([#982](https://github.com/reliaburger/reliaburger/issues/982)). The
+   quickstart pins Lima 2.2.1, which fixes the leak
+   ([#983](https://github.com/reliaburger/reliaburger/issues/983)).
+
+   ```sh
+   # About an hour, compressed: every fault kind, every node, every special.
+   scripts/release/qualify-jobs-sustained.sh --tier fast \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST
+   # 8 hours on the full schedule, on the final candidate: the one final soak.
+   scripts/release/qualify-jobs-sustained.sh --tier final \
+     --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-RUN_ID-ATTEMPT \
+     --qualified-digest QUALIFIED_DIGEST --soak-bun /path/to/bun-v0.2.0-soak.1 \
+     --record docs/qualification/DATE-job-qualification.md
+   ```
+
+   `--target-rate` raises the rate above the default 1,390 a second (the
+   floor plus 20%); `--plan` prints the schedule without touching anything,
+   including the job controller's `job-runs` line: how many runs it expects,
+   the most it holds at once and its limit of 256. The controller holds a run
+   from admission until an hour after it drains (the candidate's retention),
+   and a soak whose load wouldn't fit refuses to start
+   ([#989](https://github.com/reliaburger/reliaburger/issues/989)).
+   The record fails if any job runtime misses a fault kind, loses or
+   double-counts an accepted outcome, or averages less than the target rate.
+   Beside it, `DATE-job-qualification.jobs.json` holds the accepted rates,
+   per-runtime retry causes and the September plan's measurements: wall time
+   of a 1,048,576-task array, p99 start lag, Raft entries a second and run
+   state, Bun memory and CPU, executor overhead, task-array storage per
+   million tasks and retained logs. Those are recorded in every run and never
+   gate it. A soak compares three of them with restated targets
+   (maintainer decision, 15 October 2026,
+   [#668](https://github.com/reliaburger/reliaburger/issues/668)), since the
+   plan's were for one batch on a quiet cluster: task-array storage at most
+   64 MiB per million accepted tasks; each Bun process's steady-state RSS
+   (the median of its samples once it has been seen for 10 minutes, a process
+   being its boot, pid and image) at most 512 MiB on node 1, which serves the
+   API, and 384 MiB on the others, with the peak beside it; and Raft entries a
+   second for all cluster writes, recorded without a target because the batch
+   target counts only task-array writes. The gated memory checks are
+   unchanged. Commit both files. Bounded job storage
+   ([#678](https://github.com/reliaburger/reliaburger/issues/678)) has to
+   pass before the final run: until it does, a full disk stops a worker
+   taking grants and fails the run.
+
+   Before release, re-record the published throughput table on the candidate
+   with `relish bench --scenario … --report FILE` on the same rig, and
+   compare it with the committed reports
+   (`relish bench --scenario jobs-host-processes --compare docs/qualification/…/r1-jobs-host-processes.json`);
+   `--compare` fails on a drop larger than `--tolerance` (10% by default).
 
    Either tier also fails on a slow agent loop. Every settle and heavy check
    reads each node's `bun_agent_loop_turn_seconds` histogram from
@@ -529,28 +715,78 @@ the real `curl … | sh` install against it on every host we advertise.
    the warm sample, fds bounded) and a log-order swap when an instance moved
    nodes under the same name (fixed by #272: one adjacent swap in an
    unlabelled tail, the instance on different nodes in the status snapshots
-   either side). The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
+   either side). For 0.2.0 only, a node cut off from the host by Lima's SSH
+   port forwarder was a third (gone with the forwarder, fixed by
+   [#983](https://github.com/reliaburger/reliaburger/issues/983)). The job
+   controller running out of its 256-run budget in 0.2.0's 12-hour job final
+   was a fourth for 0.2.0 only; it's fixed by
+   [#989](https://github.com/reliaburger/reliaburger/issues/989) and excuses
+   nothing after it. The [plan](plans/2026-09-25-v02-sustained.md#4-pass-and-fail)
    keeps the list. Anything else still needs a new candidate, and from 1.0 on
    only a clean final-tier run passes.
 
-5. **Record it.** Copy each host's record into
+5. **Pull the plug.** Killing a process isn't a power cut: page-cache writes
+   survive one and not the other. Run the power-cut and reboot qualifications
+   ([what they prove](testing.md#pulling-the-plug)) on the candidate's commit,
+   from the host:
+
+   ```sh
+   scripts/release/qualify-power-cut-reboot.sh --commit CANDIDATE_SHA --iterations 10 \
+     --record-dir docs/qualification/DATE-power-cut-reboot
+   ```
+
+   Run it from an up-to-date checkout; the lanes themselves run from the
+   candidate's. It makes a clean detached checkout of the commit, creates a disposable
+   Lima VM `rb-pcut-<short sha>` from
+   [`power-cut-vm.yaml`](../scripts/release/power-cut-vm.yaml) (4 vCPUs,
+   6 GiB of memory, 6 GiB of swap so the linker isn't killed, and only that
+   checkout mounted, read-only), and checks all of that from inside the guest
+   before any lane runs. Then it runs the three storage fixtures
+   (`qualify-storage-power-cut.sh --fixture exporter|leases|backups`) and
+   the OCI and discovery reboot lanes (`qualify-oci-reboot.sh`,
+   `qualify-discovery-reboot.sh`) `N` times each, in that order, and stops at
+   the first failure. It writes each lane's record into the record directory
+   and a summary with each lane's runs and rule-of-three bound next to it, in
+   `docs/qualification/DATE-power-cut-reboot.md`, the shape of the
+   [16 October record](qualification/2026-10-16-power-cut-reboot.md). Fill in
+   anything the summary can't know (other load on the host, why this many
+   runs) before committing it. Afterwards it deletes the VM and the checkout;
+   `--keep` keeps both, and so does a failure, so the guest evidence survives.
+   It never touches the development VM: it refuses `--vm reliaburger-test`,
+   a VM that already exists and a dirty or wrong-commit `--worktree`. Ten
+   runs per lane take about half an hour on an M-series Mac, plus the first
+   boot's provisioning.
+
+   Every iteration must pass. A row marked `PASS (VM start retried)` is the
+   known Lima start failure straight after a forced stop, not a product
+   failure; any other failure is a release blocker. Ten clean runs only rule out failure rates above 30%, so this catches a
+   regression, not a rare race; a release that changes storage, locking or
+   ownership (as #613 did) runs 25.
+
+   Also link the candidate commit's `task-array benchmarks` run from the gate
+   issue. It runs nightly on `main` and fails only on a regression of more
+   than 2x against main's last baseline, allowing for the runner's own speed
+   ([how](testing.md#benchmarks-in-ci)); its `criterion-task-arrays` artefact
+   is the cost evidence for bounded-cost claims such as 0.2.0's (#668).
+
+6. **Record it.** Copy each host's record into
    `docs/qualification/DATE-staged-install-HOST.md`, alongside the run ID,
    attempt, commit and digest, and link them from the release's milestone or
    gate issue (V04 is [#288](https://github.com/reliaburger/reliaburger/issues/288)).
 
-6. **Clean up the staging pre-releases.** Delete them before promotion so the
+7. **Clean up the staging pre-releases.** Delete them before promotion so the
    release page and the release notes' "previous tag" don't pick them up:
 
    ```sh
    gh release delete staging-v0.1.0-RUN_ID-ATTEMPT --cleanup-tag --yes
    ```
 
-7. **Promote** as described above, with the same run ID and digest. The
+8. **Promote** as described above, with the same run ID and digest. The
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
    `staging`.
 
-8. **Update the docs** once the release is public: the release date in the
+9. **Update the docs** once the release is public: the release date in the
    [roadmap](roadmap.md) (tick the release) and the homepage
    (`docs/website/index.html`), and the bootstrap's default version if it
    changed. Grep for the previous version to find the other "current
@@ -562,8 +798,33 @@ the real `curl … | sh` install against it on every host we advertise.
    re-record `docs/website/assets/tour.cast` against the published install
    with `scripts/demo/tour.sh --record … --install vX.Y.Z`
    ([how](website/README.md#re-recording-the-tour)), and move the poster time
-   in `index.html` if its moment moved. The website deploys from `main`, so
-   merge that change after promotion, not before.
+   in `index.html` if its moment moved. The recording's title and the caption
+   under it name the installed version, and `tests/suite/website.rs` fails
+   until they match the bootstrap's default. Regenerate the released-CLI
+   snapshot with `scripts/release/released_cli.py vX.Y.Z >
+   scripts/release/released-cli.tsv` and run `make readme-commands`: commands
+   labelled "X.Y.Z, not in" the old release lose their labels, and the same test
+   flags any label the docs no longer need
+   ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
+   website deploys from `main`, and publishes `/demo/*` from the tag the
+   bootstrap installs, so merge that change after promotion, not before.
+
+   Refresh the homepage's
+   [How a release is tested](https://reliaburger.com/#release-testing)
+   section (`#release-testing` in `index.html`) to the new release: its
+   latest-release paragraph, its headline numbers with links to this
+   release's records, and the soak charts beside them. The charts are copies
+   of the final app soak's and the final job soak's `-charts/` directories in
+   `docs/website/assets/soak/`, which holds only this release's
+   ([how](website/README.md#soak-charts)). `tests/suite/website.rs`
+   fails while the section names a version older than the installer's
+   default, the release log's newest entry isn't this release, or a chart
+   isn't a byte-for-byte copy of this release's record.
+
+   Add the release's paragraph to the top of the
+   [release log](release-log.md): the promotion date, how long qualifying it
+   took and how many candidates, what each soak found and what fixed it, and
+   any known issue it ships with, linking the records from step 6.
 
 ## Soaking a candidate in CI
 
@@ -574,7 +835,7 @@ on a hosted Linux runner. Once a candidate is staged:
 gh workflow run soak.yml --ref main \
   -f staging_tag=staging-v0.1.0-RUN_ID-ATTEMPT \
   -f qualified_digest=QUALIFIED_DIGEST \
-  -f duration=90m -f schedule=compressed
+  -f duration=60m -f schedule=compressed
 ```
 
 `staging_tag` also takes the staged base URL. The job runs on `ubuntu-24.04`
@@ -708,10 +969,10 @@ Why these choices:
   runner builds aarch64 and `ubuntu-24.04` builds x86_64, at native speed and
   without `/dev/kvm`, which libguestfs (`virt-customize`) would want, and
   without the `qemu-user-static` a cross-architecture chroot would need.
-- **qcow2 with zlib, not zstd or raw.** Lima 2.1.0 converts qcow2 itself, but
-  registers no zstd decompressor for qcow2 clusters, and it decompresses a
-  `.zst` or `.xz` file by running the `zstd` or `xz` command, which macOS
-  doesn't ship. zlib qcow2 is what Ubuntu itself publishes, so the quickstart
+- **qcow2 with zlib, not zstd or raw.** Lima (2.1.0 to 2.2.1) converts qcow2
+  itself, but registers no zstd decompressor for qcow2 clusters, and it
+  decompresses a `.zst` or `.xz` file by running the `zstd` or `xz` command,
+  which macOS doesn't ship. zlib qcow2 is what Ubuntu itself publishes, so the quickstart
   treats the built image exactly like the stock one.
 - **Live archive, not a snapshot.** `snapshot.ubuntu.com` doesn't serve
   `ubuntu-ports` (arm64) anonymously, so the build installs the current

@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large pickle-test-macos ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit clean pdf loc help bench bench-large ci ci-bench observability-demo kubernetes-demo toml-demo readme-commands bench-task-arrays
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -26,8 +26,15 @@ build: ## Compile all crates (debug)
 release: ## Compile all crates (optimised release)
 	$(CARGO) build --release
 
-test: ## Run the portable suite with nextest (ignored suites are separate)
+test: warm-executables ## Run the portable suite with nextest (ignored suites are separate)
 	$(NEXTEST)
+
+# `cargo test --no-run` builds the binaries exactly as the suite does. A plain
+# `cargo build --bins` leaves out the dev-dependencies' features, so nextest
+# then compiled the library and every binary again and replaced the warm ones.
+warm-executables: ## Build the suite and its binaries, then run each binary once, so macOS assesses them before any test is timed
+	$(CARGO) test --no-run
+	python3 scripts/ci/warm_executables.py
 
 test-cargo: ## Run the portable suite with Cargo's built-in runner
 	$(CARGO) test
@@ -41,15 +48,17 @@ test-slow: ## Run required wall-clock acceptance tests
 test-images: ## Fetch the pinned test images (with retries) into the local mirror cache
 	python3 scripts/test-images/mirror.py warm --cache "$(TEST_IMAGE_CACHE)"
 
+# Build bun, which RELIABURGER_BUN_BINARY names, the way nextest builds it, so
+# nextest compiles nothing again and leaves that file alone (#904).
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
-	$(CARGO) build --features ebpf --bin bun
+	$(CARGO) test --no-run --features ebpf
 	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/^grill::(volume|image)::tests::/) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
 
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites
-	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) '
+	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability)'
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -63,14 +72,15 @@ test-upgrade-cluster: ## Run only the cluster self-upgrade tests
 test-apple: ## Run deferred Apple adapter development tests on Apple silicon
 	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(/^grill::apple::tests::/)'
 
-test-standard-clients: ## Push and pull through Pickle's TLS listener with crane (needs crane on PATH)
-	$(NEXTEST) --run-ignored=only -E 'binary(suite) & test(/^registry_standard_clients::crane_/)'
+test-standard-clients: ## Push and pull through Pickle's TLS listener with docker, podman, skopeo and crane (Linux; prepare with scripts/standard-clients-host.sh)
+	scripts/standard-clients-host.sh
+	$(NEXTEST) --run-ignored=only -E 'binary(suite) & test(/^registry_standard_clients::/)'
 
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
 
-test-s3: ## Export logs to a real bucket (needs AWS credentials and RELIABURGER_TEST_S3_URL=s3://bucket/prefix)
-	$(NEXTEST) --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual)'
+test-s3: ## Export logs and round-trip a council backup through a real bucket (needs AWS credentials and RELIABURGER_TEST_S3_URL=s3://bucket/prefix)
+	$(NEXTEST) --run-ignored=only -E 'test(=ketchup::export::tests::export_to_real_s3_manual) | test(=council::backup::tests::council_backup_round_trips_through_real_s3)'
 
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check
@@ -107,8 +117,9 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 	fi
 	$(CARGO) audit
 
-bench: ## Run reproducible transport and 5-250 node gossip benchmarks
+bench: ## Run reproducible transport and 5-250 node gossip benchmarks, and the 1k and 10k node scheduling pass
 	$(CARGO) bench --bench gossip
+	$(CARGO) bench --bench scheduler
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
@@ -136,11 +147,9 @@ kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
 toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
 
-pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
-	./scripts/pickle-push-test.sh
-
 test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+	python3 -m unittest discover -s scripts/release -p 'test_*.py'
 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons

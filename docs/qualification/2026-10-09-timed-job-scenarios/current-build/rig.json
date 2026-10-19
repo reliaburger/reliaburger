@@ -1,0 +1,15 @@
+{
+  "location": "Local Lima VM on macOS",
+  "host_cpu": "Apple M2 Max",
+  "host_physical_cores": 12,
+  "host_memory_bytes": 34359738368,
+  "vm_vcpus": 4,
+  "vm_memory_bytes": 8589934592,
+  "os": "Ubuntu 24.04 aarch64",
+  "kernel": "6.8.0-139-generic",
+  "runc_version": "runc version 1.4.0",
+  "node_cpu_reservation_millicores": 500,
+  "live_application_cpu_request_millicores": 500,
+  "job_cpu_budget_millicores": 3000,
+  "unrelated_vm_processes_retained": true
+}

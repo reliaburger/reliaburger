@@ -1,37 +1,148 @@
 /// Phase 1: Filter.
 ///
-/// Eliminates nodes that cannot run the workload. Checks capacity,
-/// required labels, and readiness.
+/// Eliminates nodes that cannot run the workload. Checks readiness,
+/// required labels, the capabilities the workload needs, and room.
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-use super::cluster_state::ClusterStateCache;
-use super::types::{NodeId, Resources};
+use crate::config::app::AppSpec;
+
+use super::cluster_state::{ClusterStateCache, SchedulerNodeState};
+use super::types::{NodeId, Resources, UnplacedReason};
+
+/// The hard constraints a workload puts on the node it runs on.
+///
+/// Fixed-replica placement, daemon placement and the leader's check that a
+/// committed placement still holds all judge a node against this, so the
+/// three can't drift apart.
+#[derive(Debug, Clone, Default)]
+pub struct WorkloadRequirements {
+    /// What one replica requests.
+    pub resources: Resources,
+    /// `required` placement labels: the node must carry every one.
+    pub labels: BTreeMap<String, String>,
+    /// The app declares egress or `allow_from` rules, which only a node that
+    /// enforces them before the process starts may run.
+    pub requires_egress: bool,
+    /// The cluster runs internal DNS, so every placement needs a node whose
+    /// resolver is ready and reachable from workloads.
+    pub requires_dns: bool,
+    /// The host binary an `exec` or `script` app runs (see [`host_binary`]).
+    pub host_binary: Option<PathBuf>,
+    /// The app runs an image: its own (or, with only a `command`, a root
+    /// filesystem), or an init container's. Only a node whose runtime runs
+    /// containers may take it (#914).
+    pub requires_containers: bool,
+}
+
+impl WorkloadRequirements {
+    /// The requirements of `spec`'s replicas, in a cluster that does or
+    /// doesn't require internal DNS.
+    pub fn for_app(spec: &AppSpec, requires_dns: bool) -> Self {
+        Self {
+            resources: crate::meat::admission::app_requests(spec),
+            labels: spec
+                .placement
+                .as_ref()
+                .map(|p| super::scheduler::parse_label_list(&p.required))
+                .unwrap_or_default(),
+            requires_egress: spec.requires_network_policy(),
+            requires_dns,
+            host_binary: host_binary(spec).map(Path::to_path_buf),
+            requires_containers: (spec.exec.is_none() && spec.script.is_none())
+                || spec.init.iter().any(|init| init.image.is_some()),
+        }
+    }
+}
+
+/// The host binary a process workload runs: an `exec` app's path, or the
+/// script interpreter for a `script` app. `None` for a container.
+///
+/// A node refuses an `exec` app whose path isn't in its
+/// `[process_workloads] allowed_binaries`, and a `script` app unless
+/// `/bin/sh` is (`Supervisor::admit_process_workload`). Placement asks the
+/// same question here, so app validation (#701) and any other caller that
+/// needs it should too.
+pub fn host_binary(spec: &AppSpec) -> Option<&Path> {
+    spec.exec.as_deref().or_else(|| {
+        spec.script
+            .as_ref()
+            .map(|_| Path::new(crate::grill::process_workload::SCRIPT_INTERPRETER))
+    })
+}
+
+/// Whether `node` can run a workload with these requirements, room and
+/// labels aside: it's ready, runs containers when the workload is one, and
+/// can enforce egress, resolve internal DNS and run the host binary when
+/// the workload needs them.
+pub fn node_can_run(node: &SchedulerNodeState, requirements: &WorkloadRequirements) -> bool {
+    node.ready
+        && runs_its_kind(node, requirements)
+        && (!requirements.requires_egress || node.capabilities.egress.can_enforce_allowlist())
+        && (!requirements.requires_dns || node.capabilities.dns.can_resolve_internal())
+        && requirements
+            .host_binary
+            .as_deref()
+            .is_none_or(|binary| node.capabilities.process.runs(binary))
+}
+
+/// Whether `node` runs this kind of workload at all: a container needs a
+/// container runtime (#914).
+fn runs_its_kind(node: &SchedulerNodeState, requirements: &WorkloadRequirements) -> bool {
+    !requirements.requires_containers || node.capabilities.containers
+}
 
 /// Filter the cluster to nodes eligible for placing this workload.
 ///
 /// A node passes the filter if:
 /// 1. It is ready (not unknown, draining, or cordoned).
-/// 2. It has sufficient allocatable resources after current allocations.
-/// 3. It matches all required placement labels.
-/// 4. It can enforce any security capability the workload requires.
+/// 2. It matches all required placement labels.
+/// 3. It runs containers if the workload is one, can enforce any security
+///    capability the workload requires, and runs its host binary if it has
+///    one.
+/// 4. It has sufficient allocatable resources after current allocations.
 pub fn filter_nodes(
-    resources: &Resources,
-    required_labels: &BTreeMap<String, String>,
-    requires_egress: bool,
-    requires_dns: bool,
+    requirements: &WorkloadRequirements,
     cluster: &ClusterStateCache,
 ) -> Vec<NodeId> {
     cluster
         .nodes()
         .filter(|node| {
-            node.ready
-                && node.can_fit(resources)
-                && node.matches_labels(required_labels)
-                && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
-                && (!requires_dns || node.capabilities.dns.can_resolve_internal())
+            node_can_run(node, requirements)
+                && node.matches_labels(&requirements.labels)
+                && node.can_fit(&requirements.resources)
         })
         .map(|node| node.node_id.clone())
         .collect()
+}
+
+/// Why [`filter_nodes`] found no node: the first constraint, in filter
+/// order, that no node meets.
+pub fn unplaced_reason(
+    requirements: &WorkloadRequirements,
+    cluster: &ClusterStateCache,
+) -> UnplacedReason {
+    let ready: Vec<&SchedulerNodeState> = cluster.nodes().filter(|node| node.ready).collect();
+    if ready.is_empty() {
+        return UnplacedReason::NoReadyNode;
+    }
+    let labelled: Vec<&SchedulerNodeState> = ready
+        .into_iter()
+        .filter(|node| node.matches_labels(&requirements.labels))
+        .collect();
+    if labelled.is_empty() {
+        return UnplacedReason::NoLabelMatch;
+    }
+    if !labelled
+        .iter()
+        .any(|node| runs_its_kind(node, requirements))
+    {
+        return UnplacedReason::NoContainerRuntime;
+    }
+    if !labelled.iter().any(|node| node_can_run(node, requirements)) {
+        return UnplacedReason::NoCapableNode;
+    }
+    UnplacedReason::NoRoom
 }
 
 /// Cordon nodes that are mid-binary-upgrade (Phase 14): mark them not
@@ -80,7 +191,7 @@ mod tests {
             allocated: Resources::default(),
             labels,
             ready,
-            capabilities: Default::default(),
+            capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
             app_replicas: Default::default(),
             uptime_secs: 86400,
             cached_images: HashSet::new(),
@@ -101,10 +212,14 @@ mod tests {
         cluster.set_node(node_state("small", 100, 256, BTreeMap::new(), true));
 
         let result = filter_nodes(
-            &Resources::new(500, 1024, 0),
-            &BTreeMap::new(),
-            false,
-            false,
+            &WorkloadRequirements {
+                resources: Resources::new(500, 1024, 0),
+                labels: BTreeMap::new(),
+                requires_egress: false,
+                requires_dns: false,
+                host_binary: None,
+                requires_containers: false,
+            },
             &cluster,
         );
 
@@ -132,10 +247,14 @@ mod tests {
 
         let required = labels(&[("zone", "us-east")]);
         let result = filter_nodes(
-            &Resources::new(100, 100, 0),
-            &required,
-            false,
-            false,
+            &WorkloadRequirements {
+                resources: Resources::new(100, 100, 0),
+                labels: required.clone(),
+                requires_egress: false,
+                requires_dns: false,
+                host_binary: None,
+                requires_containers: false,
+            },
             &cluster,
         );
 
@@ -150,10 +269,14 @@ mod tests {
         cluster.set_node(node_state("not-ready", 2000, 4096, BTreeMap::new(), false));
 
         let result = filter_nodes(
-            &Resources::new(100, 100, 0),
-            &BTreeMap::new(),
-            false,
-            false,
+            &WorkloadRequirements {
+                resources: Resources::new(100, 100, 0),
+                labels: BTreeMap::new(),
+                requires_egress: false,
+                requires_dns: false,
+                host_binary: None,
+                requires_containers: false,
+            },
             &cluster,
         );
 
@@ -175,10 +298,14 @@ mod tests {
         }
 
         let result = filter_nodes(
-            &Resources::new(100, 100, 0),
-            &BTreeMap::new(),
-            false,
-            false,
+            &WorkloadRequirements {
+                resources: Resources::new(100, 100, 0),
+                labels: BTreeMap::new(),
+                requires_egress: false,
+                requires_dns: false,
+                host_binary: None,
+                requires_containers: false,
+            },
             &cluster,
         );
         assert_eq!(result.len(), 5);
@@ -208,10 +335,14 @@ mod tests {
         cluster.set_node(unready);
 
         let result = filter_nodes(
-            &Resources::new(100, 100, 0),
-            &BTreeMap::new(),
-            false,
-            true,
+            &WorkloadRequirements {
+                resources: Resources::new(100, 100, 0),
+                labels: BTreeMap::new(),
+                requires_egress: false,
+                requires_dns: true,
+                host_binary: None,
+                requires_containers: false,
+            },
             &cluster,
         );
         assert_eq!(result, vec![NodeId::new("dns-ready")]);
@@ -232,6 +363,7 @@ mod tests {
             node_id: node.to_string(),
             address: "127.0.0.1:9117".to_string(),
             role: NodeRole::Worker,
+            platform: None,
             from_version: None,
             phase,
             since: None,
@@ -240,9 +372,7 @@ mod tests {
         let upgrade = ClusterUpgradeState {
             upgrade_id: "up-1".to_string(),
             target_version: "v0.2.0".parse().unwrap(),
-            binary_sha256: String::new(),
-            embedded_signature: String::new(),
-            external_signature: None,
+            binaries: Vec::new(),
             parallel: 1,
             direction: UpgradeDirection::Upgrade,
             phase: ClusterUpgradePhase::UpgradingWorkers,
@@ -257,14 +387,141 @@ mod tests {
         apply_upgrade_cordon(&mut cluster, Some(&upgrade));
 
         let result = filter_nodes(
-            &Resources::new(100, 100, 0),
-            &BTreeMap::new(),
-            false,
-            false,
+            &WorkloadRequirements {
+                resources: Resources::new(100, 100, 0),
+                labels: BTreeMap::new(),
+                requires_egress: false,
+                requires_dns: false,
+                host_binary: None,
+                requires_containers: false,
+            },
             &cluster,
         );
         // n1 is mid-upgrade (Directed) and cordoned; n2 is merely Pending
         // and keeps taking work until its turn actually comes.
         assert_eq!(result, vec![NodeId::new("n2")]);
+    }
+
+    fn running(name: &str, enabled: bool, allowed: &[&str]) -> SchedulerNodeState {
+        let mut node = node_state(name, 2000, 4096, BTreeMap::new(), true);
+        node.capabilities.process = crate::meat::cluster_state::ProcessWorkloadCapability {
+            enabled,
+            allowed_binaries: allowed.iter().map(PathBuf::from).collect(),
+        };
+        node
+    }
+
+    /// #702: nodes with different `[process_workloads]` policies. An exec
+    /// app lands only where the node will start it; anywhere else the node
+    /// refuses it and the placement used to hold there for good.
+    #[test]
+    fn exec_app_skips_a_node_whose_allowlist_lacks_its_binary() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(running("python", true, &["/usr/bin/python3"]));
+        cluster.set_node(running("ruby", true, &["/usr/bin/ruby"]));
+        cluster.set_node(running("isolated", false, &["/usr/bin/python3"]));
+        cluster.set_node(running("shell", true, &["/bin/sh"]));
+        let spec: AppSpec = toml::from_str(r#"exec = "/usr/bin/python3""#).unwrap();
+
+        let result = filter_nodes(&WorkloadRequirements::for_app(&spec, false), &cluster);
+
+        assert_eq!(result, vec![NodeId::new("python")]);
+
+        // A script runs the interpreter, so only `/bin/sh` admits it.
+        let script: AppSpec = toml::from_str(r#"script = "echo hi""#).unwrap();
+        let result = filter_nodes(&WorkloadRequirements::for_app(&script, false), &cluster);
+        assert_eq!(result, vec![NodeId::new("shell")]);
+
+        // A container runs anywhere, whatever the allowlist says.
+        let container: AppSpec = toml::from_str(r#"image = "web:1""#).unwrap();
+        let result = filter_nodes(&WorkloadRequirements::for_app(&container, false), &cluster);
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn an_empty_cluster_says_no_node_is_ready() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(node_state("down", 2000, 4096, BTreeMap::new(), false));
+        let needs = WorkloadRequirements::default();
+
+        assert_eq!(
+            unplaced_reason(&needs, &cluster),
+            UnplacedReason::NoReadyNode
+        );
+    }
+
+    #[test]
+    fn the_reason_names_the_first_constraint_no_node_meets() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(running("ruby", true, &["/usr/bin/ruby"]));
+        let mut needs = WorkloadRequirements {
+            labels: labels(&[("zone", "east")]),
+            host_binary: Some(PathBuf::from("/usr/bin/python3")),
+            resources: Resources::new(9000, 0, 0),
+            ..Default::default()
+        };
+        assert_eq!(
+            unplaced_reason(&needs, &cluster),
+            UnplacedReason::NoLabelMatch
+        );
+
+        needs.labels.clear();
+        assert_eq!(
+            unplaced_reason(&needs, &cluster),
+            UnplacedReason::NoCapableNode
+        );
+
+        needs.host_binary = None;
+        assert_eq!(unplaced_reason(&needs, &cluster), UnplacedReason::NoRoom);
+        assert!(filter_nodes(&needs, &cluster).is_empty());
+    }
+
+    /// `node` on `--runtime process`: no container runtime.
+    fn process_only(mut node: SchedulerNodeState) -> SchedulerNodeState {
+        node.capabilities.containers = false;
+        node
+    }
+
+    /// #914: an app that names an image needs a container runtime, and a
+    /// node on `--runtime process` refuses it. Placement keeps it off such a
+    /// node, so it lands where it can run instead of failing after placement.
+    #[test]
+    fn image_app_skips_a_node_without_a_container_runtime() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(running("runc", true, &["/bin/sh"]));
+        cluster.set_node(process_only(running("process", true, &["/bin/sh"])));
+
+        let image: AppSpec = toml::from_str(r#"image = "web:1""#).unwrap();
+        let result = filter_nodes(&WorkloadRequirements::for_app(&image, false), &cluster);
+        assert_eq!(result, vec![NodeId::new("runc")]);
+
+        // So is an init container's own image, even before an exec app.
+        let init: AppSpec = toml::from_str(
+            "exec = \"/bin/sh\"\n[[init]]\nimage = \"migrate:2\"\ncommand = [\"migrate\"]",
+        )
+        .unwrap();
+        let result = filter_nodes(&WorkloadRequirements::for_app(&init, false), &cluster);
+        assert_eq!(result, vec![NodeId::new("runc")]);
+
+        // A host workload runs on either.
+        let script: AppSpec = toml::from_str(r#"script = "echo hi""#).unwrap();
+        let mut result = filter_nodes(&WorkloadRequirements::for_app(&script, false), &cluster);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(result, vec![NodeId::new("process"), NodeId::new("runc")]);
+    }
+
+    #[test]
+    fn an_image_app_with_only_process_nodes_is_unplaced_for_want_of_a_container_runtime() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(process_only(running("process", true, &["/bin/sh"])));
+        let image: AppSpec = toml::from_str(r#"image = "web:1""#).unwrap();
+
+        let reason = unplaced_reason(&WorkloadRequirements::for_app(&image, false), &cluster);
+
+        assert_eq!(reason, UnplacedReason::NoContainerRuntime);
+        assert_eq!(
+            reason.to_string(),
+            "no ready node has a container runtime to run its image"
+        );
     }
 }

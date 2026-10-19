@@ -38,7 +38,9 @@
 //! 2. An await that stays inline without the turn's deadline carries a
 //!    `// LOOP-INLINE: <why>` comment on its statement: an in-memory lock,
 //!    an fsync'd persist (allowed, and bounded by the harness's slow-disk
-//!    scenario), or the short sleep before an upgrade's exec.
+//!    scenario), or the short sleep before an upgrade's exec. A consumer
+//!    step's discovery-journal write is the exception: it waits only until
+//!    the turn's deadline, then lands off the loop (#890).
 //! 3. `loop_rule::every_inline_await_on_the_agent_loop_has_a_deadline_or_a_reason`
 //!    walks every method a turn can reach and fails on an await with
 //!    neither. Reviewers read the tags, not the whole call graph.
@@ -48,7 +50,8 @@
 //!
 //! Every turn is timed by branch ([`super::loop_meter`]) and exported as
 //! `bun_agent_loop_turn_seconds`; any turn over 250 ms is logged with the
-//! command or deploy op it ran.
+//! command, deploy op or consumer-sync step it ran, and with what its timed
+//! slow awaits took ([`super::loop_meter::TurnPart`], #890).
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
@@ -61,10 +64,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::config::app::AppSpec;
-use crate::config::job::JobSpec;
 use crate::council::node::CouncilNode;
 use crate::council::types::CouncilNodeInfo;
-use crate::grill::oci::generate_job_oci_spec;
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
 use crate::grill::{Grill, InstanceId};
@@ -80,9 +81,6 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 // to `BunAgent` (or owns a type the loop drives); `run_loop` stays here.
 mod adopted_placements;
 mod app_stop;
-mod batch_jobs;
-mod cluster_jobs;
-pub use cluster_jobs::{ClusterJobReceipt, ClusterJobSettlement};
 mod commands;
 mod consumer;
 mod council_requests;
@@ -98,10 +96,7 @@ mod follow_ups;
 mod health_checks;
 mod identity;
 mod identity_signing;
-mod job_runs;
 mod launch;
-#[cfg(test)]
-pub(crate) use cluster_jobs::ClusterJobExecution;
 mod launch_evidence;
 mod logs;
 mod networking;
@@ -131,7 +126,6 @@ use discovery_ownership::{DiscoveryOwnership, JournalReference};
 use faults::{InstalledNetworkFaults, NodeFaultFence};
 use health_checks::wait_instance_healthy;
 pub use identity::workload_spiffe_uri;
-use job_runs::ScheduledJob;
 use restarts::RestartRotation;
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 pub use status::{
@@ -156,11 +150,6 @@ const INIT_TIMEOUT_SECS: u64 = 300;
 /// Runc prints why it refused to start (an occupied cgroup, a missing binary)
 /// in its last line or two, so a short tail says why without flooding logs.
 const INIT_FAILURE_STDERR_BYTES: u64 = 400;
-
-/// Maximum time a `run_before` prerequisite job may run before the gated
-/// deploy is aborted. Migrations are the classic case; a hung one must not
-/// wedge the deploy forever.
-const RUN_BEFORE_TIMEOUT_SECS: u64 = 600;
 
 /// How many event-loop ticks (~1s each) between attempts to provision an
 /// identity for a running instance that has none — frequent enough to heal
@@ -381,9 +370,6 @@ enum LoopStall {
     /// A pre-start's DNS lookups for an egress allowlist. Whoever prepares
     /// the start does them now, off the loop (#419).
     EgressDns,
-    /// Validating and serialising the whole job inventory, off the loop
-    /// but awaited by it.
-    JobInventoryEncode,
     /// Reading the runtime's launch inventory: the runc intent journal,
     /// one file per launch, which after a restart comes off a cold disk.
     /// Only counted; `MockGrill::set_inventory_delay` makes it slow.
@@ -477,6 +463,16 @@ impl LoopStalls {
     }
 }
 
+/// The forward-path isolation ruleset (`crate::firewall::isolation`) `nft`
+/// holds, the task applying one, and the newest one waiting for it.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[derive(Debug, Default)]
+struct IsolationRules {
+    applied: Option<String>,
+    applying: Option<tokio::task::Id>,
+    waiting: Option<String>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
@@ -494,6 +490,9 @@ pub struct BunAgent<G: Grill> {
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
+    /// Where the cgroup v2 hierarchy is mounted: `/sys/fs/cgroup`, except in
+    /// tests that stand a directory in for it.
+    cgroup_mount: PathBuf,
     /// Which apps' volumes a snapshot operation owns right now.
     volume_maintenance: crate::bun::volume_maintenance::VolumeMaintenance,
     /// Test hook: an accepted restore waits here before touching the disk.
@@ -559,6 +558,22 @@ pub struct BunAgent<G: Grill> {
     /// reconcile-and-prune reason (NET5). eBPF only.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
+    /// `destination_map` keys (real workload addresses) this node has
+    /// written, so the reconcile deletes the departed ones. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    destination_bpf_keys: std::collections::HashSet<crate::onion::types::DestinationKey>,
+    /// Task addresses and allowlists the delegated job runtimes hold, which
+    /// the kernel reconciliation and sweep must keep. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    delegated_network: std::sync::Arc<crate::bun::task_namespace::DelegatedNetwork>,
+    /// Forward-path isolation ruleset `nft` last applied, the task applying
+    /// one, and the newest one waiting for it. eBPF only.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    isolation_rules: IsolationRules,
+    /// The address workloads resolve names through (the node's DNS
+    /// responder), which every egress allowlist implicitly permits on
+    /// port 53. `None` when `[dns]` is off.
+    workload_dns: Option<std::net::Ipv4Addr>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Exclusive publication checkpoint, or a fence after an uncertain write.
@@ -630,6 +645,13 @@ pub struct BunAgent<G: Grill> {
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// The runtime generation each parent's initialisers last launched, so
+    /// the parent's retirement can forget exactly those journals and never
+    /// a successor's under the same identity (#850).
+    initialiser_generations: std::collections::HashMap<
+        InstanceId,
+        std::collections::HashMap<InstanceId, crate::grill::RuntimeGeneration>,
+    >,
     /// Captured before startup; a recovered runtime hold needs original discovery
     /// reconciliation rather than an empty in-memory map authorising release.
     /// Original executions awaiting cluster cleanup after the API becomes available.
@@ -650,15 +672,23 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Apps whose last admission here failed because the execution budget
+    /// had no room (job leases may hold it), keyed by (app_name, namespace),
+    /// with the replica ordinals the admission tried to start. Every state
+    /// report carries them, so the leader places those replicas elsewhere
+    /// instead of holding them (#971). An entry stays until an admission of
+    /// that app succeeds here or the app is stopped or retired here: a
+    /// deploy backs off for minutes between attempts, and the refusal must
+    /// not lapse in between (#967).
+    capacity_refusals: std::collections::HashMap<(String, String), Vec<u32>>,
+    /// The app versions this node's placement reconciler last finished
+    /// deploying, as it last told the agent. State reports carry them so the
+    /// leader can release a rollout node by node (#692).
+    converged_rollouts: Vec<crate::reporting::types::RolloutReport>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; reservations advance beyond both this counter and all restored owners.
     next_deploy_gen: u64,
-    /// Jobs carrying a `schedule`, registered on apply and fired by the cron
-    /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
-    scheduled_jobs: std::collections::HashMap<(String, String), ScheduledJob>,
-    /// A failed or cancelled write must be resolved by reloading at startup.
-    scheduled_jobs_store_uncertain: bool,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -685,9 +715,6 @@ pub struct BunAgent<G: Grill> {
     /// crash restart or a self-upgrade exec) can adopt them instead of
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
-    recorded_jobs: BTreeMap<String, super::jobs::RecordedJob>,
-    retired_batch_executions: BTreeMap<String, super::jobs::RetiredBatchExecution>,
-    job_store_uncertain: bool,
     /// Self-upgrade manager. `None` when upgrades are not configured
     /// (upgrade commands then answer with an error).
     upgrade: Option<crate::upgrade::manager::UpgradeManager>,
@@ -807,6 +834,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -841,6 +869,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            destination_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            delegated_network: Default::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            isolation_rules: Default::default(),
+            workload_dns: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
@@ -874,15 +909,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
-            scheduled_jobs: std::collections::HashMap::new(),
-            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             capture_offsets: Arc::default(),
             events: None,
@@ -891,9 +927,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             signature_source: None,
             records_dir: None,
-            recorded_jobs: BTreeMap::new(),
-            retired_batch_executions: BTreeMap::new(),
-            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -950,6 +983,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             loop_stalls: Arc::default(),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
             volume_maintenance: Default::default(),
             #[cfg(test)]
             restore_pause: None,
@@ -984,6 +1018,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            destination_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            delegated_network: Default::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            isolation_rules: Default::default(),
+            workload_dns: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
@@ -1028,15 +1069,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            capacity_refusals: std::collections::HashMap::new(),
+            converged_rollouts: Vec::new(),
             next_deploy_gen: 1,
-            scheduled_jobs: std::collections::HashMap::new(),
-            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             capture_offsets: Arc::default(),
             events: None,
@@ -1045,9 +1087,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_policy: crate::config::node::TrustPolicySection::default(),
             signature_source: None,
             records_dir: None,
-            recorded_jobs: BTreeMap::new(),
-            retired_batch_executions: BTreeMap::new(),
-            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -1201,6 +1240,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.set_process_config(config);
     }
 
+    /// Thread the host-path policy built from `node.toml` into the supervisor.
+    /// Without this every volume or config-file `source` is refused.
+    pub fn set_host_path_policy(&mut self, policy: super::host_paths::HostPathPolicy) {
+        self.supervisor.set_host_path_policy(policy);
+    }
+
     /// Thread the parsed `[smoker]` duration limits in, so faults are bounded
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
@@ -1246,6 +1291,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.volumes_dir = dir;
     }
 
+    /// Stand a directory in for the cgroup v2 mount.
+    #[cfg(test)]
+    pub(crate) fn set_cgroup_mount(&mut self, mount: std::path::PathBuf) {
+        self.cgroup_mount = mount;
+    }
+
     /// Configure the actual protected listener ports, explicit enrolment peers
     /// and operator networks allowed to the management port. This grants
     /// network reachability only; protocol authentication still applies.
@@ -1285,6 +1336,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(runner)
     }
+    /// The network state delegated job runtimes share with this agent.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub fn delegated_network(
+        &self,
+    ) -> std::sync::Arc<crate::bun::task_namespace::DelegatedNetwork> {
+        self.delegated_network.clone()
+    }
+
+    /// The resolver every egress allowlist implicitly permits.
+    pub fn workload_dns(&self) -> Option<std::net::Ipv4Addr> {
+        self.workload_dns
+    }
+
     /// The same kernel owner used by apps, for delegated source ancestry.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn delegated_namespace_kernel(
@@ -1330,6 +1394,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
 
+    /// Record the DNS nameserver workloads use, so every egress allowlist
+    /// can resolve names through it. Call before recovery reprograms any
+    /// allowlist.
+    pub fn set_workload_dns(&mut self, nameserver: std::net::Ipv4Addr) {
+        self.workload_dns = Some(nameserver);
+    }
+
     /// Enable on-disk instance records under `dir` ({data_dir}/instances).
     /// Call before deploying anything; also enables `adopt_recorded_instances`.
     pub fn set_records_dir(&mut self, dir: PathBuf) {
@@ -1371,7 +1442,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let grill = self.supervisor.grill().clone();
         let id = instance_id.clone();
-        let app = self.logical_execution_name(instance_id, app_name);
+        let app = app_name.to_string();
         let namespace = namespace.to_string();
 
         let (line_tx, mut line_rx) = mpsc::channel::<crate::ketchup::types::CapturedLine>(256);
@@ -1513,8 +1584,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // (#505). Its steps take turns with everything below:
                     // this branch yields once after each step, and the one
                     // under commands takes the step when nothing else waits.
-                    _ = std::future::ready(()), if self.consumer_syncs.step_first() => {
-                        let turn = self.begin_turn(LoopBranch::FollowUp, Some("consumer_sync"));
+                    // No step runs while a step's write is in flight.
+                    _ = std::future::ready(()), if self.consumer_syncs.step_first()
+                        && !self.discovery_write_in_flight() => {
+                        let turn = self.begin_consumer_sync_turn();
+                        self.continue_consumer_sync().await;
+                        turn
+                    }
+                    // A step's write that outlasted its turn has landed
+                    // (#890): take the step's remainder now.
+                    outcome = Self::discovery_write_done(&mut self.discovery_ownership),
+                        if self.discovery_write_in_flight() => {
+                        let turn = self.begin_consumer_sync_turn();
+                        self.land_discovery_write(outcome).await;
                         self.continue_consumer_sync().await;
                         turn
                     }
@@ -1528,8 +1610,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.handle_command(cmd).await;
                         turn
                     }
-                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle() => {
-                        let turn = self.begin_turn(LoopBranch::FollowUp, Some("consumer_sync"));
+                    _ = std::future::ready(()), if !self.consumer_syncs.is_idle()
+                        && !self.discovery_write_in_flight() => {
+                        let turn = self.begin_consumer_sync_turn();
                         self.continue_consumer_sync().await;
                         turn
                     }
@@ -1569,6 +1652,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.loop_meter.begin(branch, detail)
     }
 
+    /// Start a turn that takes the next consumer-sync step, named after
+    /// that step, so a slow one's log line says which it was (#890).
+    fn begin_consumer_sync_turn(&mut self) -> super::loop_meter::Turn {
+        let step = self.consumer_syncs.next_step_label();
+        self.begin_turn(LoopBranch::FollowUp, Some(step))
+    }
+
     /// When the turn in progress must give up on a runtime read or other
     /// work it can retry later. Outside a turn (startup adoption, or a test
     /// driving a handler directly) nothing else is waiting, so each wait gets
@@ -1587,7 +1677,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// The loop's periodic work: health probes, restarts, retirements, jobs,
+    /// The loop's periodic work: health probes, restarts, retirements,
     /// fault expiry, firewall reconciliation and identity rotation.
     async fn run_health_tick(&mut self) {
         self.reopen_uncertain_discovery().await;
@@ -1598,12 +1688,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.drive_deferred_retirements().await;
         self.refresh_egress_readiness().await;
         self.run_health_checks().await;
-        self.fire_due_jobs().await;
         self.begin_state_sweep();
         self.drive_pending_restarts().await;
         self.expire_faults().await;
         self.reconcile_firewall();
-        if self.namespace_firewall_stale {
+        if self.namespace_firewall_stale || self.delegated_network_changed() {
             self.sync_firewall_ebpf().await;
         }
         self.reresolve_egress();

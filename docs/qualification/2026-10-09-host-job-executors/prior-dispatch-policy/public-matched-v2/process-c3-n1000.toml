@@ -1,0 +1,14 @@
+name = "process-c3-n1000"
+namespace = "default"
+[[cohort]]
+name = "commands"
+count = 1000
+chunk_size = 1000
+max_attempts = 1
+per_node_concurrency = 3
+[cohort.template]
+runtime = "process"
+cpu = "100m-1000m"
+memory = "32Mi"
+exec = "/tmp/rb-host-executor-v1/host/busybox"
+command = ["true"]

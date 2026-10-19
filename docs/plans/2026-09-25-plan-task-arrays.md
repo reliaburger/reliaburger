@@ -1,6 +1,6 @@
 # Plan: task arrays and a 100,000-job tour step
 
-Status: superseded by [`2026-09-28-plan-million-jobs.md`](2026-09-28-plan-million-jobs.md),
+Status: superseded by [`2026-09-28-plan-million-jobs.md`](archive/2026-09-28-plan-million-jobs.md),
 which keeps these findings and is the one to update. Kept for history.
 
 ## Why

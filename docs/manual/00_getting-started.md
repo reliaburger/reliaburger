@@ -42,7 +42,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.1.6.
+runc path inside Linux VMs. Apple Container isn't supported in 0.2.0.
 
 ## From source, without containers
 
@@ -54,11 +54,13 @@ git clone https://github.com/reliaburger/reliaburger
 cd reliaburger && cargo build --locked --bins
 ```
 
-The built-in ProcessGrill runtime supervises plain OS processes, so you don't
-need a container runtime to try it. From the repository root:
+The built-in process runtime supervises plain OS processes, so you don't
+need a container runtime to try it. It runs host binaries the node allows,
+not images. From the repository root, start Bun with the example node config,
+which allows the `testapp` binary:
 
 ```sh
-target/debug/bun --runtime process
+target/debug/bun --runtime process --config examples/node/process-runtime.toml
 ```
 
 Leave it running. In a second terminal, also from the repository root:
@@ -70,7 +72,7 @@ target/debug/relish status
 
 You should see the `hello` workload in `Running` state. Open
 <http://127.0.0.1:9117/> for the web dashboard, or run `relish` with no
-arguments for the terminal one. ProcessGrill supervises real processes but
+arguments for the terminal one. The process runtime supervises real processes but
 doesn't isolate them, so keep it for trying things out.
 
 ## Where to next

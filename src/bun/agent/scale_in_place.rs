@@ -17,6 +17,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// How many replicas deploying `spec` adds beside the ones already
     /// running, when the deploy changes nothing but a higher replica count.
     ///
+    /// `Some(0)` is the spec this node already runs, sent again after a
+    /// capacity refusal here: the refused deploy changed nothing, and the
+    /// leader has since moved the replicas it couldn't start, so there is
+    /// nothing to add and nothing to roll (#971).
+    ///
     /// `None` means the deploy must roll as usual: the app is new, its spec
     /// changed, its count didn't grow, or not every replica it runs is
     /// running (a stopped app, a crash-looping replica, a rollout that
@@ -29,14 +34,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> Option<u32> {
         let key = (app_name.to_string(), namespace.to_string());
         let previous = self.deployed_specs.get(&key)?;
-        let (running, added) = replicas_added(previous, spec)?;
+        let (running, added) = match (replicas_added(previous, spec), spec.replicas) {
+            (Some(grown), _) => grown,
+            (None, Replicas::Fixed(count))
+                if previous == spec && self.capacity_refusals.contains_key(&key) =>
+            {
+                (count, 0)
+            }
+            (None, _) => return None,
+        };
         let instances: Vec<_> = self
             .supervisor
             .list_instances()
             .into_iter()
             .filter(|instance| {
-                !instance.is_job
-                    && instance.app_name == app_name
+                instance.app_name == app_name
                     && instance.namespace == namespace
                     && !self.deferred_retirements.contains(&instance.id)
             })

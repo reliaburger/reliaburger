@@ -26,7 +26,7 @@ use super::task_array_leader::{NodeView, TaskArrayWriteError, read_task_arrays, 
 use super::task_array_node::{MAX_RESULT_ROWS, NodeSyncRequest, TaskArrayNodeError, TaskResultRow};
 use crate::config::job::JobSpec;
 use crate::meat::NodeId;
-use crate::meat::batch_tracker::epoch_now_secs;
+use crate::meat::batch_ids::epoch_now_secs;
 use crate::meat::task_array::{TaskArraySpec, validate_template};
 use crate::meat::task_array_store::{TaskArrayRecord, TaskArrayWrite};
 
@@ -152,6 +152,26 @@ async fn follower_council(state: &ApiState) -> Option<&crate::council::CouncilNo
     }
 }
 
+/// How long a leader gets to prove it leads before it answers a run it
+/// can't find (#1009, #1192).
+const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The council to forward a run's request to, or `None` when this node has
+/// proved it leads (or runs without a council) and its record is the truth.
+///
+/// A follower's replica can lag, and a node back from a stop may hold a log
+/// older than the run, so only a confirmed leader may say "not found". The
+/// leader gets [`LEADER_CONFIRMATION`] to prove it, so one heartbeat round
+/// its followers answer late doesn't turn into a 503.
+async fn council_to_forward_to(state: &ApiState) -> Option<&crate::council::CouncilNode> {
+    let council = state.council.as_deref()?;
+    if council.confirm_leadership(LEADER_CONFIRMATION).await {
+        None
+    } else {
+        Some(council)
+    }
+}
+
 /// `POST /v1/batch/array`: submit a task array.
 pub async fn submit_handler(
     State(state): State<ApiState>,
@@ -177,6 +197,7 @@ pub async fn submit_handler(
     if let Err(response) = crate::sesame::auth::authorize_scoped(auth, &request.name, &namespace) {
         return response;
     }
+    crate::bun::audit::annotate_workload(&request.name, &namespace);
     if let Some(council) = follower_council(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/array", body, &headers).await;
     }
@@ -192,6 +213,7 @@ pub async fn submit_handler(
             missed: Default::default(),
         }),
         replay_unknown: true,
+        hook: false,
     };
     if let Err(response) = super::job_api::admit_definition(
         &state,
@@ -200,6 +222,7 @@ pub async fn submit_handler(
         &request.name,
         &namespace,
         &mut definition,
+        None,
     )
     .await
     {
@@ -208,12 +231,9 @@ pub async fn submit_handler(
     let trigger = if definition.cron.is_some() {
         None
     } else {
-        let request_id = match headers.get("idempotency-key") {
-            Some(value) => match value.to_str() {
-                Ok(value) => value.to_string(),
-                Err(_) => return error(StatusCode::BAD_REQUEST, "invalid idempotency-key"),
-            },
-            None => hex::encode(rand::random::<[u8; 16]>()),
+        let request_id = match request_identity(&headers) {
+            Ok(request_id) => request_id,
+            Err(response) => return response,
         };
         Some(crate::meat::job::RunTrigger::Manual { request_id })
     };
@@ -236,6 +256,20 @@ pub async fn submit_handler(
             .into_response(),
         Ok(None) => (StatusCode::ACCEPTED, Json(serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true}))).into_response(),
         Err(e) => write_error(e),
+    }
+}
+
+/// The submission's `Idempotency-Key` header, or a fresh random identity when
+/// the client sent none. A retry that reuses the key returns the runs the
+/// first attempt created; without one, every request is new work.
+#[allow(clippy::result_large_err)] // An HTTP refusal is the error.
+fn request_identity(headers: &HeaderMap) -> Result<String, Response> {
+    match headers.get("idempotency-key") {
+        Some(value) => match value.to_str() {
+            Ok(value) => Ok(value.to_string()),
+            Err(_) => Err(error(StatusCode::BAD_REQUEST, "invalid idempotency-key")),
+        },
+        None => Ok(hex::encode(rand::random::<[u8; 16]>())),
     }
 }
 
@@ -275,6 +309,7 @@ pub async fn manifest_handler(
     {
         return response;
     }
+    crate::bun::audit::annotate_workload(&request.name, &request.namespace);
     for cohort in &mut request.cohort {
         let mut array = TaskArraySubmitRequest {
             name: request.name.clone(),
@@ -296,6 +331,7 @@ pub async fn manifest_handler(
             tasks: cohort.spec.clone(),
             cron: None,
             replay_unknown: true,
+            hook: false,
         };
         if let Err(response) = super::job_api::admit_definition(
             &state,
@@ -304,6 +340,7 @@ pub async fn manifest_handler(
             &request.name,
             &request.namespace,
             &mut definition,
+            None,
         )
         .await
         {
@@ -311,9 +348,14 @@ pub async fn manifest_handler(
         }
         cohort.template = definition.template;
     }
+    let request_id = match request_identity(&headers) {
+        Ok(request_id) => request_id,
+        Err(response) => return response,
+    };
     let write = TaskArrayWrite::RegisterManifest {
         name: request.name,
         namespace: request.namespace,
+        request_id,
         cohorts: request.cohort,
         submitted_at_epoch_secs: epoch_now_secs(),
     };
@@ -342,10 +384,12 @@ pub(crate) async fn admit_template_image(
         let mut config = crate::config::Config::default();
         config.job.insert("task".into(), template.clone());
         super::api::bind_images(state, binder, &mut config).await?;
-        *template = config
-            .job
-            .remove("task")
-            .expect("binder retains job template");
+        *template = config.job.remove("task").ok_or_else(|| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image binding lost the job template",
+            )
+        })?;
     }
     pin_template_image(state, template)
         .await
@@ -404,10 +448,12 @@ async fn pin_template_image(
         )
         .map_err(|e| e.to_string())?
         {
-            template.image = Some(crate::meat::scheduler::pin_image_reference(
-                template.image.as_deref().expect("image checked"),
-                &digest,
-            ));
+            let image = template
+                .image
+                .as_deref()
+                .ok_or("signature check returned a digest for a job without an image")?;
+            let pinned = crate::meat::scheduler::pin_image_reference(image, &digest);
+            template.image = Some(pinned);
         }
     }
     Ok(())
@@ -421,6 +467,12 @@ pub async fn cancel_handler(
     AxumPath(batch_id): AxumPath<u64>,
     headers: HeaderMap,
 ) -> Response {
+    // Forward before looking the run up: a lagging replica doesn't know
+    // every run, and the leader authorises the forwarded caller itself.
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!("/v1/batch/{batch_id}/cancel");
+        return forward_to_leader(&state, council, &path, String::new(), &headers).await;
+    }
     let auth = auth.as_deref();
     if let Err(response) =
         crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Deployer)
@@ -433,7 +485,7 @@ pub async fn cancel_handler(
             &record.name,
             &record.namespace,
             TaskArrayWrite::Cancel {
-                now_epoch_secs: crate::meat::batch_tracker::epoch_now_secs(),
+                now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
                 batch_id,
             },
         )
@@ -455,6 +507,7 @@ pub async fn cancel_handler(
             format!("task submission {batch_id} not found"),
         );
     };
+    crate::bun::audit::annotate_workload(name, namespace);
     if arrays
         .manifest(batch_id)
         .is_none_or(|manifest| !manifest.common_jobs)
@@ -487,10 +540,6 @@ pub async fn cancel_handler(
             return response;
         }
     }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!("/v1/batch/{batch_id}/cancel");
-        return forward_to_leader(&state, council, &path, String::new(), &headers).await;
-    }
     match write_task_array(&state, write).await {
         Ok(_) => (
             StatusCode::ACCEPTED,
@@ -511,6 +560,33 @@ pub fn array_summary(
 ) -> serde_json::Value {
     let state = &record.state;
     let summary = state.summary();
+    let elapsed = record
+        .terminal_at_epoch_secs
+        .unwrap_or_else(epoch_now_secs)
+        .saturating_sub(state.submitted_at_epoch_secs);
+    let callers = nodes
+        .iter()
+        .try_fold(0u64, |sum, node| sum.checked_add(node.counters.running));
+    // A node's view is what it said at its last sync, and the leader keeps a
+    // silent node's view until it answers again. Count each node's active
+    // commands only up to the tasks the leader says it holds now: a node
+    // whose chunks were taken back counts for nothing, and because grants
+    // never overlap, the sum can't exceed `held` (#968).
+    let active = if summary.status.is_terminal() {
+        Some(0)
+    } else if nodes.is_empty() {
+        None
+    } else {
+        nodes
+            .iter()
+            .filter(|node| node.refused.is_none())
+            .try_fold(0u64, |sum, node| {
+                let holds = state
+                    .held_by(&node.node)
+                    .map_or(0, |chunks| state.tasks_in(chunks));
+                sum.checked_add(node.counters.active_commands?.min(holds))
+            })
+    };
     let failed: Vec<[u32; 2]> = state
         .failed_indices()
         .ranges()
@@ -529,8 +605,14 @@ pub fn array_summary(
         "failed": summary.failed,
         "not_run": summary.not_run,
         "retried": summary.retried,
+        "retry_causes": summary.retry_causes,
         "queued": summary.queued,
         "held": summary.held,
+        "active_commands": active,
+        "other_in_flight_attempts": active.and_then(|count| callers.and_then(|callers| callers.checked_sub(count))),
+        "activity_semantics": "last_node_sync_verified_start_to_positive_cleanup",
+        "elapsed_seconds": elapsed,
+        "whole_run_successes_per_second": (elapsed > 0).then(|| summary.succeeded as f64 / elapsed as f64),
         "chunks": state.spec.chunk_count(),
         "chunks_done": summary.chunks_done,
         "failed_indices": failed,
@@ -544,6 +626,14 @@ pub fn array_summary(
         "age_seconds": epoch_now_secs().saturating_sub(state.submitted_at_epoch_secs),
         "details_retention_seconds": crate::meat::task_array_store::TERMINAL_RETENTION_SECS,
         "execution_semantics": "at_least_once",
+        "runtime": record.template.runtime,
+        "idle_executor_reservation": if matches!(record.template.runtime, crate::config::job::JobRuntime::SharedRunc | crate::config::job::JobRuntime::Process) {
+            super::reusable_executor::ExecutorProfile::new(&record.template).ok().map(|profile| serde_json::json!({"cpu_millicores":profile.reservation.cpu_millicores,"memory_bytes":profile.reservation.memory_bytes}))
+        } else { None },
+        "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
+        "quota_blocked": record.quota_blocked,
+        "quota_blocked_reason": record.quota_blocked.as_ref().map(ToString::to_string),
+        "unrunnable_reason": record.unrunnable,
     })
 }
 
@@ -609,6 +699,7 @@ pub async fn manifest_summary(
     let mut failed = 0;
     let mut not_run = 0;
     let mut retried = 0;
+    let mut retry_causes = crate::meat::task_array_state::RetryCauses::default();
     let mut queued = 0;
     let mut held = 0;
     let mut done = true;
@@ -629,6 +720,7 @@ pub async fn manifest_summary(
             failed += s.failed;
             not_run += s.not_run;
             retried += s.retried;
+            retry_causes.add(&s.retry_causes);
             queued += s.queued;
             held += s.held;
             done &= s.status.is_terminal();
@@ -651,9 +743,45 @@ pub async fn manifest_summary(
             done = false;
         }
     }
-    serde_json::json!({ "batch_id":batch_id,"kind":"manifest","name":manifest.name,"namespace":manifest.namespace,"total":total,"succeeded":succeeded,"failed":failed,"not_run":not_run,"retried":retried,"queued":queued,"held":held,"done":done,
+    let aggregate = |key: &str| {
+        (cohorts.len() == manifest.cohorts.len())
+            .then(|| {
+                cohorts
+                    .iter()
+                    .try_fold(0u64, |sum, cohort| sum.checked_add(cohort[key].as_u64()?))
+            })
+            .flatten()
+    };
+    let active = aggregate("active_commands");
+    let other = aggregate("other_in_flight_attempts");
+    let end = if done {
+        manifest
+            .cohorts
+            .iter()
+            .filter_map(|(_, id)| {
+                arrays
+                    .get(*id)
+                    .and_then(|record| record.terminal_at_epoch_secs)
+            })
+            .max()
+            .unwrap_or(manifest.submitted_at_epoch_secs)
+    } else {
+        epoch_now_secs()
+    };
+    let elapsed = end.saturating_sub(manifest.submitted_at_epoch_secs);
+    serde_json::json!({ "batch_id":batch_id,"kind":"manifest","name":manifest.name,"namespace":manifest.namespace,"total":total,"succeeded":succeeded,"failed":failed,"not_run":not_run,"retried":retried,"retry_causes":retry_causes,"queued":queued,"held":held,"done":done,
         "status":if unknown && !done {"Unknown"} else if stopping {"Stopping"} else if !done {"Running"} else if stopped_failed {"Failed"} else if not_run>0 {"Cancelled"} else if failed>0 {"CompletedWithFailures"} else {"Succeeded"},
-        "cohorts":cohorts,"duration_final_attempt_ms":{"bounds":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null],"counts":durations},"rates":service.rates(batch_id,(succeeded,failed)).await,"details_retention_seconds":crate::meat::task_array_store::TERMINAL_RETENTION_SECS,"execution_semantics":if manifest.common_jobs {"acknowledged_unknown_replay"} else {"at_least_once"} })
+        "active_commands":active,"other_in_flight_attempts":other,"elapsed_seconds":elapsed,"whole_run_successes_per_second":(elapsed>0).then(||succeeded as f64/elapsed as f64),"activity_semantics":"last_node_sync_verified_start_to_positive_cleanup","cohorts":cohorts,"duration_final_attempt_ms":{"bounds":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,null],"counts":durations},"rates":service.rates(batch_id,(succeeded,failed)).await,"details_retention_seconds":crate::meat::task_array_store::TERMINAL_RETENTION_SECS,"execution_semantics":if manifest.common_jobs {"acknowledged_unknown_replay"} else {"at_least_once"} })
+}
+
+/// Bytes of replicated Raft state a run's chunk bookkeeping occupies, as the
+/// JSON the council stores. Serialising costs time, so only a single run's
+/// summary reports it, never the list of every run.
+pub fn state_bytes<'a>(records: impl IntoIterator<Item = &'a TaskArrayRecord>) -> Option<usize> {
+    records.into_iter().try_fold(0usize, |total, record| {
+        let bytes = serde_json::to_vec(&record.state).ok()?.len();
+        total.checked_add(bytes)
+    })
 }
 
 /// `POST /v1/batch/array/sync`: the leader's once-a-second call.
@@ -666,7 +794,10 @@ pub async fn sync_handler(
         return response;
     }
     match &state.task_arrays.node {
-        Some(node) => Json(node.sync(&request).await).into_response(),
+        Some(node) => match node.sync(&request).await {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => node_error(error),
+        },
         None => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "this node has no task-array executor",
@@ -678,6 +809,16 @@ fn node_error(error: TaskArrayNodeError) -> Response {
     match error {
         TaskArrayNodeError::UnknownArray { .. } | TaskArrayNodeError::NoOutput { .. } => {
             self::error(StatusCode::NOT_FOUND, error.to_string())
+        }
+        // Gone, not missing: the task failed, but its chunk had already
+        // kept its share of failure output.
+        TaskArrayNodeError::OutputNotKept { .. } => {
+            self::error(StatusCode::GONE, error.to_string())
+        }
+        // The leader counts it as a failed sync, as it would a timeout,
+        // so the node's held chunks still move on after its silence.
+        TaskArrayNodeError::SyncBusy => {
+            self::error(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
         }
         other => self::error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
@@ -827,7 +968,11 @@ pub fn merge_rows(
             let Some(chunk) = record.state.spec.chunk_of(row.index) else {
                 continue;
             };
-            if record.state.accepted_grant(chunk) == Some((node.clone(), row.grant_attempt)) {
+            let accepted = record.state.accepted_grant(chunk).is_some_and(|grant| {
+                grant.attempt == row.grant_attempt
+                    && grant.owner.as_ref().is_none_or(|owner| *owner == node)
+            });
+            if accepted {
                 merged.insert(row.index, row);
             }
         }
@@ -836,10 +981,13 @@ pub fn merge_rows(
     (merged.into_values().take(limit).collect(), truncated)
 }
 
+/// The index window one results page covers, and the nodes that hold its
+/// rows: `None` when a chunk's owner was compacted away (see
+/// `TaskArrayState::accepted_grant`), so every node must be asked.
 fn result_window(
     record: &TaskArrayRecord,
     query: &ResultsQuery,
-) -> (u32, u32, std::collections::BTreeSet<NodeId>) {
+) -> (u32, u32, Option<std::collections::BTreeSet<NodeId>>) {
     let start = query
         .index
         .unwrap_or_else(|| query.after.map_or(0, |a| a.saturating_add(1)));
@@ -856,7 +1004,10 @@ fn result_window(
         let Some(chunk) = record.state.spec.chunk_of(cursor) else {
             break;
         };
-        if let Some((node, _)) = record.state.accepted_grant(chunk) {
+        if let Some(accepted) = record.state.accepted_grant(chunk) {
+            let Some(node) = accepted.owner else {
+                return (start, end, None);
+            };
             if !owners.contains(&node) && owners.len() == 8 {
                 end = cursor;
                 break;
@@ -867,7 +1018,7 @@ fn result_window(
         cursor = ((u64::from(chunk.0) + 1) * u64::from(record.state.spec.chunk_size))
             .min(u64::from(end)) as u32;
     }
-    (start, end, owners)
+    (start, end, Some(owners))
 }
 
 /// `GET /v1/batch/{id}/results`: every task's outcome, gathered from the
@@ -886,6 +1037,15 @@ pub async fn results_handler(
         .limit
         .unwrap_or(DEFAULT_RESULT_ROWS)
         .min(MAX_RESULT_ROWS);
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!(
+            "/v1/batch/{batch_id}/results?failed={}&limit={limit}{}{}",
+            query.failed,
+            query.after.map_or(String::new(), |a| format!("&after={a}")),
+            query.index.map_or(String::new(), |i| format!("&index={i}"))
+        );
+        return forward_get_to_leader(&state, council, &path, &headers).await;
+    }
     let arrays = read_task_arrays(&state).await;
     let Some(record) = arrays.get(batch_id) else {
         return error(
@@ -898,22 +1058,16 @@ pub async fn results_handler(
     {
         return response;
     }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!(
-            "/v1/batch/{batch_id}/results?failed={}&limit={limit}{}{}",
-            query.failed,
-            query.after.map_or(String::new(), |a| format!("&after={a}")),
-            query.index.map_or(String::new(), |i| format!("&index={i}"))
-        );
-        return forward_get_to_leader(&state, council, &path, &headers).await;
-    }
     let (start, end, owners) = result_window(record, &query);
     let mut per_node = Vec::new();
     let mut unreachable = Vec::new();
     let mut calls = tokio::task::JoinSet::new();
     let mut known = std::collections::BTreeSet::new();
     for (node, url) in every_node(&state).await {
-        if !owners.contains(&node) {
+        if owners
+            .as_ref()
+            .is_some_and(|owners| !owners.contains(&node))
+        {
             continue;
         }
         known.insert(node.clone());
@@ -937,7 +1091,9 @@ pub async fn results_handler(
             }
         }
     }
-    unreachable.extend(owners.difference(&known).cloned());
+    if let Some(owners) = &owners {
+        unreachable.extend(owners.difference(&known).cloned());
+    }
     while let Some(done) = calls.join_next().await {
         let Ok((node, result)) = done else { continue };
         match result {
@@ -986,6 +1142,10 @@ pub async fn logs_handler(
     AxumPath((batch_id, index)): AxumPath<(u64, u32)>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
+        return forward_get_to_leader(&state, council, &path, &headers).await;
+    }
     let arrays = read_task_arrays(&state).await;
     let Some(record) = arrays.get(batch_id) else {
         return error(
@@ -1008,52 +1168,50 @@ pub async fn logs_handler(
     ) {
         return response;
     }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
-        return forward_get_to_leader(&state, council, &path, &headers).await;
-    }
-    if index >= record.state.spec.count {
+    let Some(chunk) = record.state.spec.chunk_of(index) else {
         return error(
             StatusCode::NOT_FOUND,
             format!("task array {batch_id} has no task {index}"),
         );
-    }
-    let chunk = record.state.spec.chunk_of(index).expect("validated index");
-    let Some((owner, grant)) = record.state.accepted_grant(chunk) else {
+    };
+    let Some(accepted) = record.state.accepted_grant(chunk) else {
         return error(StatusCode::NOT_FOUND, "task has no accepted outcome yet");
     };
-    let Some((_, url)) = every_node(&state)
+    let grant = accepted.attempt;
+    // A compacted record forgot the owner, but not the attempt: ask every
+    // node for that grant's output. Only the node that ran it has any.
+    let candidates: Vec<(NodeId, Option<String>)> = every_node(&state)
         .await
         .into_iter()
-        .find(|(node, _)| node == &owner)
-    else {
+        .filter(|(node, _)| accepted.owner.as_ref().is_none_or(|owner| owner == node))
+        .collect();
+    if candidates.is_empty() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "accepted task owner is unavailable",
         );
-    };
-    let output = match url {
-        None => match &state.task_arrays.node {
-            Some(node) => node.task_output_grant(batch_id, index, grant).await.ok(),
-            None => None,
-        },
-        Some(url) => {
-            let url =
-                format!("{url}/v1/batch/array/{batch_id}/local/tasks/{index}/logs?grant={grant}");
-            match fetch_from_node(&state, &url).await {
-                Ok(response) if response.status().is_success() => {
-                    response.bytes().await.ok().map(|bytes| bytes.to_vec())
-                }
-                Ok(response) if response.status() == StatusCode::NOT_FOUND => None,
-                _ => {
-                    return error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "accepted task owner's output is unavailable",
-                    );
-                }
+    }
+    let mut output = None;
+    let mut unavailable = false;
+    for (_, url) in candidates {
+        match task_output(&state, url.as_deref(), batch_id, index, grant).await {
+            TaskOutput::Kept(bytes) => {
+                output = Some(bytes);
+                break;
             }
+            TaskOutput::NotKept => {
+                return node_error(TaskArrayNodeError::OutputNotKept { index });
+            }
+            TaskOutput::Missing => {}
+            TaskOutput::Unavailable => unavailable = true,
         }
-    };
+    }
+    if output.is_none() && unavailable {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "accepted task owner's output is unavailable",
+        );
+    }
     if let Some(bytes) = output {
         return bytes.into_response();
     }
@@ -1063,6 +1221,48 @@ pub async fn logs_handler(
             "no node kept output for task {index}; singleton and failed-task output is retained"
         ),
     )
+}
+
+/// What one node kept of a task's output at one grant.
+enum TaskOutput {
+    /// The output.
+    Kept(Vec<u8>),
+    /// Nothing for this task at this grant.
+    Missing,
+    /// The node ran it but, by policy, didn't keep its output.
+    NotKept,
+    /// The node couldn't be asked.
+    Unavailable,
+}
+
+/// Ask one node (`url`, or this node for `None`) for a task's output at `grant`.
+async fn task_output(
+    state: &ApiState,
+    url: Option<&str>,
+    batch_id: u64,
+    index: u32,
+    grant: u64,
+) -> TaskOutput {
+    let Some(url) = url else {
+        return match &state.task_arrays.node {
+            Some(node) => match node.task_output_grant(batch_id, index, grant).await {
+                Ok(bytes) => TaskOutput::Kept(bytes),
+                Err(TaskArrayNodeError::OutputNotKept { .. }) => TaskOutput::NotKept,
+                Err(_) => TaskOutput::Missing,
+            },
+            None => TaskOutput::Missing,
+        };
+    };
+    let url = format!("{url}/v1/batch/array/{batch_id}/local/tasks/{index}/logs?grant={grant}");
+    match fetch_from_node(state, &url).await {
+        Ok(response) if response.status().is_success() => match response.bytes().await {
+            Ok(bytes) => TaskOutput::Kept(bytes.to_vec()),
+            Err(_) => TaskOutput::Missing,
+        },
+        Ok(response) if response.status() == StatusCode::NOT_FOUND => TaskOutput::Missing,
+        Ok(response) if response.status() == StatusCode::GONE => TaskOutput::NotKept,
+        _ => TaskOutput::Unavailable,
+    }
 }
 
 /// Gather bounded parent/profile summaries, excluding a parent's child arrays.
@@ -1112,7 +1312,8 @@ pub async fn summaries(
             serde_json::json!({"kind":"schedule", "name":name, "namespace":namespace,
             "status":"Scheduled", "batch_id":null, "revision":record.revision,
             "cron":cron, "last_observed_minute":record.last_observed_minute,
-            "total":record.definition.tasks.count}),
+            "skipped":record.skipped, "skipped_count":record.skipped_count,
+            "history":record.history, "total":record.definition.tasks.count}),
         );
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r["batch_id"].as_u64().unwrap_or(0)));
@@ -1132,10 +1333,12 @@ mod tests {
     use super::*;
     use crate::config::types::EnvValue;
     use crate::meat::index_set::IndexRangeSet;
-    use crate::meat::task_array_state::TaskArrayState;
+    use crate::meat::task_array::{ChunkId, TaskArraySpec};
+    use crate::meat::task_array_state::{ChunkResult, TaskArrayState};
 
     fn template() -> JobSpec {
         JobSpec {
+            runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: Some(vec!["{index}".to_string()]),
             schedule: None,
@@ -1146,6 +1349,12 @@ mod tests {
             namespace: None,
             exec: Some("/usr/bin/true".into()),
             script: None,
+            firewall: None,
+            egress: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         }
     }
 
@@ -1156,6 +1365,12 @@ mod tests {
             template: template(),
             spec: TaskArraySpec::with_count(100),
         }
+    }
+
+    #[test]
+    fn a_busy_node_answers_the_leader_service_unavailable() {
+        let response = node_error(TaskArrayNodeError::SyncBusy);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -1186,6 +1401,7 @@ mod tests {
                         failed_indices: IndexRangeSet::new(),
                         not_run: 0,
                         retried: 0,
+                        retry_causes: Default::default(),
                         duration_counts: [0; 16],
                     },
                 )
@@ -1197,9 +1413,14 @@ mod tests {
             template: template(),
             state,
             terminal_at_epoch_secs: Some(1),
+            quota_blocked: None,
+            unrunnable: None,
         };
         let (start, end, owners) = result_window(&record, &ResultsQuery::default());
-        assert_eq!((start, end, owners.len()), (0, 8, 8));
+        assert_eq!(
+            (start, end, owners.map(|owners| owners.len())),
+            (0, 8, Some(8))
+        );
         let (start, end, owners) = result_window(
             &record,
             &ResultsQuery {
@@ -1207,7 +1428,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!((start, end, owners.len()), (8, 16, 8));
+        assert_eq!(
+            (start, end, owners.map(|owners| owners.len())),
+            (8, 16, Some(8))
+        );
         let (start, end, owners) = result_window(
             &record,
             &ResultsQuery {
@@ -1215,7 +1439,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!((start, end, owners.len()), (14, 15, 1));
+        assert_eq!(
+            (start, end, owners.map(|owners| owners.len())),
+            (14, 15, Some(1))
+        );
     }
 
     #[test]
@@ -1303,11 +1530,14 @@ mod tests {
                     failed_indices,
                     not_run: 0,
                     retried: 0,
+                    retry_causes: Default::default(),
                 },
             )
             .unwrap();
         TaskArrayRecord {
             terminal_at_epoch_secs: None,
+            quota_blocked: None,
+            unrunnable: None,
             name: "render".to_string(),
             namespace: "default".to_string(),
             template: template(),
@@ -1355,6 +1585,215 @@ mod tests {
     }
 
     #[test]
+    fn results_whose_owner_was_compacted_are_fenced_by_attempt_and_ask_every_node() {
+        // Ten thousand one-task chunks alternating between two nodes split
+        // the accepted record past its range cap, so it folds.
+        let mut state = TaskArrayState::new(
+            TaskArraySpec {
+                chunk_size: 1,
+                ..TaskArraySpec::with_count(10_000)
+            },
+            1,
+        )
+        .unwrap();
+        let nodes = [NodeId::new("a"), NodeId::new("b")];
+        for chunk in 0..10_000u32 {
+            let node = &nodes[chunk as usize % 2];
+            let chunks = IndexRangeSet::from_range(chunk..=chunk);
+            state.grant(node, &chunks).unwrap();
+            if chunk == 0 {
+                // Chunk 0 is lost once and finished by "b" at attempt 2.
+                state.requeue_node(node);
+                state.grant(&nodes[1], &chunks).unwrap();
+            }
+            state
+                .complete(
+                    if chunk == 0 { &nodes[1] } else { node },
+                    &ChunkResult {
+                        duration_counts: [0; 16],
+                        chunk: ChunkId(chunk),
+                        attempt: state.attempt_of(ChunkId(chunk)),
+                        succeeded: 1,
+                        failed_count: 0,
+                        failed_indices: IndexRangeSet::new(),
+                        not_run: 0,
+                        retried: 0,
+                        retry_causes: Default::default(),
+                    },
+                )
+                .unwrap();
+        }
+        let accepted = state.accepted_grant(ChunkId(0)).unwrap();
+        assert_eq!((accepted.owner, accepted.attempt), (None, 2));
+        let record = TaskArrayRecord {
+            name: "tiny".into(),
+            namespace: "default".into(),
+            template: template(),
+            state,
+            terminal_at_epoch_secs: Some(1),
+            quota_blocked: None,
+            unrunnable: None,
+        };
+        let (_, _, owners) = result_window(&record, &ResultsQuery::default());
+        assert_eq!(owners, None, "every node is asked");
+        let attempt = |index, grant_attempt| TaskResultRow {
+            grant_attempt,
+            ..row(index, true)
+        };
+        let (rows, _) = merge_rows(
+            &record,
+            vec![
+                // "a"'s run of chunk 0 was written off at attempt 1.
+                (nodes[0].clone(), vec![attempt(0, 1), attempt(2, 1)]),
+                (nodes[1].clone(), vec![attempt(0, 2), attempt(1, 1)]),
+            ],
+            10,
+        );
+        let got: Vec<(u32, u64)> = rows.iter().map(|r| (r.index, r.grant_attempt)).collect();
+        assert_eq!(got, vec![(0, 2), (1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn activity_requires_receipts_from_every_reporting_backend() {
+        let mut record = record_with_failures(&[]);
+        record.state = crate::meat::task_array_state::TaskArrayState::new(
+            crate::meat::task_array::TaskArraySpec::with_count(10),
+            100,
+        )
+        .unwrap();
+        record.terminal_at_epoch_secs = None;
+        record
+            .state
+            .grant(&NodeId::new("first"), &IndexRangeSet::from_range(0..=0))
+            .unwrap();
+        assert!(array_summary(9, &record, &[])["active_commands"].is_null());
+        let mut nodes = vec![NodeView {
+            node: NodeId::new("first"),
+            slots: 8,
+            refused: None,
+            counters: super::super::task_array_node::NodeArrayCounters {
+                running: 8,
+                active_commands: Some(3),
+                ..Default::default()
+            },
+        }];
+        let summary = array_summary(9, &record, &nodes);
+        assert_eq!(summary["active_commands"], 3);
+        assert_eq!(summary["other_in_flight_attempts"], 5);
+        nodes.push(NodeView {
+            node: NodeId::new("unsupported"),
+            slots: 2,
+            refused: None,
+            counters: Default::default(),
+        });
+        assert!(array_summary(9, &record, &nodes)["active_commands"].is_null());
+        nodes[1].refused = Some("unsupported".into());
+        assert_eq!(array_summary(9, &record, &nodes)["active_commands"], 3);
+    }
+
+    fn active_view(node: &str, active: u64) -> NodeView {
+        NodeView {
+            node: NodeId::new(node),
+            slots: 4,
+            refused: None,
+            counters: super::super::task_array_node::NodeArrayCounters {
+                running: active,
+                active_commands: Some(active),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_powered_off_nodes_remembered_activity_never_exceeds_held() {
+        // #968: node 3 held the last chunk with one active command and went
+        // dark. The leader took the chunk back and granted it to node 1, which
+        // now reports one active command too. The leader still remembers node
+        // 3's last view, but node 3 holds nothing, so it counts for nothing.
+        let mut record = record_with_failures(&[]);
+        record.state = crate::meat::task_array_state::TaskArrayState::new(
+            crate::meat::task_array::TaskArraySpec {
+                chunk_size: 1,
+                ..crate::meat::task_array::TaskArraySpec::with_count(2)
+            },
+            100,
+        )
+        .unwrap();
+        record.terminal_at_epoch_secs = None;
+        record
+            .state
+            .grant(&NodeId::new("n1"), &IndexRangeSet::from_range(1..=1))
+            .unwrap();
+        let nodes = vec![active_view("n1", 1), active_view("n3", 1)];
+        let summary = array_summary(9, &record, &nodes);
+        assert_eq!(summary["held"], 1);
+        assert_eq!(summary["active_commands"], 1);
+        // As far as the leader knows node 3's command may still run, so it
+        // shows up as another attempt in flight rather than vanishing.
+        assert_eq!(summary["other_in_flight_attempts"], 1);
+        // The per-node views are reported unchanged.
+        assert_eq!(summary["nodes"][1]["counters"]["active_commands"], 1);
+    }
+
+    #[test]
+    fn a_nodes_activity_counts_no_more_than_the_tasks_it_holds() {
+        // A node that lost one chunk and was granted another can still report
+        // the old command as active until its next sync: count at most what
+        // the leader says it holds now.
+        let mut record = record_with_failures(&[]);
+        record.state = crate::meat::task_array_state::TaskArrayState::new(
+            crate::meat::task_array::TaskArraySpec {
+                chunk_size: 1,
+                ..crate::meat::task_array::TaskArraySpec::with_count(4)
+            },
+            100,
+        )
+        .unwrap();
+        record.terminal_at_epoch_secs = None;
+        record
+            .state
+            .grant(&NodeId::new("n1"), &IndexRangeSet::from_range(0..=0))
+            .unwrap();
+        record
+            .state
+            .grant(&NodeId::new("n2"), &IndexRangeSet::from_range(1..=2))
+            .unwrap();
+        let nodes = vec![active_view("n1", 2), active_view("n2", 1)];
+        let summary = array_summary(9, &record, &nodes);
+        assert_eq!(summary["held"], 3);
+        assert_eq!(summary["active_commands"], 2);
+    }
+
+    #[test]
+    fn native_profile_summary_discloses_idle_helper_cost_without_claiming_live_usage() {
+        let record = record_with_failures(&[]);
+        let summary = array_summary(9, &record, &[]);
+        assert_eq!(summary["runtime"], "process");
+        assert_eq!(summary["idle_executor_reservation"]["cpu_millicores"], 1010);
+        assert_eq!(
+            summary["idle_executor_reservation"]["memory_bytes"],
+            72 << 20
+        );
+        assert_eq!(
+            summary["idle_executor_reservation_semantics"],
+            "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage"
+        );
+    }
+
+    #[test]
+    fn whole_run_rate_freezes_at_accepted_terminal_time_and_empty_activity_is_unknown() {
+        let mut record = record_with_failures(&[2, 3, 7]);
+        record.state.submitted_at_epoch_secs = 100;
+        record.terminal_at_epoch_secs = Some(110);
+        let summary = array_summary(5, &record, &[]);
+        assert_eq!(summary["elapsed_seconds"], 10);
+        assert_eq!(summary["whole_run_successes_per_second"], 0.7);
+        assert_eq!(summary["active_commands"], 0);
+        record.terminal_at_epoch_secs = Some(100);
+        assert!(array_summary(5, &record, &[])["whole_run_successes_per_second"].is_null());
+    }
+
+    #[test]
     fn an_array_summary_says_when_it_is_done() {
         let record = record_with_failures(&[2, 3, 7]);
         let summary = array_summary(5, &record, &[]);
@@ -1366,6 +1805,63 @@ mod tests {
         assert_eq!(
             summary["failed_indices"],
             serde_json::json!([[2, 3], [7, 7]])
+        );
+    }
+
+    #[test]
+    fn state_bytes_counts_the_replicated_json_of_every_cohort() {
+        let record = record_with_failures(&[2, 3, 7]);
+        let one = serde_json::to_vec(&record.state).unwrap().len();
+        assert_eq!(state_bytes([&record]), Some(one));
+        assert_eq!(state_bytes([&record, &record]), Some(2 * one));
+        assert_eq!(state_bytes([]), Some(0));
+    }
+
+    #[test]
+    fn an_array_summary_reports_retry_causes_beside_the_retry_count() {
+        use crate::meat::task_array::ChunkId;
+        use crate::meat::task_array_state::ChunkResult;
+        let mut state = TaskArrayState::new(TaskArraySpec::with_count(4), 0).unwrap();
+        let node = NodeId::new("worker");
+        state
+            .grant(&node, &IndexRangeSet::from_range(0..=0))
+            .unwrap();
+        let causes = crate::meat::task_array_state::RetryCauses {
+            exit_code: 1,
+            signal: 2,
+            launch: 1,
+            ..Default::default()
+        };
+        state
+            .complete(
+                &node,
+                &ChunkResult {
+                    chunk: ChunkId(0),
+                    attempt: 1,
+                    succeeded: 4,
+                    failed_count: 0,
+                    failed_indices: IndexRangeSet::new(),
+                    not_run: 0,
+                    retried: 4,
+                    retry_causes: causes,
+                    duration_counts: [0; 16],
+                },
+            )
+            .unwrap();
+        let record = TaskArrayRecord {
+            name: "causes".into(),
+            namespace: "default".into(),
+            template: template(),
+            state,
+            terminal_at_epoch_secs: Some(1),
+            quota_blocked: None,
+            unrunnable: None,
+        };
+        let summary = array_summary(9, &record, &[]);
+        assert_eq!(summary["retried"], 4);
+        assert_eq!(
+            summary["retry_causes"],
+            serde_json::json!({"exit_code":1,"signal":2,"timeout":0,"unknown":0,"launch":1,"unrecorded":0})
         );
     }
 }

@@ -5,14 +5,13 @@
 /// Select → Commit) to place replicas across the cluster.
 pub mod admission;
 pub mod autoscaler;
-pub mod batch;
-pub(crate) mod batch_execution;
-pub mod batch_tracker;
+pub mod batch_ids;
 pub mod cluster_state;
 pub mod cron;
 pub mod deploy_types;
 pub mod filter;
 pub mod index_set;
+pub mod job_capability;
 pub mod latency_histogram;
 pub mod quota;
 pub mod scheduler;

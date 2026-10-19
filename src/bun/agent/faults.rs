@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// The principal a fault's automatic expiry is recorded under.
+pub const FAULT_EXPIRY_PRINCIPAL: &str = "system";
+
+/// How long adoption waits for the runtime to name an instance's main pid,
+/// to thaw it if a pause fault froze it. Adoption already waits up to ten
+/// seconds for the runtime per instance.
+const ADOPTION_PID_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What fencing a node fault left for a task to finish.
 pub(super) enum NodeFaultFence {
     /// Nothing: the grant is fenced and its slot free.
@@ -170,6 +178,20 @@ pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError
     }
 }
 
+/// Delays shape each caller's own container `eth0`. A host process on a
+/// mixed node shares the host's network, so it has nothing to shape: leave it
+/// out instead of failing the whole injection on it.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_callers(
+    callers: Vec<crate::smoker::network::LocalCaller>,
+    addressed: &std::collections::HashSet<String>,
+) -> Vec<crate::smoker::network::LocalCaller> {
+    callers
+        .into_iter()
+        .filter(|caller| addressed.contains(&caller.instance_id))
+        .collect()
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Populate the gossip + Raft blocklists to partition this node
     /// from the named peers. Returns how many addresses were blocked.
@@ -321,9 +343,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .count() as u32;
 
-        let target_service_faulted_replicas =
-            self.fault_registry
-                .count_by_service(&request.target_service) as u32;
+        let target_service_faulted_replicas = self
+            .fault_registry
+            .count_paused(request.namespace.as_deref(), &request.target_service)
+            as u32;
 
         // Cluster-derived fields, or zeros when this node has no council. A
         // zero `council_size`/`total_nodes` makes the quorum, leader, and
@@ -674,7 +697,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .filter_map(|instance| {
                 Some((
                     instance.id.clone(),
-                    instance.oci_spec.as_ref()?.linux.host_cgroup_path()?,
+                    self.workload_cgroup_dir(instance.oci_spec.as_ref()?)?,
                 ))
             })
             .collect()
@@ -941,6 +964,52 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// The host cgroup directory a workload's specification places it in.
+    pub(super) fn workload_cgroup_dir(
+        &self,
+        spec: &crate::grill::oci::OciSpec,
+    ) -> Option<std::path::PathBuf> {
+        spec.linux.cgroup_path_under(&self.cgroup_mount)
+    }
+
+    /// Undo whatever a fault from an earlier Bun left on an instance this
+    /// one adopts.
+    ///
+    /// A fault's saved values and paused pids live only in the registry of
+    /// the Bun that applied it, so a Bun that crashes or upgrades mid-fault
+    /// takes them with it, and nothing could lift a CPU cap or thaw a paused
+    /// process afterwards. The adopted instance's recorded specification
+    /// says what its limits should be, so they're written back, and every
+    /// process it runs gets a SIGCONT, which a running process ignores.
+    /// Best-effort: a failure is logged, and adoption goes on.
+    pub(super) async fn release_leftover_faults(
+        &self,
+        id: &InstanceId,
+        spec: &crate::grill::oci::OciSpec,
+    ) {
+        if let Some(cgroup) = self.workload_cgroup_dir(spec)
+            && cgroup.is_dir()
+        {
+            if let Err(error) = crate::smoker::resource::restore_recorded_limits(
+                &cgroup,
+                spec.linux.resources.as_ref(),
+            ) {
+                eprintln!("smoker: restoring {id}'s recorded limits failed: {error}");
+            }
+            if let Err(error) = crate::smoker::process::resume_cgroup_processes(&cgroup) {
+                eprintln!("smoker: resuming {id}'s processes failed: {error}");
+            }
+        }
+        // A runtime that keeps no cgroup of its own (the process runtime)
+        // still names the main process.
+        let pid =
+            tokio::time::timeout(ADOPTION_PID_PATIENCE, self.supervisor.grill().pid(id)).await;
+        if let Ok(Ok(Some(pid))) = pid {
+            // A process that has gone has nothing to resume.
+            let _ = crate::smoker::process::resume_process(pid as i32);
+        }
+    }
+
     /// Pair each saved `(instance id, value)` with the instance's cgroup path.
     ///
     /// The cgroup path comes from the current instance's original OCI specification so
@@ -960,7 +1029,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 {
                     return None;
                 }
-                let path = instance.oci_spec.as_ref()?.linux.host_cgroup_path()?;
+                let path = self.workload_cgroup_dir(instance.oci_spec.as_ref()?)?;
                 // A specific instance target still restores only its own cgroup.
                 if rule.target_instance.as_ref().is_some_and(|t| t != id) {
                     return None;
@@ -992,6 +1061,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // the process frozen and an expired resource fault left its cap in
             // place (CHAOS1).
             self.reverse_fault(rule).await;
+            self.record_fault_expired(rule).await;
             expired_dns |= matches!(
                 rule.fault_type,
                 crate::smoker::types::FaultType::DnsNxdomain
@@ -1011,6 +1081,54 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // helper was killed, so a transient removal failure doesn't leave the
         // controller permanently refusing new pressure faults.
         self.retry_node_pressure_cleanup();
+    }
+
+    /// Audit a fault's automatic reversal (design §8.1: every reversal is
+    /// recorded). The cluster itself acts here, so the principal is
+    /// `system`, and nothing waits for the disk: the agent loop must not.
+    pub(super) async fn record_fault_expired(&self, rule: &crate::smoker::types::FaultRule) {
+        let Some(events) = &self.events else { return };
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let fault_type = serde_json::to_value(&rule.fault_type)
+            .ok()
+            .and_then(|value| value.get("type")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| rule.fault_type.to_string());
+        let mut details = std::collections::BTreeMap::from([
+            ("fault_id".to_string(), rule.id.to_string()),
+            ("fault_type".to_string(), fault_type.clone()),
+            ("injected_by".to_string(), rule.injected_by.clone()),
+            (
+                "duration_seconds".to_string(),
+                (rule.duration_ns / 1_000_000_000).to_string(),
+            ),
+        ]);
+        if let Some(instance) = &rule.target_instance {
+            details.insert("target_instance".to_string(), instance.clone());
+        }
+        let node = self
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.local_node_id.0.clone())
+            .or_else(|| rule.target_node.clone());
+        let _receipt = events
+            .write()
+            .await
+            .record_audit(crate::bun::events::AuditEvent {
+                timestamp,
+                kind: crate::bun::events::EventKind::Fault,
+                severity: crate::bun::events::EventSeverity::Info,
+                action: "fault.expired".to_string(),
+                principal: FAULT_EXPIRY_PRINCIPAL.to_string(),
+                app: (!rule.target_service.is_empty()).then(|| rule.target_service.clone()),
+                namespace: rule.namespace.clone(),
+                node,
+                source_address: None,
+                details,
+                message: format!("fault {} ({fault_type}) expired and was reversed", rule.id),
+            });
     }
 
     /// Local instances that may call a faulted service.
@@ -1171,9 +1289,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 rule.target_service
             ));
         }
-        let callers: Vec<String> = self
-            .local_callers()
-            .await
+        let callers: Vec<String> = delay_callers(self.local_callers().await, &self.addressed())
             .into_iter()
             .filter(|caller| {
                 crate::smoker::network::applies_to_caller(rule, &caller.app, &caller.namespace)
@@ -1198,6 +1314,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             None => Ok(()),
             Some(error) => Err(format!("cannot delay traffic: {error}")),
         }
+    }
+
+    /// Instances with their own container address, the only ones a delay
+    /// can shape.
+    #[cfg(target_os = "linux")]
+    fn addressed(&self) -> std::collections::HashSet<String> {
+        self.supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| instance.container_ip.is_some())
+            .map(|instance| instance.id.0.clone())
+            .collect()
     }
 
     /// Remove any delay tree a previous Bun left on this node's containers.
@@ -1268,7 +1396,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if !delaying && self.network_faults.delays.is_empty() {
             return Vec::new();
         }
-        let callers = self.local_callers().await;
+        let callers = delay_callers(self.local_callers().await, &self.addressed());
         let services = self.merged_service_map();
         let desired = desired_delays(
             self.fault_registry.iter(),

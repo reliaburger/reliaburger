@@ -1,0 +1,7 @@
+---
+source: src/relish/commands.rs
+expression: text
+---
+ops/nightly revision 2: 1 tasks, UTC schedule 0 3 * * *
+  run 41 finished 2026-10-11 03:00 UTC: CompletedWithFailures, 0 succeeded, 1 failed; first failure: task 0
+  run 40 finished 2026-10-10 03:00 UTC: Succeeded, 1 succeeded, 0 failed

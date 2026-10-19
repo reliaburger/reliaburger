@@ -169,6 +169,18 @@ async fn run_tcp_proxy(
 
 Each connection gets its own spawned task with bidirectional `tokio::io::copy`. The `CancellationToken` from `tokio_util` lets us shut down the proxy cleanly when the container is torn down — cancel the token, and the `select!` loop exits.
 
+Which host port, though? The `PortAllocator` in `src/grill/port.rs` picks one at random from `[network] port_range`, and for a long time that range was 10000 to 60000. It looked roomy. It also overlapped Linux's ephemeral range (32768 to 60999 by default), the pool the kernel draws source ports from for every outgoing connection, and it knew nothing about ports a host daemon was already listening on. The allocator's only evidence was its own bookkeeping. With DNAT in front, a published port that happened to match a host service quietly shadowed that service for external clients.
+
+The 0.2.1 fix is two small changes. The default range now stops below the ephemeral range (`start = 10000, end = 32767`, end exclusive), and the allocator asks the host before it hands a port out:
+
+```rust
+fn host_port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
+}
+```
+
+That's a synchronous bind, which looks out of place in async code. It's one non-blocking syscall, though, and the listener is dropped (closing the socket) the moment `is_ok()` returns, so it doesn't stall the runtime. Binding the IPv4 wildcard fails on Linux when anything listens on that port on any IPv4 address, which is exactly the question we're asking. Adopted workloads still `reserve()` their existing ports without a probe: they're the ones holding them.
+
 ### Why nftables, not iptables
 
 You might wonder why we chose nftables over the more familiar iptables. The answer is scaling.
@@ -385,7 +397,7 @@ On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in
 
 ### The BPF maps
 
-The eBPF programs don't call back to Bun. They read from kernel-resident hash maps that Bun populates. Three maps (plus a supplementary one for namespace isolation):
+The eBPF programs don't call back to Bun. They read from kernel-resident hash maps that Bun populates. Three maps, plus two supplementary ones for namespace isolation:
 
 **`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string, value is a 4-byte IPv4 address in network byte order. It's a leftover from the abandoned in-kernel DNS design (see "Why userspace DNS" below) — the userspace responder resolves names straight from the `ServiceMap` instead, so this map isn't on the resolution path today.
 
@@ -395,7 +407,9 @@ The eBPF programs don't call back to Bun. They read from kernel-resident hash ma
 
 **`cgroup_namespace_map`**: The supplementary map — `cgroup_id → namespace_id`. It's the quiet load-bearing one. The connect hook only runs the isolation check when it can find the *source's* namespace here; if the lookup misses, it lets the connection through. So an empty `cgroup_namespace_map` doesn't fail safe, it fails *open* — every cross-namespace connection is allowed. Populating it is what turns isolation on, and `firewall_map` then carries the explicit exceptions. We learned this the hard way: for a while the resolver that computed these entries had no production caller at all (the same "parsed but never wired" trap we hit with port mappings in Chapter 1). Both maps were empty in every running cluster, so namespace isolation was advertised but inert. The fix is a reconcile in Bun that, on every deploy, redeploy and stop, rebuilds both maps from the live service map and the running instances' cgroup ids — writing what should exist and deleting what shouldn't, so a departed workload's isolation identity can't linger on a cgroup id the kernel later reuses.
 
-All four are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
+**`destination_map`**: The second supplementary map, `(ip, port) → (app_id, namespace_id)`. It names who owns a *real* destination, so the isolation check runs on the addresses behind a VIP too. "Isolation on real addresses" below explains why it had to exist.
+
+All five are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
 
 ```rust
 #[repr(C)]
@@ -592,6 +606,41 @@ pub fn allows(&self, src: IpAddr) -> bool {
 }
 ```
 
+### Whose resolver?
+
+Forwarding needs somewhere to forward *to*. For a long time `[dns] upstream` defaulted to `8.8.8.8:53`, and nothing ever read the host's own `/etc/resolv.conf`. That works on a laptop on home broadband. Now picture the 0.3.0 target: a rack in an office whose firewall blocks outbound port 53, and whose internal names (`git.corp.example`) only resolve on the office resolver. Every container's external lookup fails, and the ones that get out tell Google about your internal hostnames. The whitepaper had promised the host's resolvers all along.
+
+So `upstream` is now an `Option<String>`, and `None` means "ask the host". Bun reads the `nameserver` lines once at start:
+
+```rust
+pub fn resolv_conf_nameservers(
+    contents: &str,
+    port: u16,
+    own_listen: std::net::SocketAddr,
+) -> Vec<std::net::SocketAddr> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("nameserver"), Some(address)) => address.parse().ok(),
+                _ => None,
+            }
+        })
+        .map(|ip: std::net::IpAddr| std::net::SocketAddr::new(ip, port))
+        .filter(|address| *address != own_listen)
+        .collect()
+}
+```
+
+If you're coming from Python, this is a generator pipeline; from Go, it's the loop you'd write by hand. `lines()` and `split_whitespace()` hand out borrowed `&str` slices of `contents`, so nothing is copied until `collect()` builds the `Vec`. `filter_map` keeps only the closures that return `Some`, which lets one step both pick `nameserver` lines and drop addresses that don't parse (a comment, or a link-local `fe80::1%eth0`, whose zone suffix `IpAddr` can't hold). Matching on a tuple of two `Option`s is a neat way to say "the first word is `nameserver` and there is a second one" without indexing into a `Vec` that might be short. The type annotation on the `map` closure, `|ip: std::net::IpAddr|`, is what tells `parse()` two lines up which type to produce: Rust infers a generic call's type from how its result is used later.
+
+Two things can't come from the file. resolv.conf has no syntax for a port, so every nameserver answers on 53. And a host resolver that is Bun itself would turn each external query into an endless loop, so we drop any address equal to the responder's own. The configured listen address is only half the story, since `0.0.0.0:53` becomes the runc gateway at start-up, so Bun filters again once the real address is known. If nothing usable is left, DNS is on and there's nowhere to send external names: Bun refuses to start and tells the operator to set `[dns] upstream`. That's the same fail-closed reasoning as the next section.
+
+The responder now holds `upstreams: Vec<SocketAddr>` and tries them in order, giving each the per-query timeout before moving on, which is what glibc does with several `nameserver` lines. A dead first resolver costs a slow lookup, not a failed one.
+
+We considered re-reading resolv.conf when it changes, as systemd-resolved and DHCP clients rewrite it. We didn't, yet: on a server the file is stable, a restart picks up a change, and an inotify watcher is one more task that has to be correct.
+
 ### Fail closed, not open
 
 One more change worth calling out. The original responder was spawned as a detached best-effort task: if it couldn't bind its socket, the error was logged and the node carried on. That's the wrong default. A node that's advertising service discovery but has no resolver is worse than one that refuses to start — the apps deploy, look healthy, and then can't find each other. Bun now binds both UDP and TCP *before* it starts the agent or publishes readiness. Either bind failing aborts startup. If the serving task later exits, its supervisor cancels Bun so the reporting lease expires and the scheduler withdraws the capability. Config validation catches the related trap earlier still: a VIP the responder hands out only routes because the eBPF connect hook rewrites it, so enabling `[dns]` with `[ebpf]` turned off is rejected outright rather than deploying an app whose VIP silently goes nowhere.
@@ -735,6 +784,43 @@ One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goe
 
 While we were in there, we fixed how a defective object file fails. The map handles used to be fetched lazily, deep inside the agent, with `.unwrap()` — a `.bpf.o` missing a map would panic Bun at the first write, minutes or hours after startup. Now the loader validates every required map and program against a single list the moment the object loads, and refuses with the full roster of what's missing. One clear error at load time beats nine scattered panics at use time.
 
+### Isolation on real addresses
+
+Here's a question an audit asked us, and it's worth asking of any isolation story: what does `relish resolve db` print? A VIP, and then the backends: `10.88.0.5:5432` on this node, `192.168.0.2:31001` on another. So what stops a workload in the `shop` namespace from skipping the VIP and dialling `192.168.0.2:31001` directly?
+
+For a long time, nothing. The namespace check lived inside the VIP branch of the connect hook. A connect to anything outside `127.128.0.0/16` went straight to the egress check and, for an app without an allowlist, through. "Cross-namespace traffic is blocked by default" was true for anyone polite enough to use the VIP.
+
+The fix (decision D3-B in the 0.2.0 audit) is a map from real destination to owner. `destination_map` holds three kinds of entry, all rebuilt by the same reconcile that writes `cgroup_namespace_map` and `firewall_map`:
+
+- each backend in the merged service view, at the address the VIP rewrites to: a local container's address and port, or a remote node's address and published host port;
+- each backend the replicated catalogue lists on *any* node, this one included, at its node address and host port. That's the DNAT target another node's workload would dial;
+- port 0, meaning every port, of each local container address, jobs and delegated task containers included.
+
+The hook now looks up a non-VIP destination, exact port first, then port 0, and runs the same namespace check the VIP path runs. We pulled that check out into two small `static __always_inline` helpers, `source_namespace` and `isolation_denies`, so the VIP path and the real-address path can't drift apart. The same helper runs in `sendmsg4`, and in `connect6` and `sendmsg6` for v4-mapped addresses, because otherwise UDP and dual-stack sockets would each be a new door. (We've learned to count the doors.)
+
+A service's real addresses carry the service's own `app_id`, the same identity its VIP carries. That keeps `allow_from` simple: one grant covers both paths. A job publishes no service, so it gets an identity of its own, `0x8000_0000 | hash(namespace/name)`. VIP identities are `127.128.x.x` read as a `u32`, which is always below `0x8000_0000`, so the two ranges can't collide.
+
+What if two owners claim one address? It can happen for a moment: a catalogue entry naming a host port on another node that the node has since reused. Guessing would be a security decision made by accident. Instead, the reconcile marks the address *contested*, with a namespace id of `0xFFFFFFFF`. No source has that namespace, so every namespaced caller is refused until the owners agree. In Rust that's one call to the entry API:
+
+```rust
+entries
+    .entry(key)
+    .and_modify(|current: &mut DestinationValue| {
+        if *current != value {
+            *current = DestinationValue { app_id: 0, namespace_id: NAMESPACE_CONTESTED };
+        }
+    })
+    .or_insert(value);
+```
+
+`BTreeMap::entry` hands back a view of the slot for `key`, present or not. `and_modify` runs only when something's there; `or_insert` only when nothing is. One lookup, no `if let Some(...) = map.get_mut(...)` dance, and the borrow checker is happy because the closure borrows the slot, not the map.
+
+Socket hooks only see sockets, though. A container with `CAP_NET_RAW` can hand-craft packets, and a container dialling *any* address at a published host port gets forwarded by the portmap DNAT to whichever container owns that port, after the connect hook has already looked at the pre-DNAT address. So there's a second layer on the forward path: an nftables table, `reliaburger_isolation`, that keeps each local workload address in a per-namespace set and drops a packet from one host veth to another workload's address unless the namespaces match, `allow_from` granted the pair, or it answers an allowed connection. Bun rebuilds the whole table in one `nft -f` transaction whenever the reconcile's answer changes, off the agent loop.
+
+Host `exec` and `script` workloads needed one more piece. They never ran in a cgroup of their own, so the hook couldn't tell which namespace they belonged to, and they bypassed isolation entirely. Now the owned process runtime's execution gate writes `0` to `cgroup.procs` of the workload's cgroup just before it `exec`s the command (writing `0` moves the writer), and the agent binds that cgroup before start, exactly as it does for a container. Be clear about what this buys: a host command running as root can write itself into another cgroup. Isolation keeps honest host commands in bounds; it doesn't contain hostile root code. Processes outside Reliaburger's cgroups (sshd, cron, Bun itself) were never inside the policy and still aren't.
+
+The Lima tests prove each path with a listener on a loopback address of its own, so a test's map entries can't touch another test's traffic: `cross_namespace_connect_to_container_ip_is_denied`, `cross_namespace_connect_to_node_host_port_is_denied`, `allow_from_opens_the_real_address_path_too` and `exec_workload_is_held_to_its_namespace`. One kernel can't host two Buns (only one may own the root cgroup's hooks), so the cross-node case is a catalogue entry naming a "remote" node at its own loopback address.
+
 ### Running Linux tests from a MacBook
 
 Here's a problem we hit early: most of the interesting tests need Linux. Network namespaces, veth pairs, runc containers, eBPF programs — none of these exist on macOS. You could push to CI and wait, but that's a slow feedback loop when you're debugging a failing test.
@@ -779,7 +865,7 @@ Let's step back and see what Onion gives us.
 
 A container calls `getaddrinfo("redis.internal")`. Bun's built-in DNS responder looks up the service map and responds with a virtual IP — one node-local UDP round trip, about 50 microseconds. The container calls `connect()` with that VIP. An eBPF program intercepts the syscall, picks a healthy backend via round-robin from a kernel hash map, and rewrites the destination. The TCP handshake goes directly to the backend. No proxy in the data path, no iptables rules.
 
-Kubernetes needs CoreDNS (a separate Go binary consuming 170MB of RAM), kube-proxy (thousands of iptables rules, O(n) per packet), and often a service mesh sidecar (Envoy, consuming 50-100MB per pod). We need a single binary with a built-in DNS responder, one eBPF program, and a hash map. The eBPF connect hook persists in the kernel — if Bun crashes, running connections keep working. DNS resolution pauses (since Bun runs the responder), but that only affects new connections. Existing TCP sessions are fine.
+Kubernetes needs CoreDNS (a separate Go binary consuming 170MB of RAM), kube-proxy (thousands of iptables rules, O(n) per packet), and often a service mesh sidecar (Envoy, consuming 50-100MB per pod). We need a single binary with a built-in DNS responder, one eBPF program, and a hash map. The eBPF connect hook persists in the kernel — if Bun crashes, running connections keep working. DNS resolution pauses (since Bun runs the responder), but that only affects new connections. Existing TCP sessions are fine. The systemd units we ship make the commonest crash, the OOM killer, less likely: `OOMScoreAdjust=-900` tells the kernel to kill workloads before Bun when memory runs out, and `RestartSec=2` brings Bun back two seconds after any exit. The -900 alone wasn't enough: a child inherits its parent's score, so every container and job Bun started ran at -900 too, and in the 0.2.0 jobs soak the kernel took Bun over a leaking Lima guest agent at -500 ([#984](https://github.com/reliaburger/reliaburger/issues/984)). Bun now starts every workload at +500; Chapter 17 shows how.
 
 We originally planned to do DNS entirely in-kernel too. It turned out the cgroup socket-address hooks we chose can't read DNS packet payloads. A TC proof shows packet hooks can do it, but only by adding a second, deliberately narrower parser and lifecycle. So we went with the pragmatic approach: userspace DNS at 50 microseconds, in-kernel connect rewrite at zero. Pragmatism over purity. We'll revisit TC only if measurements show a material reason.
 
@@ -858,9 +944,9 @@ Each client gets a token bucket. Tokens refill at a configured rate (requests pe
 
 There's a question hiding in "each client": keyed by what? Key by IP alone and one client's `/api` traffic spends the same budget as its `/` traffic — two routes with different limits share a bucket, which is wrong. So the bucket key is the pair `(route, client IP)`, where the route is `(host, path prefix)`. A client hammering `/api` can still load `/` at full rate. Same fix shape as the namespaced VIPs and routes: when two things should be independent, put both of them in the key.
 
-The config for a bucket also needs validating before it's ever used. A rate of zero requests per second isn't "unlimited", it's a divide-by-zero waiting to happen when we compute the retry-after. So we reject `rps == 0` (and a `burst` that would overflow when we derive its default) at routing-rebuild time — the route with the bad limit is simply never installed, and the operator gets told which app was rejected. Bad input caught at the door beats a panic in the hot path.
+The config for a bucket also needs validating before it's ever used. A rate of zero requests per second isn't "unlimited", it's a divide-by-zero waiting to happen when we compute the retry-after. So we reject `rps == 0` (and a `burst` that would overflow when we derive its default). `relish apply` and `relish lint` refuse it first; a routing rebuild that meets one anyway never installs that route and logs which app it skipped. Bad input caught at the door beats a panic in the hot path.
 
-Rate limiting is per-node, not cluster-wide. An attacker hitting all nodes gets N times the rate limit. For serious DDoS protection, you'd put something like Cloudflare or AWS Shield in front. Our rate limiter is there for reasonable load shedding, not nation-state defence.
+Rate limiting is per-node, not cluster-wide: the limit is per node, per client IP. A client that an L4 balancer spreads over N nodes, or an attacker hitting all of them, gets N times the rate limit. For serious DDoS protection, you'd put something like Cloudflare or AWS Shield in front. Our rate limiter is there for reasonable load shedding, not nation-state defence.
 
 Stale token buckets (no requests for 5 minutes) are garbage collected every 60 seconds to bound memory growth.
 
@@ -878,11 +964,39 @@ pub enum TlsMode {
 }
 ```
 
-`Disabled` is plain HTTP. `Cluster` issues the ingress certificate from the cluster's Sesame Ingress CA — the air-gapped case, where every client already trusts the cluster root. `Explicit` uses an operator-supplied certificate and key file. A route that asks for anything else — `auto`, `acme`, a typo — is a **config error**, rejected at rebuild, not silently downgraded to plaintext. That's the whole point: an unsupported mode must fail loudly, never fall back to the clear.
+`Disabled` is plain HTTP. `Cluster` issues the ingress certificate from the cluster's Sesame Ingress CA — the air-gapped case, where every client already trusts the cluster root. `Explicit` uses an operator-supplied certificate and key file. A route that asks for anything else — `auto`, `acme`, a typo — is a **config error**, refused at `relish apply` and skipped at rebuild, never silently downgraded to plaintext. That's the whole point: an unsupported mode must fail loudly, never fall back to the clear.
 
 Once a route knows it needs TLS, the plain-HTTP listener stops serving it. A request for a TLS route on port 80 gets a `308 Permanent Redirect` to the `https://` URL (308, not 301, because it preserves the method and body — a redirected POST stays a POST). That includes `/.well-known/acme-challenge/`: v1 has no ACME responder, so leaving that path open would create a plaintext exception with nobody legitimate to answer it.
 
 For the cluster-CA path we reuse Sesame's Ingress CA rather than inventing a parallel certificate scheme. Sesame already builds a Root CA and three intermediates — Node, Workload, and Ingress — when a cluster is initialised. `issue_ingress_cert` asks the Ingress CA for an end-entity certificate carrying the ingress hostnames as SANs and the TLS server extended-key-usage, then hands the DER straight to rustls. One CA hierarchy, one trust root, ingress certs included. We deliberately did *not* build full ACME here — that's a lot of protocol for a speculative feature, and the explicit and cluster paths cover the real cases. TLS 1.0 and 1.1 are still rejected; only 1.2 and 1.3 are accepted.
+
+### One bad route, one skipped route
+
+"Skipped at rebuild" sounds safe. It was safe on the local path. On the cluster path it was a cluster-wide outage waiting for a typo.
+
+`RoutingTable::rebuild` installs every valid route and then, if any were invalid, returns `Err(RoutingError)` listing them. That `Err` is really a warning: the table is already built and usable. The local rebuild treated it that way and logged it. The two cluster paths, though, the plain catalogue publication and the discovery-owning consumer view, did what Rust makes very easy:
+
+```rust
+candidate
+    .rebuild(&merged, &ingress)
+    .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
+```
+
+The `?` operator returns early from the function with the error. So one app with `tls = "acme"` made every node refuse every new catalogue generation, and from then on service discovery, DNS answers and ingress for *every* app were frozen at the last good catalogue. Nothing at apply time looked at `ingress` at all, and the manual told people that `acme` "fails route validation", so they'd try it.
+
+The fix has two halves. First, both cluster paths now do what the local path did: log the rejected routes (the error already names each one's namespace and app) and publish everything else.
+
+```rust
+if let Err(error) = candidate.rebuild(&merged, &ingress) {
+    eprintln!("wrapper: cluster catalogue {generation} skipped invalid routes: {error}");
+}
+```
+
+Second, the bad spec shouldn't get that far. `validate_app` now calls `wrapper::routing::validate_ingress`, which runs the very checks the rebuild runs (`TlsMode::parse` and the rate-limit builder), so `relish apply` and `relish lint` refuse it. One function, two callers: the validator can't drift from what the data plane accepts.
+
+What we didn't do is change `rebuild`'s signature to return the rejected list as plain data instead of an `Err`. That would make the misuse impossible to write, which is tempting. It would also churn every test and caller for a type that already says what happened, and the rule "a node only refuses a catalogue it can't trust, and one route isn't the catalogue" now lives in a comment next to each caller. The regression tests (`one_invalid_cluster_route_does_not_block_the_catalogue`, its consumer-path twin, and the three-node `invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide`, which writes the bad spec straight to the council to stand in for one admitted before validation existed) pin that rule down instead.
+
+The lesson is about `?`. It's the best thing in Rust's error handling, and it's also a decision you make on every line: "this failure ends my function". When a `Result` carries partial success, read the `Err` before you propagate it.
 
 ### Switching the proxy on
 
@@ -1094,6 +1208,49 @@ Then we measured the real binary on Linux. A Python forwarder that behaves like 
 
 Its memory was less tidy, and that's worth being honest about. Each round still parks 600 connections at once for 75 seconds, and glibc's allocator spreads those buffers over one arena per thread and doesn't hand fragmented arenas back to the kernel. Resident memory crept up to about 397 MB over eight rounds and flattened out. With `MALLOC_ARENA_MAX=2` the same run levelled off at 284 MB after round two, and the same requests sent directly (every client closes its own socket) left Bun flat at 113 MB, exactly like an idle Bun. So what's left is allocator high-water, not a leak, and the soak's real rate (one poll every 30 seconds) keeps only a handful of idle connections alive at any moment.
 
+### The buffer every connection kept (0.2.0 soak fix)
+
+"A handful" turned out to be optimistic. In the 0.2.0 soak the node that took the cluster's API traffic sat at 600 to 800 MB of resident memory for hours while its two peers sat near 200 MB, and the kernel eventually killed it during an upgrade ([#892](https://github.com/reliaburger/reliaburger/issues/892), and [chapter 14](14-changing-the-tyres.md#a-binary-too-big-to-hold) for the upgrade half). It wasn't the leader. It was simply the node the harness's `relish` and the job controller talked to first, and when it was down and node 2 took the traffic, node 2 climbed to 600 MB and came back down when node 1 returned.
+
+The soak's snapshots record each Bun's resident memory and its open file descriptors every few seconds. Over 2,201 samples across the three nodes the two move together (a correlation of 0.87), at about 2.5 MB of memory per descriptor. The API node held 220 to 320 descriptors, its peers 70 to 145. The job controller runs one `curl` per request, six job polls every two seconds, and each one arrives through Lima's forwarder as a new connection that then sits idle for its 75 seconds. So a couple of hundred idle connections was normal, and something in each one cost megabytes. A TLS session and Hyper's read buffer are tens of kilobytes. What's the rest?
+
+Hyper's source answered it. When Hyper writes an HTTP/1 response, it asks the stream one question first:
+
+```rust
+let strategy = if io.is_write_vectored() {
+    WriteStrategy::Queue
+} else {
+    WriteStrategy::Flatten
+};
+```
+
+`is_write_vectored` is a method on Tokio's `AsyncWrite` trait. A stream that can send several buffers in one system call (`writev`) says `true`, and Hyper then queues the response body's own buffers behind the headers and writes them without copying. A stream that says `false` gets "flatten": Hyper copies every body chunk into its one write buffer, a `Vec<u8>`, however big the chunk is, and writes that. Between requests it empties the `Vec` with `clear()`, which keeps its capacity. So a connection that once sent a 4 MB `wtf` answer or cluster status keeps a 4 MB buffer for as long as it stays open.
+
+TCP sockets and rustls sessions both say `true`. Our wrappers said `false`. `StallGuardedIo` and `LifetimeLimitedIo` implement `poll_write`, `poll_flush` and `poll_shutdown` and nothing else, and the trait gives every method you don't write a default. The default `is_write_vectored` returns `false`, and the default `poll_write_vectored` writes only the first non-empty buffer through `poll_write`. Nothing failed; Hyper just quietly picked the copying path. This is the cost of default methods in Rust traits: they make wrappers short, and they let a wrapper hide what the thing inside it can do. A wrapper around an I/O stream should forward every optional capability, not just the required ones.
+
+The fix forwards both:
+
+```rust
+fn poll_write_vectored(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &[io::IoSlice<'_>],
+) -> Poll<io::Result<usize>> {
+    let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+    self.track_write(cx, poll)
+}
+
+fn is_write_vectored(&self) -> bool {
+    self.inner.is_write_vectored()
+}
+```
+
+`io::IoSlice` is a borrowed buffer laid out like the C `struct iovec` that `writev(2)` takes, so a slice of them goes to the kernel as it is. The stall guard passes the result through `track_write` like any other write, so a vectored write that makes no progress still trips its five-minute limit, and a test pins that down.
+
+`tests/connection_memory.rs` is the test that would have caught it. Like the Mayo and upgrade memory tests, it's a binary with a counting global allocator. It serves a 4 MiB answer (one shared `Bytes`, so the answer itself is never counted twice) on eight kept-alive connections through `serve_http_connection`, reads each answer, leaves the connections open, and divides the heap they still hold by eight. Before the fix each one held 4,217,881 bytes: the answer plus Hyper's bookkeeping. After it, 31,968. The unit tests beside the wrappers check the other half, that each one reports what the socket under it reports.
+
+The 2.5 MB per connection is the soak's number and the 32 KB is the test's. We thought the rest of the API node's extra memory was short-lived work per request: verifying a bearer token hashes it with Argon2, which needs 19 MiB each time (up to four at once on the blocking pool), and a few handlers copy the council's whole desired state to read one field. We said neither grows over time. The next soak proved us half wrong. With this fix in, the API node still reached 1.1 GB, and it moved in steps of exactly 19 MiB: glibc kept nearly every Argon2 block it was handed, one or more in each of its arenas. Chapter 10's "Don't let the hash keep its memory" has the cause and the fix. In 0.2.0 Argon2's memory came from a mapping of its own and went back to the kernel when the hash was done; in 0.2.1 tokens are checked with SHA-256, which needs no working memory at all. The desired-state copies are still there; they really are short-lived.
+
 ### Count the request before you hide the route
 
 The permit fixed WebSockets that started *during* a drain. It said nothing about a slow request that reached its backend a second *before* the drain began. The tracker had never counted it, so the drain reported "complete" while the request was still waiting for its answer, and Bun stopped the container underneath it. A gated test server that acknowledges a request and then waits to be released made this easy to reproduce.
@@ -1160,6 +1317,23 @@ script. Those differ when cross-compiling. An embedded-object integration test
 loads and attaches the object on a real Linux kernel without supplying an object
 directory. This belongs in the privileged eBPF suite; a macOS unit test can't
 prove that a Linux kernel accepts a program.
+
+The rest of the eBPF suite took longer to catch up. Its helper walked the
+target directory and loaded the first `onion_connect.bpf.o` it found. That's
+fine when one checkout owns the directory. Several worktrees sharing one
+`CARGO_TARGET_DIR` each leave an object in there, though, and the walk had no
+way of telling which was ours. A test could pass against another branch's
+program. Now every test loads the embedded copy through `load_embedded`, the
+way Bun does. The one test that covers the `program_dir` override copies this
+build's object into a temporary directory first.
+
+How do we know the object belongs to this build? `OnionEbpf::embedded_object()`
+returns the embedded bytes, and a test that needs no kernel compares them with
+the file in the test's own `OUT_DIR`. Cargo hands the library and its
+integration tests the same build-script directory, so `env!("OUT_DIR")` can't
+point at another tree. The test then reads `ebpf/onion_connect.bpf.c` and checks
+that every map it declares appears as a symbol in the object. Add a map without
+rebuilding the object and this test fails.
 
 ## A route belongs to the cluster
 
@@ -1444,4 +1618,19 @@ The other half of the fix is to lose the race less often. `reqwest` keeps an idl
 
 Two tests pin this down, both built on a fake backend that answers the first request on a connection and then drops the connection as soon as the next request arrives. `idempotent_request_on_a_closed_pooled_connection_is_retried` sends three `GET`s and wants three 200s; before the fix the second one came back 502 every time. `streamed_post_on_a_closed_pooled_connection_is_not_replayed` warms the pool, sends a `POST`, and wants a 502 plus a backend that saw the `POST` exactly once.
 
-Finally, a limit. Rootless Runc can prove who owns its local host port, but nothing yet carries that proof through remote withdrawal. So for 0.1.0 rootless Runc is standalone only: Bun refuses `--cluster` as soon as it selects a rootless runtime, before it touches any state. Container clusters are rootful Linux Runc with eBPF, which is what the macOS quickstart runs inside its Linux VM.
+Finally, a limit. Rootless Runc can prove who owns its local host port, but nothing yet carries that proof through remote withdrawal. So for 0.1.0 rootless Runc is standalone only: Bun refuses `--cluster` when the runtime it would select is rootless Runc, before it touches any state. Container clusters are rootful Linux Runc with eBPF, which is what the macOS quickstart runs inside its Linux VM.
+
+That refusal used to come later than it should. Bun first wrote its state-format marker, claimed the image upload lock and started hashing its own binary for self-upgrade, and only then selected the runtime and refused. The hash runs on Tokio's blocking pool (`spawn_blocking`, threads set aside for work that would stall the async scheduler), and dropping a Tokio runtime waits for every blocking task it started. So the error message waited for a SHA-256 of the whole binary: 2.5 seconds for an 850 MB debug build on an idle VM, 16 seconds on a loaded one, which is how a test with a 10 second bound found it ([#813](https://github.com/reliaburger/reliaburger/issues/813)). The conflict is between the command line and the host (no root, and a selection that means Runc), so `refuse_rootless_cluster` now runs straight after argument parsing, before Bun loads its config:
+
+```rust
+#[cfg(target_os = "linux")]
+if cli.cluster {
+    let rootless = reliaburger::grill::rootless::is_rootless();
+    let runc_installed = rootless
+        && cli.runtime == "auto"
+        && matches!(detect_runtime().await, DetectedRuntime::Runc { .. });
+    refuse_rootless_cluster(&cli.runtime, rootless, runc_installed)?;
+}
+```
+
+`#[cfg(target_os = "linux")]` compiles the block only on Linux, where Runc exists. The `&&` chain short-circuits, as in C, so only a rootless `auto` cluster pays for the `which runc` probe. In the `matches!` pattern from Chapter 1, `{ .. }` ignores the variant's fields. The decision itself is a plain function of three inputs, so unit tests cover every selection without a rootless host. The integration test also checks that the refused node left nothing but its `node.toml` behind.

@@ -18,9 +18,10 @@ use crate::relish::council_view::CouncilNodeObservation;
 use super::{
     AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
     ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
-    DiskObservation, Evidence, FaultObservation, LogObservation, NodeObservation,
-    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
-    TokenObservation, WtfInputs,
+    DiskObservation, Evidence, FaultObservation, GitOpsObservation, IsolationObservation,
+    LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable,
+    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+    ServiceObservation, TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -209,6 +210,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         collect_council_evidence(cluster_enabled, &collected, council_result, collected_at);
     let restarts = collect_restarts(&collected, collected_at);
     let deploys = collect_deploys(&collected, collected_at);
+    let isolation = collect_isolation(&desired_result, capabilities_result.as_ref(), collected_at);
     let replicas = collect_replicas(&desired_result, &collected, app, collected_at);
     let services = collect_services(desired_result, services_result, app, collected_at);
     let faults = collect_faults(&collected, collected_at);
@@ -224,6 +226,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         // Tokens live in the council; a standalone node has none.
         Evidence::available(collected_at, Vec::new())
     };
+    let gitops = collect_gitops(&endpoints, collected_at).await;
     let recent_logs = collect_logs(client, app, &restarts, collected_at).await;
 
     Ok(WtfInputs {
@@ -239,6 +242,8 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             certificates: local.certificates,
             registry,
             tokens,
+            isolation,
+            gitops,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -647,10 +652,26 @@ fn collect_replicas(
         .filter(|desired| app_scope.is_none_or(|app| desired.app == app))
         .map(|desired| {
             let mut running = BTreeMap::new();
+            let mut launch_failures = Vec::new();
             for node in collected {
                 let Ok(instances) = &node.instances else {
                     continue;
                 };
+                launch_failures.extend(
+                    instances
+                        .iter()
+                        .filter(|instance| {
+                            instance.app_name == desired.app
+                                && instance.namespace == desired.namespace
+                        })
+                        .filter_map(|instance| {
+                            Some(LaunchFailureObservation {
+                                node: node.node_id.clone(),
+                                instance: instance.id.clone(),
+                                reason: instance.reason.clone()?,
+                            })
+                        }),
+                );
                 let count = instances
                     .iter()
                     .filter(|instance| {
@@ -675,6 +696,9 @@ fn collect_replicas(
                 unanswered: unanswered.clone(),
                 blocked: desired.blocked.as_ref().map(ToString::to_string),
                 volume_home_away: desired.volume_home_away.clone(),
+                unschedulable: desired.unschedulable.as_ref().map(ToString::to_string),
+                rollout_failed: desired.rollout_failed.clone(),
+                launch_failures,
             }
         })
         .collect();
@@ -927,11 +951,132 @@ fn collect_registry(
                     peer_reachable: registry.peer_reachable,
                     redundancy_possible: registry.redundancy_possible,
                     under_replicated_layers: registry.under_replicated_layers,
+                    lost_images: registry.lost_images,
+                    lost_image_count: registry.lost_image_count,
+                    needs_mtls: registry.needs_mtls,
                 });
             }
         }
     }
     builder.finish(observed_at)
+}
+
+/// Ask every node how the cluster's GitOps looks from there (#693).
+///
+/// The sync warnings live in Raft, so any node's answer carries them. Each
+/// node also reports whether its own `[gitops]` differs from the cluster's,
+/// which only that node knows.
+async fn collect_gitops(
+    endpoints: &[NodeEndpoint],
+    observed_at: u64,
+) -> Evidence<GitOpsObservation> {
+    let answers = futures_util::future::join_all(endpoints.iter().map(|endpoint| async move {
+        let status = match &endpoint.client {
+            Ok(client) => bounded("gitops status", client.gitops_status()).await,
+            Err(reason) => Err(reason.clone()),
+        };
+        (endpoint.status.node_id.clone(), status)
+    }))
+    .await;
+    let mut value = GitOpsObservation::default();
+    let mut answered = false;
+    let mut missing = Vec::new();
+    for (node_id, status) in answers {
+        let status = match status {
+            Ok(status) => status,
+            Err(reason) => {
+                missing.push(format!("node {node_id}: {reason}"));
+                continue;
+            }
+        };
+        if !answered {
+            value.warnings = status
+                .sync
+                .as_ref()
+                .map(|sync| sync.warnings.clone())
+                .unwrap_or_default();
+        }
+        answered = true;
+        value.configured |= status.config.is_some();
+        match status.local {
+            crate::lettuce::types::LocalConfigCheck::Differs { fields } => {
+                value
+                    .differing_nodes
+                    .push(NodeGitOpsDifference { node_id, fields });
+            }
+            crate::lettuce::types::LocalConfigCheck::Unreadable { reason } => {
+                value
+                    .unreadable_nodes
+                    .push(NodeGitOpsUnreadable { node_id, reason });
+            }
+            _ => {}
+        }
+    }
+    if !answered {
+        return Evidence::Unavailable {
+            reason: missing.join("; "),
+        };
+    }
+    if missing.is_empty() {
+        Evidence::available(observed_at, value)
+    } else {
+        Evidence::Degraded {
+            observed_at,
+            value,
+            reason: missing.join("; "),
+        }
+    }
+}
+
+/// Every namespace with a desired app, and whether each node can keep them
+/// apart: its live hooks and runtime can enforce isolation.
+fn collect_isolation(
+    desired: &Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String>,
+    report: Result<&ClusterCapabilityReport, &String>,
+    observed_at: u64,
+) -> Evidence<IsolationObservation> {
+    let (desired, report) = match (desired, report) {
+        (Ok(desired), Ok(report)) => (desired, report),
+        (Err(reason), _) | (_, Err(reason)) => {
+            return Evidence::Unavailable {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let namespaces: BTreeSet<String> = desired.iter().map(|app| app.namespace.clone()).collect();
+    let mut nodes = Vec::new();
+    let mut missing = Vec::new();
+    for node in &report.nodes {
+        match node {
+            CollectedNodeCapability::Unknown {
+                node_id, reason, ..
+            } => missing.push(format!("node {node_id}: {reason}")),
+            CollectedNodeCapability::Evidence {
+                node_id, report, ..
+            } => match &report.placement {
+                Some(placement) => nodes.push(NodeIsolation {
+                    node_id: node_id.clone(),
+                    enforced: placement.egress.can_enforce_isolation(),
+                }),
+                None => missing.push(format!(
+                    "node {node_id}: live enforcement evidence is absent"
+                )),
+            },
+        }
+    }
+    let value = IsolationObservation {
+        namespaces: namespaces.into_iter().collect(),
+        nodes,
+    };
+    if missing.is_empty() {
+        Evidence::available(observed_at, value)
+    } else {
+        Evidence::Degraded {
+            observed_at,
+            value,
+            reason: missing.join("; "),
+        }
+    }
 }
 
 async fn collect_logs(
@@ -1115,7 +1260,9 @@ mod tests {
                 service_port: Some(8080),
                 blocked: None,
                 volume_home_away: None,
+                unschedulable: None,
                 volume_homes: Vec::new(),
+                rollout_failed: None,
             }]),
             Ok(Vec::new()),
             None,
@@ -1416,6 +1563,8 @@ mod tests {
             version: "v0.1.1".into(),
             commit: Some("3fcb1fd".into()),
             binary_sha256: Some("aaaa".into()),
+            platform: None,
+            compatibility: None,
         };
         let collected = [
             ("node-1", Ok(answered)),

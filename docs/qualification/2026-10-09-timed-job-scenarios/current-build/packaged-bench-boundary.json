@@ -1,0 +1,13 @@
+{
+  "source_commit": "006aca5f9157a3b9432752470d507ca6ecb7e0d5",
+  "concurrency": 27,
+  "cpu_request_millicores": 25,
+  "public_cpu_limit_millicores": 1000,
+  "public_memory_bytes": 33554432,
+  "host_busybox_sha256": "f19470457088612bc3285404783d9f93533d917e869050aca13a4139b937c0a5",
+  "same_original_bun_and_service": true,
+  "raw_supervisor_changed_requires_new_hour": true,
+  "controller_pid": 3532141,
+  "controller_start_ticks": 120756791,
+  "started_utc": "2026-10-09T18:32:35.553964+00:00"
+}

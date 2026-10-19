@@ -95,6 +95,17 @@ impl CrlHandle {
         cert::check_crl(serial, &guard)
     }
 
+    /// Whether a chain a peer presented at an earlier handshake would still be
+    /// admitted: no certificate in it revoked and no node in it retired.
+    ///
+    /// A handshake checks the CRL once. A connection that outlives it (the
+    /// Raft transport keeps connections open, #928) calls this before each
+    /// use, so a revocation still takes effect at the next RPC.
+    pub fn admits(&self, chain: &[CertificateDer<'_>]) -> bool {
+        let chain: Vec<&CertificateDer<'_>> = chain.iter().collect();
+        self.check_chain(&chain).is_ok()
+    }
+
     /// Check every certificate in a presented chain against the CRL.
     fn check_chain(&self, chain: &[&CertificateDer<'_>]) -> Result<(), rustls::Error> {
         for der in chain {

@@ -41,6 +41,18 @@ class Contracts(unittest.TestCase):
         with self.assertRaisesRegex(contracts.Invalid, expected):
             self.check()
 
+    def test_native_host_cases_have_exact_linux_gate_contracts(self):
+        root = Path(__file__).resolve().parents[2]
+        manifest = json.loads((root / 'tests/contracts/manifest.json').read_text())
+        cases = {(case['binary'], case['test']): case['requires']
+                 for contract in manifest['contracts'] for case in contract['cases']}
+        for name in (
+            'cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_profiles',
+            'cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart',
+        ):
+            self.assertEqual(cases.get(('reliaburger::owned_task_arrays', name)),
+                             ['linux-root-storage'], name)
+
     def test_current_successful_discovered_execution_passes(self):
         self.assertEqual(self.check(), {('reliaburger', 'pickle::tests::bounded')})
 
@@ -139,6 +151,16 @@ class Contracts(unittest.TestCase):
         self.discovery['rust-suites']['reliaburger']['testcases']['pickle::tests::bounded']['filter-match'] = {'status': 'mismatch', 'reason': 'expression'}
         self.write()
         self.rejects('empty selected')
+
+    def test_a_partitioned_list_names_its_own_tests_and_every_shards_tests(self):
+        cases = self.discovery['rust-suites']['reliaburger']['testcases']
+        cases['other::shard'] = {'ignored': False, 'filter-match': {'status': 'mismatch', 'reason': 'partition'}}
+        # Filtered out for any other reason, a test is in no shard's list.
+        cases['filtered::out'] = {'ignored': False, 'filter-match': {'status': 'mismatch', 'reason': 'expression'}}
+        cases['ignored::one'] = {'ignored': True, 'filter-match': {'status': 'mismatch', 'reason': 'ignored'}}
+        own, everything = contracts.partitioned(self.discovery)
+        self.assertEqual(own, {('reliaburger', 'pickle::tests::bounded')})
+        self.assertEqual(everything, {('reliaburger', 'pickle::tests::bounded'), ('reliaburger', 'other::shard')})
 
     def test_renamed_case_fails_exact_match(self):
         self.manifest['contracts'][0]['cases'][0]['test'] = 'pickle::tests::renamed'

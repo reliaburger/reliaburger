@@ -180,6 +180,7 @@ mod tests {
                 pid: Some(1234),
                 runtime_unknown: false,
                 status_age_ms: None,
+                reason: None,
             },
             InstanceStatus {
                 exit_code: None,
@@ -192,6 +193,7 @@ mod tests {
                 pid: None,
                 runtime_unknown: false,
                 status_age_ms: None,
+                reason: None,
             },
         ];
         let html = render_instance_table_fragment(&instances);

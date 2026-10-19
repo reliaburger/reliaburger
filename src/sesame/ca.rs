@@ -714,8 +714,8 @@ pub fn verify_join_token(token_plaintext: &str, stored_hash: &[u8; 32]) -> bool 
 /// byte difference into one accumulator, so the running time depends only on
 /// the length, not the contents. `ring::constant_time` is deprecated and
 /// pulling in `subtle` as a direct dependency isn't warranted for a 32-byte
-/// compare, so we spell it out.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// compare, so we spell it out. Join-token and API-token digests both use it.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

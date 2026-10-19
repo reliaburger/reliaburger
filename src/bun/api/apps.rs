@@ -66,21 +66,31 @@ pub(super) async fn stop_handler(
             .into_response();
     }
     if let Some(council) = state.council.clone() {
-        return cluster_app_change(state, council, app, namespace, AppChange::Stop).await;
+        return cluster_app_change(state, council, app, namespace, AppChange::Stop, &headers).await;
     }
 
     stop_local(&state, app, namespace).await
+}
+
+/// `?force=true` on a delete or rollback: change a GitOps-managed app anyway.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ForceQuery {
+    #[serde(default)]
+    pub(super) force: bool,
 }
 
 /// `POST /v1/delete/{app}/{namespace}` — remove an app from the cluster.
 ///
 /// In cluster mode the app leaves desired state and every node retires its
 /// instances. A standalone node has no desired state beyond its running
-/// instances, so deleting is the same as stopping there.
+/// instances, so deleting is the same as stopping there. An app GitOps
+/// manages is refused without `?force=true`: the next sync would put it
+/// back (#693).
 pub(super) async fn delete_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<ForceQuery>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) =
@@ -132,7 +142,8 @@ pub(super) async fn delete_handler(
             .into_response();
     }
     if let Some(council) = state.council.clone() {
-        return cluster_app_change(state, council, app, namespace, AppChange::Delete).await;
+        let change = AppChange::Delete { force: query.force };
+        return cluster_app_change(state, council, app, namespace, change, &headers).await;
     }
 
     stop_local(&state, app, namespace).await
@@ -143,17 +154,51 @@ pub(super) async fn delete_handler(
 pub(super) enum AppChange {
     /// Scale to zero, keeping the specification, until the next apply.
     Stop,
-    /// Remove the app from desired state.
-    Delete,
+    /// Remove the app from desired state; `force` removes one GitOps
+    /// manages.
+    Delete { force: bool },
 }
 
 impl AppChange {
     pub(super) fn verb(self) -> &'static str {
         match self {
             AppChange::Stop => "stop",
-            AppChange::Delete => "delete",
+            AppChange::Delete { .. } => "delete",
         }
     }
+}
+
+/// The 409 for a delete or rollback of a GitOps-managed app without
+/// `force`, or `None` when the change may go ahead (#693).
+pub(super) async fn gitops_managed_refusal(
+    council: &crate::council::CouncilNode,
+    app: &str,
+    namespace: &str,
+    verb: &str,
+    force: bool,
+) -> Option<Response> {
+    if force {
+        return None;
+    }
+    let app_id = crate::meat::AppId::new(app, namespace);
+    if !council
+        .desired_state()
+        .await
+        .gitops_owned
+        .apps
+        .contains(&app_id)
+    {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": crate::lettuce::types::managed_change_refusal(verb, app, namespace)
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// Stop or delete an app in cluster mode through Raft. Nodes' reconcilers
@@ -166,21 +211,22 @@ pub(super) async fn cluster_app_change(
     app: String,
     namespace: String,
     change: AppChange,
+    caller_headers: &HeaderMap,
 ) -> Response {
     // Followers can't write to Raft (openraft does not forward client
     // writes), so forward the whole request to the leader's API.
     if !council.is_leader().await {
-        let Some(leader_url) = leader_api_url(&state, &council).await else {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "no cluster leader known yet; retry shortly"
-                })),
-            )
-                .into_response();
+        let leader_url = match leader_api_url(&state, &council, caller_headers).await {
+            Ok(url) => url,
+            Err(refusal) => return refusal.into_response(),
         };
-        let url = format!("{leader_url}/v1/{}/{app}/{namespace}", change.verb());
-        let mut request = state.cluster_http.client().post(url);
+        let force = if matches!(change, AppChange::Delete { force: true }) {
+            "?force=true"
+        } else {
+            ""
+        };
+        let url = format!("{leader_url}/v1/{}/{app}/{namespace}{force}", change.verb());
+        let mut request = mark_leader_forwarded(state.cluster_http.client().post(url));
         if let Some(token) = &state.service_token {
             request = request.bearer_auth(token);
         }
@@ -201,10 +247,16 @@ pub(super) async fn cluster_app_change(
         };
     }
 
+    if let AppChange::Delete { force } = change
+        && let Some(refusal) =
+            gitops_managed_refusal(&council, &app, &namespace, "delete", force).await
+    {
+        return refusal;
+    }
     let app_id = crate::meat::AppId::new(&app, &namespace);
     let request = match change {
         AppChange::Stop => crate::council::types::RaftRequest::AppStop { app_id },
-        AppChange::Delete => crate::council::types::RaftRequest::AppDelete { app_id },
+        AppChange::Delete { .. } => crate::council::types::RaftRequest::AppDelete { app_id },
     };
     match council.write(request).await {
         Ok(crate::council::CouncilResponse::Refused { reason }) => (
@@ -215,7 +267,7 @@ pub(super) async fn cluster_app_change(
         Ok(_) => {
             let status = match change {
                 AppChange::Stop => "stopping",
-                AppChange::Delete => "deleting",
+                AppChange::Delete { .. } => "deleting",
             };
             (
                 StatusCode::ACCEPTED,

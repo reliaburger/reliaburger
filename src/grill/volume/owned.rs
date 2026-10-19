@@ -302,6 +302,7 @@ pub(super) fn prepare(
             cfg!(target_os = "linux") && super::is_root(),
             size.is_some(),
         );
+        super::refuse_unenforced_size(backend, &volume.path, volume.size.as_deref())?;
         journal.volumes.insert(
             volume.path.clone(),
             OwnedVolume {
@@ -357,7 +358,7 @@ pub(super) fn prepare(
                 ensure_loop_mount(&path)?;
             }
         }
-        manager.write_backend(&path, backend, None)?;
+        manager.write_backend(&path, backend, None, size)?;
         let mut directory = Some(path.as_path());
         while let Some(current) = directory {
             std::fs::File::open(current)?.sync_all()?;
@@ -373,22 +374,22 @@ pub(super) fn prepare(
             .ready = true;
         persist(&root, &journal)?;
     }
-    // OCI generation writes only within this previously claimed config root.
+    // OCI generation writes only within this previously claimed config root,
+    // one directory per instance with hashed file names (#701).
     let config_root = root.join(".config").join(namespace).join(app);
     checked_path(&root, &config_root)?;
-    for config in spec
-        .config_file
-        .iter()
-        .filter(|config| config.content.is_some())
-    {
-        let filename = config
-            .path
-            .file_name()
-            .ok_or_else(|| refuse("inline configuration has no file name"))?;
-        let path = config_root.join(filename);
-        checked_path(&root, &path)?;
-        if exists(&path)? && !std::fs::symlink_metadata(&path)?.is_file() {
-            return Err(refuse("inline configuration is not a regular file"));
+    if !exists(&config_root)? {
+        return Ok(());
+    }
+    for instance in std::fs::read_dir(&config_root)? {
+        let instance = instance?;
+        if !instance.file_type()?.is_dir() {
+            return Err(refuse("inline configuration directory is not a directory"));
+        }
+        for file in std::fs::read_dir(instance.path())? {
+            if !file?.file_type()?.is_file() {
+                return Err(refuse("inline configuration is not a regular file"));
+            }
         }
     }
     Ok(())
@@ -940,7 +941,10 @@ mod tests {
         manager
             .prepare_test_storage("rbtest-storage", "web", &app)
             .unwrap();
-        let directory = root.path().join(".config/rbtest-storage/web");
+        // Inline config files live per instance (#701).
+        let directory = root
+            .path()
+            .join(".config/rbtest-storage/web/rbtest-storage__web-0");
         std::fs::create_dir_all(&directory).unwrap();
         std::os::unix::fs::symlink(external.path(), directory.join("example.conf")).unwrap();
         assert!(

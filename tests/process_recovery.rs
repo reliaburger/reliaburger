@@ -7,14 +7,21 @@ use reliaburger::grill::process::ProcessGrill;
 use reliaburger::grill::state::ContainerState;
 use reliaburger::grill::{Grill, InstanceId};
 
+#[path = "support/first_launch.rs"]
+mod first_launch;
+
 fn runtime(directory: &Path) -> ProcessGrill {
     ProcessGrill::with_owner(directory.to_path_buf(), env!("CARGO_BIN_EXE_bun").into())
 }
 
+/// A host workload: the only kind the process runtime runs (#914).
 fn spec(script: &str) -> OciSpec {
     OciSpec {
+        reusable_executor: false,
+        host_process: true,
+        initialiser: false,
         root: OciRoot {
-            path: "/".into(),
+            path: reliaburger::grill::oci::HOST_ROOT.into(),
             readonly: false,
         },
         process: OciProcess {
@@ -24,6 +31,7 @@ fn spec(script: &str) -> OciSpec {
             cwd: "/".into(),
             user: OciUser { uid: 0, gid: 0 },
             capabilities: None,
+            oom_score_adj: None,
             overrides: None,
         },
         mounts: vec![],
@@ -445,7 +453,6 @@ fn redacted_owner_phase(directory: &Path, id: &InstanceId) -> String {
 
 #[tokio::test]
 async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let launched = directory.path().join("helper-started");
     let release = directory.path().join("release-helper");
@@ -454,11 +461,16 @@ async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
     // wrapper gated forever. It signals a file, never an unverified PID.
     let _release_on_failure = ReleaseOwnedHelper(release.clone());
     let wrapper = directory.path().join("delayed-bun");
-    std::fs::write(&wrapper, format!(
-        "#!/bin/sh\ntouch '{}'\ndeadline=$(( $(date +%s) + 15 ))\nwhile [ ! -f '{}' ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\ntouch '{}'\nexec '{}' \"$@\"\n",
-        launched.display(), release.display(), released.display(), env!("CARGO_BIN_EXE_bun")
-    )).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // One shared, already-launched wrapper (#582): it finds this test's
+    // marker files beside the link it was started as, so the 15-second wait
+    // for `helper-started` no longer includes macOS assessing a new file.
+    first_launch::install_script(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\ndir=${{0%/*}}\ntouch \"$dir/helper-started\"\ndeadline=$(( $(date +%s) + 15 ))\nwhile [ ! -f \"$dir/release-helper\" ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\ntouch \"$dir/helper-released\"\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_bun")
+        ),
+    );
     let grill = ProcessGrill::with_owner(directory.path().to_path_buf(), wrapper);
     let id = InstanceId("default__cancelled-caller-0".into());
     grill.create(&id, &spec("sleep 30")).await.unwrap();
@@ -750,94 +762,10 @@ async fn agent_retires_launches_that_have_no_adoption_record() {
     let result = recovery_agent(directory.path())
         .adopt_recorded_instances()
         .await;
-    let live_state = grill.state(&live).await;
-    let prepared_state = grill.state(&prepared).await;
-    grill.kill(&live).await.unwrap();
-    stopped(&grill, &live).await;
+    // The runtime forgets only a generation that has retired, so the
+    // journals going is the proof that neither launch can still run (#738).
+    owners_forgotten(directory.path(), &[&live.0, &prepared.0]).await;
     assert_eq!(result.unwrap(), 0);
-    assert_eq!(live_state.unwrap(), ContainerState::Stopped);
-    assert_eq!(prepared_state.unwrap(), ContainerState::Stopped);
-}
-
-fn write_job_checkpoint(directory: &Path, phase: &str) {
-    let config =
-        reliaburger::config::Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n")
-            .unwrap();
-    let job = serde_json::json!({
-        "name":"work", "namespace":"default", "spec": config.job["work"],
-        "runtime":"Process", "generation":1, "restart_count":1,
-        "phase":phase, "runtime_absent":false, "batch_execution":null,
-    });
-    std::fs::write(
-        directory.join("job-attempts.checkpoint"),
-        serde_json::to_vec(
-            &serde_json::json!({"schema":3, "jobs":[job], "retired_batch_executions":[]}),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-}
-
-fn recovered_job(directory: &Path) -> serde_json::Value {
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.join("job-attempts.checkpoint")).unwrap())
-            .unwrap();
-    value["jobs"][0].clone()
-}
-
-#[tokio::test]
-async fn agent_recovers_short_job_exit_without_an_adoption_record() {
-    let directory = tempfile::tempdir().unwrap();
-    let grill = runtime(directory.path());
-    let id = InstanceId("default__work-0".into());
-    grill.create(&id, &spec("exit 23")).await.unwrap();
-    write_job_checkpoint(directory.path(), "Launching");
-    grill.start(&id).await.unwrap();
-    stopped(&grill, &id).await;
-    recovery_agent(directory.path())
-        .adopt_recorded_instances()
-        .await
-        .unwrap();
-    let job = recovered_job(directory.path());
-    assert_eq!(job["phase"], serde_json::json!({"Exited":{"code":23}}));
-    assert_eq!(job["runtime_absent"], true);
-    assert_eq!(job["restart_count"], 1);
-}
-
-#[tokio::test]
-async fn preparing_retry_never_inherits_previous_generations_exit_code() {
-    for previous_launch in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let grill = runtime(directory.path());
-        let id = InstanceId("default__work-0".into());
-        if previous_launch {
-            grill.create(&id, &spec("exit 23")).await.unwrap();
-            grill.start(&id).await.unwrap();
-            stopped(&grill, &id).await;
-        }
-        write_job_checkpoint(directory.path(), "Preparing");
-        recovery_agent(directory.path())
-            .adopt_recorded_instances()
-            .await
-            .unwrap();
-        let job = recovered_job(directory.path());
-        assert_eq!(job["phase"], "Unknown");
-        assert_eq!(job["runtime_absent"], true);
-        assert_eq!(job["restart_count"], 1);
-    }
-}
-
-#[tokio::test]
-async fn authorised_job_without_runtime_intent_refuses_recovery() {
-    let directory = tempfile::tempdir().unwrap();
-    write_job_checkpoint(directory.path(), "Launching");
-    assert!(
-        recovery_agent(directory.path())
-            .adopt_recorded_instances()
-            .await
-            .is_err()
-    );
-    assert_eq!(recovered_job(directory.path())["phase"], "Launching");
 }
 
 #[tokio::test]
@@ -1315,4 +1243,447 @@ async fn exec_owner_can_launch_after_its_binary_has_been_unlinked() {
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
     assert_eq!(result.unwrap(), "mapped-image\n");
+}
+
+/// A variable in this test process that host commands must not inherit
+/// (nextest sets `CARGO_*`).
+fn private_variable() -> String {
+    std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .find(|key| !reliaburger::grill::process::inherited_by_host_commands(key))
+        .expect("the test environment has a variable outside the allowlist")
+}
+
+/// A directory holding an executable `rb-exec-tool` that prints `found`.
+fn tool_directory(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = root.join("tools");
+    std::fs::create_dir(&directory).unwrap();
+    let tool = directory.join("rb-exec-tool");
+    std::fs::write(&tool, "#!/bin/sh\nprintf found\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    directory
+}
+
+#[tokio::test]
+async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__exec-env-0".into());
+    let tools = tool_directory(directory.path());
+    let mut workload = spec("sleep 60");
+    workload.process.env = vec![
+        "JOB=1".into(),
+        format!("PATH={}:/usr/bin:/bin", tools.display()),
+    ];
+    grill.create(&id, &workload).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let env = grill.exec(&id, &["/usr/bin/env".into()]).await;
+    let resolved = grill.exec(&id, &["rb-exec-tool".into()]).await;
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    let env = env.unwrap();
+    let lines: Vec<&str> = env.lines().collect();
+    assert!(lines.contains(&"JOB=1"), "{env}");
+    assert!(
+        lines.contains(&format!("PATH={}:/usr/bin:/bin", tools.display()).as_str()),
+        "{env}"
+    );
+    if let Ok(home) = std::env::var("HOME") {
+        assert!(lines.contains(&format!("HOME={home}").as_str()), "{env}");
+    }
+    let private = private_variable();
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with(&format!("{private}="))),
+        "{private} leaked: {env}"
+    );
+    assert_eq!(resolved.unwrap(), "found");
+}
+
+/// An agent with a durable process runtime and records under `directory`,
+/// its loop running, and the sender that commands it.
+/// A running agent over the owned process runtime that allows `script`
+/// apps (`/bin/sh`) and `exec` apps of `binaries`.
+fn running_agent(
+    directory: &Path,
+    binaries: &[&Path],
+) -> (
+    tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let mut agent = reliaburger::bun::agent::BunAgent::new(
+        runtime(directory),
+        reliaburger::grill::PortAllocator::new(30000, 30100),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(directory.to_path_buf());
+    agent.set_volumes_dir(directory.join("volumes"));
+    agent.set_perimeter_enabled(false);
+    let mut allowed_binaries = vec![std::path::PathBuf::from("/bin/sh")];
+    allowed_binaries.extend(binaries.iter().map(|binary| binary.to_path_buf()));
+    agent.set_process_config(
+        reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries,
+            mount_isolation: false,
+            ..Default::default()
+        },
+    );
+    let task = tokio::spawn(async move { agent.run().await });
+    (sender, shutdown, task)
+}
+
+async fn deploy(
+    sender: &tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+    toml: &str,
+) {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
+    let (events, mut received) = tokio::sync::mpsc::channel(64);
+    sender
+        .send(AgentCommand::Deploy {
+            config: reliaburger::config::Config::parse(toml).unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+    let mut last = None;
+    while let Some(event) = received.recv().await {
+        last = Some(event);
+    }
+    assert!(
+        matches!(last, Some(ApplyEvent::Complete { .. })),
+        "deploy failed: {last:?}"
+    );
+}
+
+/// The process runtime's ownership journal for `id`.
+fn owner_directory(directory: &Path, id: &str) -> std::path::PathBuf {
+    directory.join("process-owners").join(id)
+}
+
+/// Wait until the ownership journals of every one of `ids` are gone.
+async fn owners_forgotten(directory: &Path, ids: &[&str]) {
+    let gone = tokio::time::timeout(Duration::from_secs(15), async {
+        while ids.iter().any(|id| owner_directory(directory, id).exists()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let kept: Vec<_> = ids
+        .iter()
+        .filter(|id| owner_directory(directory, id).exists())
+        .collect();
+    assert!(
+        gone.is_ok(),
+        "ownership journals outlived retirement: {kept:?}"
+    );
+}
+
+const SLEEPER: &str = "script = 'sleep 60'\n";
+
+#[tokio::test]
+async fn deleting_an_app_removes_the_ownership_journal_of_every_instance() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 2\n")).await;
+    let ids = ["default__web-0", "default__web-1"];
+    assert!(
+        ids.iter()
+            .all(|id| owner_directory(directory.path(), id).is_dir())
+    );
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    owners_forgotten(directory.path(), &ids).await;
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn deleting_an_app_removes_its_init_containers_journals_and_a_redeploy_runs_its_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
+    let app =
+        format!("[app.web]\n{SLEEPER}[[app.web.init]]\ncommand = ['/bin/sh', '-c', 'exit 0']\n");
+    deploy(&sender, &app).await;
+    let init = "default__web-0__init-0";
+    assert!(owner_directory(directory.path(), init).is_dir());
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    // The redeploy reuses the initialiser's identity straight away and
+    // must still read its own exit code (#850).
+    deploy(&sender, &app).await;
+    assert!(
+        owner_directory(directory.path(), init).is_dir(),
+        "the redeploy's initialiser lost its journal"
+    );
+
+    let (response, retired) = tokio::sync::oneshot::channel();
+    sender
+        .send(reliaburger::bun::agent::AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), retired)
+        .await
+        .expect("retirement never finished")
+        .unwrap()
+        .unwrap();
+    owners_forgotten(directory.path(), &["default__web-0", init]).await;
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[]);
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 3\n")).await;
+    let before = ["default__web-0", "default__web-1", "default__web-2"];
+    deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 1\n")).await;
+    owners_forgotten(directory.path(), &before).await;
+    let kept = std::fs::read_dir(directory.path().join("process-owners"))
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter(|name| name.starts_with("default__web"))
+        .count();
+    assert_eq!(kept, 1, "the remaining replica keeps its journal");
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_adoption_keeps_a_live_instances_journal_and_forgets_a_dead_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, _shutdown, task) = running_agent(directory.path(), &[]);
+    deploy(
+        &sender,
+        &format!("[app.live]\n{SLEEPER}[app.dead]\n{SLEEPER}"),
+    )
+    .await;
+    // The previous bun process goes away without stopping its workloads.
+    task.abort();
+    let _ = task.await;
+    let grill = runtime(directory.path());
+    let dead = InstanceId("default__dead-0".into());
+    grill.kill(&dead).await.unwrap();
+    stopped(&grill, &dead).await;
+
+    let mut restarted = recovery_agent(directory.path());
+    let adopted = restarted.adopt_recorded_instances().await;
+    owners_forgotten(directory.path(), &[&dead.0]).await;
+    // Give a wrong forget of the adopted instance the chance to land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let live = InstanceId("default__live-0".into());
+    let live_journal = owner_directory(directory.path(), &live.0).is_dir();
+    let live_state = grill.state(&live).await;
+    grill.kill(&live).await.unwrap();
+    stopped(&grill, &live).await;
+    assert_eq!(adopted.unwrap(), 1);
+    assert!(live_journal, "the adopted instance lost its journal");
+    assert_eq!(live_state.unwrap(), ContainerState::Running);
+}
+
+/// An executable script that exits at once, for a test to remove or make
+/// unexecutable between `create` and `start` (#905).
+fn installed_tool(directory: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tool = directory.join("vanishing-tool");
+    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tool
+}
+
+/// Why the runtime refused a launch, or a panic naming what it did instead.
+fn refused(error: reliaburger::grill::GrillError) -> reliaburger::grill::LaunchProblem {
+    match error.launch_problem() {
+        Some(problem) => problem.clone(),
+        None => panic!("expected a refused launch, got {error:?}"),
+    }
+}
+
+/// #905: the binary passes `create`'s check, then disappears before the
+/// owner gate's `exec`. The gate's ENOENT comes back through the owner's
+/// record, so `start` reports "binary not found" and the generation retires.
+#[tokio::test]
+async fn an_owned_start_refuses_a_binary_deleted_before_exec_as_binary_not_found() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = installed_tool(directory.path());
+    let id = InstanceId("default__vanishing-0".into());
+    let grill = runtime(directory.path());
+    let mut launch = spec("unused");
+    launch.process.args = vec![tool.display().to_string()];
+    grill.create(&id, &launch).await.unwrap();
+    std::fs::remove_file(&tool).unwrap();
+
+    let problem = refused(grill.start(&id).await.unwrap_err());
+    assert_eq!(
+        problem.to_string(),
+        format!("binary not found: {}", tool.display())
+    );
+    stopped(&grill, &id).await;
+}
+
+/// #905: a binary that loses its execute bit before the gate's `exec` is
+/// refused as "binary not executable".
+#[tokio::test]
+async fn an_owned_start_refuses_a_binary_made_unexecutable_before_exec() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let tool = installed_tool(directory.path());
+    let id = InstanceId("default__unexecutable-0".into());
+    let grill = runtime(directory.path());
+    let mut launch = spec("unused");
+    launch.process.args = vec![tool.display().to_string()];
+    grill.create(&id, &launch).await.unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let problem = refused(grill.start(&id).await.unwrap_err());
+    assert_eq!(
+        problem.to_string(),
+        format!("binary not executable: {}", tool.display())
+    );
+    stopped(&grill, &id).await;
+}
+
+/// #905: a running app whose binary is deleted, and which then exits, fails
+/// its restart at once with "binary not found" instead of spending its
+/// restart budget and ending `Failed` without a reason.
+#[tokio::test]
+async fn a_restart_after_the_binary_vanished_ends_failed_with_binary_not_found() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let tool = directory.path().join("self-deleting-tool");
+    // It runs long enough for the deploy to see it start, then removes
+    // its own file and exits, so the restart finds no binary.
+    std::fs::write(&tool, "#!/bin/sh\nsleep 1\nrm -f \"$0\"\nexit 1\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (sender, shutdown, task) = running_agent(directory.path(), &[&tool]);
+    deploy(
+        &sender,
+        &format!("[app.ghost]\nexec = {:?}\n", tool.display().to_string()),
+    )
+    .await;
+
+    let reason = format!("binary not found: {}", tool.display());
+    let failed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .send(reliaburger::bun::agent::AgentCommand::Status { response })
+                .await
+                .unwrap();
+            let instances = result.await.unwrap();
+            if let Some(ghost) = instances
+                .into_iter()
+                .find(|instance| instance.app_name == "ghost" && instance.state == "failed")
+            {
+                break ghost;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the restart never failed");
+    shutdown.cancel();
+    task.await.unwrap();
+    assert_eq!(failed.reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(failed.restart_count, 1, "one attempt, not the whole budget");
+}
+
+/// An executor pool forgets each retired executor as it goes idle, so
+/// several forgets of different generations run at once while the agent
+/// reads the inventory. The forgets share one garbage directory, and each
+/// sweeps the others' leftovers: one finishing another's deletion is not a
+/// failure (#924). A spurious error left the mixed runtime's route and lock
+/// files behind until the next restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_forgets_of_retired_generations_all_succeed() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(&directory.path().join("instances"));
+    // Without the fix, one round failed about one run in six on macOS and
+    // four rounds failed most runs.
+    for round in 0..4 {
+        let ids: Vec<_> = (0..16)
+            .map(|index| InstanceId(format!("default__executor-{round}-{index}")))
+            .collect();
+        for id in &ids {
+            grill.create(id, &spec("exit 0")).await.unwrap();
+            grill.start(id).await.unwrap();
+        }
+        for id in &ids {
+            stopped(&grill, id).await;
+        }
+        let forgets = ids.iter().map(|id| {
+            let grill = grill.clone();
+            let id = id.clone();
+            tokio::spawn(async move { grill.forget_retired(&id).await })
+        });
+        // The agent reads the inventory meanwhile. A launch forgotten while
+        // it reads has left, and is no reason to fail the read.
+        let reader = grill.clone();
+        let reads = tokio::spawn(async move {
+            loop {
+                if reader
+                    .launch_inventory()
+                    .await?
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Ok::<_, reliaburger::grill::GrillError>(());
+                }
+            }
+        });
+        for (id, forget) in ids
+            .iter()
+            .zip(futures_util::future::join_all(forgets).await)
+        {
+            forget
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{}: {error}", id.0));
+        }
+        reads.await.unwrap().unwrap();
+    }
+    let garbage = directory.path().join("instances/forgotten-process-owners");
+    let kept: Vec<_> = std::fs::read_dir(&garbage)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(kept.is_empty(), "{kept:?}");
 }

@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:9117")]
     listen: String,
 
-    /// Runtime to use: auto, process, runc (Linux).
+    /// Runtime to use: auto, process, runc or mixed (Linux).
     #[arg(long, default_value = "auto")]
     runtime: String,
 
@@ -245,14 +245,23 @@ fn cluster_params_from_config(
         labels: config.node.labels.clone(),
         // Wired in by the caller (run) once the disk-pressure channel exists.
         self_disk_pressured_rx: None,
+        job_capabilities_rx: None,
         readiness: None,
+        recovery_probe_window: config
+            .cluster
+            .recovery_probe_window_secs
+            .map(std::time::Duration::from_secs),
     })
 }
 
 /// Assemble Pickle's live listener, membership and catalogue evidence.
+/// `self_id` always counts as live: this node's own copies can answer.
+/// `needs_mtls` says the cluster is plaintext, so the registry can't forward.
+#[allow(clippy::too_many_arguments)]
 async fn current_registry_capability(
     bind: reliaburger::pickle::capability::RegistryBindPlan,
     tls: bool,
+    needs_mtls: bool,
     p2p_enabled: bool,
     redundancy_target: u32,
     membership: Option<
@@ -260,17 +269,14 @@ async fn current_registry_capability(
     >,
     council: Option<&Arc<reliaburger::council::CouncilNode>>,
     catalog: &Arc<RwLock<ManifestCatalog>>,
+    self_id: u64,
 ) -> reliaburger::pickle::capability::RegistryCapabilityEvidence {
-    let known_nodes = membership
-        .map(|receiver| {
-            receiver
-                .borrow()
-                .iter()
-                .filter(|member| member.state == reliaburger::mustard::state::NodeState::Alive)
-                .count()
-        })
-        .unwrap_or(1)
-        .max(1);
+    let live_nodes = match membership {
+        Some(receiver) => {
+            reliaburger::cluster::identity::live_registry_nodes(&receiver.borrow(), self_id)
+        }
+        None => std::collections::BTreeSet::from([self_id]),
+    };
     let authoritative;
     let local;
     let catalog = if let Some(council) = council {
@@ -280,15 +286,18 @@ async fn current_registry_capability(
         local = catalog.read().await;
         &local
     };
-    reliaburger::pickle::capability::registry_capability_evidence(
-        bind,
-        true,
-        tls,
-        p2p_enabled,
-        redundancy_target,
-        known_nodes,
-        catalog,
-    )
+    reliaburger::pickle::capability::RegistryCapabilityEvidence {
+        needs_mtls,
+        ..reliaburger::pickle::capability::registry_capability_evidence(
+            bind,
+            true,
+            tls,
+            p2p_enabled,
+            redundancy_target,
+            &live_nodes,
+            catalog,
+        )
+    }
 }
 
 /// The directory this node reads/writes its identity from: the configured
@@ -765,11 +774,33 @@ fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg);
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    limit_malloc_arenas();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("failed to construct Tokio runtime: {error}"))?;
     runtime.block_on(run_agent(cli))
+}
+
+/// Cap glibc's malloc arenas before the runtime starts its threads.
+///
+/// glibc hands busy threads their own arena (up to eight per core) and keeps
+/// freed memory in each one. On a busy job node that held Bun's resident
+/// memory at 600 to 770 MiB, while live data was under 200 MiB: with two
+/// arenas, the same five-minute host-job run ended at about 190 MiB and ran
+/// as many jobs. An operator's own `MALLOC_ARENA_MAX` still wins.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // SAFETY: mallopt only tunes the allocator, and runs here before Bun
+    // starts any other thread. A value glibc rejects is reported by the return
+    // value, which we can ignore: the default arenas simply stay in place.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
 }
 
 /// Resolve the configured `cluster.join` seeds to socket addresses.
@@ -862,6 +893,20 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         )
     );
 
+    // A rootless runc cluster is a contradiction between the command line
+    // and the host, so refuse it before loading config or touching storage.
+    // Refusing later left a state marker and upload lock behind, and Tokio's
+    // shutdown then waited for the self-upgrade hash of Bun's own binary:
+    // up to 16 s for a debug build on a loaded host (#813).
+    #[cfg(target_os = "linux")]
+    if cli.cluster {
+        let rootless = reliaburger::grill::rootless::is_rootless();
+        let runc_installed = rootless
+            && cli.runtime == "auto"
+            && matches!(detect_runtime().await, DetectedRuntime::Runc { .. });
+        refuse_rootless_cluster(&cli.runtime, rootless, runc_installed)?;
+    }
+
     // Load node config
     let config = if let Some(ref path) = cli.config {
         NodeConfig::from_file(path).map_err(|e| anyhow::anyhow!("failed to load config: {e}"))?
@@ -911,6 +956,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // checks existed but were never run, so a bad value failed opaquely later.
     config
         .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    // Log and metric caps must fit the disk they bound (#678).
+    let data_filesystem =
+        reliaburger::bun::disk_pressure::FilesystemUsage::of(&config.storage.data)
+            .with_context(|| format!("cannot measure {}", config.storage.data.display()))?;
+    config
+        .validate_storage_caps(data_filesystem.total_bytes)
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // Create port allocator from config
@@ -991,6 +1043,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
             Err(e) => eprintln!("bun: warning: upgrade startup recovery failed: {e}"),
         }
+        // Hash our own binary now, off the request path. `/v1/version`
+        // reports the digest, and a joiner's compatibility check gives up
+        // after 10 s; hashing a debug Bun on that first request took longer
+        // on a loaded host (#765). The task ends once the digest is cached.
+        manager.spawn_running_binary_hash();
     }
 
     // Debug-only test hook: a `{exe}.fail-boot` sidecar next to the resolved
@@ -1025,15 +1082,24 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
             if cli.cluster {
-                anyhow::bail!(
-                    "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
-                     or use rootful Linux Runc with eBPF for a container cluster \
-                     (relish setup --quickstart provisions a managed Linux VM on macOS)"
-                );
+                // Refused at start-up already; this guards a host whose
+                // runc appeared between that check and runtime selection.
+                anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
             }
             (true, false)
         }
         AnyGrill::Runc(_) => (config.ebpf.enabled, config.ebpf.enabled),
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(runtime) if runtime.container().is_rootless() => {
+            if cli.cluster {
+                // Refused at start-up already; this guards a host whose
+                // runc appeared between that check and runtime selection.
+                anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
+            }
+            (true, false)
+        }
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(_) => (config.ebpf.enabled, config.ebpf.enabled),
         _ => (false, false),
     };
     #[cfg(not(target_os = "linux"))]
@@ -1046,16 +1112,20 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         );
     }
     // DNS is a workload capability, not a best-effort side task. Select the
-    // runtime first so we can derive its reachable resolver address, then bind
-    // both sockets before starting the agent, reporting readiness or adopting
-    // any surviving workloads.
-    let (runtime, bound_dns, dns_capability) = prepare_dns_runtime(runtime, &config.dns).await?;
+    // runtime first so we can derive its reachable resolver address, give the
+    // runtime that resolver, and only then route a previous runtime's
+    // launches, which recorded it (#839). Bind both sockets before starting
+    // the agent, reporting readiness or adopting any surviving workloads.
+    let (runtime, workload_dns) = prepare_runtime(runtime, &config.dns).await?;
+    let (bound_dns, dns_capability) = bind_workload_dns(workload_dns).await?;
     // Remember which runtime we settled on — `/v1/capabilities` reports it,
     // and several test cases are runtime-specific.
     let runtime_kind = match &runtime {
         AnyGrill::Process(_) => "process",
         #[cfg(target_os = "linux")]
         AnyGrill::Runc(_) => "runc",
+        #[cfg(target_os = "linux")]
+        AnyGrill::Mixed(_) => "runc+process",
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
@@ -1137,6 +1207,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // pressured voter. Created before the cluster block so the receiver can ride
     // into ClusterParams.
     let (disk_pressured_tx, disk_pressured_rx) = tokio::sync::watch::channel(false);
+    // The kinds of job this node runs (#788), published once the task
+    // executor exists further down and advertised over gossip, so the leader
+    // refuses a run no live node could take at submission.
+    let (job_capabilities_tx, job_capabilities_rx) = tokio::sync::watch::channel(None);
 
     // Why the council's Raft core stopped, when it stops on its own (#480).
     // Set once by the watchdog below; bun then shuts down and exits non-zero.
@@ -1170,6 +1244,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         registry_cluster_advertise = Some(params.gossip_addr.ip());
         params.mayo = Some(Arc::clone(&mayo_store));
         params.self_disk_pressured_rx = Some(disk_pressured_rx.clone());
+        params.job_capabilities_rx = Some(job_capabilities_rx.clone());
         params.readiness = Some(readiness.clone());
         // Advertised via the gossip directory (12b.2): peers reach this
         // node's API at the port it actually listens on, not a derived one.
@@ -1258,7 +1333,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
-    let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
+    let mut events = reliaburger::bun::events::EventStore::new();
+    // The audit trail is durable and bounded on its own, so a busy job
+    // queue can't push it out of the event ring's memory (#685). A node
+    // that can't open it still runs; `GET /v1/audit` says it keeps no log.
+    let audit_directory = data_base.join(reliaburger::bun::audit::AUDIT_DIRECTORY);
+    match reliaburger::bun::audit::AuditLog::open(
+        audit_directory.clone(),
+        reliaburger::bun::audit::AuditLimits::from_total(config.storage.audit_max_bytes),
+    ) {
+        Ok(log) => events.set_audit_log(log),
+        Err(error) => eprintln!(
+            "bun: audit log at {} unavailable, audit records stay in memory only: {error}",
+            audit_directory.display()
+        ),
+    }
+    let event_store = Arc::new(RwLock::new(events));
     agent.set_event_store(Arc::clone(&event_store));
     let loop_meter = agent.loop_meter();
     // `/v1/status` reads the loop's published snapshot through this.
@@ -1309,6 +1399,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // policy and an operator's allowlist would be silently ignored — a
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
+    // Host-path sources are refused unless `[storage] allowed_host_paths`
+    // covers them, and never reach the node's own directories.
+    agent.set_host_path_policy(
+        reliaburger::bun::host_paths::HostPathPolicy::from_node_config(&config),
+    );
     // Bound fault durations by the `[smoker]` policy (default + maximum).
     agent.configure_perimeter(
         vec![
@@ -1361,14 +1456,26 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Settle any snapshot restore a previous Bun died in the middle of,
     // before anything can snapshot, mount or adopt those volumes. A volume
     // recovery can't settle keeps its journal, so it refuses to mount.
+    // Then delete the half-made snapshots of creates it died in (#695).
     let recovery_dir = config.storage.volumes.clone();
-    let unsettled = tokio::task::spawn_blocking(move || {
-        reliaburger::grill::snapshot::SnapshotManager::new(recovery_dir).recover_restores()
+    let (unsettled, interrupted) = tokio::task::spawn_blocking(move || {
+        let snapshots = reliaburger::grill::snapshot::SnapshotManager::new(recovery_dir);
+        (snapshots.recover_restores(), snapshots.sweep_interrupted())
     })
     .await
     .context("snapshot restore recovery task")?;
-    for error in unsettled {
+    for error in unsettled.iter().chain(&interrupted.errors) {
         eprintln!("bun: {error}");
+    }
+    for path in &interrupted.removed {
+        eprintln!("bun: deleted interrupted snapshot {}", path.display());
+    }
+    for path in &interrupted.unexplained {
+        eprintln!(
+            "bun: {} is a snapshot subvolume with no metadata and no intent; it is never \
+             listed, uploaded or pruned",
+            path.display()
+        );
     }
 
     // Scheduled volume snapshots ([storage.snapshots], Phase 12 E3).
@@ -1386,6 +1493,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Durable kernel ownership requires all hooks before recovery. A load
     // failure must not start an agent that can forget original policy owners.
     agent.set_ebpf_sweep_interval(config.ebpf.sweep_interval_secs);
+    // Egress allowlists always permit the resolver workloads use, so a
+    // workload can resolve the names on its list.
+    if let Some(bound) = &bound_dns
+        && let std::net::SocketAddr::V4(resolver) = bound.local_addr()?
+    {
+        agent.set_workload_dns(*resolver.ip());
+    }
     // Observed, not configured: `enabled = true` with a failed load means no
     // enforcement, and a capability report must say so.
     // `mut` only matters on an `ebpf` build — the assignment below lives
@@ -1509,9 +1623,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 Arc::clone(council),
                 membership_rx.clone(),
                 aggregated_rx,
-                config.dns.enabled,
-                config.reconstruction.clone(),
+                reliaburger::cluster::orchestrate::LeaderSchedulerSettings {
+                    dns_required: config.dns.enabled,
+                    reconstruction: config.reconstruction.clone(),
+                    stale_node_grace: std::time::Duration::from_secs(
+                        config.reporting_tree.stale_node_grace_secs,
+                    ),
+                },
                 Some(readiness.clone()),
+                Some(Arc::clone(&event_store)),
                 shutdown.clone(),
             ));
             // L3: leader-only autoscale loop, feeding on the same rollup
@@ -1560,15 +1680,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         .borrow()
                         .iter()
                         .map(|m| api::RosterMember {
-                            info: api::NodeMembershipInfo {
-                                node_id: m.node_id.clone(),
-                                address: directory.api_address(
-                                    &m.node_id,
-                                    m.address,
-                                    gossip_to_api_offset,
-                                ),
-                                api_advertised: directory.endpoints.contains_key(&m.node_id),
-                            },
+                            info: api::NodeMembershipInfo::from_gossip(
+                                m,
+                                &directory,
+                                gossip_to_api_offset,
+                            ),
                             gossip_address: m.address,
                             state: m.state,
                             incarnation: m.incarnation,
@@ -1855,11 +1971,20 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
     agent.adopt_recorded_instances().await?;
     let task_runner = agent.delegated_task_runner(&data_base)?;
+    let forgotten = task_runner.forget_retired_executors().await;
+    if forgotten > 0 {
+        eprintln!("bun: forgot {forgotten} retired executor identities");
+    }
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     let task_runner = if let Some(kernel) = agent.delegated_namespace_kernel() {
         task_runner.with_namespace_policy(
-            reliaburger::bun::task_namespace::TaskNamespacePolicy::recover(kernel, &data_base)
-                .await?,
+            reliaburger::bun::task_namespace::TaskNamespacePolicy::recover(
+                kernel,
+                &data_base,
+                agent.delegated_network(),
+                agent.workload_dns(),
+            )
+            .await?,
         )
     } else {
         task_runner
@@ -2029,8 +2154,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let collection_cmd_tx = cmd_tx.clone();
     let collection_node = node_name.clone();
     let collection_loop_meter = Arc::clone(&loop_meter);
+    // Job counters and usage for the attempts this node runs, shared by the
+    // task-array executor (which counts), this loop (which exports and
+    // measures) and `relish top` (which reads the latest usage).
+    let job_telemetry = Arc::new(reliaburger::mayo::job_metrics::JobTelemetry::default());
+    let collection_jobs = Arc::clone(&job_telemetry);
     feeder_handles.push(tokio::spawn(async move {
         let mut collector = SystemCollector::new();
+        let mut job_cgroups = reliaburger::mayo::job_metrics::CgroupCpu::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
         let mut flush_counter = 0u64;
         loop {
@@ -2052,6 +2183,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             .collect_agent_instance_metrics(&collection_cmd_tx, &collection_node)
                             .await,
                     );
+
+                    // Job counters and histograms for the attempts this node
+                    // ran, and CPU and memory for the ones running now,
+                    // labelled by namespace, definition, profile and node only.
+                    samples.extend(collection_jobs.samples(&collection_node));
+                    samples.extend(collection_jobs.sample_usage(
+                        &collector,
+                        &mut job_cgroups,
+                        &collection_node,
+                    ));
 
                     // Ingress metrics (E): fold the wrapper's process-global
                     // request counters into the same time series.
@@ -2532,68 +2673,53 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .with_policy(config.images.trust_policy.clone())
     });
 
-    // GitOps (L13): if [gitops] is configured on a cluster node, spawn
-    // the leader-only sync loop and hand the API a webhook sender that
-    // nudges it. The webhook endpoint returns 503 without this.
+    // GitOps (L13, #693): every cluster node runs the sync loop. The
+    // configuration lives in Raft, so a leader without its own [gitops]
+    // still syncs the cluster's repository; a node's [gitops] only seeds
+    // Raft when the cluster has none. The API gets a webhook sender that
+    // nudges the loop, and this node's local-config check for `relish wtf`.
     // The webhook validator authenticates public webhook POSTs by the
-    // `[gitops] webhook_secret` HMAC (GIT3). Without a secret it stays
-    // `None`, and the public route fails closed.
+    // cluster's `webhook_secret` HMAC (GIT3), taken from Raft on each
+    // request; with no secret anywhere the public route fails closed.
     let mut gitops_webhook_validator = None;
-    let gitops_webhook_tx =
-        if let (Some(gitops), Some(council)) = (config.gitops.clone(), api_council.clone()) {
-            let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
-            if let Some(secret) = gitops.webhook_secret.as_deref() {
-                gitops_webhook_validator = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                    reliaburger::lettuce::webhook::WebhookValidator::new(
-                        secret,
-                        gitops.webhook_rate_limit,
-                    ),
-                )));
-            }
-            reliaburger::lettuce::runner::spawn_gitops_sync(
-                council,
-                gitops,
-                webhook_rx,
-                config.storage.data.clone(),
-                shutdown.clone(),
-                image_binder.clone(),
-            );
-            println!("bun: gitops sync loop started");
-            Some(webhook_tx)
-        } else {
-            None
-        };
-
-    // A freshly swapped-in version must prove itself: after the boot grace
-    // period, ask the agent to verify that every pre-upgrade workload
-    // survived, then commit (or flag revert and exit).
-    // Gossip proof is independent of local API health and restored membership.
-    if let Some(marker) = upgrade_verify.take() {
-        let verify_tx = cmd_tx.clone();
-        let grace_secs = config.upgrades.boot_grace_secs;
-        let rejoin_secs = config.upgrades.gossip_rejoin_secs;
-        tokio::spawn(async move {
-            let (_, rejoin) = tokio::join!(
-                tokio::time::sleep(std::time::Duration::from_secs(grace_secs)),
-                reliaburger::upgrade::rejoin::wait_for_rejoin(
-                    upgrade_rejoin_rx,
-                    std::time::Duration::from_secs(rejoin_secs),
+    let mut gitops_local_check = None;
+    let gitops_webhook_tx = if let Some(council) = api_council.clone() {
+        let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
+        let local = config.gitops.clone();
+        let validator = match &local {
+            Some(gitops) => match gitops.webhook_secret.as_deref() {
+                Some(secret) => reliaburger::lettuce::webhook::WebhookValidator::new(
+                    secret,
+                    gitops.webhook_rate_limit,
                 ),
-            );
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if verify_tx
-                .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
-                    marker,
-                    rejoin,
-                    response: tx,
-                })
-                .await
-                .is_ok()
-            {
-                let _ = rx.await;
-            }
-        });
-    }
+                None => reliaburger::lettuce::webhook::WebhookValidator::unkeyed(
+                    gitops.webhook_rate_limit,
+                ),
+            },
+            None => reliaburger::lettuce::webhook::WebhookValidator::unkeyed(10),
+        };
+        gitops_webhook_validator = Some(std::sync::Arc::new(tokio::sync::Mutex::new(validator)));
+        let sync = reliaburger::lettuce::runner::spawn_gitops_sync(
+            council,
+            local,
+            webhook_rx,
+            config.storage.data.clone(),
+            shutdown.clone(),
+            image_binder.clone(),
+        );
+        gitops_local_check = Some(sync.local_check);
+        println!(
+            "bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)"
+        );
+        Some(webhook_tx)
+    } else {
+        None
+    };
+
+    // The upgrade verification below starts after the API task, by which
+    // point `cmd_tx` has moved into the API state. Only a replacement that
+    // has something to verify keeps a sender for it.
+    let upgrade_verify_tx = upgrade_verify.as_ref().map(|_| cmd_tx.clone());
 
     // Cluster apps live in Raft; jobs always belong to the receiving node.
     let local_lease_file = if api_council.is_some() {
@@ -2606,9 +2732,41 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     )
     .await
     .map_err(|error| anyhow::anyhow!("failed to open test lease store: {error}"))?;
+    // Delegated tasks share the agent runtime and resource commitments;
+    // detailed outcomes remain in durable worker ledgers.
+    let task_arrays = Arc::new(
+        reliaburger::bun::task_array_leader::TaskArrayService::new(Some(Arc::new(
+            reliaburger::bun::task_array_node::TaskArrayNode::new(
+                reliaburger::bun::task_array_node::TaskArrayNodeConfig::for_data_dir(
+                    &data_base,
+                    config.process_workloads.clone(),
+                ),
+                reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
+            )
+            .with_budget(execution_budget)
+            .with_telemetry(Arc::clone(&job_telemetry)),
+        )))
+        .with_job_notifier(WebhookDispatcher::new(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+            config.alerts.destinations.clone(),
+            config.cluster.name.clone(),
+        ))
+        .with_trust_policy(config.images.trust_policy.clone())
+        .with_signature_source(signature_source.clone())
+        .with_storage(&data_base)
+        .await?,
+    );
+    if let Some(node) = &task_arrays.node {
+        job_capabilities_tx.send_replace(Some(node.job_capabilities()));
+    }
+    // A job lease's cleanup stops and forgets its jobs in these arrays.
     let local_lease_reaper = reliaburger::testkit::lease::spawn_local_lease_reaper(
         local_test_leases.clone(),
         cmd_tx.clone(),
+        Some(Arc::clone(&task_arrays)),
         shutdown.clone(),
     );
     let cluster_lease_reaper = api_council.as_ref().map(|council| {
@@ -2690,7 +2848,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .is_some(),
         // Host execution is deny-by-default: an empty allowlist refuses
         // every process workload.
-        process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
+        process_workloads: host_workloads_enabled(runtime_kind, &config.process_workloads),
         // CPU/memory/disk faults need writable cgroup v2 control files.
         cgroup_faults: {
             #[cfg(target_os = "linux")]
@@ -2755,6 +2913,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     } else {
         None
     };
+    // The leader's registry endpoints accept only mTLS node certificates, so
+    // a plaintext cluster's registry can't forward or replicate (#792). Say
+    // so once here; the reaper, `relish status` and `relish wtf` carry it on.
+    let registry_needs_mtls = registry_forwarder
+        .as_ref()
+        .is_some_and(|forwarder| forwarder.requires_mtls());
+    if registry_needs_mtls {
+        eprintln!(
+            "bun: WARNING — {}",
+            reliaburger::pickle::types::PickleError::RegistryNeedsMtls
+        );
+    }
 
     let app = api::router_with_upgrade(
         cmd_tx,
@@ -2794,24 +2964,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases.clone()),
         jwt_verifier,
         Some(status_reader),
-        // Delegated tasks share the agent runtime and resource commitments;
-        // detailed outcomes remain in durable worker ledgers.
-        Some(Arc::new(
-            reliaburger::bun::task_array_leader::TaskArrayService::new(Some(Arc::new(
-                reliaburger::bun::task_array_node::TaskArrayNode::new(
-                    reliaburger::bun::task_array_node::TaskArrayNodeConfig::for_data_dir(
-                        &data_base,
-                        config.process_workloads.clone(),
-                    ),
-                    reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
-                )
-                .with_budget(execution_budget),
-            )))
-            .with_trust_policy(config.images.trust_policy.clone())
-            .with_signature_source(signature_source.clone())
-            .with_storage(&data_base)
-            .await?,
-        )),
+        Some(Arc::clone(&task_arrays)),
     );
     let app = match &registry_forwarder {
         Some(forwarder) => app.layer(axum::Extension(
@@ -2828,6 +2981,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match image_binder {
         Some(binder) => app.layer(axum::Extension(binder)),
+        None => app,
+    };
+    let app = match gitops_local_check {
+        Some(check) => app.layer(axum::Extension(api::GitOpsLocalCheck(check))),
         None => app,
     };
     let app = match api_known_members {
@@ -2939,6 +3096,47 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
     );
 
+    // A freshly swapped-in version must prove itself: after the boot grace
+    // period, ask the agent to verify that every pre-upgrade workload
+    // survived, then commit (or flag revert and exit).
+    // Gossip proof is independent of local API health and restored membership.
+    // Both clocks start once the replacement can answer for itself: its API
+    // task is spawned above, and `/v1/version` reports the binary hash the
+    // boot task is still computing. A debug Bun's hash took longer than the
+    // whole rejoin deadline under load, so nobody could see the replacement
+    // before it reverted (#771).
+    if let (Some(marker), Some(verify_tx)) = (upgrade_verify.take(), upgrade_verify_tx) {
+        let grace = std::time::Duration::from_secs(config.upgrades.boot_grace_secs);
+        let rejoin_timeout = std::time::Duration::from_secs(config.upgrades.gossip_rejoin_secs);
+        let answering_manager = upgrade_manager.clone();
+        tokio::spawn(async move {
+            let answerable = async move {
+                if let Some(manager) = answering_manager {
+                    manager.running_binary_sha256().await;
+                }
+            };
+            let rejoin = reliaburger::upgrade::rejoin::verify_after_answerable(
+                answerable,
+                grace,
+                upgrade_rejoin_rx,
+                rejoin_timeout,
+            )
+            .await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if verify_tx
+                .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
+                    marker,
+                    rejoin,
+                    response: tx,
+                })
+                .await
+                .is_ok()
+            {
+                let _ = rx.await;
+            }
+        });
+    }
+
     // Spawn alert evaluation + webhook dispatch task
     if let Some(ref alert_evaluator) = alerts {
         let eval_mayo = Arc::clone(&mayo_store);
@@ -2971,8 +3169,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = eval_shutdown.cancelled() => break,
                     _ = tick.tick() => {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
                         let store = eval_mayo.read().await;
-                        let latest = gather_latest_values(&store).await;
+                        let latest = gather_latest_values(&store, now_secs).await;
                         drop(store);
 
                         let transitions = {
@@ -3004,7 +3206,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         service_token.clone(),
     ));
     // Physical payloads, including temporary uploads and runtime pulls, share
-    // the configured BlobStore cap. Logical per-repository policy is separate.
+    // the configured BlobStore cap. Untagged-image expiry bounds growth.
     let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig::default();
     let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
         reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
@@ -3097,7 +3299,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
     );
 
-    let pickle_app = reliaburger::pickle::api::router(pickle_state.clone());
+    // The leader's heal asks this node to copy images straight from their
+    // holders (#697); it pulls with the same authenticated cluster client.
+    let pickle_app = reliaburger::pickle::api::router(pickle_state.clone()).layer(axum::Extension(
+        reliaburger::pickle::replication::ReplicaClient(registry_client.clone()),
+    ));
     // Describe the listener honestly (B3). A clustered listener authenticates
     // writes (service token or a Deployer bearer) and, on a routable bind,
     // reads too — regardless of TLS. Only the literal loopback standalone
@@ -3133,11 +3339,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             current_registry_capability(
                 registry_bind,
                 registry_over_tls,
+                registry_needs_mtls,
                 registry_p2p_enabled,
                 config.images.redundancy,
                 replication_membership.as_ref(),
                 api_council.as_ref(),
                 &pickle_catalog,
+                node_raft_id,
             )
             .await,
         )
@@ -3164,11 +3372,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         let evidence = current_registry_capability(
                             registry_bind,
                             registry_over_tls,
+                            registry_needs_mtls,
                             registry_p2p_enabled,
                             registry_redundancy,
                             registry_evidence_membership.as_ref(),
                             registry_evidence_council.as_ref(),
                             &registry_evidence_catalog,
+                            node_raft_id,
                         ).await;
                         registry_evidence_readiness.set_registry(evidence).await;
                     }
@@ -3207,13 +3417,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let pickle_acceptor = match (&api_identity, registry_over_tls) {
         (Some(identity), true) => {
             let crl = crl_refresh.clone().unwrap_or_default();
-            match reliaburger::sesame::mtls::build_live_api_server_config(identity, crl) {
-                Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
-                Err(e) => {
-                    eprintln!("bun: failed to build registry TLS config, serving plaintext: {e}");
-                    None
-                }
-            }
+            // Fail closed, as the API does: a registry that silently fell
+            // back to plaintext would carry tokens and images in the clear.
+            let cfg = reliaburger::sesame::mtls::build_live_api_server_config(identity, crl)
+                .map_err(|e| anyhow::anyhow!("failed to build registry TLS config: {e}"))?;
+            Some(tokio_rustls::TlsAcceptor::from(cfg))
         }
         _ => None,
     };
@@ -3261,6 +3469,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let gc_store = Arc::clone(&blob_store);
         let gc_catalog = Arc::clone(&pickle_catalog);
         let gc_registry = pickle_state.clone();
+        let gc_council = api_council.clone();
+        let gc_retain =
+            std::time::Duration::from_secs(u64::from(config.images.gc_retain_days) * 86_400);
         let gc_shutdown = shutdown.clone();
         let gc_config = GcConfig {
             retain_days: config.images.gc_retain_days,
@@ -3303,8 +3514,40 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     }
                 };
 
-                // Phase 1: nominate (fs walk off the runtime).
-                let catalog_snapshot = gc_catalog.read().await.clone();
+                // Expiry first (#697): untagged manifests older than
+                // `gc_retain_days` leave the catalogue (through Raft on the
+                // leader, locally standalone), so this sweep can reclaim
+                // their layers. Images running here count as pinned.
+                let pinned: std::collections::HashSet<String> = active
+                    .iter()
+                    .filter_map(|image| reliaburger::pickle::types::image_pin_digest(image))
+                    .map(str::to_string)
+                    .collect();
+                match gc_registry
+                    .expire_untagged_manifests(
+                        reliaburger::pickle::types::unix_millis(std::time::SystemTime::now()),
+                        gc_retain,
+                        &pinned,
+                    )
+                    .await
+                {
+                    Ok(expired) if !expired.is_empty() => {
+                        println!("bun: expired {} untagged image(s)", expired.len());
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("bun: image expiry will retry: {error}"),
+                }
+
+                // Phase 1: nominate (fs walk off the runtime) against the
+                // authoritative catalogue. A worker's local view only knows
+                // its own pushes, and its stale tags would keep expired
+                // layers forever, so it nominates freely and lets the
+                // arbiter refuse anything still referenced.
+                let catalog_snapshot = match (&gc_council, gc_registry.forwarder.is_some()) {
+                    (Some(council), _) => council.manifest_catalog().await,
+                    (None, true) => reliaburger::pickle::types::ManifestCatalog::default(),
+                    (None, false) => gc_catalog.read().await.clone(),
+                };
                 let store = Arc::clone(&gc_store);
                 let gc_cfg = gc_config.clone();
                 let nominated = tokio::task::spawn_blocking(move || {
@@ -3333,10 +3576,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Pickle heal loop (L10 + Phase 12 B5): leader-only loop that keeps
-    // every manifest's layers on at least `[images] redundancy` nodes.
+    // every manifest's layers on at least `[images] redundancy` live nodes.
     // The tick body lives in `pickle::replication::heal_tick` — rarest
-    // first, capped per tick, pulling layers the leader lacks before
-    // replicating onward — so it is testable without a running binary.
+    // first, capped per tick, counting only live holders, and asking each
+    // chosen node to copy straight from a holder (#697) — so it is testable
+    // without a running binary.
     if let (Some(council), Some(membership_rx)) = (api_council.clone(), replication_membership) {
         let repl_registry = pickle_state.clone();
         let repl_shutdown = shutdown.clone();
@@ -3360,12 +3604,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
 
                 let catalog = council.manifest_catalog().await;
-                let peers = {
+                let (peers, live) = {
                     let members = membership_rx.borrow();
-                    reliaburger::cluster::identity::pickle_peers_scheme(
-                        &members,
-                        registry_port,
-                        &heal_scheme,
+                    (
+                        reliaburger::cluster::identity::pickle_peers_scheme(
+                            &members,
+                            registry_port,
+                            &heal_scheme,
+                        ),
+                        reliaburger::cluster::identity::live_registry_nodes(
+                            &members,
+                            repl_registry.node_raft_id,
+                        ),
                     )
                 };
                 if peers.len() < 2 {
@@ -3376,6 +3626,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     &catalog,
                     &repl_registry,
                     &peers,
+                    &live,
                     redundancy,
                     10,
                     &client,
@@ -3456,6 +3707,34 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
 const APPLE_RUNTIME_DEFERRED: &str = "direct Apple Container is disabled for 0.1.0; use the managed Linux VM with `relish setup --quickstart`";
 
+/// Why a node that would run rootless runc can't start with `--cluster`.
+#[cfg(target_os = "linux")]
+const ROOTLESS_CLUSTER_UNSUPPORTED: &str = "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
+     or use rootful Linux Runc with eBPF for a container cluster \
+     (relish setup --quickstart provisions a managed Linux VM on macOS)";
+
+/// Refuse a cluster node whose `--runtime` selection would be rootless runc.
+///
+/// `rootless` says whether Bun lacks root, and `runc_installed` whether
+/// `auto` would pick runc. Both are facts about the command line and the
+/// host, so the refusal can come before Bun touches any state (#813).
+#[cfg(target_os = "linux")]
+fn refuse_rootless_cluster(
+    selection: &str,
+    rootless: bool,
+    runc_installed: bool,
+) -> anyhow::Result<()> {
+    let selects_runc = match selection {
+        "runc" | "mixed" => true,
+        "auto" => runc_installed,
+        _ => false,
+    };
+    if rootless && selects_runc {
+        anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
+    }
+    Ok(())
+}
+
 async fn select_runtime(
     name: &str,
     instances_dir: &std::path::Path,
@@ -3474,17 +3753,18 @@ async fn select_runtime(
                     std::env::current_exe()?,
                 )),
                 #[cfg(target_os = "linux")]
-                DetectedRuntime::Runc { rootless } => AnyGrill::Runc(create_runc_runtime(
+                DetectedRuntime::Runc { rootless } => AnyGrill::with_host_processes(
+                    create_runc_runtime(instances_dir, image_directory, rootless, mirrors)?,
                     instances_dir,
-                    image_directory,
-                    rootless,
-                    mirrors,
-                )?),
+                    std::env::current_exe()?,
+                ),
             };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
                 #[cfg(target_os = "linux")]
                 AnyGrill::Runc(_) => "runc",
+                #[cfg(target_os = "linux")]
+                AnyGrill::Mixed(_) => "runc+process",
                 #[cfg(target_os = "macos")]
                 AnyGrill::Apple(_) => "apple-container",
             };
@@ -3499,13 +3779,20 @@ async fn select_runtime(
             )))
         }
         #[cfg(target_os = "linux")]
-        "runc" => {
+        "runc" | "mixed" => {
             let is_rootless = reliaburger::grill::rootless::is_rootless();
             let mode = if is_rootless { "rootless" } else { "root" };
-            println!("bun: using runc runtime ({mode})");
-
+            println!("bun: using {name} runtime ({mode})");
             let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
-            Ok(AnyGrill::Runc(grill))
+            if name == "mixed" {
+                Ok(AnyGrill::with_host_processes(
+                    grill,
+                    instances_dir,
+                    std::env::current_exe()?,
+                ))
+            } else {
+                Ok(AnyGrill::Runc(grill))
+            }
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
         other => anyhow::bail!("unknown runtime: {other}"),
@@ -3532,10 +3819,21 @@ fn create_runc_runtime(
     )?)
 }
 
+// Host workloads are refused under mount isolation until #714 implements it,
+// so a node with it on doesn't advertise them.
+fn host_workloads_enabled(
+    runtime: &str,
+    policy: &reliaburger::config::process_workloads::ProcessWorkloadsConfig,
+) -> bool {
+    matches!(runtime, "process" | "runc+process")
+        && !policy.allowed_binaries.is_empty()
+        && !policy.mount_isolation
+}
+
 async fn runtime_version(runtime: &str) -> Option<String> {
     match runtime {
         "process" => Some(env!("CARGO_PKG_VERSION").to_string()),
-        "runc" => bounded_version_command("runc", &["--version"]).await,
+        "runc" | "runc+process" => bounded_version_command("runc", &["--version"]).await,
         "apple" => bounded_version_command("container", &["--version"]).await,
         _ => None,
     }
@@ -3567,23 +3865,73 @@ async fn bounded_version_command(program: &str, arguments: &[&str]) -> Option<St
         .map(|line| line.trim().to_string())
 }
 
-/// Bind and wire the `.internal` resolver for the selected runtime.
+/// A workload resolver the runtime was configured with, not yet bound.
+struct WorkloadDns {
+    config: reliaburger::onion::dns::DnsConfig,
+    nameserver: std::net::Ipv4Addr,
+    freebind: bool,
+}
+
+/// Make the selected runtime the one Bun will run with, before anything reads
+/// its launches.
+///
+/// Two steps, in this order. First the runtime gets its workload resolver,
+/// which is part of the configuration every runc launch records. Then the
+/// mixed runtime routes the launches a previous single runtime left behind
+/// (#823). Routing reads the runc launch journal, which refuses a live launch
+/// recorded under a different configuration, so routing before the resolver
+/// is set refuses every container a runc node started with DNS on (#839).
+async fn prepare_runtime(
+    runtime: AnyGrill,
+    section: &reliaburger::config::node::DnsSection,
+) -> anyhow::Result<(AnyGrill, Option<WorkloadDns>)> {
+    let (runtime, dns) = configure_dns_runtime(runtime, section)?;
+    route_previous_runtime_launches(&runtime).await?;
+    Ok((runtime, dns))
+}
+
+/// Route each launch from a previous single runtime to the backend that owns
+/// it, when the node now runs the mixed runtime (#823).
+async fn route_previous_runtime_launches(runtime: &AnyGrill) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let AnyGrill::Mixed(mixed) = runtime {
+        let routed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            mixed.route_unrouted_launches(),
+        )
+        .await
+        .context("timed out routing launches from the previous runtime")?
+        .context("cannot route launches from the previous runtime")?;
+        if !routed.is_empty() {
+            eprintln!(
+                "bun: routed {} launch(es) from the previous runtime: {}",
+                routed.len(),
+                routed
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = runtime;
+    Ok(())
+}
+
+/// Give the selected runtime its `.internal` resolver address.
 ///
 /// Rootful runc is the only runtime whose transparent resolver path is
 /// implemented today. Its workload address is the node-side veth gateway;
 /// `IP_FREEBIND` lets Bun bind that exact address before the first container
 /// network creates it. Other runtime/address combinations fail before the
-/// agent can create or adopt a workload.
-async fn prepare_dns_runtime(
+/// agent can create or adopt a workload. With DNS off there is no resolver.
+fn configure_dns_runtime(
     runtime: AnyGrill,
     section: &reliaburger::config::node::DnsSection,
-) -> anyhow::Result<(
-    AnyGrill,
-    Option<reliaburger::onion::dns::BoundDnsResponder>,
-    reliaburger::onion::dns::DnsCapability,
-)> {
+) -> anyhow::Result<(AnyGrill, Option<WorkloadDns>)> {
     if !section.enabled {
-        return Ok((runtime, None, Default::default()));
+        return Ok((runtime, None));
     }
 
     let mut config = section.to_dns_config()?;
@@ -3596,13 +3944,46 @@ async fn prepare_dns_runtime(
 
     let (runtime, nameserver, freebind) = configure_workload_dns(runtime, config.listen_addr)?;
     #[cfg(target_os = "linux")]
-    if let AnyGrill::Runc(grill) = &runtime {
+    if let Some(grill) = runtime.runc_runtime() {
         config.source_namespaces = grill.dns_source_namespaces();
     }
     if config.listen_addr.ip().is_unspecified() {
         config.listen_addr.set_ip(nameserver.into());
     }
+    // Only now is the address workloads query known; forwarding to it would
+    // loop every external lookup back into this responder.
+    let own_listen = config.listen_addr;
+    config.upstreams.retain(|upstream| *upstream != own_listen);
+    if config.upstreams.is_empty() {
+        anyhow::bail!(
+            "dns: every upstream resolver is this node's own DNS address {own_listen}; set [dns] upstream"
+        );
+    }
+    Ok((
+        runtime,
+        Some(WorkloadDns {
+            config,
+            nameserver,
+            freebind,
+        }),
+    ))
+}
 
+/// Bind the `.internal` resolver's sockets before Bun reports readiness.
+async fn bind_workload_dns(
+    dns: Option<WorkloadDns>,
+) -> anyhow::Result<(
+    Option<reliaburger::onion::dns::BoundDnsResponder>,
+    reliaburger::onion::dns::DnsCapability,
+)> {
+    let Some(WorkloadDns {
+        config,
+        nameserver,
+        freebind,
+    }) = dns
+    else {
+        return Ok((None, Default::default()));
+    };
     #[cfg(target_os = "linux")]
     let bound = if freebind {
         reliaburger::onion::dns::BoundDnsResponder::bind_freebind(config)
@@ -3625,7 +4006,7 @@ async fn prepare_dns_runtime(
         ipv6: false,
         workload_reachable: true,
     };
-    Ok((runtime, Some(bound), capability))
+    Ok((Some(bound), capability))
 }
 
 #[cfg(target_os = "linux")]
@@ -3636,6 +4017,18 @@ fn configure_workload_dns(
     use std::net::IpAddr;
 
     match runtime {
+        AnyGrill::Mixed(grill) => {
+            let (configured, nameserver, freebind) =
+                configure_workload_dns(AnyGrill::Runc(grill.container().clone()), listen_addr)?;
+            let AnyGrill::Runc(container) = configured else {
+                anyhow::bail!("DNS changed the selected container backend");
+            };
+            Ok((
+                AnyGrill::Mixed(grill.with_container(container)),
+                nameserver,
+                freebind,
+            ))
+        }
         AnyGrill::Runc(grill) => {
             let Some(gateway) = grill.dns_gateway_address() else {
                 anyhow::bail!(
@@ -3734,6 +4127,68 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn rootless_cluster_is_refused_for_every_selection_that_picks_runc() {
+        for (selection, runc_installed) in [("runc", false), ("mixed", false), ("auto", true)] {
+            let error = refuse_rootless_cluster(selection, true, runc_installed)
+                .expect_err("rootless runc cannot join a cluster");
+            assert_eq!(
+                error.to_string(),
+                ROOTLESS_CLUSTER_UNSUPPORTED,
+                "{selection}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rootless_cluster_is_allowed_when_no_rootless_runc_is_selected() {
+        // Rootful runc, the process runtime, and `auto` without runc all
+        // cluster; unknown names fail later with their own message.
+        for (selection, rootless, runc_installed) in [
+            ("runc", false, true),
+            ("mixed", false, true),
+            ("auto", false, true),
+            ("process", true, true),
+            ("auto", true, false),
+            ("apple", true, true),
+        ] {
+            refuse_rootless_cluster(selection, rootless, runc_installed).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn explicit_runc_disables_host_execution_and_mixed_enables_both() {
+        use reliaburger::grill::{Grill, records::RuntimeKind};
+        let root = tempfile::tempdir().unwrap();
+        for (mode, host) in [("runc", false), ("mixed", true)] {
+            let runtime = select_runtime(
+                mode,
+                &root.path().join(mode),
+                &root.path().join("images"),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                runtime.supports_runtime(RuntimeKind::Process),
+                host,
+                "{mode}"
+            );
+            assert!(runtime.supports_runtime(RuntimeKind::Runc));
+            let policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/true".into()],
+                mount_isolation: false,
+                ..Default::default()
+            };
+            let name = if host { "runc+process" } else { "runc" };
+            assert_eq!(host_workloads_enabled(name, &policy), host);
+            assert!(!host_workloads_enabled(name, &Default::default()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn runc_selection_uses_the_nodes_private_image_storage() {
         let root = tempfile::tempdir().unwrap();
@@ -3822,6 +4277,21 @@ mod tests {
     }
 
     #[test]
+    fn host_workloads_are_not_advertised_under_mount_isolation() {
+        // Host apps and jobs are refused under mount isolation (#714), so
+        // `relish test` must skip their cases instead of waiting on them (#777).
+        let mut policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+            allowed_binaries: vec!["/bin/true".into()],
+            mount_isolation: false,
+            ..Default::default()
+        };
+        assert!(host_workloads_enabled("process", &policy));
+        policy.mount_isolation = true;
+        assert!(!host_workloads_enabled("process", &policy));
+        assert!(!host_workloads_enabled("runc+process", &policy));
+    }
+
+    #[test]
     fn resolve_join_seeds_handles_empty_and_ip_literals() {
         // No seeds → no error, empty list (the node bootstraps a new cluster).
         assert!(resolve_join_seeds(&[]).unwrap().is_empty());
@@ -3889,6 +4359,129 @@ mod tests {
             .err()
             .expect("host loopback is isolated from the workload namespace");
         assert!(error.to_string().contains("host loopback"));
+    }
+
+    /// The DNS section a node with `[dns] enabled = true` runs with.
+    #[cfg(target_os = "linux")]
+    fn dns_section(enabled: bool) -> reliaburger::config::node::DnsSection {
+        reliaburger::config::node::DnsSection {
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    /// Record a live runc launch the way a `--runtime runc` Bun did: under
+    /// the runtime configuration that Bun computed, resolver included. The
+    /// journal is runc's own; nothing here needs root or a runc binary.
+    #[cfg(target_os = "linux")]
+    async fn record_runc_launch(
+        instances: &std::path::Path,
+        images: &std::path::Path,
+        nameserver: Option<std::net::Ipv4Addr>,
+        id: &reliaburger::grill::InstanceId,
+    ) {
+        use reliaburger::grill::runc_intent::{IntentConfiguration, IntentJournal};
+        let hostname =
+            std::fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "localhost".to_string());
+        let bundles = std::path::absolute(instances.join("runc").join("bundles")).unwrap();
+        std::fs::create_dir_all(&bundles).unwrap();
+        let journal = IntentJournal::new(
+            bundles.join(".intents"),
+            IntentConfiguration {
+                bundle_directory: bundles,
+                state_directory: std::path::absolute(instances.join("runc").join("state")).unwrap(),
+                image_directory: std::path::absolute(images).unwrap(),
+                runc_program: "runc".into(),
+                rootless: false,
+                dns_nameserver: nameserver,
+                node_index: reliaburger::grill::netns::node_index_from_id(hostname.trim()),
+            },
+        );
+        let job: reliaburger::config::job::JobSpec =
+            toml::from_str("image='alpine:3.20'\ncommand=['/bin/sleep','60']").unwrap();
+        let spec = reliaburger::grill::generate_job_oci_spec(
+            "frontend",
+            "default",
+            &job,
+            "/sys/fs/cgroup/reliaburger/default/frontend/2",
+            None,
+        );
+        journal
+            .claim(id, None)
+            .await
+            .unwrap()
+            .publish(&spec)
+            .await
+            .unwrap();
+    }
+
+    /// The runtimes a `--runtime runc` and a `--runtime mixed` Bun build
+    /// from the same node.toml, before DNS configures either.
+    #[cfg(target_os = "linux")]
+    fn runc_and_mixed(
+        instances: &std::path::Path,
+        images: &std::path::Path,
+    ) -> (AnyGrill, AnyGrill) {
+        let mirrors = reliaburger::grill::ImageMirrors::default();
+        let runc = || create_runc_runtime(instances, images, false, &mirrors).unwrap();
+        let mixed =
+            AnyGrill::with_host_processes(runc(), instances, std::env::current_exe().unwrap());
+        (AnyGrill::Runc(runc()), mixed)
+    }
+
+    /// #839: a runc node with DNS on records its resolver in every launch.
+    /// Restarted with `--runtime mixed`, Bun routed those launches before it
+    /// gave the runtime its resolver, so the runc journal refused each one
+    /// and Bun crash-looped. Routing has to see the configuration Bun runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runc_launches_with_dns_are_routed_once_the_mixed_runtime_has_its_resolver() {
+        use reliaburger::grill::Grill;
+        let temp = tempfile::tempdir().unwrap();
+        let (instances, images) = (temp.path().join("instances"), temp.path().join("images"));
+        let id = reliaburger::grill::InstanceId("default__frontend-2".into());
+        let section = dns_section(true);
+
+        let (runc, mixed) = runc_and_mixed(&instances, &images);
+        let (runc, _) = configure_dns_runtime(runc, &section).unwrap();
+        let nameserver = runc.runc_runtime().unwrap().dns_gateway_address();
+        record_runc_launch(&instances, &images, nameserver, &id).await;
+        // The runc Bun itself reads the launch back: the recorded
+        // configuration is the one a runc Bun computes.
+        assert_eq!(runc.launch_inventory().await.unwrap().unwrap().len(), 1);
+
+        // A mixed runtime without its resolver is not the one Bun runs.
+        assert!(
+            route_previous_runtime_launches(&mixed).await.is_err(),
+            "the journal accepted a launch recorded under another resolver"
+        );
+
+        let (mixed, dns) = prepare_runtime(mixed, &section).await.unwrap();
+        assert!(dns.is_some());
+        let launches = mixed.launch_inventory().await.unwrap().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].instance_id, id);
+    }
+
+    /// With DNS off neither runtime has a resolver, and routing still works.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runc_launches_without_dns_are_routed_by_the_mixed_runtime() {
+        use reliaburger::grill::Grill;
+        let temp = tempfile::tempdir().unwrap();
+        let (instances, images) = (temp.path().join("instances"), temp.path().join("images"));
+        let id = reliaburger::grill::InstanceId("default__frontend-2".into());
+        let section = dns_section(false);
+
+        let (runc, mixed) = runc_and_mixed(&instances, &images);
+        record_runc_launch(&instances, &images, None, &id).await;
+        assert_eq!(runc.launch_inventory().await.unwrap().unwrap().len(), 1);
+
+        let (mixed, dns) = prepare_runtime(mixed, &section).await.unwrap();
+        assert!(dns.is_none());
+        let launches = mixed.launch_inventory().await.unwrap().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].instance_id, id);
     }
 
     use reliaburger::council::CouncilNode;
@@ -4130,13 +4723,27 @@ mod tests {
     }
 
     #[test]
-    fn mtls_mode_accepts_a_bootstrap_node_without_mtls_required() {
+    fn mtls_mode_accepts_a_bootstrap_node_that_opts_into_plaintext() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = NodeConfig::default();
         config.storage.data = dir.path().to_path_buf();
-        // require_mtls defaults to false — plaintext is allowed.
+        // Plaintext is an explicit opt-in, never the default.
+        config.security.require_mtls = false;
         let params = cluster_params_from_config(&config).unwrap();
         assert!(enforce_mtls_mode(&config, &params).is_ok());
+    }
+
+    #[test]
+    fn a_default_cluster_config_without_an_identity_refuses_and_names_relish_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = dir.path().to_path_buf();
+        let params = cluster_params_from_config(&config).unwrap();
+        let err = enforce_mtls_mode(&config, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("relish init"),
+            "an omitted [security] section must fail closed, got: {err}"
+        );
     }
     #[tokio::test]
     async fn api_tls_connection_drains_inflight_work_before_retiring() {

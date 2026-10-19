@@ -1,7 +1,7 @@
 # A laptop cluster
 
-The command below installs the published, signed 0.1.6 release (7 October
-2026) and builds a laptop cluster from it. The two cold installs of the
+The command below installs the published, signed 0.2.0 release
+(16 October 2026) and builds a laptop cluster from it. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
 to a ready three-node cluster ([record](qualification/2026-09-27-v0.1.0-release-closure.md#how-it-ended)).
 Intel Macs and Linux hosts haven't been measured yet, and your connection and
@@ -18,7 +18,7 @@ relish dashboard             # Ctrl-C stops the browser connection
 ```
 
 The installer says what it's fetching before each download (for example
-`Downloading relish v0.1.6 for macos-aarch64 (89.4 MiB)...`), draws curl's
+`Downloading relish v0.2.0 for macos-aarch64 (RELISH_SIZE_0_2_0 MiB)...`), draws curl's
 progress bar when you run it in a terminal, and finishes each download with
 the bytes and seconds it took. In a log or a pipe it prints only those lines.
 
@@ -53,6 +53,15 @@ least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
 image download time also depends on your connection. The VMs don't install
 anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
 `~/.reliaburger/lima`, isolated from your normal Lima configuration.
+
+Relish pins Lima 2.2.1, whatever Lima you have installed yourself. Older Lima
+releases have two problems for the quickstart: before 2.1.3 any user inside a
+QEMU VM could reach the guest agent's socket and become root
+([CVE-2026-53657](https://nvd.nist.gov/vuln/detail/cve-2026-53657)), and
+before 2.2.0 the guest agent leaked a socket for every connection forwarded
+to a host port ([lima-vm/lima#5210](https://github.com/lima-vm/lima/issues/5210)),
+so a script polling the API slowly filled the guest's memory. Relish uses
+Lima's default port forwarder; you don't need `LIMA_SSH_PORT_FORWARDER`.
 
 Each VM takes its time from your Mac. Lima's guest agent sets the guest clock
 to the host's whenever the two drift more than 100 ms apart, checking every
@@ -134,7 +143,10 @@ node is running and its critical subsystems are ready. Missing or stopped VMs,
 unresponsive APIs and unavailable evidence return exit 1 after printing the
 observations. A saved provisioning checkpoint is not a live health check.
 
-`stop` preserves data. `destroy --yes` removes only the VMs named in this
+`stop` preserves data. It asks each guest to power itself off, so every node
+shuts down cleanly in a few seconds. If a guest is still running after two
+minutes, `stop` says so and falls back to `limactl stop`, which cuts the
+power after 30 seconds. `destroy --yes` removes only the VMs named in this
 cluster's saved record, along with its credentials and checkpoints. It keeps
 the downloaded tool and image cache for future clusters. `--name NAME` selects
 a different saved cluster; setup currently supports one active CLI context.
@@ -164,11 +176,18 @@ normal CLI commands read it without requiring a VM shell. The node APIs use
 TLS and pinned cluster CAs. Explicit `--endpoint` settings don't inherit this
 context's credentials.
 
+Each VM runs Bun as `reliaburger.service`. systemd restarts it 2 seconds after
+it exits, and `OOMScoreAdjust=-900` makes the kernel kill workloads before
+Bun when the guest runs out of memory: Bun starts every workload, job and task
+at `oom_score_adj` +500. Containers resolve `.internal` names
+through Bun, and everything else through the guest's own resolvers from
+`/etc/resolv.conf`, not a public one.
+
 For guest diagnostics, use the VM name printed by `relish local status`:
 
 ```sh
 LIMA_HOME="$HOME/.reliaburger/lima" \
-  ~/.reliaburger/tools/lima-2.1.0/bin/limactl shell VM_NAME \
+  ~/.reliaburger/tools/lima-2.2.1/bin/limactl shell VM_NAME \
   sudo journalctl -u reliaburger.service --no-pager -n 100
 ```
 
@@ -188,7 +207,10 @@ candidate verification and the matching installer environment variable.
 ## Development qualification
 
 To try a change that isn't in a release, build Linux `bun` and `relish` with
-`--features ebpf` and supply their directory explicitly:
+`--features ebpf` and supply their directory explicitly. Once main changes a
+format after a release, a build from it carries a `-dev` version (as
+`0.2.0-dev` did before 0.2.0), and setup refuses to download release nodes for
+it, because none exist and the last release speaks older cluster formats:
 
 ```sh
 RELIABURGER_HOME=/absolute/path/to/isolated-state \

@@ -2,7 +2,7 @@
 ///
 /// Permissions define which actions a principal (identified by its token name)
 /// can perform on which apps and namespaces. Valid actions: deploy, scale,
-/// logs, metrics, exec, host-exec, admin, secret-read, secret-write.
+/// logs, metrics, exec, host-exec, fault, admin, secret-read, secret-write.
 ///
 /// Enforcement (see `sesame::auth::authorize_permission`): a spec named after a
 /// token is an **additional** allow-list on top of that token's role and scope
@@ -34,6 +34,8 @@ pub enum PermissionAction {
     Metrics,
     Exec,
     HostExec,
+    /// Inject or clear chaos faults (`relish fault`).
+    Fault,
     Admin,
     SecretRead,
     SecretWrite,
@@ -49,6 +51,7 @@ impl PermissionAction {
             PermissionAction::Metrics => "metrics",
             PermissionAction::Exec => "exec",
             PermissionAction::HostExec => "host-exec",
+            PermissionAction::Fault => "fault",
             PermissionAction::Admin => "admin",
             PermissionAction::SecretRead => "secret-read",
             PermissionAction::SecretWrite => "secret-write",

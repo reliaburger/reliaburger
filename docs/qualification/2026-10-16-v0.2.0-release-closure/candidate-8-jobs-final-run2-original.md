@@ -1,0 +1,199 @@
+# Sustained soak (V02): FAIL
+
+16 October 2026. final tier, full schedule, 12 h 00 min of soak on a three-node quickstart cluster.
+
+**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, then a fresh final-tier run.
+
+## Candidate and host
+
+| | |
+|---|---|
+| Staged base URL | <https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.0-38674308323-1> |
+| `candidate.json` SHA-256 | `a8188b1cb13a5ec798b05a5d338ccb6fa26d39253d465820d49f1ea8012a3e0a` |
+| Running versions | v0.2.0 x3 |
+| Soak build | `bun-v0.2.0-soak.1`, SHA-256 `8c6fb16b4e5c41db265201565fe3280fbd2726e15c132055c460fcdc35549d39` |
+| Walks roll back to | 0.2.0 |
+| Host | macOS 26.3.1, Apple M2 Max, 32 GiB |
+| Lima | limactl version 2.1.0 |
+| Guest | Ubuntu 24.04.5 LTS, kernel 6.8.0-139-generic |
+| RELIABURGER_HOME | `/tmp/rbq.GSMFHv` |
+| Evidence | `/var/tmp/reliaburger-v02.q8RbSV` |
+
+## Configuration deviations
+
+- Lima forwards ports over SSH (`LIMA_SSH_PORT_FORWARDER=true`), not its default gRPC forwarder, which leaks a guest-agent socket per forwarded connection in Lima 2.1 (lima-vm/lima#5210, #982)
+- node.toml `[testing] allowed_operations` adds `provision_isolated_workloads` (quickstart allows only inject_workload_faults and alter_node_state), so the catalogue pulse can lease test namespaces
+- node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory
+- node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness
+- Bun runs with auto/mixed; host jobs opt in to a single pinned BusyBox copy under /var/lib/reliaburger/soak-jobs, mount_isolation=false. The independent verifier listens on each private VM address, TCP 8189, with a separate run token
+- node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps
+- node.toml `[upgrades] external_signing_key` = a throwaway operator key the harness made for this run (`ed25519:91U71LIBgPLPkS7ZgtKThUEOaytMGiY3F1Q3Ug1ZvEA=`); the soak build's `.sig` gets that key's external signature beside the release one (D2)
+- node.toml `[security] leaf_lifetime_override_secs = 3600` (D1)
+
+## Timeline
+
+- Started 2026-10-16 05:36:07 UTC, finished 2026-10-16 17:36:20 UTC
+- Cycles completed: 12
+- Teardown: `relish local destroy --yes` and `relish uninstall --yes` succeeded
+
+## Faults and slots
+
+| Class | Runs | Settled/ok | Failed | Skipped | Settle (median / max) |
+|---|---|---|---|---|---|
+| fault:bun-kill-follower | 12 | 11 | 1 | 0 | 39 s / 306 s |
+| fault:bun-kill-leader | 12 | 11 | 1 | 0 | 38 s / 302 s |
+| fault:chaos-delay | 2 | 4 | 0 | 0 | 21 s / 21 s |
+| fault:chaos-dns | 1 | 1 | 1 | 0 | 305 s / 305 s |
+| fault:chaos-drop | 1 | 2 | 0 | 0 | 31 s / 31 s |
+| fault:chaos-kill | 2 | 3 | 1 | 0 | 311 s / 311 s |
+| fault:chaos-partition | 2 | 4 | 0 | 0 | 22 s / 22 s |
+| fault:chaos-pause | 2 | 4 | 0 | 0 | 22 s / 22 s |
+| fault:chaos-scenario | 2 | 4 | 0 | 0 | 46 s / 46 s |
+| fault:deploy-kill | 6 | 6 | 0 | 0 | 44 s / 57 s |
+| fault:node-delay | 4 | 3 | 1 | 0 | 37 s / 305 s |
+| fault:node-disk-full | 4 | 4 | 0 | 0 | 21 s / 23 s |
+| fault:node-slow-fsync | 4 | 4 | 0 | 0 | 21 s / 22 s |
+| fault:power-off | 11 | 5 | 6 | 0 | 22 s / 480 s |
+| pulse | 12 | 11 | 1 | 0 | n/a |
+| pulse:settle | 0 | 11 | 1 | 0 | 22 s / 305 s |
+| special:all-off | 1 | 1 | 0 | 0 | 62 s / 62 s |
+| special:graceful-stop | 2 | 2 | 0 | 0 | 85 s / 85 s |
+| special:quorum-back | 2 | 2 | 0 | 0 | n/a |
+| special:quorum-loss | 2 | 2 | 0 | 0 | 22 s / 22 s |
+| storage:offline-export | 2 | 2 | 0 | 0 | n/a |
+| storage:registry-push | 12 | 0 | 0 | 0 | n/a |
+| tls:invalid-expired | 15 | 15 | 0 | 0 | n/a |
+| tls:invalid-torn | 18 | 18 | 0 | 0 | n/a |
+| tls:reload | 138 | 138 | 0 | 0 | n/a |
+| upgrade:rollback | 6 | 6 | 0 | 0 | n/a |
+| upgrade:settle | 0 | 6 | 0 | 0 | 83 s / 87 s |
+| upgrade:upgrade | 6 | 5 | 1 | 0 | n/a |
+
+## Renewals and rotations
+
+| Measure | Observed | Required | Verdict |
+|---|---|---|---|
+| workload identity rotations (soak-identity, per node) | 25 | ≥ 23 | PASS |
+| node leaf renewals (per node) | 24 | ≥ 23 | PASS |
+| operator ingress reloads (all nodes) | 138 | ≥ 47 | PASS |
+| mixed job campaign and positive drain | 6 missing/failing checks | 0 | FAIL |
+
+## Jobs
+
+| Runtime | Accepted successes | Retries | Last accepted progress |
+|---|---|---|---|
+| runc | 60369 | 6 | 1792172051 |
+| shared-runc | 52437980 | 19 | 1792172048 |
+| process | 145762780 | 1 | 1792166724 |
+
+The bounded campaign shares the app soak's fault schedule. These counts are reliability evidence, not a saturation rate or a 100-million-per-day qualification.
+
+- retained run budget exhausted
+- runc long work (1928): candidate API refused POST /v1/batch/1928/cancel (HTTP 404)
+- process long work (2048): candidate API refused POST /v1/batch/2048/cancel (HTTP 404)
+- shared-runc short work (2101): candidate API refused POST /v1/batch/2101/cancel (HTTP 404)
+- job campaign drain deadline exceeded
+- job campaign did not positively drain before teardown
+- Independent verifier execution attempts: 24
+- Explicit test-operator acknowledgements for known replay-safe fenced fixtures: 256
+
+- rb-d6f3f07e703b-1: latest complete job storage (KiB) {'instances': 14408, 'job-state': 8, 'task-arrays': 2656}; free 4432412 KiB; live/peak owners 0/32; peak storage {'instances': 101692, 'job-state': 8, 'task-arrays': 62916}
+- rb-d6f3f07e703b-2: latest complete job storage (KiB) {'instances': 3616, 'job-state': 8, 'task-arrays': 2620}; free 6018564 KiB; live/peak owners 0/32; peak storage {'instances': 61304, 'job-state': 8, 'task-arrays': 63752}
+- rb-d6f3f07e703b-3: latest complete job storage (KiB) {'instances': 24784, 'job-state': 8, 'task-arrays': 2440}; free 6003776 KiB; live/peak owners 0/32; peak storage {'instances': 28464, 'job-state': 8, 'task-arrays': 68580}
+
+Complete disk inventories are recorded. Global retention bounds and the 12-hour job qualification remain #668; this gate cannot certify an unimplemented retention policy.
+
+## Job qualification (D18-C)
+
+Load: target; 3 nodes; accepted 4,600.3/s against a 1390.0/s target: PASS.
+
+The September plan set its targets for one 1M-task batch on a quiet cluster. A soak runs for hours with restarts, upgrades and apps, so its storage, Bun memory and Raft targets are restated (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). Bun's steady state is the median RSS of each process once it has been seen for 10 minutes; the gated memory checks are unchanged (`leak-rss`, and Mayo's 70% `memory_high` alert through `wtf`).
+
+| Measure (recorded, not gated) | Observed | Target |
+|---|---|---|
+| Wall time of a 1,048,576-task array (median / max of 64) | 264 s / 1,167 s | ≤ 600 s |
+| p99 start lag, pooled executors | 32 ms (bucket upper bound) | < 1,000 ms |
+| Raft entries per second, all cluster writes | 8.13 | recorded only; the batch target counts only task-array writes |
+| Raft state of one run, largest seen | 6,610 B | ≤ 256 KiB per 1M tasks |
+| Bun steady-state RSS per process, worst node against its target | rb-d6f3f07e703b-2: 226.89 MiB steady, 400.08 MiB peak | ≤ 384 MiB (≤ 512 MiB on node 1, which serves the API) |
+| Bun CPU, busiest node | 0.34 cores | ≤ 1 core (leader batch control) |
+| Executor helper CPU, busiest node | 0.01 cores | ≤ 0.5 core |
+| Node task-array storage per 1M accepted tasks (peaks summed) | 0.96 MiB | ≤ 64 MiB, deleted after retirement |
+| Retained log volume, all nodes | 25.03 MB | ≤ 50 MB |
+
+- Bun RSS on rb-d6f3f07e703b-1 (serves the API, target ≤ 512 MiB): pid 8341: 194.71 MiB peak (seen for under 10 minutes); pid 1325924: 233.59 MiB steady, 342.12 MiB peak; pid 4010587: 193.32 MiB steady, 194.14 MiB peak; pid 4010587: 194.96 MiB steady, 269.21 MiB peak; pid 2332199: 229.42 MiB steady, 279.96 MiB peak; pid 2332199: 196.69 MiB steady, 249.92 MiB peak; pid 70297: 212.21 MiB peak (seen for under 10 minutes); pid 70297: 220.30 MiB steady, 224.96 MiB peak; pid 677: 368.81 MiB peak (seen for under 10 minutes); pid 350511: 182.93 MiB steady, 221.87 MiB peak; pid 3275423: 177.49 MiB peak (seen for under 10 minutes); pid 666: 158.14 MiB steady, 163.36 MiB peak; pid 666: 190.14 MiB steady, 193.05 MiB peak; pid 672: 196.05 MiB steady, 210.82 MiB peak; pid 3902181: 189.59 MiB steady, 190.52 MiB peak; pid 3902181: 191.73 MiB steady, 227.43 MiB peak; pid 471386: 204.71 MiB peak (seen for under 10 minutes); pid 1779397: 196.65 MiB steady, 198.17 MiB peak; pid 2470154: 178.82 MiB peak (seen for under 10 minutes); pid 2470154: 190.61 MiB steady, 193.66 MiB peak; pid 674: 168.19 MiB peak (seen for under 10 minutes)
+- Bun RSS on rb-d6f3f07e703b-2 (node, target ≤ 384 MiB): pid 2363: 168.60 MiB steady, 170.74 MiB peak; pid 2959442: 178.81 MiB steady, 232.17 MiB peak; pid 2959442: 174.65 MiB steady, 176.46 MiB peak; pid 715064: 178.48 MiB steady, 182.30 MiB peak; pid 923046: 153.88 MiB steady, 155.29 MiB peak; pid 923046: 167.20 MiB steady, 170.25 MiB peak; pid 1395181: 154.21 MiB steady, 158.54 MiB peak; pid 94603: 151.63 MiB peak (seen for under 10 minutes); pid 672: 162.12 MiB steady, 162.49 MiB peak; pid 668: 167.79 MiB steady, 168.09 MiB peak; pid 668: 195.10 MiB steady, 195.53 MiB peak; pid 673: 195.81 MiB steady, 195.81 MiB peak; pid 1829656: 226.89 MiB steady, 303.34 MiB peak; pid 3803208: 250.02 MiB peak (seen for under 10 minutes); pid 3803208: 201.04 MiB steady, 249.36 MiB peak; pid 675: 400.08 MiB peak (seen for under 10 minutes); pid 1620493: 176.77 MiB peak (seen for under 10 minutes); pid 3107838: 219.89 MiB peak (seen for under 10 minutes); pid 670: 190.58 MiB steady, 204.96 MiB peak; pid 697357: 181.78 MiB peak (seen for under 10 minutes); pid 2194689: 220.09 MiB steady, 235.56 MiB peak; pid 674: 144.05 MiB peak (seen for under 10 minutes); pid 327056: 176.90 MiB steady, 177.50 MiB peak; pid 4047840: 161.91 MiB steady, 163.66 MiB peak; pid 4047840: 161.78 MiB steady, 164.27 MiB peak; pid 674: 149.26 MiB peak (seen for under 10 minutes)
+- Bun RSS on rb-d6f3f07e703b-3 (node, target ≤ 384 MiB): pid 2150: 118.25 MiB peak (seen for under 10 minutes); pid 3513: 155.01 MiB steady, 159.77 MiB peak; pid 665: 174.84 MiB steady, 183.63 MiB peak; pid 1599353: 177.70 MiB peak (seen for under 10 minutes); pid 3267019: 202.27 MiB steady, 226.89 MiB peak; pid 1886493: 181.64 MiB steady, 218.34 MiB peak; pid 674: 177.66 MiB steady, 226.89 MiB peak; pid 1430564: 183.54 MiB peak (seen for under 10 minutes); pid 1430564: 197.15 MiB steady, 220.69 MiB peak; pid 1646621: 198.28 MiB steady, 238.15 MiB peak; pid 676: 135.04 MiB peak (seen for under 10 minutes); pid 157191: 161.51 MiB steady, 171.17 MiB peak; pid 674: 166.04 MiB steady, 166.11 MiB peak; pid 673: 167.95 MiB steady, 168.02 MiB peak; pid 2636748: 179.59 MiB steady, 180.27 MiB peak; pid 2636748: 160.23 MiB steady, 160.50 MiB peak; pid 673: 152.35 MiB peak (seen for under 10 minutes); pid 162574: 195.83 MiB steady, 199.16 MiB peak; pid 162574: 161.41 MiB steady, 164.83 MiB peak; pid 671: 153.43 MiB steady, 154.30 MiB peak; pid 668: 151.59 MiB steady, 152.98 MiB peak; pid 668: 162.62 MiB steady, 164.83 MiB peak; pid 673: 136.21 MiB peak (seen for under 10 minutes)
+
+- runc retry causes: exit_code 1, launch 4, signal 0, timeout 1, unknown 0, unrecorded 0
+- shared-runc retry causes: exit_code 1, launch 9, signal 0, timeout 9, unknown 0, unrecorded 0
+- process retry causes: exit_code 1, launch 0, signal 0, timeout 0, unknown 0, unrecorded 0
+- Audited executions: 24; operator replay decisions: 256
+
+## Data
+
+- Volume writer: highest ACK 389600 in the log view; the writer file checks (writer-lost, writer-regression) decide data loss, and `*-log-order` failures are about the order the log view returned lines in
+- Redis counter: highest INCR 40651 in the log view
+- Export rb-d6f3f07e703b-1: 210 source files, 1348 at the destination
+- Export rb-d6f3f07e703b-2: 493 source files, 1428 at the destination
+- Export rb-d6f3f07e703b-3: 398 source files, 938 at the destination
+- Registry images pushed and re-verified: 12
+- Agent-loop turns over the 1 s budget: rb-d6f3f07e703b-1 0, rb-d6f3f07e703b-2 0, rb-d6f3f07e703b-3 0
+- Guest clock steps by Lima's guest agent: rb-d6f3f07e703b-1 7, rb-d6f3f07e703b-2 8, rb-d6f3f07e703b-3 8
+- Checks evaluated: 1558 (heavy 147, light 1086, settle 325)
+- Last observed progress: redis-counter 40651, writer-ack 389600
+
+## Resource trends
+
+| Node | Measure | First | Last | Max |
+|---|---|---|---|---|
+| rb-d6f3f07e703b-1 | disk_kb data | 1370772 | 1555032 | 1571824 |
+| rb-d6f3f07e703b-1 | disk_kb images | 328964 | 482176 | 482176 |
+| rb-d6f3f07e703b-1 | disk_kb logs | 48 | 8728 | 9316 |
+| rb-d6f3f07e703b-1 | disk_kb metrics | 96 | 8684 | 9188 |
+| rb-d6f3f07e703b-1 | disk_kb soak-export | 4 | 125768 | 125768 |
+| rb-d6f3f07e703b-1 | disk_kb volumes | 200 | 252 | 252 |
+| rb-d6f3f07e703b-1 | fd | 92 | 116 | 281 |
+| rb-d6f3f07e703b-1 | rss_kb | 146468 | 172228 | 377660 |
+| rb-d6f3f07e703b-2 | disk_kb data | 68696 | 70596 | 618036 |
+| rb-d6f3f07e703b-2 | disk_kb images | 162076 | 329168 | 329168 |
+| rb-d6f3f07e703b-2 | disk_kb logs | 28 | 8708 | 9528 |
+| rb-d6f3f07e703b-2 | disk_kb metrics | 84 | 8684 | 9096 |
+| rb-d6f3f07e703b-2 | disk_kb soak-export | 4 | 65628 | 65628 |
+| rb-d6f3f07e703b-2 | disk_kb volumes | 16736 | 27824 | 27824 |
+| rb-d6f3f07e703b-2 | fd | 61 | 82 | 607 |
+| rb-d6f3f07e703b-2 | rss_kb | 106696 | 152840 | 409680 |
+| rb-d6f3f07e703b-3 | disk_kb data | 231328 | 261368 | 781936 |
+| rb-d6f3f07e703b-3 | disk_kb images | 316524 | 320944 | 320944 |
+| rb-d6f3f07e703b-3 | disk_kb logs | 28 | 5596 | 5596 |
+| rb-d6f3f07e703b-3 | disk_kb metrics | 84 | 8744 | 9292 |
+| rb-d6f3f07e703b-3 | disk_kb soak-export | 4 | 56780 | 56780 |
+| rb-d6f3f07e703b-3 | disk_kb volumes | 16760 | 19564 | 19740 |
+| rb-d6f3f07e703b-3 | fd | 65 | 74 | 247 |
+| rb-d6f3f07e703b-3 | rss_kb | 107328 | 139484 | 243864 |
+
+## Failures
+
+| # | First seen | Check | Symptom | Class | Cause | Action |
+|---|---|---|---|---|---|---|
+| 1 | 11:06:15 | upgrade-upgrade | versions after 600 s: 0.2.0-soak.1 0.2.0-soak.1 ?  (wanted 0.2.0-soak.1) | unclassified | open | open |
+| 2 | 12:17:37 | settle | fault:power-off did not settle within 480 s | unclassified | open | open |
+| 3 | 12:23:53 | settle | fault:chaos-dns did not settle within 300 s | unclassified | open | open |
+| 4 | 12:29:10 | settle | fault:chaos-kill did not settle within 300 s | unclassified | open | open |
+| 5 | 12:36:55 | settle | fault:node-delay did not settle within 300 s | unclassified | open | open |
+| 6 | 12:37:17 | heavy-check | fail: ingress-http: podinfo answered 000 0.000234; | unclassified | open | open |
+| 7 | 12:42:36 | pulse | relish test exited 1; see pulse-1792154243.json | unclassified | open | open |
+| 8 | 12:46:30 | settle-check | fail: leak-rss rb-d6f3f07e703b-2: bun RSS 310620 kB is over 125% of the warm 232796 kB; | unclassified | open | open |
+| 9 | 12:47:47 | settle | pulse:settle did not settle within 300 s | unclassified | open | open |
+| 10 | 12:53:00 | settle | fault:bun-kill-follower did not settle within 300 s | unclassified | open | open |
+| 11 | 13:02:57 | settle | fault:bun-kill-leader did not settle within 300 s | unclassified | open | open |
+| 12 | 13:07:12 | light-check | fail: ingress-http: podinfo answered 000 0.000231; | unclassified | open | open |
+| 13 | 16:05:33 | light-check | fail: jobs: retained run budget exhausted; | unclassified | open | open |
+| 14 | 16:35:48 | light-check | fail: jobs: runc has no accepted progress in a healthy recovery interval; | unclassified | open | open |
+| 15 | 17:06:09 | light-check | fail: jobs: runc has no accepted progress in a healthy recovery interval; | unclassified | open | open |
+
+## Notes
+
+- The harness stopped early (exit 1) during final
+
+Evidence: `/var/tmp/reliaburger-v02.q8RbSV` (events.jsonl, snapshots/, failures/<n>/).

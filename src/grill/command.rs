@@ -28,6 +28,13 @@ const OUTPUT_LIMIT: u64 = 1024 * 1024;
 #[serde(transparent)]
 pub struct CommandId(InstanceId);
 
+impl CommandId {
+    /// The attempt's name, as its directory and log lines show it.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0.0
+    }
+}
+
 /// Positive evidence currently available for a command generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandState {
@@ -121,6 +128,9 @@ impl OwnedCommands {
             .map_err(|_| io::Error::other("cannot generate runtime command identity"))?;
         let id = CommandId(InstanceId(format!("command-{}", hex::encode(nonce))));
         let spec = OciSpec {
+            reusable_executor: false,
+            host_process: false,
+            initialiser: false,
             root: OciRoot {
                 path: "/".into(),
                 readonly: false,
@@ -137,6 +147,7 @@ impl OwnedCommands {
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: Vec::new(),
@@ -179,7 +190,16 @@ impl OwnedCommands {
 
     /// Activate the prepared generation through its independent owner.
     pub async fn start(&self, id: &CommandId) -> Result<(), CommandError> {
-        Ok(self.control.start(&id.0).await?)
+        self.control.start(&id.0).await?;
+        Ok(())
+    }
+
+    /// Cancel an attempt that was prepared but whose owner never started,
+    /// and return whether it is now Cancelled. A delayed start then refuses.
+    /// An attempt that is running, finished or starting right now is left
+    /// alone; this never signals a command.
+    pub async fn cancel_unstarted(&self, id: &CommandId) -> Result<bool, CommandError> {
+        Ok(self.control.cancel_unstarted(&id.0).await?)
     }
 
     /// Run an auxiliary command supervised by this command's independent owner.

@@ -1,3 +1,7 @@
+/// Builds the image error an injected create failure returns. A function
+/// pointer, because `ImageError` can't be cloned for every call.
+pub type ImageErrorFactory = fn() -> super::image::ImageError;
+
 /// Shared mock Grill for tests.
 ///
 /// Records all calls to the `Grill` trait so tests can assert on
@@ -71,6 +75,8 @@ pub struct MockGrill {
     fail_kill: Arc<AtomicBool>,
     fail_stop: Arc<AtomicBool>,
     inventory_delay: Arc<Mutex<Option<std::time::Duration>>>,
+    /// One launch inventory answer read before a concurrent change.
+    stale_inventory: Arc<Mutex<Option<Vec<super::RuntimeLaunch>>>>,
     /// Time each force-kill request takes, as `runc kill` does on a loaded host.
     kill_delay: Arc<Mutex<Option<std::time::Duration>>>,
     pid_delay: Arc<Mutex<Option<std::time::Duration>>>,
@@ -82,6 +88,13 @@ pub struct MockGrill {
     /// Make pid reads fail, as an owner that doesn't answer does.
     fail_pid: Arc<AtomicBool>,
     fail_create: Arc<AtomicBool>,
+    /// When set, `create` refuses the launch as a missing binary would (#881).
+    refused_launch: Arc<Mutex<Option<super::LaunchProblem>>>,
+    /// When set, `start` refuses the launch as the owner gate's failed
+    /// `exec` would (#905).
+    refused_start: Arc<Mutex<Option<super::LaunchProblem>>>,
+    /// Make creation fail with this image error, as a pull does.
+    create_image_error: Arc<Mutex<Option<ImageErrorFactory>>>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
@@ -95,6 +108,18 @@ pub struct MockGrill {
     call_delays: Arc<Mutex<HashMap<MockCall, std::time::Duration>>>,
     /// What `logs` returns per instance; empty when unset.
     captured_logs: Arc<Mutex<HashMap<InstanceId, String>>>,
+    /// The spec each instance was last created from.
+    created_specs: Arc<Mutex<HashMap<InstanceId, OciSpec>>>,
+    /// Each identity's current launch generation, as a journalling runtime
+    /// keeps one: every successful `create` starts a new one.
+    generations: Arc<Mutex<HashMap<InstanceId, u64>>>,
+    /// The last generation handed out.
+    last_generation: Arc<AtomicUsize>,
+    /// Hold generation-checked forgets until the next exit-code read, so a
+    /// test can land a late forget between a successor's create and the
+    /// read of its exit code.
+    park_forgets: Arc<AtomicBool>,
+    parked_forgets: Arc<Mutex<Vec<(InstanceId, super::RuntimeGeneration)>>>,
 }
 
 impl Default for MockGrill {
@@ -133,12 +158,16 @@ impl Default for MockGrill {
             fail_kill: Arc::default(),
             fail_stop: Arc::default(),
             inventory_delay: Arc::default(),
+            stale_inventory: Arc::default(),
             kill_delay: Arc::default(),
             pid_delay: Arc::default(),
             workload_cgroup_delay: Arc::default(),
             instance_pid_delays: Arc::default(),
             fail_pid: Arc::default(),
             fail_create: Arc::default(),
+            refused_launch: Arc::default(),
+            refused_start: Arc::default(),
+            create_image_error: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             inspection_failures: Arc::default(),
@@ -147,6 +176,11 @@ impl Default for MockGrill {
             log_stems: Arc::default(),
             call_delays: Arc::default(),
             captured_logs: Arc::default(),
+            created_specs: Arc::default(),
+            generations: Arc::default(),
+            last_generation: Arc::default(),
+            park_forgets: Arc::default(),
+            parked_forgets: Arc::default(),
         }
     }
 }
@@ -155,6 +189,11 @@ impl MockGrill {
     /// Create a new MockGrill.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The spec `instance` was last created from, if it was created.
+    pub fn created_spec(&self, instance: &InstanceId) -> Option<OciSpec> {
+        self.created_specs.lock().unwrap().get(instance).cloned()
     }
 
     /// Make every later `call` take `delay`, or no time again with `None`.
@@ -208,6 +247,23 @@ impl MockGrill {
     /// Fail creation after recording the attempted runtime mutation.
     pub fn set_fail_create(&self, value: bool) {
         self.fail_create.store(value, Ordering::SeqCst);
+    }
+
+    /// Refuse every later `create` with this launch problem, or stop refusing.
+    pub fn set_refused_launch(&self, problem: Option<super::LaunchProblem>) {
+        *self.refused_launch.lock().unwrap() = problem;
+    }
+
+    /// Refuse every later `start` with this launch problem, as a binary
+    /// deleted between `create` and the gate's `exec` does, or stop refusing.
+    pub fn set_refused_start(&self, problem: Option<super::LaunchProblem>) {
+        *self.refused_start.lock().unwrap() = problem;
+    }
+
+    /// Fail creation with the image error `error` builds, as a pull that
+    /// fails inside `create` does; `None` stops failing.
+    pub fn set_create_image_error(&self, error: Option<ImageErrorFactory>) {
+        *self.create_image_error.lock().unwrap() = error;
     }
 
     /// Fail start after recording the attempted runtime mutation.
@@ -431,6 +487,14 @@ impl MockGrill {
         *self.inventory_delay.lock().unwrap() = delay;
     }
 
+    /// Answer the next launch inventory read with `launches`, as a read that
+    /// listed the runtime just before a concurrent change. Later reads see
+    /// the inventory [`Self::set_launch_inventory`] supplies.
+    #[allow(dead_code)]
+    pub fn answer_next_inventory_with(&self, launches: Vec<super::RuntimeLaunch>) {
+        *self.stale_inventory.lock().unwrap() = Some(launches);
+    }
+
     /// Delay every pid read, as a runtime waiting on a busy lifecycle lock would.
     pub fn set_pid_delay(&self, delay: Option<std::time::Duration>) {
         *self.pid_delay.lock().unwrap() = delay;
@@ -475,6 +539,54 @@ impl MockGrill {
 }
 
 impl MockGrill {
+    /// Hold every later generation-checked forget until the next exit-code
+    /// read, which applies it first.
+    pub fn park_forgets(&self) {
+        self.park_forgets.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the runtime still keeps a launch (a journal) for `instance`.
+    pub fn has_launch(&self, instance: &InstanceId) -> bool {
+        self.generations.lock().unwrap().contains_key(instance)
+    }
+
+    fn generation_of(&self, instance: &InstanceId) -> Option<super::RuntimeGeneration> {
+        self.generations
+            .lock()
+            .unwrap()
+            .get(instance)
+            .map(|generation| super::RuntimeGeneration::process(&format!("mock-{generation}")))
+    }
+
+    /// Forget `instance`'s launch and exit code if `generation` is still its
+    /// current one, as a journalling runtime does.
+    fn apply_forget(
+        &self,
+        instance: &InstanceId,
+        generation: &super::RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        match self.generation_of(instance) {
+            None => Ok(()),
+            Some(current) if current == *generation => {
+                self.generations.lock().unwrap().remove(instance);
+                self.exit_codes.lock().unwrap().remove(instance);
+                Ok(())
+            }
+            Some(_) => {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(("forget_refused".to_string(), instance.clone()));
+                Err(GrillError::StateUnavailable {
+                    instance: instance.clone(),
+                    reason: "a successor generation owns the identity".into(),
+                })
+            }
+        }
+    }
+}
+
+impl MockGrill {
     /// Pause address release while a test inspects durable permission.
     pub fn block_network_releases(&self) {
         self.block_network_release.store(true, Ordering::SeqCst);
@@ -495,10 +607,47 @@ impl MockGrill {
 }
 
 impl super::Grill for MockGrill {
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("forget_retired".to_string(), instance.clone()));
+        Ok(())
+    }
+
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &super::RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("forget_retired_generation".to_string(), instance.clone()));
+        if self.park_forgets.load(Ordering::SeqCst) {
+            self.parked_forgets
+                .lock()
+                .unwrap()
+                .push((instance.clone(), generation.clone()));
+            return Ok(());
+        }
+        self.apply_forget(instance, generation)
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::RuntimeGeneration>, GrillError> {
+        Ok(self.generation_of(instance))
+    }
+
     async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
         let delay = *self.inventory_delay.lock().unwrap();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
+        }
+        if let Some(stale) = self.stale_inventory.lock().unwrap().take() {
+            return Ok(Some(stale));
         }
         Ok(self.launch_inventory.lock().await.clone())
     }
@@ -585,12 +734,31 @@ impl super::Grill for MockGrill {
                 reason: "injected create failure".into(),
             });
         }
+        let refused = self.refused_launch.lock().unwrap().clone();
+        if let Some(problem) = refused {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
+            });
+        }
+        if let Some(error) = *self.create_image_error.lock().unwrap() {
+            return Err(GrillError::ImagePull(error()));
+        }
         if let Some(path) = spec.linux.host_cgroup_path() {
             self.cgroup_paths
                 .lock()
                 .unwrap()
                 .insert(instance.clone(), path);
         }
+        self.created_specs
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), spec.clone());
+        let generation = self.last_generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+        self.generations
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), generation);
         Ok(())
     }
 
@@ -613,6 +781,13 @@ impl super::Grill for MockGrill {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "injected start failure".into(),
+            });
+        }
+        let refused = self.refused_start.lock().unwrap().clone();
+        if let Some(problem) = refused {
+            return Err(GrillError::LaunchRefused {
+                instance: instance.clone(),
+                problem,
             });
         }
         Ok(())
@@ -697,6 +872,12 @@ impl super::Grill for MockGrill {
 
     async fn exit_code(&self, instance: &InstanceId) -> Result<Option<i32>, GrillError> {
         self.delay(MockCall::ExitCode).await;
+        let parked = std::mem::take(&mut *self.parked_forgets.lock().unwrap());
+        for (id, generation) in parked {
+            // A refusal is the runtime's answer to the late forget; the
+            // caller that asked has long moved on.
+            let _ = self.apply_forget(&id, &generation);
+        }
         if self.exit_code_failures.lock().unwrap().contains(instance) {
             return Err(GrillError::StateUnavailable {
                 instance: instance.clone(),

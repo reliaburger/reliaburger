@@ -51,12 +51,12 @@ pub fn vm_config(
             "install -d -m 700 /etc/reliaburger\n")
         }]
     });
-    Ok(serde_yaml::to_string(&value)?)
+    Ok(yaml_serde::to_string(&value)?)
 }
 
 /// Shell that leaves the guest's wall clock to Lima's guest agent alone.
 ///
-/// Lima 2.1's host agent sets the guest clock to the host's every 10 s
+/// Lima's host agent (2.1 and 2.2 alike) sets the guest clock to the host's every 10 s
 /// whenever they differ by more than 100 ms, and has no setting to turn
 /// that off. With systemd-timesyncd also running, the two fought: timesyncd
 /// slewed the clock forward at its +500 ppm limit and the agent stepped it
@@ -169,7 +169,7 @@ pub fn describe_test_policy(policy: &crate::testkit::safety::ClusterTestPolicy) 
 }
 
 /// Guest service supervised and restarted by systemd; logs go to its journal.
-pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=always\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
+pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=always\nRestartSec=2\nOOMScoreAdjust=-900\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(test)]
 mod tests {
@@ -181,6 +181,14 @@ mod tests {
         // SIGKILL them on every restart and leave their records unowned.
         assert!(SERVICE.contains("\nKillMode=process\n"), "{SERVICE}");
         assert!(!SERVICE.contains("KillMode=mixed"));
+    }
+
+    #[test]
+    fn service_unit_sets_oom_score_adjust() {
+        // Under memory pressure the kernel must pick a container before Bun,
+        // or discovery map updates stall for every workload (#700).
+        assert!(SERVICE.contains("\nOOMScoreAdjust=-900\n"), "{SERVICE}");
+        assert!(SERVICE.contains("\nRestartSec=2\n"), "{SERVICE}");
     }
 
     #[test]
@@ -201,7 +209,7 @@ mod tests {
             Some(15050),
         )
         .unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(value["mounts"].as_sequence().unwrap().len(), 0);
         assert_eq!(value["containerd"]["user"], false);
         assert_eq!(value["containerd"]["system"], false);
@@ -222,7 +230,7 @@ mod tests {
     #[test]
     fn provisioning_never_waits_for_a_graceful_logind_stop() {
         let yaml = vm_config("/private/cache/ubuntu.img", "aarch64", 19117, None, None).unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
         let script = value["provision"][0]["script"].as_str().unwrap();
         let kill = script
             .find("systemctl kill --signal=SIGKILL systemd-logind.service")
@@ -243,33 +251,27 @@ mod tests {
     /// Run the generated provision script with stub system tools and
     /// record every `apt-get` and `systemctl` invocation. `missing` is a
     /// package the stub `dpkg-query` has never heard of.
+    ///
+    /// The stubs are shell functions defined ahead of the script, not files
+    /// on `PATH`: macOS assesses every newly written executable on its first
+    /// launch, one at a time across the host, so fresh stub files could wait
+    /// out nextest's limit behind another process's large binary (#762).
     #[cfg(unix)]
     fn run_provisioning(missing: Option<&str>) -> Provisioned {
-        use std::os::unix::fs::PermissionsExt;
         let yaml = vm_config("/private/cache/guest.qcow2", "aarch64", 19117, None, None).unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
         let script = value["provision"][0]["script"].as_str().unwrap();
-        let stubs = tempfile::tempdir().unwrap();
-        let apt_log = stubs.path().join("apt.log");
-        let systemctl_log = stubs.path().join("systemctl.log");
-        let tools = [
-            (
-                "dpkg-query",
-                "for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done",
-            ),
-            ("apt-get", "echo \"$*\" >> \"$APT_LOG\""),
-            ("systemctl", "echo \"$*\" >> \"$SYSTEMCTL_LOG\""),
-            ("install", "true"),
-        ];
-        for (name, body) in tools {
-            let path = stubs.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let logs = tempfile::tempdir().unwrap();
+        let apt_log = logs.path().join("apt.log");
+        let systemctl_log = logs.path().join("systemctl.log");
+        let stubs = "dpkg-query() { for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done; }\n\
+                     apt-get() { echo \"$*\" >> \"$APT_LOG\"; }\n\
+                     systemctl() { echo \"$*\" >> \"$SYSTEMCTL_LOG\"; }\n\
+                     install() { true; }\n";
         let status = std::process::Command::new("bash")
             .arg("-c")
-            .arg(script)
-            .env("PATH", format!("{}:/usr/bin:/bin", stubs.path().display()))
+            .arg(format!("{stubs}{script}"))
+            .env("PATH", "/usr/bin:/bin")
             .env("MISSING", missing.unwrap_or(""))
             .env("APT_LOG", &apt_log)
             .env("SYSTEMCTL_LOG", &systemctl_log)

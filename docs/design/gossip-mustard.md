@@ -31,7 +31,7 @@ Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a de
 
 | Dependency | Component | Why |
 |------------|-----------|-----|
-| **Sesame** (Security/mTLS) | All inter-node communication | Mustard gossip messages are authenticated with an HMAC-SHA256 key derived (HKDF) from the cluster master key, when one is configured. Raft log entries are encrypted at rest. The reporting tree uses mTLS channels signed by the Node CA. Recovery candidate notifications are sent over mTLS. |
+| **Sesame** (Security/mTLS) | All inter-node communication | Mustard gossip messages are authenticated with an HMAC-SHA256 key derived (HKDF) from the cluster master key, when one is configured. Raft log entries (not the snapshot) are encrypted at rest under a key derived from the same master key. The reporting tree uses mTLS channels signed by the Node CA. Recovery candidate notifications are sent over mTLS. |
 | **Bun** (Agent) | Every node | Bun is the host process. Mustard, Raft, and the reporting tree all run as async tasks within the Bun process. Bun owns the node lifecycle (join, leave, shutdown) that Mustard reacts to. |
 | **Meat** (Scheduler) | Leader only | The leader runs Meat. Council selection criteria (resource availability, stability) are evaluated using data that Meat also consumes. The leader's scheduling decisions are replicated via Raft. |
 | **Lettuce** (GitOps) | Council coordinator | When GitOps is enabled, the Lettuce engine provides the authoritative desired state. During state reconstruction, the new leader loads desired state from the git repository via Lettuce. |
@@ -111,6 +111,12 @@ Node A                    Node B                    Node C
 
 Each PING/ACK message piggybacks a bounded number of membership updates (new joins, suspects, deaths, leader changes). This piggybacking is how information propagates in O(log N) rounds without dedicated broadcast messages.
 
+**A relay never blocks.** When C receives A's PING-REQ for B, it sends B a PING, records "forward B's ACK to A" with a deadline of one `probe_timeout`, and returns. B's ACK arrives through the ordinary message handler, which forwards it to A as an ACK that C sends in its own name with `relayed_for: Some(B)`. Every message a node receives while it waits for its own probe's ACK goes through the same handler, so a node in the middle of a probe still answers PINGs, merges syncs and serves relays. (The first version waited inline for B and dropped everything else that arrived meanwhile, so a busy relay stopped acknowledging its own probers and got itself suspected.)
+
+**Byte budget.** A datagram is at most 1,400 bytes (`MAX_DATAGRAM_BYTES`). A probe is built header first, then the sender's directory extension (§4.1), then piggybacked updates in priority order until the next one doesn't fit; the rest stay queued with their broadcast counts untouched. `MAX_PIGGYBACK_UPDATES` (8) caps the count, but the byte budget is what bounds the size, so a node with 63-byte names, IPv6 addresses and a full label set sends fewer updates per probe instead of oversized datagrams the transport refuses. The budget is measured from the encoded message, not computed from constants, so a field added to the header or extension later is accounted for automatically. In the worst case (16 labels using the whole 512-byte label budget, plus the ten-byte job capability summary) a PING still carries one update; a PING-REQ or relayed ACK may carry none, and anti-entropy, which sends no extension, makes up the difference. If an extension alone would not fit, the probe goes without it. A failed send is counted and logged at most every ten seconds, never discarded.
+
+**Refutation first.** The dissemination queue sends this node's own refutation (Alive about itself at a raised incarnation) ahead of everything else, then Dead/Left, Suspect and Alive about others. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
+
 **Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 73 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
 
 ```
@@ -158,6 +164,37 @@ Raft is **not** used for:
 - Failure detection (that is Mustard's job)
 - Communication with non-council nodes
 
+#### Forwarding leader-only API calls
+
+openraft doesn't forward client writes, so a node that can't confirm it leads (`CouncilNode::is_leader`, a quorum check) forwards leader-only API calls to the leader's API, carrying the caller's own credential. Two rules stop a forward from looping ([#1069](https://github.com/reliaburger/reliaburger/issues/1069)):
+
+- **Never to itself.** `leader_api_url` and `upgrade::leader_base_url` return `NoLeaderRoute::ThisNode` when Raft names this node as leader (`current_leader`, or its metrics). That node is a restored leader in the startup recovery probe, or a leader cut off from its quorum. The route answers 503 "this node holds the leader role but can't confirm it with a quorum" and makes no outbound request. `NoLeaderRoute::Unknown` keeps each route's "no cluster leader known yet" answer.
+- **Never twice.** Every forwarded request carries `x-reliaburger-forwarded: 1`. A node that receives a marked request and can't confirm it leads answers 503 (`NoLeaderRoute::AlreadyForwarded`) instead of forwarding again; a confirmed leader serves it. The header only ever turns a forward into a 503, so it needs no authentication of its own. The older per-route markers (`x-reliaburger-upgrade-forwarded`, `-lease-forwarded`, `-forwarded-sign`, `-desired-apps-forwarded`, `-webhook-forwarded`) still travel alongside it.
+
+#### Raft transport connections
+
+Raft RPCs travel over TCP with mTLS (`src/council/network.rs`). Each node keeps a small pool of established connections per peer (`src/council/connection_pool.rs`, [#928](https://github.com/reliaburger/reliaburger/issues/928)), so a heartbeat or append doesn't pay for a TCP and TLS handshake. This matters because a leader confirming its leadership for a linearizable read gives each heartbeat only `heartbeat_interval` (150 ms) to come back; on a debug-build Lima cluster a handshake per RPC exceeded that (found while proving [#870](https://github.com/reliaburger/reliaburger/issues/870)). One missed round doesn't make a settled leader refuse a read: the lease routes call `CouncilNode::confirm_leadership`, which repeats the check every heartbeat interval for up to 3 s while the node's own metrics still name it leader, and answers "not leader" at once on a node that names another voter or none ([#1009](https://github.com/reliaburger/reliaburger/issues/1009)).
+
+- **Client.** An RPC takes an idle connection for its peer (keyed by address and the node name the certificate is checked against) or dials one, sends one request, reads one response and returns the connection. A cancelled RPC drops its connection, so a connection with a request in flight is never reused. If a pooled connection fails, the RPC is sent once more on a fresh dial (Raft RPCs are idempotent at the receiver). At most 4 idle connections are kept per peer.
+- **Retirement.** A pooled connection is closed instead of reused once it is 30 s old or 10 s idle, when this node's identity changed since it was dialled (renewal or new trust set, so the next handshake presents the new certificate), or when the peer's presented chain is now on the CRL.
+- **Server.** A connection serves requests until the peer is idle for 20 s or the connection is 60 s old (the client's limits are shorter, checked by `const` assertions). Before each request it re-checks the node fault gate and the client's chain against the live CRL, so a revocation takes effect at the next RPC. The handshake and each request keep the 10 s deadline (CP11).
+- Both ends set `TCP_NODELAY`, and a frame goes out in one write.
+
+**Measured heartbeat round trips.** `examples/raft-heartbeat-rtt.rs` forms a three-voter council over the production transport (mTLS, live identities, node-bound connectors) on loopback and times 1,000 `ensure_linearizable` calls on the leader, 5 ms apart. Apple M2 Max (12 cores), 17 October 2026, host otherwise quiet (no builds, one-minute load average below 3 at the start); "loaded" adds 12 `yes > /dev/null` processes, one per core. Debug builds include the optimised `ring` override from [#922](https://github.com/reliaburger/reliaburger/pull/922). No sample failed or exceeded 150 ms in any run.
+
+| Build | Host | Transport | p50 | p90 | p99 | max |
+|-------|------|-----------|-----|-----|-----|-----|
+| debug | idle | handshake per RPC | 2.50 ms | 3.56 ms | 5.13 ms | 6.60 ms |
+| debug | idle | pooled | 0.53 ms | 1.82 ms | 2.44 ms | 3.65 ms |
+| release | idle | handshake per RPC | 1.43 ms | 2.29 ms | 3.62 ms | 4.66 ms |
+| release | idle | pooled | 0.26 ms | 0.58 ms | 1.20 ms | 4.06 ms |
+| debug | loaded | handshake per RPC | 3.13 ms | 6.11 ms | 14.07 ms | 21.06 ms |
+| debug | loaded | pooled | 0.91 ms | 5.62 ms | 11.50 ms | 20.10 ms |
+| release | loaded | handshake per RPC | 1.50 ms | 5.76 ms | 12.25 ms | 107.74 ms |
+| release | loaded | pooled | 0.28 ms | 4.16 ms | 10.33 ms | 16.92 ms |
+
+Pooling cuts the median by about five times in both profiles. Under load the tail is set by CPU scheduling rather than handshakes, so pooling helps less there, but it removed the one run whose worst heartbeat used most of the 150 ms budget. Loopback with the optimised `ring` doesn't reproduce the Lima failure itself, where each handshake also crossed virtual NICs on a slower, unoptimised build; the dev cluster was not re-measured.
+
 ### 3.4 Council Selection Algorithm
 
 The leader selects council members from the general node pool. Selection criteria, in priority order:
@@ -166,6 +203,17 @@ The leader selects council members from the general node pool. Selection criteri
 2. **Resource availability** *(criterion present in code, but a no-op in production).* The selector filters on CPU < 90% / memory < 85%, but because per-node resources are never gossiped (`NodeMembership.resources` is always `None` for remote peers), the filter treats every node as eligible — an unreported node passes. This criterion only bites once resource gossip is implemented; today it rejects no one.
 3. **Zone diversity.** If node labels include zone or region information, the leader maximizes geographic distribution among council members. A council where all members are in the same rack defeats the purpose of redundancy.
 4. **Random tiebreaker.** Among otherwise-equal candidates, selection is random (seeded by the leader's node ID + current term for reproducibility).
+
+**Odd voter counts (D12, #694).** The planner (`plan_council_action`) targets the largest odd number of voters not above the live nodes (live voters, live learners and live spare candidates) nor `max_council_size`. An even council tolerates no more failures than the odd one below it and adds a write acknowledgement, so no planner action ever lands on an even count:
+
+| Live nodes | Voters |
+|---|---|
+| 1-2 | 1 |
+| 3-4 | 3 |
+| 5-6 | 5 |
+| 7+ | 7 |
+
+Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Extra eligible nodes stay workers or learners. A two-node cluster therefore has one voter: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
 
 Council replacement flow:
 
@@ -187,7 +235,7 @@ Leader evaluates candidate pool via Mustard membership
 Leader selects replacement node R
      │
      ▼
-Leader issues Raft AddNode(R) log entry
+Leader adds R as a learner
      │
      ▼
 R receives Raft log snapshot + incremental entries
@@ -196,12 +244,12 @@ R receives Raft log snapshot + incremental entries
 R catches up to current log position
      │
      ▼
-Council returns to target size
+Leader swaps R in for C in one membership change (count stays odd)
 ```
 
 ### 3.5 Hierarchical Reporting Tree
 
-> **Status: the shipped topology is a flat star to the leader, not the two-level tree below.** What runs today (`src/cluster/runtime.rs`) has **every worker report directly to the leader**. The runtime's `spawn_leader_target_maintainer` pushes a *single-element* council list containing only the leader, and each `ReportWorker` runs the same `assign_parent(worker_id, council)` helper over that one-element list — so the hash always resolves to the leader. The two-level consistent-hash tree (workers → council member → leader) is deliberate MVP scaffolding that exists in the code (`src/reporting/assignment.rs`, `src/reporting/aggregator.rs`) but is **not wired into the running topology**. The fan-in arithmetic and diagram below describe that **planned** two-level design.
+> **Status: the shipped topology is a flat star to the leader, not the two-level tree below.** What runs today (`src/cluster/runtime.rs`) has **every worker report directly to the leader**. The runtime's `spawn_leader_target_maintainer` pushes a *single-element* council list containing only the leader, and each `ReportWorker` runs the same `assign_parent(worker_id, council)` helper over that one-element list — so the hash always resolves to the leader. The two-level consistent-hash tree (workers → council member → leader) is deliberate MVP scaffolding that exists in the code (`src/reporting/assignment.rs`, `src/reporting/aggregator.rs`) but is **not wired into the running topology**. The fan-in arithmetic and diagram below describe that **planned** two-level design. The council-to-leader message the tree would need is gone: `ReportingMessage::AggregatedReport` bundled many nodes' reports with no identity binding, so any authenticated peer could forge another node's state through it, and production never sent it (#696). If the tree is built, that message comes back with council-peer authentication.
 
 In the planned tree, each non-council node is assigned to a specific council member as its parent, deterministically: `parent = council_members[hash(node_id) % council_size]`, distributing the reporting load evenly.
 
@@ -231,29 +279,43 @@ When (in the planned tree) a council member departs, its assigned workers re-has
 ### 4.1 Gossip Message Types
 
 ```rust
-/// Top-level gossip message, always fixed-size.
-/// Sent as a single UDP datagram (max 1400 bytes to avoid fragmentation).
+/// Top-level gossip message.
+/// Sent as a single UDP datagram of at most MAX_DATAGRAM_BYTES (1400) to
+/// avoid fragmentation; probes fill what the header and extension leave
+/// with piggybacked updates (§3.2, "Byte budget").
 #[derive(Serialize, Deserialize)]
 struct GossipMessage {
-    /// Protocol version for forward compatibility.
+    /// Protocol version; a node refuses any other generation.
     version: u8,
-    /// Sender's node ID.
+    /// Durable state generation required for cluster admission.
+    state_format: u32,
+    /// Sender's node ID. Always the node that built and sent the datagram.
     sender: NodeId,
     /// Monotonic incarnation number (incremented on refutation).
     incarnation: u64,
-    /// HMAC-SHA256 over the serialised payload, keyed by the shared gossip key
-    /// derived from the node's mTLS certificate.
+    /// The sender's message counter (§8.1): seeded from wall-clock
+    /// microseconds at process start, +1 per message. Receivers drop a
+    /// message at or below the highest sequence seen from its sender.
+    sequence: u64,
+    /// HMAC-SHA256 over the message with this field zeroed, keyed by the
+    /// gossip key derived from the cluster master key.
     hmac: [u8; 32],
     /// The message payload.
     payload: GossipPayload,
+    /// Directory extension (endpoints, leader hint, labels, disk pressure,
+    /// recovery claim, job capabilities), encoded after the body with its
+    /// own HMAC. Not serialised inside the body. The job capabilities
+    /// (#788) are nine flags saying which kinds of job the node runs; the
+    /// leader refuses a job run at submission when every live member's
+    /// flags refuse it.
+    extension: Option<DirectoryExtension>,
 }
 
 #[derive(Serialize, Deserialize)]
 enum GossipPayload {
     Ping {
-        /// Target node being probed.
-        target: NodeId,
-        /// Piggybacked membership updates (bounded to MAX_PIGGYBACK_UPDATES).
+        /// Piggybacked membership updates (byte-budgeted, at most
+        /// MAX_PIGGYBACK_UPDATES).
         updates: Vec<MembershipUpdate>,
     },
     PingReq {
@@ -264,9 +326,10 @@ enum GossipPayload {
         updates: Vec<MembershipUpdate>,
     },
     Ack {
-        /// Responding to a PING or PING-REQ for this target.
-        target: NodeId,
         updates: Vec<MembershipUpdate>,
+        /// `Some(target)` when a relay forwards the target's ACK in its own
+        /// name; `None` when the sender answers for itself.
+        relayed_for: Option<NodeId>,
     },
     /// Anti-entropy push-pull: up to MAX_PIGGYBACK_UPDATES entries of the
     /// sender's full membership table. Only the first datagram of a request
@@ -277,8 +340,11 @@ enum GossipPayload {
     },
 }
 
-/// Maximum number of piggybacked membership updates per gossip message.
-/// Bounded to keep message size constant.
+/// Largest datagram any node sends.
+const MAX_DATAGRAM_BYTES: usize = 1400;
+
+/// Most piggybacked membership updates per gossip message. The byte
+/// budget is the real limit; this bounds the work per message.
 const MAX_PIGGYBACK_UPDATES: usize = 8;
 
 /// A single membership update piggybacked on gossip messages.
@@ -540,9 +606,9 @@ struct EncryptedRecoveryCandidateList {
 
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
-| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation) |
+| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
 | Mustard anti-entropy (Sync push-pull) | UDP | bincode (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
-| Raft (AppendEntries, RequestVote) | TCP + mTLS | bincode | Unbounded (log entries can contain app specs) |
+| Raft (AppendEntries, Vote, InstallSnapshot) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
 | Reporting tree (StateReports) | TCP + mTLS | bincode | 1 MiB (bounded by max events per report) |
 
 All TCP connections use mTLS via Sesame's Node CA certificates.
@@ -708,9 +774,25 @@ Leader election uses standard Raft semantics, constrained to the council.
 
 With a council of 5, a majority is 3 votes. Even with one member down, 4 remaining members can elect a leader (needing 3 of 4). With two members down, 3 remaining can still elect (needing 2 of 3). This is why the minimum council size is 3 -- it tolerates exactly 1 failure.
 
+#### Moving leadership off a voter
+
+openraft 0.9 has no leadership transfer. Two paths still need to move leadership off a healthy leader: disk-pressure resignation (§5.5's step-down, run by the council reconciler) and the admin endpoint `POST /v1/cluster/elect`. Both use the same two steps (`src/council/handover.rs`):
+
+1. **The old leader holds its elections.** `CouncilNode::hold_elections_until` sets openraft's `runtime_config().elect(false)`: the node still votes, replicates and leads, but never campaigns on its own timer. Without this, the election that follows a deposition goes to the longest log, which is usually the old leader's (it wrote the newest entries), and the old leader wins straight back (#646, #755).
+2. **Another voter campaigns.** Its higher term deposes the leader. Followers refuse every candidate until the leader lease (the maximum election timeout) runs out, so a single campaign often only deposes; the next election, from a timer or a repeated campaign, picks the most up-to-date remaining voter by Raft's own vote rule.
+
+The hold ends when another voter leads, or after `HANDOVER_HOLD` (30 s) if nobody does, so a hold can't leave the council leaderless. Repeated holds only extend the deadline.
+
+- **Disk pressure.** A pressured voter holds its elections on every reconciler tick while it leads or no leader is known, provided a healthy voter that isn't under pressure could lead instead. The deposition target is the first such voter; it campaigns at most once per reconciler operation timeout. Holding while no leader is known covers a follower's campaign that deposes the leader before the leader's own tick has held.
+- **`POST /v1/cluster/elect`** (cluster admin), sent to the voter that should take over. That voter forwards a hold request to the leader (`x-reliaburger-elect-hold`, carrying the caller's credential so the leader repeats the admin check), then campaigns every 1.5 leader leases for up to 20 s until another voter leads, and answers `{"status": "leadership moved", "leader", "previous_leader"}`. A voter with a longer log may win instead of the receiving node; that is still a handover. Sent to the leader itself or to a non-voter, it answers 409. If the leader can't be asked to hold, it answers 502 or 504 without campaigning; if leadership doesn't move in time, 504.
+
+Neither path is a bounded membership operation, so the timed-out-operation finisher in §5.7 (#673) has nothing to finish: `trigger().elect()` returns once the campaign starts, and the hold is local state with its own deadline.
+
 **Leader election performance target: < 5 seconds.** This includes the election timeout (up to 2 seconds), one or two rounds of voting if the first round has a split vote (up to 4 seconds in the worst case), and the leader announcement via gossip (~1 second to propagate). In practice, elections complete in 1-3 seconds.
 
 ### 5.3 Council Selection Algorithm
+
+The candidate ranking below feeds the planner, which caps the voter count at the largest odd number the live nodes and `max_council_size` allow (§3.4, D12). `target_size` here is the cap; the planner never seats an even council even when more candidates rank.
 
 ```
 fn select_council_candidates(
@@ -855,9 +937,9 @@ When a new leader is elected, it must rebuild its understanding of the cluster's
 
 ### 5.5 Catastrophic Recovery
 
-> **Status — what ships vs what's proposed.** Full-council loss recovery ships as an **operator-triggered** flow, not the fully-automatic pre-seeded election described below. `relish council recover` runs against a stopped survivor (`src/council/recovery.rs`): it restores the desired state from the last sealed external backup (`src/council/backup.rs`) or the node's own durable snapshot and committed log, re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council from healthy members. Anything written after the last backup is lost, which is why a human confirms the restore. The pre-seeded recovery-candidate machinery in steps 1–5 below — priority-ordered candidates, the encrypted gossip candidate blob, and a survivor assuming leadership *without* an election — remains an **architecture proposal** (a later phase); it is documented here as the target design, not current behaviour. The learning period in §5.4, the backup/restore, and disk-pressure council step-down all ship today.
+> **Status — what ships vs what's proposed.** Full-council loss recovery ships as an **operator-triggered** flow, not the fully-automatic pre-seeded election described below. `relish council recover` runs against a stopped survivor (`src/council/recovery.rs`): it restores the desired state from the last sealed external backup (`src/council/backup.rs`) or the node's own durable snapshot and committed log, re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council from healthy members. Anything written after the last backup is lost, which is why a human confirms the restore. The pre-seeded recovery-candidate machinery in steps 1–5 below — priority-ordered candidates, the encrypted gossip candidate blob, and a survivor assuming leadership *without* an election — remains an **architecture proposal** (a later phase); it is documented here as the target design, not current behaviour. The learning period in §5.4, the backup/restore, and disk-pressure council step-down (which moves leadership off a pressured leader as §5.2 describes) all ship today.
 >
-> **Recovery fence (#424).** The recovery epoch is per-node fence state (`src/council/fence.rs`), not just a filter on RPC pairs. Gossip extensions carry each node's claimed epoch and leader hints order by (epoch, term). A restarted voter probes its peers' gossiped epochs for up to five seconds before serving Raft (`src/cluster/recovery_fence.rs`); a node that learns of a newer epoch from gossip or from a peer's `Fenced` reply fences itself permanently (persisted in `raft/recovery-fence.json`), sends and serves no Raft, refuses writes and names no leader. A fresh data directory claims no epoch and adopts the first council that admits it, which is how the recovered council regrows and how `relish council re-enrol` brings a fenced voter back. The recovered council snapshots and purges its log after bootstrap so joiners receive the restored state by InstallSnapshot. Limit: old voters that reach only each other, never a newer-epoch node, can't learn of the recovery; operators re-enrol them first.
+> **Recovery fence (#424).** The recovery epoch is per-node fence state (`src/council/fence.rs`), not just a filter on RPC pairs. Gossip extensions carry each node's claimed epoch and leader hints order by (epoch, term). Each recovery also draws a random 128-bit recovery id (#694), stored with the epoch in the snapshot (`DesiredState::recovery_id`) and the fence record. The new epoch is `max(restored epoch, the recovering node's fence epoch, its fenced_by) + 1`, read before the old directory moves aside, and `relish council recover` refuses a data directory whose record says it's fenced unless `--force`. Raft envelopes carry `sender_recovery_id` and a `Fenced` reply carries the refusing node's own id; the gossip directory extension carries `recovery_epoch: Option<u64>` and `recovery_id: Option<RecoveryId>` side by side, folded into `NodeDirectory::recovery_claims: HashMap<NodeId, Option<RecoveryClaim>>`. A node that meets its own epoch with a different id moves to `FenceState::Split` and so does the other side, since neither can tell which recovery is real; `relish council status` and `relish wtf` report it as critical. A restarted voter doesn't serve Raft until gossip has joined and completed its first push-pull sync, then waits two anti-entropy intervals (20 s, overridable with `[cluster] recovery_probe_window_secs`) unless every peer its persisted membership names has advertised a claim sooner (`src/cluster/recovery_fence.rs`); a voter whose persisted membership names no other member has nobody to hear from and serves once gossip has synced (at once when it has no seeds), so a single-node cluster restarts as quickly as before. A failed fence write is retried every five seconds and reported in council status until it lands. Before it changes anything, `relish council recover` reads the persisted voter set (the data directory's or the backup's last membership) and asks each voter's `/v1/health` whether it is an unfenced council voter, refusing while one says yes or answers unreadably, and failing closed on an empty voter set; a node that learns of a newer epoch from gossip or from a peer's `Fenced` reply fences itself permanently (persisted in `raft/recovery-fence.json`), sends and serves no Raft, refuses writes and names no leader. A fresh data directory claims no epoch and adopts the first council that admits it, which is how the recovered council regrows and how `relish council re-enrol` brings a fenced voter back. The recovered council snapshots and purges its log after bootstrap so joiners receive the restored state by InstallSnapshot. Limit: old voters that reach only each other, never a newer-epoch node, can't learn of the recovery; operators re-enrol them first.
 
 When the entire Raft council is lost simultaneously (all 3-7 members fail at once), the *proposed* pre-seeded recovery mechanism activates as follows.
 
@@ -927,6 +1009,8 @@ Split-brain can occur during a network partition where two groups each believe t
 
 **Determinism:** There is never ambiguity about which group leads. The priority order was established before the failure. Two groups cannot independently decide they should both lead. This is the primary advantage of the pre-seeded approach over any voting-based catastrophic recovery.
 
+**What ships today (operator-triggered recovery, #694).** Two operators can still recover two survivors independently. The recovery id is what keeps that from becoming two live councils: both land on the same epoch with different ids, and each fences itself as a split on first contact (gossip or a Raft refusal). Recovering a node whose fence record says it was fenced needs `--force` and lands above the fencing epoch, so the operator's second attempt resolves the split instead of repeating it. The live-voter probe in `relish council recover` refuses while any persisted voter still serves.
+
 **Read-only mode behaviour:**
 
 - Apps continue running and serving traffic.
@@ -959,11 +1043,15 @@ Remove member flow:
 5. Leader broadcasts updated council membership via Mustard.
 ```
 
+In the implementation, promotion and eviction go through openraft's joint consensus (`change_membership`): a joint configuration commits first, then the uniform one. The caller's future proposes the second step, so a caller that times out or a leader that fails over between the steps leaves a committed joint configuration behind. The council reconciler finishes it before planning anything else (`CouncilNode::finish_membership_change`), proposing the joint configuration's target voter set; otherwise its change-in-flight gate would hold every later membership change (#673).
+
+Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). Step 5's catch-up is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
+
 ---
 
 ## 6. Configuration
 
-There are **no `[mustard]` or `[raft]` TOML sections**. The SWIM and Raft protocol timings shown historically here (gossip interval, probe/suspicion timeouts, the 10 s anti-entropy push-pull interval, heartbeat and election timeouts, batch/snapshot sizes) are **compile-time constants**, not tunable config. What *is* configurable lives under `[cluster]` in `node.toml`, and it is essentially the three ports:
+There are **no `[mustard]` or `[raft]` TOML sections**. The SWIM and Raft protocol timings shown historically here (gossip interval, probe/suspicion timeouts, the 10 s anti-entropy push-pull interval, heartbeat and election timeouts, batch/snapshot sizes) are **compile-time constants**, not tunable config. What *is* configurable lives under `[cluster]` in `node.toml`: essentially the three ports, plus the recovery probe window (#694):
 
 ```toml
 [cluster]
@@ -981,6 +1069,11 @@ raft_port = 9444
 
 # Reporting-tree state reports (TCP + mTLS). Default: 9445.
 reporting_port = 9445
+
+# How long a restarted voter keeps listening for its peers' recovery
+# epochs after gossip has synced, unless every peer advertises sooner.
+# Unset means two anti-entropy intervals (20 s).
+# recovery_probe_window_secs = 20
 ```
 
 (The old `7946`/`7947` gossip/raft ports never shipped; the real defaults are `9443`/`9444`/`9445`. The node HTTP API is a separate port, `9117`.)
@@ -991,9 +1084,9 @@ The council sizing constants below are compile-time defaults in `CouncilSelectio
 # Minimum council size (below this, the cluster enters degraded mode).
 min_council_size = 3
 
-# Maximum / steady-state target council size. The runtime passes
-# max_council_size as the selection target, so the council grows to 7,
-# not 5. There is no separate "target_size = 5".
+# Maximum council size. The council holds the largest odd number of
+# voters not above this nor the live node count (D12), so it grows
+# 1, 3, 5, 7. There is no separate "target_size = 5".
 max_council_size = 7
 
 # Minimum time a node must be alive before it can join the council.
@@ -1091,7 +1184,7 @@ UDP is unreliable. Mustard handles this through redundancy:
 - Each membership update is piggybacked on multiple messages (a dissemination count of `ceil(log(N))` ensures each update is sent enough times for probabilistic reliability).
 - Indirect probing (PING-REQ) provides a second path when direct probes fail.
 - The suspicion subprotocol prevents premature failure declarations from transient loss.
-- *(Planned)* A periodic TCP full-state sync between random node pairs as a consistency backstop. This is not implemented today; convergence relies on UDP piggyback and indirect probing alone.
+- A periodic push-pull exchange of membership tables between random node pairs (§3.2, "Anti-entropy push-pull") is the consistency backstop. It runs over the same UDP transport, not TCP.
 
 At 10,000 nodes with 0.1% UDP packet loss, the expected convergence time increases by less than one additional protocol period (~500ms).
 
@@ -1105,6 +1198,10 @@ When the node has a cluster master key (`[security] master_key_path`, produced b
 
 A node started without a master key (single-node and pre-security configurations) gossips unauthenticated. Generated secure clusters always have one.
 
+**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it rises across restarts. A receiver keeps the highest sequence it has accepted from each sender and drops any message at or below it before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
+
+The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error. A node whose clock stepped backwards across a restart is not heard until its old record is reaped (suspicion plus `cleanup_timeout`), because reaping a member forgets its sequence.
+
 **TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 
 ### 8.2 Encrypted Recovery Candidate List
@@ -1117,13 +1214,13 @@ The council's shared age keypair is generated during `relish init` and stored en
 
 ### 8.3 Raft Log Encryption
 
-Raft log entries are encrypted at rest on disk using age encryption with a key derived from the Node CA certificate. This protects secrets stored in the Raft log (encrypted environment variables, API tokens, etc.) from disk access by an attacker who gains physical or root access to a council node without valid cluster credentials.
+Raft log entries are encrypted at rest with AES-256-GCM under a key derived (HKDF) from the cluster master key, which is stored on the node. This protects the log's entries from someone who copies the disk or the log file; it doesn't protect against root on a running node, which can read the master key. The Raft snapshot (`snapshot.redb`) is not encrypted. See [security-sesame.md](security-sesame.md) §5.6.
 
 In transit, Raft messages are protected by mTLS (all inter-council communication uses TLS 1.3 with mutual certificate authentication via Sesame).
 
 ### 8.4 Reporting Tree Authentication
 
-All reporting tree connections use mTLS via Sesame's Node CA. A council member verifies that the reporting worker's node ID (from the certificate common name) matches the claimed `node_id` in the StateReport. This prevents a compromised worker from reporting state on behalf of another node.
+All reporting connections use mTLS via Sesame's Node CA. In the shipped flat star (§3.5) every worker reports straight to the leader, which verifies that the worker's node ID (from the certificate) matches the `node_id` claimed in every message that carries node state: `Report`, `MetricsRollup`, `CapabilityReport` and `NodeReadinessReport`. This prevents a compromised worker from reporting state on behalf of another node. There is no message that carries several nodes' reports: `AggregatedReport` was removed because it bypassed exactly this check (#696).
 
 ---
 
@@ -1283,7 +1380,7 @@ Nomad uses Raft for consensus among server nodes and a gossip protocol (Serf) fo
 
 - [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol (Das et al., 2002)](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf) -- The protocol that Mustard implements. Proves O(log N) convergence and O(1) per-node overhead.
 - [In Search of an Understandable Consensus Algorithm (Ongaro & Ousterhout, 2014)](https://raft.github.io/raft.pdf) -- The Raft paper. Our Raft implementation follows this specification.
-- [Lifeguard: Local Health Awareness for More Accurate Failure Detection (Hashimoto, 2017)](https://arxiv.org/abs/1707.00788) -- Improvements to SWIM used in Consul's memberlist. We adopt the suspicion subprotocol and local health awareness piggybacking.
+- [Lifeguard: Local Health Awareness for More Accurate Failure Detection (Hashimoto, 2017)](https://arxiv.org/abs/1707.00788) -- Improvements to SWIM used in Consul's memberlist. Mustard does not implement Lifeguard: it has SWIM's own suspicion subprotocol with a fixed suspicion timeout, and no local health awareness or dynamic timeouts.
 
 ---
 

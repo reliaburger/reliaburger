@@ -32,99 +32,17 @@ use crate::sesame::types::{ApiRole, TokenScope};
 /// short enough that abandoned sessions don't accumulate.
 pub const DEFAULT_UPLOAD_TTL: Duration = Duration::from_secs(3600);
 
-/// Quota configuration for the registry.
+/// Storage quota for the registry.
 ///
-/// `0` means unlimited on either axis — the default, so an operator opts
-/// into limits rather than tripping over them.
+/// There is one axis: the node's physical payload cap. A per-repository
+/// ceiling existed here once but nothing could configure it; untagged-image
+/// expiry (#697) is what now bounds growth.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QuotaConfig {
-    /// Maximum stored bytes for any single repository. `0` = unlimited.
-    pub per_repository_bytes: u64,
     /// Node-local CAS, upload temporary and repository receipt payload cap.
     /// The HTTP API enforces this through the shared BlobStore budget.
     /// `0` = unlimited bytes; the store still bounds payload-file counts.
     pub total_bytes: u64,
-}
-
-impl QuotaConfig {
-    /// Whether both axes are unlimited (the fast, common path).
-    pub fn is_unlimited(&self) -> bool {
-        self.per_repository_bytes == 0 && self.total_bytes == 0
-    }
-}
-
-/// Why a quota check refused an upload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuotaError {
-    /// The repository would exceed its byte ceiling.
-    RepositoryExceeded {
-        repository: String,
-        current: u64,
-        incoming: u64,
-        limit: u64,
-    },
-    /// The registry as a whole would exceed its byte ceiling.
-    TotalExceeded {
-        current: u64,
-        incoming: u64,
-        limit: u64,
-    },
-}
-
-impl std::fmt::Display for QuotaError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            QuotaError::RepositoryExceeded {
-                repository,
-                current,
-                incoming,
-                limit,
-            } => write!(
-                f,
-                "repository {repository} quota exceeded: {current}+{incoming} over {limit} bytes"
-            ),
-            QuotaError::TotalExceeded {
-                current,
-                incoming,
-                limit,
-            } => write!(
-                f,
-                "registry quota exceeded: {current}+{incoming} over {limit} bytes"
-            ),
-        }
-    }
-}
-
-/// Check whether admitting `incoming` bytes into `repository` would breach
-/// either quota axis (REG4).
-///
-/// `repository_current` is the repository's current stored size,
-/// `total_current` the whole registry's. A `0` limit on an axis skips it.
-pub fn check_quota(
-    config: &QuotaConfig,
-    repository: &str,
-    incoming: u64,
-    repository_current: u64,
-    total_current: u64,
-) -> Result<(), QuotaError> {
-    if config.per_repository_bytes != 0
-        && repository_current.saturating_add(incoming) > config.per_repository_bytes
-    {
-        return Err(QuotaError::RepositoryExceeded {
-            repository: repository.to_string(),
-            current: repository_current,
-            incoming,
-            limit: config.per_repository_bytes,
-        });
-    }
-    if config.total_bytes != 0 && total_current.saturating_add(incoming) > config.total_bytes {
-        return Err(QuotaError::TotalExceeded {
-            current: total_current,
-            incoming,
-            limit: config.total_bytes,
-        });
-    }
-    Ok(())
 }
 
 /// Whether a registry write is authorised (REG4).
@@ -162,7 +80,7 @@ pub async fn authenticate_writer(
         return Ok(Some(crate::sesame::auth::system_context()));
     }
 
-    let tokens = { auth.tokens.read().await.clone() };
+    let tokens = auth.tokens.read().await;
     if allow_unauthenticated_bootstrap && tokens.is_empty() && auth.service_token.is_none() {
         return Ok(None);
     }
@@ -170,7 +88,7 @@ pub async fn authenticate_writer(
     let Some(bearer) = bearer else {
         return Err(WriteDenied::Unauthenticated);
     };
-    match crate::sesame::auth::authenticate_off_lock(bearer, tokens).await {
+    match crate::sesame::auth::authenticate(bearer, &tokens) {
         Ok(ctx) => {
             // A registry push is a deploy-class mutation.
             if crate::sesame::token::check_role(ctx.role, ApiRole::Deployer).is_ok() {
@@ -212,10 +130,8 @@ pub async fn authorise_read(
     let Some(bearer) = bearer else {
         return Err(WriteDenied::Unauthenticated);
     };
-    let tokens = { auth.tokens.read().await.clone() };
-    crate::sesame::auth::authenticate_off_lock(bearer, tokens)
-        .await
-        .map_err(|_| WriteDenied::Unauthenticated)
+    let tokens = auth.tokens.read().await;
+    crate::sesame::auth::authenticate(bearer, &tokens).map_err(|_| WriteDenied::Unauthenticated)
 }
 
 /// Why a write was refused.
@@ -558,45 +474,6 @@ mod tests {
     use crate::sesame::auth::new_token_store;
     use crate::sesame::token::create_token;
     use crate::sesame::types::TokenScope;
-
-    // --- quotas ---
-
-    #[test]
-    fn unlimited_quota_admits_everything() {
-        let config = QuotaConfig::default();
-        assert!(config.is_unlimited());
-        assert!(check_quota(&config, "web", 1_000_000_000, 0, 0).is_ok());
-    }
-
-    #[test]
-    fn per_repository_quota_refuses_over_limit() {
-        let config = QuotaConfig {
-            per_repository_bytes: 1000,
-            total_bytes: 0,
-        };
-        // 900 stored + 200 incoming = 1100 > 1000.
-        let err = check_quota(&config, "web", 200, 900, 5000).unwrap_err();
-        assert!(matches!(err, QuotaError::RepositoryExceeded { .. }));
-    }
-
-    #[test]
-    fn per_repository_quota_admits_within_limit() {
-        let config = QuotaConfig {
-            per_repository_bytes: 1000,
-            total_bytes: 0,
-        };
-        assert!(check_quota(&config, "web", 100, 900, 900).is_ok());
-    }
-
-    #[test]
-    fn total_quota_refuses_over_limit() {
-        let config = QuotaConfig {
-            per_repository_bytes: 0,
-            total_bytes: 2000,
-        };
-        let err = check_quota(&config, "web", 500, 100, 1800).unwrap_err();
-        assert!(matches!(err, QuotaError::TotalExceeded { .. }));
-    }
 
     // --- auth ---
 

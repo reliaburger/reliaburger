@@ -59,6 +59,10 @@ pub struct InstanceStatus {
     /// whose loop hasn't published for longer fails the request instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_ms: Option<u64>,
+    /// Why a `failed` instance could not launch, such as
+    /// `binary not found: /usr/local/bin/app` (#881).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// A workload status with the node that supplied it.
@@ -191,9 +195,23 @@ pub struct CouncilStatus {
     /// council has admitted it (#424).
     #[serde(default)]
     pub recovery_epoch: Option<u64>,
-    /// The newer epoch that fenced the answering node, when it is fenced.
+    /// The epoch that fenced the answering node, when it is fenced: the
+    /// newer epoch that replaced its council, or its own epoch when a split
+    /// fenced it.
     #[serde(default)]
     pub fenced_by: Option<u64>,
+    /// The recovery that started the answering node's epoch (#694).
+    #[serde(default)]
+    pub recovery_id: Option<crate::council::types::RecoveryId>,
+    /// The other council's recovery id, when two recoveries landed on the
+    /// answering node's epoch and it fenced itself as a split (#694).
+    #[serde(default)]
+    pub split_with: Option<crate::council::types::RecoveryId>,
+    /// Why the answering node's last write of its recovery fence failed,
+    /// while it keeps retrying (#694). A fence that isn't on disk is lost
+    /// on restart.
+    #[serde(default)]
+    pub fence_persist_error: Option<String>,
     /// Index of the last entry in the answering node's log.
     #[serde(default)]
     pub last_log_index: Option<u64>,
@@ -206,7 +224,7 @@ pub fn council_role(
 ) -> CouncilRole {
     use crate::council::fence::FenceState;
     match fence.map(|fence| fence.state) {
-        Some(FenceState::Fenced { .. }) => return CouncilRole::Fenced,
+        Some(FenceState::Fenced { .. } | FenceState::Split { .. }) => return CouncilRole::Fenced,
         Some(FenceState::Probing) => return CouncilRole::Starting,
         _ => {}
     }
@@ -247,6 +265,9 @@ pub async fn council_status(
         })
         .collect();
     let fence = council.recovery_fence().map(|fence| fence.snapshot());
+    let fence_persist_error = council
+        .recovery_fence()
+        .and_then(|fence| fence.persist_failure());
 
     CouncilStatus {
         members,
@@ -257,6 +278,11 @@ pub async fn council_status(
         role: council_role(metrics, fence),
         recovery_epoch: fence.and_then(|fence| fence.claimed_epoch()),
         fenced_by: fence.and_then(|fence| fence.fenced_by()),
+        recovery_id: fence
+            .and_then(|fence| fence.claim())
+            .and_then(|claim| claim.id),
+        split_with: fence.and_then(|fence| fence.split_with()),
+        fence_persist_error,
         last_log_index: metrics.last_log_index,
     }
 }
@@ -391,6 +417,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             egress_degraded: !egress_affected_workloads.is_empty(),
             egress_affected_workloads,
+            job_reservations: {
+                let held = self.execution_budget().job_reservations();
+                crate::reporting::types::JobReservations {
+                    cpu_millicores: held.cpu_millicores,
+                    memory_bytes: held.memory_bytes,
+                }
+            },
+            capacity_refusals: self
+                .capacity_refusals
+                .iter()
+                .map(
+                    |((app_name, namespace), ordinals)| crate::reporting::types::CapacityRefusal {
+                        app_name: app_name.clone(),
+                        namespace: namespace.clone(),
+                        ordinals: ordinals.clone(),
+                    },
+                )
+                .collect(),
+            rollouts: self.converged_rollouts.clone(),
         };
         let _ = req.response.send(snapshot);
     }
@@ -501,32 +546,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// What the loop knows about every instance, for a status snapshot.
     pub(super) fn status_entries(&self) -> Vec<status_snapshot::StatusEntry> {
         use status_snapshot::{EvidenceSource, StatusEntry};
-        let mut entries: Vec<_> = self
+        let entries: Vec<_> = self
             .supervisor
             .list_instances()
             .into_iter()
             .map(|instance| {
-                let recorded_exit = if let Some(job) = self.recorded_jobs.get(&instance.id.0)
-                    && job.batch_execution.is_some()
-                {
-                    // The public runtime snapshot may see an exit before the loop
-                    // commits it. Batch callbacks must wait for durable evidence
-                    // of this attempt so recovery preserves the reported result.
-                    Some(job.batch_terminal_exit())
-                } else {
-                    match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
-                        Some(crate::bun::jobs::JobPhase::Exited { code }) => Some(Some(*code)),
-                        Some(crate::bun::jobs::JobPhase::Unknown) => Some(None),
-                        _ => None,
-                    }
-                };
                 let evidence = if instance.is_being_created() {
-                    EvidenceSource::Creating {
-                        exit_code: recorded_exit.flatten(),
-                    }
+                    EvidenceSource::Creating { exit_code: None }
                 } else {
                     EvidenceSource::Runtime {
-                        recorded_exit,
+                        recorded_exit: None,
                         alive: matches!(
                             instance.state,
                             ContainerState::Running
@@ -538,44 +567,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 StatusEntry {
                     status: InstanceStatus {
                         id: instance.id.0.clone(),
-                        app_name: self.logical_execution_name(&instance.id, &instance.app_name),
+                        app_name: instance.app_name.clone(),
                         namespace: instance.namespace.clone(),
-                        state: self.job_state_label(instance),
+                        state: instance.state.to_string(),
                         restart_count: instance.restart_count,
                         host_port: instance.host_port,
                         exit_code: None,
                         pid: None,
                         runtime_unknown: false,
                         status_age_ms: None,
+                        reason: instance.launch_failure.clone(),
                     },
                     evidence,
                 }
             })
             .collect();
-        for (id, job) in &self.recorded_jobs {
-            if self
-                .supervisor
-                .get_instance(&InstanceId(id.clone()))
-                .is_some()
-            {
-                continue;
-            }
-            entries.push(StatusEntry {
-                status: InstanceStatus {
-                    id: id.clone(),
-                    app_name: job.logical_name().into(),
-                    namespace: job.namespace.clone(),
-                    state: "unknown".into(),
-                    restart_count: job.restart_count,
-                    host_port: None,
-                    exit_code: None,
-                    pid: None,
-                    runtime_unknown: true,
-                    status_age_ms: None,
-                },
-                evidence: EvidenceSource::Creating { exit_code: None },
-            });
-        }
         entries
     }
 
@@ -602,42 +608,5 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn get_status(&self) -> Vec<InstanceStatus> {
         let snapshot = self.publish_status();
         status_snapshot::read_status(self.supervisor.grill(), &snapshot).await
-    }
-
-    pub(super) fn get_job_status(&self) -> Vec<JobStatus> {
-        let mut jobs: Vec<_> = self
-            .supervisor
-            .list_instances()
-            .into_iter()
-            .filter(|instance| instance.is_job)
-            .map(|instance| JobStatus {
-                name: self.logical_execution_name(&instance.id, &instance.app_name),
-                namespace: instance.namespace.clone(),
-                instance_id: instance.id.0.clone(),
-                image: instance.image.clone(),
-                state: self.job_state_label(instance),
-                restart_count: instance.restart_count,
-                age_seconds: instance.created_at.elapsed().as_secs(),
-            })
-            .collect();
-        for (id, job) in &self.recorded_jobs {
-            if self
-                .supervisor
-                .get_instance(&InstanceId(id.clone()))
-                .is_some()
-            {
-                continue;
-            }
-            jobs.push(JobStatus {
-                name: job.logical_name().into(),
-                namespace: job.namespace.clone(),
-                instance_id: id.clone(),
-                image: job.spec.image.clone().unwrap_or_default(),
-                state: "unknown".into(),
-                restart_count: job.restart_count,
-                age_seconds: 0,
-            });
-        }
-        jobs
     }
 }

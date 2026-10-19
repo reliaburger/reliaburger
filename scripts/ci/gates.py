@@ -164,9 +164,22 @@ def archive_origin(plan, entry, root):
     c.require(c.digest(path) == origin['sha256'], 'archive build-origin receipt changed')
     builder = c.read_json(path)
     c.require(builder == origin['builder'], 'wrong archive build-origin receipt')
-    for key in ('commit', 'run_id', 'attempt'):
+    for key in ('commit', 'run_id'):
         c.require(builder[key] == plan[key], f'stale archive build-origin {key}')
+    c.require(earlier_or_current_attempt(builder['attempt'], plan['attempt']), 'stale archive build-origin attempt')
     c.require(builder['exit_code'] == 0, 'archive builder failed')
+
+
+def earlier_or_current_attempt(attempt, current):
+    """True when attempt is a run attempt no later than the current one.
+
+    Re-running only the failed jobs of a GitHub run gives those jobs attempt
+    N+1, while the jobs that passed keep their attempt-N outputs and
+    artifacts. Evidence from an earlier attempt of the same run and commit is
+    still current; a later, zero or malformed attempt never is.
+    """
+    return (isinstance(attempt, str) and attempt.isdigit() and int(attempt) > 0
+            and isinstance(current, str) and current.isdigit() and int(attempt) <= int(current))
 
 
 def archive_build(command, root, archive, receipt, expected, run=subprocess.run):
@@ -277,8 +290,10 @@ def validate_plan(plan, manifest, expected):
                 type(builder['schema_version']) is int and builder['schema_version'] == 1,
                 'invalid origin schema',
             )
-            for key in ('commit', 'run_id', 'attempt'):
+            for key in ('commit', 'run_id'):
                 c.require(builder[key] == plan[key], f'stale archive build-origin {key}')
+            c.require(earlier_or_current_attempt(builder['attempt'], plan['attempt']),
+                      'stale archive build-origin attempt')
             c.require(builder['host'] in ('linux', 'darwin'), 'invalid builder host')
             c.argv(builder['command'])
             c.require(builder['command'][:3] == ['cargo', 'nextest', 'archive'], 'wrong builder command')

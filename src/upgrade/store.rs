@@ -16,6 +16,15 @@ use super::error::UpgradeError;
 use super::signing::SignatureEnvelope;
 use super::version::BinaryVersion;
 
+/// Name prefixes of the temporary files a candidate binary or a staging
+/// write uses in the binary directory.
+pub(super) const TEMPORARY_PREFIXES: [&str; 2] = [".candidate-", ".staging-"];
+
+/// How long a candidate or staging file must go unchanged before startup
+/// treats it as a killed process's leftover: well past the longest fetch
+/// (75 s) and compatibility query (60 s) an upgrade allows.
+pub const CANDIDATE_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Manages the versioned binaries and the entry symlink in one directory.
 #[derive(Debug, Clone)]
 pub struct BinaryStore {
@@ -50,29 +59,51 @@ impl BinaryStore {
 
     /// Write a verified binary and its envelope into the store.
     ///
-    /// The binary is written to a temporary file, fsynced, made executable,
-    /// and renamed into place, so a crash mid-write never leaves a truncated
-    /// file under a versioned name. Does NOT touch the symlink.
-    ///
-    /// The store is keyed by version, so a version name must always mean
-    /// the same bytes. Staging bytes identical to what is already stored
-    /// leaves the binary alone (it may be the one running right now);
-    /// staging *different* bytes under an existing version is refused with
-    /// [`UpgradeError::VersionContentConflict`] rather than silently
-    /// replacing a rollback target or pretending a swap happened.
+    /// The bytes go to a private temporary file in the binary directory,
+    /// then [`stage_file`](Self::stage_file) takes over. Does NOT touch the
+    /// symlink. An upgrade stages its candidate file directly instead, so it
+    /// never holds the binary in memory (#892).
     pub fn stage(
         &self,
         version: &BinaryVersion,
         bytes: &[u8],
         envelope: &SignatureEnvelope,
     ) -> Result<PathBuf, UpgradeError> {
+        use std::io::Write as _;
+        std::fs::create_dir_all(&self.binary_dir)?;
+        let mut file = tempfile::Builder::new()
+            .prefix(TEMPORARY_PREFIXES[1])
+            .tempfile_in(&self.binary_dir)?;
+        file.write_all(bytes)?;
+        self.stage_file(version, file.into_temp_path(), envelope)
+    }
+
+    /// Move a verified binary file and its envelope into the store.
+    ///
+    /// `binary` must be in the binary directory, so the move is a rename on
+    /// one filesystem. It is fsynced, made executable, and renamed into
+    /// place, so a crash mid-way never leaves a truncated file under a
+    /// versioned name. Does NOT touch the symlink. Both files are hashed a
+    /// piece at a time, so a release-sized binary is never read into memory.
+    ///
+    /// The store is keyed by version, so a version name must always mean
+    /// the same bytes. Staging bytes identical to what is already stored
+    /// leaves the binary alone (it may be the one running right now) and
+    /// deletes `binary`; staging *different* bytes under an existing version
+    /// is refused with [`UpgradeError::VersionContentConflict`] rather than
+    /// silently replacing a rollback target or pretending a swap happened.
+    pub fn stage_file(
+        &self,
+        version: &BinaryVersion,
+        binary: tempfile::TempPath,
+        envelope: &SignatureEnvelope,
+    ) -> Result<PathBuf, UpgradeError> {
         std::fs::create_dir_all(&self.binary_dir)?;
 
         let final_path = self.binary_path(version);
-        match std::fs::read(&final_path) {
+        match super::signing::sha256_file(&final_path) {
             Ok(stored) => {
-                let stored = super::signing::sha256_hex(&stored);
-                let incoming = super::signing::sha256_hex(bytes);
+                let incoming = super::signing::sha256_file(&binary)?;
                 if stored != incoming {
                     return Err(UpgradeError::VersionContentConflict {
                         version: version.clone(),
@@ -87,24 +118,15 @@ impl BinaryStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        let tmp_path = self.binary_dir.join(format!(
-            ".{}.tmp-{}",
-            version.file_name(&self.stem),
-            std::process::id()
-        ));
 
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-        }
-        #[cfg(unix)]
+        std::fs::File::open(&binary)?.sync_all()?;
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
         }
-        std::fs::rename(&tmp_path, &final_path)?;
+        binary
+            .persist(&final_path)
+            .map_err(|failed| UpgradeError::from(failed.error))?;
 
         envelope.store(&self.envelope_path(version))?;
         self.sync_dir()?;
@@ -167,6 +189,45 @@ impl BinaryStore {
             }
         }
         Ok(versions)
+    }
+
+    /// Delete candidate and staging files a killed process left behind.
+    ///
+    /// A candidate binary is written to a private temporary file in this
+    /// directory (#892); a process killed mid-fetch can't delete its own, and
+    /// each is as big as a release. Call it at startup, before anything can
+    /// be writing one. A file changed in the last [`CANDIDATE_STALE_AFTER`]
+    /// is left alone, in case another node shares this directory (several
+    /// local nodes run from one build directory) and is fetching right now.
+    /// Returns how many files it removed.
+    pub fn remove_stale_candidates(&self) -> Result<usize, UpgradeError> {
+        let entries = match std::fs::read_dir(&self.binary_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !TEMPORARY_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            let age = metadata
+                .modified()?
+                .elapsed()
+                .unwrap_or(std::time::Duration::ZERO);
+            if metadata.is_file() && age >= CANDIDATE_STALE_AFTER {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Delete the oldest versions beyond `retain`, never touching versions
@@ -260,6 +321,64 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755);
         }
+    }
+
+    #[test]
+    fn startup_removes_only_files_left_by_a_killed_fetch() {
+        let (dir, store) = store();
+        store.stage(&v("0.2.0"), b"kept", &envelope()).unwrap();
+        let old = std::time::SystemTime::now() - CANDIDATE_STALE_AFTER * 2;
+        for name in [".candidate-abc123", ".staging-def456", ".unrelated"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"half a binary").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        // Another node sharing the directory may be writing this one now.
+        std::fs::write(dir.path().join(".candidate-in-flight"), b"arriving").unwrap();
+
+        assert_eq!(store.remove_stale_candidates().unwrap(), 2);
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".candidate-in-flight",
+                ".unrelated",
+                "bun-v0.2.0",
+                "bun-v0.2.0.sig"
+            ]
+        );
+    }
+
+    #[test]
+    fn staging_a_file_identical_to_the_stored_one_deletes_the_incoming_file() {
+        let (dir, store) = store();
+        store.stage(&v("0.2.0"), b"same", &envelope()).unwrap();
+        let incoming = dir.path().join(".candidate-same");
+        std::fs::write(&incoming, b"same").unwrap();
+
+        store
+            .stage_file(
+                &v("0.2.0"),
+                tempfile::TempPath::from_path(&incoming),
+                &envelope(),
+            )
+            .unwrap();
+
+        assert!(!incoming.exists());
+        assert_eq!(
+            std::fs::read(store.binary_path(&v("0.2.0"))).unwrap(),
+            b"same"
+        );
     }
 
     #[test]

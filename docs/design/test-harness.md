@@ -61,7 +61,7 @@ be visible until we remove its race.
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
-| `make test-standard-clients` | `crane` against Pickle's TLS listener | Linux, with a pinned `crane`; PRs into `main`, `main` and nightly |
+| `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make test-gpu`, `make test-s3` | Real NVIDIA hardware; a real S3 bucket | Manual |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
@@ -81,7 +81,13 @@ acceptance uses Linux VMs (V04 in the roadmap's [known gaps](../roadmap.md#known
 
 Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
-PR targets `main` or a release's merge-train branch (`release-*`), and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
+Pull requests into a release's merge-train branch (`release-*`) run the light set:
+lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
+contract boundaries. Labelled `full-ci`, they run every heavy owner but not the
+macOS shards (the `train-full` selection). The merge queue on the train, the push to it and the gate PR
+into `main` run everything, including the three macOS shards
+([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
 holds a fixture for each of these rules.
@@ -105,6 +111,7 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 | `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix make test-s3` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
 | `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
+| All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
 
 `.github/workflows/v02-loops.yml` is the other long-running lane. It runs only when
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
@@ -205,7 +212,60 @@ Harnesses own their spawned tasks and cancellation tokens. The main ProcessGrill
 waits for shutdown in `Drop`, then aborts only after a bounded grace period. TCP reporting
 does the same for listeners, workers and aggregators. Tests bind port `0`, use temporary
 directories and keep every resource scoped so worktrees and nextest processes can run
-concurrently.
+concurrently. A listener that must come back on the same port after a restart or an
+upgrade exec is the exception: it leases its port instead (see the cluster fixtures below).
+
+## A new executable's first launch
+
+On macOS the first `exec` of a newly written executable waits for `syspolicyd` to assess
+it. Terminals with the Developer Tools permission are exempt, so a test can pass every
+time on a developer's laptop and still time out on a CI runner or in an agent's shell. The
+wait happens in the child after `posix_spawn` has returned, so it lands inside any deadline
+the test put around the child, and assessments queue host-wide: a freshly linked debug
+`relish` (about 490 MB) took 4 to 8 seconds alone and over 15 seconds while two other fresh
+binaries were being assessed ([#573](https://github.com/reliaburger/reliaburger/issues/573)).
+A small fresh script waits in the same queue.
+
+A fixture that times a subprocess therefore pays the first launch outside its deadline.
+`tests/support/first_launch.rs` runs each executable once, all at the same time, with a
+45-second bound that names the phase if the queue never drains, and remembers which paths
+it has launched in this test process. The behavioural deadline then measures only the
+program it was written for.
+
+Fake tools are the bigger source. nextest runs every test in its own process, so a script
+each test writes for itself is a new file every time, and six lifecycle tests starting
+together each queued a fresh `limactl` behind the others
+([#582](https://github.com/reliaburger/reliaburger/issues/582)). Fixtures install scripts
+with `install_script(path, body)` instead of `std::fs::write`. It keeps one read-only copy
+of each distinct body, named by its SHA-256, in a directory only the current user can
+write (`reliaburger-fixture-scripts-<uid>` under the system temporary directory), launches
+it once with `--reliaburger-first-launch` (a line the helper adds, so the body doesn't
+run), and hard-links it to `path`. A hard link shares the already-assessed file; a copy is
+a new file that gets assessed again. Per-test state goes beside the link, and the script
+finds it through `${0%/*}`, the directory of the name it was started as, so one body
+serves every test. Library unit tests reach the same file through
+`#[cfg(all(test, unix))] #[path = "../tests/support/first_launch.rs"] mod first_launch;`
+in `src/lib.rs`.
+
+That one shared launch still queues behind whatever else the host is assessing, including
+another worktree's freshly built binaries: a two-line script waited up to 32 s behind one
+fresh 800 MB test binary, and 75 to 94 s behind two at load average 50 to 180. A fake that
+the code under test runs through a configurable program path can avoid the launch
+altogether. The quickstart lifecycle fake is a plain script run as `/bin/sh <script> <args>`
+via the test-only `Lima::shell_script`
+([#762](https://github.com/reliaburger/reliaburger/issues/762)); `/bin/sh` is a system
+binary and never assessed, and the same script started that way took 0.02 s. The runner's
+fake `limactl` does the same, and the provisioning tests define their stub `apt-get`,
+`systemctl`, `dpkg-query` and `install` as Bash functions ahead of the script instead of
+files on `PATH`. Prefer this
+shape for a new fixture whose caller can take an interpreter; use `install_script` when the
+caller needs a single executable path.
+
+The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
+depends on `make warm-executables`, which builds them with `cargo test --no-run`, as the
+suite will, and runs each of them once before the suite
+([#722](https://github.com/reliaburger/reliaburger/issues/722),
+[#846](https://github.com/reliaburger/reliaburger/issues/846)).
 
 ## Benchmarks and coverage
 
@@ -246,8 +306,10 @@ own script declaration. No prefix matching or generic alias can widen the bridge
 The seventeen original manual/subprocess classifications remain outside CI
 inventory, with the original policy visible in the generated matrix.
 
-`workflow_assembly.py` defines eleven literal owners and derives portable/full
-selection from trusted current workflow inputs. `workflow_adapter.py` preserves
+`workflow_assembly.py` defines eleven literal owners and derives light, portable,
+train-full or full selection from trusted current workflow inputs; only a pull request may
+qualify with less than full. The macOS owner runs as three hash-partition
+shards, and aggregation proves their lists cover every test exactly once. `workflow_adapter.py` preserves
 those commands and their complete selections. Ordinary nextest producers retain
 discovery and JUnit under one selector/environment plan. `completion.py` retains
 libtest discovery, selected-case completion and the actual child exit for owned
@@ -258,7 +320,11 @@ context cannot qualify CI.
 The archive builder publishes current successful archive/runtime digests before
 archived jobs execute. Aggregation requires those builder outputs, successful
 selected jobs and each producer's sealed output digest. Commit, run ID, attempt,
-host, owner command, inputs and payload bytes all belong to that context. Do not
+host, owner command, inputs and payload bytes all belong to that context. Commit,
+run ID and host must equal the aggregator's; the attempt may be earlier, because
+re-running only the failed jobs keeps the passed jobs' attempt-N outputs, and all
+owners of one job must share an attempt. An archived owner takes the builder's
+attempt from the digest-bound archive runtime, never later than its own. Do not
 reconstruct authority from artifact filenames or let a late report choose which
 owners should have run. Always retain whole-command failure as failure, even if
 all finite required assertions passed before the command failed elsewhere.
@@ -322,3 +388,91 @@ included once at the suite root and reached through `crate::`.
 Multi-node tests start their clusters through `tests/support/cluster.rs`: the fully wired
 `bun --cluster` node, the in-memory five-node council, `local`, `wait_until` and the leader
 waits all live there, so include it rather than copying another start-up helper.
+
+A cluster test shares nothing with another test or with an earlier run. `make test-cluster`
+runs its binaries side by side, and #721 found two ways that went wrong in
+`cluster_failover`: a fixed port block that `placement` also used (node `fo3`'s reporting
+port was `wk1`'s Raft port, so whichever started second failed with "Address already in
+use"), and a fixed data directory that a killed root run left with a `reliaburger-identity`
+tmpfs still mounted, which `start_wired_node` failed to remove and then reused. So:
+
+- lease each node's port block with `reserve_port_block_lease` from
+  `tests/support/bun_process.rs` and hold it until the test ends;
+- give each test its own temporary `data_root`; `start_wired_node` clears a node's directory
+  with `clear_fixture_dir`, which unmounts anything beneath it on Linux and fails the test
+  rather than starting on what it couldn't remove;
+- ask the cluster which node leads before writing, reading the leader's aggregated reports
+  or killing it. Leadership can move under load, and a write to a follower returns
+  `ForwardToLeader`.
+
+`placement`, `cluster_task_arrays` and `council_disaster_recovery` lease their blocks the
+same way (#744), and so does `cluster_gossip` (#840). Before that, three
+`cluster_task_arrays` tests shared one fixed block and two more shared another, so two runs
+of the binary at once (two worktrees, say) failed with "Address already in use" on the
+second run's gossip bind. `cluster_gossip` was the last `make test-cluster` suite on fixed
+ports: two nextest processes running it at once lost 4 of their 16 tests that way. A new
+multi-node test leases its ports like these. The two leader-loss tests in
+`owned_task_arrays` (`make test-linux`) were the last on fixed bases (24510 and 24610);
+they lease their three nodes' ports the same way and keep the nodes' data under their own
+fixture root (#852). A port that has to stay fixed keeps out of the leased 27000–30000
+range.
+
+The same rule covers any port a process gives up and binds again: a crash fixture's
+restart, and every self-upgrade or rollback, because `exec` closes Bun's sockets and the
+new binary binds the configured ports once it starts. Never choose such a port with
+`bind("127.0.0.1:0")` and release it. That port comes from the ephemeral range, and in the
+gap any other test's `bind(0)`, outgoing `connect()` or slirp forward can take it. That was
+one of #734's two causes: `oci_crash`'s upgrade fixture released its API port, a parallel
+`owned_rootless` test could draw the same number for a slirp forward, and the exec'd Bun
+exited with "Address already in use". Nothing restarts Bun in that fixture, so the walk
+reported only "owned runtime never settled on v0.1.0" after 45 seconds. (The other cause
+was in the product: adoption after an exec refused while the old process's last `runc`
+command was still finishing; see chapter 15.) The upgrade
+fixtures in `oci_crash`, `self_upgrade` and `self_upgrade_cluster`, and the slirp host
+ports in `owned_rootless`, now lease their ports for the whole test. The settle wait also
+fails at once with the node log when the Bun it watches exits.
+
+Cleanup has to find everything a test started, including processes whose command lines
+don't name the test root. `oci_crash`'s `RootCleanup` killed only those that did, so a
+failed rootless run leaked its `slirp4netns` helper: the helper names only its generation's
+`/tmp/rbr-<uid>-<generation>/` directory. The leaked helper also kept every descriptor it
+inherited, including the lock the shared Linux test VM queues its users on, and it held
+that lock for an hour. `RootCleanup` now reads each node's runtime intents for those
+directories and kills whatever names them too.
+
+Cleanup also removes the root, mounts and all. A rootful Bun mounts a `reliaburger-identity`
+tmpfs for each workload beneath its volumes directory, and the mounts outlive Bun. Until
+#780 `RootCleanup` never removed the root, so every rootful run left its identity tmpfs
+mounted under `/tmp`. It now finishes with `clear_fixture_dir` from
+[`tests/support/fixture_dir.rs`](../../tests/support/fixture_dir.rs), the helper the
+cluster fixtures use, which unmounts everything beneath the root deepest first and then
+removes it. A root it can't remove fails a passing test; while a failed test unwinds, the
+error goes to stderr, because a second panic would abort the test binary.
+
+The owned-runc capacity harness in `tests/owned_runc.rs` had the same leak in a quieter
+form (#852). It handed its agent a volumes `TempDir` and dropped it once the agent task
+ended, and dropping a `TempDir` ignores a failed removal, so a mounted identity tmpfs
+stayed behind without a word. The harness now owns the directory for its whole life; its
+`Drop` stops the agent and API first, then calls `clear_fixture_dir` with the same
+panic-or-print rule.
+
+Cleanup must also stop at what the test owns. The scan reads every process on the host, and
+on a CI runner that includes the runner. Until #800 it killed the whole process group of any
+match outside the test's own group. From #758 on, a match could be any process with a file
+open under the root. A process the test didn't start, sitting in someone else's group, would have taken
+that group down with it. A runner killed that way loses the job and every log it had.
+That is how the privileged Linux job's OCI step failed five times on 11 October, though no
+run proved which process matched. The rule now
+lives in one place, [`tests/support/root_processes.rs`](../../tests/support/root_processes.rs),
+shared by `oci_crash`, `kubernetes_demo` and `autoscale_memory`:
+
+- A process counts as the test's if its command line names one of the test's unique paths,
+  or if it descends from the test process. Holding a file under the root isn't enough.
+- A group is killed only when one of the test's processes leads it, as Bun's detached owners
+  do. Any other process of the test's is killed alone.
+- Anything else is left running, and the cleanup logs that it spared it.
+
+`root_teardown` in the portable suite proves it on Linux. A sleeper started through
+`setsid -f` (its own group, outside the test's tree) holds a file under the root. Next to it
+runs an owner that leads its own group. Teardown must kill the owner and its child and leave
+the sleeper running.

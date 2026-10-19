@@ -22,6 +22,13 @@ Subcommands:
   nodes-json FILE leader|followers|alive|council
   utc-stamp EPOCH                       YYMMDDHHMMSSZ for `openssl ca -startdate/-enddate`
   registry EVIDENCE push|verify --port P --server-name N --ca CA --token-file F [--tag T]
+  forwards SNAPSHOT --limactl L --api-port P --ingress-port P --registry-port P --node VM... [--down I]
+                                        probe every forwarded port from the host, and from inside
+                                        the guest when the host gets no answer (#987)
+  keep-host-logs EVIDENCE --lima-home D --reason R VM...
+                                        keep Lima's host-agent logs before a stop truncates them
+  curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
+  test-failures REPORT [STDERR]         each failing case's reason from a `relish --output json test` report
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
 """
 import argparse
@@ -35,8 +42,12 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import statistics
 import sys
 import time
+import job_soak
+import job_soak_inventory
+import soak_charts
 
 # Thresholds from section 4 of the plan (seconds unless stated).
 NODE_CERT_MARGIN = 300
@@ -45,9 +56,20 @@ INGRESS_CERT_MARGIN = 300
 RETRYING_LIMIT = 600
 WTF_CRITICAL_LIMIT = 300
 WTF_WARNING_LIMIT = 600
+# Mayo alerts the soak raises by design: it drives 2-vCPU guests at the job
+# target rate, so guest CPU above 90% is the load, not a fault (#1112). They
+# are recorded, not gated. `memory_high` stays gated: it is a leak signal.
+UNGATED_ALERTS = {"cpu_throttle"}
 NO_LEADER_LIMIT = 30
 RSS_WARMUP = 3600
 RSS_GROWTH = 1.25
+# Recorded job-cost targets for a soak (maintainer decision, 15 October 2026,
+# #668). A Bun process's steady-state RSS is the median of the samples taken
+# once it has been seen for BUN_STEADY_AFTER seconds.
+BUN_STEADY_AFTER = 600
+API_BUN_RSS_TARGET_MIB = 512
+BUN_RSS_TARGET_MIB = 384
+TASK_ARRAY_STORAGE_TARGET_MIB = 64
 # A leak-fd window: floors over 10-minute buckets after a 10-minute warm-up,
 # each at least FD_STEP above the last, 25% up overall. Bun images rarely
 # live more than two hours in the soak, so the window has to be short.
@@ -57,6 +79,8 @@ FD_RISES = 3
 FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
+# Snapshot kinds that collect the guest inventories (collect in qualify-sustained.sh).
+INVENTORY_KINDS = ("settle", "heavy")
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
 # The agent loop's turn budget (docs/plans/2026-09-30-agent-loop-review.md,
 # decision 1): a tier fails if any node runs one turn longer than this. Bun
@@ -69,6 +93,16 @@ TURN_BUCKET_BOUNDS = ("2.5", "5", "10", "+Inf")
 # a quorum loss outlasts them and is judged against the fault window.
 REGISTRY_UNAVAILABLE_TRIES = 3
 REGISTRY_UNAVAILABLE_PAUSE = 5
+# The ports the quickstart forwards from the host (src/relish/quickstart/
+# runner.rs): every node's API, and node 1's ingress and registry. Each is
+# probed with a request the service answers, since Lima's gRPC forwarder
+# accepts every connection on the host even when the guest side is gone.
+FORWARDS = (("api", 9117, "https", "/v1/health"), ("ingress", 80, "http", "/"), ("registry", 5050, "https", "/v2/"))
+# A forward that has just come up after a boot may lag Bun by a few seconds;
+# one that stays cut this long is a failure (#987).
+HOST_FORWARD_GRACE = 60
+CURL_REASONS = {6: "no such host", 7: "refused", 22: "HTTP error", 28: "timeout", 35: "TLS", 52: "empty reply",
+                55: "send failed", 56: "reset", 58: "TLS", 60: "TLS", 77: "TLS", 90: "TLS", 91: "TLS"}
 
 
 # --- state -----------------------------------------------------------------
@@ -248,9 +282,19 @@ def rotation_findings(state, node, rotation_state, now):
     return []
 
 
-def leak_findings(baseline, current, baseline_instances, current_instances, node):
-    """Resources beyond the baseline plus the node's current instances."""
+def leak_findings(baseline, current, baseline_instances, current_instances, node, job_inventory=None,
+                  lingering=()):
+    """Resources beyond the baseline plus the node's current instances.
+
+    A live job owner's temporary setup peer (`vtc-<hash>`) is excused, unless
+    it is in `lingering`: present in the previous inventory too (#944)."""
     findings = []
+    if job_inventory is not None:
+        owned = job_soak_inventory.exemptions(job_inventory)
+        owned["veth"] |= owned["setup_peer"] - set(lingering)
+        # Compare the reconciled kernel snapshot with exact live owner proofs.
+        current = dict(current, **{kind:[v for v in values if v not in owned[kind]]
+                                  for kind,values in job_inventory["resources"].items()})
     instances = set(current_instances)
     for kind, prefix in (("runc", ""), ("netns", "rb-"), ("lease", "")):
         for value in current.get(kind, []):
@@ -419,7 +463,11 @@ def restart_findings(state, node, inventory, expectations, now):
         explained = min(observed, len(fresh))
         restarts["used"] += explained
         if observed > explained:
-            findings.append(finding("bun-restart", "fail", f"{observed - explained} systemd restart(s) of bun without a harness kill", node))
+            item = finding("bun-restart", "fail", f"{observed - explained} systemd restart(s) of bun without a harness kill "
+                           f"(NRestarts now {count})", node)
+            # Each rise is a new restart, not a repeat of the last one (#985).
+            item["repeat_key"] = f"{node}|{boot}|{count}"
+            findings.append(item)
     else:
         # A new boot starts systemd's counter again; nothing carries over.
         restarts["used"] = len(expectations)
@@ -458,11 +506,19 @@ def wtf_findings(state, report, now, fault_window):
                                      ("warning", report.get("warnings", []), WTF_WARNING_LIMIT)):
         for entry in entries:
             key = f"{severity}|{entry['id']}|{entry.get('affected_resource', '')}"
+            # Every alert of one resource shares an id, so the rule names it.
+            rule = entry.get("title", "").split(":")[0] if entry["id"] == "alerts-firing" else None
+            if rule:
+                key += "|" + rule
             current.add(key)
             first = max(seen.setdefault(key, now), settled)
             if fault_window or now - first <= limit or key in reported:
                 continue
             reported.append(key)
+            if rule in UNGATED_ALERTS:
+                findings.append(finding("wtf-alert", "info", f"{rule} for {now - first} s (recorded, not gated)",
+                                        entry.get("affected_resource")))
+                continue
             findings.append(finding("wtf-" + severity, "fail",
                                     f"{entry['id']} for {now - first} s: {entry.get('title', '')}",
                                     entry.get("affected_resource")))
@@ -483,6 +539,151 @@ def settle_clean(report, nodes, nodes_problems, leaks, http_ok):
     return not nodes_problems and not leaks and http_ok is not False
 
 
+# --- host forwards (#987) --------------------------------------------------------
+
+def test_failure_reasons(report_text, stderr_text=""):
+    """Why a `relish --output json test` run failed, in one line (#1068).
+
+    Names each case that did not pass with its outcome's reason. Without a
+    readable report it falls back to the tail of stderr, then of stdout."""
+    try:
+        results = json.loads(report_text)["results"]
+    except (ValueError, KeyError, TypeError):
+        results = None
+    if results is not None:
+        reasons = [f"{result.get('name', '?')}: {result.get('outcome', {}).get('status', '?')}: "
+                   f"{result.get('outcome', {}).get('reason', 'no reason given')}"
+                   for result in results if result.get("outcome", {}).get("status") != "pass"]
+        return "; ".join(reasons) if reasons else "no failing case in the report"
+    for text in (stderr_text, report_text):
+        tail = " ".join(line.strip() for line in text.strip().splitlines()[-3:])
+        if tail:
+            return tail
+    return "no output"
+
+
+def curl_reason(code):
+    """What a curl exit code means for a probe, in a word or two."""
+    return CURL_REASONS.get(code, f"curl exit {code}")
+
+
+def http_probe(port, scheme, path, timeout=5):
+    """None when something answers HTTP on 127.0.0.1:`port`, else why not.
+
+    Any status counts: the probe asks whether the forward reaches the
+    service, not whether the service is happy."""
+    if scheme == "https":
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        connection = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout, context=context)
+    else:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers={"Host": "podinfo.localhost"} if scheme == "http" else {})
+        connection.getresponse().read(64)
+        return None
+    except ConnectionRefusedError:
+        return "refused"
+    except (socket.timeout, TimeoutError):
+        return "timeout"
+    except ssl.SSLError:
+        return "TLS"
+    except (http.client.RemoteDisconnected, http.client.BadStatusLine):
+        return "empty reply"
+    except ConnectionResetError:
+        return "reset"
+    except OSError as error:
+        return "error " + (os.strerror(error.errno) if error.errno else type(error).__name__)
+    finally:
+        connection.close()
+
+
+def guest_probe(limactl, vm, port, scheme, path):
+    """The same probe from inside the guest, over `limactl shell` (SSH, not
+    the port forwarder): None when the service answers there."""
+    import subprocess
+    url = f"{scheme}://127.0.0.1:{port}{path}"
+    try:
+        result = subprocess.run([str(limactl), "shell", "--workdir", "/", vm, "sudo", "curl", "-sk", "-o", "/dev/null",
+                                 "-w", "%{http_code}", "--connect-timeout", "3", "--max-time", "5", url],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "limactl shell timeout"
+    except OSError as error:
+        return "limactl " + type(error).__name__
+    if result.returncode == 0 and result.stdout.strip() not in ("", "000"):
+        return None
+    return curl_reason(result.returncode) if result.returncode else "no HTTP answer"
+
+
+def probe_forwards(nodes, ports, down, limactl, host=http_probe, guest=guest_probe):
+    """One row per forwarded port of every node that is up. The guest is
+    asked only when the host gets no answer."""
+    rows = []
+    for index, node in enumerate(nodes, 1):
+        if index in down:
+            continue
+        for name, guest_port, scheme, path in FORWARDS:
+            if name != "api" and index != 1:
+                continue
+            port = ports["api"] + index - 1 if name == "api" else ports[name]
+            failed = host(port, scheme, path)
+            inside = None
+            if failed is not None:
+                inside = guest(limactl, node, guest_port, scheme, path) or "ok"
+            rows.append(dict(node=node, name=name, port=port, host=failed or "ok", guest=inside))
+    return rows
+
+
+def host_forward_findings(state, rows, now):
+    """A port the host can't reach while the guest serves it is cut off.
+    Once it has stayed cut for HOST_FORWARD_GRACE it is one failure for the
+    whole incident (later checks see it as info), not a cascade. Returns the
+    findings and the cut (node, name) pairs, which excuse the checks that
+    go through them."""
+    seen = state.setdefault("host_forward", {})
+    findings, cut, current = [], set(), set()
+    for row in rows:
+        if row.get("host") == "ok" or row.get("guest") != "ok":
+            continue
+        key = f"{row['node']} {row['port']}"
+        current.add(key)
+        cut.add((row["node"], row["name"]))
+        entry = seen.setdefault(key, {"since": now, "reported": False})
+        detail = (f"{row['name']} port {row['port']} {row['host']} from the host since {entry['since']} "
+                  f"while {row['node']} serves it inside the guest; checks through it are excused")
+        if entry["reported"] or now - entry["since"] < HOST_FORWARD_GRACE:
+            findings.append(finding("host-forward", "info", detail, key))
+        else:
+            entry["reported"] = True
+            findings.append(finding("host-forward", "fail", detail, key))
+    for key in list(seen):
+        if key not in current:
+            del seen[key]
+    return findings, cut
+
+
+def keep_host_logs(evidence, lima_home, reason, vms, now=None):
+    """Copy each VM's `ha.stderr.log`, which Lima truncates when the
+    instance starts again, into EVIDENCE/lima/VM/, gzipped."""
+    import gzip
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
+    for vm in vms:
+        source = Path(lima_home) / vm / "ha.stderr.log"
+        if not source.is_file():
+            continue
+        target = Path(evidence) / "lima" / vm
+        target.mkdir(parents=True, exist_ok=True)
+        name = f"{stamp}-{reason}"
+        sequence = 0
+        while (target / f"{name}.ha.stderr.log.gz").exists():
+            sequence += 1
+            name = f"{stamp}-{reason}-{sequence}"
+        with source.open("rb") as data, gzip.open(target / f"{name}.ha.stderr.log.gz", "wb") as out:
+            out.write(data.read())
+
+
 # --- evaluation ----------------------------------------------------------------
 
 def read(snapshot, name):
@@ -500,6 +701,42 @@ def read_json(snapshot, name):
         return None
 
 
+def job_findings(evidence, snapshot, now, fault_window, state=None):
+    """The job campaign's findings for one snapshot. The campaign keeps each
+    error it records for the whole run, so a check fails on an error only
+    the first time it sees it; after that it is `info`, and the final
+    verdict still fails on it through `job_soak.coverage_failures` (#968)."""
+    metadata=read_json(evidence,"metadata.json") or {}
+    if metadata.get("job_soak") is not True: return []
+    value=read_json(snapshot,"jobs.json")
+    problems=job_soak.findings(value,now,fault_window)
+    if value and value.get("stopped") and now < metadata.get("job_stop_at",now):
+        problems.append("job controller stopped before the final drain interval")
+    errors=set(value.get("errors",[])) if isinstance(value,dict) else set()
+    reported=state.setdefault("job_errors_reported",[]) if state is not None else []
+    result=[]
+    for item in problems:
+        if item in errors and item in reported:
+            result.append(finding("jobs","info","reported earlier: "+item))
+            continue
+        if item in errors and state is not None:
+            reported.append(item); state["job_errors_reported"]=reported[-64:]
+        result.append(finding("jobs","fail",item))
+    return result
+
+
+def collection_end(snapshot, meta, now):
+    """When the harness finished collecting `snapshot`: meta.json's
+    `collected`, or for a snapshot from before it was recorded, when its last
+    collected file was written. The guests are asked after meta.json's `ts`,
+    so their evidence is stamped between the two."""
+    if type(meta.get("collected")) is int:
+        return meta["collected"]
+    written = [path.stat().st_mtime for path in Path(snapshot).iterdir()
+               if path.name not in ("meta.json", "verdict.json", "findings.txt")]
+    return max(now, int(max(written))) if written else now
+
+
 def evaluate(evidence, snapshot):
     state = load_state(evidence)
     meta = read_json(snapshot, "meta.json") or {}
@@ -508,11 +745,23 @@ def evaluate(evidence, snapshot):
     expected_nodes = state.get("nodes", [])
     findings = []
 
+    forwards = read_json(snapshot, "forwards.json")
+    cut = set()
+    if isinstance(forwards, list):
+        forward_findings, cut = host_forward_findings(state, forwards, now)
+        findings += forward_findings
+    ingress_cut = any(name == "ingress" for _, name in cut)
+
     http = read(snapshot, "http.txt")
     http_ok = None
     if http is not None:
         http_ok = http.split()[:1] == ["200"]
-        if not http_ok:
+        if not http_ok and ingress_cut:
+            # The probe went through the cut forward: the product isn't judged by it.
+            http_ok = None
+            findings.append(finding("ingress-http", "info",
+                                    "podinfo answered " + (http.strip() or "nothing") + " through a cut host forward"))
+        elif not http_ok:
             findings.append(finding("ingress-http", "info" if fault_window else "fail",
                                     "podinfo answered " + (http.strip() or "nothing")))
 
@@ -591,6 +840,11 @@ def evaluate(evidence, snapshot):
     by_node = instances_by_node(status) if isinstance(status, list) else None
     baseline = state.get("baseline", {})
     leaks = []
+    jobs_enabled=(read_json(evidence,"metadata.json") or {}).get("job_soak") is True
+    job_found=job_findings(evidence,snapshot,now,fault_window,state)
+    findings += job_found
+    # An error reported by an earlier check doesn't hold back this settle.
+    job_problems=[item for item in job_found if item["severity"]!="info"]
     for node in expected_nodes:
         diagnostics = read_json(snapshot, f"diagnostics-{node}.json")
         if diagnostics is not None:
@@ -610,9 +864,38 @@ def evaluate(evidence, snapshot):
             findings += restart_findings(state, node, inventory, restart_expectations(evidence, node), now)
             findings += resource_trend_findings(state, node, inventory, now)
             findings += clock_findings(state, node, inventory, fault_window)
+            if jobs_enabled:
+                job_metric_samples(state, node, inventory, now)
+            owned=None
+            if jobs_enabled:
+                text=read(snapshot,f"jobs-{node}.txt")
+                try:
+                    owned=job_soak_inventory.validate(json.loads(text) if text else None,now,(inventory.get("boot") or [None])[0],
+                                                      collection_end(snapshot,meta,now))
+                    # Refuse a forged proof even when there are no app instances.
+                    job_soak_inventory.exemptions(owned)
+                    usage=state.setdefault("job_resources",{}).setdefault(node,{})
+                    usage.update(ts=owned["ts"],complete=True,available_kb=owned["available_kb"],storage_kb=owned["storage_kb"],live_owners=len(owned["owners"]))
+                    usage["peak_owners"]=max(usage.get("peak_owners",0),len(owned["owners"]))
+                    peaks=usage.setdefault("peak_storage_kb",{})
+                    for scope,size in owned["storage_kb"].items(): peaks[scope]=max(peaks.get(scope,0),size)
+                    campaign_snapshot=read_json(snapshot,"jobs.json") or {}
+                    if campaign_snapshot.get("stopped") and now-campaign_snapshot.get("heartbeat",0)>5 and owned["owners"]:
+                        raise job_soak_inventory.InvalidInventory("job-owned resources remain after positive campaign drain")
+                except (job_soak_inventory.InvalidInventory,ValueError,KeyError,TypeError) as error:
+                    problem=finding("job-inventory","info" if fault_window else "fail",str(error),node)
+                    job_problems.append(problem); findings.append(problem)
+            lingering=state.get("setup_peers",{}).get(node,[])
+            if owned is not None:
+                # A setup peer lasts milliseconds; one seen by two inventories leaked.
+                state.setdefault("setup_peers",{})[node]=sorted(v for v in owned["resources"].get("veth",[]) if v.startswith("vtc-"))
             if by_node is not None and node in baseline:
                 leaks += leak_findings(baseline[node]["inventory"], inventory,
-                                       baseline[node]["instances"], by_node.get(node, []), node)
+                                       baseline[node]["instances"], by_node.get(node, []), node,owned,lingering)
+        elif jobs_enabled and not fault_window and meta.get("kind") in INVENTORY_KINDS:
+            # Light snapshots don't collect guest inventories (#943).
+            problem=finding("job-inventory","fail","kernel/storage inventory missing",node)
+            job_problems.append(problem); findings.append(problem)
         text = read(snapshot, f"export-{node}.txt")
         if text is not None:
             findings += export_findings(state, node, text)
@@ -626,7 +909,11 @@ def evaluate(evidence, snapshot):
     findings += [dict(leak, severity="info") if fault_window else leak for leak in leaks]
 
     registry = read_json(snapshot, "registry.json")
-    if registry is not None:
+    registry_cut = any(name == "registry" for _, name in cut)
+    if registry is not None and registry_cut:
+        for problem in registry.get("problems", []) + registry.get("unavailable", []):
+            findings.append(finding("registry", "info", problem + " (through a cut host forward)"))
+    elif registry is not None:
         for problem in registry.get("problems", []):
             findings.append(finding("registry", "fail", problem))
         # Refusing reads without a leader is Pickle failing closed, not data
@@ -637,7 +924,7 @@ def evaluate(evidence, snapshot):
     clean = None
     if meta.get("kind") in ("settle", "heavy"):
         # Without status the leak check couldn't run, so the node isn't known to be clean.
-        clean = settle_clean(report, nodes, node_problems, leaks, http_ok) and by_node is not None
+        clean = settle_clean(report, nodes, node_problems, leaks, http_ok) and by_node is not None and not job_problems
     findings = suppress_repeats(state, findings, now)
     verdict = {"ts": now, "kind": meta.get("kind"), "fault_window": fault_window,
                "settle_clean": clean, "findings": findings}
@@ -659,7 +946,7 @@ def suppress_repeats(state, findings, now):
     reported = state.setdefault("reported", {})
     result = []
     for item in findings:
-        key = f"{item['check']}|{item['target'] or ''}"
+        key = f"{item['check']}|{item.get('repeat_key') or item['target'] or ''}"
         if item["severity"] == "fail":
             if now - reported.get(key, -REPEAT_WINDOW) < REPEAT_WINDOW:
                 item = dict(item, severity="repeat")
@@ -694,7 +981,12 @@ def turn_findings(state, node, samples):
 
     The buckets count from the bun process's start, so the check remembers
     what it last saw per branch, and starts again from zero when the process
-    changes (a kill, an upgrade's exec), as the resource trends do."""
+    changes (a kill, an upgrade's exec), as the resource trends do.
+
+    On the node whose writes the soak throttles (`node-slow-fsync`), a turn
+    that journals is slow by construction: those turns are info, and stay out
+    of the record's over-budget count, while the window lasts (#972)."""
+    throttled = state.get("window") == "node-slow-fsync" and state.get("window_node") == node
     buckets = turn_buckets(samples)
     resources = state.get("resources", {}).get(node, {})
     process = [resources.get("pid"), resources.get("image")]
@@ -719,8 +1011,11 @@ def turn_findings(state, node, samples):
                       if buckets.get((branch, bound)) == total), "+Inf")
         lower = {"2.5": "1", "5": "2.5", "10": "5", "+Inf": "10"}[worst]
         span = f"over {lower} s" if worst == "+Inf" else f"between {lower} and {worst} s"
-        findings.append(finding("agent-loop-turn", "fail",
-                                f"{new} {branch} turn(s) over the 1 s budget, the worst {span}", node))
+        detail = f"{new} {branch} turn(s) over the 1 s budget, the worst {span}"
+        if throttled:
+            findings.append(finding("agent-loop-turn", "info", detail + ", during the injected slow-fsync fault", node))
+            continue
+        findings.append(finding("agent-loop-turn", "fail", detail, node))
         state.setdefault("turns_over_budget", {})[node] = state.get("turns_over_budget", {}).get(node, 0) + new
     return findings
 
@@ -818,6 +1113,99 @@ def resource_trend_findings(state, node, inventory, now):
     findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
     findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
     return findings
+
+
+def job_metric_samples(state, node, inventory, now):
+    """Accumulate Bun and executor-helper CPU for the M8 measurements.
+
+    Counters only grow within one process or cgroup, so a restart or a
+    retired helper starts a new baseline instead of counting backwards."""
+    metrics = state.setdefault("job_metrics", {}).setdefault(node, {"bun_cpu_seconds": 0.0, "executor_cpu_seconds": 0.0})
+    pid = inventory_number(inventory, "bun_pid")
+    ticks = inventory_number(inventory, "bun_cpu_ticks")
+    hertz = inventory_number(inventory, "clk_tck")
+    mark = metrics.get("bun_mark")
+    if ticks is not None and hertz:
+        if mark and mark[0] == pid and ticks >= mark[1]:
+            metrics["bun_cpu_seconds"] += (ticks - mark[1]) / hertz
+            metrics["bun_wall_seconds"] = metrics.get("bun_wall_seconds", 0) + now - mark[2]
+        metrics["bun_mark"] = [pid, ticks, now]
+    helpers = {}
+    for line in inventory.get("executor_cpu", []):
+        group, _, usec = line.rpartition(" ")
+        if group and usec.isdigit():
+            helpers[group] = int(usec)
+    if "executor_mark" in metrics:
+        previous, since = metrics["executor_mark"]
+        for group, usec in helpers.items():
+            if group in previous and usec >= previous[group]:
+                metrics["executor_cpu_seconds"] += (usec - previous[group]) / 1e6
+        metrics["executor_wall_seconds"] = metrics.get("executor_wall_seconds", 0) + now - since
+    metrics["executor_mark"] = [helpers, now]
+    bun_rss_samples(metrics, inventory, pid, now)
+
+
+def bun_rss_samples(metrics, inventory, pid, now):
+    """Keep each Bun process's RSS samples for its steady state.
+
+    The inventory gives no start time, so a process is its boot, pid and
+    image (an upgrade execs in place: same pid, new image), timed from the
+    first snapshot that saw it. A sample counts towards the steady state once
+    the process has been seen for BUN_STEADY_AFTER seconds."""
+    rss = inventory_number(inventory, "bun_rss_kb")
+    if rss is None:
+        return
+    key = dict(boot=(inventory.get("boot") or [None])[0], pid=pid, image=(inventory.get("bun_image") or [None])[0])
+    processes = metrics.setdefault("bun_processes", [])
+    if not processes or any(processes[-1][name] != value for name, value in key.items()):
+        processes.append(dict(key, first_seen=now, peak_kb=rss, steady_kb=[]))
+    process = processes[-1]
+    process["peak_kb"] = max(process["peak_kb"], rss)
+    if now - process["first_seen"] >= BUN_STEADY_AFTER:
+        process["steady_kb"].append(rss)
+
+
+def job_host_metrics(state, accepted):
+    """M8 measurements the guests' inventories give, recorded and never gated."""
+    trends = state.get("trends", {})
+    # Node 1 serves the API the harness and the job controller talk to.
+    api_node = (state.get("nodes") or [None])[0]
+    per_node = {}
+    for node, metrics in sorted(state.get("job_metrics", {}).items()):
+        logs = trends.get(node, {}).get("disk_kb logs", {})
+        ledger = state.get("job_resources", {}).get(node, {}).get("peak_storage_kb", {}).get("task-arrays")
+        processes = [dict(boot=process["boot"], pid=process["pid"], image=process["image"], first_seen=process["first_seen"],
+                          steady_samples=len(process["steady_kb"]),
+                          steady_rss_mib=statistics.median(process["steady_kb"]) / 1024 if process["steady_kb"] else None,
+                          peak_rss_mib=process["peak_kb"] / 1024)
+                     for process in metrics.get("bun_processes", [])]
+        steady = [process["steady_rss_mib"] for process in processes if process["steady_rss_mib"] is not None]
+        per_node[node] = dict(
+            bun_processes=processes,
+            bun_steady_rss_mib=max(steady) if steady else None,
+            bun_peak_rss_mib=max((process["peak_rss_mib"] for process in processes), default=None),
+            bun_rss_target_mib=API_BUN_RSS_TARGET_MIB if node == api_node else BUN_RSS_TARGET_MIB,
+            bun_cpu_cores=metrics["bun_cpu_seconds"] / metrics["bun_wall_seconds"] if metrics.get("bun_wall_seconds") else None,
+            executor_helper_cpu_cores=metrics["executor_cpu_seconds"] / metrics["executor_wall_seconds"] if metrics.get("executor_wall_seconds") else None,
+            retained_log_mb=logs.get("max", 0) * 1024 / 1e6 if logs else None,
+            peak_task_array_storage_mib=ledger / 1024 if ledger is not None else None)
+    def worst(key):
+        values = [row[key] for row in per_node.values() if row[key] is not None]
+        return max(values) if values else None
+    # Targets differ by node, so the worst node is the one closest to its own.
+    measured = [(node, row) for node, row in per_node.items() if row["bun_steady_rss_mib"] is not None]
+    rss_node, rss_row = max(measured, key=lambda item: item[1]["bun_steady_rss_mib"] / item[1]["bun_rss_target_mib"], default=(None, None))
+    logs = [row["retained_log_mb"] for row in per_node.values() if row["retained_log_mb"] is not None]
+    ledgers = [row["peak_task_array_storage_mib"] for row in per_node.values() if row["peak_task_array_storage_mib"] is not None]
+    return dict(per_node=per_node,
+                api_node=api_node,
+                bun_rss_worst=dict(node=rss_node, steady_rss_mib=rss_row["bun_steady_rss_mib"], peak_rss_mib=rss_row["bun_peak_rss_mib"],
+                                   target_mib=rss_row["bun_rss_target_mib"]) if rss_row else None,
+                # The leader moves during the soak: the busiest Bun bounds it.
+                leader_cpu_cores=worst("bun_cpu_cores"),
+                executor_overhead_cores_per_node=worst("executor_helper_cpu_cores"),
+                retained_log_mb=sum(logs) if logs else None,
+                node_ledger_mib_per_million_tasks=(sum(ledgers) / accepted * 1e6) if ledgers and accepted else None)
 
 
 def record_baseline(evidence, snapshot):
@@ -1069,6 +1457,17 @@ def render(evidence, record):
     if reload_period:
         need = max(0, int(elapsed // reload_period) - 1)
         gates.append(("operator ingress reloads (all nodes)", str(reloads), f"≥ {need}", "PASS" if reloads >= need else "FAIL"))
+    job_report=read_json(evidence,"jobs/snapshot.json")
+    fault_kinds=job_soak.FAULT_KINDS+(job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())
+    job_missing=job_soak.coverage_failures(job_report,state.get("nodes",[]),fault_kinds) if metadata.get("job_soak") is True else []
+    if metadata.get("job_soak") is True:
+        if job_report and (type(job_report.get("stop_requested_at")) is not int or job_report["stop_requested_at"] < metadata.get("job_stop_at",0)):
+            job_missing.append("job campaign requested drain before the final two-minute interval")
+        for node in state.get("nodes",[]):
+            observed=state.get("job_resources",{}).get(node,{})
+            if observed.get("complete") is not True or observed.get("ts",0)<(job_report or {}).get("heartbeat",0) or observed.get("live_owners")!=0:
+                job_missing.append(node+" lacks a complete empty owner inventory after campaign drain")
+        gates.append(("mixed job campaign and positive drain",str(len(job_missing))+" missing/failing checks","0","FAIL" if job_missing else "PASS"))
     gate_failed = any(row[3] == "FAIL" for row in gates)
     open_failures = [row for row in failures if row.get("disposition", "open") == "open"]
     result = metadata.get("result") or ("FAIL" if open_failures or gate_failed else "PASS")
@@ -1125,6 +1524,25 @@ def render(evidence, record):
     lines += [f"| {label} | {observed} | {need} | {verdict} |" for label, observed, need, verdict in gates]
     lines.append("")
     progress = state.get("progress", {})
+    if metadata.get("job_soak") is True:
+        lines += ["## Jobs", "", "| Runtime | Accepted successes | Retries | Last accepted progress |", "|---|---|---|---|"]
+        for mode in job_soak.MODES:
+            sample=(job_report or {}).get("progress",{}).get(mode,{})
+            lines.append(f"| {mode} | {sample.get('succeeded',0)} | {sample.get('retried',0)} | {sample.get('latest_success','missing')} |")
+        lines += ["", "The bounded campaign shares the app soak's fault schedule. These counts are reliability evidence, not a saturation rate or a 100-million-per-day qualification.", ""]
+        lines += ["- "+problem for problem in job_missing]
+        lines += ["- Independent verifier execution attempts: "+str((job_report or {}).get("totals",{}).get("audit_attempts",0)),
+                  "- Explicit test-operator acknowledgements for known replay-safe fenced fixtures: "+str((job_report or {}).get("totals",{}).get("operator_replay_decisions",0)), ""]
+        for node, sample in state.get("job_resources",{}).items():
+            lines.append(f"- {node}: latest complete job storage (KiB) {sample.get('storage_kb')}; free {sample.get('available_kb')} KiB; live/peak owners {sample.get('live_owners')}/{sample.get('peak_owners')}; peak storage {sample.get('peak_storage_kb')}")
+        lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 12-hour job qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
+        qualification = job_qualification(job_report, state, metadata, elapsed)
+        lines += job_qualification_lines(qualification)
+        evidence_json = record.with_name(record.stem + ".jobs.json")
+        if evidence_json.exists():
+            raise SystemExit(f"{evidence_json} already exists")
+        record.parent.mkdir(parents=True, exist_ok=True)
+        evidence_json.write_text(json.dumps(qualification, indent=1, sort_keys=True) + "\n")
     lines += ["## Data", "",
               f"- Volume writer: highest ACK {state.get('writer-ack', 'none')} in the log view; "
               "the writer file checks (writer-lost, writer-regression) decide data loss, "
@@ -1152,6 +1570,8 @@ def render(evidence, record):
         for measure, entry in sorted(trend.items()):
             lines.append(f"| {node} | {measure} | {entry['first']} | {entry.get('last', entry['first'])} | {entry['max']} |")
     lines.append("")
+    charts_directory = record.parent / f"{record.stem}-charts"
+    lines += soak_charts.section(soak_charts.write_charts(evidence, charts_directory), charts_directory.name)
     lines += ["## Failures", ""]
     if failures:
         lines += ["| # | First seen | Check | Symptom | Class | Cause | Action |", "|---|---|---|---|---|---|---|"]
@@ -1169,6 +1589,79 @@ def render(evidence, record):
     record.parent.mkdir(parents=True, exist_ok=True)
     record.write_text("\n".join(lines) + "\n")
     return 0 if result == "PASS" else 1
+
+
+def job_qualification(job_report, state, metadata, elapsed):
+    """The job qualification report written beside the record (D18-C)."""
+    report = job_soak.report(job_report)
+    accepted = sum((report.get("accepted_successes") or {}).values())
+    report["m8"] = dict(report.get("m8") or {}, **job_host_metrics(state, accepted))
+    report["gate"] = dict(
+        decision="D18-C",
+        nodes=len(state.get("nodes", [])),
+        soak_seconds=elapsed,
+        tier=metadata.get("tier"),
+        schedule=metadata.get("schedule"),
+        node_faults=metadata.get("node_faults") is True,
+        fault_kinds=list(job_soak.FAULT_KINDS + (job_soak.NODE_FAULT_KINDS if metadata.get("node_faults") is True else ())))
+    return report
+
+
+def job_qualification_lines(report):
+    """The record's table of the job gate and the recorded M8 measurements."""
+    m8 = report.get("m8", {})
+    def show(value, unit=""):
+        if value is None:
+            return "not measured"
+        return (f"{value:,.2f}" if isinstance(value, float) else f"{value:,}") + unit
+    wall = m8.get("million_task_array_wall_seconds") or {}
+    rate = report.get("accepted_successes_per_second") or 0
+    target = report.get("target_rate")
+    rss = m8.get("bun_rss_worst")
+    rss_observed = (f"{rss['node']}: {show(rss['steady_rss_mib'], ' MiB')} steady, {show(rss['peak_rss_mib'], ' MiB')} peak"
+                    if rss else "not measured")
+    rss_target = (f"≤ {rss['target_mib']} MiB" if rss else f"≤ {BUN_RSS_TARGET_MIB} MiB") + \
+        f" (≤ {API_BUN_RSS_TARGET_MIB} MiB on node 1, which serves the API)"
+    lines = ["## Job qualification (D18-C)", "",
+             f"Load: {report.get('load')}; {report.get('gate', {}).get('nodes', 0)} nodes; "
+             f"accepted {rate:,.1f}/s" + (f" against a {target}/s target: {'PASS' if report.get('target_met') else 'FAIL'}" if target else " (calibration load: not gated)") + ".", "",
+             "The September plan set its targets for one 1M-task batch on a quiet cluster. A soak runs for hours with "
+             "restarts, upgrades and apps, so its storage, Bun memory and Raft targets are restated (maintainer decision, "
+             "15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). Bun's steady state is the "
+             f"median RSS of each process once it has been seen for {BUN_STEADY_AFTER // 60} minutes; "
+             "the gated memory checks are unchanged (`leak-rss`, and Mayo's 70% `memory_high` alert through `wtf`).", "",
+             "| Measure (recorded, not gated) | Observed | Target |", "|---|---|---|",
+             f"| Wall time of a 1,048,576-task array (median / max of {wall.get('runs', 0)}) | {show(wall.get('median'), ' s')} / {show(wall.get('max'), ' s')} | ≤ 600 s |",
+             f"| p99 start lag, pooled executors | {show(m8.get('p99_start_lag_ms'), ' ms')} (bucket upper bound) | < 1,000 ms |",
+             f"| Raft entries per second, all cluster writes | {show(m8.get('raft_entries_per_second'))} | recorded only; the batch target counts only task-array writes |",
+             f"| Raft state of one run, largest seen | {show(m8.get('raft_state_bytes_max'), ' B')} | ≤ 256 KiB per 1M tasks |",
+             f"| Bun steady-state RSS per process, worst node against its target | {rss_observed} | {rss_target} |",
+             f"| Bun CPU, busiest node | {show(m8.get('leader_cpu_cores'), ' cores')} | ≤ 1 core (leader batch control) |",
+             f"| Executor helper CPU, busiest node | {show(m8.get('executor_overhead_cores_per_node'), ' cores')} | ≤ 0.5 core |",
+             f"| Node task-array storage per 1M accepted tasks (peaks summed) | {show(m8.get('node_ledger_mib_per_million_tasks'), ' MiB')} | ≤ {TASK_ARRAY_STORAGE_TARGET_MIB} MiB, deleted after retirement |",
+             f"| Retained log volume, all nodes | {show(m8.get('retained_log_mb'), ' MB')} | ≤ 50 MB |", ""]
+    for node, row in (m8.get("per_node") or {}).items():
+        if not row.get("bun_processes"):
+            continue
+        role = "serves the API" if node == m8.get("api_node") else "node"
+        lines.append(f"- Bun RSS on {node} ({role}, target ≤ {row['bun_rss_target_mib']} MiB): " + "; ".join(
+            (f"pid {process['pid']}: {show(process['steady_rss_mib'], ' MiB')} steady, {show(process['peak_rss_mib'], ' MiB')} peak"
+             if process["steady_rss_mib"] is not None else
+             f"pid {process['pid']}: {show(process['peak_rss_mib'], ' MiB')} peak (seen for under {BUN_STEADY_AFTER // 60} minutes)")
+            for process in row["bun_processes"]))
+    if any((row.get("bun_processes") for row in (m8.get("per_node") or {}).values())):
+        lines.append("")
+    causes = report.get("retry_causes") or {}
+    for mode in job_soak.MODES:
+        if causes.get(mode):
+            lines.append(f"- {mode} retry causes: " + ", ".join(f"{key} {value}" for key, value in causes[mode].items()))
+    fallbacks = report.get("api_fallbacks") or {}
+    missed = ", ".join(f"{node} missed {count}" for node, count in sorted((fallbacks.get("missed") or {}).items()))
+    answered = ", ".join(f"{node} answered {count}" for node, count in sorted((fallbacks.get("answered") or {}).items()))
+    lines += [f"- Audited executions: {report.get('audited_attempts', 0)}; operator replay decisions: {report.get('operator_replay_decisions', 0)}",
+              "- Job controller API fallbacks: " + (f"{missed}; {answered}" if missed else "none") +
+              " (requests a node didn't answer, and the node that took them instead)", ""]
+    return lines
 
 
 # --- command line ------------------------------------------------------------
@@ -1210,6 +1703,7 @@ def main(argv=None):
     window.add_argument("action", choices=["open", "close", "settled"])
     window.add_argument("label", nargs="?")
     window.add_argument("--down", type=int, default=0)
+    window.add_argument("--node", help="the node a node fault targets")
     for name in ("baseline", "evaluate"):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
@@ -1242,9 +1736,29 @@ def main(argv=None):
     for name in ("port", "server-name", "ca", "token-file"):
         registry.add_argument("--" + name, required=True, type=int if name == "port" else str)
     registry.add_argument("--tag", default="pulse")
+    forwards = commands.add_parser("forwards", help="probe the forwarded ports from the host and the guest (#987)")
+    forwards.add_argument("snapshot")
+    forwards.add_argument("--limactl", required=True)
+    for name in ("api-port", "ingress-port", "registry-port"):
+        forwards.add_argument("--" + name, required=True, type=int)
+    forwards.add_argument("--node", action="append", required=True, help="the VMs, node 1 first")
+    forwards.add_argument("--down", action="append", type=int, default=[], help="a node (1-3) that is powered off")
+    keep = commands.add_parser("keep-host-logs", help="keep Lima's host-agent logs before a stop truncates them")
+    keep.add_argument("evidence")
+    keep.add_argument("--lima-home", required=True)
+    keep.add_argument("--reason", required=True)
+    keep.add_argument("vms", nargs="+")
+    reason = commands.add_parser("curl-reason")
+    reason.add_argument("code", type=int)
+    failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
+    failures.add_argument("report")
+    failures.add_argument("stderr", nargs="?")
     record = commands.add_parser("render")
     record.add_argument("evidence")
     record.add_argument("record")
+    charts = commands.add_parser("render-charts", help="rebuild a record's charts from an existing evidence directory")
+    charts.add_argument("evidence")
+    charts.add_argument("directory")
     args = parser.parse_args(argv)
 
     if args.command == "event":
@@ -1266,8 +1780,13 @@ def main(argv=None):
         if args.action == "open":
             state["window"] = args.label or "fault"
             state["nodes_down"] = args.down
+            if args.node:
+                state["window_node"] = args.node
+            else:
+                state.pop("window_node", None)
         else:
             state.pop("window", None)
+            state.pop("window_node", None)
             state["nodes_down"] = 0
             if args.action == "settled":
                 state["last_settled"] = int(time.time())
@@ -1320,6 +1839,26 @@ def main(argv=None):
         return 0
     if args.command == "registry":
         return registry_command(args)
+    if args.command == "forwards":
+        rows = probe_forwards(args.node, {"api": args.api_port, "ingress": args.ingress_port, "registry": args.registry_port},
+                              set(args.down), args.limactl)
+        (Path(args.snapshot) / "forwards.json").write_text(json.dumps(rows, indent=1))
+        return 0
+    if args.command == "keep-host-logs":
+        keep_host_logs(args.evidence, args.lima_home, args.reason, args.vms)
+        return 0
+    if args.command == "curl-reason":
+        print(curl_reason(args.code))
+        return 0
+    if args.command == "test-failures":
+        stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""
+        print(test_failure_reasons(Path(args.report).read_text(errors="replace"), stderr_text))
+        return 0
+    if args.command == "render-charts":
+        directory = Path(args.directory)
+        written = soak_charts.write_charts(args.evidence, directory)
+        print("\n".join(soak_charts.section(written, directory.name)))
+        return 0
     return render(args.evidence, args.record)
 
 

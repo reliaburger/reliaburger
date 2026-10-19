@@ -85,6 +85,74 @@ impl fmt::Display for CouncilNodeInfo {
 // NodeEssential + Serialize + Deserialize, which CouncilNodeInfo does.
 
 // ---------------------------------------------------------------------------
+// Recovery identity (#694)
+// ---------------------------------------------------------------------------
+
+/// A random 128-bit name for one `relish council recover` run.
+///
+/// The recovery epoch alone can't tell two recoveries apart: two survivors
+/// recovered independently from the same backup both land on the same
+/// epoch. Each recovery also draws a fresh id, so two councils at one epoch
+/// with different ids are recognisably a split. Serialised as 32 lowercase
+/// hex digits, which survives JSON readers that round big numbers.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct RecoveryId(pub u128);
+
+impl RecoveryId {
+    /// A fresh random id from the OS-seeded thread generator.
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
+}
+
+impl fmt::Display for RecoveryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+impl Serialize for RecoveryId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.len() != 32 {
+            return Err(serde::de::Error::custom(
+                "a recovery id is 32 hexadecimal digits",
+            ));
+        }
+        u128::from_str_radix(&text, 16)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The recovery a council descends from: its epoch, and the id of the
+/// recovery that started that epoch (`None` at epoch 0, which no recovery
+/// started, or where the id isn't known).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryClaim {
+    /// The recovery epoch.
+    pub epoch: u64,
+    /// The recovery that started it.
+    pub id: Option<RecoveryId>,
+}
+
+impl RecoveryClaim {
+    /// Whether `other` claims the same epoch from a different recovery: two
+    /// councils that can't both be the real one. An unknown id never
+    /// conflicts.
+    pub fn conflicts_with(&self, other: &RecoveryClaim) -> bool {
+        self.epoch == other.epoch
+            && matches!((self.id, other.id), (Some(mine), Some(theirs)) if mine != theirs)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RaftRequest (log entry payload)
 // ---------------------------------------------------------------------------
 
@@ -166,22 +234,6 @@ pub enum RaftRequest {
     /// Finish a cluster upgrade: archive it to history and clear the
     /// active slot.
     UpgradeClear { upgrade_id: String },
-    /// Register a batch, allocating its id from the durable counter
-    /// (12b.2 JOB4). The response carries the assigned id.
-    BatchRegister {
-        /// Revision used to plan this complete allocation.
-        expected_log_id: Option<openraft::LogId<u64>>,
-        batch: crate::meat::batch_tracker::BatchRecord,
-    },
-    /// Record a job's state transition within a tracked batch. An
-    /// unknown batch/job or an illegal transition is `Refused`.
-    BatchJobUpdate {
-        batch_id: u64,
-        job_name: String,
-        namespace: String,
-        status: crate::meat::batch_tracker::JobStatus,
-        exit_code: Option<i32>,
-    },
     /// Register a build, allocating its id from the durable counter
     /// (12b.2 JOB4). The response carries the assigned id.
     BuildRegister {
@@ -339,24 +391,18 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
+    /// Replace the set of fixed-size apps the leader's scheduling pass placed
+    /// only part of, each with how many and why (#702). Proposed only when
+    /// the set changes, like `QuotaBlocked`.
+    Unschedulable {
+        apps: Vec<(AppId, crate::meat::types::Unschedulable)>,
+    },
     /// Remove the API tokens that expired more than
     /// [`crate::sesame::token::EXPIRED_TOKEN_GRACE`] before `now_unix_ms`.
     /// The leader proposes it on a timer; the state machine decides what to
     /// remove from `now_unix_ms` alone, so every replica removes the same
     /// tokens. It never removes the last Admin and never empties the store.
     SweepExpiredApiTokens { now_unix_ms: u64 },
-    /// Hold migration intent before authorising any execution or app revision.
-    PrerequisiteBegin {
-        operation_id: String,
-        term: u64,
-        config: Box<crate::config::Config>,
-    },
-    /// Publish the held manifest atomically after durable prerequisite success.
-    PrerequisiteCommit { operation_id: String },
-    /// Release a positively failed, durably settled prerequisite operation.
-    PrerequisiteFailed { operation_id: String },
-    /// Release ordinary-job intent after trusted positive terminal proof.
-    JobApplyComplete { operation_id: String },
     /// Publish dependent apps and admit ordinary indexed runs in one transaction.
     JobApplyCommit {
         operation_id: String,
@@ -407,6 +453,52 @@ pub enum RaftRequest {
     /// jobs). One variant wrapping the array's own write type, so the
     /// rules live beside the data in `meat::task_array_store`.
     TaskArray(Box<crate::meat::task_array_store::TaskArrayWrite>),
+    /// Attach jobs to an active job test lease before their deployment is
+    /// admitted, so the lease's cleanup knows to stop and forget them. A job
+    /// in a test namespace is only admitted once its lease owns it.
+    TestLeaseJobs {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        jobs: Vec<AppId>,
+    },
+    /// A desired-state write Lettuce makes for the repository (#693).
+    ///
+    /// `change` is an app, namespace or permission spec or delete. It
+    /// applies, and the GitOps ownership set records (or forgets) the
+    /// resource, in this one entry. `term` is the Raft term the sync read
+    /// its snapshot in; an entry proposed in any other term is refused, so
+    /// a leader that lost and regained leadership mid-sync can't apply a
+    /// stale diff. A delete of a resource GitOps doesn't own is refused.
+    GitOpsWrite { term: u64, change: Box<RaftRequest> },
+    /// Set or clear the cluster's GitOps configuration (#693). With `seed`,
+    /// it only applies when the cluster has none: that's how a node's
+    /// `[gitops]` section bootstraps it without overriding the cluster.
+    GitOpsConfigSet {
+        config: Option<Box<crate::lettuce::types::StoredGitOpsConfig>>,
+        seed: bool,
+    },
+    /// Remove an app from a test lease's namespace. A plain `AppDelete` is
+    /// refused there, so only the lease's cleanup removes its apps.
+    TestLeaseAppDelete { lease_id: String, app_id: AppId },
+    /// Remove a test lease's namespace, carrying the lease.
+    TestLeaseNamespaceDelete { lease_id: String, name: String },
+    /// Remove an untagged registry manifest once it has been untagged for
+    /// `gc_retain_days` (#697). The leader proposes it; apply rechecks that
+    /// it is still untagged since the same moment and that no app or job
+    /// pins it, and answers `Refused` otherwise.
+    ExpireManifest(crate::pickle::types::ExpireManifest),
+    /// A node aborted its rollout of an app's current spec (#692, D11-B).
+    /// The leader stops handing that spec to nodes until a different one is
+    /// applied. Refused when the fingerprint isn't the app's current spec:
+    /// the operator has moved on since.
+    RolloutFailed {
+        app_id: AppId,
+        failure: crate::meat::deploy_types::RolloutFailure,
+    },
+    /// Every node an app is placed on runs its current spec healthy (#692):
+    /// record it as the newest rollback target. Refused unless `spec` is
+    /// still the app's current spec.
+    RolloutReleased { app_id: AppId, spec: Box<AppSpec> },
 }
 
 // ---------------------------------------------------------------------------
@@ -438,9 +530,6 @@ pub enum CouncilResponse {
     /// sealed under an old generation (PKI8). The state is unchanged;
     /// `reason` tells the proposer why.
     Refused { reason: String },
-    /// A `BatchRegister` entry was applied; carries the batch id the
-    /// durable counter assigned to *this* entry (12b.2 JOB4).
-    BatchRegistered { batch_id: u64 },
     /// A `BuildRegister` entry was applied; carries the assigned build id.
     BuildRegistered { build_id: u64 },
     /// A `ConsumeJoinTokenForIssue` entry was applied and this proposer won
@@ -463,6 +552,9 @@ pub enum CouncilResponse {
     /// A task array was registered under this id, taken from the same
     /// counter as ordinary batches.
     TaskArrayRegistered { batch_id: u64 },
+    /// A leader tick's task-array writes applied; these were refused, by
+    /// array id, with the reason.
+    TaskArrayTicked { refused: Vec<(u64, String)> },
 }
 
 // ---------------------------------------------------------------------------
@@ -517,10 +609,36 @@ pub struct DesiredState {
         deserialize_with = "map_as_vec::deserialize"
     )]
     pub quota_blocked: HashMap<AppId, crate::meat::quota::QuotaError>,
+    /// Fixed-size apps the leader's last scheduling pass placed only part
+    /// of: how many replicas found a node, out of how many, and why the rest
+    /// didn't (#702). It clears once every replica is placed.
+    #[serde(
+        default,
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub unschedulable: HashMap<AppId, crate::meat::types::Unschedulable>,
+    /// Each app's rollout record (#692): the fully rolled-out specs that
+    /// `relish rollback` and the leader's node-by-node release fall back on,
+    /// and the spec whose rollout failed. Survives every node restarting.
+    #[serde(
+        default,
+        serialize_with = "map_as_vec::serialize",
+        deserialize_with = "map_as_vec::deserialize"
+    )]
+    pub rollouts: HashMap<AppId, crate::meat::deploy_types::AppRollouts>,
     /// GitOps sync state.
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
     pub gitops_coordinator: Option<crate::lettuce::types::CoordinatorElection>,
+    /// The cluster's GitOps configuration, credentials sealed (#693). Every
+    /// leader syncs from this, never from its own `node.toml`.
+    #[serde(default)]
+    pub gitops_config: Option<crate::lettuce::types::StoredGitOpsConfig>,
+    /// The apps, namespaces and permissions GitOps wrote, and so may prune
+    /// (D9, #693).
+    #[serde(default)]
+    pub gitops_owned: crate::lettuce::types::GitOpsOwnership,
     /// Cluster security state: CAs, tokens, age keypairs, OIDC config.
     /// Contains wrapped (encrypted) private keys — safe to replicate.
     pub security_state: SecurityState,
@@ -528,13 +646,13 @@ pub struct DesiredState {
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
     pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
-    /// Durable batch tracker: monotonic id counter plus in-flight and
-    /// recently terminal batches (12b.2 JOB4).
-    pub batch_state: crate::meat::batch_tracker::BatchDurableState,
+    /// The id counter task arrays, job runs and manifests share, so a new
+    /// leader never hands out an id twice.
+    pub batch_ids: crate::meat::batch_ids::BatchIds,
     /// Task arrays (0.2.0): chunk tables and counts, never a record per
-    /// task. Ids come from `batch_state`'s counter.
+    /// task. Ids come from `batch_ids`.
     pub task_arrays: crate::meat::task_array_store::TaskArrays,
-    /// Durable build tracker, same shape and rationale as `batch_state`.
+    /// Durable build tracker: a monotonic id counter plus recent builds.
     pub build_state: crate::bun::build_runner::BuildDurableState,
     /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster
     /// that has never been recovered; the recovery path stamps a strictly
@@ -542,6 +660,10 @@ pub struct DesiredState {
     /// loss (stale reports, tokens tied to the old term line) is
     /// distinguishable from post-recovery state.
     pub recovery_epoch: u64,
+    /// The recovery that started `recovery_epoch` (#694): `None` at epoch 0.
+    /// Two councils on one epoch with different ids came from two separate
+    /// recoveries, a split that both sides must fence.
+    pub recovery_id: Option<RecoveryId>,
     /// Declared namespaces keyed by name (12b.2 T6). Their resource
     /// budgets feed the scheduler's quota ledger. Uses a `BTreeMap` so
     /// the JSON snapshot is deterministic.
@@ -564,11 +686,6 @@ pub struct DesiredState {
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
-    /// Migration intent, retained across handover when the outcome is uncertain.
-    /// Missing ownership state is refused rather than decoded as an empty fence.
-    #[serde(deserialize_with = "super::prerequisites::deserialize_claims")]
-    pub prerequisite_claims:
-        std::collections::BTreeMap<String, super::prerequisites::PrerequisiteClaim>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -576,15 +693,48 @@ pub struct DesiredState {
 }
 
 impl DesiredState {
+    /// Every image digest an app or job in desired state pins
+    /// (`web:v1@sha256:…`): app and init-container images, the rollback
+    /// targets in each app's rollout record (#692), job definitions and
+    /// task-array templates. Registry expiry never removes these.
+    pub fn pinned_image_digests(&self) -> std::collections::HashSet<String> {
+        let rollback_targets = self
+            .rollouts
+            .values()
+            .flat_map(|rollouts| rollouts.released.iter());
+        let apps = self.apps.values().chain(rollback_targets).flat_map(|spec| {
+            spec.image
+                .iter()
+                .chain(spec.init.iter().filter_map(|init| init.image.as_ref()))
+        });
+        let jobs = self
+            .task_arrays
+            .jobs()
+            .definitions()
+            .filter_map(|(_, record)| record.definition.template.image.as_ref());
+        let arrays = self
+            .task_arrays
+            .iter()
+            .filter_map(|(_, record)| record.template.image.as_ref());
+        apps.chain(jobs)
+            .chain(arrays)
+            .filter_map(|image| crate::pickle::types::image_pin_digest(image))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Turn a restored state into the first state of a new recovery epoch
     /// (12b.2 D21/CP12).
     ///
-    /// Bumps the epoch, drops the dead council's log position and
-    /// membership so the recovered node starts a fresh term line, and lifts
-    /// the catalogue generation above anything the old epoch published
-    /// (#478).
-    pub fn enter_recovery_epoch(&mut self) {
-        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+    /// Bumps the epoch above both this state's and `floor` (the newest epoch
+    /// the recovering node's fence record knows of, so a fenced node never
+    /// lands on the epoch that fenced it), draws a fresh recovery id, drops
+    /// the dead council's log position and membership so the recovered node
+    /// starts a fresh term line, and lifts the catalogue generation above
+    /// anything the old epoch published (#478).
+    pub fn enter_recovery_epoch(&mut self, floor: u64) {
+        self.recovery_epoch = self.recovery_epoch.max(floor).saturating_add(1);
+        self.recovery_id = Some(RecoveryId::random());
         self.last_applied_log = None;
         self.last_membership = StoredMembership::default();
         self.endpoint_withdrawals
@@ -746,6 +896,14 @@ mod tests {
             RaftRequest::DeleteTag(DeleteTag {
                 repository: "myapp".to_string(),
                 tag: "old".to_string(),
+                deleted_at_unix_ms: 1,
+            }),
+            RaftRequest::ExpireManifest(crate::pickle::types::ExpireManifest {
+                repository: "myapp".to_string(),
+                digest: crate::pickle::types::Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                untagged_at_unix_ms: 1,
             }),
             RaftRequest::AttachSignature(AttachSignature {
                 manifest_digest: crate::pickle::types::Digest::from_sha256_hex(
@@ -778,7 +936,6 @@ mod tests {
             RaftRequest::CreateApiToken(crate::sesame::types::ApiToken {
                 name: "ci-deploy".to_string(),
                 token_hash: vec![1, 2, 3],
-                token_salt: vec![4, 5, 6],
                 role: crate::sesame::types::ApiRole::Deployer,
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
@@ -791,7 +948,6 @@ mod tests {
             RaftRequest::RotateApiToken(crate::sesame::types::TokenRotation {
                 name: "ci-deploy".to_string(),
                 token_hash: vec![7, 8, 9],
-                token_salt: vec![1, 1, 1],
                 rotated_at: std::time::SystemTime::UNIX_EPOCH,
                 expires_at: None,
                 previous_valid_until: Some(std::time::SystemTime::UNIX_EPOCH),
@@ -930,6 +1086,62 @@ mod tests {
         assert_ne!(app_spec, app_delete);
         assert_ne!(app_spec, noop);
         assert_ne!(app_delete, noop);
+    }
+
+    #[test]
+    fn each_recovery_gets_a_distinct_recovery_id() {
+        let backup = DesiredState::default();
+        let mut first = backup.clone();
+        let mut second = backup;
+        first.enter_recovery_epoch(0);
+        second.enter_recovery_epoch(0);
+        // Same backup, same epoch: only the id tells the two councils apart.
+        assert_eq!(first.recovery_epoch, second.recovery_epoch);
+        assert!(first.recovery_id.is_some());
+        assert_ne!(first.recovery_id, second.recovery_id);
+        let claim = |state: &DesiredState| RecoveryClaim {
+            epoch: state.recovery_epoch,
+            id: state.recovery_id,
+        };
+        assert!(claim(&first).conflicts_with(&claim(&second)));
+        assert!(!claim(&first).conflicts_with(&claim(&first)));
+    }
+
+    #[test]
+    fn entering_an_epoch_lands_above_the_floor() {
+        let mut state = DesiredState {
+            recovery_epoch: 1,
+            ..DesiredState::default()
+        };
+        state.enter_recovery_epoch(4);
+        assert_eq!(state.recovery_epoch, 5);
+        state.enter_recovery_epoch(0);
+        assert_eq!(state.recovery_epoch, 6);
+    }
+
+    #[test]
+    fn a_recovery_id_round_trips_as_hex() {
+        let id = RecoveryId(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"0123456789abcdef0011223344556677\"");
+        assert_eq!(serde_json::from_str::<RecoveryId>(&json).unwrap(), id);
+        assert!(serde_json::from_str::<RecoveryId>("\"12\"").is_err());
+    }
+
+    #[test]
+    fn an_unknown_recovery_id_never_conflicts() {
+        let known = RecoveryClaim {
+            epoch: 1,
+            id: Some(RecoveryId(1)),
+        };
+        let unknown = RecoveryClaim { epoch: 1, id: None };
+        assert!(!known.conflicts_with(&unknown));
+        assert!(!unknown.conflicts_with(&known));
+        let other_epoch = RecoveryClaim {
+            epoch: 2,
+            id: Some(RecoveryId(2)),
+        };
+        assert!(!known.conflicts_with(&other_epoch));
     }
 
     /// Helper to create a minimal AppSpec for tests.

@@ -5,6 +5,9 @@
 # cargo-audit, so the list can't silently rot.
 #
 # Reviewed 18 September 2026; see docs/qualification/2026-09-18-dependency-exceptions.md.
+# RUSTSEC-2024-0449 (unsafe-libyaml) was added 12 October 2026 (see
+# docs/qualification/2026-10-12-dependency-exceptions.md) and removed the same
+# month: relish moved from serde_yaml to yaml_serde, which uses libyaml-rs (#817).
 # rustls-pemfile was removed in favour of the existing Rustls PEM parser.
 # The rkyv exception additionally requires an empty active graph in make audit.
 # Earlier exceptions were

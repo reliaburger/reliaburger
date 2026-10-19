@@ -4,232 +4,30 @@
 
 use super::*;
 
-/// A known terminal failure may release the replicated gate; uncertainty cannot.
-#[derive(Debug)]
-pub struct PrerequisiteFailure {
-    pub message: String,
-    pub settled: bool,
-}
-
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) fn validate_deploy_names(&self, config: &Config) -> Result<(), String> {
-        use crate::bun::deploy_operations::DeployTargetKind;
+        // Jobs take the common job lifecycle (indexed runs the leader grants
+        // to nodes); the agent only runs apps.
+        if !config.job.is_empty() {
+            return Err(
+                "jobs run through the common job lifecycle, not a node's app deploy".into(),
+            );
+        }
         config
             .validate_workload_names()
             .map_err(|error| error.to_string())?;
-        for (name, namespace) in config
-            .app
-            .iter()
-            .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default")))
-            .chain(
-                config
-                    .job
-                    .iter()
-                    .map(|(name, spec)| (name, spec.namespace.as_deref().unwrap_or("default"))),
-            )
-        {
-            let id = crate::grill::InstanceIdentity::new(namespace, name, 0).instance_id();
-            if self
-                .recorded_jobs
-                .get(&id.0)
-                .is_some_and(|job| job.batch_execution.is_some())
-                || self.retired_batch_executions.contains_key(&id.0)
-            {
-                return Err(format!(
-                    "workload {namespace}/{name} belongs to a batch execution"
-                ));
-            }
-        }
-        for (name, spec) in &config.app {
-            let namespace = spec.namespace.as_deref().unwrap_or("default");
-            if self
-                .scheduled_jobs
-                .contains_key(&(name.clone(), namespace.to_string()))
-            {
-                return Err(format!(
-                    "workload {namespace}/{name} belongs to a registered cron job; stop it before deploying an app with that name"
-                ));
-            }
-            self.supervisor
-                .admit_workload_kind(
-                    name,
-                    spec.namespace.as_deref().unwrap_or("default"),
-                    DeployTargetKind::App,
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        for (name, spec) in &config.job {
-            let namespace = spec.namespace.as_deref().unwrap_or("default");
-            if !spec.run_before.is_empty()
-                && self
-                    .scheduled_jobs
-                    .contains_key(&(name.clone(), namespace.into()))
-            {
-                return Err(format!(
-                    "workload {namespace}/{name} belongs to a registered cron job; stop it before running a migration"
-                ));
-            }
-            self.supervisor
-                .admit_job(name, namespace, spec)
-                .map_err(|error| error.to_string())?;
-        }
         Ok(())
     }
 
-    /// Reserve all local targets and perform trust admission before Raft intent
-    /// or any execution. Failure here can release ownership without uncertainty.
-    pub(super) async fn prepare_prerequisites(
-        &mut self,
-        config: Config,
-        response: oneshot::Sender<
-            Result<(Config, crate::bun::deploy_operations::DeployOperationHandle), String>,
-        >,
-    ) {
-        if self.startup_cleanup_pending
-            || self.draining.load(std::sync::atomic::Ordering::Relaxed)
-            || self.stopping_target(&config).is_some()
-            || self.restoring_target(&config).is_some()
-        {
-            let _ = response.send(Err(
-                "node cleanup, stop, restore or drain still owns a target".into(),
-            ));
-            return;
-        }
-        if let Err(error) = self.validate_deploy_names(&config) {
-            let _ = response.send(Err(error));
-            return;
-        }
-        // LOOP-INLINE: in-memory target ownership, no I/O
-        let operation = match self.deploy_operations.start(&config).await {
-            Ok(operation) => operation,
-            Err(error) => {
-                let _ = response.send(Err(error.to_string()));
-                return;
-            }
-        };
-        let worker = self.prerequisite_worker(operation.clone());
-        tokio::spawn(async move {
-            let mut config = config;
-            // This shared preflight performs no runtime create or start.
-            let result = worker.preflight_prerequisites(&mut config).await;
-            if let Err(message) = result {
-                operation
-                    .finish(
-                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                        message.clone(),
-                    )
-                    .await;
-                let _ = response.send(Err(message));
-            } else if response.send(Ok((config, operation.clone()))).is_err() {
-                operation
-                    .finish(
-                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                        "prepared prerequisite receiver disappeared before dispatch",
-                    )
-                    .await;
-            }
-        });
-    }
-
-    fn prerequisite_worker(
-        &self,
-        operation: crate::bun::deploy_operations::DeployOperationHandle,
-    ) -> DeployWorker<G> {
-        DeployWorker {
-            rerun_unknown_jobs: false,
-            prepared_batch_jobs: None,
-            grill: self.supervisor.grill().clone(),
-            ops: DeployOps {
-                tx: self.deploy_ops_tx.clone(),
-            },
-            drains: self.drains.clone(),
-            operation: Some(operation),
-            stop_confirmation_timeout: self.stop_confirmation_timeout,
-            egress: self.egress_resolver(),
-        }
-    }
-
-    /// Run only migration jobs; the API retains the operation through commit.
-    pub(super) fn run_prepared_prerequisites(
-        &self,
-        config: Config,
-        operation: crate::bun::deploy_operations::DeployOperationHandle,
-        response: oneshot::Sender<Result<(), PrerequisiteFailure>>,
-    ) {
-        let worker = self.prerequisite_worker(operation.clone());
-        tokio::spawn(async move {
-            let result = async {
-                for (name, spec) in config
-                    .job
-                    .iter()
-                    .filter(|(_, job)| !job.run_before.is_empty())
-                {
-                    if operation.cancellation_requested() {
-                        return Err(PrerequisiteFailure {
-                            message: "prerequisite cancellation retains uncertain ownership".into(),
-                            settled: false,
-                        });
-                    }
-                    worker
-                        .run_prerequisite_job(
-                            name,
-                            spec.namespace.as_deref().unwrap_or("default"),
-                            spec,
-                        )
-                        .await
-                        .map_err(|error| PrerequisiteFailure {
-                            settled: matches!(error, BunError::PrerequisiteFailed { .. }),
-                            message: error.to_string(),
-                        })?;
-                }
-                // Match standalone deploy's boundary after migration settlement.
-                // A positive exit does not erase an accepted cancellation.
-                if operation.cancellation_requested() {
-                    return Err(PrerequisiteFailure {
-                        message:
-                            "prerequisite cancelled before app publication; ownership remains held"
-                                .into(),
-                        settled: false,
-                    });
-                }
-                Ok(())
-            }
-            .await;
-            if response.send(result).is_err() {
-                operation
-                    .finish(
-                        crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
-                        "prerequisite result receiver disappeared; replicated claim remains held",
-                    )
-                    .await;
-            }
-        });
-    }
-
-    /// Admit and track either an operator apply or one cron firing through
-    /// worker completion, including rollback and cancellation.
-    pub(super) async fn begin_deploy(
-        &mut self,
-        config: Config,
-        events: mpsc::Sender<ApplyEvent>,
-        register_schedule: bool,
-        rerun_unknown_jobs: bool,
-    ) {
+    /// Admit and track an app deploy through worker completion, including
+    /// rollback and cancellation.
+    pub(super) async fn begin_deploy(&mut self, config: Config, events: mpsc::Sender<ApplyEvent>) {
         if self.startup_cleanup_pending {
             // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events
                 .send(ApplyEvent::Error {
                     message: "startup cleanup still owns runtime allocations; retry after recovery"
                         .into(),
-                })
-                .await;
-            return;
-        }
-        if rerun_unknown_jobs && let Err(message) = crate::bun::jobs::validate_rerun(&config) {
-            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-            let _ = events
-                .send(ApplyEvent::Error {
-                    message: message.into(),
                 })
                 .await;
             return;
@@ -303,22 +101,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
-        // Register any cron-scheduled jobs so the event loop fires them
-        // on their schedule rather than at deploy time (E).
-        if register_schedule && let Err(error) = self.register_scheduled_jobs(&config).await {
-            let message = error.to_string();
-            // LOOP-INLINE: in-memory lock, no I/O
-            operation
-                .finish(
-                    crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                    message.clone(),
-                )
-                .await;
-            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-            let _ = events.send(ApplyEvent::Error { message }).await;
-            return;
-        }
-
         // Forward deploy events to the caller, mirroring errors into the
         // event store. The deploy itself runs on its own task so a slow
         // pull or a rolling health wait can't wedge this loop
@@ -328,8 +110,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let event_store = self.events.clone();
         let observed_operation = operation.clone();
         let worker = DeployWorker {
-            rerun_unknown_jobs,
-            prepared_batch_jobs: None,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
                 tx: self.deploy_ops_tx.clone(),
@@ -440,14 +220,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// has no such catalogue here; its apply checked the same rules against
     /// its own registry, on this node, before the deploy began.
     pub(super) async fn enforce_image_signature(
-        &self,
-        spec: &AppSpec,
-    ) -> Result<Option<String>, String> {
-        self.enforce_image_reference_signature(spec.image.as_deref())
-            .await
-    }
-
-    pub(super) async fn enforce_image_reference_signature(
         &self,
         image: Option<&str>,
     ) -> Result<Option<String>, String> {
@@ -687,10 +459,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             eprintln!("bun: warning: {e}");
         }
 
+        // Mount the host paths the policy approves now, resolved (#797).
+        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
-            spec,
+            &spec,
             &instance_id.0,
             host_port,
             &cgroup_str,
@@ -704,6 +478,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cgroup_path,
             has_init: !spec.init.is_empty(),
         })
+    }
+
+    /// The runtime refused to launch `instance_id` because its binary can't
+    /// run here (#881). Launching it again fails the same way, so the
+    /// instance is `Failed` at once, keeping the reason for `relish status`
+    /// and `relish wtf`, instead of waiting in `Starting`.
+    pub(super) async fn record_launch_failure(&mut self, instance_id: &InstanceId, reason: String) {
+        let Some(instance) = self.supervisor.get_instance_mut(instance_id) else {
+            return;
+        };
+        if let Ok(failed) = instance.state.transition_to(ContainerState::Failed) {
+            instance.state = failed;
+        }
+        instance.retry_pending = false;
+        instance.launch_failure = Some(reason.clone());
+        let app = instance.app_name.clone();
+        let namespace = instance.namespace.clone();
+        self.record_event(
+            crate::bun::events::EventKind::Deploy,
+            crate::bun::events::EventSeverity::Warning,
+            Some(app),
+            Some(namespace),
+            format!("instance {instance_id} cannot launch: {reason}"),
+        )
+        .await;
     }
 
     /// Post-start bookkeeping for a fresh instance (the loop side of the tail
@@ -814,12 +613,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 created_at: Instant::now(),
                 restart_policy: Default::default(),
                 health_config: None,
-                is_job: false,
                 retry_pending: false,
                 image: spec.image.clone().unwrap_or_default(),
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
+                launch_failure: None,
             },
         );
         self.supervisor
@@ -857,10 +656,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         let cgroup_path =
             crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
+        // A replacement never went through `admit_app`, so this is its host
+        // path check as well as the resolution of what to mount (#797).
+        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
-            spec,
+            &spec,
             &instance_id.0,
             host_port,
             &cgroup_path.to_string_lossy(),
@@ -977,11 +779,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         for new_id in new_ids {
             let host_port = new_ports.get(new_id).copied().flatten();
-            let health_config = spec
-                .health
-                .as_ref()
-                .zip(spec.port)
-                .map(|(hs, port)| crate::bun::health::HealthCheckConfig::from_spec(hs, port));
+            let health_config = crate::bun::health::HealthCheckConfig::for_app(spec);
             if let Some(ref cfg) = health_config {
                 self.supervisor
                     .register_health(new_id.clone(), cfg.clone(), now);
@@ -1006,12 +804,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     created_at: now,
                     restart_policy: crate::bun::restart::RestartPolicy::default(),
                     health_config,
-                    is_job: false,
                     retry_pending: false,
                     image: spec.image.clone().unwrap_or_default(),
                     oci_spec: new_specs.remove(new_id),
                     identity,
                     identity_mount,
+                    launch_failure: None,
                 },
             );
         }
@@ -1064,7 +862,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             steps_total: new_ids.len(),
             spec: Some(Box::new(spec.clone())),
         };
-        self.deploy_history.write().await.push(entry);
+        super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
         Ok(())
     }
 

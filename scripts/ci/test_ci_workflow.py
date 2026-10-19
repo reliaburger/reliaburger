@@ -6,6 +6,8 @@ import tempfile
 import subprocess
 import unittest
 
+from workflow_assembly import SHARDS
+
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO / ".github" / "workflows"
 
@@ -96,8 +98,17 @@ class EvidenceTests(unittest.TestCase):
             producer = blocks[index]
             identity = gate.replace('-', '_')
             self.assertIn('id: ' + identity, producer)
-            self.assertIn(identity + '_sha256: ${{ steps.' + identity
-                          + '.outputs.' + identity + '_sha256 }}', job)
+            # A split owner is one matrix job; each shard sets only its own output.
+            count = SHARDS.get(gate)
+            suffixes = [''] if count is None else ['_' + str(shard) for shard in range(1, count + 1)]
+            for suffix in suffixes:
+                self.assertIn(identity + suffix + '_sha256: ${{ steps.' + identity
+                              + '.outputs.' + identity + suffix + '_sha256 }}', job)
+            label = gate if count is None else gate + '-${{ matrix.shard }}'
+            if count is not None:
+                self.assertIn('        shard: [' + ', '.join(map(str, range(1, count + 1))) + ']\n', job)
+                self.assertIn('--shard "${{ matrix.shard }}/' + str(count) + '"', producer)
+                self.assertIn('--directory "target/contracts/' + host + '/' + label + '"', producer)
             if gate != 'oci-interruptions':
                 for argument in ('--host ' + host, '--commit "$EXPECTED_CHECKOUT_COMMIT"',
                                  '--run-id "$GITHUB_RUN_ID"', '--attempt "$GITHUB_RUN_ATTEMPT"',
@@ -105,11 +116,11 @@ class EvidenceTests(unittest.TestCase):
                     self.assertIn(argument, producer)
             retains = [step for step in blocks[index + 1:]
                        if 'actions/upload-artifact@' in step
-                       and 'name: contract-' + host + '-' + gate + '\n' in step]
+                       and 'name: contract-' + host + '-' + label + '\n' in step]
             self.assertEqual(len(retains), 1, gate)
             retain = retains[0]
             self.assertIn('if: always()', retain)
-            self.assertIn('path: target/contracts/' + host + '/' + gate, retain)
+            self.assertIn('path: target/contracts/' + host + '/' + label + '\n', retain)
             self.assertIn('retention-days: 14', retain)
             self.assertIn('if-no-files-found: error', retain)
         # Original test owners must be intercepted rather than executed again.
@@ -247,6 +258,71 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(change=changed), self.assertRaises(AssertionError):
                 self.assert_root_storage_evidence_restored_for_upload(dict(self.jobs, linux=changed))
 
+    def assert_oci_interruptions_bounded(self, workflow_jobs):
+        """A hung OCI test fails its own step and leaves evidence behind (#800).
+
+        The step ends well inside the job's limit, so its log and envelope
+        are kept. A watcher records free disk and memory throughout, and a
+        report afterwards prints the low-water marks, plus every process the
+        step left running with its kernel stacks when it didn't succeed.
+        """
+        job = workflow_jobs['linux']
+        job_limit = re.search(r'^    timeout-minutes: (\d+)$', job, re.M)
+        self.assertIsNotNone(job_limit)
+        blocks = steps(job)
+
+        def only(predicate):
+            found = [index for index, step in enumerate(blocks) if predicate(step)]
+            self.assertEqual(len(found), 1)
+            return found[0]
+
+        producer = only(lambda step: 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+        watch = only(lambda step: 'name: Watch disk and memory during the OCI interruptions' in step)
+        report = only(lambda step: "name: Report the OCI interruptions' headroom and leftovers" in step)
+        upload = only(lambda step: 'name: contract-linux-oci-interruptions\n' in step)
+        self.assertLess(watch, producer)
+        self.assertLess(producer, report)
+        self.assertLess(report, upload)
+        step_limit = re.search(r'^        timeout-minutes: (\d+)$', blocks[producer], re.M)
+        self.assertIsNotNone(step_limit)
+        # The steps before it take about nine minutes; the rest of the margin
+        # is for the report and the evidence upload.
+        self.assertLessEqual(int(step_limit.group(1)) + 15, int(job_limit.group(1)))
+        # The watcher must not hold the step's output open, or the step
+        # itself would never finish.
+        for text in ('nohup ', '< /dev/null', 'MemAvailable', 'df ', '.pid'):
+            self.assertIn(text, blocks[watch])
+        for text in ('if: always()', 'timeout-minutes:', '.pid', 'steps.oci_interruptions.outcome',
+                     'ps -eo', '/stack'):
+            self.assertIn(text, blocks[report])
+
+    def test_a_hung_oci_interruption_test_fails_its_step_and_keeps_its_evidence(self):
+        self.assert_oci_interruptions_bounded(self.jobs)
+
+    def test_an_unbounded_or_unwatched_oci_step_is_detected(self):
+        self.assert_oci_interruptions_bounded(self.jobs)
+        original = self.jobs['linux']
+        blocks = steps(original)
+        producer = next(step for step in blocks
+                        if 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+        watch = next(step for step in blocks
+                     if 'name: Watch disk and memory during the OCI interruptions' in step)
+        report = next(step for step in blocks
+                      if "name: Report the OCI interruptions' headroom and leftovers" in step)
+        unbounded = re.sub(r'\n        timeout-minutes: \d+', '', producer)
+        changes = [
+            original.replace(producer, unbounded),
+            original.replace(producer, re.sub(r'timeout-minutes: \d+', 'timeout-minutes: 39', producer)),
+            original.replace(watch, ''),
+            original.replace(watch, watch.replace(' < /dev/null', '')),
+            original.replace(report, ''),
+            original.replace(report, report.replace('if: always()', 'if: failure()')),
+            original.replace(watch + '\n', '').replace(report, report + '\n' + watch),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_oci_interruptions_bounded(dict(self.jobs, linux=changed))
+
     def test_every_suite_keeps_its_own_junit_report(self):
         self.assert_owner_artifacts(self.jobs)
 
@@ -304,6 +380,125 @@ class EvidenceTests(unittest.TestCase):
                         acceptance.index('--gate standard-clients --host linux'))
         install = next(step for step in steps(acceptance) if "go-containerregistry" in step)
         self.assertIn("sha256sum --check", install)
+
+    def test_the_standard_clients_run_on_a_prepared_host(self):
+        acceptance = self.jobs["acceptance"]
+        provision = 'sudo scripts/standard-clients-host.sh --provision'
+        self.assertIn(provision, acceptance)
+        self.assertLess(acceptance.index(provision),
+                        acceptance.index('--gate standard-clients --host linux'))
+
+
+class TrainAndQueueTests(unittest.TestCase):
+    """Light checks on train PRs; everything on the merge queue and the train."""
+
+    def setUp(self):
+        self.ci = (WORKFLOWS / "ci.yml").read_text()
+        self.jobs = jobs(self.ci)
+        self.triggers = self.ci[:self.ci.index("\nconcurrency:")]
+
+    def test_the_merge_queue_and_pushes_to_a_train_run_ci(self):
+        self.assertRegex(self.triggers, r"\n  merge_group:\n(?:\s+#.*\n)*\s+types: \[checks_requested\]\n")
+        self.assertRegex(self.triggers, r"\n  push:\n(?:\s+#.*\n)*\s+branches: \[main, \"release-\*\"\]\n")
+
+    def test_selection_sees_the_head_branch_and_the_full_ci_label(self):
+        changes = self.jobs["changes"]
+        self.assertIn("HEAD_REF: ${{ github.event.pull_request.head.ref }}", changes)
+        self.assertIn("FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}", changes)
+        self.assertIn("macos: ${{ steps.select.outputs.macos }}", changes)
+
+    def test_evidence_binds_to_the_merge_groups_own_commit(self):
+        self.assertIn("  EXPECTED_CHECKOUT_COMMIT: ${{ github.event.merge_group.head_sha || github.sha }}\n",
+                      self.ci)
+
+    def test_a_newer_push_to_a_pull_request_or_a_train_cancels_the_older_run(self):
+        group = re.search(r"concurrency:\n(?:#.*\n)*\s+group: (.*)", self.ci).group(1)
+        cancel = re.search(r"\n  cancel-in-progress: (.*)", self.ci).group(1)
+        self.assertIn("github.event.pull_request.number", group)
+        self.assertIn("startsWith(github.ref, 'refs/heads/release-') && github.ref", group)
+        self.assertIn("github.event_name == 'pull_request'", cancel)
+        self.assertIn("github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')", cancel)
+        # Main and merge-queue runs fall back to their own run id.
+        self.assertTrue(group.rstrip().endswith("|| github.run_id }}"), group)
+
+    def test_the_final_gate_waits_for_every_other_job_and_always_reports(self):
+        gate = self.jobs["ignored-evidence"]
+        needs = set(re.search(r"needs: \[([^\]]*)\]", gate).group(1).split(", "))
+        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence"})
+        self.assertIn("    name: ignored-test evidence\n", gate)
+        self.assertIn("    if: ${{ always() }}\n", gate)
+        blocks = steps(gate)
+        first = next(index for index, step in enumerate(blocks) if "every_job.py" in step)
+        aggregate = next(index for index, step in enumerate(blocks) if "workflow_adapter.py aggregate" in step)
+        self.assertLess(first, aggregate)
+        self.assertNotIn("if:", blocks[first])
+        self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[first])
+        self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[aggregate])
+        # The owner check still reports when another job failed, so one red
+        # job doesn't hide whether the evidence was complete.
+        self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
+
+    def test_macos_runs_when_selected_and_splits_the_once_only_steps(self):
+        macos = self.jobs["macos"]
+        self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", macos)
+        self.assertIn("      fail-fast: false\n", macos)
+        self.assertIn("    name: portable macOS (${{ matrix.shard }}/" + str(SHARDS["portable-darwin"]) + ")\n", macos)
+        for name in ["Lint every target, with all features", "Doctests"]:
+            block = next(step for step in steps(macos) if "name: " + name in step)
+            self.assertRegex(block, r"if: matrix\.shard == \d\n")
+
+    def test_the_heavy_jobs_wait_for_their_own_selection(self):
+        for name in ["linux", "build-tests", "cluster", "acceptance"]:
+            self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
+        for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app"]:
+            self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
+
+
+class BenchmarkTests(unittest.TestCase):
+    def setUp(self):
+        self.ci = (WORKFLOWS / "ci.yml").read_text()
+        self.jobs = jobs(self.ci)
+
+    def test_bench_task_arrays_is_run_by_a_workflow(self):
+        job = self.jobs["task-array-benchmarks"]
+        # select-jobs.sh sets task_arrays on schedules, so it runs nightly.
+        self.assertIn("needs.changes.outputs.task_arrays == 'true'", job)
+        self.assertIn("task_arrays: ${{ steps.select.outputs.task_arrays }}",
+                      self.jobs["changes"])
+        self.assertIn("run: make bench-task-arrays", job)
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertIn("--max-ratio", compare)
+
+    def test_task_array_benchmarks_over_the_limit_are_measured_again_once(self):
+        # A disk stall during one benchmark is not a regression (#936): the
+        # compare step re-runs just the benchmarks over the limit, once.
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertIn("--remeasure 'cargo bench --bench task_arrays --'", compare)
+
+    def test_only_main_saves_the_task_array_baseline(self):
+        job = self.jobs["task-array-benchmarks"]
+        restore = next(step for step in steps(job) if "actions/cache/restore@" in step)
+        self.assertIn("restore-keys: task-array-bench-", restore)
+        for marker in ("bench_baseline.py save", "actions/cache/save@"):
+            step = next(step for step in steps(job) if marker in step)
+            self.assertIn("if: github.ref == 'refs/heads/main'", step)
+
+    def test_the_task_array_criterion_output_is_kept_as_an_artefact(self):
+        job = self.jobs["task-array-benchmarks"]
+        upload = next(step for step in steps(job) if "actions/upload-artifact@" in step)
+        self.assertIn("if: always()", upload)
+        self.assertIn("target/criterion", upload)
+        self.assertIn("name: criterion-task-arrays", upload)
+
+    def test_every_benchmark_target_is_run_by_a_workflow(self):
+        makefile = (REPO / "Makefile").read_text()
+        targets = re.findall(r"(?m)^(bench[a-z-]*):", makefile)
+        self.assertIn("bench-task-arrays", targets)
+        workflows = "\n".join(path.read_text() for path in WORKFLOWS.glob("*.yml"))
+        for target in targets:
+            with self.subTest(target=target):
+                self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
 
 
 class RetargetTests(unittest.TestCase):

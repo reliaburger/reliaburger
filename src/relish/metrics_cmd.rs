@@ -162,7 +162,7 @@ fn print_structured<T: Serialize>(value: &T, output: OutputFormat) -> Result<(),
         OutputFormat::Yaml => {
             print!(
                 "{}",
-                serde_yaml::to_string(value).map_err(RelishError::SerialiseYaml)?
+                yaml_serde::to_string(value).map_err(RelishError::SerialiseYaml)?
             );
         }
         _ => println!(

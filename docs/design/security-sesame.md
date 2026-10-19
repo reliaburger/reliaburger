@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Sesame is Reliaburger's built-in PKI, identity, and security layer. It provides the cryptographic foundation that every other subsystem depends on: mutual TLS between cluster nodes, workload identity certificates for every app and job, API authentication for human operators and CI systems, secret encryption at rest, and network-level firewalling. Raft log encryption is designed and implemented as a module but is **not yet wired into the durable log** — see the status note in §5.6.
+Sesame is Reliaburger's built-in PKI, identity, and security layer. It provides the cryptographic foundation that every other subsystem depends on: mutual TLS between cluster nodes, workload identity certificates for every app and job, API authentication for human operators and CI systems, secret encryption at rest, and network-level firewalling. Raft log entries are encrypted at rest under a key derived from the cluster master key; the Raft snapshot is not (§5.6).
 
 Sesame is not a separate binary or sidecar. It is compiled into the single `reliaburger` binary and activated during `relish init`. Every security primitive -- certificate authorities, certificate signing, token management, secret encryption, firewall rule generation -- is handled by code paths within the existing node roles (council and worker).
 
@@ -13,7 +13,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 - **Workload identity.** SPIFFE-compatible X.509 certificates and OIDC JWTs for every workload, issued via a CSR model, rotated automatically.
 - **API authentication.** Scoped tokens with roles, TTLs, and rate limits. Optional OIDC integration with external identity providers.
 - **Secret encryption.** Asymmetric age encryption for secrets checked into git. Namespace-scoped keypairs for multi-tenant isolation.
-- **Data at rest encryption (planned — implemented but not yet wired).** AES-256-GCM encryption of the Raft log, with HKDF key derivation and optional TPM sealing. The crypto lives in `sesame::raft_encryption` (complete and tested) but has no call sites yet; the durable log currently writes plaintext. TPM sealing is not implemented at all.
+- **Data at rest encryption (Raft log entries only).** Raft log entries are encrypted with AES-256-GCM under a key derived (HKDF-SHA256, fresh salt per entry) from the cluster master key, which is stored on the node. `snapshot.redb` and the vote and log-position metadata are plaintext, and a cluster without a master key writes a plaintext log. This protects a stolen disk or copied log, not a node whose root is compromised. Snapshot encryption with a TPM- or identity-derived key is 0.3.0 appliance work (#402); TPM sealing is not implemented.
 - **Network security.** nftables perimeter firewall, eBPF inter-app firewall, egress allowlists, namespace isolation -- all managed automatically by Bun.
 - **Certificate revocation.** CRL distribution for long-lived node certificates.
 
@@ -387,11 +387,9 @@ pub struct ApiToken {
     /// Human-readable name for the token (e.g., "ci-deploy").
     pub name: String,
 
-    /// Argon2id hash of the token secret.
+    /// SHA-256 digest of the full token secret (`rbrg_` + 64 hex
+    /// characters). No salt: see "Why SHA-256, not Argon2id" in §5.4.
     pub token_hash: Vec<u8>,
-
-    /// Salt used for hashing.
-    pub token_salt: Vec<u8>,
 
     /// The role granted to this token.
     pub role: ApiRole,
@@ -525,6 +523,24 @@ pub struct CrlEntry {
 ```
 
 ### 4.7 Firewall Rules
+
+> **As built (#677).** The listing below is the original design. The binary
+> keys `firewall_map` by `(source cgroup, destination app id)` and grants only
+> cross-namespace paths (D4): apps in one namespace always reach each other,
+> and `allow_from` names `app` or `namespace/app` sources from other
+> namespaces. Apps and jobs both take `[firewall] allow_from`; a job's
+> destination identity is `0x8000_0000 | hash(namespace/name)`, a service's
+> its VIP. A job can also be the source `allow_from` names (#737): each task
+> cgroup is bound in `cgroup_source_map` to its run identity
+> (`hash(namespace/job)`), and the grant keys `firewall_map` on
+> `1 << 63 | identity` instead of a cgroup, so it holds before the job's
+> first task starts. Isolation covers real destinations as well as VIPs through
+> `destination_map` (see the Onion design, §4), and the
+> `reliaburger_isolation` nftables table repeats the check on the forward
+> path between local containers, for traffic that never meets a socket hook.
+> A node that can't enforce isolation refuses `allow_from` at deploy and in
+> task-array admission. Config validation checks every `allow_from` source and
+> egress entry for apps and jobs alike.
 
 ```rust
 /// A per-app eBPF firewall rule controlling inbound connections.
@@ -718,8 +734,8 @@ pub enum AttestationMode {
 /// Encryption state for the Raft log on a council node.
 #[derive(Debug)]
 pub struct RaftLogEncryption {
-    /// AES-256-GCM key derived via HKDF from the node's identity.
-    /// This is derived at startup and held in memory only.
+    /// Intended design. Today each entry's AES-256-GCM key is derived via
+    /// HKDF from the cluster master key with a per-entry salt (§5.6).
     pub log_encryption_key: [u8; 32],
 
     /// HKDF salt (stored alongside the encrypted Raft log on disk).
@@ -770,12 +786,24 @@ The master key and security-bootstrap files are both written with mode `0600`.
 Bun enforces that at load time, so a generated bootstrap never relies on a
 world-readable interval or asks the operator to repair permissions manually.
 
-This is the normal path. Explicit development generators are the exception:
-`relish init --development-plaintext` and `relish dev create` write
-`require_mtls = false`, embed a development-only warning in the file and print
-the same warning; Bun repeats it at every cluster start. The Lima dev cluster
-keeps this temporary limitation because its provisioning path doesn't enrol a
-separate node identity in each VM yet. Don't reuse those configs elsewhere.
+This is the normal path, and since 0.2.1 it's also the default: `[security]
+require_mtls` defaults to `true`, so a node config that omits it, or omits the
+whole section, fails closed. `bun --cluster` with no identity on disk refuses to
+start with the command that fixes it, `relish init` on a bootstrap node or
+`relish join` on a joiner. Single-node `bun` without `--cluster` doesn't read
+the setting. `relish dev create` builds an mTLS cluster the way
+`relish setup --quickstart` does, from the same bootstrap code: it generates the
+CA, master key and first identity on the host, then enrols every other Lima VM
+with a join token and `relish join`.
+
+Plaintext is an explicit opt-in, and there are only two: `relish init
+--development-plaintext`, and test fixtures that write `require_mtls = false`.
+The generated file embeds a development-only warning, the command prints it,
+and Bun repeats it at every cluster start. Don't reuse such a config elsewhere.
+A plaintext cluster has no cluster registry, because the registry needs mTLS
+(#792), so it can't pull Docker Hub short names such as `nginx:1.27`. That's
+deliberate: Pickle stays the only path to Docker Hub, and no node ever falls
+back to a direct pull that skips the cluster's cache and policy (#870).
 
 The transport contract has one deliberate split. Raft and reporting require a
 valid, unrevoked node certificate at the TLS handshake. The agent API also
@@ -873,11 +901,47 @@ $ relish token create --name ci-deploy --role deployer \
     --apps "web,api" --namespaces "production" --ttl-days 30
 ```
 
-1. Generate a 256-bit cryptographically random token secret.
-2. Hash the secret with Argon2id (salt generated per-token).
-3. Store the hash, salt, role, scope, and expiry in Raft.
+1. Generate a 256-bit cryptographically random token secret
+   (`sesame::token::TOKEN_SECRET_BYTES`, asserted at compile time to be at
+   least 32 bytes).
+2. Hash the whole plaintext, `rbrg_` prefix included, with SHA-256
+   (`sesame::token::hash_secret`). The function refuses any secret that
+   isn't `rbrg_` plus 64 hex characters, so nothing short or human-chosen
+   can end up behind the fast hash.
+3. Store the digest, role, scope, and expiry in Raft.
 4. Return the plaintext token to the user, with its expiry. It is never stored
    in plaintext.
+
+**Verification.** `sesame::auth::authenticate` turns away a bearer that
+doesn't have the token shape with a string check. Otherwise it hashes the
+bearer once and compares the digest with every stored secret (each token's
+current one, and its previous one during a rotation's grace period) using a
+constant-time comparison (`sesame::ca::constant_time_eq`, the one join
+tokens use). The whole check takes a few microseconds, so it runs inline on
+the request's async task: no semaphore, no blocking thread and no
+verified-token cache.
+
+**Why SHA-256, not Argon2id (0.2.1, #912).** Until 0.2.1 the stored hash was
+Argon2id with a per-token salt. Argon2id is a *password* hash. It's slow and
+memory-hungry on purpose, so that an attacker who steals the hashes can't
+try billions of guesses at short, human-chosen passwords. Our secrets aren't
+passwords: they're 256 random bits, and nobody can enumerate 2^256 guesses
+however fast each one is. The slowness bought nothing, and every request
+paid for it. One verification used about 19 MiB and tens of milliseconds
+per stored token, so up to four ran at a time behind a process-wide
+semaphore. In the V02 soak the API node served thousands of job-controller
+requests an hour, and glibc kept part of that freed memory resident (#892).
+Measured on the same machine, verifying a bearer against a ten-token store
+went from 177 ms to under 7 µs, and a burst of 40 verifications on four
+threads stopped adding 57 MiB to peak RSS. A salt is pointless for the same
+reason: it defends against precomputed tables of likely passwords, and there
+are no likely 256-bit secrets. The trade only holds while every stored
+secret is long and random, which is why issuing refuses anything else. A
+stolen digest still doesn't reveal the token, because SHA-256 can't be run
+backwards.
+
+The change alters the stored format, so 0.2.1 starts a fresh cluster (state
+`69`, see `src/compatibility.rs`) and tokens must be reissued.
 
 **Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
 ReadOnly token expires after the answering node's `[security.tokens]
@@ -905,7 +969,15 @@ registry applies the same scope to repositories: a scoped token may push and
 namespace and app it covers, over Bearer and Basic alike; bare names such as
 `api` are refused to it, and `/v1/build` destinations meet the same rule. The
 internal service token and unscoped tokens are unaffected. See
-`registry-pickle.md` §1.2 for the exact rule.
+`registry-pickle.md` §1.2 for the exact rule. The discovery and chaos reads
+filter to the scope as well: `/v1/resolve` and `/v1/resolve/{name}` list only
+in-scope services, `/v1/routes` only in-scope ingress routes (`RouteInfo`
+carries the route's namespace), `GET /v1/fault` only workload faults on
+in-scope apps (`FaultSummary` carries the fault's namespace), and
+`GET /v1/build/{id}` answers only for a build whose destination repository
+(`BuildRecord::repository`) is in scope. `GET /v1/fault?cluster=true` refuses a
+scoped caller, since node faults belong to no tenant. A workload's JWT is a
+scoped read-only token, so these are the rules a compromised container meets.
 
 **Permission specs (shipped):** A `[permission.<token-name>]` block
 (`config::PermissionSpec`, replicated as `DesiredState.permissions`) is an
@@ -918,9 +990,9 @@ session carries its token's name, so it rides the same spec. The route matrix in
 
 | Gate | Check | Routes |
 |------|-------|--------|
-| `App(action)` | `authorize_permission` on the path's app and namespace | logs (SSE, entries, cross-node query, WebSocket) → `logs`; app metrics and charts → `metrics`; delete, rollback → `deploy`; stop → `scale`; exec → `exec` |
-| `Body(action)` | the same, per app the body names | apply (`deploy`, plus `host-exec` for host commands), deploy cancel (`deploy`) |
-| `Cluster(action)` | `authorize_cluster_permission`: the action with `apps = ["*"]` and no `namespaces` | `/v1/logs/sql` → `logs`; `/v1/metrics*` store, rollups and cluster queries, `/v1/alerts`, the alerts fragment → `metrics`; secret rotation → `secret-write`; tokens, join tokens, upgrades, elections, decommission, image signing, log export, `[permission]`/`[namespace]` declarations and test-lease overrides → `admin` |
+| `App(action)` | `authorize_permission` on the path's app and namespace | logs (SSE, entries, cross-node query, WebSocket) → `logs`; app metrics and charts → `metrics`; delete, rollback, snapshot create, restore and delete → `deploy`; stop → `scale`; exec → `exec` |
+| `Body(action)` | the same, per app the body names | apply (`deploy`, plus `host-exec` for host commands and host-path `source`s), deploy cancel (`deploy`); `/v1/build` → `deploy` on the destination repository's app, or cluster-wide for a destination with no namespace; fault inject and clear → `fault` on the target service, cluster-wide for a node fault or a clear that spans tenants, judged against the stored fault for a clear by id |
+| `Cluster(action)` | `authorize_cluster_permission`: the action with `apps = ["*"]` and no `namespaces` | `/v1/logs/sql` → `logs`; `/v1/metrics*` store, rollups and cluster queries, `/v1/alerts`, the alerts fragment → `metrics`; secret rotation → `secret-write`; tokens, join tokens, upgrades, elections, decommission, image signing, log export, `[permission]`/`[namespace]` declarations and test leases (create, renew, release) → `admin` |
 | `Filtered(action)` | the route answers without the parts the spec doesn't grant | `/v1/top` rows → `metrics` per app; dashboard alert panel → cluster `metrics`; app page charts → `metrics` on that app |
 
 `admin` is a super-grant covering every other action. `secret-read` gates no
@@ -930,7 +1002,30 @@ keep the matrix honest: `every_gated_route_checks_its_permission_action`
 statically finds each gated handler's check, and the table test in
 `src/bun/api/permission_tests.rs` drives a real request per gated route and per
 principal (every role, grant shape, session, scope, system and bootstrap),
-asserting 403 exactly where the spec doesn't grant the action.
+asserting 403 exactly where the spec doesn't grant the action. Snapshots,
+builds, faults and test leases joined the gated set in 0.2.0 (decision D5 in
+[#674](https://github.com/reliaburger/reliaburger/issues/674)), with the new
+`fault` action.
+
+**The principal column (0.2.0):** each matrix row also names the least
+principal it admits (`Public`, `AnyToken`, `Deployer`, `Admin`, `System`).
+`every_route_refuses_callers_below_its_principal` drives every row as seven
+callers (a read-only token, a user session, a service-token session, a scoped
+Deployer, a Deployer, an Admin and the system principal) and requires a 401 or
+403 from every caller ranked below the row, plus entry for a read-only token
+on every `AnyToken` row; a second router with a real token store checks that
+only `Public` rows answer a request with no credentials. Node-to-node routes
+whose JSON message the probe doesn't build are listed exactly and covered by
+`every_system_route_requires_the_system_principal`, a source check that their
+handlers call `require_system`.
+
+**Sessions and the system principal:** a dashboard session is always
+read-only. One opened with the service token keeps the token name `__system`
+but has the principal id `session:__system`, and
+`sesame::auth::is_system_principal` requires both the name and the id to be
+`__system`. `require_system` uses it, so a session never passes a node-to-node
+route, whatever token it came from. The session cookie is `HttpOnly`,
+`SameSite=Strict` and, when the API serves TLS, `Secure`.
 
 **Bootstrap boundary (shipped):** An empty user-token store leaves protected
 API routes open long enough to create the first cluster token. Bun contains
@@ -950,7 +1045,7 @@ $ relish token rotate ci-deploy [--grace-hours 24]
 1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
    new secret and hash, and reads the clock once.
 2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
-   hash and salt, `rotated_at`, the new expiry (the token's previous lifetime
+   SHA-256 digest, `rotated_at`, the new expiry (the token's previous lifetime
    length from now, or none) and `previous_valid_until` (now plus the grace,
    24 hours by default, capped at the old expiry; `None` for a zero grace).
 3. The state machine (`sesame::token::apply_rotation`) moves the old hash into
@@ -968,6 +1063,8 @@ $ relish token rotate ci-deploy [--grace-hours 24]
    secret. Role, scope and the `[permission]` spec stay with the name.
 
 **Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
+
+**Verification cost in 0.2.0 (#945):** 0.2.0 ran Argon2id against the stored hashes on every bearer request, on the blocking pool, at most four at once. One hash at the default cost needs 19 MiB of working memory, and from glibc's heap those blocks stayed in its per-thread arenas after they were freed: the API node of the 0.2.0 candidate 4 soak held about 1 GB on a 2 GiB VM in 19 MiB steps. 0.2.0 fixed that by hashing into a private anonymous mapping, unmapped when the hash finished. 0.2.1 verifies with SHA-256 instead (see "Why SHA-256, not Argon2id" above), which needs no working memory, so the mapping, the permits and the 0.2.0 counting-allocator test (`tests/auth_memory.rs`) went with Argon2.
 
 **Expiry sweep (shipped, F05 I2):** every hour (`bun::token_sweep::TOKEN_SWEEP_INTERVAL`) the leader proposes `RaftRequest::SweepExpiredApiTokens { now_unix_ms }`, but only when its own copy of the store has something due, so a quiet cluster writes nothing. The state machine decides what to remove from the entry's `now_unix_ms` alone (`sesame::token::tokens_to_sweep`), so every replica removes the same tokens: those whose `expires_at` plus a 24-hour grace (`EXPIRED_TOKEN_GRACE`) is past. Two rules override that, because an empty store is the bootstrap window in `auth_middleware`: the last Admin is never removed (if every Admin is due, the one that expired most recently stays, ties to the greater name), and the store is never emptied (with no Admin, the most recently expired token stays). The reply, `CouncilResponse::ApiTokensSwept { removed }`, lets the leader record one `token.expired_swept` audit event per token with principal `system`. A store whose every token has expired is not empty, so it still refuses anonymous requests (tested).
 
@@ -1009,9 +1106,14 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 
 ### 5.6 Raft Log Encryption
 
-> **Status: implemented (with a cluster master key).** `council::durable_log`
-> now routes entry values through `sesame::raft_encryption` (HKDF derivation,
-> AES-256-GCM seal/open) whenever `open_with_key` is given a cluster master key.
+> **Status: log entries encrypted, keyed by the master key; snapshot plaintext.**
+> `council::durable_log` routes entry values through `sesame::raft_encryption`
+> (HKDF derivation from the cluster master key with a per-entry salt,
+> AES-256-GCM seal/open) whenever `open_with_key` is given that key. The master
+> key is stored on the node, so this protects a stolen disk or copied log, not a
+> node whose root is compromised. `snapshot.redb` (token hashes, wrapped keys,
+> desired state) is written in plaintext; encrypting it with a TPM- or
+> identity-derived key is 0.3.0 appliance work (#402).
 > Encrypted entries carry a one-byte marker and a per-entry salt+nonce; a
 > plaintext entry (leading `{`) still decodes, so plaintext and encrypted logs
 > interoperate and a keyless/dev cluster stays plaintext. An encrypted entry
@@ -1020,11 +1122,11 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 > sensitive keys inside the log (step 5) ships as before. TPM sealing (step 2) is
 > still not implemented.
 
-On each council node (intended design):
+On each council node (intended design; step 1 differs today, see the status note):
 
 1. At startup, derive the AES-256-GCM encryption key via HKDF:
-   - **Input keying material:** the node's certificate private key (DER bytes).
-   - **Salt:** a random 32-byte salt stored alongside the Raft log on disk.
+   - **Input keying material:** the node's certificate private key (DER bytes). Today it's the cluster master key.
+   - **Salt:** a random 32-byte salt stored alongside the Raft log on disk. Today each entry carries its own salt.
    - **Info:** `"reliaburger-raft-log-encryption-v1"`.
 2. If a TPM is available, seal the derived key to the current PCR values. The key can only be unsealed on the same hardware with the same boot state.
 3. All Raft log writes are encrypted with AES-256-GCM using the derived key. Each entry gets a unique nonce (96-bit counter, never reused).
@@ -1107,6 +1209,13 @@ Current status: egress enforcement is opt-in per app. With no `[app.NAME.egress]
 block, Bun allows external egress. Once an app declares a non-empty allowlist,
 the following contract applies and there is no warning-only fallback.
 
+Jobs take the same `[job.NAME.egress]` block, with the same contract (D26).
+The agent programs a job's cgroup before it starts, and a delegated task's
+namespace lease programs the task cgroup (a reusable executor's `task`
+cgroup) before its command runs. The egress policy is part of the reusable
+executor profile key, so commands with different policies never share an
+executor. Host (`runtime = "process"`) jobs and apps refuse an allowlist.
+
 When Bun processes an app's `[app.NAME.egress]` block:
 
 1. Each entry is parsed: exact IPv4/IPv6 destinations (`1.2.3.4:443`, `[2001:db8::1]:443`), CIDRs (`10.0.0.0/8:443`, `[2001:db8::/32]:443` — host bits rejected), or hostnames resolved via DNS keeping both A and AAAA records.
@@ -1117,6 +1226,7 @@ When Bun processes an app's `[app.NAME.egress]` block:
 6. Bun reports the four hooks and pre-start runtime support as a typed live node capability. The scheduler filters policy-bearing workloads using it, and the agent repeats the check immediately before start so a stale report can't open a gap.
 7. Every one-second agent tick verifies the live hooks and each protected cgroup's enforcement flag. It repairs a missing flag once and verifies the result. Hook loss, an unreadable map or failed repair stops the affected workload, records the affected app and makes the node unready until all four hooks recover. The slower kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60) still scrubs stale state and rebuilds all entries.
 8. `allow_franchise` remains unimplemented. Bun refuses it explicitly rather than starting a workload with unrestricted cross-cluster egress.
+9. Every allowlist implicitly permits the node's DNS responder (the address Bun installs in workloads' `resolv.conf`) on port 53, so a workload can resolve the hostnames on its list and `.internal` names. Without `[dns]` there is no responder, and the allowlist must name its resolver.
 
 ### 5.10 Image Signing Trust Roots
 
@@ -1169,6 +1279,24 @@ cache when it's on (F03 U3). Either half without the other is refused at
 startup.
 
 ---
+
+### 5.11 Audit Log
+
+**Shipped (#685).** Audit records used to live only in the 1024-entry event ring (`bun::events::EventStore`), next to health, deploy and job events. A busy array evicted them within seconds, a restart emptied the ring, and only five areas (tokens, CAs, secrets, namespace keys, faults) recorded anything. Each node now keeps its own store, `bun::audit::AuditLog`:
+
+- **Format and place.** JSON Lines under `{[storage] data}/audit/`, in segments named `audit-<first sequence>.jsonl`. A record (`AuditRecord`) has a per-node `sequence` that keeps counting across restarts, `timestamp`, `kind`, `severity`, `action`, `principal`, `app`, `namespace`, `node`, `source_address`, `details` and `message`.
+- **Durability.** One dedicated writer thread owns the files, fed by a bounded `mpsc` queue, so no Tokio worker blocks on disk. It appends and `sync_data`s each record and replies on a oneshot; the API waits for that (at most `AUDIT_WRITE_TIMEOUT`, 5 s) before answering. Audit traffic is a few records a second, so one sync per record is cheap. On open, a half-written last line is ended with a newline and skipped on read.
+- **Bound.** `[storage] audit_max_bytes` (64 MiB default, 64 KiB minimum) is shared by eight segments. A record that would push the newest segment past its share starts a new one; when the total passes the bound the oldest segment is deleted, never the newest.
+- **Failure.** A failed write (or a full queue) is printed to stderr and counted (`AuditLog::failures`); the action still happens. `GET /v1/audit` reports the count as a warning.
+- **No secrets.** Handlers never put one in a record; as a backstop the writer replaces anything shaped like `rbrg_…` (API and join tokens) with `rbrg_[redacted]`.
+- **Coverage.** One route layer (`bun::api::audit::audit_layer`, inside the auth layer) records every route in `AUDITED_ROUTES` that answers 2xx, with the caller's principal, the address from `ConnectInfo`, and `{app}`/`{namespace}` from the path. Handlers that know more add it through `bun::audit::annotate` (a manifest's namespace and workloads, a decommission's target, an upgrade's version), carried in a task-local for the request. Token, CA, secret and fault handlers record their own, richer events; the agent records `fault.expired` and the token sweep and namespace-key loops record as `system`. A test (`every_mutating_route_is_audited_or_exempt`) makes every `POST`/`DELETE` route in the authorisation matrix choose: layer-audited, self-audited or exempt with a reason (node-to-node plumbing, heartbeats, reads).
+- **Read.** `GET /v1/audit?since&until&action&principal&namespace&limit` (newest `limit`, default 100, at most 10,000, oldest first) needs an unscoped Admin with the cluster-wide `admin` permission, and refuses the service principal. `?cluster=true` asks every live member under the caller's own credential (not the service token), so each repeats the check, and merges by `(timestamp, node, sequence)` with a warning per member that didn't answer. `relish audit` wraps it.
+- **Ring.** `EventStore::record_audit` still puts each record in the ring and the live stream, so the TUI and `relish events` show it as it happens.
+- **Refusals (#798).** A 401 or 403 on any layer-audited or self-audited route is recorded as `api.refused` (kind `refusal`, severity warning). The recorder, `bun::api::audit::refusal_layer`, is a second route layer *outside* the auth layer, because a request without a valid credential is answered by `auth_middleware` and never reaches `audit_layer`. For a refusal that does get that far (a role, `[permission]` or scope check in the handler), `audit_layer` attaches the caller's principal and whatever the handler annotated (a manifest's namespace) to the response as a private extension, and `refusal_layer` takes it off. The `reason` detail is `unauthenticated` (401), `scope` (403 built by `sesame::auth::scope_refusal`, which marks the response with `RefusalReason::Scope`) or `forbidden` (any other 403). The record also has `route` (`POST /v1/apply`), `attempted` (the action a success would have recorded), `token_name` when authenticated, the source address and the path's app and namespace; never the credential or the body. `principal` is `anonymous` without a valid credential.
+- **Refusal rate limit.** Refusals are free for the caller, so `bun::audit::refusals::RefusalLimiter` keeps a fixed 60 s window per (source IP, principal): the first 5 refusals are recorded, the rest counted. A window that closes with suppressed refusals produces one `api.refusals_suppressed` record (`suppressed`, `source`, `window_start`, `window_seconds`), written by the next refusal or by a 15 s sweeper task, whichever comes first. All sources together are capped at 100 records a window, and the limiter tracks at most 256 sources; refusals from further sources while it's full are counted under one overflow source (`*`, "other sources"). So a flood writes at most about 100 refusal records plus one summary per tracked source a minute, a few hundred KiB an hour, which can't push real records out of a 64 MiB log. The constants are fixed, not configurable.
+- **Disk pressure (#798).** The audit directory counts toward task-data pressure (`disk_pressure::node_data_bytes`) alongside `{data}/task-arrays`, since both share the data filesystem.
+
+A call a follower forwards to the leader is recorded on both: the entry node with the client's address, the leader with the forwarder's. **Planned:** central retention (shipping records off the node, so a decommissioned node's history survives it) and tamper evidence (hash-chained records).
 
 ## 6. Configuration
 
@@ -1417,7 +1545,7 @@ council_size = 3
 1. Immediately run `relish ca rotate` for the compromised CA. **(Planned — CA rotation is not implemented yet, §5.8. Until it ships, the practical response is CRL-revoking affected certificates and, in the worst case, re-bootstrapping the PKI.)**
 2. Revoke all certificates issued by the compromised CA (via the CRL, §5.7).
 3. The dual-signing period ensures existing legitimate certificates continue working during the transition.
-4. Investigate how the key was exfiltrated. Council nodes should have restricted access; TPM sealing and at-rest Raft log encryption are planned hardening (§5.6), not yet active.
+4. Investigate how the key was exfiltrated. Council nodes should have restricted access. At-rest encryption covers Raft log entries only, under the master key on the same host (§5.6); TPM sealing is planned hardening, not yet active.
 
 **Root CA compromise:** If the sealed root CA backup is stolen, the attacker can sign new intermediate CAs. This requires a full PKI re-bootstrap: `relish init` on a new cluster and migrating workloads.
 
@@ -1450,9 +1578,9 @@ council_size = 3
 
 ### 7.5 Raft Log Encryption Key Loss
 
-> **Applies only once §5.6 ships.** At-rest Raft log encryption and TPM sealing
-> are not wired today (the log is plaintext), so this failure mode is about the
-> planned design, not current behaviour.
+> **Applies only once TPM sealing ships.** Today the log key comes from the
+> cluster master key, which every node holds, so moving a disk to new hardware
+> doesn't break decryption. This failure mode is about the planned design.
 
 **Scenario:** A council node's disk is moved to different hardware, breaking TPM sealing.
 
@@ -1477,7 +1605,7 @@ council_size = 3
 The threat model assumes:
 
 - **Trusted:** The operator who runs `relish init` and has access to the sealed root CA backup.
-- **Semi-trusted:** Council nodes. They hold sensitive key material. The intended hardening (minimal attack surface, TPM sealing, encrypted Raft logs) is only partly shipped: TPM sealing and at-rest Raft log encryption are planned, not active (§5.6). Today's protection for keys in the log is the per-key HKDF wrapping, not whole-log encryption.
+- **Semi-trusted:** Council nodes. They hold sensitive key material. The intended hardening (minimal attack surface, TPM sealing, encrypted Raft state) is only partly shipped: Raft log entries are encrypted under the master key, the snapshot is plaintext, and TPM sealing is planned (§5.6). For keys in the snapshot, the protection is the per-key HKDF wrapping.
 - **Untrusted:** Worker nodes. They may be compromised. The system is designed so that a compromised worker node has limited blast radius.
 - **Untrusted:** Network between nodes. All inter-node communication is mTLS-authenticated and encrypted.
 - **Untrusted:** External network. Declared app allowlists are default-deny; apps without an egress block remain unrestricted until the planned cluster default lands. nftables perimeter rules and Wrapper-only ingress cover inbound traffic.
@@ -1537,14 +1665,14 @@ The threat model assumes:
 3. Rotate the age keypair: `relish secret rotate`.
 4. Rotate the OIDC signing keypair (re-minting all JWTs).
 5. Rotate all API tokens.
-6. Audit all cluster activity during the compromise window.
+6. Audit all cluster activity during the compromise window: `relish audit --cluster --since <start> --until <end>` lists every node's records, with the principal and source address of each action (§5.11). Read the compromised node's log before you rebuild it; there is no central copy yet.
 7. Investigate the attack vector and harden council node access.
 
 **Prevention:**
 
 - Council nodes should have the smallest possible attack surface.
 - TPM sealing would ensure key material cannot be extracted even with disk access (planned — not implemented).
-- Encrypted Raft logs would protect against offline forensic access (planned — the encryption module exists but is not wired; the log is plaintext today, §5.6). Per-key HKDF wrapping does protect the age/CA keys stored inside the log.
+- Encrypted Raft log entries protect against offline access to a copied log, but the key is the master key on the same host and `snapshot.redb` is plaintext (§5.6). Per-key HKDF wrapping protects the age/CA keys stored in Raft state.
 - Council nodes should be on a restricted management network.
 
 ### 8.4 Join Token Theft
@@ -1693,6 +1821,8 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 ### 10.7 Audit Logging
 
+- **Durable audit tests (shipped, #685):** a record survives a restart and the log stays within its bound, dropping the oldest segment first (`src/bun/audit.rs`); job events can't evict an audit record (`job_events_cannot_evict_audit_records`); apply, exec, delete, upgrade and decommission are recorded with principal, namespace and source address, and a fault's record carries its namespace and override flags (`src/bun/api/audit_tests.rs`); only a cluster-wide Admin reads the log, never the service principal; a token created before a Bun restart is listed after it (`tests/suite/security_integration.rs`); and `?cluster=true` merges every node (`cluster_audit_query_merges_every_node`, `make test-cluster`).
+
 - **Token audit test:** Use an API token to perform operations. Verify that `relish token list` shows the correct `last_used` timestamp.
 - **Secret decryption audit test:** Deploy an app with encrypted secrets. Verify that `relish events --type secret` shows the decryption events with correct app, node, and timestamp.
 - **Egress DNS change audit test:** Change the DNS record for a hostname in an egress allowlist. Verify that an audit event is logged when Bun updates the eBPF maps.
@@ -1777,11 +1907,10 @@ Reliaburger's age-based secret encryption is much simpler than Vault but covers 
 |-------|---------|-------|
 | **rustls** | TLS implementation for all inter-node mTLS and API TLS. | Pure Rust, no OpenSSL dependency. Supports certificate verification callbacks for CRL checking. |
 | **rcgen** | X.509 certificate generation and CSR creation. | Used by `relish init` for CA generation and by Bun for creating workload CSRs. |
-| **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing. | The core crypto library. No unsafe code, constant-time operations. |
+| **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing (including API and join token digests). | The core crypto library. No unsafe code, constant-time operations. |
 | **age** | Asymmetric encryption for secrets (`ENC[AGE:...]` values). | Rust implementation of the age encryption format. Used for secret encryption/decryption and root CA key sealing. |
 | **x509-parser** | Parsing and validating X.509 certificates and CRLs. | Used for certificate chain validation, CRL parsing, and `relish ca status` output. |
 | **pem** | PEM encoding/decoding for certificates and keys. | Used for writing certificate files to workload identity mounts. |
-| **argon2** | Password hashing for API token storage. | Argon2id variant. Used for hashing API token secrets before Raft storage. |
 
 ---
 

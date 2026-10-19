@@ -14,40 +14,25 @@ use super::*;
 /// back as one of these ops. Each carries a `oneshot` the loop replies on, so
 /// the task drives the sequence while the loop applies it.
 pub(super) enum DeployOp {
-    PreparedBatchJob {
-        name: String,
-        namespace: String,
-        generation: u64,
-        spec: Box<JobSpec>,
-        reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
-    },
-    /// A prerequisite's observed success must be durable before its dependent app runs.
-    EnforceImageReference {
-        image: Option<String>,
-        reply: oneshot::Sender<Result<Option<String>, String>>,
-    },
-    ConfirmJobSuccess {
-        instance_id: InstanceId,
-        code: i32,
-        reply: oneshot::Sender<Result<(), BunError>>,
-    },
     /// A bounded probe completes off-loop; only the agent mutates health state.
     HealthProbeResult {
         instance_id: InstanceId,
         created_at: Instant,
         status: Result<crate::bun::health::HealthStatus, crate::bun::probe::ProbeError>,
     },
-    /// Enforce the image trust policy; returns the digest-pinned image, if any.
+    /// Enforce the image trust policy on one image reference (an app's or an
+    /// init container's); returns the digest-pinned image, if any.
     EnforceImageSignature {
-        spec: Box<AppSpec>,
+        image: Option<String>,
         reply: oneshot::Sender<Result<Option<String>, String>>,
     },
     /// Admit the app kind before recording the deployed spec for the Brioche UI.
+    /// Answers the spec the app's instances ran before, if the node knows it.
     StoreDeployedSpec {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<Result<(), BunError>>,
+        reply: oneshot::Sender<Result<Option<AppSpec>, BunError>>,
     },
     /// Every owned instance id, including terminal instances awaiting cleanup.
     ListExistingOwned {
@@ -81,14 +66,6 @@ pub(super) enum DeployOp {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
-    },
-    /// Create supervisor-tracked instances for a job deploy.
-    SupervisorDeployJob {
-        rerun_unknown: bool,
-        job_name: String,
-        namespace: String,
-        spec: Box<JobSpec>,
         reply: oneshot::Sender<Result<Vec<InstanceId>, BunError>>,
     },
     /// Register an app + firewall in the service map and sync its eBPF maps.
@@ -144,6 +121,14 @@ pub(super) enum DeployOp {
         index: usize,
         reply: oneshot::Sender<Result<InstanceId, BunError>>,
     },
+    /// Remember the runtime generation an initialiser launched, for its
+    /// parent's retirement to forget (#850).
+    RecordInitialiserGeneration {
+        instance_id: InstanceId,
+        initialiser: InstanceId,
+        generation: crate::grill::RuntimeGeneration,
+        reply: oneshot::Sender<()>,
+    },
     /// Release an initialiser only after confirmed runtime retirement.
     ForgetInitialiser {
         instance_id: InstanceId,
@@ -169,6 +154,13 @@ pub(super) enum DeployOp {
         to: ContainerState,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// The runtime refused to launch an instance (#881): fail it, keeping
+    /// the reason for status.
+    RecordLaunchFailure {
+        instance_id: InstanceId,
+        reason: String,
+        reply: oneshot::Sender<()>,
+    },
     /// Post-start bookkeeping for a fresh instance: log forwarder, on-disk
     /// record, container IP, HealthWait(→Running), service-map backend and
     /// kernel networking.
@@ -184,7 +176,6 @@ pub(super) enum DeployOp {
         app_name: String,
         namespace: String,
         instance_id: InstanceId,
-        is_job: bool,
         reply: oneshot::Sender<()>,
     },
     /// Claim replacement ownership before allocating identity or runtime resources.
@@ -272,16 +263,6 @@ pub(super) enum DeployOp {
         entry: Box<crate::meat::deploy_types::DeployHistoryEntry>,
         reply: oneshot::Sender<()>,
     },
-    /// Post-start bookkeeping for a job instance: log forwarder, on-disk
-    /// record, transitions to Running.
-    FinishJobInstance {
-        instance_id: InstanceId,
-        job_name: String,
-        namespace: String,
-        oci_spec: Box<crate::grill::oci::OciSpec>,
-        evidence: Box<launch_evidence::LaunchEvidence>,
-        reply: oneshot::Sender<Result<(), BunError>>,
-    },
     /// Rebuild the Wrapper routing table after all instances started.
     RebuildRoutingTable { reply: oneshot::Sender<()> },
     /// Record a per-app "deployed" lifecycle event.
@@ -296,8 +277,6 @@ impl DeployOp {
     /// The variant's name, for the loop meter's slow-turn log.
     pub(super) fn name(&self) -> &'static str {
         match self {
-            DeployOp::ConfirmJobSuccess { .. } => "confirm_job_success",
-            DeployOp::EnforceImageReference { .. } => "enforce_image_reference",
             DeployOp::HealthProbeResult { .. } => "health_probe_result",
             DeployOp::EnforceImageSignature { .. } => "enforce_image_signature",
             DeployOp::StoreDeployedSpec { .. } => "store_deployed_spec",
@@ -306,8 +285,6 @@ impl DeployOp {
             DeployOp::AddAppReplicas { .. } => "add_app_replicas",
             DeployOp::NextDeployGen { .. } => "next_deploy_gen",
             DeployOp::SupervisorDeployApp { .. } => "supervisor_deploy_app",
-            DeployOp::PreparedBatchJob { .. } => "prepared_batch_job",
-            DeployOp::SupervisorDeployJob { .. } => "supervisor_deploy_job",
             DeployOp::RegisterServiceApp { .. } => "register_service_app",
             DeployOp::RestoreStoppedRouting { .. } => "restore_stopped_routing",
             DeployOp::AbandonUnstartedInstances { .. } => "abandon_unstarted_instances",
@@ -315,9 +292,11 @@ impl DeployOp {
             DeployOp::PrepareFreshInstance { .. } => "prepare_fresh_instance",
             DeployOp::StoreOciSpec { .. } => "store_oci_spec",
             DeployOp::RegisterInitialiser { .. } => "register_initialiser",
+            DeployOp::RecordInitialiserGeneration { .. } => "record_initialiser_generation",
             DeployOp::ForgetInitialiser { .. } => "forget_initialiser",
             DeployOp::ApplyNetworkPreStart { .. } => "apply_network_pre_start",
             DeployOp::TransitionState { .. } => "transition_state",
+            DeployOp::RecordLaunchFailure { .. } => "record_launch_failure",
             DeployOp::FinishFreshInstance { .. } => "finish_fresh_instance",
             DeployOp::ProvisionIdentity { .. } => "provision_identity",
             DeployOp::ReserveRollingInstance { .. } => "reserve_rolling_instance",
@@ -330,7 +309,6 @@ impl DeployOp {
             DeployOp::BeginRetire { .. } => "begin_retire",
             DeployOp::DeferRetire { .. } => "defer_retire",
             DeployOp::PushDeployHistory { .. } => "push_deploy_history",
-            DeployOp::FinishJobInstance { .. } => "finish_job_instance",
             DeployOp::RebuildRoutingTable { .. } => "rebuild_routing_table",
             DeployOp::RecordDeployedEvent { .. } => "record_deployed_event",
         }
@@ -347,6 +325,36 @@ pub(super) struct RollingInstance {
     pub(super) host_port: Option<u16>,
     /// What the runtime reported once the replacement started.
     pub(super) launch: launch_evidence::LaunchEvidence,
+}
+
+/// How many deploy history entries a node keeps per app.
+pub(crate) const DEPLOY_HISTORY_PER_APP: usize = 50;
+
+/// Append a deploy history entry, dropping the app's oldest entries beyond
+/// [`DEPLOY_HISTORY_PER_APP`].
+///
+/// Every deploy, retry and abort records one, each with a full spec, so an
+/// app the reconciler retried for a week used to hold thousands of specs in
+/// memory. Fifty is plenty to read a story from; `relish rollback` in a
+/// cluster reads the council's rollback targets, not this.
+pub(crate) fn record_deploy_history(
+    history: &mut Vec<crate::meat::deploy_types::DeployHistoryEntry>,
+    entry: crate::meat::deploy_types::DeployHistoryEntry,
+) {
+    let app_id = entry.app_id.clone();
+    history.push(entry);
+    let kept = history
+        .iter()
+        .filter(|entry| entry.app_id == app_id)
+        .count();
+    let mut excess = kept.saturating_sub(DEPLOY_HISTORY_PER_APP);
+    history.retain(|entry| {
+        if excess > 0 && entry.app_id == app_id {
+            excess -= 1;
+            return false;
+        }
+        true
+    });
 }
 
 /// The fast pre-create outputs the loop hands back for a fresh instance.
@@ -478,11 +486,11 @@ impl DeployOps {
 
     pub(super) async fn enforce_image_signature(
         &self,
-        spec: &AppSpec,
+        image: Option<&str>,
     ) -> Result<Option<String>, String> {
         self.call(
             |reply| DeployOp::EnforceImageSignature {
-                spec: Box::new(spec.clone()),
+                image: image.map(String::from),
                 reply,
             },
             Err("agent shutting down".to_string()),
@@ -495,7 +503,7 @@ impl DeployOps {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-    ) -> Result<(), BunError> {
+    ) -> Result<Option<AppSpec>, BunError> {
         self.call(
             |reply| DeployOp::StoreDeployedSpec {
                 app_name: app_name.to_string(),
@@ -597,89 +605,6 @@ impl DeployOps {
             },
             Ok(Vec::new()),
         )
-        .await
-    }
-
-    pub(super) async fn enforce_image_reference(
-        &self,
-        image: Option<&str>,
-    ) -> Result<Option<String>, String> {
-        self.call(
-            |reply| DeployOp::EnforceImageReference {
-                image: image.map(str::to_owned),
-                reply,
-            },
-            Err("agent shutting down during prerequisite trust admission".into()),
-        )
-        .await
-    }
-
-    pub(super) async fn confirm_job_success(
-        &self,
-        instance_id: &InstanceId,
-    ) -> Result<(), BunError> {
-        self.confirm_job_exit(instance_id, 0).await
-    }
-
-    pub(super) async fn confirm_job_exit(
-        &self,
-        instance_id: &InstanceId,
-        code: i32,
-    ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::ConfirmJobSuccess {
-                instance_id: instance_id.clone(),
-                code,
-                reply,
-            },
-            Err(BunError::JobState(
-                "agent unavailable before job exit was persisted".into(),
-            )),
-        )
-        .await
-    }
-
-    pub(super) async fn prepared_batch_job(
-        &self,
-        name: &str,
-        namespace: &str,
-        generation: u64,
-        spec: &JobSpec,
-    ) -> Result<Vec<InstanceId>, BunError> {
-        self.call(
-            |reply| DeployOp::PreparedBatchJob {
-                name: name.into(),
-                namespace: namespace.into(),
-                generation,
-                spec: Box::new(spec.clone()),
-                reply,
-            },
-            Err(BunError::JobState(
-                "agent unavailable before the prepared generation was claimed".into(),
-            )),
-        )
-        .await
-    }
-
-    pub(super) async fn supervisor_deploy_job(
-        &self,
-        job_name: &str,
-        namespace: &str,
-        spec: &JobSpec,
-        rerun_unknown: bool,
-    ) -> Result<Vec<InstanceId>, BunError> {
-        retry_while_still_running(|| {
-            self.call(
-                |reply| DeployOp::SupervisorDeployJob {
-                    rerun_unknown,
-                    job_name: job_name.to_string(),
-                    namespace: namespace.to_string(),
-                    spec: Box::new(spec.clone()),
-                    reply,
-                },
-                Ok(Vec::new()),
-            )
-        })
         .await
     }
 
@@ -820,6 +745,24 @@ impl DeployOps {
         .await
     }
 
+    pub(super) async fn record_initialiser_generation(
+        &self,
+        instance_id: &InstanceId,
+        initialiser: &InstanceId,
+        generation: crate::grill::RuntimeGeneration,
+    ) {
+        self.call(
+            |reply| DeployOp::RecordInitialiserGeneration {
+                instance_id: instance_id.clone(),
+                initialiser: initialiser.clone(),
+                generation,
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
     pub(super) async fn forget_initialiser(
         &self,
         instance_id: &InstanceId,
@@ -880,6 +823,19 @@ impl DeployOps {
         .await
     }
 
+    /// Fail an instance the runtime refused to launch, with the reason.
+    pub(super) async fn record_launch_failure(&self, instance_id: &InstanceId, reason: String) {
+        self.call(
+            |reply| DeployOp::RecordLaunchFailure {
+                instance_id: instance_id.clone(),
+                reason,
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
     pub(super) async fn finish_fresh_instance(
         &self,
         instance_id: &InstanceId,
@@ -905,14 +861,12 @@ impl DeployOps {
         app_name: &str,
         namespace: &str,
         instance_id: &InstanceId,
-        is_job: bool,
     ) {
         self.call(
             |reply| DeployOp::ProvisionIdentity {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 instance_id: instance_id.clone(),
-                is_job,
                 reply,
             },
             (),
@@ -1137,28 +1091,6 @@ impl DeployOps {
         .await
     }
 
-    pub(super) async fn finish_job_instance(
-        &self,
-        instance_id: &InstanceId,
-        job_name: &str,
-        namespace: &str,
-        oci_spec: crate::grill::oci::OciSpec,
-        evidence: launch_evidence::LaunchEvidence,
-    ) -> Result<(), BunError> {
-        self.call(
-            |reply| DeployOp::FinishJobInstance {
-                instance_id: instance_id.clone(),
-                job_name: job_name.to_string(),
-                namespace: namespace.to_string(),
-                oci_spec: Box::new(oci_spec),
-                evidence: Box::new(evidence),
-                reply,
-            },
-            Ok(()),
-        )
-        .await
-    }
-
     pub(super) async fn rebuild_routing_table(&self) {
         self.call(|reply| DeployOp::RebuildRoutingTable { reply }, ())
             .await
@@ -1178,6 +1110,37 @@ impl DeployOps {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    /// Remember what an app admission on this node says about capacity, so
+    /// the next state report tells the leader (#681, #967).
+    ///
+    /// Every path that leases app replicas from the execution budget comes
+    /// through here: a fresh deploy, replicas added beside running ones and
+    /// a rolling or blue-green replacement. `ordinals` are the replicas the
+    /// admission tried to start: the leader moves those, and only those,
+    /// off this node (#971). A refusal is kept until an admission of the
+    /// same app succeeds; any other failure says nothing about capacity, so
+    /// it leaves the record as it was.
+    fn note_admission<T>(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        mut ordinals: Vec<u32>,
+        result: &Result<T, BunError>,
+    ) {
+        let key = (app_name.to_string(), namespace.to_string());
+        match result {
+            Err(BunError::Capacity { .. }) => {
+                ordinals.sort_unstable();
+                ordinals.dedup();
+                self.capacity_refusals.insert(key, ordinals);
+            }
+            Ok(_) => {
+                self.capacity_refusals.remove(&key);
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Apply one deploy op from a spawned deploy task. This is where the
     /// supervisor state machine stays authoritative: the task owns the
     /// blocking grill I/O, but every state transition and every mutation of
@@ -1193,9 +1156,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.complete_health_probe(instance_id, created_at, status)
                     .await;
             }
-            DeployOp::EnforceImageSignature { spec, reply } => {
-                let verdict = self.enforce_image_signature(&spec).await;
-                let check = self.cosign_check(spec.image.as_deref()).await;
+            DeployOp::EnforceImageSignature { image, reply } => {
+                let verdict = self.enforce_image_signature(image.as_deref()).await;
+                let check = self.cosign_check(image.as_deref()).await;
                 answer_after_cosign(verdict, check, reply);
             }
             DeployOp::StoreDeployedSpec {
@@ -1204,16 +1167,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 spec,
                 reply,
             } => {
-                let result = self.supervisor.admit_workload_kind(
-                    &app_name,
-                    &namespace,
-                    crate::bun::deploy_operations::DeployTargetKind::App,
-                );
-                if result.is_ok() {
-                    self.forget_adopted_app(&app_name, &namespace);
-                    self.deployed_specs.insert((app_name, namespace), *spec);
-                }
-                let _ = reply.send(result);
+                let adopted = self.adopted_spec(&app_name, &namespace);
+                self.forget_adopted_app(&app_name, &namespace);
+                let previous = self
+                    .deployed_specs
+                    .insert((app_name, namespace), *spec)
+                    .or(adopted);
+                let _ = reply.send(Ok(previous));
             }
             DeployOp::ListExistingOwned {
                 app_name,
@@ -1224,7 +1184,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .list_instances()
                     .iter()
-                    .filter(|i| !i.is_job && i.app_name == app_name && i.namespace == namespace)
+                    .filter(|i| i.app_name == app_name && i.namespace == namespace)
                     // Retired by an earlier rollout; only its release remains.
                     .filter(|i| !self.deferred_retirements.contains(&i.id))
                     .map(|i| i.id.clone())
@@ -1246,11 +1206,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 count,
                 reply,
             } => {
+                let adding = self
+                    .supervisor
+                    .ordinals_to_add(&app_name, &namespace, &spec, count);
                 // LOOP-INLINE: in-memory lock, no I/O
                 let result = self
                     .supervisor
                     .add_app_replicas(&app_name, &namespace, &spec, count, Instant::now())
                     .await;
+                self.note_admission(&app_name, &namespace, adding, &result);
                 let _ = reply.send(result);
             }
             DeployOp::NextDeployGen { app_name, reply } => {
@@ -1296,81 +1260,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .deploy_app(&app_name, &namespace, &spec, now)
                     .await;
-                let _ = reply.send(result);
-            }
-            DeployOp::EnforceImageReference { image, reply } => {
-                let verdict = self
-                    .enforce_image_reference_signature(image.as_deref())
-                    .await;
-                let check = self.cosign_check(image.as_deref()).await;
-                answer_after_cosign(verdict, check, reply);
-            }
-            DeployOp::ConfirmJobSuccess {
-                instance_id,
-                code,
-                reply,
-            } => {
-                let result = self
-                    .record_observed_job_exit(
-                        &instance_id,
-                        crate::bun::jobs::JobPhase::Exited { code },
-                    )
-                    .await;
-                if result.is_ok()
-                    && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
-                {
-                    instance.retry_pending = false;
-                    if instance.state.can_transition_to(ContainerState::Stopping) {
-                        instance.state = ContainerState::Stopping;
-                    }
-                    if instance.state.can_transition_to(ContainerState::Stopped) {
-                        instance.state = ContainerState::Stopped;
-                    }
-                }
-                let _ = reply.send(result);
-            }
-            DeployOp::PreparedBatchJob {
-                name,
-                namespace,
-                generation,
-                spec,
-                reply,
-            } => {
-                let id = crate::grill::InstanceIdentity::new(&namespace, &name, 0).instance_id();
-                let result =
-                    self.recorded_jobs
-                        .get(&id.0)
-                        .filter(|job| {
-                            job.generation == generation
-                                && job.restart_count == 0
-                                && job.phase == crate::bun::jobs::JobPhase::Preparing
-                                && job.batch_execution.is_some()
-                                && job.spec == *spec
-                        })
-                        .filter(|_| {
-                            !self.job_store_uncertain
-                                && self.supervisor.get_instance(&id).is_some_and(|instance| {
-                                    instance.state == ContainerState::Pending
-                                })
-                        })
-                        .map(|_| vec![id.clone()])
-                        .ok_or_else(|| {
-                            BunError::JobState(
-                                "prepared batch generation no longer owns this launch".into(),
-                            )
-                        });
-                let _ = reply.send(result);
-            }
-            DeployOp::SupervisorDeployJob {
-                rerun_unknown,
-                job_name,
-                namespace,
-                spec,
-                reply,
-            } => {
-                let result = self
-                    .prepare_job_run(&job_name, &namespace, &spec, rerun_unknown)
-                    .await;
+                self.note_admission(&app_name, &namespace, spec.replica_ordinals(), &result);
                 let _ = reply.send(result);
             }
             DeployOp::RegisterServiceApp {
@@ -1482,6 +1372,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 let _ = reply.send(result);
             }
+            DeployOp::RecordInitialiserGeneration {
+                instance_id,
+                initialiser,
+                generation,
+                reply,
+            } => {
+                // Only the parent that still owns the initialiser records it.
+                if self
+                    .initialisers
+                    .get(&instance_id)
+                    .is_some_and(|children| children.contains(&initialiser))
+                {
+                    self.initialiser_generations
+                        .entry(instance_id)
+                        .or_default()
+                        .insert(initialiser, generation);
+                }
+                let _ = reply.send(());
+            }
             DeployOp::ForgetInitialiser {
                 instance_id,
                 initialiser,
@@ -1546,6 +1455,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self.transition_deploy_state(&instance_id, to).await;
                 let _ = reply.send(result);
             }
+            DeployOp::RecordLaunchFailure {
+                instance_id,
+                reason,
+                reply,
+            } => {
+                self.record_launch_failure(&instance_id, reason).await;
+                let _ = reply.send(());
+            }
             DeployOp::FinishFreshInstance {
                 instance_id,
                 app_name,
@@ -1562,19 +1479,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 namespace,
                 instance_id,
-                is_job,
                 reply,
             } => {
                 // A no-op in standalone mode; a failure here is retried by the
                 // rotation loop rather than failing the deploy. The CSR runs
                 // off the loop, and the worker is answered when it finishes.
-                self.begin_identity_provision(
-                    &app_name,
-                    &namespace,
-                    &instance_id,
-                    is_job,
-                    Some(reply),
-                );
+                self.begin_identity_provision(&app_name, &namespace, &instance_id, Some(reply));
             }
             DeployOp::ReserveRollingInstance {
                 instance_id,
@@ -1586,6 +1496,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self
                     .reserve_rolling_instance(&instance_id, &app_name, &namespace, &spec)
                     .await;
+                // A rollout that can't start one replacement rolls back, so
+                // none of the new spec's replicas can run here.
+                self.note_admission(&app_name, &namespace, spec.replica_ordinals(), &result);
                 let _ = reply.send(result);
             }
             DeployOp::PrepareRollingInstance {
@@ -1630,11 +1543,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         owner.retry_pending = false;
                         owner.oci_spec = Some(instance.oci_spec);
                         let health_config =
-                            instance.spec.health.as_ref().zip(instance.spec.port).map(
-                                |(health, port)| {
-                                    crate::bun::health::HealthCheckConfig::from_spec(health, port)
-                                },
-                            );
+                            crate::bun::health::HealthCheckConfig::for_app(&instance.spec);
                         owner.health_config = health_config.clone();
                         if let Some(config) = health_config {
                             self.supervisor
@@ -1700,21 +1609,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(());
             }
             DeployOp::PushDeployHistory { entry, reply } => {
-                self.deploy_history.write().await.push(*entry);
+                record_deploy_history(&mut *self.deploy_history.write().await, *entry);
                 let _ = reply.send(());
-            }
-            DeployOp::FinishJobInstance {
-                instance_id,
-                job_name,
-                namespace,
-                oci_spec,
-                evidence,
-                reply,
-            } => {
-                let result = self
-                    .finish_job_instance(&instance_id, &job_name, &namespace, *oci_spec, &evidence)
-                    .await;
-                let _ = reply.send(result);
             }
             DeployOp::RebuildRoutingTable { reply } => {
                 self.rebuild_routing_table().await;
@@ -1742,5 +1638,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::{DEPLOY_HISTORY_PER_APP, record_deploy_history};
+    use crate::meat::deploy_types::{DeployHistoryEntry, DeployId, DeployResult};
+
+    fn entry(app: &str, id: u64) -> DeployHistoryEntry {
+        DeployHistoryEntry {
+            id: DeployId(id),
+            app_id: crate::meat::types::AppId::new(app, "default"),
+            image: format!("{app}:{id}"),
+            result: DeployResult::Completed,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+            steps_completed: 1,
+            steps_total: 1,
+            spec: None,
+        }
+    }
+
+    #[test]
+    fn deploy_history_keeps_the_newest_fifty_entries_per_app() {
+        let mut history = Vec::new();
+        record_deploy_history(&mut history, entry("api", 0));
+        for id in 0..120 {
+            record_deploy_history(&mut history, entry("web", id));
+        }
+        let web: Vec<u64> = history
+            .iter()
+            .filter(|entry| entry.app_id.name == "web")
+            .map(|entry| entry.id.0)
+            .collect();
+        assert_eq!(web.len(), DEPLOY_HISTORY_PER_APP);
+        assert_eq!(web.first(), Some(&70), "the oldest entries go first");
+        assert_eq!(web.last(), Some(&119));
+        assert!(
+            history.iter().any(|entry| entry.app_id.name == "api"),
+            "one app's deploys never push out another app's history"
+        );
     }
 }

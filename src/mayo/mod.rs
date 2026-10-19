@@ -7,6 +7,7 @@
 
 pub mod alert;
 pub mod collector;
+pub mod job_metrics;
 pub mod query_fanout;
 pub mod rollup;
 pub mod rollup_generator;

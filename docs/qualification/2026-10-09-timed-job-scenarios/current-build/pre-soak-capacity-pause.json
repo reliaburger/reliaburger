@@ -1,0 +1,9 @@
+{
+  "driver_pid": 2960659,
+  "driver_start_ticks": 119330469,
+  "reason": "Pause orchestration parent before hourly measurements; recording child continues normally",
+  "retired_helper_archive_sha256": "daf3d50e33b863b231e535657a2dab17485305c6b89d426cd54e84a5e7cdce4a",
+  "retired_helper_bytes": 328863296,
+  "filesystem_available_before_hours": 2701819904,
+  "driver_resumed": true
+}

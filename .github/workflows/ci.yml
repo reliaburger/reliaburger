@@ -3,24 +3,35 @@ name: CI
 on:
   workflow_call:
   push:
-    branches: [main]
+    # A push to a release's merge train runs everything on the merged result.
+    branches: [main, "release-*"]
   pull_request:
     # fix/** covers review PRs stacked on each other rather than on main.
-    # release-* is each release's merge train: PRs into it get the whole of CI.
+    # release-* is each release's merge train: PRs into it get the light set
+    # (scripts/ci/select-jobs.sh), and the merge queue and the push to the
+    # train run everything.
     branches: [main, "codex/**", "fix/**", "release-*"]
-    # labeled lets a `full-ci` label start the heavy suites on a stacked PR.
+    # labeled lets a `full-ci` label start the heavy suites on any PR (on a
+    # PR into a train, everything but the macOS shards).
     types: [opened, synchronize, reopened, labeled]
+  merge_group:
+    # The merge queue on release-* tests each batch, merged onto the train,
+    # with every job before any of it lands. It requires one check:
+    # "ignored-test evidence", which waits for every other job.
+    types: [checks_requested]
   schedule:
     # Nightly full run on main, including the benchmarks.
     - cron: "17 3 * * *"
 
-# PR updates supersede earlier checks. Main/tag runs each retain their own group.
+# A newer push to a PR, or to a merge train, supersedes the older run: the
+# newer commit contains the older one. Main, merge-queue and called runs each
+# keep their own group; the queue cancels its own groups when it re-forms.
 # Fixed prefixes also keep reusable source CI separate from its release caller,
 # and github.workflow (the caller's name when called) keeps a retarget run
 # (ci-retarget.yml) from cancelling the pull request's own run.
 concurrency:
-  group: source-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: source-ci-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-') && github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')) }}
 
 permissions:
   contents: read
@@ -43,7 +54,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_PROFILE: ci
-  EXPECTED_CHECKOUT_COMMIT: ${{ github.sha }}
+  # Evidence binds to the commit this run checked out: the PR's test merge,
+  # the pushed commit, or the merge queue's temporary group commit.
+  EXPECTED_CHECKOUT_COMMIT: ${{ github.event.merge_group.head_sha || github.sha }}
   PYTHONDONTWRITEBYTECODE: '1'
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
@@ -56,6 +69,8 @@ jobs:
       code: ${{ steps.select.outputs.code }}
       gossip: ${{ steps.select.outputs.gossip }}
       heavy: ${{ steps.select.outputs.heavy }}
+      task_arrays: ${{ steps.select.outputs.task_arrays }}
+      macos: ${{ steps.select.outputs.macos }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +81,8 @@ jobs:
           # The PR event names the branch it targets; github.base_ref reported
           # main for a PR stacked on another branch (run 35921062344).
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # A train's gate PR into main, or any PR from a train, runs everything.
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
         run: scripts/ci/select-jobs.sh
@@ -79,6 +96,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # test_shard_partition.py checks the macOS shard merge against what
+      # the pinned nextest really lists, on a throwaway crate.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - name: Test the CI scripts
         run: make test-ci-scripts
       - name: Every ignored test names its owner
@@ -276,9 +298,39 @@ jobs:
           path: target/contracts/linux/rootless-linux
           if-no-files-found: error
           retention-days: 14
+      - name: Watch disk and memory during the OCI interruptions
+        # Twice on 11 Oct the runner itself stopped answering in the next
+        # step and GitHub kept no log at all (#800). Record the headroom
+        # every 5 s; the report below prints the low-water marks.
+        run: |
+          nohup bash -c 'while :; do echo "$(date -u +%T) disk_kb=$(df -k --output=avail / | tail -1 | tr -d " ") mem_kb=$(awk "/^MemAvailable/ {print \$2}" /proc/meminfo) load=$(cut -d" " -f1 /proc/loadavg)"; sleep 5; done' > "$RUNNER_TEMP/oci-resources.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/oci-resources.pid"
       - name: Qualify actual Bun OCI interruptions
         id: oci_interruptions
+        # Normally five minutes; the driver allows each of its three binaries
+        # 420 s. Fail the step well inside the job limit, so a hang keeps its
+        # log, its evidence and the report below (#800).
+        timeout-minutes: 25
         run: scripts/release/qualify-oci-interruptions.sh
+      - name: Report the OCI interruptions' headroom and leftovers
+        if: always()
+        timeout-minutes: 3
+        run: |
+          kill "$(cat "$RUNNER_TEMP/oci-resources.pid")" 2>/dev/null || true
+          echo "Lowest free disk and memory while the OCI interruptions ran:"
+          sort -t= -k2 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          sort -t= -k3 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          if [ "${{ steps.oci_interruptions.outcome }}" != success ]; then
+            ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
+            # Kernel stacks of every uninterruptible task, and of every thread
+            # of a test binary, Bun or owner that outlived the step.
+            for pid in $(ps -eo pid=,stat=,args= | awk '$2 ~ /^D/ || /target\/debug\/(deps\/|bun)|upgrade-bin\/bun|__process-owner/ {print $1}'); do
+              for task in /proc/"$pid"/task/*; do
+                echo "== $task ($(sudo cat "$task"/comm 2>/dev/null), $(sudo cat "$task"/wchan 2>/dev/null))"
+                sudo cat "$task"/stack 2>/dev/null || true
+              done
+            done
+          fi
       - name: Retain oci-interruptions current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -386,7 +438,8 @@ jobs:
       upgrade_cluster_sha256: ${{ steps.upgrade_cluster.outputs.upgrade_cluster_sha256 }}
       standard_clients_sha256: ${{ steps.standard_clients.outputs.standard_clients_sha256 }}
     # Wall-clock, single-node upgrade and cluster upgrade suites, plus the
-    # crane interoperability test: each used to pay for its own test build.
+    # standard registry client tests (docker, podman, skopeo, crane): each
+    # used to pay for its own test build.
     name: acceptance
     needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
@@ -459,6 +512,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/crane"
           tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane" crane
           echo "$RUNNER_TEMP/crane" >> "$GITHUB_PATH"
+      - name: Prepare the host for docker, podman and skopeo
+        # docker, podman and skopeo come with the runner image. The gate's
+        # host check fails if one is missing and logs the versions it ran.
+        # This step names the registry host and lets the tests install their
+        # CA under certs.d.
+        if: ${{ !cancelled() }}
+        run: sudo scripts/standard-clients-host.sh --provision
       - name: Standard registry clients
         id: standard_clients
         if: ${{ !cancelled() }}
@@ -501,35 +561,53 @@ jobs:
           retention-days: 14
 
   ignored-evidence:
+    # The final gate, and the one check the merge queue requires: it waits
+    # for every other job, fails if any of them failed, and then checks that
+    # every selected evidence owner completed its exact cases this run. It
+    # always reports, so a skipped owner can never stand in for a pass.
     name: ignored-test evidence
-    needs: [changes, portable, macos, contract-boundaries, build-tests, linux, cluster, acceptance]
-    if: ${{ always() && needs.changes.outputs.code == 'true' }}
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Every job this run waited for succeeded or was not selected
+        run: |
+          mkdir -p target
+          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
+          python3 scripts/ci/every_job.py --needs target/workflow-needs.json --event "$GITHUB_EVENT_NAME"
       - uses: actions/download-artifact@v4
+        if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
         with:
           pattern: contract-*
           path: incoming
           merge-multiple: false
       - name: Every selected owner and exact required case completed this run
+        if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
         run: |
-          mkdir -p target
-          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
           python3 scripts/ci/workflow_adapter.py aggregate --root . \
             --manifest tests/contracts/manifest.json --directory incoming \
             --ignored-bindings tests/contracts/ignored-bindings.json \
             --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME"
 
   macos:
     outputs:
-      portable_darwin_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_sha256 }}
-    name: portable macOS
+      portable_darwin_1_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_1_sha256 }}
+      portable_darwin_2_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_2_sha256 }}
+      portable_darwin_3_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_3_sha256 }}
+    # The portable suite on macOS, split three ways by nextest hash partition
+    # (SHARDS in scripts/ci/workflow_assembly.py). Each shard sets only its own
+    # output; ignored-test evidence proves the three ran every test once.
+    name: portable macOS (${{ matrix.shard }}/3)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.macos == 'true'
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -541,27 +619,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Three shards would save the same cache three times.
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
           cache-on-failure: true
       - name: Clear restored execution envelopes
         run: rm -rf -- target/contracts
       # One pass, all features: the macOS-only code is in it, and the lint
       # job runs the no-features pass on Linux (see lint-macos in Makefile).
+      # One shard runs it.
       - name: Lint every target, with all features
+        if: matrix.shard == 1
         run: make lint-macos
       - name: Portable tests
         id: portable_darwin
         run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --host darwin --directory target/contracts/darwin/portable-darwin --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "${{ matrix.shard }}/3" --host darwin --directory "target/contracts/darwin/portable-darwin-${{ matrix.shard }}" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain portable-darwin current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: contract-darwin-portable-darwin
-          path: target/contracts/darwin/portable-darwin
+          name: contract-darwin-portable-darwin-${{ matrix.shard }}
+          path: target/contracts/darwin/portable-darwin-${{ matrix.shard }}
           if-no-files-found: error
           retention-days: 14
+      # Doctests run on another shard than the lint, to even them out.
       - name: Doctests
+        if: matrix.shard == 2
         run: make test-doc
   benchmarks:
     # Criterion output is uploaded, not gated, so pull requests only pay for
@@ -587,3 +670,56 @@ jobs:
           path: target/criterion
           if-no-files-found: error
           retention-days: 14
+
+  task-array-benchmarks:
+    # benches/task_arrays.rs: the leader's cost for a 1M-task array, the node
+    # pool's overhead per task and this runner's fork/exec floor. Nightly on
+    # main, and on pull requests that touch what it measures (select-jobs.sh).
+    # Hosted runners vary from run to run, so it measures each benchmark
+    # against main's last baseline relative to the rest of this run, and fails
+    # only when one is more than twice as slow as the rest, or the run's
+    # median is more than twice as slow (#857). A benchmark over that limit
+    # is measured once more on its own, and fails only when it's over the
+    # limit both times, so one disk stall isn't a regression (#936). The full
+    # Criterion output is kept for the trend #668 reads.
+    name: task-array benchmarks
+    needs: changes
+    if: needs.changes.outputs.task_arrays == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Restore the last baseline main saved
+        uses: actions/cache/restore@v4
+        with:
+          path: target/task-array-baseline
+          key: task-array-bench-${{ github.run_id }}
+          restore-keys: task-array-bench-
+      - run: make bench-task-arrays
+      - name: Compare with main's baseline
+        run: python3 scripts/ci/bench_baseline.py compare --criterion target/criterion --baseline target/task-array-baseline/baseline.json --max-ratio 2 --summary "$GITHUB_STEP_SUMMARY" --remeasure 'cargo bench --bench task_arrays --'
+      - name: Record this run as main's baseline
+        if: github.ref == 'refs/heads/main'
+        run: python3 scripts/ci/bench_baseline.py save --criterion target/criterion --baseline target/task-array-baseline/baseline.json
+      - name: Keep the baseline for the next run
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/task-array-baseline
+          key: task-array-bench-${{ github.run_id }}
+      # Kept 90 days, not 14: #668's cost trend is read from these.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-task-arrays
+          path: |
+            target/criterion
+            target/task-array-baseline
+          if-no-files-found: error
+          retention-days: 90

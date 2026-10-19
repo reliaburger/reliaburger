@@ -59,8 +59,6 @@ pub struct InstanceRecord {
     pub app_name: String,
     /// Replica index within the app (the `0` of `web-0`).
     pub replica_index: u32,
-    /// Job (run-to-completion) rather than long-running app.
-    pub is_job: bool,
     /// OCI image reference (informational; empty for process workloads).
     pub image: String,
     pub runtime: RuntimeKind,
@@ -350,6 +348,9 @@ mod tests {
 
     fn oci_spec() -> OciSpec {
         OciSpec {
+            reusable_executor: false,
+            host_process: false,
+            initialiser: false,
             port_mapping: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
@@ -362,6 +363,7 @@ mod tests {
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
+                oom_score_adj: None,
                 overrides: None,
             },
             mounts: vec![],
@@ -382,7 +384,6 @@ mod tests {
             namespace: "default".to_string(),
             app_name: "web".to_string(),
             replica_index: 0,
-            is_job: false,
             image: String::new(),
             runtime: RuntimeKind::Process,
             pid,

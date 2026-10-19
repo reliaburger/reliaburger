@@ -1,14 +1,14 @@
 //! The audit exception for rkyv is valid only while Cargo cannot build it.
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
 fn audit_refuses_an_active_or_uninspectable_rkyv_dependency() {
     let dir = tempfile::tempdir().unwrap();
     let cargo = dir.path().join("cargo-fixture");
-    std::fs::write(
+    // Shared, already-launched scripts rather than new files (#582).
+    crate::first_launch::install_script(
         &cargo,
         r#"#!/bin/sh
 case "$1" in
@@ -22,12 +22,8 @@ case "$1" in
   *) exit 24 ;;
 esac
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let date = dir.path().join("date");
-    std::fs::write(&date, "#!/bin/sh\necho 20260918\n").unwrap();
-    std::fs::set_permissions(&date, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
+    crate::first_launch::install_script(&dir.path().join("date"), "#!/bin/sh\necho 20260918\n");
     let mut paths = vec![dir.path().to_path_buf()];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -53,4 +49,25 @@ esac
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// RUSTSEC-2024-0449: unsafe-libyaml is unmaintained. relish reads and writes
+/// YAML through yaml_serde, which uses the maintained libyaml-rs port, so the
+/// lock file must not pull unsafe-libyaml (or the deprecated serde_yaml) back
+/// in, and the audit must not need an exception for it (#817).
+#[test]
+fn lock_file_has_no_unsafe_libyaml_and_audit_needs_no_exception_for_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    for banned in ["unsafe-libyaml", "serde_yaml"] {
+        assert!(
+            !lock.contains(&format!("name = \"{banned}\"")),
+            "Cargo.lock still contains {banned}"
+        );
+    }
+    let audit = std::fs::read_to_string(root.join(".cargo/audit.toml")).unwrap();
+    assert!(
+        !audit.contains("\"RUSTSEC-2024-0449\""),
+        ".cargo/audit.toml still ignores RUSTSEC-2024-0449"
+    );
 }

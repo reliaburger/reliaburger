@@ -218,6 +218,23 @@ class Gates(unittest.TestCase):
         with self.assertRaisesRegex(c.Invalid, 'receipt changed'):
             self.produce()
 
+    def test_archive_built_by_an_earlier_attempt_of_this_run_still_qualifies_a_rerun_owner(self):
+        # "Re-run failed jobs" re-runs the consumer as attempt 2 but keeps the
+        # attempt-1 archive from the build job that passed.
+        self.plan['attempt'] = self.expected['attempt'] = '2'
+        self.test_features_archive_remap_ignored_and_exclusions_shared()
+        self.assertEqual(self.plan['entries'][0]['archive_origin']['builder']['attempt'], '1')
+
+    def test_archive_builder_attempt_must_be_a_positive_earlier_or_current_attempt(self):
+        self.test_features_archive_remap_ignored_and_exclusions_shared()
+        saved = copy.deepcopy(self.plan)
+        for value in ('0', '', '1a', 1):
+            with self.subTest(attempt=value):
+                self.plan = copy.deepcopy(saved)
+                self.plan['entries'][0]['archive_origin']['builder']['attempt'] = value
+                with self.assertRaises(c.Invalid):
+                    self.produce()
+
     def test_archive_builder_keeps_actual_completion_and_refuses_missing_archive(self):
         command = ['cargo', 'nextest', 'archive', '--archive-file=tests.tar.zst']
         context = dict(commit=self.plan['commit'], run_id='100', attempt='1', host='linux')

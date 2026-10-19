@@ -154,15 +154,14 @@ impl MustardTransport for InMemoryTransport {
 // UDP transport for production
 // ---------------------------------------------------------------------------
 
-/// Maximum UDP datagram size for gossip messages.
-/// Stays below typical MTU to avoid IP fragmentation.
-const MAX_UDP_PAYLOAD: usize = 1400;
+use super::message::MAX_DATAGRAM_BYTES;
 
 /// Real UDP transport for gossip messages.
 ///
 /// Binds a single UDP socket that handles both sending and receiving.
 /// Messages are serialised with bincode. Datagrams exceeding
-/// `MAX_UDP_PAYLOAD` bytes are rejected to avoid fragmentation.
+/// [`MAX_DATAGRAM_BYTES`] are refused with an error to avoid
+/// fragmentation; the protocol sizes every message to fit first.
 ///
 /// Supports a runtime blocklist for chaos testing: messages to/from
 /// blocked addresses are silently dropped. The blocklist is shared
@@ -215,10 +214,12 @@ impl UdpMustardTransport {
     }
 
     /// The local address this socket is bound to.
-    pub fn local_addr(&self) -> SocketAddr {
+    pub fn local_addr(&self) -> Result<SocketAddr, MustardError> {
         self.socket
             .local_addr()
-            .expect("UDP socket should have a local address")
+            .map_err(|e| MustardError::RecvFailed {
+                reason: format!("UDP socket has no local address: {e}"),
+            })
     }
 }
 
@@ -261,9 +262,9 @@ impl MustardTransport for UdpMustardTransport {
                 .map_err(|e| MustardError::Serialisation(e.to_string()))?,
         };
 
-        if bytes.len() > MAX_UDP_PAYLOAD {
+        if bytes.len() > MAX_DATAGRAM_BYTES {
             return Err(MustardError::Serialisation(format!(
-                "gossip message too large: {} bytes (max {MAX_UDP_PAYLOAD})",
+                "gossip message too large: {} bytes (max {MAX_DATAGRAM_BYTES})",
                 bytes.len()
             )));
         }
@@ -463,7 +464,7 @@ mod tests {
             .await
             .unwrap()
             .with_key(Some(gossip_key(1)));
-        let dst = t2.local_addr();
+        let dst = t2.local_addr().unwrap();
 
         t1.send(dst, &ping_msg("node-1")).await.unwrap();
         let (_, msg) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())
@@ -483,7 +484,7 @@ mod tests {
             .await
             .unwrap()
             .with_key(Some(gossip_key(2)));
-        let dst = t2.local_addr();
+        let dst = t2.local_addr().unwrap();
 
         t1.send(dst, &ping_msg("node-1")).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), t2.recv()).await;
@@ -498,7 +499,7 @@ mod tests {
             .unwrap()
             .with_node_gate(gate.clone());
         let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
-        let dst = t2.local_addr();
+        let dst = t2.local_addr().unwrap();
 
         gate.quiesce();
         t1.send(dst, &ping_msg("node-1")).await.unwrap();
@@ -526,6 +527,8 @@ mod tests {
             labels: std::collections::BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
+            recovery_id: None,
+            jobs: None,
             hmac: [0u8; 32],
         }
     }
@@ -540,7 +543,7 @@ mod tests {
             .await
             .unwrap()
             .with_key(Some(gossip_key(1)));
-        let dst = t2.local_addr();
+        let dst = t2.local_addr().unwrap();
 
         let mut msg = ping_msg("node-1");
         msg.extension = Some(an_extension());
@@ -559,7 +562,7 @@ mod tests {
     async fn udp_transport_without_keys_delivers_the_extension_unsigned() {
         let t1 = UdpMustardTransport::bind(addr(0)).await.unwrap();
         let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
-        let dst = t2.local_addr();
+        let dst = t2.local_addr().unwrap();
 
         let mut msg = ping_msg("node-1");
         msg.extension = Some(an_extension());
@@ -582,7 +585,7 @@ mod tests {
             .await
             .unwrap()
             .with_key(Some(key));
-        let dst = t2.local_addr();
+        let dst = t2.local_addr().unwrap();
 
         let mut msg = ping_msg("node-1")
             .signed(&crate::sesame::mtls::gossip_hmac::derive_gossip_key(
@@ -609,7 +612,7 @@ mod tests {
     async fn udp_transport_without_keys_still_delivers() {
         let t1 = UdpMustardTransport::bind(addr(0)).await.unwrap();
         let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
-        let dst = t2.local_addr();
+        let dst = t2.local_addr().unwrap();
 
         t1.send(dst, &ping_msg("node-1")).await.unwrap();
         let (_, msg) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())

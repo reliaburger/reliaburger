@@ -143,6 +143,14 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
                     crate::relish::council_view::render_status_header(&summary)
                 );
             }
+            // A Lost image can't be pulled or deployed until someone pushes
+            // it again (#697); say so before the instance list.
+            if let Ok(capabilities) = client.capabilities().await
+                && let Some(placement) = capabilities.placement
+            {
+                print!("{}", render_registry_needs_mtls(&placement.registry));
+                print!("{}", render_lost_images(&placement.registry));
+            }
             // The council knows why an app isn't placed. That is extra
             // detail: an agent that can't say still shows its instances.
             let desired = client.desired_apps().await.unwrap_or_default();
@@ -154,12 +162,46 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
 
     Ok(())
+}
+
+/// The `relish status` warning for a plaintext cluster's registry (#792):
+/// one line naming the fix, or nothing when the registry can forward.
+pub fn render_registry_needs_mtls(
+    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
+) -> String {
+    if !registry.needs_mtls {
+        return String::new();
+    }
+    "registry: needs mTLS; this plaintext cluster can't push or read cluster images. \
+     Start the cluster with TLS (`relish init`, then `relish join`)\n"
+        .to_string()
+}
+
+/// The `relish status` warning for Lost images (design §7.3): one line
+/// naming them, or nothing when none are lost.
+pub fn render_lost_images(
+    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
+) -> String {
+    if registry.lost_image_count == 0 {
+        return String::new();
+    }
+    let mut names = registry.lost_images.join(", ");
+    let unnamed = registry
+        .lost_image_count
+        .saturating_sub(registry.lost_images.len());
+    if unnamed > 0 {
+        names.push_str(&format!(" and {unnamed} more"));
+    }
+    format!(
+        "registry: {} lost image(s), no live node holds them: {names}; re-push them\n",
+        registry.lost_image_count
+    )
 }
 
 /// The `relish logs` flags, as typed.
@@ -262,7 +304,7 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
 
 /// Parse a point in time for `--flag`: raw epoch seconds, or a duration like
 /// `30s`, `5m`, `2h`, `1d` before now.
-fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
+pub(super) fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
     if value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty() {
         return value.parse::<u64>().map_err(|e| RelishError::InvalidFlag {
             flag: flag.to_string(),
@@ -501,17 +543,18 @@ async fn stop_with_client(
     Ok(())
 }
 
-/// Remove an app from the cluster.
-pub async fn delete(app: &str, namespace: &str) -> Result<(), RelishError> {
-    delete_with_client(app, namespace, &BunClient::default_local()).await
+/// Remove an app from the cluster. A GitOps-managed app needs `force`.
+pub async fn delete(app: &str, namespace: &str, force: bool) -> Result<(), RelishError> {
+    delete_with_client(app, namespace, force, &BunClient::default_local()).await
 }
 
 async fn delete_with_client(
     app: &str,
     namespace: &str,
+    force: bool,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    client.delete(app, namespace).await?;
+    client.delete_with_force(app, namespace, force).await?;
     println!("delete requested for {app}; check `relish status` for remaining instances");
     Ok(())
 }
@@ -535,6 +578,51 @@ pub enum InitSecurityMode {
     MutualTls,
     /// Leave internal transports plaintext for isolated development only.
     DevelopmentPlaintext,
+}
+
+/// What `relish init` needs to know about the host it writes a node config
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitHost {
+    /// The host runs Linux, where the eBPF data path exists.
+    pub linux: bool,
+    /// `relish init` runs as root, as Bun will on a rootful runc node.
+    pub root: bool,
+    /// `runc` is on `PATH`.
+    pub runc: bool,
+}
+
+impl InitHost {
+    /// Inspect the current host.
+    pub fn detect() -> Self {
+        let runc = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|directory| directory.join("runc").is_file())
+        });
+        Self {
+            linux: cfg!(target_os = "linux"),
+            root: nix::unistd::geteuid().is_root(),
+            runc,
+        }
+    }
+
+    /// Whether a node here runs rootful runc and so can load the eBPF data
+    /// path.
+    fn runs_rootful_runc(self) -> bool {
+        self.linux && self.root && self.runc
+    }
+}
+
+/// Turn on the eBPF data path and the DNS responder for a rootful runc
+/// node. Namespace isolation is enforced only with eBPF, and Bun refuses to
+/// start such a node when eBPF fails to load, so isolation is on by default
+/// rather than silently absent. An egress allowlist resolves names through
+/// the DNS responder. Elsewhere both stay off, and Bun refuses `allow_from`
+/// and egress allowlists instead of running them unenforced.
+pub fn enable_node_data_path(config: &mut crate::config::node::NodeConfig, host: InitHost) {
+    if host.runs_rootful_runc() {
+        config.ebpf.enabled = true;
+        config.dns.enabled = true;
+    }
 }
 
 /// Initialise a new cluster with starter config files and PKI, using mTLS for
@@ -631,6 +719,7 @@ pub fn init_with_security(
     // address — bun otherwise refuses to bind them (C7).
     node_config.security.allow_insecure_cluster =
         security_mode == InitSecurityMode::DevelopmentPlaintext;
+    enable_node_data_path(&mut node_config, InitHost::detect());
     let security_header = match security_mode {
         InitSecurityMode::MutualTls => "# Internal cluster transports require mTLS.\n",
         InitSecurityMode::DevelopmentPlaintext => {
@@ -743,7 +832,7 @@ pub async fn decommission_node(
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&retirement).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&retirement).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())
@@ -783,7 +872,7 @@ async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(
                 println!("{json}");
             }
             OutputFormat::Yaml => {
-                let yaml = serde_yaml::to_string(&nodes).map_err(RelishError::SerialiseYaml)?;
+                let yaml = yaml_serde::to_string(&nodes).map_err(RelishError::SerialiseYaml)?;
                 print!("{yaml}");
             }
         }
@@ -945,7 +1034,7 @@ async fn council_with_client(output: OutputFormat, client: &BunClient) -> Result
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&report).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&report).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -963,7 +1052,7 @@ fn print_standalone_council(
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(council).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(council).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -975,34 +1064,31 @@ fn print_standalone_council(
 /// Offline by design: run it against a STOPPED node. It restores the desired
 /// state (from a sealed backup or the node's own snapshot and committed
 /// log), retires the dead cluster's Raft log, and stamps a fresh recovery
-/// epoch. The next start
-/// re-bootstraps a single-voter council the reconciler regrows.
+/// epoch and recovery id. The next start re-bootstraps a single-voter
+/// council the reconciler regrows.
+///
+/// Before it changes anything it asks every voter the restored state names,
+/// on `api_port`, whether it still serves a council, and refuses if one does
+/// or if the state names no voters (#694). It also refuses a data directory
+/// another recovery has already fenced. `force` overrides both.
 pub async fn council_recover(
     data_dir: &std::path::Path,
     from: Option<&str>,
+    backup: Option<&str>,
     master_key_path: Option<&std::path::Path>,
+    api_port: u16,
     force: bool,
 ) -> Result<(), RelishError> {
-    use crate::council::recovery::{RecoverySource, load_recovery_state, recover_data_dir};
+    use crate::council::recovery::{
+        RecoverySource, load_recovery_state, persisted_voters, recover_data_dir,
+    };
+    use crate::relish::recover_guard::{VoterEndpoint, check_voters_gone, probe_client};
 
-    // Safety check: refuse if a live council still answers, unless forced. In a
-    // genuine full-council loss the local agent is down, so this check simply
-    // passes; it only bites when someone runs recovery against a healthy
-    // cluster by mistake.
-    if !force {
-        if let Ok(nodes) = BunClient::default_local().nodes().await {
-            let live_voter = nodes.iter().find(|n| n.is_council && !n.is_down());
-            if let Some(voter) = live_voter {
-                return Err(RelishError::Recovery(format!(
-                    "a live council voter ({}) is still reachable; stop the cluster or pass --force",
-                    voter.node_id
-                )));
-            }
-        }
-    } else {
+    if force {
         eprintln!(
-            "WARNING: --force skips the live-council check. Recovering a cluster that still has a \
-             quorum will split the brain. Continue only if every voter is truly gone."
+            "WARNING: --force skips the live-voter and fenced-directory checks. Recovering a \
+             cluster that still has a quorum will split the brain. Continue only if every voter \
+             is truly gone."
         );
     }
 
@@ -1023,7 +1109,10 @@ pub async fn council_recover(
         .transpose()?;
 
     let source = match from {
-        Some(url) => RecoverySource::BackupUrl(url.to_string()),
+        Some(url) => RecoverySource::BackupUrl {
+            url: url.to_string(),
+            backup: backup.map(str::to_string),
+        },
         None => RecoverySource::NodeDataDir(data_dir.to_path_buf()),
     };
 
@@ -1034,12 +1123,32 @@ pub async fn council_recover(
     let token_count = state.security_state.api_tokens.len();
     let prior_epoch = state.recovery_epoch;
 
-    recover_data_dir(data_dir, state).map_err(|e| RelishError::Recovery(e.to_string()))?;
+    // The live-voter guard: every voter of the council this state came
+    // from must be gone, or recovery starts a second council next to it.
+    if !force {
+        let voters: Vec<VoterEndpoint> = persisted_voters(&state)
+            .iter()
+            .map(|info| VoterEndpoint::from_info(info, api_port))
+            .collect();
+        let client = probe_client()
+            .map_err(|e| RelishError::Recovery(format!("build the voter probe: {e}")))?;
+        check_voters_gone(&client, &voters)
+            .await
+            .map_err(|refusal| RelishError::Recovery(refusal.to_string()))?;
+    }
+
+    let claim = recover_data_dir(data_dir, state, force)
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    let recovery_id = claim
+        .id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "-".to_string());
 
     println!("Council recovery complete.");
     println!("  Restored apps:   {app_count}");
     println!("  API tokens:      {token_count}");
-    println!("  Recovery epoch:  {} -> {}", prior_epoch, prior_epoch + 1);
+    println!("  Recovery epoch:  {prior_epoch} -> {}", claim.epoch);
+    println!("  Recovery id:     {recovery_id}");
     println!("  Data directory:  {}", data_dir.display());
     println!();
     println!("Start this node to re-bootstrap a single-voter council; the reconciler");
@@ -1050,6 +1159,78 @@ pub async fn council_recover(
     println!("this node, nothing can tell them. Re-enrol each one before starting it:");
     println!("  relish council re-enrol --data-dir <its data directory>");
     Ok(())
+}
+
+/// One row of `relish council backups`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct BackupListing {
+    name: String,
+    recovery_epoch: u64,
+    term: u64,
+    index: u64,
+    millis: u64,
+    recovery_id: Option<String>,
+}
+
+/// List the council backups at `from`, newest first: the order
+/// `council recover` tries them in, and the names `--backup` takes (#695).
+/// Lists object names only, so it needs no master key.
+pub async fn council_backups(from: &str, output: OutputFormat) -> Result<(), RelishError> {
+    let store = crate::council::backup::BackupStore::from_url(from)
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    let keys = store
+        .list()
+        .await
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    let rows: Vec<BackupListing> = keys
+        .iter()
+        .rev()
+        .map(|key| BackupListing {
+            name: key.object_name(),
+            recovery_epoch: key.recovery_epoch,
+            term: key.term,
+            index: key.index,
+            millis: key.millis,
+            recovery_id: key.recovery_id.map(|id| id.to_string()),
+        })
+        .collect();
+    match output {
+        OutputFormat::Human => print_backups_human(&rows),
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&rows).map_err(RelishError::SerialiseJson)?;
+            println!("{json}");
+        }
+        OutputFormat::Yaml => {
+            let yaml = yaml_serde::to_string(&rows).map_err(RelishError::SerialiseYaml)?;
+            print!("{yaml}");
+        }
+    }
+    Ok(())
+}
+
+fn print_backups_human(rows: &[BackupListing]) {
+    if rows.is_empty() {
+        println!("no backups");
+        return;
+    }
+    println!(
+        "{:<6} {:<8} {:<10} {:<24} NAME",
+        "EPOCH", "TERM", "INDEX", "TAKEN (UTC)"
+    );
+    for row in rows {
+        let taken =
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(row.millis) * 1_000_000)
+                .ok()
+                .and_then(|at| {
+                    at.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+                .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<6} {:<8} {:<10} {:<24} {}",
+            row.recovery_epoch, row.term, row.index, taken, row.name
+        );
+    }
 }
 
 /// Re-enrol a voter fenced out by `council recover` (#424): offline, against
@@ -1197,7 +1378,7 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
                 }
                 OutputFormat::Yaml => {
                     let yaml =
-                        serde_yaml::to_string(&result).map_err(RelishError::SerialiseYaml)?;
+                        yaml_serde::to_string(&result).map_err(RelishError::SerialiseYaml)?;
                     print!("{yaml}");
                 }
             }
@@ -1245,7 +1426,7 @@ pub async fn cancel_deploy(operation_id: &str, output: OutputFormat) -> Result<(
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&operation).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&operation).map_err(RelishError::SerialiseYaml)?
         ),
     }
     if matches!(
@@ -1295,7 +1476,7 @@ pub async fn history(app: &str, namespace: &str, output: OutputFormat) -> Result
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&entries).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&entries).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -1332,13 +1513,14 @@ fn render_history_table(
     table
 }
 
-/// Rollback an app to the previous version.
-pub async fn rollback(app: &str, namespace: &str) -> Result<(), RelishError> {
+/// Rollback an app to the previous version. A GitOps-managed app needs
+/// `force`.
+pub async fn rollback(app: &str, namespace: &str, force: bool) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
     // X3: rollback used to only print advice. It now calls the server,
     // which redeploys the previous successful spec.
-    client.rollback(app, namespace).await?;
+    client.rollback_with_force(app, namespace, force).await?;
     println!("rolled {app} back to its previous version");
     Ok(())
 }
@@ -1543,7 +1725,7 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&top.rows).map_err(RelishError::SerialiseYaml)?;
+            let yaml = yaml_serde::to_string(&top.rows).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
@@ -1592,8 +1774,33 @@ fn render_status(
         .iter()
         .filter_map(|app| app.volume_home_away.as_ref().map(|home| (app, home)))
         .collect();
-    if !blocked.is_empty() || !waiting.is_empty() {
+    let failed: Vec<_> = desired
+        .iter()
+        .filter_map(|app| app.rollout_failed.as_ref().map(|failure| (app, failure)))
+        .collect();
+    let short: Vec<_> = desired
+        .iter()
+        .filter_map(|app| app.unschedulable.as_ref().map(|short| (app, short)))
+        .collect();
+    let refused: Vec<_> = statuses
+        .iter()
+        .filter_map(|row| row.instance.reason.as_ref().map(|reason| (row, reason)))
+        .collect();
+    if !blocked.is_empty()
+        || !waiting.is_empty()
+        || !failed.is_empty()
+        || !short.is_empty()
+        || !refused.is_empty()
+    {
         output.push('\n');
+    }
+    // #881: the runtime refused the launch, so waiting won't start it.
+    for (row, reason) in refused {
+        let _ = writeln!(
+            output,
+            "{} ({}, namespace {}) failed on {}: {reason}",
+            row.instance.id, row.instance.app_name, row.instance.namespace, row.node
+        );
     }
     for (app, reason) in blocked {
         let _ = writeln!(
@@ -1607,6 +1814,22 @@ fn render_status(
         let _ = writeln!(
             output,
             "{} (namespace {}) waits for {home}, which holds its volume and is out of the cluster",
+            app.app, app.namespace
+        );
+    }
+    // #692: the leader won't try this spec again until a different one is applied.
+    for (app, failure) in failed {
+        let _ = writeln!(
+            output,
+            "{} (namespace {}) RolloutFailed on {}: {}; apply a different spec or roll back",
+            app.app, app.namespace, failure.node, failure.reason
+        );
+    }
+    // #702: the scheduler placed what fits and says why the rest has no node.
+    for (app, short) in short {
+        let _ = writeln!(
+            output,
+            "{} (namespace {}) is unschedulable: {short}",
             app.app, app.namespace
         );
     }
@@ -1635,7 +1858,10 @@ fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
         "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
     );
     for row in rows {
-        let pid = pid_cell(&row.instance);
+        // A job row stands for many tasks, so it shows their count, not a PID.
+        let pid = row
+            .tasks
+            .map_or_else(|| pid_cell(&row.instance), |tasks| format!("tasks:{tasks}"));
         let cpu = row
             .cpu_percent
             .map(|cpu| format!("{cpu:.1}%"))
@@ -1677,6 +1903,123 @@ fn format_memory(bytes: u64) -> String {
 
 /// Rotate or finalise the cluster's secret encryption key, or one
 /// namespace's.
+/// `relish gitops status`: the cluster's GitOps configuration (never its
+/// credentials), the last sync, what GitOps owns, and whether the answering
+/// node's own `[gitops]` differs (#693).
+pub async fn gitops_status(output: OutputFormat) -> Result<(), RelishError> {
+    let status = BunClient::default_local().gitops_status().await?;
+    match output {
+        OutputFormat::Human => print!("{}", render_gitops_status(&status)),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&status).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            yaml_serde::to_string(&status).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    Ok(())
+}
+
+/// The human view of `relish gitops status`.
+fn render_gitops_status(status: &crate::lettuce::types::GitOpsStatus) -> String {
+    use crate::lettuce::types::LocalConfigCheck;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let Some(config) = &status.config else {
+        out.push_str("GitOps is off for this cluster\n");
+        return out;
+    };
+    let _ = writeln!(out, "repository:   {}", config.repo);
+    let _ = writeln!(out, "branch:       {}", config.branch);
+    let _ = writeln!(out, "path:         {}", config.path);
+    let _ = writeln!(out, "poll:         every {}s", config.poll_interval_secs);
+    let _ = writeln!(
+        out,
+        "credentials:  {}",
+        if status.has_credentials {
+            "sealed in the cluster"
+        } else {
+            "none"
+        }
+    );
+    if let Some(sync) = &status.sync {
+        let commit = sync
+            .last_applied_commit
+            .as_ref()
+            .map_or("none yet", |commit| commit.sha.as_str());
+        let _ = writeln!(out, "applied:      {commit}");
+        if let Some(error) = &sync.last_error {
+            let _ = writeln!(out, "last error:   {error}");
+        }
+        for warning in &sync.warnings {
+            let _ = writeln!(out, "warning:      {warning}");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "owns:         {} app(s), {} namespace(s), {} permission(s)",
+        status.owned.apps.len(),
+        status.owned.namespaces.len(),
+        status.owned.permissions.len()
+    );
+    let local = match &status.local {
+        LocalConfigCheck::Differs { fields } => format!(
+            "differs from the cluster ({}); the cluster's is used",
+            fields.join(", ")
+        ),
+        LocalConfigCheck::Matches => "matches the cluster's".into(),
+        LocalConfigCheck::NoLocalConfig => "none; follows the cluster's".into(),
+        LocalConfigCheck::Unreadable { reason } => format!("can't read the cluster's: {reason}"),
+        LocalConfigCheck::NoClusterConfig | LocalConfigCheck::Unknown => "not checked yet".into(),
+    };
+    let _ = writeln!(out, "this node:    [gitops] {local}");
+    out
+}
+
+/// Read a `[gitops]` section from a TOML file: a node's `node.toml`, or a
+/// file holding just the section's keys.
+fn read_gitops_section(path: &Path) -> Result<crate::lettuce::types::GitOpsConfig, RelishError> {
+    let text = fs::read_to_string(path)?;
+    let mut value: toml::Table =
+        toml::from_str(&text).map_err(crate::config::ConfigError::TomlParse)?;
+    let section = match value.remove("gitops") {
+        Some(toml::Value::Table(section)) => section,
+        Some(_) => {
+            return Err(RelishError::InvalidFlag {
+                flag: "path".into(),
+                reason: format!("{}: [gitops] must be a table", path.display()),
+            });
+        }
+        None => value,
+    };
+    Ok(section
+        .try_into()
+        .map_err(crate::config::ConfigError::TomlParse)?)
+}
+
+/// `relish gitops set <file>`: replace the cluster's GitOps configuration.
+pub async fn gitops_set(path: &Path) -> Result<(), RelishError> {
+    let config = read_gitops_section(path)?;
+    BunClient::default_local()
+        .gitops_config_set(Some(config))
+        .await?;
+    println!(
+        "the cluster's GitOps configuration is now {}; the leader syncs it on its next tick",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `relish gitops disable`: turn GitOps off; what it wrote stays.
+pub async fn gitops_disable() -> Result<(), RelishError> {
+    BunClient::default_local().gitops_config_set(None).await?;
+    println!("GitOps is off; the apps, namespaces and permissions it wrote stay in place");
+    Ok(())
+}
+
 pub async fn secret_rotate(finalize: bool, namespace: Option<&str>) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.secret_rotate(finalize, namespace).await?;
@@ -1788,6 +2131,55 @@ pub fn resolve_image_digest(
     crate::pickle::types::Digest::new(digest).map_err(|_| not_found())
 }
 
+/// Split `repository:tag` for `relish images delete`. A registry host in
+/// front (`localhost:5050/team/web:v1`) is dropped, the way deploys drop it.
+/// A digest, or a name without a tag, is refused: deleting `web` must not
+/// quietly mean `web:latest`.
+pub fn parse_image_tag(reference: &str) -> Result<(&str, &str), RelishError> {
+    let invalid = || RelishError::InvalidImageTag {
+        reference: reference.to_string(),
+    };
+    if reference.contains('@') {
+        return Err(invalid());
+    }
+    let tail_start = reference.rfind('/').map_or(0, |i| i + 1);
+    let (name, tag) = reference[tail_start..]
+        .rfind(':')
+        .map(|i| {
+            (
+                &reference[..tail_start + i],
+                &reference[tail_start + i + 1..],
+            )
+        })
+        .ok_or_else(invalid)?;
+    let repository = crate::meat::scheduler::canonical_repository(name);
+    if repository.is_empty() || tag.is_empty() || tag.starts_with("sha256") {
+        return Err(invalid());
+    }
+    Ok((repository, tag))
+}
+
+/// `relish images delete <repository:tag>`: untag an image in Pickle.
+pub async fn image_delete(reference: &str) -> Result<(), RelishError> {
+    image_delete_with_client(reference, &BunClient::default_local()).await
+}
+
+async fn image_delete_with_client(reference: &str, client: &BunClient) -> Result<(), RelishError> {
+    let (repository, tag) = parse_image_tag(reference)?;
+    let registry = client
+        .capabilities()
+        .await?
+        .service_endpoints
+        .registry
+        .ok_or(RelishError::RegistryUnavailable)?;
+    client.delete_image_tag(&registry, repository, tag).await?;
+    println!(
+        "deleted {repository}:{tag}; the image expires once it has been untagged for \
+         gc_retain_days, unless an app or job pins it"
+    );
+    Ok(())
+}
+
 pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.images().await?;
@@ -1796,7 +2188,7 @@ pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
             OutputFormat::Json => {
                 serde_json::to_string_pretty(&result).map_err(RelishError::SerialiseJson)?
             }
-            _ => serde_yaml::to_string(&result).map_err(RelishError::SerialiseYaml)?,
+            _ => yaml_serde::to_string(&result).map_err(RelishError::SerialiseYaml)?,
         };
         print!("{text}");
         if matches!(output, OutputFormat::Json) {
@@ -2099,8 +2491,62 @@ pub async fn build(
     Ok(())
 }
 
+/// Longest `Idempotency-Key` the cluster keeps as a request identity.
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+/// The key this submission sends: the caller's `--idempotency-key`, or a
+/// fresh random one. Either way it is written to `err` (stderr in
+/// production) *before* anything is sent, so a person whose submission times
+/// out already holds the key that makes the retry safe.
+pub fn submission_key(
+    explicit: Option<String>,
+    err: &mut dyn std::io::Write,
+) -> Result<String, RelishError> {
+    let key = match explicit {
+        Some(key) => {
+            if key.is_empty()
+                || key.len() > MAX_IDEMPOTENCY_KEY_BYTES
+                || !key.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(RelishError::InvalidFlag {
+                    flag: "idempotency-key".into(),
+                    reason: format!(
+                        "use 1–{MAX_IDEMPOTENCY_KEY_BYTES} printable ASCII characters without spaces"
+                    ),
+                });
+            }
+            key
+        }
+        None => format!("{:032x}", rand::random::<u128>()),
+    };
+    // A failed write to stderr mustn't stop the submission.
+    let _ = writeln!(
+        err,
+        "idempotency key {key}; if this submission times out, retry with --idempotency-key {key}"
+    );
+    Ok(key)
+}
+
 /// Submit a batch of jobs for high-throughput scheduling.
-pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
+pub async fn batch(
+    path: &std::path::Path,
+    idempotency_key: Option<String>,
+) -> Result<(), RelishError> {
+    batch_with_client(
+        path,
+        idempotency_key,
+        &BunClient::default_local(),
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+async fn batch_with_client(
+    path: &std::path::Path,
+    idempotency_key: Option<String>,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
+) -> Result<(), RelishError> {
     use crate::config::Config;
 
     let config = Config::from_file(path)?;
@@ -2109,8 +2555,8 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
         return Ok(());
     }
 
-    let client = BunClient::default_local();
-    let result = client.submit_batch(&config.job).await?;
+    let key = submission_key(idempotency_key, err)?;
+    let result = client.submit_batch(&config.job, Some(&key)).await?;
     println!(
         "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
@@ -2191,6 +2637,8 @@ fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
 /// What `relish run --batch` submits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskArrayRun {
+    /// Explicit job backend; host execution requires process.
+    pub runtime: crate::config::job::JobRuntime,
     /// Durable UTC schedule; omitted means an immediate manual run.
     pub schedule: Option<String>,
     pub image: Option<String>,
@@ -2208,6 +2656,8 @@ pub struct TaskArrayRun {
     pub env: Vec<String>,
     /// Count and policy.
     pub spec: crate::meat::task_array::TaskArraySpec,
+    /// `--idempotency-key` from an earlier, uncertain submission.
+    pub idempotency_key: Option<String>,
 }
 
 /// Turn `relish run --batch` flags into the API request, refusing bad
@@ -2215,6 +2665,13 @@ pub struct TaskArrayRun {
 pub fn task_array_request(
     run: TaskArrayRun,
 ) -> Result<crate::bun::task_array_api::TaskArraySubmitRequest, RelishError> {
+    if (run.runtime == crate::config::job::JobRuntime::Process
+        && (run.image.is_some() || run.exec.is_none()))
+        || (run.runtime != crate::config::job::JobRuntime::Process
+            && (run.image.is_none() || run.exec.is_some()))
+    {
+        return Err(RelishError::InvalidFlag { flag: "runtime".into(), reason: "process requires --exec and refuses --image; runc/shared-runc require --image and refuse --exec".into() });
+    }
     if run.exec.as_ref().is_some_and(|path| !path.is_absolute()) {
         return Err(RelishError::InvalidFlag {
             flag: "exec".to_string(),
@@ -2241,6 +2698,7 @@ pub fn task_array_request(
         name: run.name,
         namespace: Some(run.namespace),
         template: crate::config::job::JobSpec {
+            runtime: run.runtime,
             image: run.image,
             command: Some(run.args),
             schedule: run.schedule,
@@ -2259,6 +2717,12 @@ pub fn task_array_request(
             namespace: None,
             exec: run.exec,
             script: None,
+            firewall: None,
+            egress: None,
+            max_attempts: None,
+            task_timeout_secs: None,
+            overlap: None,
+            replay_unknown: false,
         },
         spec: run.spec,
     })
@@ -2269,6 +2733,26 @@ pub async fn submit_task_manifest(
     path: &std::path::Path,
     output: OutputFormat,
     dry_run: bool,
+    idempotency_key: Option<String>,
+) -> Result<(), RelishError> {
+    submit_task_manifest_with_client(
+        path,
+        output,
+        dry_run,
+        idempotency_key,
+        &BunClient::default_local(),
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+async fn submit_task_manifest_with_client(
+    path: &std::path::Path,
+    output: OutputFormat,
+    dry_run: bool,
+    idempotency_key: Option<String>,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
 ) -> Result<(), RelishError> {
     let source = std::fs::read_to_string(path)?;
     let request: crate::bun::task_array_api::TaskManifestRequest = toml::from_str(&source)
@@ -2283,6 +2767,7 @@ pub async fn submit_task_manifest(
             &crate::meat::task_array_store::TaskArrayWrite::RegisterManifest {
                 name: request.name.clone(),
                 namespace: request.namespace.clone(),
+                request_id: "dry-run".into(),
                 cohorts: request.cohort.clone(),
                 submitted_at_epoch_secs: 0,
             },
@@ -2304,9 +2789,8 @@ pub async fn submit_task_manifest(
         );
         return Ok(());
     }
-    let response = BunClient::default_local()
-        .submit_task_manifest(&request)
-        .await?;
+    let key = submission_key(idempotency_key, err)?;
+    let response = client.submit_task_manifest(&request, Some(&key)).await?;
     if matches!(output, OutputFormat::Human) {
         println!(
             "manifest {} submitted; watch with: relish batch watch {}",
@@ -2347,7 +2831,7 @@ pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), Re
 /// attempt. Quantiles merge bucket counts and report bucket upper bounds.
 pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     if summary["kind"] == "schedule" {
-        return format!(
+        let mut line = format!(
             "{}/{}: UTC schedule {}, {} tasks per occurrence; revision {}",
             summary["namespace"].as_str().unwrap_or("default"),
             summary["name"].as_str().unwrap_or("?"),
@@ -2355,13 +2839,26 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
             summary["total"],
             summary["revision"]
         );
+        if let Some(minute) = summary["skipped"]["minute"].as_i64() {
+            line.push_str(&format!(
+                " | skipped: capacity ({} so far, latest at minute {minute})",
+                summary["skipped_count"].as_u64().unwrap_or(1)
+            ));
+        }
+        return line;
     }
 
     let rate = summary["rates"]["successes_per_second"]
         .as_f64()
         .map_or("unknown".to_string(), |r| format!("{r:.1}/s"));
+    let interval = summary["rates"]["interval_seconds"]
+        .as_f64()
+        .map_or("unknown".into(), |seconds| format!("{seconds:.1}s"));
+    let whole = summary["whole_run_successes_per_second"]
+        .as_f64()
+        .map_or("unknown".into(), |rate| format!("{rate:.1}/s"));
     let mut output = format!(
-        "batch {}: {} / {} succeeded, {} failed, {} not run, {} retries; {} | accepted successes {}",
+        "batch {}: {} / {} succeeded, {} failed, {} not run, {} retries; {} | accepted successes recent {} over {} | since admission {}",
         summary["batch_id"],
         summary["succeeded"],
         summary["total"],
@@ -2369,12 +2866,37 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
         summary["not_run"],
         summary["retried"],
         summary["status"].as_str().unwrap_or("unknown"),
-        rate
+        rate,
+        interval,
+        whole
     );
+    let count = |key: &str| {
+        summary[key]
+            .as_u64()
+            .map_or("unknown".into(), |value| value.to_string())
+    };
+    output.push_str(&format!(
+        " | mode {} | {} active commands, {} other in-flight attempts",
+        summary["runtime"]
+            .as_str()
+            .unwrap_or(if summary["kind"] == "manifest" {
+                "mixed"
+            } else {
+                "unknown"
+            }),
+        count("active_commands"),
+        count("other_in_flight_attempts")
+    ));
     output.push_str(&format!(
         " | {} queued, {} held",
         summary["queued"], summary["held"]
     ));
+    if let Some(reason) = summary["quota_blocked_reason"].as_str() {
+        output.push_str(&format!(" | quota blocked: {reason}"));
+    }
+    if let Some(reason) = summary["unrunnable_reason"].as_str() {
+        output.push_str(&format!(" | refused: {reason}"));
+    }
     let failure_rate = summary["rates"]["failures_per_second"]
         .as_f64()
         .map_or("unknown".into(), |r| format!("{r:.1}/s"));
@@ -2407,6 +2929,14 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
             cohort["memory_request_bytes"].as_u64().unwrap_or(0) / (1024 * 1024)
         ));
     }
+    for cohort in summary["cohorts"].as_array().into_iter().flatten() {
+        if let Some(reason) = cohort["unrunnable_reason"].as_str() {
+            output.push_str(&format!(
+                "\n  array {} refused: {reason}",
+                cohort["batch_id"]
+            ));
+        }
+    }
     for profile in
         std::iter::once(summary).chain(summary["cohorts"].as_array().into_iter().flatten())
     {
@@ -2430,9 +2960,25 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
 
 /// Submit a task array (`relish run --batch`).
 pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
+    run_task_array_with_client(run, &BunClient::default_local(), &mut std::io::stderr()).await
+}
+
+async fn run_task_array_with_client(
+    mut run: TaskArrayRun,
+    client: &BunClient,
+    err: &mut dyn std::io::Write,
+) -> Result<(), RelishError> {
+    let explicit = run.idempotency_key.take();
+    let scheduled = run.schedule.is_some();
     let request = task_array_request(run)?;
-    let client = BunClient::default_local();
-    let answer = client.submit_task_array(&request).await?;
+    // A schedule registers a definition, not a run, so it needs no key;
+    // re-registering the same schedule is already idempotent.
+    let key = if scheduled {
+        explicit.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()))
+    } else {
+        submission_key(explicit, err)?
+    };
+    let answer = client.submit_task_array(&request, Some(&key)).await?;
     if let Some(id) = answer["batch_id"].as_u64() {
         println!(
             "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
@@ -2460,14 +3006,7 @@ pub async fn jobs(definitions: bool, output: OutputFormat) -> Result<(), RelishE
     }
     if definitions {
         for row in rows["definitions"].as_array().into_iter().flatten() {
-            println!(
-                "{}/{} revision {}: {} tasks, UTC schedule {}",
-                row["namespace"].as_str().unwrap_or("?"),
-                row["name"].as_str().unwrap_or("?"),
-                row["revision"],
-                row["count"],
-                row["cron"]["expression"].as_str().unwrap_or("disabled")
-            );
+            print!("{}", format_definition(row));
         }
     } else {
         for row in rows["batches"].as_array().into_iter().flatten() {
@@ -2512,7 +3051,7 @@ pub async fn batch_results(
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&results).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&results).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())
@@ -2591,6 +3130,23 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         count("not_run"),
         count("retried"),
     ));
+    let causes: Vec<String> = [
+        ("exit_code", "non-zero exit"),
+        ("signal", "signal"),
+        ("timeout", "timeout"),
+        ("unknown", "unknown outcome"),
+        ("launch", "launch failure"),
+        ("unrecorded", "not recorded across a restart"),
+    ]
+    .into_iter()
+    .filter_map(|(key, label)| {
+        let value = summary["retry_causes"][key].as_u64()?;
+        (value > 0).then(|| format!("{value} {label}"))
+    })
+    .collect();
+    if !causes.is_empty() {
+        out.push_str(&format!("  retry causes: {}\n", causes.join(", ")));
+    }
     out.push_str(&format!(
         "  chunks: {} of {} done; {} tasks held by nodes, {} queued\n",
         count("chunks_done"),
@@ -2598,6 +3154,12 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
         count("held"),
         count("queued"),
     ));
+    if let Some(reason) = summary["quota_blocked_reason"].as_str() {
+        out.push_str(&format!("  waiting for quota: {reason}\n"));
+    }
+    if let Some(reason) = summary["unrunnable_reason"].as_str() {
+        out.push_str(&format!("  refused: {reason}\n"));
+    }
     if let Some(ranges) = summary["failed_indices"].as_array()
         && !ranges.is_empty()
     {
@@ -2645,7 +3207,7 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
 
 /// Create a new API token through the agent.
 ///
-/// The agent mints the token, stores its Argon2id hash in Raft, and
+/// The agent mints the token, stores its SHA-256 digest in Raft, and
 /// returns the plaintext once; this prints it to stdout and never stores
 /// it. Needs a reachable agent and an admin credential.
 pub async fn token_create(request: &super::client::TokenRequest) -> Result<(), RelishError> {
@@ -2809,7 +3371,7 @@ pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            serde_yaml::to_string(&listing).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(&listing).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())
@@ -2892,6 +3454,42 @@ fn render_token_scope(scope: &super::client::TokenScopeSummary) -> String {
     } else {
         parts.join(" ")
     }
+}
+
+/// One job definition for `relish jobs --definitions`: its schedule, then
+/// its last outcomes, newest first. The outcomes outlive the runs' details.
+fn format_definition(row: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "{}/{} revision {}: {} tasks, UTC schedule {}\n",
+        row["namespace"].as_str().unwrap_or("?"),
+        row["name"].as_str().unwrap_or("?"),
+        row["revision"],
+        row["count"],
+        row["cron"]["expression"].as_str().unwrap_or("disabled")
+    );
+    let history = row["history"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for outcome in history.iter().rev() {
+        let _ = write!(
+            text,
+            "  run {} finished {}: {}, {} succeeded, {} failed",
+            outcome["run"],
+            outcome["finished_at_epoch_secs"]
+                .as_u64()
+                .map_or_else(|| "?".to_string(), format_utc),
+            outcome["status"].as_str().unwrap_or("?"),
+            outcome["succeeded"],
+            outcome["failed"],
+        );
+        if outcome["not_run"].as_u64().is_some_and(|count| count > 0) {
+            let _ = write!(text, ", {} not run", outcome["not_run"]);
+        }
+        if let Some(index) = outcome["first_failed_index"].as_u64() {
+            let _ = write!(text, "; first failure: task {index}");
+        }
+        text.push('\n');
+    }
+    text
 }
 
 /// Unix seconds as `YYYY-MM-DD HH:MM UTC`; the raw number if out of range.
@@ -3133,10 +3731,40 @@ mod tests {
                 pid,
                 runtime_unknown: false,
                 status_age_ms: None,
+                reason: None,
             },
             cpu_percent: cpu,
             memory_bytes: memory,
+            tasks: None,
         }
+    }
+
+    #[test]
+    fn job_definitions_list_their_last_outcomes_newest_first() {
+        let text = format_definition(&serde_json::json!({
+            "namespace": "ops", "name": "nightly", "revision": 2, "count": 1,
+            "cron": {"expression": "0 3 * * *"},
+            "history": [
+                {"run": 40, "finished_at_epoch_secs": 1_791_601_200u64, "status": "Succeeded",
+                 "succeeded": 1, "failed": 0, "not_run": 0},
+                {"run": 41, "finished_at_epoch_secs": 1_791_687_600u64, "status": "CompletedWithFailures",
+                 "succeeded": 0, "failed": 1, "not_run": 0, "first_failed_index": 0},
+            ],
+        }));
+        insta::assert_snapshot!(text);
+    }
+
+    #[test]
+    fn top_shows_a_job_row_with_its_running_task_count() {
+        let mut job = top_row("rb-2", "tasks", None, Some(250.0), Some(8 << 20));
+        job.instance.app_name = "render".into();
+        job.tasks = Some(27);
+        let table = render_top(&[job]);
+        let line = table.lines().nth(1).unwrap();
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(columns[1], "render", "{table}");
+        assert_eq!(columns[4], "tasks:27", "{table}");
+        assert_eq!(columns[6], "250.0%", "{table}");
     }
 
     #[test]
@@ -3740,6 +4368,8 @@ spec:
             service_port: None,
             blocked: None,
             volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
             volume_homes: Vec::new(),
         }
     }
@@ -3766,12 +4396,35 @@ spec:
         );
     }
 
+    /// #692: an app whose rollout failed shows `RolloutFailed`, where and
+    /// why, and how to clear it.
+    #[test]
+    fn status_names_an_app_whose_rollout_failed() {
+        let failed = crate::bun::diagnostics::DesiredAppEvidence {
+            rollout_failed: Some(crate::meat::deploy_types::RolloutFailure {
+                fingerprint: "abc".to_string(),
+                node: "node-3".to_string(),
+                reason: "web-g2-0 failed its health check".to_string(),
+                at_unix_ms: 1,
+            }),
+            ..evidence("web", 3)
+        };
+        let output = render_status(&[], &[evidence("fine", 1), failed]);
+        assert_eq!(
+            output,
+            "no workloads running\n\n\
+             web (namespace prod) RolloutFailed on node-3: web-g2-0 failed its health check; \
+             apply a different spec or roll back\n"
+        );
+    }
+
     /// #423: an app waiting for the node that holds its volume isn't just
     /// missing from the table; status says which node it waits for.
     #[test]
     fn status_names_a_volume_app_waiting_for_its_home_node() {
         let waiting = crate::bun::diagnostics::DesiredAppEvidence {
             volume_home_away: Some("node-2".to_string()),
+            rollout_failed: None,
             ..evidence("db", 1)
         };
         let output = render_status(&[], &[evidence("fine", 1), waiting]);
@@ -3780,6 +4433,57 @@ spec:
             "no workloads running\n\n\
              db (namespace prod) waits for node-2, which holds its volume and is out of the \
              cluster\n"
+        );
+    }
+
+    /// #702: an app placed only in part says how many replicas found a
+    /// node and why the rest didn't.
+    #[test]
+    fn status_says_how_much_of_a_short_app_is_placed_and_why() {
+        let short = crate::bun::diagnostics::DesiredAppEvidence {
+            unschedulable: Some(crate::meat::types::Unschedulable {
+                placed: 2,
+                wanted: 3,
+                reason: crate::meat::types::UnplacedReason::NoRoom,
+            }),
+            ..evidence("web", 3)
+        };
+        let output = render_status(&[], &[evidence("fine", 1), short]);
+        assert_eq!(
+            output,
+            "no workloads running\n\n\
+             web (namespace prod) is unschedulable: placed 2 of 3 replicas: \
+             no node that can run it has room\n"
+        );
+    }
+
+    /// #881: an instance the runtime refused to launch says why under the
+    /// table, so a missing binary isn't just a `failed` cell.
+    #[test]
+    fn status_names_an_instance_that_could_not_launch_and_why() {
+        let row = crate::bun::agent::ClusterInstanceStatus {
+            node: "node-1".to_string(),
+            instance: crate::bun::agent::InstanceStatus {
+                id: "default__ghost-0".to_string(),
+                app_name: "ghost".to_string(),
+                namespace: "default".to_string(),
+                state: "failed".to_string(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: None,
+                pid: None,
+                runtime_unknown: false,
+                status_age_ms: None,
+                reason: Some("binary not found: /opt/ghost/server".to_string()),
+            },
+        };
+        let output = render_status(&[row], &[]);
+        assert!(
+            output.ends_with(
+                "\ndefault__ghost-0 (ghost, namespace default) failed on node-1: \
+                 binary not found: /opt/ghost/server\n"
+            ),
+            "{output}"
         );
     }
 
@@ -3830,6 +4534,44 @@ spec:
         init(dir.path(), "test-cluster", "node-01").unwrap();
         assert!(dir.path().join("reliaburger.toml").exists());
         assert!(dir.path().join("app.toml").exists());
+    }
+
+    #[test]
+    fn init_enables_ebpf_and_dns_on_rootful_linux() {
+        let rootful = InitHost {
+            linux: true,
+            root: true,
+            runc: true,
+        };
+        let mut config = crate::config::node::NodeConfig::default();
+        enable_node_data_path(&mut config, rootful);
+        assert!(config.ebpf.enabled, "namespace isolation needs eBPF");
+        assert!(
+            config.dns.enabled,
+            "allowlisted workloads resolve through Bun"
+        );
+
+        for host in [
+            InitHost {
+                linux: false,
+                ..rootful
+            },
+            InitHost {
+                root: false,
+                ..rootful
+            },
+            InitHost {
+                runc: false,
+                ..rootful
+            },
+        ] {
+            let mut config = crate::config::node::NodeConfig::default();
+            enable_node_data_path(&mut config, host);
+            assert!(
+                !config.ebpf.enabled && !config.dns.enabled,
+                "{host:?} can't load eBPF, so it must not be told to"
+            );
+        }
     }
 
     #[test]
@@ -4163,6 +4905,66 @@ spec:
     }
 
     #[test]
+    fn status_names_lost_images_and_stays_quiet_otherwise() {
+        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
+        assert_eq!(render_lost_images(&registry), "");
+
+        registry.lost_images = vec!["web:v1".into(), "api@sha256:abc".into()];
+        registry.lost_image_count = 3;
+
+        assert_eq!(
+            render_lost_images(&registry),
+            "registry: 3 lost image(s), no live node holds them: web:v1, api@sha256:abc \
+             and 1 more; re-push them\n"
+        );
+    }
+
+    #[test]
+    fn status_says_once_that_a_plaintext_registry_needs_mtls() {
+        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
+        assert_eq!(render_registry_needs_mtls(&registry), "");
+
+        registry.needs_mtls = true;
+
+        let line = render_registry_needs_mtls(&registry);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.starts_with("registry: "), "{line}");
+        assert!(line.contains("needs mTLS"), "{line}");
+        assert!(line.contains("relish init"), "{line}");
+    }
+
+    #[test]
+    fn image_delete_reads_repository_and_tag() {
+        assert_eq!(parse_image_tag("web:v1").unwrap(), ("web", "v1"));
+        assert_eq!(
+            parse_image_tag("team/web:v1.2").unwrap(),
+            ("team/web", "v1.2")
+        );
+        assert_eq!(
+            parse_image_tag("localhost:5050/team/web:latest").unwrap(),
+            ("team/web", "latest")
+        );
+    }
+
+    #[test]
+    fn image_delete_refuses_a_bare_name_or_a_digest() {
+        for reference in [
+            "web",
+            "localhost:5050/web",
+            "web:",
+            "web@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ] {
+            assert!(
+                matches!(
+                    parse_image_tag(reference),
+                    Err(RelishError::InvalidImageTag { .. })
+                ),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
     fn sign_refuses_an_image_the_registry_does_not_hold() {
         for image in [
             "myapp:v9",
@@ -4205,8 +5007,115 @@ mod task_array_tests {
     use crate::bun::task_array_node::TaskResultRow;
     use crate::meat::task_array::TaskArraySpec;
 
+    /// A stand-in leader that records each `/v1/batch/array` submission's
+    /// `Idempotency-Key` header and admits it as run 7.
+    async fn key_recording_server() -> (
+        BunClient,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/batch/array",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let recorder = recorder.clone();
+                async move {
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    recorder.lock().unwrap().push(key);
+                    axum::Json(serde_json::json!({"batch_id": 7, "count": 10, "chunks": 1}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (client, seen, server)
+    }
+
+    #[tokio::test]
+    async fn run_batch_sends_and_prints_an_idempotency_key() {
+        let (client, seen, server) = key_recording_server().await;
+        let mut err = Vec::new();
+        run_task_array_with_client(run(), &client, &mut err)
+            .await
+            .unwrap();
+        server.abort();
+        let sent = seen.lock().unwrap().clone();
+        let [Some(key)] = sent.as_slice() else {
+            panic!("expected one keyed submission, got {sent:?}");
+        };
+        assert_eq!(key.len(), 32, "{key}");
+        let printed = String::from_utf8(err).unwrap();
+        assert!(
+            printed.contains(&format!("--idempotency-key {key}")),
+            "{printed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_idempotency_key_is_sent_unchanged() {
+        let (client, seen, server) = key_recording_server().await;
+        let mut retry = run();
+        retry.idempotency_key = Some("retry-after-timeout-1".into());
+        let mut err = Vec::new();
+        run_task_array_with_client(retry, &client, &mut err)
+            .await
+            .unwrap();
+        let mut bad = run();
+        bad.idempotency_key = Some("has a space".into());
+        assert!(
+            run_task_array_with_client(bad, &client, &mut Vec::new())
+                .await
+                .is_err()
+        );
+        server.abort();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("retry-after-timeout-1".to_string())],
+            "a refused key never reaches the cluster"
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("retry-after-timeout-1")
+        );
+    }
+
+    #[test]
+    fn lint_rejects_an_out_of_range_job_policy() {
+        for policy in [
+            "max_attempts = 0",
+            "max_attempts = 11",
+            "task_timeout_secs = 86401",
+            "overlap = 'allow'",
+        ] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                file.path(),
+                format!("[job.cleanup]\nimage = 'cleanup:v1'\n{policy}\n"),
+            )
+            .unwrap();
+            assert!(lint(file.path()).is_err(), "{policy}");
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "[job.cleanup]\nimage = 'cleanup:v1'\nschedule = '@daily'\nmax_attempts = 2\ntask_timeout_secs = 300\noverlap = 'allow'\nreplay_unknown = true\n",
+        )
+        .unwrap();
+        lint(file.path()).unwrap();
+    }
+
     fn run() -> TaskArrayRun {
         TaskArrayRun {
+            runtime: crate::config::job::JobRuntime::Process,
             schedule: None,
             image: None,
             cpu: None,
@@ -4217,7 +5126,27 @@ mod task_array_tests {
             args: vec!["--frame".to_string(), "{index}".to_string()],
             env: vec!["MODE=fast".to_string(), "EMPTY=".to_string()],
             spec: TaskArraySpec::with_count(10),
+            idempotency_key: None,
         }
+    }
+
+    #[test]
+    fn run_flags_preserve_explicit_container_isolation_and_refuse_host_reuse() {
+        use crate::config::job::JobRuntime;
+        let mut image = run();
+        image.exec = None;
+        image.image = Some(
+            "fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+        );
+        image.runtime = JobRuntime::SharedRunc;
+        let request = task_array_request(image).unwrap();
+        assert_eq!(request.template.runtime, JobRuntime::SharedRunc);
+        let mut host = run();
+        host.runtime = JobRuntime::SharedRunc;
+        assert!(
+            matches!(task_array_request(host), Err(RelishError::InvalidFlag {flag,..}) if flag == "runtime")
+        );
     }
 
     #[test]
@@ -4266,7 +5195,9 @@ mod task_array_tests {
         let summary = serde_json::json!({
             "kind": "array", "name": "render", "namespace": "default",
             "status": "Running", "total": 100000, "succeeded": 51200,
-            "failed": 5, "not_run": 0, "retried": 12, "queued": 40000,
+            "failed": 5, "not_run": 0, "retried": 15, "queued": 40000,
+            "retry_causes": { "exit_code": 10, "signal": 2, "timeout": 0,
+                              "unknown": 0, "launch": 3, "unrecorded": 0 },
             "held": 8800, "chunks": 98, "chunks_done": 50,
             "failed_indices": [[7, 7], [1000, 1002]],
             "nodes": [
@@ -4279,11 +5210,59 @@ mod task_array_tests {
         assert_eq!(
             format_array_summary(3, &summary),
             "task array 3 (render in default): Running\n\
-             \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 12 retries\n\
+             \x20 tasks: 100000 total, 51200 succeeded, 5 failed, 0 not run, 15 retries\n\
+             \x20 retry causes: 10 non-zero exit, 2 signal, 3 launch failure\n\
              \x20 chunks: 50 of 98 done; 8800 tasks held by nodes, 40000 queued\n\
              \x20 failed indices: 7, 1000-1002 and 1 more (see relish batch results 3 --failed)\n\
              \x20 node-1: 8 slots, 8 running, 51200 succeeded, 5 failed\n\
              \x20 node-2: can't run it: /x isn't in this node's [process_workloads] allowed_binaries\n"
+        );
+    }
+
+    #[test]
+    fn watch_distinguishes_started_commands_preparation_and_observation_rates() {
+        let value = serde_json::json!({"kind":"array","batch_id":9,"succeeded":1000,"total":2000,"failed":0,"not_run":0,"retried":0,"queued":500,"held":500,"status":"Running","runtime":"shared-runc","active_commands":3,"other_in_flight_attempts":5,"whole_run_successes_per_second":100.0,"rates":{"successes_per_second":500.0,"interval_seconds":2.0}});
+        let rendered = format_batch_watch(&value);
+        for phrase in [
+            "mode shared-runc",
+            "3 active commands",
+            "5 other in-flight attempts",
+            "since admission 100.0/s",
+            "recent 500.0/s over 2.0s",
+        ] {
+            assert!(
+                rendered.contains(phrase),
+                "{phrase:?} missing from {rendered:?}"
+            );
+        }
+        let unknown = format_batch_watch(&serde_json::json!({"kind":"array"}));
+        assert!(unknown.contains("unknown active commands"));
+    }
+
+    #[test]
+    fn status_says_why_no_node_could_run_a_failed_run() {
+        let reason =
+            "no node can run it: host jobs don't run under [process_workloads] mount_isolation yet";
+        let run = serde_json::json!({"kind":"array","batch_id":4,"status":"Failed","not_run":20,"unrunnable_reason":reason});
+        assert!(format_batch_watch(&run).contains(&format!("refused: {reason}")));
+        assert!(format_array_summary(4, &run).contains(&format!("  refused: {reason}\n")));
+        // A manifest names the profile no node could run.
+        let manifest = serde_json::json!({"kind":"manifest","batch_id":5,"status":"Failed","cohorts":[
+            {"profile":"small","batch_id":6,"succeeded":1,"total":1},
+            {"profile":"host","batch_id":7,"succeeded":0,"total":4,"unrunnable_reason":reason}]});
+        assert!(format_batch_watch(&manifest).contains(&format!("array 7 refused: {reason}")));
+    }
+
+    #[test]
+    fn status_says_why_a_run_waits_and_which_occurrences_were_skipped() {
+        let reason = "namespace \"tenant\" would exceed CPU quota: 2000+1000 > 2000m";
+        let run = serde_json::json!({"kind":"array","batch_id":4,"status":"Running","quota_blocked_reason":reason});
+        assert!(format_batch_watch(&run).contains(&format!("quota blocked: {reason}")));
+        assert!(format_array_summary(4, &run).contains(&format!("waiting for quota: {reason}")));
+        let schedule = serde_json::json!({"kind":"schedule","name":"nightly","namespace":"ops","cron":{"expression":"0 2 * * *"},"total":1,"revision":1,"skipped":{"minute":29000000,"reason":"capacity"},"skipped_count":2});
+        assert!(
+            format_batch_watch(&schedule)
+                .contains("skipped: capacity (2 so far, latest at minute 29000000)")
         );
     }
 

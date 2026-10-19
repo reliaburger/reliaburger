@@ -32,21 +32,35 @@ impl DnsHarness {
     /// Start a responder forwarding to `upstream` (use an unroutable
     /// TEST-NET address when the test never expects forwarding).
     async fn start(upstream: std::net::SocketAddr, map: ServiceMap) -> Self {
+        Self::start_with_upstreams(vec![upstream], map).await
+    }
+
+    /// Start a responder that tries `upstreams` in order.
+    async fn start_with_upstreams(upstreams: Vec<std::net::SocketAddr>, map: ServiceMap) -> Self {
+        Self::serve_config(
+            DnsConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                upstreams,
+                ..DnsConfig::default()
+            },
+            map,
+        )
+        .await
+    }
+
+    /// Serve `config` with a short upstream timeout and loopback clients
+    /// bound to the default namespace.
+    async fn serve_config(mut config: DnsConfig, map: ServiceMap) -> Self {
         let (map_tx, map_rx) = watch::channel(map);
         let (fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
         let shutdown = CancellationToken::new();
 
-        let config = DnsConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            upstream,
-            upstream_timeout: Duration::from_millis(400),
-            source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
-                "127.0.0.1".parse().unwrap(),
-                "default".into(),
-            )]))
-            .1,
-            ..DnsConfig::default()
-        };
+        config.upstream_timeout = Duration::from_millis(400);
+        config.source_namespaces = watch::channel(DnsSourceNamespaces::from_bindings([(
+            "127.0.0.1".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1;
         let (socket, addr) = bind_dns_responder(&config).await.unwrap();
 
         let serve_shutdown = shutdown.clone();
@@ -248,6 +262,79 @@ async fn forwarded_query_relays_valid_upstream_reply() {
     assert_eq!(response[2] & 0x80, 0x80, "QR bit set");
 }
 
+/// A fake resolver on loopback that answers every query with its own
+/// transaction ID and QR set. Returns its address.
+async fn echoing_upstream() -> std::net::SocketAddr {
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        while let Ok((n, src)) = upstream.recv_from(&mut buf).await {
+            let mut reply = buf[..n].to_vec();
+            reply[2] = 0x80; // QR=1
+            let _ = upstream.send_to(&reply, src).await;
+        }
+    });
+    addr
+}
+
+/// #700: with no `[dns] upstream`, external names go to the host's own
+/// resolvers, read from its resolver file, not to 8.8.8.8.
+#[tokio::test]
+async fn external_lookup_uses_the_configured_resolver_file() {
+    let upstream = echoing_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let resolv_conf = dir.path().join("resolv.conf");
+    std::fs::write(
+        &resolv_conf,
+        format!("search corp.example\nnameserver {}\n", upstream.ip()),
+    )
+    .unwrap();
+    let section = reliaburger::config::node::DnsSection {
+        enabled: true,
+        listen: "127.0.0.1:0".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        section.upstream, None,
+        "the default must be the host's resolvers"
+    );
+    // resolv.conf names addresses only; the fake resolver can't bind port 53
+    // unprivileged, so the test tells the reader which port they answer on.
+    let config = section
+        .to_dns_config_from(&resolv_conf, upstream.port())
+        .unwrap();
+    assert_eq!(config.upstreams, vec![upstream]);
+
+    let harness = DnsHarness::serve_config(config, ServiceMap::new()).await;
+    let response = harness
+        .query(&build_query("example.com", QTYPE_A))
+        .await
+        .expect("no relayed response from the host resolver");
+    assert_eq!(&response[..2], &[0x12, 0x34]);
+    assert_eq!(response[2] & 0x80, 0x80, "QR bit set");
+    assert_eq!(rcode(&response), 0);
+}
+
+/// A host with several nameservers: one that never answers must not fail
+/// lookups the next one would answer.
+#[tokio::test]
+async fn external_lookup_falls_through_to_the_next_resolver() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let live = echoing_upstream().await;
+    let harness = DnsHarness::start_with_upstreams(
+        vec![silent.local_addr().unwrap(), live],
+        ServiceMap::new(),
+    )
+    .await;
+    let response = harness
+        .query(&build_query("example.com", QTYPE_A))
+        .await
+        .expect("the second resolver should have answered");
+    assert_eq!(rcode(&response), 0);
+    drop(silent);
+}
+
 #[tokio::test]
 async fn upstream_reply_with_wrong_id_yields_servfail() {
     let fake_upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -287,7 +374,7 @@ async fn run_dns_responder_fails_closed_when_it_cannot_bind() {
 
     let config = DnsConfig {
         listen_addr: taken,
-        upstream: unroutable_upstream(),
+        upstreams: vec![unroutable_upstream()],
         upstream_timeout: Duration::from_millis(400),
         source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
             "127.0.0.1".parse().unwrap(),
@@ -356,7 +443,7 @@ async fn bound_responder_answers_internal_query_over_tcp_on_the_same_port() {
     let shutdown = CancellationToken::new();
     let responder = BoundDnsResponder::bind(DnsConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
-        upstream: unroutable_upstream(),
+        upstreams: vec![unroutable_upstream()],
         source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
             "127.0.0.1".parse().unwrap(),
             "default".into(),

@@ -29,6 +29,7 @@ fn fast_config() -> ReportingTreeSection {
         report_interval_secs: 1,
         max_events_per_report: 100,
         stale_report_timeout_secs: 30,
+        stale_node_grace_secs: 300,
     }
 }
 
@@ -62,6 +63,9 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                             allocated_ports: vec![8080],
                             capacity_cpu_millicores: 4000,
                             capacity_memory_mb: 8192,
+                            job_reservations: Default::default(),
+                            capacity_refusals: Vec::new(),
+                            rollouts: Vec::new(),
                         };
                         let _ = req.response.send(snapshot);
                     } else {

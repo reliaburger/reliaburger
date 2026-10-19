@@ -13,6 +13,9 @@ pub mod command;
 pub mod image;
 pub mod image_config;
 mod inventory;
+#[cfg(target_os = "linux")]
+pub mod kernel;
+pub mod mixed;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
 // grill (a runtime whose `pid()` is `None`), which unit tests can't.
@@ -44,6 +47,7 @@ pub mod userns;
 pub mod volume;
 
 use std::fmt;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
@@ -239,11 +243,78 @@ pub enum GrillError {
         reason: String,
     },
 
+    /// The workload's executable can't run on this node (#881). Launching it
+    /// again fails the same way until someone installs the binary or fixes
+    /// the spec, so callers fail the instance instead of retrying.
+    #[error("instance {instance} cannot launch: {problem}")]
+    LaunchRefused {
+        instance: InstanceId,
+        problem: LaunchProblem,
+    },
+
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
 
     #[error("image pull failed: {0}")]
     ImagePull(#[from] image::ImageError),
+}
+
+/// Why a workload's executable can't run, found before launching it.
+///
+/// Its message is the reason `relish status` and `relish wtf` show.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LaunchProblem {
+    /// No file at the path, or no match on the workload's `PATH`.
+    #[error("binary not found: {}", .0.display())]
+    BinaryNotFound(PathBuf),
+    /// The path names a directory, or a file without execute permission.
+    #[error("binary not executable: {}", .0.display())]
+    BinaryNotExecutable(PathBuf),
+    /// The workload is a container, and this node's runtime runs only host
+    /// processes (`--runtime process`, #914). An image needs a container
+    /// runtime: the process runtime never pulls one, and running the app's
+    /// `command` on the host instead would only pretend to run it.
+    ///
+    /// It carries the image: an app's or an init container's own (or, for
+    /// an app with only a `command`, the root filesystem it would run in).
+    #[error("needs a container runtime to run image {0}, and this node's runtime is process")]
+    NeedsContainerRuntime(String),
+    /// The spec names nothing to execute.
+    #[error("no command to run")]
+    NoCommand,
+}
+
+impl GrillError {
+    /// Why this launch can never succeed as it stands, if that's what failed.
+    pub fn launch_problem(&self) -> Option<&LaunchProblem> {
+        match self {
+            GrillError::LaunchRefused { problem, .. } => Some(problem),
+            _ => None,
+        }
+    }
+
+    /// Whether this error says the workload's spec can't run as written,
+    /// so another launch would fail the same way: a launch the runtime
+    /// refused (a missing or unexecutable binary, nothing to run, or an image
+    /// on a node whose runtime runs only host processes), an image reference
+    /// that doesn't parse, or an image whose digest-verified config is
+    /// invalid.
+    ///
+    /// Every other error is the runtime, the host or a registry failing
+    /// (a pull, a runc call, disk, network setup), which a later attempt
+    /// may get past. When it isn't clear which, the answer is `false`: a
+    /// launch that never ran its command is safe to retry, and the retry
+    /// is bounded by the job's `max_attempts` (#889).
+    pub fn refuses_spec(&self) -> bool {
+        matches!(
+            self,
+            Self::LaunchRefused { .. }
+                | Self::ImagePull(
+                    image::ImageError::InvalidReference(_)
+                        | image::ImageError::InvalidConfig { .. }
+                )
+        )
+    }
 }
 
 /// Non-secret identity of one original runtime execution generation.
@@ -398,6 +469,56 @@ pub trait Grill: Send + Sync {
         std::future::ready(Ok(None))
     }
 
+    /// Delete the durable metadata of an instance whose retirement is already
+    /// proven: its ownership journal, routing record and their lock files.
+    ///
+    /// Refuses, deleting nothing, while the instance may still own a process,
+    /// an address or any other resource. A later `create` of the same
+    /// identity starts from nothing, as it would on a fresh node. Runtimes
+    /// that keep no per-instance metadata do nothing.
+    fn forget_retired(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send {
+        let _ = instance;
+        std::future::ready(Ok(()))
+    }
+
+    /// [`Grill::forget_retired`], for one known generation of a reused
+    /// identity: it also refuses while the identity's current generation is
+    /// any other, so a late request can't forget a successor's launch, such
+    /// as an init container whose exit code a redeploy still has to read
+    /// (#850).
+    fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &RuntimeGeneration,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send {
+        let _ = (instance, generation);
+        std::future::ready(Ok(()))
+    }
+
+    /// The generation of the instance's current launch, for a later
+    /// [`Grill::forget_retired_generation`]. `None` when this runtime keeps
+    /// no launch for it, or keeps no per-instance metadata at all.
+    fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<RuntimeGeneration>, GrillError>> + Send
+    {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
+    /// Identities this runtime keeps metadata for although no backend has a
+    /// launch for them, so nothing they record can still run. Candidates for
+    /// [`Grill::forget_retired`] at startup; most runtimes have none.
+    fn unlaunched_metadata(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<InstanceId>, GrillError>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
     /// Hold a rootful address before discovery publication. Unsupported adapters
     /// return None; the production recovery profile must require this capability.
     fn retain_network_reference(
@@ -435,6 +556,51 @@ pub trait Grill: Send + Sync {
     /// instance records so adoption is routed to the right runtime.
     fn runtime_kind(&self) -> records::RuntimeKind {
         records::RuntimeKind::Process
+    }
+
+    /// The backend selected by the validated workload's execution kind.
+    fn runtime_kind_for_host(&self, _host: bool) -> records::RuntimeKind {
+        self.runtime_kind()
+    }
+    fn runtime_kind_for(&self, spec: &OciSpec) -> records::RuntimeKind {
+        self.runtime_kind_for_host(spec.host_process)
+    }
+    /// Whether recovery can route an original backend without a fallback.
+    fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
+        self.runtime_kind() == kind
+    }
+    /// Whether this runtime runs containers, which an image app needs
+    /// (#914). The process runtime runs host workloads only.
+    fn runs_containers(&self) -> bool {
+        self.runtime_kind_for_host(false) != records::RuntimeKind::Process
+    }
+    /// Per-workload enforcement: whether this workload's process will run in
+    /// the cgroup its spec names, so the agent can bind policy to it first.
+    fn honours_cgroup_path_for(&self, spec: &OciSpec) -> bool {
+        if spec.host_process {
+            self.places_host_processes()
+        } else {
+            self.honours_cgroup_path()
+        }
+    }
+
+    /// Whether host commands (`exec`/`script`) start inside the cgroup their
+    /// spec names, which lets namespace isolation hold them too. Only the
+    /// owned process runtime on rootful cgroup v2 Linux does.
+    fn places_host_processes(&self) -> bool {
+        false
+    }
+
+    /// Owned rootful host backend capable of bounded native command executors.
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<ProcessGrill> {
+        None
+    }
+
+    /// Rootful owned runtime capable of the private reusable command protocol.
+    #[cfg(target_os = "linux")]
+    fn reusable_runtime(&self) -> Option<runc::RuncGrill> {
+        None
     }
 
     /// Whether this runtime places workloads into the cgroup v2 path in
@@ -580,12 +746,35 @@ pub enum AnyGrill {
     /// Linux runc-based container runtime.
     #[cfg(target_os = "linux")]
     Runc(runc::RuncGrill),
+    /// Per-workload runc and owned host-process execution.
+    #[cfg(target_os = "linux")]
+    Mixed(mixed::MixedGrill<runc::RuncGrill>),
     /// macOS Apple Container runtime.
     #[cfg(target_os = "macos")]
     Apple(apple::AppleContainerGrill),
 }
 
 impl AnyGrill {
+    #[cfg(target_os = "linux")]
+    pub fn runc_runtime(&self) -> Option<&runc::RuncGrill> {
+        match self {
+            Self::Runc(g) => Some(g),
+            Self::Mixed(g) => Some(g.container()),
+            _ => None,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn with_host_processes(
+        container: runc::RuncGrill,
+        instances: &std::path::Path,
+        executable: std::path::PathBuf,
+    ) -> Self {
+        Self::Mixed(mixed::MixedGrill::new(
+            container,
+            ProcessGrill::with_owner(instances.to_path_buf(), executable),
+            instances.join("runtime-routes"),
+        ))
+    }
     pub(crate) async fn tail_snapshot(&self, instance: &InstanceId) -> capture::TailSnapshot {
         if let Self::Process(runtime) = self {
             return runtime.tail_snapshot(instance).await;
@@ -605,17 +794,36 @@ impl AnyGrill {
         match self {
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => Some(g.image_store().clone()),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => Some(g.container().image_store().clone()),
             _ => None,
         }
     }
 }
 
 impl Grill for AnyGrill {
+    fn runtime_kind_for_host(&self, host: bool) -> records::RuntimeKind {
+        let _ = host;
+        #[cfg(target_os = "linux")]
+        if let Self::Mixed(g) = self {
+            return g.runtime_kind_for_host(host);
+        }
+        self.runtime_kind()
+    }
+    fn supports_runtime(&self, kind: records::RuntimeKind) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Self::Mixed(g) = self {
+            return g.supports_runtime(kind);
+        }
+        self.runtime_kind() == kind
+    }
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         match self {
             AnyGrill::Process(g) => g.create(instance, spec).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.create(instance, spec).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.create(instance, spec).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.create(instance, spec).await,
         }
@@ -626,6 +834,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.start(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.start(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.start(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.start(instance).await,
         }
@@ -636,6 +846,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.stop(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.stop(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.stop(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.stop(instance).await,
         }
@@ -646,6 +858,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.kill(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.kill(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.kill(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.kill(instance).await,
         }
@@ -656,6 +870,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.state(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.state(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.state(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.state(instance).await,
         }
@@ -666,6 +882,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.has_exited(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.has_exited(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.has_exited(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.has_exited(instance).await,
         }
@@ -680,6 +898,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.adopt(instance, record).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.adopt(instance, record).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.adopt(instance, record).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.adopt(instance, record).await,
         }
@@ -690,8 +910,61 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.launch_inventory().await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.launch_inventory().await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.launch_inventory().await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.launch_inventory().await,
+        }
+    }
+
+    async fn forget_retired(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.forget_retired(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.forget_retired(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.forget_retired(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.forget_retired(instance).await,
+        }
+    }
+
+    async fn forget_retired_generation(
+        &self,
+        instance: &InstanceId,
+        generation: &RuntimeGeneration,
+    ) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.forget_retired_generation(instance, generation).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.forget_retired_generation(instance, generation).await,
+        }
+    }
+
+    async fn launch_generation(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<RuntimeGeneration>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.launch_generation(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.launch_generation(instance).await,
+        }
+    }
+
+    async fn unlaunched_metadata(&self) -> Result<Vec<InstanceId>, GrillError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.unlaunched_metadata().await,
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -703,6 +976,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(runtime) => runtime.retain_network_reference(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => runtime.retain_network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(runtime) => runtime.retain_network_reference(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(runtime) => runtime.retain_network_reference(instance).await,
         }
@@ -716,6 +991,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(runtime) => runtime.network_reference(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => runtime.network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(runtime) => runtime.network_reference(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(runtime) => runtime.network_reference(instance).await,
         }
@@ -729,6 +1006,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(runtime) => runtime.release_network_reference(reference).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(runtime) => runtime.release_network_reference(reference).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(runtime) => runtime.release_network_reference(reference).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(runtime) => runtime.release_network_reference(reference).await,
         }
@@ -739,16 +1018,47 @@ impl Grill for AnyGrill {
             AnyGrill::Process(_) => records::RuntimeKind::Process,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(_) => records::RuntimeKind::Runc,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(_) => records::RuntimeKind::Runc,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => records::RuntimeKind::Apple,
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn host_executor_runtime(&self) -> Option<ProcessGrill> {
+        match self {
+            Self::Process(runtime) => runtime.host_executor_runtime(),
+            Self::Mixed(runtime) => runtime.host_executor_runtime(),
+            _ => None,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn reusable_runtime(&self) -> Option<runc::RuncGrill> {
+        match self {
+            Self::Runc(runtime) => runtime.reusable_runtime(),
+            Self::Mixed(runtime) => runtime.reusable_runtime(),
+            _ => None,
+        }
+    }
     fn honours_cgroup_path(&self) -> bool {
         match self {
             AnyGrill::Process(_) => false,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.honours_cgroup_path(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.honours_cgroup_path(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
+        }
+    }
+    fn places_host_processes(&self) -> bool {
+        match self {
+            AnyGrill::Process(g) => g.places_host_processes(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.places_host_processes(),
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => false,
         }
@@ -759,6 +1069,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.log_stem(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.log_stem(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.log_stem(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.log_stem(instance).await,
         }
@@ -772,6 +1084,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.rootless_network_record(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.rootless_network_record(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.rootless_network_record(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.rootless_network_record(instance).await,
         }
@@ -782,6 +1096,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.pid(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.pid(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.pid(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.pid(instance).await,
         }
@@ -792,6 +1108,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.workload_cgroup(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.workload_cgroup(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.workload_cgroup(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.workload_cgroup(instance).await,
         }
@@ -802,6 +1120,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.container_ip(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.container_ip(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.container_ip(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.container_ip(instance).await,
         }
@@ -812,6 +1132,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.exit_code(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.exit_code(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.exit_code(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.exit_code(instance).await,
         }
@@ -822,6 +1144,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.logs(instance).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.logs(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.logs(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.logs(instance).await,
         }
@@ -837,6 +1161,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.follow_logs(instance, lines_tx, resume).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.follow_logs(instance, lines_tx, resume).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.follow_logs(instance, lines_tx, resume).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.follow_logs(instance, lines_tx, resume).await,
         }
@@ -847,6 +1173,8 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.exec(instance, command).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.exec(instance, command).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.exec(instance, command).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.exec(instance, command).await,
         }
@@ -895,6 +1223,67 @@ async fn which_exists(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_unusable_spec_refuses_a_launch() {
+        use super::image::ImageError;
+        let instance = InstanceId("default__job-0".into());
+        let refused = |problem| GrillError::LaunchRefused {
+            instance: instance.clone(),
+            problem,
+        };
+        let refusals = [
+            GrillError::ImagePull(ImageError::InvalidReference("no tag".into())),
+            GrillError::ImagePull(ImageError::InvalidConfig {
+                digest: "sha256:00".into(),
+                reason: "not JSON".into(),
+            }),
+            // The runtime's own launch refusals (#881, #914) are the spec's
+            // fault too, so a task is refused rather than retried (#889).
+            refused(LaunchProblem::BinaryNotFound("/missing".into())),
+            refused(LaunchProblem::BinaryNotExecutable("/etc".into())),
+            refused(LaunchProblem::NeedsContainerRuntime("busybox:1.36".into())),
+            refused(LaunchProblem::NoCommand),
+        ];
+        for error in &refusals {
+            assert!(error.refuses_spec(), "{error}");
+        }
+        let transient = [
+            GrillError::ImagePull(ImageError::ManifestPull {
+                image: "busybox".into(),
+                reason: "registry leader refused proposal: 503 Service Unavailable".into(),
+            }),
+            GrillError::ImagePull(ImageError::LayerPull {
+                digest: "sha256:00".into(),
+                reason: "connection reset".into(),
+            }),
+            GrillError::ImagePull(ImageError::DigestMismatch {
+                digest: "sha256:00".into(),
+                expected: "a".into(),
+                actual: "b".into(),
+            }),
+            GrillError::ImagePull(ImageError::UnpackFailed {
+                digest: "sha256:00".into(),
+                reason: "No space left on device".into(),
+            }),
+            GrillError::ImagePull(ImageError::Io(std::io::Error::other("disk"))),
+            GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "runc create: exit status 1".into(),
+            },
+            GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "runtime command did not finish within 5s".into(),
+            },
+            GrillError::InventoryUnavailable {
+                reason: "journal unreadable".into(),
+            },
+            GrillError::NotFound { instance },
+        ];
+        for error in &transient {
+            assert!(!error.refuses_spec(), "{error}");
+        }
+    }
+
     #[test]
     fn runtime_generation_wire_values_require_canonical_fingerprints() {
         let original = RuntimeGeneration::process("private-generation");

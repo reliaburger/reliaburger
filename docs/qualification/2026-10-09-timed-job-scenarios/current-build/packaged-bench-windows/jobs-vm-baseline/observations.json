@@ -1,0 +1,92 @@
+{
+  "application_probes": 60,
+  "application_failures": 0,
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.014204730046913028,
+      "cpu_ticks": [
+        7315018,
+        5659,
+        7486120,
+        464693279,
+        1622934,
+        0,
+        646118,
+        0,
+        0,
+        0
+      ],
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 187969536,
+          "files_observed": 2438,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2652422144
+        }
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 180174848,
+          "peak_rss_bytes": 303005696
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 778240,
+          "peak_rss_bytes": 1703936
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.415151846129447,
+      "cpu_ticks": [
+        7317507,
+        5659,
+        7494597,
+        464694154,
+        1622936,
+        0,
+        646119,
+        0,
+        0,
+        0
+      ],
+      "storage": {
+        "/tmp/rb-host-executor-v4/data": {
+          "allocated_bytes_observed": 187981824,
+          "files_observed": 2438,
+          "raced_entries": 0,
+          "complete": false,
+          "filesystem_available_bytes": 2652409856
+        }
+      },
+      "processes": [
+        {
+          "pid": 2960485,
+          "start_ticks": 119317256,
+          "complete": true,
+          "rss_bytes": 181256192,
+          "peak_rss_bytes": 303005696
+        },
+        {
+          "pid": 2960635,
+          "start_ticks": 119317979,
+          "complete": true,
+          "rss_bytes": 778240,
+          "peak_rss_bytes": 1703936
+        }
+      ]
+    }
+  ],
+  "service_latency_ms": {
+    "samples": 60,
+    "maximum": 14.015688095241785,
+    "p95": 2.068383852019906
+  },
+  "observation_boundary": "Service and resource observations span preparation, measured work and positive drain"
+}

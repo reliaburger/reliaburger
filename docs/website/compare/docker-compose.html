@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An evidence-based comparison of Docker Compose and Reliaburger: local development, single-server operations, cluster scheduling, commands and upgrade boundaries.">
+  <meta name="theme-color" content="#181b19">
+  <title>Reliaburger and Docker Compose · Reliaburger comparisons</title>
+  <link rel="stylesheet" href="../style.css">
+  <link rel="stylesheet" href="../comparisons.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="masthead">
+      <a class="wordmark" href="../" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
+      <nav aria-label="Main navigation"><a href="../#install">Install</a><a href="./index.html">Comparisons</a><a href="./methodology.html">Methodology</a></nav>
+    </header>
+    <main id="main" class="comparison-page">
+      <section class="comparison-intro" id="intro" aria-labelledby="title">
+        <p class="eyebrow">LOCAL DEVELOPMENT / DOCKER COMPOSE</p>
+        <h1 id="title">Reliaburger and Docker Compose</h1>
+        <p class="lede">Take application operations beyond one Docker host. Reliaburger combines placement across nodes, cluster identity, service discovery and incident investigation in one platform. Compose remains a straightforward way to define and run a stack on one host; Reliaburger adds the shared operational model for a cluster.</p>
+        <p class="evidence">Basis: <a href="https://docs.docker.com/compose/gettingstarted/">Compose's development workflow</a>, <a href="https://docs.docker.com/compose/how-tos/production/">production scope</a> and <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/06_under-the-hood.md">Reliaburger architecture</a>. Suitability is our qualitative assessment.</p>
+        <aside class="comparison-note"><strong>Version boundary.</strong> Reliaburger's public installer supplies <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.1.6">0.1.6</a>; feature analysis uses the <strong>unreleased release-0-2-1 snapshot</strong>, <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/roadmap.md"><code>32effd9</code></a>. Compose commands follow current official documentation, reviewed 15 October 2026. This page compares ordinary <code>docker compose</code> operation; <a href="https://docs.docker.com/engine/swarm/">Swarm</a> is a separate clustering mode.</aside>
+      </section>
+      <nav class="comparison-toc" aria-label="On this page"><a href="#summary">At a glance</a><a href="#concepts">Concepts</a><a href="#install">Installation</a><a href="#workflows">Daily work</a><a href="#upgrades">Upgrades</a><a href="#tradeoffs">Where it fits</a><a href="#sources">Evidence</a></nav>
+
+      <section id="summary">
+        <h2>Where each wins <a class="permalink" href="#summary" aria-label="Link to where each wins">#</a></h2>
+        <div class="verdict-grid">
+          <div><h3>Reliaburger: one operational cluster</h3><p>Bun combines Raft, scheduling, discovery, registry caching, metrics and logs. Placement and failure decisions operate over cluster nodes, and <code>relish wtf</code> explains available evidence. That is a concrete capability advantage when the requirement spans machines. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/06_under-the-hood.md">Architecture</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/02_cluster-basics.md">cluster behavior</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/07_diagnostics.md">diagnostics</a>.</p></div>
+          <div><h3>Compose: a small deployment unit</h3><p>One YAML definition combines services, networks and volumes. Watch can synchronize source or rebuild containers during development, while production overrides reuse the base definition. These documented workflows make Compose a compelling development and single-server choice. <a href="https://docs.docker.com/compose/gettingstarted/">Getting started</a> · <a href="https://docs.docker.com/compose/how-tos/file-watch/">Watch</a> · <a href="https://docs.docker.com/compose/how-tos/production/">production overrides</a>.</p></div>
+        </div>
+        <p>Docker restart policies recover containers on their Docker daemon; they do not create another host to replace a failed machine. Pointing Compose at a remote daemon changes the destination, not its scheduling model. Docker's own production guide directs cluster deployments toward Swarm. <a href="https://docs.docker.com/engine/containers/start-containers-automatically/">Restart policies</a> · <a href="https://docs.docker.com/compose/how-tos/production/">remote host and clustering</a>.</p>
+      </section>
+
+      <section id="concepts">
+        <h2>Translate the concepts <a class="permalink" href="#concepts" aria-label="Link to concepts">#</a></h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th scope="col">Concern</th><th scope="col">Compose</th><th scope="col">Reliaburger</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Definition</th><td>A project groups YAML services, networks and volumes. <a href="https://docs.docker.com/compose/gettingstarted/">Model</a></td><td>TOML apps/jobs and namespaces; supported Kubernetes YAML can be imported. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md">Apps</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/09_kubernetes.md">import limits</a></td></tr>
+            <tr><th scope="row">Service discovery</th><td>Containers on a project network resolve service names through Docker DNS. <a href="https://docs.docker.com/compose/how-tos/networking/">Networking</a></td><td>Cluster DNS and stable service addresses backed by eBPF routing. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/03_networking.md">Networking</a></td></tr>
+            <tr><th scope="row">Readiness</th><td><code>depends_on: service_healthy</code> gates dependent startup on a health check. <a href="https://docs.docker.com/compose/how-tos/startup-order/">Startup order</a></td><td>Health checks feed replica state and rollout progression; this is not a direct dependency-graph equivalent. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md">Health contract</a></td></tr>
+            <tr><th scope="row">Secrets</th><td>Explicit grants mount secret files into eligible service containers. <a href="https://docs.docker.com/compose/how-tos/use-secrets/">Secrets</a></td><td>Encrypted secrets and namespace-scoped access within the cluster identity model. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/10_security.md">Security</a></td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>Learning curve, our assessment:</strong> an existing Compose user can keep familiar YAML and Docker tools. Moving to Reliaburger means learning manifests, placement and quorum; the payoff is a common interface for cluster diagnostics. This is a conceptual comparison, not measured onboarding time. <a href="https://docs.docker.com/compose/gettingstarted/">Compose tutorial</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/02_cluster-basics.md">cluster concepts</a>.</p>
+      </section>
+
+      <section id="install">
+        <h2>Install the platform <a class="permalink" href="#install" aria-label="Link to installation">#</a></h2>
+        <p>Docker Desktop includes Engine, CLI and Compose. On Linux with Engine, CLI and Docker's package repository already configured, the Debian/Ubuntu plugin commands below install Compose. Installing the plugin alone does not install those prerequisites. <a href="https://docs.docker.com/compose/install/">Installation choices</a> · <a href="https://docs.docker.com/compose/install/linux/">Linux instructions</a>.</p>
+        <div class="command-grid">
+          <div class="terminal"><div class="terminal-heading">COMPOSE <span>configured Debian/Ubuntu host</span></div><pre><code>sudo apt-get update
+sudo apt-get install docker-compose-plugin
+docker compose version</code></pre></div>
+          <div class="terminal"><div class="terminal-heading">RELIABURGER <span>laptop quickstart</span></div><pre><code>curl -fsSL https://reliaburger.com/install.sh | sh
+relish status
+relish nodes</code></pre></div>
+        </div>
+        <p>Reliaburger's default installer creates three Linux VMs using Apple's Virtualization.framework through Lima on macOS, or QEMU/KVM through Lima on Linux, with roughly 8 GiB free memory and 15 GiB disk required. It exercises cluster behavior; that is a different installation scope from adding Compose to an existing daemon. Production Reliaburger container clusters use rootful Linux runc and eBPF. <a href="https://github.com/reliaburger/reliaburger/blob/v0.1.6/docs/quickstart.md">Stable quickstart</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/README.md#scope-and-limits">runtime limits</a>.</p>
+      </section>
+
+      <section id="workflows">
+        <h2>Validate, run and investigate <a class="permalink" href="#workflows" aria-label="Link to workflows">#</a></h2>
+        <p>These examples assume an existing <code>compose.yaml</code> with service <code>web</code>, or <code>web.toml</code> with app <code>web</code>. Compose's <code>config --quiet</code> validates configuration; <code>up --wait</code> waits for services to be running or healthy. Reliaburger's <code>apply</code> commits desired state asynchronously, so inspect health afterward. <a href="https://docs.docker.com/reference/cli/docker/compose/config/">Config</a> · <a href="https://docs.docker.com/reference/cli/docker/compose/up/">up</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md">Reliaburger deployment</a>.</p>
+        <div class="command-grid">
+          <div class="terminal"><div class="terminal-heading">COMPOSE <span>project directory</span></div><pre><code>docker compose config --quiet
+docker compose up -d --wait
+docker compose logs --tail 50 web
+docker compose exec web sh</code></pre></div>
+          <div class="terminal"><div class="terminal-heading">RELIABURGER <span>reachable cluster</span></div><pre><code>relish lint web.toml
+relish apply web.toml
+relish inspect web
+relish logs web --tail 50
+relish wtf --app web</code></pre></div>
+        </div>
+        <p>Compose's shell example needs an image containing <code>sh</code>; logs and exec are service-oriented commands. Reliaburger's diagnostic command investigates placement and network paths instead of being a shell equivalent. Its authenticated dashboard is read-only. <a href="https://docs.docker.com/reference/cli/docker/compose/logs/">Compose logs</a> · <a href="https://docs.docker.com/reference/cli/docker/compose/exec/">exec</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/07_diagnostics.md">diagnostics</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/04_observability.md">dashboard</a>.</p>
+        <p>Reliaburger also makes the resolved deployment configuration inspectable: <code>relish compile config/ &gt; all.toml</code> combines manifests, inherited defaults and derived namespaces into one file before admission. Compose provides <code>docker compose config</code> for its resolved service model. Both give the reader a concrete configuration to review. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md#many-files">Reliaburger compilation</a> · <a href="https://docs.docker.com/reference/cli/docker/compose/config/">Compose configuration</a>.</p>
+        <p>For development, configure <code>develop.watch</code>, then use <code>docker compose up --watch</code> for its file-sync/build loop. Watch is aimed at editing and testing source locally, while the deployment commands above apply a workload definition. <a href="https://docs.docker.com/compose/how-tos/file-watch/">Watch setup and supported actions</a>.</p>
+      </section>
+
+      <section id="upgrades">
+        <h2>Applications and the platform have different upgrades <a class="permalink" href="#upgrades" aria-label="Link to upgrades">#</a></h2>
+        <p><strong>Compose application:</strong> after changing the image reference, pull and reconcile it. Pull alone does not start a container; <code>up</code> recreates changed services. This is not a documented cluster rolling-release controller, and <code>--wait</code> does not promise uninterrupted traffic. <a href="https://docs.docker.com/reference/cli/docker/compose/pull/">Pull</a> · <a href="https://docs.docker.com/reference/cli/docker/compose/up/">recreation and waiting</a>.</p>
+        <div class="command-grid">
+          <div class="terminal"><div class="terminal-heading">APP RELEASE <span>Compose, image already edited</span></div><pre><code>docker compose pull web
+docker compose up -d --wait web</code></pre></div>
+          <div class="terminal"><div class="terminal-heading">APP RELEASE <span>Reliaburger, manifest edited</span></div><pre><code>relish deploy web.toml
+relish history web
+relish rollback web</code></pre></div>
+        </div>
+        <p><strong>Reliaburger, unreleased snapshot:</strong> changed-spec rollouts advance one node at a time, after health succeeds on that node. Surge/unavailable budgets are local to each node; managed volumes force stop-first. Successful versions are replicated for rollback across restarts, while failed rollouts halt further nodes. This is a stronger cluster release contract, not evidence of faster recovery. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/01_deploy-an-app.md#rolling-deploys">Pinned rollout and rollback semantics</a>.</p>
+        <p><strong>Platform:</strong> updating the Compose package uses the Linux installation commands above; manual binary installations need manual updates. Docker Engine/Desktop has its own lifecycle. Reliaburger offers <code>relish upgrade check</code> and coordinated agent upgrades only across compatible protocol/state formats. The 0.1.6-to-development-train transition requires a fresh cluster. <a href="https://docs.docker.com/compose/install/linux/">Plugin updates</a> · <a href="https://docs.docker.com/compose/install/">installation components</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/12_operations.md#upgrading-bun">Bun upgrade rules</a>.</p>
+      </section>
+
+      <section id="tradeoffs">
+        <h2>Where Reliaburger fits <a class="permalink" href="#tradeoffs" aria-label="Link to where Reliaburger fits">#</a></h2>
+        <p>Compose's local volumes persist beyond a container, but backups and remote storage need an explicit operational design. Reliaburger has Btrfs snapshots and council backups; council backups exclude application volumes. Neither platform makes a database restore correct merely by copying files. <a href="https://docs.docker.com/engine/storage/volumes/">Docker volume lifecycle and backup procedures</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/11_images-and-volumes.md">Reliaburger volumes</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/manual/12_operations.md#backing-up-the-council">council recovery</a>.</p>
+        <p><strong>Choose Reliaburger when the operational unit is a cluster:</strong> its integrated identity, discovery and diagnostics let you work with applications across nodes through one platform. Its prototype status and rootful/eBPF requirements still matter. For a small stack that only needs one host, Compose has a narrower set of concepts to operate. This suitability assessment follows the documented scope. <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/README.md">Reliaburger status</a> · <a href="https://github.com/reliaburger/reliaburger/blob/32effd96e2a349d5a0533aa8a51c22b1054338d0/docs/README.md#scope-and-limits">scope</a> · <a href="https://docs.docker.com/compose/how-tos/production/">Compose production model</a>.</p>
+      </section>
+
+      <section id="sources">
+        <h2>Evidence and limits <a class="permalink" href="#sources" aria-label="Link to evidence">#</a></h2>
+        <p class="source">This comparison uses Docker's official command references and operational guides, alongside Reliaburger's pinned manuals. Claims about Compose do not silently include Swarm, third-party proxies or backup operators. No workload was deployed for this review; performance, resource overhead and recovery-time comparisons remain unmeasured. Current Docker documentation may change after the review date.</p>
+      </section>
+    </main>
+    <footer class="footer">
+      <p>Reviewed 15 October 2026. Source and documentation review, not a deployment benchmark. Learning-curve and suitability judgments are qualitative.</p>
+      <p>Static HTML and CSS. The only script copies commands and section links. <a href="./index.html">All comparisons</a> · <a href="./methodology.html#method">Sources and method</a></p>
+    </footer>
+  </div>
+  <script src="../assets/copy.js" defer></script>
+</body>
+</html>

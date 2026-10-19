@@ -284,6 +284,7 @@ impl RoutingTable {
                     host: host.clone(),
                     path: route.path_prefix.clone(),
                     app_name: route.app_name.clone(),
+                    namespace: route.namespace.clone(),
                     healthy_backends: route.healthy_count(),
                     total_backends: route.backends.len(),
                     websocket: route.websocket,
@@ -493,6 +494,17 @@ fn build_path_route(
         rate_limit,
         tls_mode,
     })
+}
+
+/// Check an ingress config the way a routing rebuild will: the TLS mode
+/// parses, and the rate limit and burst are usable.
+///
+/// Config validation calls this so `relish apply` and `relish lint` refuse a
+/// route every node would skip. Returns the reason the route is invalid.
+pub fn validate_ingress(ingress: &IngressSpec) -> Result<(), String> {
+    TlsMode::parse(ingress.tls.as_deref()).map_err(|e| e.to_string())?;
+    build_rate_limit(ingress.rate_limit_rps, ingress.rate_limit_burst)?;
+    Ok(())
 }
 
 /// Validate and build a rate-limit config.

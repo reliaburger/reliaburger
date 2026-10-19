@@ -115,6 +115,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         records: &[InstanceRecord],
         launches: Option<&[RuntimeLaunch]>,
     ) -> Result<(), BunError> {
+        if self.discovery_write_in_flight() {
+            return Err(BunError::AdoptionState(
+                "a discovery journal write is still in flight".into(),
+            ));
+        }
         let DiscoveryOwnership::Recovered(journal) = &self.discovery_ownership else {
             return Ok(());
         };
@@ -147,6 +152,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Complete exact permissions whose runtime acknowledgement may have been lost.
     pub(super) async fn replay_discovery_releases(&mut self) -> Result<(), BunError> {
+        self.settle_discovery_write().await;
         let DiscoveryOwnership::Recovered(journal) = &self.discovery_ownership else {
             return Ok(());
         };
@@ -165,6 +171,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Publish only positively adopted runtimes and retire confirmed empty allocations.
     pub(super) async fn finish_discovery_recovery(&mut self) -> Result<(), BunError> {
+        self.settle_discovery_write().await;
         if !matches!(self.discovery_ownership, DiscoveryOwnership::Recovered(_)) {
             return Ok(());
         }

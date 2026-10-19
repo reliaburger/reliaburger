@@ -141,6 +141,7 @@ const KNOWN_PERMISSION_ACTIONS: &[&str] = &[
     "metrics",
     "exec",
     "host-exec",
+    "fault",
     "admin",
     "secret-read",
     "secret-write",
@@ -248,6 +249,13 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             name: name.to_string(),
         });
     }
+    validate_network_policy(
+        &format!("app {name:?}"),
+        app.firewall.as_ref(),
+        app.egress.as_ref(),
+    )?;
+    validate_app_ingress(name, app)?;
+    validate_app_honoured_fields(name, app)?;
 
     // Ordinals come from the leader's placements, never from a config file.
     if app.ordinals.is_some() {
@@ -398,9 +406,10 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
 
     // Deploy block: `max_surge = 0` with `max_unavailable = 0` leaves a rolling
     // deploy no legal move in either direction, so reject it here rather than
-    // let the rollout wedge (M7).
+    // let the rollout wedge (M7). A timeout that doesn't parse is refused
+    // too, rather than replaced by the default (#692).
     if let Some(deploy) = &app.deploy
-        && let Err(reason) = crate::meat::deploy_types::DeployConfig::from_spec(deploy).validate()
+        && let Err(reason) = crate::meat::deploy_types::DeployConfig::parse(deploy)
     {
         return Err(ConfigError::Validation {
             field: "deploy".to_string(),
@@ -427,8 +436,148 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     Ok(())
 }
 
+/// Refuse an ingress route every node's routing rebuild would skip, so a
+/// typo like `tls = "acme"` fails at apply and lint instead of silently
+/// serving no route (#700).
+fn validate_app_ingress(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let Some(ingress) = &app.ingress else {
+        return Ok(());
+    };
+    crate::wrapper::routing::validate_ingress(ingress).map_err(|reason| ConfigError::Validation {
+        field: "ingress".to_string(),
+        context: format!("app {name:?}"),
+        reason,
+    })
+}
+
+/// Refuse app fields that would parse and then be ignored or half-honoured,
+/// so a valid-looking config can't quietly run something else (#701): a GPU
+/// request no node can back, mounts and a user a process workload never
+/// applies, and a health check that can't probe or can only fail.
+fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let refuse = |field: &str, reason: String| ConfigError::Validation {
+        field: field.to_string(),
+        context: format!("app {name:?}"),
+        reason,
+    };
+
+    // D41: no device passthrough or cluster GPU accounting yet.
+    if app.gpu.is_some_and(|gpu| gpu > 0) {
+        return Err(refuse(
+            "gpu",
+            "GPU workloads aren't supported yet (#359)".to_string(),
+        ));
+    }
+
+    // ProcessGrill runs the host binary as it is: no mounts, no user switch.
+    // Placement asks the same question through `host_binary`.
+    if crate::meat::filter::host_binary(app).is_some() {
+        let ignored = [
+            ("volumes", !app.volumes.is_empty()),
+            ("config_file", !app.config_file.is_empty()),
+            ("run_as_user", app.run_as_user.is_some()),
+            ("run_as_group", app.run_as_group.is_some()),
+        ];
+        if let Some((field, _)) = ignored.iter().find(|(_, set)| *set) {
+            return Err(refuse(
+                field,
+                format!("{field} applies to image workloads; an exec or script app can't use it"),
+            ));
+        }
+    }
+
+    let Some(health) = &app.health else {
+        return Ok(());
+    };
+    if health.port.or(app.port).is_none() {
+        return Err(refuse(
+            "health",
+            "no port to probe: set health.port or the app's port".to_string(),
+        ));
+    }
+    let zero = [
+        ("health.interval", health.interval == Some(0)),
+        ("health.timeout", health.timeout == Some(0)),
+        (
+            "health.threshold_unhealthy",
+            health.threshold_unhealthy == Some(0),
+        ),
+        (
+            "health.threshold_healthy",
+            health.threshold_healthy == Some(0),
+        ),
+    ];
+    if let Some((field, _)) = zero.iter().find(|(_, is_zero)| *is_zero) {
+        return Err(refuse(field, format!("{field} must be at least 1")));
+    }
+    let interval = health
+        .interval
+        .unwrap_or(crate::bun::health::DEFAULT_HEALTH_INTERVAL_SECS);
+    let timeout = health
+        .timeout
+        .unwrap_or(crate::bun::health::DEFAULT_HEALTH_TIMEOUT_SECS);
+    // A probe that may outlast the interval overlaps the next one. Equal is
+    // allowed: seconds are whole, so a 1 s interval needs a 1 s timeout.
+    if timeout > interval {
+        return Err(refuse(
+            "health.timeout",
+            format!("timeout ({timeout}s) must not be longer than interval ({interval}s)"),
+        ));
+    }
+    Ok(())
+}
+
+/// Check the network policy apps and jobs share: every egress entry parses
+/// (without resolving names), and every `allow_from` source is `app` or
+/// `namespace/app` made of workload labels.
+fn validate_network_policy(
+    context: &str,
+    firewall: Option<&super::app::FirewallSpec>,
+    egress: Option<&super::app::EgressSpec>,
+) -> Result<(), ConfigError> {
+    // Cross-cluster egress (Franchise) doesn't exist: every node would refuse
+    // the workload, so refuse it here, at apply and lint (#701).
+    if egress.is_some_and(|egress| !egress.allow_franchise.is_empty()) {
+        return Err(ConfigError::Validation {
+            field: "egress.allow_franchise".to_string(),
+            context: context.to_string(),
+            reason: "cross-cluster egress isn't implemented".to_string(),
+        });
+    }
+    for entry in egress.map_or(&[][..], |egress| egress.allow.as_slice()) {
+        crate::sesame::egress::validate_egress_entry(entry).map_err(|error| {
+            ConfigError::Validation {
+                field: "egress".to_string(),
+                context: context.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    for source in firewall.map_or(&[][..], |firewall| firewall.allow_from.as_slice()) {
+        let valid = match source.split_once('/') {
+            Some((namespace, app)) => valid_workload_label(namespace) && valid_workload_label(app),
+            None => valid_workload_label(source),
+        };
+        if !valid {
+            return Err(ConfigError::Validation {
+                field: "firewall.allow_from".to_string(),
+                context: context.to_string(),
+                reason: format!(
+                    "{source:?} must be an app name or namespace/app, each a lowercase DNS label"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
     validate_label(name, "job", "name")?;
+    validate_network_policy(
+        &format!("job {name:?}"),
+        job.firewall.as_ref(),
+        job.egress.as_ref(),
+    )?;
     validate_label(
         job.namespace.as_deref().unwrap_or("default"),
         name,
@@ -477,7 +626,48 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
         });
     }
 
-    Ok(())
+    job.validate_runtime()
+        .map_err(|reason| ConfigError::Validation {
+            field: "runtime".into(),
+            context: format!("job {name:?}"),
+            reason: reason.into(),
+        })?;
+    validate_job_policy(name, job)
+}
+
+/// Check a TOML job's run policy against the same limits a manifest has.
+fn validate_job_policy(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError> {
+    let refuse = |field: &str, reason: String| ConfigError::Validation {
+        field: field.into(),
+        context: format!("job {name:?}"),
+        reason,
+    };
+    if job.overlap.is_some() && job.schedule.is_none() {
+        return Err(refuse(
+            "overlap",
+            "only applies to a job with a schedule".into(),
+        ));
+    }
+    if job.replay_unknown && !job.run_before.is_empty() {
+        return Err(refuse(
+            "replay_unknown",
+            "a run_before hook can't replay an unknown outcome automatically; acknowledge it with relish batch replay".into(),
+        ));
+    }
+    // The definition is where the policy lands, so its limits are the ones to check.
+    let tasks = crate::meat::job::JobDefinition::from_spec(job.clone()).tasks;
+    tasks.validate().map_err(|error| {
+        let field = match error {
+            crate::meat::task_array::TaskArraySpecError::AttemptsOutOfRange { .. } => {
+                "max_attempts"
+            }
+            crate::meat::task_array::TaskArraySpecError::TimeoutOutOfRange { .. } => {
+                "task_timeout_secs"
+            }
+            _ => "job",
+        };
+        refuse(field, error.to_string())
+    })
 }
 
 impl NodeConfig {
@@ -532,11 +722,16 @@ impl NodeConfig {
             ("storage.metrics", &self.storage.metrics),
             ("storage.volumes", &self.storage.volumes),
         ];
-        for (field, path) in &paths {
+        let allowed_host_paths = self
+            .storage
+            .allowed_host_paths
+            .iter()
+            .map(|path| ("storage.allowed_host_paths", path));
+        for (field, path) in paths.into_iter().chain(allowed_host_paths) {
             if !path.is_absolute() {
                 return Err(ConfigError::NonAbsolutePath {
-                    field: (*field).to_string(),
-                    path: (*path).clone(),
+                    field: field.to_string(),
+                    path: path.clone(),
                 });
             }
         }
@@ -586,6 +781,19 @@ impl NodeConfig {
             return Err(ConfigError::NonAbsolutePath {
                 field: "upgrades.binary_dir".to_string(),
                 path: dir.clone(),
+            });
+        }
+
+        // A log smaller than a few records would drop each record as soon
+        // as the next arrived, which is no audit trail at all (#685).
+        if self.storage.audit_max_bytes < crate::bun::audit::MIN_AUDIT_MAX_BYTES {
+            return Err(ConfigError::Validation {
+                field: "storage.audit_max_bytes".into(),
+                context: "node config".into(),
+                reason: format!(
+                    "must be at least {} bytes",
+                    crate::bun::audit::MIN_AUDIT_MAX_BYTES
+                ),
             });
         }
 
@@ -1033,6 +1241,55 @@ mod tests {
     }
 
     #[test]
+    fn unknown_deploy_strategy_is_rejected() {
+        // "bluegreen" used to mean "rolling", silently.
+        let error = toml::from_str::<AppSpec>(
+            r#"
+            image = "web:v1"
+            [deploy]
+            strategy = "bluegreen"
+        "#,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "an unknown strategy must fail to parse: {error}"
+        );
+        for strategy in ["rolling", "blue-green"] {
+            let app: AppSpec = toml::from_str(&format!(
+                "image = \"web:v1\"\n[deploy]\nstrategy = \"{strategy}\"\n"
+            ))
+            .unwrap();
+            config_with_app("web", app).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn unparseable_drain_timeout_is_rejected() {
+        for (field, value) in [
+            ("drain_timeout", "1m30s"),
+            ("drain_timeout", "500ms"),
+            ("health_timeout", "a minute"),
+        ] {
+            let app: AppSpec = toml::from_str(&format!(
+                "image = \"web:v1\"\n[deploy]\n{field} = \"{value}\"\n"
+            ))
+            .unwrap();
+            let err = config_with_app("web", app).validate().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Validation { field: ref f, ref reason, .. }
+                    if f == "deploy" && reason.contains(field) && reason.contains(value)),
+                "{field} = {value:?} must be refused, not replaced by the default: {err:?}"
+            );
+        }
+        let app: AppSpec = toml::from_str(
+            "image = \"web:v1\"\n[deploy]\ndrain_timeout = \"90s\"\nhealth_timeout = \"2m\"\n",
+        )
+        .unwrap();
+        config_with_app("web", app).validate().unwrap();
+    }
+
+    #[test]
     fn validate_autoscale_min_greater_than_max_rejected() {
         let app: AppSpec = toml::from_str(
             r#"
@@ -1138,6 +1395,22 @@ mod tests {
             nc.validate(),
             Err(ConfigError::NonAbsolutePath { .. })
         ));
+    }
+
+    #[test]
+    fn audit_log_bound_has_a_floor() {
+        let mut nc = NodeConfig::default();
+        assert_eq!(
+            nc.storage.audit_max_bytes,
+            crate::bun::audit::DEFAULT_AUDIT_MAX_BYTES
+        );
+        nc.storage.audit_max_bytes = 1024;
+        let error = nc.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.audit_max_bytes"), "{error}");
+        nc.storage.audit_max_bytes = crate::bun::audit::MIN_AUDIT_MAX_BYTES;
+        assert!(nc.validate().is_ok());
+        let parsed = NodeConfig::parse("[storage]\naudit_max_bytes = 1048576\n").unwrap();
+        assert_eq!(parsed.storage.audit_max_bytes, 1 << 20);
     }
 
     #[test]
@@ -1644,9 +1917,50 @@ mod tests {
     }
 
     #[test]
+    fn job_egress_is_validated_like_an_app() {
+        let invalid = [
+            ("egress", "allow = [\"no-port.example.com\"]", "egress"),
+            ("egress", "allow = [\"10.0.0.1/8:443\"]", "egress"),
+            ("egress", "allow = [\"2001:db8::1:443\"]", "egress"),
+            (
+                "firewall",
+                "allow_from = [\"Not_A_Label\"]",
+                "firewall.allow_from",
+            ),
+            (
+                "firewall",
+                "allow_from = [\"a/b/c\"]",
+                "firewall.allow_from",
+            ),
+        ];
+        for (table, body, field) in invalid {
+            for kind in ["app", "job"] {
+                let source =
+                    format!("[{kind}.work]\nimage = \"fixture:v1\"\n[{kind}.work.{table}]\n{body}");
+                let error = Config::parse(&source).unwrap().validate().unwrap_err();
+                assert!(
+                    matches!(&error, ConfigError::Validation { field: actual, .. } if actual == field),
+                    "{kind} accepted {table} {body:?}: {error}"
+                );
+            }
+        }
+        for kind in ["app", "job"] {
+            let source = format!(
+                "[{kind}.work]\nimage = \"fixture:v1\"\n\
+                 [{kind}.work.egress]\nallow = [\"api.example.com:443\", \"10.0.0.0/8:5432\", \"[2001:db8::1]:443\"]\n\
+                 [{kind}.work.firewall]\nallow_from = [\"web\", \"frontend/scraper\"]"
+            );
+            Config::parse(&source).unwrap().validate().unwrap();
+        }
+    }
+
+    #[test]
     fn validate_job_exec_only_passes() {
-        let job: crate::config::job::JobSpec =
-            toml::from_str(r#"exec = "/usr/bin/python3""#).unwrap();
+        let job: crate::config::job::JobSpec = toml::from_str(
+            r#"runtime = "process"
+exec = "/usr/bin/python3""#,
+        )
+        .unwrap();
         let mut config = Config::default();
         config.job.insert("test-job".to_string(), job);
         config.validate().unwrap();
@@ -1717,6 +2031,19 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. } if field == "actions"),
             "unknown permission action must be rejected: {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_permission_accepts_the_fault_action() {
+        let config = Config::parse(
+            r#"
+            [permission.chaos]
+            actions = ["fault"]
+            apps = ["web"]
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1818,5 +2145,168 @@ mod tests {
     fn same_namespace_prerequisites_are_valid() {
         Config::parse("[app.web]\nimage='web'\nnamespace='production'\n[job.migrate]\nimage='migrate'\nnamespace='production'\nrun_before=['app.web']\n")
             .unwrap().validate().unwrap();
+    }
+
+    /// Validate a one-app config whose `[app.web.ingress]` table is `ingress`.
+    fn validate_ingress(ingress: &str) -> Result<(), ConfigError> {
+        Config::parse(&format!(
+            "[app.web]\nimage = \"web:v1\"\nport = 8080\n[app.web.ingress]\nhost = \"web.example.com\"\n{ingress}"
+        ))
+        .unwrap()
+        .validate()
+    }
+
+    fn assert_ingress_refused(ingress: &str, reason_contains: &str) {
+        let error = validate_ingress(ingress).expect_err(ingress);
+        assert!(
+            matches!(error, ConfigError::Validation { ref field, .. } if field == "ingress"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains(reason_contains), "{error}");
+    }
+
+    #[test]
+    fn ingress_with_unknown_tls_mode_is_rejected() {
+        // ACME is deferred: the route would be refused on every node, so
+        // apply and lint refuse it first (#700).
+        for mode in ["acme", "auto", "letsencrypt"] {
+            assert_ingress_refused(&format!("tls = \"{mode}\""), "tls");
+        }
+    }
+
+    #[test]
+    fn ingress_with_zero_rate_limit_is_rejected() {
+        assert_ingress_refused("rate_limit_rps = 0", "rate_limit_rps");
+        assert_ingress_refused(
+            "rate_limit_rps = 10\nrate_limit_burst = 0",
+            "rate_limit_burst",
+        );
+    }
+
+    #[test]
+    fn ingress_rate_limit_without_a_derivable_burst_is_rejected() {
+        assert_ingress_refused(&format!("rate_limit_rps = {}", u32::MAX), "burst");
+    }
+
+    #[test]
+    fn ingress_with_supported_settings_is_valid() {
+        for ingress in [
+            "",
+            "tls = \"cluster\"",
+            "tls = \"explicit\"\nrate_limit_rps = 50",
+            "tls = \"none\"\nrate_limit_rps = 5\nrate_limit_burst = 20",
+        ] {
+            validate_ingress(ingress).unwrap();
+        }
+    }
+
+    /// Validate a one-app config whose `[app.web]` table is `app`.
+    fn validate_app_toml(app: &str) -> Result<(), ConfigError> {
+        Config::parse(&format!("[app.web]\n{app}"))
+            .unwrap()
+            .validate()
+    }
+
+    /// Assert `app` is refused with an error naming `field`.
+    fn assert_app_refused(app: &str, field: &str) {
+        let error = validate_app_toml(app).expect_err(app);
+        assert!(error.to_string().contains(field), "{app}: {error}");
+    }
+
+    #[test]
+    fn process_app_with_volume_is_refused() {
+        // ProcessGrill never mounts anything: the app would run without
+        // the volume it declared (#701).
+        for kind in ["exec = \"/usr/bin/python3\"", "script = \"echo hi\""] {
+            assert_app_refused(
+                &format!("{kind}\n[[app.web.volumes]]\npath = \"/data\""),
+                "volumes",
+            );
+        }
+    }
+
+    #[test]
+    fn process_app_with_config_file_is_refused() {
+        for kind in ["exec = \"/usr/bin/python3\"", "script = \"echo hi\""] {
+            assert_app_refused(
+                &format!(
+                    "{kind}\n[[app.web.config_file]]\npath = \"/etc/x.conf\"\ncontent = \"x\""
+                ),
+                "config_file",
+            );
+        }
+    }
+
+    #[test]
+    fn process_app_with_run_as_user_is_refused() {
+        assert_app_refused(
+            "exec = \"/usr/bin/python3\"\nrun_as_user = 1000",
+            "run_as_user",
+        );
+        assert_app_refused("script = \"echo hi\"\nrun_as_group = 1000", "run_as_group");
+    }
+
+    #[test]
+    fn image_app_keeps_volumes_config_files_and_user() {
+        validate_app_toml(
+            "image = \"web:v1\"\nrun_as_user = 1000\n\
+             [[app.web.volumes]]\npath = \"/data\"\n\
+             [[app.web.config_file]]\npath = \"/etc/x.conf\"\ncontent = \"x\"",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn health_port_without_app_port_is_valid() {
+        // `health.port` is enough on its own: the probe has a port (#701).
+        validate_app_toml("image = \"web:v1\"\n[app.web.health]\npath = \"/healthz\"\nport = 8081")
+            .unwrap();
+    }
+
+    #[test]
+    fn health_without_any_port_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\n[app.web.health]\npath = \"/healthz\"",
+            "health",
+        );
+    }
+
+    #[test]
+    fn zero_health_timeout_is_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        for field in [
+            "timeout",
+            "interval",
+            "threshold_unhealthy",
+            "threshold_healthy",
+        ] {
+            assert_app_refused(&format!("{health}\n{field} = 0"), field);
+        }
+    }
+
+    #[test]
+    fn health_timeout_longer_than_interval_is_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        assert_app_refused(&format!("{health}\ninterval = 5\ntimeout = 6"), "timeout");
+        // The default interval is 10 s, so an 11 s timeout alone is refused too.
+        assert_app_refused(&format!("{health}\ntimeout = 11"), "timeout");
+        // Seconds are whole, so a 1 s interval must allow a 1 s timeout.
+        validate_app_toml(&format!("{health}\ninterval = 1\ntimeout = 1")).unwrap();
+    }
+
+    #[test]
+    fn gpu_request_is_refused() {
+        // D41: no device passthrough or cluster accounting yet (#359).
+        let error = validate_app_toml("image = \"trainer:v1\"\ngpu = 1").unwrap_err();
+        assert!(error.to_string().contains("#359"), "{error}");
+        validate_app_toml("image = \"trainer:v1\"\ngpu = 0").unwrap();
+    }
+
+    #[test]
+    fn allow_franchise_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\n[app.web.egress]\nallow_franchise = [\"redis.prod-west\"]",
+            "allow_franchise",
+        );
     }
 }

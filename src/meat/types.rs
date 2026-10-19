@@ -210,6 +210,66 @@ pub struct Placement {
     pub ordinal: u32,
 }
 
+/// Why the scheduler couldn't place a replica: the first hard constraint
+/// that left no node, checked in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnplacedReason {
+    /// No node is ready to take new work.
+    NoReadyNode,
+    /// No ready node carries every `required` placement label.
+    NoLabelMatch,
+    /// The app runs an image (its own or an init container's), and no ready
+    /// node with the labels runs containers: they all run `--runtime
+    /// process` (#914).
+    NoContainerRuntime,
+    /// No ready node with the labels can enforce what the app needs: an
+    /// egress allowlist, internal DNS, or its host binary in
+    /// `[process_workloads] allowed_binaries`.
+    NoCapableNode,
+    /// Every node that could run it is short of CPU, memory or GPUs.
+    NoRoom,
+}
+
+impl fmt::Display for UnplacedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            UnplacedReason::NoReadyNode => "no node is ready",
+            UnplacedReason::NoLabelMatch => "no ready node has its required labels",
+            UnplacedReason::NoContainerRuntime => {
+                "no ready node has a container runtime to run its image"
+            }
+            UnplacedReason::NoCapableNode => {
+                "no ready node can enforce its egress or DNS needs or run its host binary"
+            }
+            UnplacedReason::NoRoom => "no node that can run it has room",
+        })
+    }
+}
+
+/// An app the scheduler placed only part of (#702). The leader records it in
+/// council state, so `relish status` and `relish wtf` can say why replicas
+/// are missing, and clears it once every replica is placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unschedulable {
+    /// Replicas placed.
+    pub placed: u32,
+    /// Replicas wanted.
+    pub wanted: u32,
+    /// Why the rest have no node.
+    pub reason: UnplacedReason,
+}
+
+impl fmt::Display for Unschedulable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "placed {} of {} replicas: {}",
+            self.placed, self.wanted, self.reason
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

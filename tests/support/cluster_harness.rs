@@ -29,6 +29,20 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// How long a test waits for a short job to finish.
+///
+/// A job's run is durable at every step: the apply, the leader's grant, the
+/// node's fence and grant files, its ledger and output, and the result each
+/// fsync before the next step starts: about thirty `F_FULLFSYNC`s in a row on
+/// macOS. Alone the wait takes about 0.3 s. While other processes flush the
+/// same disk, each flush, and each file create or rename behind one, can wait
+/// hundreds of milliseconds (#809): with 32 copies of `job_runs_to_completion`
+/// beside 100 busy loops and 12 flushing loops on a 12-core Mac, half the runs
+/// missed the old 3 s, and whole runs took up to 13.3 s. Thirty seconds is
+/// the bound `bun_process::WAIT` gives a real Bun. A job that never runs
+/// still fails, later, naming the state it was stuck in.
+pub const JOB_COMPLETION_WAIT: Duration = Duration::from_secs(30);
+
 /// Test harness: starts a real agent with ProcessGrill on an ephemeral port.
 pub struct TestHarness {
     pub client: BunClient,
@@ -54,6 +68,21 @@ impl TestHarness {
         );
         let volumes = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(volumes.path().to_path_buf());
+        // The process runtime runs only host workloads (#914), so fixture apps
+        // are `script` apps through `/bin/sh`.
+        agent.set_process_config(
+            reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec!["/bin/sh".into()],
+                mount_isolation: false,
+                ..Default::default()
+            },
+        );
+        // Tests mount host paths from their own temp directories; the
+        // managed volumes directory stays off limits, as on a real node.
+        agent.set_host_path_policy(reliaburger::bun::host_paths::HostPathPolicy::new(
+            vec![std::env::temp_dir()],
+            vec![volumes.path().to_path_buf()],
+        ));
         let deploy_history = agent.deploy_history_handle();
         let status_reader = agent.status_reader();
         let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
@@ -63,8 +92,13 @@ impl TestHarness {
         let runner = agent.delegated_task_runner(jobs.path()).unwrap();
         let node = reliaburger::bun::task_array_node::TaskArrayNode::new(
             reliaburger::bun::task_array_node::TaskArrayNodeConfig {
+                audit_dir: None,
                 root: jobs.path().join("tasks"),
                 policy: reliaburger::config::process_workloads::ProcessWorkloadsConfig {
+                    allowed_binaries: ["/bin/echo", "/bin/false", "/bin/sh", "/usr/bin/true"]
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                     mount_isolation: false,
                     ..Default::default()
                 },
@@ -183,6 +217,11 @@ impl TestHarness {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let statuses = self.client.status().await.unwrap();
+            let seen: Vec<String> = statuses
+                .iter()
+                .filter(|status| status.app_name == app_name)
+                .map(|status| format!("{} {}", status.id, status.state))
+                .collect();
             if let Some(status) = statuses
                 .into_iter()
                 .find(|status| status.app_name == app_name && predicate(status))
@@ -191,7 +230,7 @@ impl TestHarness {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{app_name} did not reach the expected state before {timeout:?}"
+                "{app_name} did not reach the expected state before {timeout:?}; last seen: {seen:?}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -223,7 +262,7 @@ impl TestHarness {
         Config::parse(&format!(
             r#"
             [app.testapp]
-            image = "test:v1"
+            script = "exec sleep 86400"
             port = {port}
 
             [app.testapp.health]
@@ -241,7 +280,7 @@ impl TestHarness {
         Config::parse(
             r#"
             [app.worker]
-            image = "test:v1"
+            script = "exec sleep 86400"
         "#,
         )
         .unwrap()

@@ -13,9 +13,16 @@
 mod bun_process;
 #[path = "../support/cluster.rs"]
 mod cluster_support;
+#[path = "../support/first_launch.rs"]
+mod first_launch;
+#[cfg(target_os = "linux")]
+#[path = "../support/root_processes.rs"]
+mod root_processes;
 // `cluster.rs` already includes the task harness; loading the file a second
 // time would compile two distinct `TestTasks` types.
 use cluster_support::task_harness;
+// Seeds whole-pass admission entries the way a planner commits them.
+mod admission_fixture;
 
 mod agent_cluster;
 mod api_tls;
@@ -23,8 +30,11 @@ mod api_tokens;
 mod app_metrics;
 mod batch;
 mod bun_auth_startup;
+mod bun_startup_exit;
 mod ca_trust_rotation;
+mod cluster_fixtures;
 mod compatibility;
+mod container_runtime_required;
 mod council_persistence;
 mod council_snapshot_install;
 mod council_tcp;
@@ -32,7 +42,9 @@ mod declarative_resources;
 mod dependency_audit;
 mod dev_robustness;
 mod dns;
+mod documented_manifests;
 mod endpoint_withdrawal;
+mod fixture_scripts;
 mod gitops;
 mod ingress;
 mod ingress_certificates;
@@ -44,6 +56,7 @@ mod log_export;
 mod logs_cross_node;
 mod managed_status;
 mod metrics_aggregation;
+mod missing_binary;
 mod node_issuer_validity;
 mod node_renewal;
 mod onion;
@@ -63,6 +76,9 @@ mod registry_standard_clients;
 mod registry_upload;
 mod relish_cli;
 mod reporting_tree;
+mod rollout_failed;
+#[cfg(target_os = "linux")]
+mod root_teardown;
 mod runtime_executor;
 mod security_integration;
 mod server_idle_connections;

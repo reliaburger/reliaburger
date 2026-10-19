@@ -112,6 +112,12 @@ pub struct AgentVersion {
     /// its self-upgrade manager, which is what hashes it.
     #[serde(default)]
     pub binary_sha256: Option<String>,
+    /// `{os}-{arch}` the agent runs on: which release artefact fits it.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// The cluster formats the agent speaks.
+    #[serde(default)]
+    pub compatibility: Option<crate::compatibility::Compatibility>,
 }
 
 /// Client for the Bun agent HTTP API.
@@ -317,6 +323,17 @@ const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_m
 
 /// Classify a reqwest send error as either a timeout or a connection failure.
 /// A successful response's JSON body, or the API error it carried.
+/// Attach an `Idempotency-Key` header when the caller has one.
+fn with_idempotency_key(
+    request: reqwest::RequestBuilder,
+    key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match key {
+        Some(key) => request.header("Idempotency-Key", key),
+        None => request,
+    }
+}
+
 async fn json_or_api_error<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, RelishError> {
@@ -861,9 +878,9 @@ impl BunClient {
             .await
     }
 
-    /// Explicitly rerun unknown jobs on this node after retiring their old runtime.
+    /// Explicitly admit fresh runs of a manifest's jobs.
     pub async fn apply_rerunning_jobs(&self, config: &Config) -> Result<ApplyResult, RelishError> {
-        crate::bun::jobs::validate_rerun(config).map_err(|error| RelishError::ApiError {
+        crate::bun::job_apply::validate_rerun(config).map_err(|error| RelishError::ApiError {
             status: 400,
             body: error.into(),
         })?;
@@ -937,6 +954,17 @@ impl BunClient {
                         ApplyEvent::InstanceCreated { id, app } => {
                             eprintln!("  created {id} ({app})");
                         }
+                        // The error that follows carries the same reason.
+                        ApplyEvent::RolloutAborted {
+                            app, rolled_back, ..
+                        } => {
+                            let outcome = if *rolled_back {
+                                "rolled back"
+                            } else {
+                                "halted"
+                            };
+                            eprintln!("  rollout of {app} {outcome}");
+                        }
                         ApplyEvent::Complete { created, instances } => {
                             result = Some(ApplyResult {
                                 created: *created,
@@ -985,7 +1013,22 @@ impl BunClient {
     /// The server streams deploy progress as SSE; we drain it, surfacing
     /// any error, and return once the stream closes.
     pub async fn rollback(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
-        let url = format!("{}/v1/rollback/{app}/{namespace}", self.base_url);
+        self.rollback_with_force(app, namespace, false).await
+    }
+
+    /// [`rollback`](Self::rollback), with `force` to roll back an app that
+    /// GitOps manages (#693); the next sync puts back what git declares.
+    pub async fn rollback_with_force(
+        &self,
+        app: &str,
+        namespace: &str,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}/v1/rollback/{app}/{namespace}{}",
+            self.base_url,
+            force_query(force)
+        );
         let response = self
             .http()?
             .post(&url)
@@ -1091,6 +1134,17 @@ impl BunClient {
             .get_typed_json(&format!("/v1/events?limit={limit}&local=true"))
             .await?;
         Ok(view.events)
+    }
+
+    /// Read the audit log: the newest records matching `filter`, oldest
+    /// first, from the node this client talks to or, with `cluster`, from
+    /// every live node.
+    pub async fn audit(
+        &self,
+        filter: &crate::bun::audit::AuditFilter,
+        cluster: bool,
+    ) -> Result<crate::bun::audit::AuditListing, RelishError> {
+        self.get_typed_json(&audit_path(filter, cluster)).await
     }
 
     /// Ask a node what it has wired up (Phase 15).
@@ -1527,7 +1581,24 @@ impl BunClient {
     /// Request removal (`POST /v1/delete/{app}/{namespace}`). Cluster cleanup
     /// is asynchronous; success does not confirm that every instance stopped.
     pub async fn delete(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
-        let url = format!("{}/v1/delete/{}/{}", self.base_url, app, namespace);
+        self.delete_with_force(app, namespace, false).await
+    }
+
+    /// [`delete`](Self::delete), with `force` to delete an app that GitOps
+    /// manages (#693); the next sync recreates it while git declares it.
+    pub async fn delete_with_force(
+        &self,
+        app: &str,
+        namespace: &str,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}/v1/delete/{}/{}{}",
+            self.base_url,
+            app,
+            namespace,
+            force_query(force)
+        );
         let response = self
             .http()?
             .post(&url)
@@ -2162,6 +2233,31 @@ impl BunClient {
         })
     }
 
+    /// Delete `repository:tag` through the registry at `registry`
+    /// (`DELETE /v2/<repository>/manifests/<tag>`), with this client's
+    /// token and cluster-CA trust.
+    pub async fn delete_image_tag(
+        &self,
+        registry: &str,
+        repository: &str,
+        tag: &str,
+    ) -> Result<(), RelishError> {
+        let http = self
+            .registry_http_client(registry)
+            .map_err(|body| RelishError::ApiError { status: 0, body })?;
+        let url = format!(
+            "{}/v2/{repository}/manifests/{tag}",
+            registry.trim_end_matches('/')
+        );
+        let response = http.delete(&url).send().await.map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// List images in the local Pickle registry.
     pub async fn images(&self) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/images", self.base_url);
@@ -2474,9 +2570,13 @@ impl BunClient {
     /// Submit a batch: full job specs travel with the request, so the
     /// cluster needs no prior deploy of them. Returns the response
     /// JSON (`batch_id`, `assigned`, `unschedulable`).
+    ///
+    /// `idempotency_key`, when given, travels as the `Idempotency-Key` header: a retry
+    /// with the same key and jobs returns the first attempt's runs.
     pub async fn submit_batch(
         &self,
         jobs: &std::collections::BTreeMap<String, crate::config::job::JobSpec>,
+        idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch", self.base_url);
         let payload = serde_json::json!({
@@ -2487,10 +2587,8 @@ impl BunClient {
                 })
                 .collect::<Vec<_>>(),
         });
-        let response = self
-            .http()?
-            .post(&url)
-            .json(&payload)
+        let request = self.http()?.post(&url).json(&payload);
+        let response = with_idempotency_key(request, idempotency_key)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2533,16 +2631,36 @@ impl BunClient {
         json_or_api_error(response).await
     }
 
-    /// Submit a task array (`POST /v1/batch/array`).
+    /// Submit a task array (`POST /v1/batch/array`). `idempotency_key`,
+    /// when given, travels as the `Idempotency-Key` header, so a retry after an
+    /// uncertain timeout returns the same run rather than a second array.
     pub async fn submit_task_array(
         &self,
         request: &crate::bun::task_array_api::TaskArraySubmitRequest,
+        idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch/array", self.base_url);
-        let response = self
+        let builder = self.http()?.post(&url).json(request);
+        let response = with_idempotency_key(builder, idempotency_key)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        json_or_api_error(response).await
+    }
+
+    /// Admit all manifest profiles through one durable request. A retry with
+    /// the same `idempotency_key` and manifest returns the existing runs;
+    /// without one, the cluster treats every request as new work.
+    pub async fn submit_task_manifest(
+        &self,
+        request: &crate::bun::task_array_api::TaskManifestRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<serde_json::Value, RelishError> {
+        let builder = self
             .http()?
-            .post(&url)
-            .json(request)
+            .post(format!("{}/v1/batch/manifest", self.base_url))
+            .json(request);
+        let response = with_idempotency_key(builder, idempotency_key)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2550,21 +2668,6 @@ impl BunClient {
     }
 
     /// Cancel a task array (`POST /v1/batch/{id}/cancel`).
-    /// Admit all manifest profiles through one durable request.
-    pub async fn submit_task_manifest(
-        &self,
-        request: &crate::bun::task_array_api::TaskManifestRequest,
-    ) -> Result<serde_json::Value, RelishError> {
-        let response = self
-            .http()?
-            .post(format!("{}/v1/batch/manifest", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .map_err(classify_error)?;
-        json_or_api_error(response).await
-    }
-
     pub async fn cancel_batch(&self, batch_id: u64) -> Result<(), RelishError> {
         let url = format!("{}/v1/batch/{batch_id}/cancel", self.base_url);
         let response = self
@@ -2813,6 +2916,31 @@ impl BunClient {
             .await
             .or_else(|_| Ok(serde_json::Value::Null))
     }
+
+    /// The cluster's GitOps configuration and sync status, as the node
+    /// this client talks to sees it (#693).
+    pub async fn gitops_status(&self) -> Result<crate::lettuce::types::GitOpsStatus, RelishError> {
+        self.get_typed_json("/v1/gitops").await
+    }
+
+    /// Replace the cluster's GitOps configuration, or turn GitOps off with
+    /// `None` (admin only).
+    pub async fn gitops_config_set(
+        &self,
+        config: Option<crate::lettuce::types::GitOpsConfig>,
+    ) -> Result<(), RelishError> {
+        let body = serde_json::to_string(&crate::lettuce::types::GitOpsConfigRequest { config })
+            .map_err(|error| RelishError::ApiError {
+                status: 0,
+                body: error.to_string(),
+            })?;
+        self.post_json("/v1/gitops/config", body).await.map(|_| ())
+    }
+}
+
+/// The query that asks the server to change a GitOps-managed app anyway.
+fn force_query(force: bool) -> &'static str {
+    if force { "?force=true" } else { "" }
 }
 
 /// The public-key route, for the cluster or one namespace. The namespace
@@ -2826,6 +2954,33 @@ fn secret_public_key_path(namespace: Option<&str>) -> String {
         }
         None => "/v1/secret/public-key".to_string(),
     }
+}
+
+/// The `GET /v1/audit` path for `filter`.
+fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String {
+    let mut params = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(since) = filter.since {
+        params.append_pair("since", &since.to_string());
+    }
+    if let Some(until) = filter.until {
+        params.append_pair("until", &until.to_string());
+    }
+    if let Some(action) = &filter.action {
+        params.append_pair("action", action);
+    }
+    if let Some(principal) = &filter.principal {
+        params.append_pair("principal", principal);
+    }
+    if let Some(namespace) = &filter.namespace {
+        params.append_pair("namespace", namespace);
+    }
+    if let Some(limit) = filter.limit {
+        params.append_pair("limit", &limit.to_string());
+    }
+    if cluster {
+        params.append_pair("cluster", "true");
+    }
+    format!("/v1/audit?{}", params.finish())
 }
 
 #[cfg(test)]

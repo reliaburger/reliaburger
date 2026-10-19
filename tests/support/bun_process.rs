@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 /// Keep a readable Bun log unchanged, or expose only the failed read's kind.
 /// Error text and paths can contain sensitive fixture data and are omitted.
-fn bun_log_diagnostic(log_path: &Path) -> String {
+pub fn bun_log_diagnostic(log_path: &Path) -> String {
     match std::fs::read_to_string(log_path) {
         Ok(log) => log,
         Err(error) => format!("bun log-read-error kind={:?}", error.kind()),
@@ -392,6 +392,11 @@ volumes = "{root}/volumes"
 [images]
 registry_bind = "127.0.0.1"
 registry_port = 0
+
+# Plaintext on purpose: a loopback fixture with no node identity, which
+# callers also start with `--cluster`.
+[security]
+require_mtls = false
 "#,
             root = root.display(),
         ),

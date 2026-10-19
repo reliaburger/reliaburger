@@ -12,6 +12,10 @@ use tokio_util::sync::CancellationToken;
 struct State {
     capacity: Resources,
     used: Resources,
+    /// The part of `used` held by task attempts and reusable executors.
+    /// Applications report their own requests per instance; this is what
+    /// the leader can't see any other way.
+    job_used: Resources,
     next_ticket: u64,
     waiters: VecDeque<u64>,
 }
@@ -23,11 +27,20 @@ pub struct ExecutionBudget {
     changed: Notify,
 }
 
+/// Who holds a lease: an application replica or job work (a task attempt
+/// or a reusable executor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseOwner {
+    Application,
+    Job,
+}
+
 /// Capacity held until the original execution has been retired.
 #[derive(Debug)]
 pub struct ResourceLease {
     budget: Arc<ExecutionBudget>,
     resources: Resources,
+    owner: LeaseOwner,
     release_on_drop: bool,
 }
 
@@ -49,29 +62,53 @@ impl ExecutionBudget {
             state: Mutex::new(State {
                 capacity,
                 used: Resources::default(),
+                job_used: Resources::default(),
                 next_ticket: 0,
                 waiters: VecDeque::new(),
             }),
             changed: Notify::new(),
         })
     }
+    /// The ledger. Every update leaves it consistent before anything that
+    /// could panic, so a lock poisoned by an unrelated panic still holds a
+    /// valid ledger, and a lease's `Drop` must never panic on it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     /// Refresh capacity without forgiving any existing commitments.
     pub fn set_capacity(&self, capacity: Resources) {
-        self.state.lock().expect("budget poisoned").capacity = capacity;
+        self.lock().capacity = capacity;
         self.changed.notify_waiters();
     }
     /// Allocatable capacity, independent of currently owned executions.
     pub fn capacity(&self) -> Resources {
-        self.state.lock().expect("budget poisoned").capacity
+        self.lock().capacity
     }
     /// Free resources, including pending and stopping application commitments.
     pub fn available(&self) -> Resources {
-        let state = self.state.lock().expect("budget poisoned");
+        let state = self.lock();
         state.capacity.saturating_sub(&state.used)
     }
-    /// Commit all dimensions atomically, or leave the ledger unchanged.
+    /// Capacity held by task attempts and reusable executors, quarantined
+    /// ones included. Application leases are left out: each node reports its
+    /// apps' requests per instance, so counting them here would count twice.
+    pub fn job_reservations(&self) -> Resources {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .job_used
+    }
+    /// Idle executors yield their reservations to queued attempts.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_waiters(&self) -> bool {
+        !self.lock().waiters.is_empty()
+    }
+    /// Commit an application replica's request in all dimensions
+    /// atomically, or leave the ledger unchanged.
     pub fn try_acquire(self: &Arc<Self>, resources: Resources) -> Option<ResourceLease> {
-        let mut state = self.state.lock().expect("budget poisoned");
+        let mut state = self.lock();
         if !state.capacity.saturating_sub(&state.used).fits(&resources) {
             return None;
         }
@@ -79,28 +116,52 @@ impl ExecutionBudget {
         Some(ResourceLease {
             budget: Arc::clone(self),
             resources,
+            owner: LeaseOwner::Application,
             release_on_drop: true,
         })
     }
-    /// Reconstruct an existing owner's commitment even after capacity shrinks.
-    /// Recovery cannot forgive running work merely because it no longer fits.
+    /// Executor admission must not overtake an already queued owner.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn try_acquire_executor(
+        self: &Arc<Self>,
+        resources: Resources,
+    ) -> Option<ResourceLease> {
+        let mut state = self.lock();
+        if !state.waiters.is_empty() || !state.capacity.saturating_sub(&state.used).fits(&resources)
+        {
+            return None;
+        }
+        state.used = state.used.saturating_add(&resources);
+        state.job_used = state.job_used.saturating_add(&resources);
+        Some(ResourceLease {
+            budget: self.clone(),
+            resources,
+            owner: LeaseOwner::Job,
+            release_on_drop: true,
+        })
+    }
+    /// Reconstruct an existing application replica's commitment even after
+    /// capacity shrinks. Recovery cannot forgive running work merely because
+    /// it no longer fits.
     pub fn adopt(self: &Arc<Self>, resources: Resources) -> ResourceLease {
-        let mut state = self.state.lock().expect("budget poisoned");
+        let mut state = self.lock();
         state.used = state.used.saturating_add(&resources);
         ResourceLease {
             budget: self.clone(),
             resources,
+            owner: LeaseOwner::Application,
             release_on_drop: true,
         }
     }
-    /// Wait for capacity without holding a partial CPU or memory reservation.
+    /// Wait for capacity for a task attempt or executor without holding a
+    /// partial CPU or memory reservation.
     pub async fn acquire(
         self: &Arc<Self>,
         resources: Resources,
         cancel: &CancellationToken,
     ) -> Option<ResourceLease> {
         let ticket = {
-            let mut state = self.state.lock().expect("budget poisoned");
+            let mut state = self.lock();
             let ticket = state.next_ticket;
             state.next_ticket = state.next_ticket.wrapping_add(1);
             state.waiters.push_back(ticket);
@@ -118,14 +179,16 @@ impl ExecutionBudget {
                 return None;
             }
             {
-                let mut state = self.state.lock().expect("budget poisoned");
+                let mut state = self.lock();
                 if state.waiters.front() == Some(&ticket)
                     && state.capacity.saturating_sub(&state.used).fits(&resources)
                 {
                     state.used = state.used.saturating_add(&resources);
+                    state.job_used = state.job_used.saturating_add(&resources);
                     return Some(ResourceLease {
                         budget: self.clone(),
                         resources,
+                        owner: LeaseOwner::Job,
                         release_on_drop: true,
                     });
                 }
@@ -141,9 +204,7 @@ struct Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         self.budget
-            .state
             .lock()
-            .expect("budget poisoned")
             .waiters
             .retain(|ticket| *ticket != self.ticket);
         self.budget.changed.notify_waiters();
@@ -154,8 +215,11 @@ impl Drop for ResourceLease {
         if !self.release_on_drop {
             return;
         }
-        let mut state = self.budget.state.lock().expect("budget poisoned");
+        let mut state = self.budget.lock();
         state.used = state.used.saturating_sub(&self.resources);
+        if self.owner == LeaseOwner::Job {
+            state.job_used = state.job_used.saturating_sub(&self.resources);
+        }
         drop(state);
         self.budget.changed.notify_waiters();
     }
@@ -165,6 +229,56 @@ impl Drop for ResourceLease {
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[tokio::test]
+    async fn job_reservations_count_task_and_executor_leases_but_not_apps() {
+        let budget = ExecutionBudget::new(Resources::new(8000, 16 << 30, 0));
+        let app = budget
+            .try_acquire(Resources::new(1000, 1 << 30, 0))
+            .unwrap();
+        let adopted = budget.adopt(Resources::new(500, 1 << 30, 0));
+        let attempt = budget
+            .acquire(Resources::new(2000, 2 << 30, 0), &CancellationToken::new())
+            .await
+            .unwrap();
+        let executor = budget
+            .try_acquire_executor(Resources::new(250, 256 << 20, 0))
+            .unwrap();
+        assert_eq!(
+            budget.job_reservations(),
+            Resources::new(2250, (2 << 30) + (256 << 20), 0)
+        );
+        drop(attempt);
+        assert_eq!(budget.job_reservations(), Resources::new(250, 256 << 20, 0));
+        // An abandoned attempt's capacity stays held, and so does its share.
+        drop(
+            budget
+                .acquire(Resources::new(100, 100, 0), &CancellationToken::new())
+                .await
+                .unwrap()
+                .quarantine_on_drop(),
+        );
+        assert_eq!(
+            budget.job_reservations(),
+            Resources::new(350, (256 << 20) + 100, 0)
+        );
+        drop((app, adopted, executor));
+        assert_eq!(budget.job_reservations(), Resources::new(100, 100, 0));
+    }
+    #[test]
+    fn poisoned_budget_lock_does_not_panic_on_drop() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1024, 0));
+        let lease = budget.try_acquire(Resources::new(500, 512, 0)).unwrap();
+        let poisoner = budget.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("poison the budget lock");
+        })
+        .join();
+        assert!(budget.state.is_poisoned());
+        drop(lease);
+        assert_eq!(budget.available(), budget.capacity());
+        assert!(budget.try_acquire(Resources::new(1000, 1024, 0)).is_some());
+    }
     #[test]
     fn mixed_requests_and_apps_share_all_dimensions() {
         let budget = ExecutionBudget::new(Resources::new(8000, 16 << 30, 0));
@@ -263,6 +377,35 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         );
+        assert_eq!(budget.available(), budget.capacity());
+    }
+    #[tokio::test]
+    async fn reusable_admission_respects_queued_owners_and_their_cancellation() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        let budget = ExecutionBudget::new(Resources::new(2000, 2048, 0));
+        let running = budget.try_acquire(Resources::new(1000, 1024, 0)).unwrap();
+        let cancel = CancellationToken::new();
+        let large = budget.acquire(Resources::new(2000, 2048, 0), &cancel);
+        tokio::pin!(large);
+        poll_fn(|cx| {
+            assert!(large.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            budget
+                .try_acquire_executor(Resources::new(500, 512, 0))
+                .is_none(),
+            "the immediate executor path cannot skip a larger queued owner"
+        );
+        cancel.cancel();
+        assert!(large.await.is_none());
+        let executor = budget
+            .try_acquire_executor(Resources::new(500, 512, 0))
+            .unwrap();
+        drop(executor);
+        drop(running);
         assert_eq!(budget.available(), budget.capacity());
     }
     #[test]

@@ -51,13 +51,13 @@ runs `tour.sh --check`, which fails if the page gains a command the script
 doesn't know how to run.
 
 Every promoted release re-records the tour against its published install
-([releasing step 8](../releasing.md#staging-a-candidate)). With no other
+([releasing step 9](../releasing.md#staging-a-candidate)). With no other
 quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`
 so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.1.6
+  --record docs/website/assets/tour.cast --install v0.2.0
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -85,9 +85,14 @@ the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
 note) when it doesn't; likewise it copies `examples/demo/burger` when the
 tarball isn't published yet. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.1.4 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
+`--install v0.2.0 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
 beside a laptop cluster on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
+
+`--record` writes the installed version into the cast's title (`Reliaburger
+0.2.0: the five-minute tour`), and the caption under the player names it too.
+`tests/suite/website.rs` checks that both match `install.sh`'s default, so a
+promotion that forgets the re-record fails CI.
 
 The "Try it in five minutes" section keeps its heading and the recording in
 plain view; people didn't notice it when the whole section sat in one collapsed
@@ -106,8 +111,9 @@ command-line definition, and does the same for the manual's copy of the tour
 The tour applies `https://reliaburger.com/demo/podinfo.yaml` and builds from
 `https://reliaburger.com/demo/burger.tar.gz`. Neither is committed here: the
 Pages workflow copies `examples/kubernetes/podinfo.yaml` into `demo/` and packs
-`examples/demo/burger` as `demo/burger.tar.gz` at deploy time, so the site
-always serves what CI tests. To preview them locally, make them the same way
+`examples/demo/burger` as `demo/burger.tar.gz` at deploy time, both taken from
+the tag `install.sh` installs. Someone running the tour has that release, and
+`main`'s demo may need features it doesn't have yet. To preview them locally, make them the same way
 (`demo/` is ignored by version control).
 
 Preview from the repository root:
@@ -125,18 +131,85 @@ every promoted release carries the four PDFs, and promotion marks it latest.
 The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
 from `main`; artefacts require GitHub sign-in and have limited retention.
 
+### Soak charts
+
+"How a release is tested" (`#release-testing`) shows the released version's
+soak charts: Bun memory, open fds and CPU from the app soak, and the same plus
+accepted jobs a second from the job soak. They are copies of the SVGs in
+`docs/qualification/<record>-charts/`, kept under the same directory names in
+`assets/soak/`, because the Pages workflow publishes only this directory.
+Each is an `<img>` linked to its own file, so a click opens it full size with
+the `<title>` on every line and mark, and `loading="lazy"` keeps the folded
+results from costing a visitor anything until they open them. The SVGs carry
+their own colours and a light surface; this page is light only
+(`color-scheme: light`), and an SVG drawn as an image follows the page's
+scheme, so the charts stay light here too. At 720 px they're wider than a
+phone and shrink with the column.
+
+At a promotion, replace them with the new release's
+([releasing step 9](../releasing.md#staging-a-candidate)):
+
+```sh
+rm -r docs/website/assets/soak
+mkdir docs/website/assets/soak
+cp -R docs/qualification/<app soak record>-charts docs/qualification/<job soak record>-charts \
+  docs/website/assets/soak/
+```
+
+then point the `<img>` and record links at them. `tests/suite/website.rs`
+fails while a chart differs from its record's copy, comes from another
+release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
+without being shown, and while the section misses any of the seven charts.
+
+### Commands the installed release doesn't have
+
+The page and the READMEs are written on the development branch, but a visitor
+runs what the installer fetched. `scripts/release/released-cli.tsv` records
+every command, positional, option and listed option value of that release,
+written from the published binary's own help by
+`scripts/release/released_cli.py VERSION > scripts/release/released-cli.tsv`.
+`tests/suite/website.rs` checks every `relish …` command on this page, in the
+README and in the tour chapter against it. The tour may only use released
+commands. Anything else has to say which release adds it, in the words
+"0.3.0, not in 0.2.0" (the build's version, then the installer's), in the
+same paragraph, `<details>` or section. The README's generated command list
+labels such commands itself. When the installer's default changes, regenerate
+the snapshot; the test refuses a snapshot for another version.
+
 The page leads with the one-line install now that releases are published;
 building from source is the second path. Update the release-status paragraph
 (version, date and release-notes link) and the install section's release-notes
 link when you promote a release. The source quickstart intentionally matches
-`examples/phase-1/proc-first-run.toml`.
+`examples/phase-1/proc-first-run.toml` and `examples/node/process-runtime.toml`.
 
 `install.sh` is a small HTTPS bootstrap for the versioned release installer.
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.1.6` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.0` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.
+
+### Comparison pages
+
+`compare/index.html` links six practical comparisons; `compare/methodology.html`
+explains the evidence and version boundaries. Public pages foreground Reliaburger’s
+strengths and honest trade-offs. Adaptation recommendations belong in the separate
+[Markdown research writeup](../research/2026-10-15-competitor-review.md).
+Each public page is hand-maintained static HTML,
+using `style.css` and the small `comparisons.css` extension. There is no generated
+copy or build dependency. The homepage links them under the stable `compare` id.
+
+Keep evidence adjacent to factual claims. Pin source-code links to the inspected
+commit or tag; date moving documentation. Distinguish the public installer release,
+the reviewed train implementation and planned features. Learning-curve judgements
+are qualitative, and source inspection is not a benchmark or security certification.
+When refreshing a comparison, review commands, installation assumptions and both
+application and platform upgrade procedures. Preserve section anchors.
+
+Serve the directory with the preview command above and open `/compare/` or
+`/compare/methodology.html`. Check all local links and fragments, desktop and narrow
+layouts, and the command examples with the current CLI's `RELISH_PARSE_ONLY=1`.
+The comparison pages use only `assets/copy.js`; they don't load the tour player.

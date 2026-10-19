@@ -38,6 +38,12 @@ pub(super) enum FollowUp {
     /// The egress allowlists were re-resolved.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     EgressResolved(Vec<super::egress_resolution::Resolution>),
+    /// `nft` applied, or refused, a forward-path isolation ruleset.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    IsolationApplied {
+        ruleset: String,
+        result: Result<(), crate::firewall::rules::FirewallError>,
+    },
 }
 
 /// How a follow-up task ended, as `JoinSet::join_next_with_id` yields it.
@@ -133,6 +139,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.egress_resolving = None;
                 self.apply_egress_resolutions(resolutions).await;
             }
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            Ok((_, FollowUp::IsolationApplied { ruleset, result })) => {
+                self.isolation_rules.applying = None;
+                match result {
+                    Ok(()) => self.isolation_rules.applied = Some(ruleset),
+                    Err(error) => {
+                        // The next reconcile (at the latest, the sweep) retries.
+                        eprintln!("sesame: forward-path isolation rules failed: {error}");
+                        self.isolation_rules.applied = None;
+                    }
+                }
+                if let Some(next) = self.isolation_rules.waiting.take() {
+                    self.apply_isolation_rules(next);
+                }
+            }
             Err(error) => {
                 // A panicked task drops its caller's answer, which the caller
                 // sees as a closed channel; say why here.
@@ -161,7 +182,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor
             .list_instances()
             .into_iter()
-            .filter(|instance| !instance.is_job && instance.state == ContainerState::Running)
+            .filter(|instance| instance.state == ContainerState::Running)
             .map(|instance| InventoryEntry {
                 id: instance.id.clone(),
                 namespace: instance.namespace.clone(),
@@ -369,6 +390,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Apply `ruleset` for `cluster_nodes` with `nft`, off the loop. A test
     /// that stalls the firewall stands in for `nft` entirely, so the harness
     /// never rewrites the host's firewall.
+    /// Apply a forward-path isolation ruleset with `nft`, off the loop.
+    /// One apply runs at a time; a newer ruleset waits for it, and an
+    /// unchanged one is not applied again.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) fn apply_isolation_rules(&mut self, ruleset: String) {
+        if self.isolation_rules.applying.is_some() {
+            self.isolation_rules.waiting = Some(ruleset);
+            return;
+        }
+        if self.isolation_rules.applied.as_ref() == Some(&ruleset) {
+            return;
+        }
+        let task = self.follow_ups.spawn(async move {
+            let result = crate::firewall::rules::apply_ruleset(&ruleset).await;
+            FollowUp::IsolationApplied { ruleset, result }
+        });
+        self.isolation_rules.applying = Some(task.id());
+    }
+
     pub(super) fn spawn_perimeter_apply(
         &mut self,
         ruleset: String,

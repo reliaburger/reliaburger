@@ -11,6 +11,8 @@ use std::fmt::Write as _;
 
 use clap::{Arg, ArgAction, Command};
 
+use super::released_cli::ReleasedCli;
+
 /// Opens the generated region of `README.md`.
 pub const START_MARKER: &str = "<!-- relish-commands:start -->";
 
@@ -151,7 +153,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "security and access",
             path: "docs/manual/10_security.md",
         }],
-        commands: &["token", "secret", "ca", "sign"],
+        commands: &["token", "secret", "ca", "sign", "audit"],
     },
     CommandGroup {
         title: "Images and volumes",
@@ -162,12 +164,12 @@ pub const GROUPS: &[CommandGroup] = &[
         commands: &["images", "build", "snapshot"],
     },
     CommandGroup {
-        title: "Upgrades",
+        title: "Upgrades and GitOps",
         guides: &[Guide {
             label: "operations",
             path: "docs/manual/12_operations.md",
         }],
-        commands: &["upgrade"],
+        commands: &["upgrade", "gitops"],
     },
     CommandGroup {
         title: "Learn",
@@ -186,6 +188,17 @@ pub const GROUPS: &[CommandGroup] = &[
         commands: &["dev"],
     },
 ];
+
+/// The published release the installer fetches, and how to label commands it
+/// lacks. The README is written on the development branch, so without labels
+/// it would offer commands a fresh install rejects.
+#[derive(Debug, Clone)]
+pub struct Availability<'a> {
+    /// What the installer's default release accepts.
+    pub released: &'a ReleasedCli,
+    /// Shown after each command that release lacks, e.g. `0.2.0, not in 0.1.6`.
+    pub label: String,
+}
 
 /// Why the command reference couldn't be rendered or placed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -208,8 +221,13 @@ pub enum CommandReferenceError {
 /// Renders the collapsible command reference for `cli`, grouped by `groups`.
 ///
 /// Hidden commands and clap's built-in `help` are left out. Every other
-/// top-level command must appear in exactly one group.
-pub fn render(cli: &Command, groups: &[CommandGroup]) -> Result<String, CommandReferenceError> {
+/// top-level command must appear in exactly one group. With `availability`,
+/// each command the published release wouldn't accept carries its label.
+pub fn render(
+    cli: &Command,
+    groups: &[CommandGroup],
+    availability: Option<&Availability>,
+) -> Result<String, CommandReferenceError> {
     let visible: Vec<&Command> = cli
         .get_subcommands()
         .filter(|command| is_documented(command))
@@ -250,7 +268,13 @@ pub fn render(cli: &Command, groups: &[CommandGroup]) -> Result<String, CommandR
                     group: group.title,
                     command: name,
                 })?;
-            render_command(&mut out, command, &format!("relish {name}"), 0);
+            render_command(
+                &mut out,
+                command,
+                &format!("relish {name}"),
+                0,
+                availability,
+            );
         }
     }
 
@@ -280,20 +304,37 @@ fn is_documented(command: &Command) -> bool {
     !command.is_hide_set() && command.get_name() != "help"
 }
 
-fn render_command(out: &mut String, command: &Command, path: &str, depth: usize) {
+fn render_command(
+    out: &mut String,
+    command: &Command,
+    path: &str,
+    depth: usize,
+    availability: Option<&Availability>,
+) {
     let indent = "  ".repeat(depth);
     let about = command
         .get_about()
         .map(|about| about.to_string())
         .unwrap_or_default();
     let synopsis = synopsis(command, path);
-    if about.is_empty() {
-        let _ = writeln!(out, "{indent}- `{synopsis}`");
-    } else {
-        let _ = writeln!(out, "{indent}- `{synopsis}`: {about}");
+    let _ = write!(out, "{indent}- `{synopsis}`");
+    if !about.is_empty() {
+        let _ = write!(out, ": {about}");
     }
+    if let Some(availability) = availability
+        && availability.released.check(&synopsis).is_err()
+    {
+        let _ = write!(out, " *({})*", availability.label);
+    }
+    out.push('\n');
     for sub in command.get_subcommands().filter(|sub| is_documented(sub)) {
-        render_command(out, sub, &format!("{path} {}", sub.get_name()), depth + 1);
+        render_command(
+            out,
+            sub,
+            &format!("{path} {}", sub.get_name()),
+            depth + 1,
+            availability,
+        );
     }
 }
 
@@ -420,7 +461,7 @@ mod tests {
 
     #[test]
     fn each_group_is_headed_and_links_to_its_manual_chapter() {
-        let out = render(&cli(), TEST_GROUPS).unwrap();
+        let out = render(&cli(), TEST_GROUPS, None).unwrap();
         assert!(out.contains("\n**Apps** ([deploy an app](docs/manual/01_deploy-an-app.md))\n"));
         assert!(out.contains("\n**Chaos** ([chaos](docs/manual/05_chaos.md))\n"));
         assert!(out.find("**Apps**").unwrap() < out.find("**Chaos**").unwrap());
@@ -428,7 +469,7 @@ mod tests {
 
     #[test]
     fn the_section_collapses_behind_a_summary() {
-        let out = render(&cli(), TEST_GROUPS).unwrap();
+        let out = render(&cli(), TEST_GROUPS, None).unwrap();
         assert!(out.starts_with("<details>\n<summary>"));
         assert!(out.ends_with("</details>\n"));
         assert!(out.contains(REGENERATE_COMMAND));
@@ -436,7 +477,7 @@ mod tests {
 
     #[test]
     fn commands_show_their_about_text_in_group_order() {
-        let out = render(&cli(), TEST_GROUPS).unwrap();
+        let out = render(&cli(), TEST_GROUPS, None).unwrap();
         let status = out
             .find("- `relish status`: Show cluster and app status.")
             .unwrap();
@@ -446,7 +487,7 @@ mod tests {
 
     #[test]
     fn positionals_show_required_optional_and_repeated_shapes() {
-        let out = render(&cli(), TEST_GROUPS).unwrap();
+        let out = render(&cli(), TEST_GROUPS, None).unwrap();
         assert!(out.contains(
             "- `relish exec <APP> [COMMAND]...`: Execute a command inside a running container."
         ));
@@ -454,7 +495,7 @@ mod tests {
 
     #[test]
     fn subcommands_nest_under_their_parent_with_required_and_repeated_options() {
-        let out = render(&cli(), TEST_GROUPS).unwrap();
+        let out = render(&cli(), TEST_GROUPS, None).unwrap();
         assert!(out.contains(
             "- `relish fault`: Inject faults.\n  - `relish fault kill --acknowledge --node <NODE_ID>... <TARGET>`: Kill instances.\n"
         ));
@@ -462,14 +503,14 @@ mod tests {
 
     #[test]
     fn positional_choices_are_listed_inline() {
-        let out = render(&cli(), TEST_GROUPS).unwrap();
+        let out = render(&cli(), TEST_GROUPS, None).unwrap();
         assert!(out.contains("- `relish fault mode [fast|slow]`: Pick a mode."));
     }
 
     #[test]
     fn hidden_commands_and_help_are_left_out() {
         let with_help = cli().subcommand(Command::new("help").about("Print help."));
-        let out = render(&with_help, TEST_GROUPS).unwrap();
+        let out = render(&with_help, TEST_GROUPS, None).unwrap();
         assert!(!out.contains("__internal"));
         assert!(!out.contains("- `relish help"));
     }
@@ -478,7 +519,7 @@ mod tests {
     fn a_command_in_no_group_is_refused_by_name() {
         let extra = cli().subcommand(Command::new("wtf").about("Diagnose."));
         assert_eq!(
-            render(&extra, TEST_GROUPS),
+            render(&extra, TEST_GROUPS, None),
             Err(CommandReferenceError::Ungrouped("wtf".to_string()))
         );
     }
@@ -491,12 +532,30 @@ mod tests {
             commands: &["status", "exec", "fault", "gone"],
         }];
         assert_eq!(
-            render(&cli(), groups),
+            render(&cli(), groups, None),
             Err(CommandReferenceError::UnknownCommand {
                 group: "Apps",
                 command: "gone",
             })
         );
+    }
+
+    #[test]
+    fn commands_the_published_release_lacks_carry_the_label() {
+        let released = ReleasedCli::parse(
+            "version\tv0.1.6\ncommand\trelish\ncommand\trelish status\ncommand\trelish fault\n",
+        )
+        .unwrap();
+        let availability = Availability {
+            released: &released,
+            label: released.unreleased_label("0.2.0"),
+        };
+        let out = render(&cli(), TEST_GROUPS, Some(&availability)).unwrap();
+        assert!(out.contains("- `relish status`: Show cluster and app status.\n"));
+        assert!(out.contains(
+            "- `relish exec <APP> [COMMAND]...`: Execute a command inside a running container. *(0.2.0, not in 0.1.6)*\n"
+        ));
+        assert!(out.contains("Kill instances. *(0.2.0, not in 0.1.6)*\n"));
     }
 
     #[test]
