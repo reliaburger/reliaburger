@@ -960,7 +960,7 @@ Two Cargo mechanisms got us there, and both are doing their job. The first is th
 requirement. `redb = "2"` in `Cargo.toml` doesn't mean "version 2". It's a caret range,
 `>=2.0.0, <3.0.0`: any release that semantic versioning (semver) promises won't break our
 code. Below 1.0 the leftmost non-zero number counts as the major version, so `nix =
-"0.29"` takes any 0.29.x and never 0.30. If you know Go, this is close to a `go.mod`
+"0.31"` takes any 0.31.x and never 0.32. If you know Go, this is close to a `go.mod`
 line, which also never crosses a major version, though Go makes that a new import path
 (`/v2`) where Cargo just refuses. Python's `~=` operator is the nearest pip equivalent.
 
@@ -1118,6 +1118,49 @@ worked out once, outside our code. Those tests passed on 0.10 before the version
 they'd fail the moment a new crate changed a single byte. The HMACs on gossip and webhooks
 and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
 compares tags in constant time.
+
+`base64` 0.22 to 0.23 got the same treatment. base64 sits under values we store and
+send: every `ENC[AGE:...]` secret, the join and workload certificate bundles, registry
+Basic credentials, cosign signatures, and each segment of the workload JWTs we mint. If
+0.23 had changed its alphabet or how strictly it reads padding, an old secret could stop
+decrypting or a new token could stop verifying somewhere else. So known answers went in
+first, worked out with Python's `base64` rather than with our own encoder: `"f"` must
+encode to `Zg==` in the standard alphabet and to `Zg` in the unpadded URL-safe one, and
+the bytes `fb ff bf` must come out as `+/+/` and `-_-_`. Decoding must still refuse a
+missing or non-canonical pad. The tests passed on 0.22 and pass unchanged on 0.23. The
+release's headline is a SIMD engine, but we still name `general_purpose::STANDARD` and
+`URL_SAFE_NO_PAD`, the scalar engines, so nothing we run changed underneath. pem 4 had
+already brought 0.23 into the lockfile; 0.22 stays there for now, because age, axum,
+k8s-openapi and oci-client still use it.
+
+And sometimes the compiler does all the reviewing. `nix`, our wrapper over Unix system
+calls, went from 0.29 to 0.31, and 0.30 moved its file-descriptor functions to *I/O
+safety*. In 0.29, `fcntl`, `fstat`, `fchown`, `syncfs` and the `*at` calls took a
+`RawFd`, a bare `i32`, so any integer would do, including one whose descriptor was already closed and
+reused. Now they take anything that implements the `AsFd` trait: a `File`, an `OwnedFd`,
+a `nix::dir::Dir`, or a `BorrowedFd` (Chapter 8 introduced the pair). The compiler refused
+eleven call sites, all in the same shape: we'd called `.as_raw_fd()` to hand nix an
+integer. The fix was to hand over the owner instead:
+
+```rust
+let stat = fstat(&top).map_err(io)?;
+// ...
+let stat = match fstatat(&*parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+```
+
+`&top` borrows the open `Dir`, and the borrow checker now proves it stays open for the
+call. `&*parent` reaches through the `Rc<Dir>` (a reference-counted pointer, so several
+children can share one parent directory) to borrow the `Dir` inside it. In C the same
+code would compile with a stale integer and fail at run time, if you were lucky. One call
+site, the `syncfs` that flushes an unpacked image, carried a comment promising "`directory`
+stays open for the whole call, so the descriptor is valid". That promise is now the
+compiler's job, so the comment went. The old `*at` signatures also took `Option<RawFd>`, where `None` meant "the current directory";
+the new ones take a descriptor and leave that case to `AT_FDCWD`. We never passed `None`,
+so nothing moved. Raw descriptors are still around where nix kept them, such as
+`connect`, and in our own `unsafe` blocks that call `libc` directly. nix 0.29 still has
+an entry in `Cargo.lock`, because `termwiz`, behind a ratatui backend we don't switch on,
+pins it. Cargo records every optional dependency it might need, but it compiles only
+those whose features are on, so `cargo tree -i nix@0.29.0` prints nothing.
 
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 

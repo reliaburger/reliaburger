@@ -1379,7 +1379,11 @@ start three VMs on a 32 GiB Mac because it saw half a GiB available. The
 free in the first place, so on a busy Mac with ten GiB compressed the result
 is nearly zero while `memory_pressure` reports 60% free. We now ask the kernel
 for that same figure, `kern.memorystatus_level`, and keep `sysinfo` on Linux,
-where `MemAvailable` means what it says.
+where `MemAvailable` means what it says. When 0.2.2 moved us from sysinfo
+0.33 to 0.39, its macOS "available" changed again: it's now active plus
+inactive plus free pages, which follows the XNU documentation but counts
+memory that running apps are actively using. That errs the other way, so
+the preflight still asks the kernel.
 
 The second lesson was about variance. Two warm runs out of four had one VM
 boot 90 seconds late. The journal showed why: our own provisioning script

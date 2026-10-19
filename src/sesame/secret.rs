@@ -516,6 +516,43 @@ mod tests {
         );
     }
 
+    /// `ENC[AGE:...]` wraps the armored age text in standard, padded
+    /// base64. age's own output is random, so pin the engine directly with
+    /// strings computed by Python's `base64`: a base64 release that changed
+    /// the alphabet or the padding would fail here rather than change every
+    /// value we seal (#1026).
+    #[test]
+    fn enc_base64_matches_the_rfc_4648_known_answers() {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let cases: [(&[u8], &str); 6] = [
+            (b"", ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (&[0xfb, 0xff, 0xbf], "+/+/"),
+            (&[0, 1, 2, 3, 4], "AAECAwQ="),
+        ];
+        for (bytes, encoded) in cases {
+            assert_eq!(engine.encode(bytes), encoded);
+            assert_eq!(engine.decode(encoded).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn an_enc_value_without_canonical_padding_is_refused() {
+        let (identity, _) = test_keypair();
+        for inner in ["Zg", "Zh==", "-_-_"] {
+            let value = format!("{ENC_PREFIX}{inner}{ENC_SUFFIX}");
+            assert!(
+                matches!(
+                    decrypt_secret(&value, &identity),
+                    Err(SecretError::InvalidFormat(_))
+                ),
+                "{inner}"
+            );
+        }
+    }
+
     #[test]
     fn a_root_key_sealed_by_age_0_10_still_unseals() {
         let sealed = include_bytes!("../../tests/fixtures/age/sealed-root-key.age");
