@@ -16,7 +16,7 @@ Both modes use the same underlying API client and output formatting. Anything vi
 1. **Zero-install debugging.** Every diagnostic tool is built in. An on-call engineer with the Relish binary and a valid token can diagnose any cluster issue without installing additional software.
 2. **Plan before apply.** Borrowing from Terraform, `relish apply <path> --dry-run` shows exactly what will change before anything is applied. No more "apply and hope."
 3. **Correlation over enumeration.** Commands like `relish wtf` don't just list problems -- they correlate events, link crashloops to recent deploys, and suggest specific remediation.
-4. **Scriptable by default.** Every command supports `--output json` for machine consumption, returns meaningful exit codes, and accepts filter flags for CI integration.
+4. **Scriptable by default.** Commands that report state support `-o json` (`--output json`) for machine consumption, and a command with nothing to report refuses it rather than printing text a script can't parse. Exit codes are meaningful (0 success, 1 error, 2 usage error, 3 warnings), and commands accept filter flags for CI integration.
 5. **Single binary, single version.** Relish is compiled into the same binary as Bun (the node agent). There's no version skew between client and server. The binary self-identifies its version and the cluster API rejects incompatible clients with a clear upgrade message.
 
 ---
@@ -60,7 +60,7 @@ The TUI resource-usage displays query the Mayo time-series database for CPU, mem
 
 ### Ketchup (log and history queries)
 
-The `relish logs` and `relish history` commands query the Ketchup log store. Ketchup stores application logs on each node with configurable retention. Event *streaming* is available in the TUI and web dashboard, not as a `relish events` CLI command.
+The `relish logs` and `relish history` commands query the Ketchup log store. Ketchup stores application logs on each node with configurable retention. `relish events` lists recent events; event *streaming* is available in the TUI and web dashboard.
 
 ### Wrapper (route queries)
 
@@ -102,7 +102,7 @@ The `relish routes` command queries the Wrapper ingress proxy for the current ro
 |  +------------------+       +------------------+                  |
 |  |   API Client     |       | Output Formatter |                  |
 |  |                  |       |                  |                  |
-|  |  reqwest HTTP/2  |       |  human-readable  |                  |
+|  |  reqwest HTTP/1.1|       |  human-readable  |                  |
 |  |  mTLS, token     |       |  JSON, table,    |                  |
 |  |  auth, WebSocket |       |  TOML             |                  |
 |  |  streaming       |       |                  |                  |
@@ -130,7 +130,7 @@ Each command executor is a standalone async function that:
 - Validates arguments locally (e.g., `relish lint` validates TOML syntax without contacting the cluster).
 - Calls the API client for remote data.
 - Formats and prints output.
-- Returns an exit code (0 for success, 1 for errors, 2 for warnings-only in lint/wtf).
+- Returns an exit code: 0 for success, 1 for errors, 2 for a usage error (clap's, or `--output` on a command without machine output), 3 for warnings-only in `wtf` and `path`. `exec` exits with the remote command's code.
 
 ### TUI Framework
 
@@ -215,7 +215,7 @@ Connection settings come from these flags, each with an environment fallback:
 | `--endpoint <url>` | `RELIABURGER_ENDPOINT` | Bun API base URL (default `http[s]://127.0.0.1:9117`) |
 | `--token <token>` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert <path>` | `RELIABURGER_CA_CERT` | Cluster root CA PEM; switches the local default to HTTPS |
-| `--output <fmt>` | — | `human`, `json` or `yaml` |
+| `-o`, `--output <fmt>` | — | `human`, `json` or `yaml` |
 
 ### TUI State
 
@@ -638,7 +638,7 @@ relish inspect <app>                # Per-instance detail (bare app name, not ap
 # Configuration tooling
 relish compile <path>               # Merge + resolve configs into one TOML document
 relish lint <path>                  # Validate a config file (warnings to stderr)
-relish fmt <path>                   # Format a TOML file in place
+relish fmt <path>                   # Format a TOML file in place, keeping comments
 relish fmt <path> --check           # Verify formatting without writing
 relish diff <path-a> [<path-b>]     # Structural diff between two configs (b defaults to empty)
 
@@ -655,6 +655,8 @@ relish logs-search <dir> <sql>      # SQL over an exported Parquet archive
 relish path <src> --to <dst>       # DNS / service-map / firewall / TCP evidence probe
 relish inspect <app>                # Per-instance detail for an app
 relish resolve <name>               # Resolve a service to its VIP and backends
+relish resolve <name> --namespace <ns>  # Pick one when the name exists in several
+relish events [--app <app>] [--severity <level>] [--limit <n>]  # Recent events, cluster-wide
 relish routes                       # Show the ingress routing table
 relish top                          # Workload table: state, PID, restarts (no live CPU/memory)
 relish wtf                          # Correlated cluster health diagnosis
@@ -667,7 +669,7 @@ relish history <app>                # Deploy history for an app
 relish history <app> --namespace <ns>  # Scope to a namespace
 
 # Interactive debugging
-relish exec <app> <cmd...>          # Run a command inside a running instance
+relish exec <app> <cmd...>          # Run a command once inside a running instance; exits with its code
 relish exec <app> --namespace <ns> <cmd...>  # Scope to a namespace
 
 # Cluster lifecycle
@@ -832,7 +834,7 @@ shipped CLI. **Status: planned — not yet implemented.**
 
 - `relish scale <app> <n>` — no imperative scale; set `replicas` in config and `apply`.
 - `relish plan <path>` — use `relish apply <path> --dry-run`.
-- `relish events` — event streaming exists only as a TUI/dashboard view, not a CLI command.
+- `relish events --follow` — event streaming exists only as a TUI/dashboard view.
 - `relish route <hostname>` — only `relish routes` (no argument) exists.
 - `relish firewall <app>` / `relish firewall test` — no firewall-inspection command; use `relish path`.
 - `relish identity <app>` — no workload-identity command.
@@ -954,7 +956,16 @@ Returns exit code 0 when the config parses and validates — any warnings (such 
 
 **`relish fmt <path>`**
 
-Formats and sorts all TOML files in a directory. Consistent key ordering, consistent whitespace, tables grouped logically. Idempotent -- running it twice produces identical output. Writes files in place. Use `--check` to verify formatting without modifying (exits 1 if any file would change).
+Formats one TOML file in place with `toml_edit`, so every comment survives
+(D35): a full-line comment moves with the key or section below it, and a
+trailing comment stays on its line. Sections go in canonical order
+(namespace, permission, app, job, build, then the rest alphabetically), keys
+are sorted within each section, `=` gets one space either side, indentation
+goes and each section header gets one blank line above it. Values keep their
+own spelling. Idempotent -- running it twice produces identical output. The
+output must re-parse to the same values or the file is left alone. Use
+`--check` to verify formatting without modifying (exits 1 if the file would
+change).
 
 #### Change Planning Commands
 
@@ -990,12 +1001,17 @@ Ketchup on the local node. Flags:
 
 There is no `--instance` flag and no `--no-follow` (following is opt-in).
 
-**`relish events`** — **Status: planned — not yet implemented.**
+**`relish events [--app APP] [--severity LEVEL] [--limit N]`**
 
-Event streaming exists only as a TUI view (the `[e]vents` screen and the web
-dashboard), not as a CLI command. There is no `relish events` subcommand or its
-`--app` / `--node` / `--type` / `--since` / `--until` / `--severity` filters.
-Use `relish history <app>` for an app's audit trail.
+Lists the newest events across the cluster, oldest first (D36): the node relish
+talks to merges its own in-memory events with every live member's, through
+`GET /v1/events`, and names any member that didn't answer on stderr. `--app`
+and `--severity` (at least `info`, `warning` or `critical`) filter on each
+node, and `--limit` (default 100) counts matching events. `-o json` prints the
+API's answer. It needs an unscoped token. There's no `--follow`; the TUI's
+events view streams. The `--node` / `--type` / `--since` / `--until` filters
+are **planned — not yet implemented**; `relish audit` is the durable,
+time-filtered record.
 
 **`relish path <app> --to <app|host> [--count N]`**
 
@@ -1040,15 +1056,23 @@ it does not show metrics, ingress, identity or deploy history.
 
 **`relish resolve <name>`**
 
-Queries the service map for one service name. Shows the virtual IP, real
-backends (host:port), health status, and which node each instance runs on.
-There is no `--all` flag.
+Queries the service map for one service name. Shows the namespace, the
+virtual IP, real backends (host:port), health status, and which node each
+instance runs on. `--namespace` picks the service when the name exists in more
+than one namespace; without it, an ambiguous name is refused with the
+namespaces it exists in, rather than answered from whichever came first. `-o
+json` prints the API's answer. There is no `--all` flag.
 
 ```
 $ relish resolve redis
-redis.internal → 127.128.0.3
-  Backends:
-    redis-1  10.0.1.5:30891  node-01  healthy
+Service:   redis
+Namespace: default
+VIP:       127.128.0.3
+Port:      6379
+Backends:  1/1 healthy
+
+  INSTANCE             NODE               PORT     HEALTH
+  default__redis-0     10.0.1.5           30891    healthy
 ```
 
 **`relish firewall <app>` / `relish firewall test`** — **Status: planned — not yet implemented.**
@@ -1085,8 +1109,9 @@ The key differentiator: `wtf` doesn't just enumerate problems. It correlates the
 
 `--app <app>` scopes the check to a single app for deeper, faster diagnosis. `--watch` runs continuously with 30-second refresh -- useful during deploys or incidents.
 
-Exit codes: 0 (all observed checks OK), 1 (criticals found), 2 (warnings or
-unknown evidence only).
+Exit codes: 0 (all observed checks OK), 1 (criticals found), 3 (warnings or
+unknown evidence only). It was 2 before 0.2.2, which clashed with clap's usage
+error.
 
 Collection starts with the configured Bun endpoint. If that node isn't
 healthy, the command fails because it has no trustworthy cluster view. It then
@@ -1153,10 +1178,17 @@ and actors, and `--since`, are **planned — not yet implemented**.
 
 **`relish exec <app> <cmd...>`**
 
-Runs a command inside a running instance of an app via the local Bun agent,
-which enters the container's namespaces and executes it. Takes a **bare app
+Runs a command once inside a running instance of an app, on the node that runs
+it, which enters the container's namespaces and executes it. Takes a **bare app
 name** and the command as trailing arguments (no `--` separator is required);
 `--namespace` scopes the lookup.
+
+It is one-shot: no stdin and no terminal, and the output comes back when the
+command ends (D34). `POST /v1/exec/{app}/{namespace}` answers `200` with
+`{"output", "exit_code"}` whatever the code, and relish exits with that code.
+Only failing to run the command is an HTTP error: `404` when no instance is
+running, `504` when it outlives the five-minute limit, `500` otherwise.
+Interactive, streaming exec is #710 (0.4.0).
 
 The `--debug`, `--privileged` and `--node` variants are **Status: planned — not
 yet implemented.** `exec` runs a command in the app's own container only; there
@@ -1594,7 +1626,7 @@ fallback resolved by `src/relish/client.rs`.
 | `--endpoint <url>` | `RELIABURGER_ENDPOINT` | Bun API base URL (default `http[s]://127.0.0.1:9117`; the local API port is **9117**) |
 | `--token <token>` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert <path>` | `RELIABURGER_CA_CERT` | Cluster root CA PEM; when set the CLI uses HTTPS |
-| `--output <fmt>` | — | `human` (default), `json`, `yaml` |
+| `-o`, `--output <fmt>` | — | `human` (default), `json`, `yaml`; refused by commands without machine output |
 
 The endpoint validator requires an explicit host (not `localhost`) and forces
 `https` for non-loopback hosts. There is no `RELISH_CLUSTER`,
@@ -1923,7 +1955,7 @@ Relish is implemented in Rust. The following crates are used:
 | `ratatui` | 0.29.x | Terminal UI rendering framework (widgets, layouts, styles) |
 | `crossterm` | 0.28.x | Cross-platform terminal manipulation (raw mode, events, colours, cursor) |
 | `nucleo-matcher` | 0.3.x | Fuzzy matching for the TUI search view |
-| `reqwest` | 0.12.x | HTTP/2 client with mTLS, connection pooling, streaming |
+| `reqwest` | 0.13.x | HTTP/1.1 client with mTLS, connection pooling, streaming; built through `http_client::builder()` |
 | `tokio` | 1.x | Async runtime for concurrent API calls, WebSocket streams, and TUI event loop |
 | `tokio-tungstenite` | 0.28.x | WebSocket client for streaming logs, events, and exec sessions |
 | `yaml_serde` | 0.10.x | YAML serialisation for `--output yaml` mode and Kubernetes import (the maintained successor to `serde_yaml`) |

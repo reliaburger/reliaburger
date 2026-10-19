@@ -224,9 +224,9 @@ pub enum RaftRequest {
     RevokeCertificate(crate::sesame::types::CrlEntry),
     /// No-op entry (used for leader commit on election).
     Noop,
-    // NOTE: the log is bincode-encoded (variant index on the wire), so new
-    // variants are APPENDED here — never inserted or reordered — or every
-    // existing log entry decodes as the wrong variant.
+    // NOTE: the log and the Raft RPC are JSON, which tags each variant by its
+    // name, so renaming a variant changes the format and reordering doesn't.
+    // New variants still go at the end, which keeps the history readable.
     /// Start or advance a cluster-wide rolling binary upgrade (Phase 14).
     UpgradeUpdate {
         state: Box<crate::upgrade::types::ClusterUpgradeState>,
@@ -523,8 +523,8 @@ pub enum CouncilResponse {
     GcApproved {
         approved: Vec<crate::pickle::types::Digest>,
     },
-    // NOTE: like `RaftRequest`, responses ride the bincode-encoded wire,
-    // so new variants are appended, never inserted or reordered.
+    // NOTE: like `RaftRequest`, responses are JSON tagged by variant name, so
+    // a rename changes the format. New variants go at the end.
     /// The entry was applied but the state machine refused to act on it —
     /// e.g. finalising a secret rotation while stored secrets are still
     /// sealed under an old generation (PKI8). The state is unchanged;

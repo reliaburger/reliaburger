@@ -518,7 +518,7 @@ HTML report. On Linux CI that same run is the test gate, so we don't pay for the
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
 crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
-mid-write: all 4,708 tests passed, then `llvm-profdata` refused the truncated file and failed
+mid-write: every test passed, then `llvm-profdata` refused the truncated file and failed
 the whole report. The report steps now pass `--failure-mode all`, which skips an unreadable
 profile with a warning and only fails when none can be read. Skipping one killed process's
 partial counts can pull coverage down a hair. It can't push it up, so the floor still means
@@ -599,10 +599,10 @@ runner-minutes, and more than half of those minutes went to runs that a newer pu
 already cancelled. Nobody waits half an hour for feedback. They push again, which cancels the
 run, which makes the wait longer. So we measured where the time went before touching anything.
 
-Two-thirds of it was compiling. The portable suite, about 4,150 tests that take five minutes to
+Two-thirds of it was compiling. The portable suite, which takes five minutes to
 run, ran seven times per push: default and no-default features in three jobs, plus macOS. The
 only default feature is `kubernetes`, and nothing in the code depends on it being *off*, so the
-four no-default runs repeated the same 4,110 tests to prove the crate builds without one
+four no-default runs repeated the same tests to prove the crate builds without one
 dependency. A second `clippy --no-default-features` proves that in seconds. The coverage job
 compiled and ran the suite again under instrumentation, beside the uninstrumented run it
 duplicated. The 10,000-member scale test had its own 21-minute release build, because
@@ -777,6 +777,30 @@ is exactly what a disk stall *doesn't* cause. The step summary shows both measur
 anything it re-measured, so a benchmark that passed on its second try is still visible to
 anyone reading the trend.
 
+Measuring twice assumed the stall was brief. It isn't always. In the 0.2.1 merge queue the
+storage benchmark came out at 3.20 times the rest of its run, and at 2.93 on the re-measure a
+few minutes later: that runner's disk was slow for the whole job (#1038). We went back through
+every `criterion-task-arrays` artefact we still had, 179 runs over a week. Eight failed on this
+benchmark alone, and in none of them was any other benchmark above 1.11 times the rest. The
+giveaway was inside each failing benchmark: its ten Criterion samples ranged from about 15 ms to
+as much as 134 ms, where a healthy runner keeps them within a few per cent. Most of the
+benchmark's time goes on fsyncs, so what it really measures is the disk.
+
+We had three ways out. Normalising it against a disk-bound reference in the same job sounds
+like the median trick again, but the samples rule it out: the disk changes speed several times
+over within one benchmark's few seconds, so a reference measured just before or after sees a
+different disk. Dropping the benchmark from the gate would stop the failures and also stop it
+catching anything. So we split it. A twin, `storage/ledger_and_index_64k_tmpfs`, does exactly
+the same writes in a directory on `/dev/shm`. That's tmpfs, a filesystem held in memory, where
+an fsync returns at once, so what's left to measure is encoding, writing and indexing the
+records, which is what a change to the ledger code can actually make slower. The twin is
+gated like any other benchmark. The on-disk original is passed to `--report-only`: the summary
+shows its ratio, marked "report only", but it can't fail the run, isn't re-measured and isn't
+counted in the median the others are measured against. The one regression this no longer
+catches is a change that adds fsyncs, since those are free on tmpfs. It still shows up in the
+on-disk ratio for anyone reading the summary, but nothing fails on it. We accepted that: until
+the disk under the runner is steady, a gate on fsync time is a gate on the runner's disk.
+
 Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
 alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
 slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
@@ -806,7 +830,7 @@ release had a dozen of them in flight. We timed twelve runs: 45 to 55 minutes of
 Runner queueing was mostly under ten minutes, so the runners weren't the problem. Portable
 macOS was the critical path in almost every run, at 35 to 49 minutes, then acceptance at about
 34. Everything else finished in about 15. Inside the macOS job, compiling the test binaries
-took 27 minutes; running all 6,288 tests took seven.
+took 27 minutes; running them took seven.
 
 So we asked what a pull request into a train actually needs to prove. That it compiles, lints
 clean on stable and on the minimum compiler, and passes the portable suite with the coverage
@@ -844,8 +868,8 @@ envelope can't be uploaded under another's name. A shard re-run on its own after
 keeps the attempt number GitHub gave it, so the check that one job's owners share an attempt
 treats each shard as its own job.
 
-Did splitting pay? Less than we hoped. The first full run with shards ran 2,094 tests in
-under three minutes per shard instead of seven, but each shard still compiled the whole suite
+Did splitting pay? Less than we hoped. The first full run with shards ran each shard's tests in
+under three minutes instead of seven, but each shard still compiled the whole suite
 for 38 minutes, so a shard took 42 to 44 minutes against the 45 before. That's level with
 acceptance, so macOS is no longer the only critical path, and no further. Three macOS jobs
 also wait longer for runners: one shard queued for 28 minutes behind other pull requests.
@@ -964,12 +988,103 @@ list, without ever failing the build. A lag report that broke builds would get m
 within a week. One that nobody reads would rot just as fast, which is why the refresh is a
 numbered step in the release runbook, not a good intention.
 
+The first security-relevant major bump shows why. reqwest 0.12 to 0.13 needed two edits
+to compile: `query` is an opt-in feature now, and one test called the removed
+`tls_built_in_root_certs`. Everything else built first time. And three of its defaults had
+moved underneath us.
+
+reqwest 0.12, built with our `rustls-tls` feature, checked public certificates against
+the Mozilla root list compiled into the binary, did its crypto with *ring*, and spoke only
+HTTP/1.1. 0.13 checks them against the operating system's trust store, falls back to
+aws-lc for crypto, and the `http2` feature turns on HTTP/2 in the TLS handshake. We
+didn't ask for any of those. We switched off reqwest's default features and picked
+`rustls-no-provider`, which brings no crypto provider of its own. That doesn't help,
+because of *feature unification*. Cargo builds each crate version once per build, with the
+union of the features every dependant asked for. `object_store`, our backup crate, was
+already on reqwest 0.13 with `rustls` and `http2`, so our reqwest got them too. If you
+know Go modules, there's no equivalent: a Go package has no optional features to merge.
+In Cargo a feature is a one-way switch, and any crate in the graph can flip it on for
+everyone.
+
+The trust store is the one that bites. On Linux, reqwest 0.13 reads the host's CA bundle
+when it *builds* a client, before any request. On a host without one it refuses to build
+at all, even for a plain `http://` scrape, and `reqwest::Client::new()` panics. We had
+`.unwrap_or_default()` fallbacks that would have turned that into a panic on a node with
+a stripped-down image.
+
+So every production client now starts from one function, `http_client::builder()` in
+`src/http_client.rs`:
+
+```rust
+pub fn builder() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .http1_only()
+        .tls_certs_only(bundled_roots().iter().cloned())
+}
+
+fn bundled_roots() -> &'static [reqwest::Certificate] {
+    static ROOTS: std::sync::LazyLock<Vec<reqwest::Certificate>> =
+        std::sync::LazyLock::new(|| {
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+                .collect()
+        });
+    &ROOTS
+}
+```
+
+`tls_certs_only` trusts exactly the certificates we hand it: the same Mozilla list 0.12
+bundled, from `webpki-root-certs`. `http1_only` puts the handshake back to HTTP/1.1.
+Installing ring as the process's default provider matters because reqwest asks rustls for
+that default before it reaches for aws-lc. The `let _ =` throws away the error you get
+when a provider is already installed, which is the common case after the first call.
+
+`static` with `LazyLock` is Rust's answer to "compute this once, the first time someone
+needs it". In C you'd reach for a global and `pthread_once`; in Python, a module-level
+value. `LazyLock` runs the closure on first access, from whichever thread gets there
+first, and every later access gets the same `Vec`. Returning `&'static [Certificate]`
+promises callers the slice lives for the whole program, which a `static` does.
+
+The clients that pin the cluster CA (relish over HTTPS, node-to-node mTLS, certificate
+renewal) didn't change behaviour. They hand reqwest a complete rustls config through
+`use_preconfigured_tls`, and that config's roots replace reqwest's. They start from
+`builder()` anyway, so there's one rule to remember. A unit test enforces it by reading
+the source tree and failing on a bare `reqwest::Client::builder()`, `Client::new()` or
+`reqwest::get()` outside test code. Other tests check the parts a default could undo: a
+server offering `h2` gets `http/1.1`, ring is the installed provider, and a client handed
+the wrong cluster CA is still refused.
+
+Proxies, the other default people worry about, didn't move. Both versions read
+`HTTP_PROXY` and friends from the environment, and neither reads macOS or Windows proxy
+settings unless the `system-proxy` feature is on, and nothing in our graph enables it.
+
 The `age` bump from 0.10 to 0.12 shows what "deliberate" means. The API we seal the root
 CA backup with changed shape, which the compiler caught. What the compiler can't catch is
 whether 0.12 still opens a file 0.10 sealed years ago, so that PR first checked in files
 sealed by the old build and made the tests open them (chapter 4 has the details). It also
 paid a dividend: `age` 0.12 no longer pulls in the unmaintained `proc-macro-error`, so its
 `cargo audit` exception went too.
+
+Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
+3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
+maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
+"replace it": gossip, reporting frames and the Raft metadata moved to postcard, which
+changed the wire and durable formats along with the crate (Chapter 2 has the details). A
+lag report can tell you you're behind. It can't tell you the road ahead still exists.
+
+Sometimes a major version changes nothing you can see. `pem` 4.0.0, the crate that turns
+our certificates and keys into the `-----BEGIN CERTIFICATE-----` text nodes keep on disk,
+has the same source code as 3.0.6. Only its `base64` dependency and its minimum Rust
+version moved. We still didn't take that on trust. A PEM file is a stored format: if the
+new crate wrote different line endings (3.0.6 writes CRLF) or wrapped lines at a different
+width, every node would rewrite every certificate it owns. So the PR checked in a root CA
+certificate and key written by the 3.0.6 build, and
+`pem_files_written_by_pem_3_parse_and_rewrite_byte_for_byte` reads them with 4.0.0 and
+writes them back, byte for byte. A one-line `.gitattributes` keeps git from "fixing" the
+fixtures' CRLFs, which would make the test check the wrong bytes. The bump also left one
+`pem` in `Cargo.lock` instead of two, since rcgen 0.14 had already moved to 4.
 
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
@@ -1506,9 +1621,21 @@ So the diagnostic commands return a small enum instead:
 pub enum CommandOutcome {
     Clean,     // ran fine, nothing wrong — exit 0
     Problems,  // ran fine, found failures — exit 1
-    Warnings,  // ran fine, only warnings — exit 2
+    Warnings,  // ran fine, only warnings — exit 3
+    Exited(u8), // `relish exec`: the remote command's own exit code
 }
 ```
+
+`Warnings` exited 2 until the 0.2.2 CLI review (#522) noticed that clap
+already exits 2 for a usage error, so `relish wtf --aap web` (a typo) and a
+degraded cluster looked the same to a script. One of them had to move, and
+clap's 2 is the Unix convention scripts already expect, so warnings took 3.
+`Exited` came in the same review: `relish exec` used to turn every failure into
+an HTTP 404 and every success into exit 0, whatever the command did. Now the
+API answers `{"output", "exit_code"}` and the binary exits with that code,
+through the same `finish_outcome`. A `u8` payload is all a process exit code
+can carry; a code outside 0 to 255 maps to `Problems`, so it can never read as
+success.
 
 `relish test` maps a report rejected by its profile to `Problems` and a clean
 one to `Clean`. That includes assertion failures, unknown evidence, required
@@ -1533,6 +1660,41 @@ everything. Same exit code, two very different events, and the code says which
 is which. This is the sort of thing Rust's enums make pleasant: the states are
 named, the `match` is exhaustive, and there's no magic integer floating around
 that a reader has to decode.
+
+The same review looked at `--output`. It's a *global* flag (`global = true` in
+clap), so clap accepts it after any command, and that's the trap: `relish -o
+json inspect web` parsed, ran, and printed the human table, because `inspect`
+never looked at the flag. A script asking for JSON got text and broke on its
+first parse. So `main` now asks before dispatching:
+
+```rust
+fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
+    if output == OutputFormat::Human || honours_output(command) {
+        return None;
+    }
+    // ... "this command has no json output; drop --output (or -o)"
+}
+```
+
+`honours_output` is one `match` over every `Command` variant, with no `_`
+arm. That's deliberate: add a command and the compiler refuses to build until
+you've said whether it prints JSON. A refusal exits 2, the usage-error code,
+since asking a command for output it doesn't have is a usage error. The flag
+also gained the short form the manual had been documenting all along, `-o`.
+
+Adding `relish events` and one flag broke every parser test on Linux CI with
+a stack overflow, while macOS passed. Clap's derive writes one function,
+`augment_subcommands`, that builds every subcommand of `Command` and every
+argument declared inline in a variant. In a debug build each builder call
+keeps its own copy of the `Arg` on the stack, about 8 KiB per argument, so that
+one function's frame had reached a megabyte, plus another half for the `fault`
+subcommands it calls. Linux gives test threads 2 MiB; macOS gives more. The
+fix moves the biggest variants' arguments into their own `#[derive(Args)]`
+structs and boxes them, `Run(Box<RunOptions>)`, so each struct gets its own
+small function, called one after another rather than all in one frame. The
+real binary was never at risk: `main` parses on the process's main thread,
+which has 8 MiB, before the runtime starts any other thread. The tests now pass
+with a 1.5 MiB stack.
 
 Two smaller choices round out the command. Selection: `--filter
 scheduling,firewall` picks those groups, and an entry that names an exact case,
@@ -5809,7 +5971,7 @@ useful to report than a gap in the evidence. Missing evidence still can't
 quietly turn green.
 
 Relish preserves that contract in human, JSON and YAML output. Pass exits 0,
-Fail exits 1, and Unknown and Degraded exit 2, matching `wtf`'s warnings. The JSON schema is versioned
+Fail exits 1, and Unknown and Degraded exit 3, matching `wtf`'s warnings. The JSON schema is versioned
 and rejects unknown top-level fields so automation doesn't silently interpret
 a changed response as the old one.
 

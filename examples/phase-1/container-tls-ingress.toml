@@ -1,0 +1,31 @@
+# Real containers: HTTPS ingress with the cluster's own certificates.
+#
+# With tls = "cluster", Wrapper serves web.localhost over HTTPS with a
+# certificate signed by the cluster's ingress CA, renews it by itself, and
+# redirects plain HTTP to HTTPS. Clients need to trust that CA. There's no
+# ACME: `relish apply` refuses tls = "auto" or "acme".
+#
+# Requires runc on Linux and a node with [ingress] enabled, which binds 80
+# and 443 (on macOS, use the managed Linux VM from `relish setup
+# --quickstart`, whose ingress forwards to localhost:18080 for HTTP; see
+# `relish manual networking`).
+#
+# Deploy with:
+#   relish apply examples/phase-1/container-tls-ingress.toml
+#   relish routes                                   # web.localhost, tls: cluster
+#   curl -sI -H 'Host: web.localhost' http://<node>/      # 308 to https://
+#   curl -sk --resolve web.localhost:443:<node> https://web.localhost/
+# Drop -k once your client trusts the cluster's ingress CA.
+
+[app.web]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+args = ["--port=9898"]
+port = 9898
+
+[app.web.health]
+path = "/readyz"
+
+[app.web.ingress]
+host = "web.localhost"
+path = "/"
+tls = "cluster"

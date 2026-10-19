@@ -1049,7 +1049,14 @@ async fn exec_returns_output_only_after_retiring_surviving_children() {
     let gone = exec_process_is_gone(pid).await;
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
-    assert_eq!(output.unwrap(), "stdout\nstderr");
+    // D34: the command's own exit code comes back with its output.
+    assert_eq!(
+        output.unwrap(),
+        reliaburger::grill::ExecOutput {
+            output: "stdout\nstderr".into(),
+            exit_code: 7,
+        }
+    );
     assert!(gone, "exec returned while its descendant remained");
 }
 
@@ -1089,9 +1096,12 @@ async fn exec_rejects_empty_commands_and_excessive_output() {
             .to_string()
             .contains("request exceeds")
     );
-    assert_eq!(long_request.unwrap(), format!("{}\n", "x".repeat(2048)));
+    assert_eq!(
+        long_request.unwrap().output,
+        format!("{}\n", "x".repeat(2048))
+    );
     assert!(oversized.unwrap_err().to_string().contains("1 MiB"));
-    assert_eq!(following.unwrap(), "still-running\n");
+    assert_eq!(following.unwrap().output, "still-running\n");
 }
 
 #[tokio::test]
@@ -1242,7 +1252,7 @@ async fn exec_owner_can_launch_after_its_binary_has_been_unlinked() {
         .await;
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
-    assert_eq!(result.unwrap(), "mapped-image\n");
+    assert_eq!(result.unwrap().output, "mapped-image\n");
 }
 
 /// A variable in this test process that host commands must not inherit
@@ -1282,7 +1292,7 @@ async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
     let resolved = grill.exec(&id, &["rb-exec-tool".into()]).await;
     grill.kill(&id).await.unwrap();
     stopped(&grill, &id).await;
-    let env = env.unwrap();
+    let env = env.unwrap().output;
     let lines: Vec<&str> = env.lines().collect();
     assert!(lines.contains(&"JOB=1"), "{env}");
     assert!(
@@ -1299,7 +1309,7 @@ async fn exec_runs_with_the_workloads_environment_and_none_of_buns() {
             .any(|line| line.starts_with(&format!("{private}="))),
         "{private} leaked: {env}"
     );
-    assert_eq!(resolved.unwrap(), "found");
+    assert_eq!(resolved.unwrap().output, "found");
 }
 
 /// An agent with a durable process runtime and records under `directory`,

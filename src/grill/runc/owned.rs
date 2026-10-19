@@ -1168,7 +1168,7 @@ impl RuncGrill {
         &self,
         instance: &InstanceId,
         command: &[String],
-    ) -> Result<String, GrillError> {
+    ) -> Result<crate::grill::ExecOutput, GrillError> {
         if command.is_empty() {
             return Err(failure(instance, "no command specified"));
         }

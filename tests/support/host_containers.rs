@@ -138,7 +138,11 @@ impl Grill for HostContainers {
         self.runtime.logs(instance).await
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<reliaburger::grill::ExecOutput, GrillError> {
         self.runtime.exec(instance, command).await
     }
 

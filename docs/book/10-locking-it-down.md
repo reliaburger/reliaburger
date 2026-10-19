@@ -949,7 +949,7 @@ The `unsafe` block turns raw bytes into a Rust type, so it deserves a closer loo
 
 Verifying a bearer and minting a token both go through one helper, `hash_off_heap`. Verification reads the variant, version, cost and salt from the stored hash, as the crate's own `verify_password` does, and compares the result with `password_hash::Output`'s `==`, which runs in constant time. A hash the crate made still verifies, a hash we mint still verifies with the crate, and a hash with other parameters verifies with its own. Unit tests pin all three, because a hand-rolled verifier that quietly accepted the wrong thing would be far worse than a fat heap.
 
-`tests/auth_memory.rs` is the test we wrote first. Like the upgrade and connection memory tests, it's a binary with a counting global allocator, so it sees every heap byte the check asks for. Checking a bearer against three stored tokens peaked at 19,922,944 heap bytes before the fix: one Argon2 block array, 19,456 KiB to the byte. After it, the same check stays under a 1 MiB ceiling, and so do refusing a wrong secret and minting a token.
+`tests/auth_memory.rs` was the test we wrote first. Like the upgrade and connection memory tests, it was a binary with a counting global allocator, so it sees every heap byte the check asks for. Checking a bearer against three stored tokens peaked at 19,922,944 heap bytes before the fix: one Argon2 block array, 19,456 KiB to the byte. After it, the same check stays under a 1 MiB ceiling, and so do refusing a wrong secret and minting a token.
 
 A heap test proves the bytes left the heap. It can't prove RSS, so we reproduced the soak in a two-CPU, 2 GiB Lima VM with swap off: one Bun, six job runs of the soak's calibration mix (262,144-task arrays and 512-task long runs on the process runtime), and the soak's request mix, each request a fresh `curl` through a forwarder that holds the connection open until Bun's idle timeout, as Lima's does. Thirty minutes, with a Bun restart at ten:
 
@@ -1879,6 +1879,8 @@ pub(super) fn replace_link(fd: &OwnedFd, new_program: RawFd, old_program: RawFd)
 
 This is a raw `bpf(2)` syscall, so it's `unsafe`: the compiler can't check what the kernel does with the pointer we pass. `UpdateAttributes` is `#[repr(C)]`, which tells Rust to lay the fields out in declaration order, exactly as the kernel's C struct expects (by default Rust may reorder them). `OwnedFd` is a file descriptor that closes itself when dropped, and `as_raw_fd()` borrows its integer for the call without giving up ownership. `BPF_F_REPLACE` makes this a compare-and-swap: if the link no longer runs `old_program`, the kernel refuses, so we can't overwrite a change we didn't expect.
 
+The two halves go through different code. The maps are aya's job: the loader is told which directory the pins live in (`EbpfLoader::default_map_pin_directory`), and for each map the C object marks as pinned by name it reuses the pin of that name or creates one there. Before aya 0.14 this method was called `map_pin_path`. That name now belongs to a different method, one that pins a single named map at an exact path, so the rename is one the compiler catches rather than one that quietly changes where pins go. The links are ours, in the raw syscalls above. When we wrote this, aya couldn't turn a cgroup socket-address attachment into a pinnable link at all. Aya 0.14 added that conversion, but its link update is internal to its XDP and TC code, so it still can't do the compare-and-swap on our pinned cgroup links, and that is the whole point. So the dependency bump changed one method name and left the pin and unpin paths alone. That matters, because a stale pinned program set once wedged every VIP connect in our VM.
+
 Keeping the kernel state alive is half the job. After a restart Bun also has to know *which workload* each piece of policy belongs to. Otherwise the next health check sees a protected workload with no binding and stops it, or a sweep mistakes the retained policy for an orphan. So before programming any policy, the agent writes a record to a private checkpoint: the instance, its original launch spec, its allowlist, its namespace identity, its cgroup id and the kernel's boot id. The cgroup id stays in the record after the runtime deletes the cgroup, so cleanup can remove the right map entries without guessing from a missing directory. The boot id stops a cgroup number from a previous boot being mistaken for the same number today. The resolved IP addresses are deliberately left out (`#[serde(skip)]` on that field): they're a DNS answer, not policy, so recovery resolves the recorded allowlist again, keeping enforcement on (deny everything) in the meantime. Each record stays in the file, marked `Retired`, until the identity files and adoption record are gone too, so a crash between those steps doesn't look like a lost checkpoint. And if a checkpoint write fails, Bun refuses further policy changes until a restart re-reads the file, because it can't know whether the old contents survived.
 
 On recovery, a surviving workload keeps running only if its original cgroup, boot id, hooks and enforcement flag all check out. Anything that doesn't match is refused rather than swept. We'd rather stop a workload than guess who owns a kernel entry.
@@ -1913,22 +1915,20 @@ Token rotation is tested at three layers, and the tests came first. In `sesame/t
 
 ### Integration tests — the lifecycles
 
-Two integration files drive whole features through the library, no running agent required:
+One integration file drives whole features through the library, no running agent required:
 
 - **`tests/suite/security_integration.rs`** is the lifecycle suite: `join_token_single_use_enforced` and `join_token_expiry_enforced` (the loop we left open in Chapter 4), `secret_rotation_dual_key_window` and `secret_rotation_finalize_drops_old_key` (the dual-key window), and `crl_revoked_cert_rejected` / `crl_valid_cert_allowed` / `crl_empty_allows_all` (revocation).
-- **`tests/identity_demo.rs`** doubles as a runnable walkthrough. Each test is a stage of the SPIFFE story — `demo_cluster_init_and_ca_hierarchy`, `demo_csr_generation_and_signing`, `demo_oidc_jwt`, `demo_identity_bundle_and_tmpfs`, `demo_rotation_state_machine` — and they print as they go.
+
+There used to be a second, an `identity_demo` binary whose tests walked through the SPIFFE story stage by stage and printed as they went. We deleted it in July 2026. It read like a tour, but it checked nothing the unit tests in `sesame` didn't already check, and a test file that looks like coverage while adding none is worse than no file.
 
 ### Running them
 
-No gating — crypto needs only a CPU:
+No gating, since crypto needs only a CPU:
 
 ```sh
 cargo test --lib sesame pickle::signing               # unit tests
 cargo test --test suite security_integration::        # token / rotation / CRL lifecycle
-cargo test --test identity_demo -- --nocapture        # the SPIFFE walkthrough, printed
 ```
-
-The `--nocapture` on the last one is the point: it turns the test into a guided tour of cluster init, CSR signing, JWT minting, and rotation, printed to your terminal.
 
 ## Trust the image, or don't run it
 
