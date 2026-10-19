@@ -859,6 +859,117 @@ fn every_inline_relish_command_names_a_real_command_and_flags() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+// --- Field references --------------------------------------------------------
+
+/// Fields the config accepts that a user never writes: the leader fills them.
+const INTERNAL_FIELDS: &[&str] = &["ordinals"];
+
+/// The fields a `deny_unknown_fields` table accepts, read from the error serde
+/// gives for one it doesn't know, so the list can't drift from the struct.
+fn accepted_fields<T: serde::de::DeserializeOwned>() -> Vec<String> {
+    let error = match toml::from_str::<T>("no_such_field = 1") {
+        Ok(_) => panic!("the table accepted an unknown field"),
+        Err(error) => error.to_string(),
+    };
+    let Some((_, list)) = error.split_once("expected one of") else {
+        panic!("serde's unknown-field error changed shape: {error}");
+    };
+    list.split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .filter(|field| !INTERNAL_FIELDS.contains(&field.as_str()))
+        .collect()
+}
+
+/// The text of a `## heading` section, up to the next `## `.
+fn manual_section(text: &str, heading: &str) -> String {
+    let start = text
+        .find(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("no `{heading}` section"));
+    let rest = &text[start + heading.len() + 2..];
+    rest[..rest.find("\n## ").unwrap_or(rest.len())].to_string()
+}
+
+#[test]
+fn manual_reference_lists_every_app_and_job_field() {
+    use reliaburger::config::app::{AppSpec, HealthSpec};
+    use reliaburger::config::job::JobSpec;
+
+    let reference = read("docs/manual/13_reference.md");
+    let tables = [
+        ("## App fields", accepted_fields::<AppSpec>()),
+        ("## App fields", accepted_fields::<HealthSpec>()),
+        ("## Job fields", accepted_fields::<JobSpec>()),
+    ];
+    let mut missing = Vec::new();
+    for (heading, fields) in tables {
+        assert!(fields.len() > 5, "found only {fields:?} under {heading}");
+        let section = manual_section(&reference, heading);
+        for field in fields {
+            let named = section.contains(&format!("`{field}`"))
+                || section.contains(&format!("`[[{field}]]`"));
+            if !named {
+                missing.push(format!("{heading}: `{field}`"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "docs/manual/13_reference.md doesn't describe:\n{}",
+        missing.join("\n")
+    );
+}
+
+// --- The CLI design doc ------------------------------------------------------
+
+/// `docs/design/cli-relish.md` describes what `relish` does. Every inline
+/// `relish …` span outside its "Planned commands" section must name a real
+/// subcommand with real flags; a planned one there or elsewhere is labelled
+/// `*(planned)*`, and must still fail, so the label lapses when it lands.
+#[test]
+fn cli_design_doc_names_no_missing_commands() {
+    let file = "docs/design/cli-relish.md";
+    let text = read(file);
+    let planned_start = text
+        .find("\n### Planned commands")
+        .unwrap_or_else(|| panic!("{file} has no Planned commands section"));
+    let planned_end = text[planned_start + 1..]
+        .find("\n#")
+        .map_or(text.len(), |end| planned_start + 1 + end);
+    let planned_lines =
+        text[..planned_start].lines().count() + 1..=text[..planned_end].lines().count();
+
+    let mut cache = BTreeMap::new();
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for span in inline_spans(file, &text) {
+        let line: usize = span
+            .location
+            .rsplit(':')
+            .next()
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_default();
+        if planned_lines.contains(&line) {
+            continue;
+        }
+        checked += 1;
+        let result = check_inline_span(&span.text, &mut cache);
+        match (result, span.labelled_planned) {
+            (Ok(()), false) | (Err(_), true) => {}
+            (Err(error), false) => {
+                failures.push(format!("{}: `{}`: {error}", span.location, span.text))
+            }
+            (Ok(()), true) => failures.push(format!(
+                "{}: `{}` works now; remove its *(planned)*",
+                span.location, span.text
+            )),
+        }
+    }
+    assert!(checked > 50, "found only {checked} inline commands");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // --- The extractor itself ----------------------------------------------------
 
 fn shell(body: &str) -> Snippet {
