@@ -3933,7 +3933,10 @@ Matching on a tuple lets one `match` look at two values at once, and the `if`
 after the second pattern is a match guard: that arm only matches when the
 condition holds too. The zero-replica admission succeeds, which clears the
 refusal, so it can't push a replica off this node the next time the leader
-puts one here. Any other identical redeploy still rolls, as before.
+puts one here. Any other identical redeploy still rolls, as before. (In
+0.2.2 this check became `share_change_in_place`, which also takes a replica
+moving off or onto the node without rolling, and the exception lives on as
+"an unchanged share while a refusal stands": Chapter 7 has the new version.)
 
 The issue also said the leader logged `cannot place` on every pass while a
 refusal stood with nowhere to go. That was the 0.2.0 scheduler. In 0.2.1 the
