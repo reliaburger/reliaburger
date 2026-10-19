@@ -1119,6 +1119,24 @@ they'd fail the moment a new crate changed a single byte. The HMACs on gossip an
 and the API-token hash never moved: they use `ring`, whose `hmac::verify` already
 compares tags in constant time.
 
+`tokio-tungstenite`, the WebSocket client behind `relish logs -f` and the TUI's live log
+and event panes, went from 0.28 to 0.30 with nothing to fix. Its own source didn't change
+beyond a doc comment; it just follows `tungstenite`, whose two releases tightened the
+server's check on `Sec-WebSocket-Key` and let clients send header values that aren't
+visible ASCII. The question worth asking was the one reqwest raised: does a `wss://`
+connection still trust what it trusted before? With a cluster CA, `ws_connect` hands
+tokio-tungstenite our own rustls config, and two tests already prove it accepts the
+cluster's certificate and refuses an unrelated CA's. Without one, tokio-tungstenite builds
+its own config from the bundled `webpki-roots` (the `rustls-tls-webpki-roots` feature),
+using whichever crypto provider the process installed, and we install ring first. The new
+test `websocket_without_a_cluster_ca_refuses_a_private_certificate` pins that fallback: a
+server with a private certificate must fail verification, so a release that quietly
+stopped checking certificates would turn it red. A quiet switch to the OS store wouldn't,
+since a private CA isn't in that either, so for that we read the diff: the TLS code in
+0.30 is byte for byte the same as 0.28's. The bump also leaves two
+`tungstenite` versions in `Cargo.lock` for now. Our server side is axum's WebSocket
+support, which still uses 0.29, and the two meet only on the wire.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
