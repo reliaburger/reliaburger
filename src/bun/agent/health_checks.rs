@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// What [`BunAgent::publish_instance_health`] did with an instance's health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HealthPublication {
+    /// The service map already says it, or the instance isn't routable.
+    Current,
+    /// Journalled and installed in this turn.
+    Published,
+    /// A discovery journal write is in flight off the loop, so publishing
+    /// would wait for it. Nothing changed; the next probe publishes.
+    Deferred,
+}
+
 /// Wait for a replacement instance to become healthy, on the deploy worker
 /// (M5): first for the runtime to report `Running`, then — when the app
 /// declares a health check — for the HTTP probe itself to pass
@@ -195,13 +207,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await;
         }
         // Retry publication even when health state already changed on an earlier
-        // probe. A refused withdrawal must not advance the restart state machine.
-        if let Err(error) = self.publish_instance_health(&instance_id).await {
-            eprintln!("bun: {error}");
-            self.supervisor
-                .health_checker_mut()
-                .schedule_next(instance_id, now);
-            return;
+        // probe. A refused or deferred withdrawal must not advance the restart
+        // state machine.
+        match self.publish_instance_health(&instance_id).await {
+            Ok(HealthPublication::Current | HealthPublication::Published) => {}
+            Ok(HealthPublication::Deferred) => {
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                return;
+            }
+            Err(error) => {
+                eprintln!("bun: {error}");
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                return;
+            }
         }
 
         // A later probe can complete publication that the transition probe failed.
@@ -239,7 +261,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn publish_instance_health(
         &mut self,
         id: &InstanceId,
-    ) -> Result<(), BunError> {
+    ) -> Result<HealthPublication, BunError> {
         let instance =
             self.supervisor
                 .get_instance(id)
@@ -247,7 +269,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     instance_id: id.clone(),
                 })?;
         if instance.host_port.is_none() {
-            return Ok(());
+            return Ok(HealthPublication::Current);
         }
         let service =
             crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
@@ -265,7 +287,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .is_some_and(|backend| backend.healthy == healthy);
         if published {
-            return Ok(());
+            return Ok(HealthPublication::Current);
+        }
+        // Journalling waits for a write a consumer step left in flight, which
+        // held a turn for 5 s on a busy disk (#1100). The next probe retries.
+        if self.discovery_write_in_flight() {
+            return Ok(HealthPublication::Deferred);
         }
         let mut candidate = self.service_map.clone();
         candidate
@@ -277,7 +304,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.publish_backend_snapshot(&service, &candidate).await?;
         self.service_map = candidate;
         self.rebuild_routing_table().await;
-        Ok(())
+        Ok(HealthPublication::Published)
     }
 
     /// A running app's process has exited, which a health check catches

@@ -157,19 +157,25 @@ pub(super) const UPGRADE_FORWARD_TIMEOUT: std::time::Duration = std::time::Durat
 
 /// The leader's API base URL: the address it advertises over gossip, else
 /// one derived from its Raft address ([`leader_api_url`]).
+///
+/// Like [`leader_api_url`], it never names this node and never forwards a
+/// request another node already forwarded (`inbound`; a request this node
+/// starts itself passes an empty map).
 pub(super) async fn leader_base_url(
     state: &ApiState,
     council: &crate::council::CouncilNode,
     directory: Option<&LeaderDirectory>,
-) -> Option<String> {
+    inbound: &HeaderMap,
+) -> Result<String, NoLeaderRoute> {
+    leader_to_forward_to(council, inbound).await?;
     let advertised = directory.and_then(|LeaderDirectory(directory)| {
         let metrics = council.metrics();
         let metrics = metrics.borrow();
         crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
     });
     match advertised {
-        Some(address) => Some(state.cluster_http.url(&address.to_string(), "")),
-        None => leader_api_url(state, council).await,
+        Some(address) => Ok(state.cluster_http.url(&address.to_string(), "")),
+        None => leader_api_url(state, council, inbound).await,
     }
 }
 
@@ -177,10 +183,12 @@ pub(super) async fn leader_base_url(
 ///
 /// Only the leader can record a run, and openraft doesn't forward client
 /// writes, so `relish upgrade start` against a follower used to fail with
-/// "not leader". `None` means handle the call here: this node leads (and if
-/// it has just lost that, its Raft write says so). The caller's own
-/// credential travels with the request, so the leader repeats every
-/// authorisation check; the follower never adds its service identity.
+/// "not leader". `None` means handle the call here: this node leads and
+/// has confirmed it with a quorum. A node Raft names as the leader that
+/// can't confirm it answers 503 rather than forwarding the call to itself
+/// (#1069). The caller's own credential travels with the request, so the
+/// leader repeats every authorisation check; the follower never adds its
+/// service identity.
 pub(super) async fn forward_upgrade_to_leader(
     state: &ApiState,
     council: &crate::council::CouncilNode,
@@ -189,13 +197,16 @@ pub(super) async fn forward_upgrade_to_leader(
     headers: &HeaderMap,
     body: &str,
 ) -> Option<Response> {
-    let leads = {
+    let named_leader = {
         let metrics = council.metrics();
         let metrics = metrics.borrow();
         metrics.current_leader == Some(metrics.id)
     };
-    if leads {
-        return None;
+    if named_leader {
+        if confirmed_lease_leader(council).await {
+            return None;
+        }
+        return Some(NoLeaderRoute::ThisNode.into_response());
     }
     let unavailable = |error: &str| {
         (
@@ -209,16 +220,19 @@ pub(super) async fn forward_upgrade_to_leader(
             "this node was named the leader but isn't; retry once the election settles",
         ));
     }
-    let Some(leader_url) = leader_base_url(state, council, directory).await else {
-        return Some(unavailable("no cluster leader known yet; retry shortly"));
+    let leader_url = match leader_base_url(state, council, directory, headers).await {
+        Ok(url) => url,
+        Err(refusal) => return Some(refusal.into_response()),
     };
-    let request = state
-        .cluster_http
-        .client()
-        .post(format!("{leader_url}{path}"))
-        .header(UPGRADE_FORWARDED_HEADER, "1")
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(body.to_string());
+    let request = mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .post(format!("{leader_url}{path}"))
+            .header(UPGRADE_FORWARDED_HEADER, "1")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string()),
+    );
     let request = copy_forwarded_auth(request, headers);
     let exchange = async {
         let response = request.send().await?;

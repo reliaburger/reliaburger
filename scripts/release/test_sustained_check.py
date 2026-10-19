@@ -607,6 +607,34 @@ class Recovery(Evidence):
         _, verdict = self.evaluate(self.snapshot(ts=NOW + 700, **{"wtf_json": report}))
         self.assertEqual(self.failures(verdict), [])
 
+    @staticmethod
+    def alerts(*rules):
+        return {"critical": [], "ok": [{"id": "replicas", "description": "replicas"}],
+                "warnings": [{"id": "alerts-firing", "title": f"{rule}: {rule} fired", "affected_resource": "cluster"}
+                             for rule in rules]}
+
+    def test_a_guest_cpu_alert_is_recorded_not_gated(self):
+        # The soak drives 2-vCPU guests at the job target rate on purpose,
+        # so Mayo's cpu_throttle alert says the load is the load (#1112).
+        report = self.alerts("cpu_throttle")
+        self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": report}))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 601, **{"wtf_json": report}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertIn("wtf-alert", [item["check"] for item in verdict["findings"] if item["severity"] == "info"])
+
+    def test_a_memory_alert_still_fails_after_ten_minutes(self):
+        report = self.alerts("memory_high")
+        self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": report}))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 601, **{"wtf_json": report}))
+        self.assertEqual(self.failures(verdict), ["wtf-warning"])
+
+    def test_each_cluster_alert_keeps_its_own_clock(self):
+        # Every cluster alert used to share one key, so an alert that had
+        # just started inherited the age of one that had been firing.
+        self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": self.alerts("cpu_throttle")}))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 601, **{"wtf_json": self.alerts("cpu_throttle", "memory_high")}))
+        self.assertEqual(self.failures(verdict), [])
+
     def test_a_repeated_failure_bundles_once_per_half_hour(self):
         _, first = self.evaluate(self.snapshot(ts=NOW, kind="light", **{"http_txt": "502 0.10\n"}))
         code, again = self.evaluate(self.snapshot(ts=NOW + 30, kind="light", **{"http_txt": "502 0.10\n"}))
@@ -1009,3 +1037,39 @@ Oct 16 10:02:00 rb-a-1 kernel: eth0: carrier ok
         bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
         self.assertIn('memory_report "$node" cursor > "$directory/memory-${vm[node]}.txt"', heavy)
         self.assertIn('memory_report "$node" recent > "$directory/memory-${vm[node]}.txt"', bundle)
+
+
+class TestFailures(unittest.TestCase):
+    """#1068: the chaos scenario recorded the JSON report's last three lines,
+    `} ] }`, which hid why `relish test` failed."""
+
+    REASON = "apply failed: API error (status 400): timeout (2s) must not be longer than interval (1s)"
+
+    def report(self):
+        return json.dumps({"schema_version": 1, "results": [
+            {"name": "dead_worker_node_has_workloads_rescheduled", "outcome": {"status": "fail", "reason": self.REASON}},
+            {"name": "passing_case", "outcome": {"status": "pass"}},
+        ]}, indent=2)
+
+    def test_a_report_names_each_failing_case_and_its_reason(self):
+        self.assertEqual(checker.test_failure_reasons(self.report()),
+                         f"dead_worker_node_has_workloads_rescheduled: fail: {self.REASON}")
+
+    def test_without_a_report_it_keeps_the_tail_of_stderr(self):
+        self.assertEqual(checker.test_failure_reasons("", "connecting\nerror: cluster unreachable\n"),
+                         "connecting error: cluster unreachable")
+
+    def test_the_subcommand_reads_the_report_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "chaos-3.log"
+            report.write_text(self.report())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(checker.main(["test-failures", str(report), str(report) + ".err"]), 0)
+        self.assertIn(self.REASON, out.getvalue())
+
+    def test_the_chaos_scenario_records_the_reason_not_the_tail(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
+        self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
+        self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)
