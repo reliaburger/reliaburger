@@ -3,6 +3,12 @@
 
 use super::*;
 
+/// How long the leader may take to prove it leads before a registry proposal
+/// or query answers 503. One heartbeat round its followers answer late must
+/// not refuse a settled leader's registry read, as it did the lease routes
+/// (#1009); 3 s matches them and leaves room inside the 10 s deadline.
+const REGISTRY_LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Include request-body extraction in the control-operation deadline.
 pub(super) async fn registry_proposal_deadline(
     request: axum::extract::Request,
@@ -47,7 +53,7 @@ pub(super) async fn registry_proposal_handler(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let security = council
-            .security_state_linearizable()
+            .security_state_confirmed(REGISTRY_LEADER_CONFIRMATION)
             .await
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
@@ -94,7 +100,10 @@ pub(super) async fn registry_query_handler(
     let Some(council) = &state.council else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let security = match council.security_state_linearizable().await {
+    let security = match council
+        .security_state_confirmed(REGISTRY_LEADER_CONFIRMATION)
+        .await
+    {
         Ok(security) => security,
         Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
     };
