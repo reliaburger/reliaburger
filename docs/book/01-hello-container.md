@@ -119,7 +119,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-toml = "0.8"
+toml = "1"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

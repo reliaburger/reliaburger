@@ -1151,6 +1151,29 @@ release's headline is a SIMD engine, but we still name `general_purpose::STANDAR
 already brought 0.23 into the lockfile; 0.22 stays there for now, because age, axum,
 k8s-openapi and oci-client still use it.
 
+`toml` 0.8 to 1.1 is the opposite case: a new parser and a new writer under an API that
+barely moved. Two call sites noticed. `relish fmt` hands `toml_edit` a table position,
+which is now an `Option<isize>` instead of a `usize`, and one test called
+`.parse::<toml::Value>()` on a whole file. Since 0.9, `Value`'s `FromStr` reads a single
+value, like `3` or `"nginx"`, so a document has to go through `toml::from_str`. That test
+would still have compiled. It would have failed at run time, which is the worse kind of
+break.
+
+TOML is in every config file a user writes, so "it compiles" wasn't the bar. We parsed every
+`.toml` file in the repository and every TOML block in the docs, 408 of them, with both
+versions and compared the trees, then ran the old and new `relish fmt` and `relish export`
+over all of them. The parses matched, and so did every formatted file. Only the error
+messages moved. 0.9 stopped handing keys to serde in the order the file wrote them, unless
+you switch on the `preserve_order` feature. A file with two mistakes in it reported the one
+that sorts first, `colour` on line 4 before `replcias` on line 3, and an error that skips
+the first mistake you made reads like a bug. So we turned the feature on, and
+`parse_config_reports_the_first_mistake_in_the_file` pins it. The feature also makes
+`toml::Table` remember insertion order instead of sorting its keys, which changes one output:
+`relish setup` now writes `[node]` above `[cluster]`, in the order it asks the questions.
+Nothing stores TOML durably (the Raft log and the job store hold JSON), so no cluster
+format changed. And `toml_edit` moved to 0.25 with it, the release that shares `toml` 1's
+parser, so `Cargo.lock` holds one `toml_edit` instead of two.
+
 `rand` wasn't on the original list at all; it turned up when we reread `Cargo.toml`. Going
 from 0.8 to 0.10 crossed two releases of renames: `thread_rng()` became `rng()`, `gen` and
 `gen_range` became `random` and `random_range`, the `Rng` trait became `RngExt`,
