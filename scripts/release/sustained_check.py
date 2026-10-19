@@ -56,6 +56,10 @@ INGRESS_CERT_MARGIN = 300
 RETRYING_LIMIT = 600
 WTF_CRITICAL_LIMIT = 300
 WTF_WARNING_LIMIT = 600
+# Mayo alerts the soak raises by design: it drives 2-vCPU guests at the job
+# target rate, so guest CPU above 90% is the load, not a fault (#1112). They
+# are recorded, not gated. `memory_high` stays gated: it is a leak signal.
+UNGATED_ALERTS = {"cpu_throttle"}
 NO_LEADER_LIMIT = 30
 RSS_WARMUP = 3600
 RSS_GROWTH = 1.25
@@ -502,11 +506,19 @@ def wtf_findings(state, report, now, fault_window):
                                      ("warning", report.get("warnings", []), WTF_WARNING_LIMIT)):
         for entry in entries:
             key = f"{severity}|{entry['id']}|{entry.get('affected_resource', '')}"
+            # Every alert of one resource shares an id, so the rule names it.
+            rule = entry.get("title", "").split(":")[0] if entry["id"] == "alerts-firing" else None
+            if rule:
+                key += "|" + rule
             current.add(key)
             first = max(seen.setdefault(key, now), settled)
             if fault_window or now - first <= limit or key in reported:
                 continue
             reported.append(key)
+            if rule in UNGATED_ALERTS:
+                findings.append(finding("wtf-alert", "info", f"{rule} for {now - first} s (recorded, not gated)",
+                                        entry.get("affected_resource")))
+                continue
             findings.append(finding("wtf-" + severity, "fail",
                                     f"{entry['id']} for {now - first} s: {entry.get('title', '')}",
                                     entry.get("affected_resource")))
