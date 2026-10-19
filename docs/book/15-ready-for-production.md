@@ -1241,6 +1241,25 @@ answer: the home directory is `$HOME`, the data and cache directories are
 `~/.cache` on Linux, the XDG overrides count on Linux only, and relish state and node data
 both land in `~/.reliaburger`. They passed on 6 before the version moved.
 
+`criterion` 0.5 to 0.8 is a dev-dependency, so no node ever runs it, and our benchmark code
+built unchanged. The risk sat somewhere else: the task-array gate doesn't read Criterion's
+console output, it reads the files Criterion leaves behind. `bench_baseline.py` walks
+`target/criterion` for `new/estimates.json`, names each benchmark by its directory, and takes
+`mean.point_estimate`. The re-measure hands Criterion an anchored regular expression as its
+filter. Any of those could have moved in three major versions, and the gate would then have
+compared nothing, or re-measured nothing, without failing. So the PR checked each one against
+both versions' source, then ran the suite under 0.5, saved a baseline from it, ran it again
+under 0.8 and had `bench_baseline.py compare` read the new run against the old baseline.
+Every benchmark found its baseline under the same name, so `main`'s saved baseline carries
+over and no run starts from scratch. The 0.8 run's estimates and the 0.5 baseline are now a
+fixture, so `make test-ci-scripts` fails if a later Criterion moves them. A forced re-measure
+with a tighter limit ran exactly the two benchmarks named in its anchored filter, and not
+their `executor/process_true_256` siblings. (The ratios themselves said more about the laptop
+than about Criterion: the 0.5 run shared it with other release builds, and the whole 0.8 run
+came out at 0.42 of it. That's the runner factor doing its job.) What
+did change is inside the measurement: before each sample, 0.8 moves the stack by a different
+number of bytes, so that one lucky memory alignment can't flatter a whole run.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
@@ -7098,3 +7117,21 @@ warm-up helper. The provisioning tests put stub `apt-get`, `systemctl`,
 ahead of the provision script (`apt-get() { echo "$*" >> "$APT_LOG"; }`), and a
 function wins over anything on `PATH`, so nothing new is ever launched. Fixtures
 whose caller can only take one executable path still use `install_script`.
+
+`bun` itself waits in the same queue, and not only once per build. The process
+owner tests start `bun __process-owner` and give it 15 seconds to record that
+its workload is running. On a Mac at load average 300 to 440, where sibling
+agents were linking binaries of their own, the test that checks the owner
+reaps orphaned grandchildren failed 3 runs in 46 with "owner did not reach
+running" ([#1134](https://github.com/reliaburger/reliaburger/issues/1134)). It
+looked like the reaping loop had stalled, so we timed every step. The owner
+went from its own `main` to a settled record in under a second. All the time
+was before `main`: 6 to 13 seconds between `spawn` returning and `bun`'s first
+line of code, with the process asleep on zero CPU while `syspolicyd` and
+XProtect were busy. A second launch of the same file from the same test took
+33 ms. Run directly from a shell, the test passed in under 3 seconds. Under
+nextest, every new test process paid again, so `make test`'s warm-up can't
+cover it. The reaping wasn't involved at all: on macOS there is no subreaper,
+`launchd` adopts the orphans, and the test saw no zombies in any run. So
+`Owner::start` now calls `first_launch` on `bun --version` before it starts
+the owner, and the 15 seconds go back to timing the owner.

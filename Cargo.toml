@@ -104,7 +104,7 @@ kubernetes = ["dep:k8s-openapi"]
 ebpf = ["aya", "aya-log"]
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 http-body-util = "0.1"
 syn = { version = "2", features = ["full", "visit"] }
 # Line numbers for syn's spans, so the agent-loop rule can point at a line.
