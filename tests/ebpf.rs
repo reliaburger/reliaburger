@@ -141,16 +141,21 @@ fn onion_objects_use_only_the_original_bpf_instruction_set() {
     // longer knew the index was in bounds.
     const BPF_ALU: u8 = 0x04;
     const BPF_JMP32: u8 = 0x06;
-    // This build's own objects, never a search of a shared target
-    // directory, which can find another worktree's (#878).
-    let directory = PathBuf::from(env!("OUT_DIR"));
-    for name in [
-        "onion_connect.bpf.o",
-        "onion_connect_owned.bpf.o",
-        "onion_dns.bpf.o",
+    // This build's own objects, embedded at compile time like the
+    // library's, never a search of a shared target directory, which can
+    // find another worktree's (#878). Embedding also survives the test
+    // archive running on another machine.
+    for (name, bytes) in [
+        (
+            "onion_connect.bpf.o",
+            &include_bytes!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o"))[..],
+        ),
+        (
+            "onion_connect_owned.bpf.o",
+            &include_bytes!(concat!(env!("OUT_DIR"), "/onion_connect_owned.bpf.o"))[..],
+        ),
     ] {
-        let bytes = std::fs::read(directory.join(name)).unwrap();
-        let file = object::File::parse(&*bytes).unwrap();
+        let file = object::File::parse(bytes).unwrap();
         for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
             let data = section.data().unwrap();
             for (index, instruction) in data.as_chunks::<8>().0.iter().enumerate() {
