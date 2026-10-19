@@ -1682,6 +1682,12 @@ The lesson is an old one: two copies of "do the thing, then record it" drift
 apart, and the copy that runs least is the one that's wrong. The all-off
 special runs once per soak.
 
+### An alert the load raises on purpose
+
+The checker fails a tier when a `relish wtf` warning outlasts ten minutes past the last settle. Candidate 6's 8 h jobs final failed that way on two warnings at once. One was a real bug (#1110, in Chapter 7). The other was Mayo's `cpu_throttle` alert, which fires once a guest's CPU stays above 90% for five minutes. The jobs soak drives 2-vCPU guests at the job target rate on purpose, so the alert fired nearly all run long, in passing runs too. It failed this one only because fourteen minutes went by without a settle to reset the clock (#1112).
+
+The alert said "the load is the load", which tells us nothing about the candidate, and whether it failed a tier came down to timing. So the checker now records `cpu_throttle` as an `info` finding instead of gating on it. `memory_high` stays gated, because a Bun that grows past 70% of its guest is the leak the soak exists to catch. The same fix caught a second bug: every cluster-wide alert shared one key, `warning|alerts-firing|cluster`, so an alert that had just started firing inherited the age of an older one. The key now ends in the rule's name, taken from the alert's title, so each alert keeps its own clock.
+
 ### Status from any node
 
 A one-replica app can run on the third VM while your CLI connects to the first.
