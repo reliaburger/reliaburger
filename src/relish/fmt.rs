@@ -37,7 +37,7 @@ pub fn format_toml(input: &str) -> Result<String, RelishError> {
         header_written: false,
     };
     // The root's own keys print before any header.
-    root.set_position(layout.position);
+    root.set_position(Some(layout.position));
     layout.position += 1;
     normalise_values(root);
     layout.header_written = root.iter().any(|(_, item)| item.is_value());
@@ -69,7 +69,7 @@ fn section_rank(key: &str) -> usize {
 /// whitespace around their headers.
 struct Layout {
     /// The next document position; `toml_edit` prints tables in this order.
-    position: usize,
+    position: isize,
     /// Whether anything has printed yet, so the first header gets no blank
     /// line above it.
     header_written: bool,
@@ -95,7 +95,7 @@ impl Layout {
             return;
         }
         table.sort_values();
-        table.set_position(self.position);
+        table.set_position(Some(self.position));
         self.position += 1;
         normalise_values(table);
         let has_values = table.iter().any(|(_, item)| item.is_value());

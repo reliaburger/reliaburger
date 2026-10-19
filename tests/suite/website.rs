@@ -316,7 +316,10 @@ const TOUR_JOBS_MAX: i64 = 16;
 
 /// Each cohort's `count` in the tour's job manifest, by cohort name.
 fn burger_job_counts() -> std::collections::BTreeMap<String, i64> {
-    let manifest: toml::Value = read(&format!("{BURGER_SOURCE}/jobs.toml")).parse().unwrap();
+    // `toml::from_str`, not `.parse::<toml::Value>()`: since toml 0.9,
+    // `Value`'s `FromStr` reads a single value, not a whole document.
+    let manifest: toml::Table =
+        toml::from_str(&read(&format!("{BURGER_SOURCE}/jobs.toml"))).unwrap();
     manifest["cohort"]
         .as_array()
         .unwrap()

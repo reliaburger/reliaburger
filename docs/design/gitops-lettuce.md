@@ -1064,7 +1064,7 @@ All dependencies are Rust crates, compiled into the Bun binary. No runtime depen
 
 | Crate | Version (min) | Purpose | Notes |
 |-------|--------------|---------|-------|
-| `toml` | 0.8 | TOML parsing and serialisation. | Already used throughout Reliaburger for config parsing. |
+| `toml` | 1 | TOML parsing and serialisation. | Already used throughout Reliaburger for config parsing. |
 | `sha2` | 0.10 | SHA-256 hash computation. Used for webhook HMAC and script content hashing. | Already used elsewhere in Bun. |
 | `reqwest` | 0.13 | HTTP client (not for webhook receiving, which uses the existing Bun API server). Reserved for future use: outbound notifications on sync events. | Optional dependency; may not be needed if notifications go through the existing alerting subsystem. |
 | `serde` / `serde_json` | 1.0 | Serialisation for webhook payload parsing and `SyncState` Raft replication. | Already a core dependency. |

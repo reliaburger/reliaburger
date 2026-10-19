@@ -1961,7 +1961,8 @@ Relish is implemented in Rust. The following crates are used:
 | `yaml_serde` | 0.10.x | YAML serialisation for `--output yaml` mode and Kubernetes import (the maintained successor to `serde_yaml`) |
 | `serde` | 1.x | Serialisation/deserialisation for config, API responses, output |
 | `serde_json` | 1.x | JSON formatting for `--output json` |
-| `toml` | 0.8.x | TOML parsing for configuration files and `compile`/`lint`/`fmt` |
+| `toml` | 1.x | TOML parsing for configuration files and `compile`/`lint`/`fmt` |
+| `toml_edit` | 0.25.x | Comment-preserving edits for `fmt` |
 | `pulldown-cmark` | 0.13.x | Markdown rendering for `relish manual` |
 | `rust-embed` | 8.x | Embedding the manual and bundled source into the binary |
 | `anyhow` | 1.x | Error handling with context |
