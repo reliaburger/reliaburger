@@ -6976,3 +6976,21 @@ warm-up helper. The provisioning tests put stub `apt-get`, `systemctl`,
 ahead of the provision script (`apt-get() { echo "$*" >> "$APT_LOG"; }`), and a
 function wins over anything on `PATH`, so nothing new is ever launched. Fixtures
 whose caller can only take one executable path still use `install_script`.
+
+`bun` itself waits in the same queue, and not only once per build. The process
+owner tests start `bun __process-owner` and give it 15 seconds to record that
+its workload is running. On a Mac at load average 300 to 440, where sibling
+agents were linking binaries of their own, the test that checks the owner
+reaps orphaned grandchildren failed 3 runs in 46 with "owner did not reach
+running" ([#1134](https://github.com/reliaburger/reliaburger/issues/1134)). It
+looked like the reaping loop had stalled, so we timed every step. The owner
+went from its own `main` to a settled record in under a second. All the time
+was before `main`: 6 to 13 seconds between `spawn` returning and `bun`'s first
+line of code, with the process asleep on zero CPU while `syspolicyd` and
+XProtect were busy. A second launch of the same file from the same test took
+33 ms. Run directly from a shell, the test passed in under 3 seconds. Under
+nextest, every new test process paid again, so `make test`'s warm-up can't
+cover it. The reaping wasn't involved at all: on macOS there is no subreaper,
+`launchd` adopts the orphans, and the test saw no zombies in any run. So
+`Owner::start` now calls `first_launch` on `bun --version` before it starts
+the owner, and the 15 seconds go back to timing the owner.
