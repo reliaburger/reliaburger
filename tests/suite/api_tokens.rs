@@ -1207,7 +1207,7 @@ async fn common_run_cancellation_and_output_obey_current_permissions() {
             })
             .await
             .unwrap();
-        let before = council.desired_state().await.task_arrays;
+        let before = council.desired_state().await;
         let mut request = Request::builder()
             .method(method)
             .uri(path)
@@ -1216,6 +1216,12 @@ async fn common_run_cancellation_and_output_obey_current_permissions() {
         request.extensions_mut().insert(owner());
         let response = router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
-        assert_eq!(council.desired_state().await.task_arrays, before);
+        // The router's leader loop may record a new cron minute meanwhile;
+        // only a write the refused request made counts.
+        assert_eq!(
+            changed_desired_fields(&before, &council.desired_state().await),
+            Vec::<String>::new(),
+            "refused {method} {path} changed desired state"
+        );
     }
 }
