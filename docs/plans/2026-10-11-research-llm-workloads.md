@@ -904,14 +904,14 @@ There are four tiers:
    a node-hour (B200 at $53.52 for recordings), Ubuntu VMs with sudo and an
    API to launch from a workflow. Eight-GPU nodes are often sold out, so the
    workflow polls for capacity. Runners-up: [Nebius](https://nebius.com/prices)
-   at $30.80 (H100) or $36.00 (H200), which also covers tier 4 with one
+   at $36.00 (H100) or $43.20 (H200), which also covers tier 4 with one
    account, and [Hyperstack](https://www.hyperstack.cloud/gpu-pricing) at
    $25.60, the cheapest list price.
 4. **Two or three eight-GPU nodes with InfiniBand, twice in total.** For
    groups, RDMA and hot spares in 0.8.0, and fair share across nodes in
    0.10.0: [Nebius](https://docs.nebius.com/compute/clusters/gpu), the only
    provider we verified with hourly, self-serve InfiniBand between root VMs
-   and no minimum size or term, at about $92 an hour for three H100 nodes.
+   and no minimum size or term, at about $108 an hour for three H100 nodes.
    The runner-up is [Crusoe](https://docs.cloud.crusoe.ai/networking/infiniband/managing-infiniband-networks)
    at a similar price. AWS Capacity Blocks have a
    [24-hour minimum, paid up front](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/capacity-blocks-purchase.html),
@@ -940,17 +940,21 @@ times as long as the validation itself:
 |---|---|---|---|---|
 | 0.6.0 GPUs | $140 | 21 h, $670 | – | $810 |
 | 0.7.0 Models | $100 | 24 h, $770 | – | $870 |
-| 0.8.0 Groups | $100 | 10 h, $320 | 2 nodes × 8 h and 3 nodes × 5 h, $950 | $1,370 |
+| 0.8.0 Groups | $100 | 10 h, $320 | 2 nodes × 8 h and 3 nodes × 5 h, $1,120 | $1,540 |
 | 0.9.0 Pipelines | $100 | 10 h, $320 | – | $420 |
-| 0.10.0 Fair share | $100 | 12 h, $385 | 2 nodes × 4 h, $250 | $735 |
-| **All five** | | | | **about $4,200** |
+| 0.10.0 Fair share | $100 | 12 h, $385 | 2 nodes × 4 h, $290 | $775 |
+| **All five** | | | | **about $4,400** |
 
 With 25% contingency for setup, idle debugging time, storage and failed
-launches, plan on **about $5,250**, roughly $1,050 per release, peaking near
-$1,700 for 0.8.0. A **monthly cap of $1,500**, with alerts at 50%, 80% and
+launches, plan on **about $5,500**, roughly $1,100 per release, peaking near
+$1,900 for 0.8.0. That's above the $5,250 decided on 11 October, which used
+Nebius's prices from before 1 October. A **monthly cap of $1,500**, with alerts at 50%, 80% and
 100%, fits every month except the one with the 0.8.0 multi-node sessions,
 which needs a one-off raise to $2,000. These are estimates from list prices
-on 11 October 2026; GPU prices have been falling.
+on 19 October 2026. Prices move both ways: Nebius raised H100 and H200 prices
+by up to 21% on 1 October
+([Spheron](https://www.spheron.network/blog/nebius-gpu-price-hike-2026-h100-to-b300-rates-rise-up-to-21/)),
+so check them again before booking.
 
 **Cost controls**, all scripted rather than remembered:
 
