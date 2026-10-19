@@ -3474,6 +3474,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Without a cluster CA, `wss://` falls back to tokio-tungstenite's
+    /// bundled public roots (`rustls-tls-webpki-roots`). A dependency bump
+    /// that stopped verifying certificates would let this private-CA server
+    /// through.
+    #[tokio::test]
+    async fn websocket_without_a_cluster_ca_refuses_a_private_certificate() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("websocket-no-ca", b"ikm").unwrap();
+        let identity = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&identity, shutdown.clone()).await;
+        let client = BunClient::build(&format!("https://{address}"), Some("rbrg_ws"), None);
+        let result = client.ws_connect("/ws").await;
+        shutdown.cancel();
+        let error = format!("{:?}", result.err());
+        assert!(
+            error.contains("certificate"),
+            "expected a certificate verification failure, got {error}"
+        );
+    }
+
     /// The legitimate mTLS path must keep working with built-in roots disabled:
     /// a client trusting the cluster CA reaches the agent over HTTPS even though
     /// the server certificate's name (`node-01`) doesn't match `127.0.0.1`.
