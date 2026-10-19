@@ -16,44 +16,41 @@ Blue-green eliminates the mixed-version window. The approach: start an entirely 
 
 Rolling deploys are sequential. Each step is: start new, health check, swap routing, drain old, stop old. One at a time. Safe, but slow, and both versions serve traffic during the transition.
 
-Blue-green deploys are batched. All new instances start in parallel. All get health-checked. If every green instance passes, routing swaps atomically. If any green instance fails, the entire green fleet gets torn down and blue keeps serving as if nothing happened.
+Blue-green deploys bring the whole new fleet up first. Every green instance starts and passes its health check while blue keeps serving, and nothing is published to routing yet: green comes up dark. Only when every green instance is healthy does the cut-over happen. If any green instance fails, the green fleet gets torn down and blue keeps serving as if nothing happened.
+
+`blue_green_redeploy` in `src/bun/agent/deploy_worker.rs` does it in three moves. Stripped of its error handling:
 
 ```rust
-pub fn execute_blue_green<D: DeployDriver>(
-    state: &mut DeployState,
-    driver: &D,
-) -> Result<DeployResult, DeployError> {
-    state.transition(DeployEvent::GreenStarting)?;
+// Start and health check the entire green fleet before touching blue.
+for &ordinal in &ordinals {
+    // create, start and probe one green instance; on failure, mark it
+    // and stop starting more
+}
 
-    // Start ALL green instances
-    for step in &mut state.steps {
-        let (id, _) = driver.start_instance(...)?;
-        step.new_instance = Some(id);
-    }
+// Nothing of blue has retired yet, so an abort only tears green down.
+if new_failed {
+    self.abort_rollout(aborted(&green), events).await;
+    return std::ops::ControlFlow::Break(());
+}
 
-    // Health check ALL green instances
-    state.transition(DeployEvent::GreenAllStarted)?;
-    for step in &state.steps {
-        driver.await_healthy(step.new_instance.as_deref().unwrap(), timeout)?;
-    }
-
-    // Atomic routing swap
-    state.transition(DeployEvent::GreenAllHealthy)?;
-    for step in &state.steps {
-        driver.add_to_routing(app, step.new_instance...)?;
-    }
-    for step in &state.steps {
-        driver.remove_from_routing(app, step.old_instance...);
-    }
-
-    // Drain and stop all blue instances
-    // ...
+// The whole green fleet is healthy. Publish every green backend so
+// routing picks them up while blue still serves...
+for new_id in new_ids {
+    self.ops.publish_new_backend(/* ... */).await;
+}
+// ...then drain and stop blue.
+for old_id in &existing {
+    self.retire_old_instance(old_id, deploy_config.drain_timeout).await;
 }
 ```
 
-The state machine got three new phases: `StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching`. Each phase has a failure path. If a green instance fails health, the state machine transitions to `Reverting` (with auto-rollback) or `Halted` (without). The abort logic stops all green instances that were started and returns.
+`std::ops::ControlFlow` is a standard-library enum with two variants, `Continue` and `Break`, for a function whose caller needs to know whether to carry on. It reads better than a `bool` whose meaning you'd have to look up.
 
-The key insight: the abort function doesn't need to "restore" anything. Blue was never touched. The routing table still points to blue. Aborting green is pure cleanup.
+The key insight: the abort doesn't need to "restore" anything. Blue was never touched. The routing table still points to blue. Aborting green is pure cleanup, which is why the closure that builds the `AbortedRollout` says nothing has retired.
+
+There's one exception to "green beside blue". A managed volume must never have two writers, so a volume app rolls stop-first even under `strategy = "blue-green"`: `blue_green_volume_app_redeploys_stop_first` pins it.
+
+The first version lived in a separate model, `execute_blue_green`, driven by Chapter 7's synchronous driver trait, and the same story applies: the agent couldn't use it, so it grew its own path, and we deleted the model in August 2026.
 
 ### Choosing between strategies
 
@@ -460,7 +457,7 @@ The idea: a module inside Bun watches a git repository. When a commit changes a 
 
 ### Architecture
 
-Lettuce runs on a single council member elected as the **GitOps coordinator**. Not the Raft leader -- a separate election that distributes load. If the coordinator dies, another council member takes over within seconds, inheriting the last sync state from Raft.
+Lettuce runs on the Raft leader, which is also the **GitOps coordinator**. Only the leader can write desired state, so only the leader can apply a sync. If it dies, Raft elects a new leader within a couple of seconds, and that node's sync loop takes over, picking up the last sync state from Raft.
 
 The sync loop:
 
@@ -477,31 +474,29 @@ A GitOps engine that treats the repository as the whole truth deletes everything
 
 ### Coordinator election
 
+The sync loop is leader-gated, so naming the coordinator is one line of logic. `coordinator_for_leader` in `src/lettuce/sync.rs` records the leader and says whether this is the first election or a handover:
+
 ```rust
-pub fn select_coordinator(
-    council_members: &[String],
-    leader_id: &str,
-    reason: CoordinatorElectionReason,
-) -> Option<CoordinatorElection> {
-    let non_leaders: Vec<_> = council_members.iter()
-        .filter(|id| id.as_str() != leader_id)
-        .collect();
-
-    let selected = if non_leaders.is_empty() {
-        leader_id.to_string()  // single-node: leader is coordinator
-    } else {
-        let mut sorted = non_leaders;
-        sorted.sort();
-        sorted[0].clone()  // deterministic: first non-leader
+pub fn coordinator_for_leader(
+    leader: &str,
+    previous: Option<&str>,
+    now_ms: u64,
+) -> CoordinatorElection {
+    let reason = match previous {
+        Some(prev) if prev != leader => CoordinatorElectionReason::Failover,
+        _ => CoordinatorElectionReason::Initial,
     };
-
-    Some(CoordinatorElection { node_id: selected, reason, ... })
+    CoordinatorElection {
+        node_id: leader.to_string(),
+        reason,
+        timestamp: now_ms,
+    }
 }
 ```
 
-Why prefer non-leaders? The Raft leader already handles write requests, log replication, and heartbeats. Adding the sync loop on top means the leader does more I/O during every sync cycle (git fetch, file read, Raft write). Putting it on another council member spreads the work across two nodes instead of concentrating it on one.
+`Some(prev) if prev != leader` is a *match guard*: the arm matches only when the pattern fits and the condition holds. Anything else (no previous coordinator, or the same leader again) is `Initial`. The reason is there for operators: the dashboard's GitOps page shows the coordinator, and a `Failover` says it moved because leadership did.
 
-Why deterministic? If two nodes simultaneously decide the coordinator needs replacing, they must agree on who the replacement is. Sorting alphabetically and picking the first non-leader means every node arrives at the same answer independently.
+What we tried first was cleverer. `select_coordinator` sorted the council and picked the first non-leader alphabetically, to take the sync loop's fetches off the busy leader. The trouble was that only the leader can write to Raft, so the loop stayed on the leader anyway, and the coordinator field named a node that never ran a sync. The code's own comment ended up calling it "fiction". We deleted the function and made the field tell the truth. Spreading load is a fine goal, but not for a role that does one fetch every 30 seconds, and never at the price of a status field that lies.
 
 ### Webhook validation
 
@@ -846,7 +841,7 @@ Can you see the pattern? Almost none of these were hard to fix. They existed bec
 
 ## Lessons learned
 
-**The mock driver refactor was worth it.** When we added blue-green deploys, the existing `MockDriver` broke. It tracked steps by counting `stop_instance` calls, which worked for rolling (one stop per step). In blue-green, all starts happen before any stops. The fix: separate counters for start and health check calls. A small change, but it highlighted why the mock should model *operation counts*, not *lifecycle phases*.
+**Test the order, not just the outcome.** Blue-green's whole promise is an order: every green instance healthy and published before any blue instance stops. A test that only checks the end state (green running, blue gone) passes for a rollout that stopped blue first and caused an outage on the way. `blue_green_publishes_green_before_stopping_blue` holds an in-flight request on a blue instance, so blue can't finish draining, and checks that green is already published while blue still serves.
 
 **Hysteresis is not optional.** The first autoscaler version scaled down as soon as the metric dropped below target. It oscillated wildly. CPU drops, scale down, CPU spikes, scale up, CPU drops, scale down. The hysteresis threshold (scale down only below target * 0.8) eliminated the oscillation. The cooldown (3 minutes between scale events) added stability. Both are required. Neither is clever -- they're standard control theory, applied.
 
@@ -854,7 +849,7 @@ Can you see the pattern? Almost none of these were hard to fix. They existed bec
 
 **WebSocket is 95% detection, 5% proxying.** We spent most of the time on header detection edge cases (case-insensitive matching, multi-value Connection headers, routes that don't opt in). The actual proxying -- connect to backend, forward upgrade, bidirectional copy -- is straightforward. The drain Close frame is 4 bytes of hand-built binary (built and tested, though not yet sent on the live drain path -- see above). No WebSocket library needed.
 
-**Coordinator election should be boring.** Our first design for Lettuce's coordinator election had scoring heuristics: CPU load, memory availability, network latency to the git remote. We replaced it with "first non-leader alphabetically." It's deterministic, requires no measurement, and produces the same result on every node without communication. The scoring approach might produce slightly better placement, but the added complexity wasn't worth it for a role that does one git fetch every 30 seconds.
+**Coordinator election should be boring.** Our first design for Lettuce's coordinator election had scoring heuristics: CPU load, memory availability, network latency to the remote. We replaced it with "first non-leader alphabetically", which was deterministic and needed no measurement. Then we noticed it named a node that couldn't apply a sync, because only the leader writes to Raft. The boring answer turned out to be the leader itself: no election of its own, and failover for free from Raft.
 
 **`skip_serializing_if` is not optional for config output.** The first version of `relish compile` and `relish import` produced TOML with dozens of empty sections: `[app.web.env]` with nothing in it, `command = []`, `config_file = []`, `[job]`, `[namespace]`, `[permission]`, `[build]`. Every `#[serde(default)]` field got serialised to its default value. The fix was adding `#[serde(skip_serializing_if = "Vec::is_empty")]` and friends to every collection and Option field on `AppSpec`, `JobSpec`, and `Config`. One attribute per field, mechanical work, but the output went from 30 lines of noise per app to just the fields that matter.
 
@@ -864,16 +859,16 @@ Can you see the pattern? Almost none of these were hard to fix. They existed bec
 
 ## Tests
 
-Six features, and nearly all of them turn out to be pure functions hiding inside an operational story. `compute_desired` is arithmetic. `is_websocket_upgrade` reads headers. `select_coordinator` sorts a list. The blue-green orchestrator runs against the same `MockDriver` from Chapter 7. So Phase 9 is, once again, mostly unit tests — 117 of them.
+Six features, and nearly all of them turn out to be pure functions hiding inside an operational story. `compute_desired` is arithmetic. `is_websocket_upgrade` reads headers. `coordinator_for_leader` compares two names. Blue-green runs the real deploy worker against the same `MockGrill` as Chapter 7. So Phase 9 is, once again, mostly unit tests.
 
 ### Unit tests by feature
 
-- **Blue-green** — the orchestrator against `MockDriver` (6), plus the new state-machine transitions (`StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching` and their failure paths, 7). The mock had to be refactored to count operations rather than lifecycle phases — see the lessons below.
-- **Autoscaling** — `compute_desired` with hysteresis and cooldown is the heart of it (12 tests covering scale-up, scale-down-only-below-threshold, clamping to min/max, oscillation), plus config parsing and the `AutoscaleTracker` baseline/override logic (6), and the metric mapping: `cpu`/`memory` to the collector series, utilisation of the request (or of one core), and refusing unsupported metrics or memory scaling without a request (7).
-- **WebSocket** — header detection edge cases (case-insensitive, multi-value `Connection`, opt-in routes) and the 4-byte close frame (8).
-- **Config tooling** — compilation and defaults merging (7), `fmt` idempotency and section ordering (4), structural `diff` (8).
-- **Lettuce** — types serde (4), git clone/fetch/list (4), webhook HMAC/replay/rate-limit (7), autoscaler-aware diff (7), sync-loop TOML parsing (3), coordinator election (5), signature verification (1).
-- **Kubernetes** — import (10) and export (6).
+- **Blue-green**: the deploy worker against `MockGrill` (`blue_green_redeploy_swaps_to_the_green_fleet`, `blue_green_publishes_green_before_stopping_blue`, `blue_green_rolls_back_when_green_fails_its_probe`, `blue_green_volume_app_redeploys_stop_first`), plus the new state-machine transitions (`StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching` and their failure paths).
+- **Autoscaling**: `compute_desired` with hysteresis and cooldown is the heart of it (scale-up, scale-down-only-below-threshold, clamping to min/max, oscillation), plus config parsing and the `AutoscaleTracker` baseline/override logic, and the metric mapping: `cpu`/`memory` to the collector series, utilisation of the request (or of one core), and refusing unsupported metrics or memory scaling without a request.
+- **WebSocket**: header detection edge cases (case-insensitive, multi-value `Connection`, opt-in routes) and the 4-byte close frame.
+- **Config tooling**: compilation and defaults merging, `fmt` idempotency and section ordering, structural `diff`.
+- **Lettuce**: types serde, clone/fetch/list, webhook HMAC/replay/rate-limit, autoscaler-aware diff, sync-loop TOML parsing, the coordinator, signature verification.
+- **Kubernetes**: import and export.
 
 ### Feature-gated: Kubernetes import/export
 
@@ -907,14 +902,12 @@ make kubernetes-demo    # import K8s YAML to TOML and export it back
 ### Running them
 
 ```sh
-cargo test --lib meat::blue_green meat::autoscaler   # deploy + scaling
+cargo test --lib blue_green meat::autoscaler         # deploy + scaling
 cargo test --lib lettuce                             # GitOps engine
 cargo test --lib wrapper                             # WebSocket proxying
 cargo test --no-default-features                      # prove it builds without K8s
 make toml-demo && make kubernetes-demo                # end-to-end round-trips
 ```
-
-Phase 9 adds 117 tests, bringing the total to 1380.
 
 ## Release integration: keep the laptop outside the VM
 
@@ -960,7 +953,7 @@ bundle and reuses it. A missing commit marker, mismatched CA or wrong master key
 is an error, never a reason to generate another identity for running VMs.
 
 Checkpoints use the durable writer described in Chapter 4. Async callers send
-writes to Tokio's blocking pool. An `Arc<File>` keeps the operation lock alive
+writes to Tokio's blocking pool. An `Arc<FileLock>` keeps the operation lock alive
 until a write finishes, even if its awaiting task is cancelled. The tests cover
 exclusive writers, stable identity and names, changed parameters, invalid
 ownership, private bootstrap files and damaged bundles.
@@ -978,7 +971,8 @@ often with "another operation is using cluster". A loop of 100 reopens with two
 threads spawning `true` in the background was refused 69 times.
 
 So the lock became a small type of its own whose `Drop` (the destructor we met
-in Chapter 1) unlocks before the file closes:
+in Chapter 1) unlocks before the file closes. This was the first version; it's
+a plain `FileLock` now, for reasons a few paragraphs on:
 
 ```rust
 struct OperationLock(std::fs::File);

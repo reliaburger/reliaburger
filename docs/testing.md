@@ -202,7 +202,12 @@ The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
 run through `make test-linux`, where the warmed digest-pinned mirror remains
 reachable. The shared-runc leader-loss case refuses to start without it: its
 cold executors read the image manifest dozens of times, which trips the public
-registry's anonymous rate limit (#786). Two of them start three in-process nodes (gossip, Raft, the API
+registry's anonymous rate limit (#786). Cases that must interrupt a real
+cold pull put `tests/support/slow_registry.rs` in front of that mirror: a
+loopback registry that forwards manifests at full speed and paces every blob
+body to 64 KiB a second, so the pinned workload image takes about half a
+minute to pull and a test can cancel it, or let a deadline expire, mid-layer
+(#740). Two of them start three in-process nodes (gossip, Raft, the API
 and the leader loop, as `bun --cluster` wires them) with real shared-runc or
 cgroup host executors, and stop the leader's control plane while it runs its
 own share of an array: no accepted outcome may be lost or counted twice, and
@@ -252,13 +257,41 @@ October, #936), so a benchmark over the limit gets one more chance: the step
 re-runs just those benchmarks (`--remeasure`, which appends an anchored
 Criterion filter naming them to `cargo bench --bench task_arrays --`), compares
 again, and fails a benchmark only when it's over the limit on both
-measurements. The median check isn't re-measured. The job summary shows each
-benchmark's ratio, its ratio against the rest and the runner factor (the
-median), plus both measurements of any benchmark it re-measured. The means of the 12 October runs are
-a fixture in
+measurements. The median check isn't re-measured.
+
+That didn't save `storage/ledger_and_index_64k` (#1038). Most of its time
+goes on more than 30 fsyncs, so it measures the runner's disk, and a slow disk
+can stay slow for the whole job: in the 0.2.1 merge queue for PR #992 it was
+3.20× the rest of its run and 2.93× on the re-measure. In the eight runs from
+12 to 18 October where it alone was over the limit, its ten samples ranged from about 15 ms to as much as 134 ms
+within one benchmark, where a healthy runner keeps them within a few per cent,
+and no other benchmark in those runs was above 1.11× the rest. So the compare
+step names it with `--report-only`: it's measured and shown, marked "report
+only", but never fails the run, is never re-measured, and isn't part of the
+median any other benchmark is measured against. Its twin,
+`storage/ledger_and_index_64k_tmpfs`, does the same writes in a directory on
+`/dev/shm`, where an fsync costs nothing, and is gated like everything else
+once `main` has recorded a baseline for it (until then it's listed as new).
+That still catches a ledger or index change that makes encoding, writing or
+indexing the records slower. What it can't catch is a change that adds
+fsyncs, since those cost nothing on tmpfs; that shows up only in the on-disk
+benchmark's reported ratio. The tmpfs twin runs on Linux only: on macOS
+`make bench-task-arrays` skips it with a note. A normalising disk reference in
+the same job was the other option, and the samples ruled it out: the disk's
+speed changes several-fold within one benchmark's few seconds, so a reference
+measured before or after it sees a different disk.
+
+The job summary shows each benchmark's ratio, its ratio against the rest and
+the runner factor (the median), plus both measurements of any benchmark it
+re-measured. The means of the 12 October runs are a fixture in
 [`fixtures/task-array-runs-2026-10-12.json`](../scripts/ci/fixtures/task-array-runs-2026-10-12.json):
 `make test-ci-scripts` checks that they pass and that a benchmark pushed to
-2.1× the rest of any of them fails. The gate matches benchmarks by name, so
+2.1× the rest of any of them fails. The eight disk-stall runs are a second
+fixture,
+[`fixtures/task-array-disk-stalls-2026-10.json`](../scripts/ci/fixtures/task-array-disk-stalls-2026-10.json):
+each fails with every benchmark gated, passes with the on-disk ledger report
+only, and still fails when any gated benchmark, the tmpfs twin included, is
+pushed to 2.1× the rest. The gate matches benchmarks by name, so
 a benchmark whose workload changes gets a new name (as
 `state/json_encode_1m_x64` did, #872): under its old name it would be
 compared with `main`'s baseline for the old workload, and a new name starts

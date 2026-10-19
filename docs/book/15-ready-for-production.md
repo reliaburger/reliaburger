@@ -518,7 +518,7 @@ HTML report. On Linux CI that same run is the test gate, so we don't pay for the
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
 crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
-mid-write: all 4,708 tests passed, then `llvm-profdata` refused the truncated file and failed
+mid-write: every test passed, then `llvm-profdata` refused the truncated file and failed
 the whole report. The report steps now pass `--failure-mode all`, which skips an unreadable
 profile with a warning and only fails when none can be read. Skipping one killed process's
 partial counts can pull coverage down a hair. It can't push it up, so the floor still means
@@ -599,10 +599,10 @@ runner-minutes, and more than half of those minutes went to runs that a newer pu
 already cancelled. Nobody waits half an hour for feedback. They push again, which cancels the
 run, which makes the wait longer. So we measured where the time went before touching anything.
 
-Two-thirds of it was compiling. The portable suite, about 4,150 tests that take five minutes to
+Two-thirds of it was compiling. The portable suite, which takes five minutes to
 run, ran seven times per push: default and no-default features in three jobs, plus macOS. The
 only default feature is `kubernetes`, and nothing in the code depends on it being *off*, so the
-four no-default runs repeated the same 4,110 tests to prove the crate builds without one
+four no-default runs repeated the same tests to prove the crate builds without one
 dependency. A second `clippy --no-default-features` proves that in seconds. The coverage job
 compiled and ran the suite again under instrumentation, beside the uninstrumented run it
 duplicated. The 10,000-member scale test had its own 21-minute release build, because
@@ -777,6 +777,30 @@ is exactly what a disk stall *doesn't* cause. The step summary shows both measur
 anything it re-measured, so a benchmark that passed on its second try is still visible to
 anyone reading the trend.
 
+Measuring twice assumed the stall was brief. It isn't always. In the 0.2.1 merge queue the
+storage benchmark came out at 3.20 times the rest of its run, and at 2.93 on the re-measure a
+few minutes later: that runner's disk was slow for the whole job (#1038). We went back through
+every `criterion-task-arrays` artefact we still had, 179 runs over a week. Eight failed on this
+benchmark alone, and in none of them was any other benchmark above 1.11 times the rest. The
+giveaway was inside each failing benchmark: its ten Criterion samples ranged from about 15 ms to
+as much as 134 ms, where a healthy runner keeps them within a few per cent. Most of the
+benchmark's time goes on fsyncs, so what it really measures is the disk.
+
+We had three ways out. Normalising it against a disk-bound reference in the same job sounds
+like the median trick again, but the samples rule it out: the disk changes speed several times
+over within one benchmark's few seconds, so a reference measured just before or after sees a
+different disk. Dropping the benchmark from the gate would stop the failures and also stop it
+catching anything. So we split it. A twin, `storage/ledger_and_index_64k_tmpfs`, does exactly
+the same writes in a directory on `/dev/shm`. That's tmpfs, a filesystem held in memory, where
+an fsync returns at once, so what's left to measure is encoding, writing and indexing the
+records, which is what a change to the ledger code can actually make slower. The twin is
+gated like any other benchmark. The on-disk original is passed to `--report-only`: the summary
+shows its ratio, marked "report only", but it can't fail the run, isn't re-measured and isn't
+counted in the median the others are measured against. The one regression this no longer
+catches is a change that adds fsyncs, since those are free on tmpfs. It still shows up in the
+on-disk ratio for anyone reading the summary, but nothing fails on it. We accepted that: until
+the disk under the runner is steady, a gate on fsync time is a gate on the runner's disk.
+
 Why the median of the suite, and not a dedicated reference workload, a fixed loop measured
 alongside? We looked at it. Benchmarks bound by CPU, process spawning and disk speed up and
 slow down independently (2.07, 1.35 and 1.34 in the same run), so the verdict would hinge on
@@ -806,7 +830,7 @@ release had a dozen of them in flight. We timed twelve runs: 45 to 55 minutes of
 Runner queueing was mostly under ten minutes, so the runners weren't the problem. Portable
 macOS was the critical path in almost every run, at 35 to 49 minutes, then acceptance at about
 34. Everything else finished in about 15. Inside the macOS job, compiling the test binaries
-took 27 minutes; running all 6,288 tests took seven.
+took 27 minutes; running them took seven.
 
 So we asked what a pull request into a train actually needs to prove. That it compiles, lints
 clean on stable and on the minimum compiler, and passes the portable suite with the coverage
@@ -844,8 +868,8 @@ envelope can't be uploaded under another's name. A shard re-run on its own after
 keeps the attempt number GitHub gave it, so the check that one job's owners share an attempt
 treats each shard as its own job.
 
-Did splitting pay? Less than we hoped. The first full run with shards ran 2,094 tests in
-under three minutes per shard instead of seven, but each shard still compiled the whole suite
+Did splitting pay? Less than we hoped. The first full run with shards ran each shard's tests in
+under three minutes instead of seven, but each shard still compiled the whole suite
 for 38 minutes, so a shard took 42 to 44 minutes against the 45 before. That's level with
 acceptance, so macOS is no longer the only critical path, and no further. Three macOS jobs
 also wait longer for runners: one shard queued for 28 minutes behind other pull requests.
@@ -1049,6 +1073,18 @@ maintainers stopped. No version clears its unmaintained advisory, so "bump it" b
 "replace it": gossip, reporting frames and the Raft metadata moved to postcard, which
 changed the wire and durable formats along with the crate (Chapter 2 has the details). A
 lag report can tell you you're behind. It can't tell you the road ahead still exists.
+
+Sometimes a major version changes nothing you can see. `pem` 4.0.0, the crate that turns
+our certificates and keys into the `-----BEGIN CERTIFICATE-----` text nodes keep on disk,
+has the same source code as 3.0.6. Only its `base64` dependency and its minimum Rust
+version moved. We still didn't take that on trust. A PEM file is a stored format: if the
+new crate wrote different line endings (3.0.6 writes CRLF) or wrapped lines at a different
+width, every node would rewrite every certificate it owns. So the PR checked in a root CA
+certificate and key written by the 3.0.6 build, and
+`pem_files_written_by_pem_3_parse_and_rewrite_byte_for_byte` reads them with 4.0.0 and
+writes them back, byte for byte. A one-line `.gitattributes` keeps git from "fixing" the
+fixtures' CRLFs, which would make the test check the wrong bytes. The bump also left one
+`pem` in `Cargo.lock` instead of two, since rcgen 0.14 had already moved to 4.
 
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 

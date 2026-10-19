@@ -476,6 +476,27 @@ class BenchmarkTests(unittest.TestCase):
         compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
         self.assertIn("--remeasure 'cargo bench --bench task_arrays --'", compare)
 
+    def test_the_on_disk_ledger_benchmark_is_reported_not_gated(self):
+        # Its speed is the runner's disk, which varies several-fold within one
+        # job (#1038); the tmpfs variant beside it is gated instead.
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertEqual(re.findall(r"--report-only (\S+)", compare),
+                         ["storage/ledger_and_index_64k"])
+
+    def test_every_report_only_benchmark_has_a_gated_variant_in_the_bench(self):
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        bench = (REPO / "benches" / "task_arrays.rs").read_text()
+        names = re.findall(r"--report-only (\S+)", compare)
+        self.assertTrue(names)
+        for name in names:
+            with self.subTest(benchmark=name):
+                group, function = name.split("/", 1)
+                self.assertIn(f'benchmark_group("{group}")', bench)
+                self.assertIn(f'"{function}"', bench)
+                self.assertIn(f'"{function}_tmpfs"', bench)
+
     def test_only_main_saves_the_task_array_baseline(self):
         job = self.jobs["task-array-benchmarks"]
         restore = next(step for step in steps(job) if "actions/cache/restore@" in step)
