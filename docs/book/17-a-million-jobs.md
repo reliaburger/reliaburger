@@ -3188,6 +3188,23 @@ the drain is asked for, or within a minute of it, because an apply's schedules
 commit after its hooks. Apply doesn't delete job definitions a file leaves
 out, so they stay exactly as the drain left them (#963).
 
+The harness lost a verdict of its own too. It starts the job controller with
+`&` and, at teardown, used to `wait` on the controller's pid to learn how it
+exited. At the end of one 0.2.1 fast soak that `wait` printed `pid 16852 is
+not a child of this shell` and returned 127. The harness runs under
+`#!/usr/bin/env bash`, which on macOS is `/bin/bash` 3.2, and an hour of soak
+forks enough short-lived commands (`date`, `python3`, `limactl`) to wrap the
+pid space. When a new child gets the controller's old pid, bash 3.2 deletes
+the controller's dead job without saving its status, so the shell forgets it
+ever had that child. That soak had already failed, but any
+run whose controller drained and exited on its own would have been failed
+whatever its status. Now the controller writes its exit status to
+`jobs/exit-status` as it returns, crash included, and `finish()` reads that
+file instead of calling `wait`. A missing file means something killed the
+controller, and fails the run. The file also tells the harness that the
+controller has gone, so it never signals a pid that now belongs to someone
+else (#1035).
+
 Candidate 7's jobs fast tier then turned one refused summary into eight
 failures. A shared-runc run reported two active commands against one held
 task. The run-level count adds up what each node said at its last sync, and

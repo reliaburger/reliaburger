@@ -804,6 +804,8 @@ GUEST
 start_jobs() {
     local load=(--load "$job_load")
     [ -z "$target_rate" ] || load+=(--target-rate "$target_rate")
+    # The controller writes jobs/exit-status as it exits; finish() reads that.
+    rm -f "$evidence/jobs/exit-status"
     python3 "$job_controller" run --evidence "$evidence" --api-port "$api_port" --ca "$ca" --limactl "$limactl" "${load[@]}" > "$evidence/jobs/controller.log" 2>&1 &
     jobs_pid=$!
 }
@@ -1575,12 +1577,24 @@ teardown_cluster() {
 finish() {
     local result=$?
     trap - EXIT
+    # Not `wait`: once the pid space wraps and a later command gets the
+    # controller's old pid, macOS bash 3.2 drops the controller from its job
+    # table without its status and `wait` fails with 127 (#1035). The status
+    # file also says the controller has gone, so a reused pid is never signalled.
+    local controller_status=
     if [ -n "${jobs_pid:-}" ]; then
-        if kill -0 "$jobs_pid" 2>/dev/null; then
+        controller_status=$(cat "$evidence/jobs/exit-status" 2>/dev/null || true)
+        if [ -n "$controller_status" ]; then
+            if [ "$controller_status" != 0 ]; then
+                meta notes+ "Job controller exited with status $controller_status"
+                result=1
+            fi
+        elif kill -0 "$jobs_pid" 2>/dev/null; then
             kill "$jobs_pid" 2>/dev/null || true
             meta notes+ 'Job controller was still running at teardown; positive drain must be present to pass'
         else
-            wait "$jobs_pid" || result=1
+            meta notes+ 'Job controller exited without recording its exit status'
+            result=1
         fi
     fi
     [ -z "${background_pid:-}" ] || kill "$background_pid" 2>/dev/null || true
@@ -1592,7 +1606,7 @@ finish() {
     elif ! teardown_cluster; then
         result=1
     fi
-    if [ -n "${jobs_pid:-}" ] && kill -0 "$jobs_pid" 2>/dev/null; then
+    if [ -n "${jobs_pid:-}" ] && [ ! -s "$evidence/jobs/exit-status" ] && kill -0 "$jobs_pid" 2>/dev/null; then
         # Teardown is already over. Do not add another drain allowance or
         # leave an orphan controller making requests after the harness exits.
         kill -KILL "$jobs_pid" 2>/dev/null || true
