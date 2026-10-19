@@ -55,7 +55,7 @@ releases.
 | [Ray](https://github.com/ray-project/ray) | Python distributed runtime | 44.0k | Underneath most RL post-training frameworks |
 | [dstack](https://github.com/dstackai/dstack) | AI orchestration over clouds, Kubernetes and SSH hosts | 2.3k | Closest to our pitch; tasks, services, dev environments |
 | [SkyPilot](https://github.com/skypilot-org/skypilot) | Launch jobs and services across clouds, Kubernetes and Slurm | 10.7k | $20M seed in July 2026 ([Fortune](https://fortune.com/2026/07/21/skypilot-from-databricks-cofounder-raises-20m-to-be-the-switzerland-of-ai-compute/)) |
-| [verl](https://github.com/volcengine/verl), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), [slime](https://github.com/THUDM/slime) | RL post-training | 23.8k, 10.1k, 8.6k | Mix inference servers and trainers in one job |
+| [verl](https://github.com/verl-project/verl), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), [slime](https://github.com/THUDM/slime) | RL post-training | 23.8k, 10.1k, 8.6k | Mix inference servers and trainers in one job |
 | Unsloth, TRL, Axolotl | Fine-tuning frameworks | 77.7k, 19.5k, 12.6k | What people actually launch |
 
 Two former contenders have dropped out: [Determined AI](https://github.com/determined-ai/determined)
@@ -132,10 +132,10 @@ the engines, with us providing the plumbing.
 
 ### 3. CPU is the wrong autoscaling signal
 
-Red Hat's own documentation says "CPU utilization does not reflect the actual
-load on the inference server", and GPU utilisation sits near 100% whenever
-the engine is batching, whatever the load
-([llm-d autoscaling](https://llm-d.ai/docs/guides/workload-autoscaling)). The
+llm-d's autoscaling guide calls CPU and GPU utilisation lagging indicators,
+and GPU utilisation is "often pegged near 100% during active batching
+regardless of actual load"
+([llm-d autoscaling](https://github.com/llm-d/llm-d/tree/main/guides/workload-autoscaling)). The
 signals that matter are the ones every engine already exports: queue depth
 (`vllm:num_requests_waiting`), running requests, KV-cache use, and the
 time-to-first-token and inter-token latency histograms. Our autoscaler
@@ -156,7 +156,7 @@ The emerging answers are weights packaged as OCI artifacts (the CNCF
 [ModelPack](https://github.com/modelpack/model-spec) spec, Docker Model
 Runner, KServe modelcars), peer-to-peer distribution (Dragonfly v2.5 speaks
 `hf://` natively and [claims](https://www.cncf.io/blog/2026/04/06/peer-to-peer-acceleration-for-ai-model-distribution-with-dragonfly/)
-origin traffic fell from 26 TB to about 130 GB across 200 nodes), streaming loaders, and placing replicas where the weights
+origin traffic would fall from 26 TB to about 130 GB across 200 nodes), streaming loaders, and placing replicas where the weights
 already are. Kubernetes users assemble that from four or five projects. We
 have a registry with P2P distribution built in, and an image-locality term in
 the scheduler that's waiting for data. **This is our clearest differentiator**
@@ -216,7 +216,7 @@ and Ollama issues):
 - One command from a model name to an OpenAI-compatible URL (Ollama,
   GPUStack, Baseten).
 - Idle models unloaded so their memory goes back to the pool, then reloaded
-  on the next request (Ollama's keep-alive, the top request on GPUStack:
+  on the next request (Ollama's keep-alive, a popular request on GPUStack:
   [#2824](https://github.com/gpustack/gpustack/issues/2824)).
 - Scale to zero with a cold start measured in seconds (Modal).
 - GPU dev environments you SSH or VS Code into, on the same cluster (dstack,
@@ -426,7 +426,7 @@ gpu-1   7    H100 80GB  580.82  healthy   idle             0%    0/80Gi
 **How we'd build it.**
 
 - *Discovery.* Replace the `nvidia-smi` parsing in `src/bun/gpu.rs` with
-  NVML (the [`nvml-wrapper`](https://github.com/Cldfire/nvml-wrapper) crate)
+  NVML (the [`nvml-wrapper`](https://github.com/rust-nvml/nvml-wrapper) crate)
   for each device's UUID, model, memory, NUMA node, NVLink peers and the
   driver and CUDA versions. Each node reports its inventory through gossip
   (`src/mustard`), and the leader stores real allocatable devices instead of
@@ -1042,7 +1042,7 @@ The landscape sources are in
 - [dstackai/dstack](https://github.com/dstackai/dstack)
 - [skypilot-org/skypilot](https://github.com/skypilot-org/skypilot)
 - [fortune.com: skypilot-from-databricks-cofounder-raises-20m-to-be-the-switzerland-of-ai-compute](https://fortune.com/2026/07/21/skypilot-from-databricks-cofounder-raises-20m-to-be-the-switzerland-of-ai-compute/)
-- [volcengine/verl](https://github.com/volcengine/verl)
+- [verl-project/verl](https://github.com/verl-project/verl)
 - [OpenRLHF/OpenRLHF](https://github.com/OpenRLHF/OpenRLHF)
 - [THUDM/slime](https://github.com/THUDM/slime)
 - [determined-ai/determined](https://github.com/determined-ai/determined)
@@ -1059,7 +1059,7 @@ The landscape sources are in
 - [llm-d.ai: sticky-until-saturated-token-aware-routing](https://llm-d.ai/blog/sticky-until-saturated-token-aware-routing)
 - [developer.nvidia.com: introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models](https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models)
 - [arXiv 2603.13358](https://arxiv.org/abs/2603.13358)
-- [llm-d.ai: workload-autoscaling](https://llm-d.ai/docs/guides/workload-autoscaling)
+- [llm-d/llm-d: guides/workload-autoscaling](https://github.com/llm-d/llm-d/tree/main/guides/workload-autoscaling)
 - [aws.amazon.com: fast-model-loading-for-ai-inference-on-amazon-eks](https://aws.amazon.com/blogs/containers/fast-model-loading-for-ai-inference-on-amazon-eks)
 - [kserve/kserve issue #5838](https://github.com/kserve/kserve/issues/5838)
 - [handbook.modular.com: fast-scaling](https://handbook.modular.com/infrastructure-and-operations/fast-scaling/)
@@ -1093,7 +1093,7 @@ The landscape sources are in
 
 **A revised release plan**
 
-- [Cldfire/nvml-wrapper](https://github.com/Cldfire/nvml-wrapper)
+- [rust-nvml/nvml-wrapper](https://github.com/rust-nvml/nvml-wrapper)
 - [cncf-tags/container-device-interface-rs](https://github.com/cncf-tags/container-device-interface-rs)
 - [docs.nvidia.com: cdi-support](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/1.19.1/cdi-support.html)
 - [docs.nvidia.com: analyzing-xid-catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html)
