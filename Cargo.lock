@@ -3990,7 +3990,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
- "memoffset",
 ]
 
 [[package]]
@@ -5301,7 +5300,7 @@ dependencies = [
  "libc",
  "memmap2",
  "mime_guess",
- "nix 0.29.0",
+ "nix 0.31.3",
  "nucleo-matcher",
  "object_store 0.14.2",
  "oci-distribution",
