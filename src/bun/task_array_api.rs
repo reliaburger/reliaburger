@@ -152,6 +152,26 @@ async fn follower_council(state: &ApiState) -> Option<&crate::council::CouncilNo
     }
 }
 
+/// How long a leader gets to prove it leads before it answers a run it
+/// can't find (#1009, #1192).
+const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The council to forward a run's request to, or `None` when this node has
+/// proved it leads (or runs without a council) and its record is the truth.
+///
+/// A follower's replica can lag, and a node back from a stop may hold a log
+/// older than the run, so only a confirmed leader may say "not found". The
+/// leader gets [`LEADER_CONFIRMATION`] to prove it, so one heartbeat round
+/// its followers answer late doesn't turn into a 503.
+async fn council_to_forward_to(state: &ApiState) -> Option<&crate::council::CouncilNode> {
+    let council = state.council.as_deref()?;
+    if council.confirm_leadership(LEADER_CONFIRMATION).await {
+        None
+    } else {
+        Some(council)
+    }
+}
+
 /// `POST /v1/batch/array`: submit a task array.
 pub async fn submit_handler(
     State(state): State<ApiState>,
@@ -447,6 +467,12 @@ pub async fn cancel_handler(
     AxumPath(batch_id): AxumPath<u64>,
     headers: HeaderMap,
 ) -> Response {
+    // Forward before looking the run up: a lagging replica doesn't know
+    // every run, and the leader authorises the forwarded caller itself.
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!("/v1/batch/{batch_id}/cancel");
+        return forward_to_leader(&state, council, &path, String::new(), &headers).await;
+    }
     let auth = auth.as_deref();
     if let Err(response) =
         crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Deployer)
@@ -513,10 +539,6 @@ pub async fn cancel_handler(
         ) {
             return response;
         }
-    }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!("/v1/batch/{batch_id}/cancel");
-        return forward_to_leader(&state, council, &path, String::new(), &headers).await;
     }
     match write_task_array(&state, write).await {
         Ok(_) => (
@@ -1015,6 +1037,15 @@ pub async fn results_handler(
         .limit
         .unwrap_or(DEFAULT_RESULT_ROWS)
         .min(MAX_RESULT_ROWS);
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!(
+            "/v1/batch/{batch_id}/results?failed={}&limit={limit}{}{}",
+            query.failed,
+            query.after.map_or(String::new(), |a| format!("&after={a}")),
+            query.index.map_or(String::new(), |i| format!("&index={i}"))
+        );
+        return forward_get_to_leader(&state, council, &path, &headers).await;
+    }
     let arrays = read_task_arrays(&state).await;
     let Some(record) = arrays.get(batch_id) else {
         return error(
@@ -1026,15 +1057,6 @@ pub async fn results_handler(
         crate::sesame::auth::authorize_scoped(auth.as_deref(), &record.name, &record.namespace)
     {
         return response;
-    }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!(
-            "/v1/batch/{batch_id}/results?failed={}&limit={limit}{}{}",
-            query.failed,
-            query.after.map_or(String::new(), |a| format!("&after={a}")),
-            query.index.map_or(String::new(), |i| format!("&index={i}"))
-        );
-        return forward_get_to_leader(&state, council, &path, &headers).await;
     }
     let (start, end, owners) = result_window(record, &query);
     let mut per_node = Vec::new();
@@ -1120,6 +1142,10 @@ pub async fn logs_handler(
     AxumPath((batch_id, index)): AxumPath<(u64, u32)>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
+        return forward_get_to_leader(&state, council, &path, &headers).await;
+    }
     let arrays = read_task_arrays(&state).await;
     let Some(record) = arrays.get(batch_id) else {
         return error(
@@ -1141,10 +1167,6 @@ pub async fn logs_handler(
         &permissions,
     ) {
         return response;
-    }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
-        return forward_get_to_leader(&state, council, &path, &headers).await;
     }
     let Some(chunk) = record.state.spec.chunk_of(index) else {
         return error(
