@@ -4,7 +4,7 @@
 //! related resources (Deployment+Service+Ingress → single App),
 //! and produces a Reliaburger `Config` with a migration report.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
@@ -80,41 +80,50 @@ impl std::fmt::Display for MigrationReport {
 // Parsed K8s resource wrapper
 // ---------------------------------------------------------------------------
 
+/// A Kubernetes object's identity. Names are unique per namespace, not per
+/// cluster, so every collected resource is keyed by both; an unset namespace
+/// means `default`, as it does to the API server.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResourceKey {
+    namespace: String,
+    name: String,
+}
+
+impl ResourceKey {
+    fn new(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            namespace: namespace.unwrap_or("default").to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// The report label: `Kind/name` in `default`, `Kind/namespace/name`
+    /// elsewhere, so two same-named resources never share a report line.
+    fn label(&self, kind: &str) -> String {
+        if self.namespace == "default" {
+            format!("{kind}/{}", self.name)
+        } else {
+            format!("{kind}/{}/{}", self.namespace, self.name)
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum K8sResource {
-    Deployment(String, Deployment),
-    DaemonSet(String, DaemonSet),
-    StatefulSet(String, StatefulSet),
-    Service(String, Service),
-    Ingress(String, Ingress),
-    Hpa(String, HorizontalPodAutoscaler),
-    ConfigMap(String, ConfigMap),
-    Secret(String, Secret),
-    Job(String, Job),
-    CronJob(String, CronJob),
+    Deployment(ResourceKey, Deployment),
+    DaemonSet(ResourceKey, DaemonSet),
+    StatefulSet(ResourceKey, StatefulSet),
+    Service(ResourceKey, Service),
+    Ingress(ResourceKey, Ingress),
+    Hpa(ResourceKey, HorizontalPodAutoscaler),
+    ConfigMap(ResourceKey, ConfigMap),
+    Secret(ResourceKey, Secret),
+    Job(ResourceKey, Job),
+    CronJob(ResourceKey, CronJob),
+    /// Namespaces are cluster-scoped, so only the name counts.
     Namespace(String, Namespace),
-    Unknown(String, String), // (kind, name)
-}
-
-impl K8sResource {
-    #[allow(dead_code)]
-    fn name(&self) -> &str {
-        match self {
-            Self::Deployment(n, _)
-            | Self::DaemonSet(n, _)
-            | Self::StatefulSet(n, _)
-            | Self::Service(n, _)
-            | Self::Ingress(n, _)
-            | Self::Hpa(n, _)
-            | Self::ConfigMap(n, _)
-            | Self::Secret(n, _)
-            | Self::Job(n, _)
-            | Self::CronJob(n, _)
-            | Self::Namespace(n, _)
-            | Self::Unknown(_, n) => n,
-        }
-    }
+    Unknown(String, ResourceKey), // (kind, key)
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +167,10 @@ pub fn import_from_yaml(yaml: &str) -> Result<ImportResult, RelishError> {
 fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError> {
     use serde::Deserialize as _;
 
+    fn typed<T: serde::de::DeserializeOwned>(value: yaml_serde::Value) -> Result<T, RelishError> {
+        yaml_serde::from_value(value).map_err(|e| RelishError::FormatFailed(e.to_string()))
+    }
+
     let mut resources = Vec::new();
 
     for document in yaml_serde::Deserializer::from_str(yaml) {
@@ -170,68 +183,22 @@ fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError
         }
 
         let kind = value["kind"].as_str().unwrap_or("").to_string();
-        let name = value["metadata"]["name"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let name = value["metadata"]["name"].as_str().unwrap_or("unknown");
+        let key = ResourceKey::new(value["metadata"]["namespace"].as_str(), name);
 
         let resource = match kind.as_str() {
-            "Deployment" => {
-                let d: Deployment = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::Deployment(name, d)
-            }
-            "DaemonSet" => {
-                let d: DaemonSet = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::DaemonSet(name, d)
-            }
-            "StatefulSet" => {
-                let d: StatefulSet = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::StatefulSet(name, d)
-            }
-            "Service" => {
-                let s: Service = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::Service(name, s)
-            }
-            "Ingress" => {
-                let i: Ingress = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::Ingress(name, i)
-            }
-            "HorizontalPodAutoscaler" => {
-                let h: HorizontalPodAutoscaler = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::Hpa(name, h)
-            }
-            "ConfigMap" => {
-                let c: ConfigMap = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::ConfigMap(name, c)
-            }
-            "Secret" => {
-                let s: Secret = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::Secret(name, s)
-            }
-            "Job" => {
-                let j: Job = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::Job(name, j)
-            }
-            "CronJob" => {
-                let c: CronJob = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::CronJob(name, c)
-            }
-            "Namespace" => {
-                let n: Namespace = yaml_serde::from_value(value.clone())
-                    .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-                K8sResource::Namespace(name, n)
-            }
-            _ => K8sResource::Unknown(kind, name),
+            "Deployment" => K8sResource::Deployment(key, typed(value)?),
+            "DaemonSet" => K8sResource::DaemonSet(key, typed(value)?),
+            "StatefulSet" => K8sResource::StatefulSet(key, typed(value)?),
+            "Service" => K8sResource::Service(key, typed(value)?),
+            "Ingress" => K8sResource::Ingress(key, typed(value)?),
+            "HorizontalPodAutoscaler" => K8sResource::Hpa(key, typed(value)?),
+            "ConfigMap" => K8sResource::ConfigMap(key, typed(value)?),
+            "Secret" => K8sResource::Secret(key, typed(value)?),
+            "Job" => K8sResource::Job(key, typed(value)?),
+            "CronJob" => K8sResource::CronJob(key, typed(value)?),
+            "Namespace" => K8sResource::Namespace(name.to_string(), typed(value)?),
+            _ => K8sResource::Unknown(kind, key),
         };
 
         resources.push(resource);
@@ -244,45 +211,80 @@ fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError
 // Resource correlation and conversion
 // ---------------------------------------------------------------------------
 
+/// The ConfigMaps in the input, and which of them a workload's `envFrom`
+/// consumed (those aren't reported as unreferenced).
+#[derive(Default)]
+struct ConfigMaps {
+    all: BTreeMap<ResourceKey, ConfigMap>,
+    used: BTreeSet<ResourceKey>,
+}
+
+/// One Deployment, DaemonSet or StatefulSet on its way to an `[app.*]`.
+struct Workload<'a> {
+    kind: &'static str,
+    key: ResourceKey,
+    /// The pod template's labels, which Service selectors match.
+    labels: BTreeMap<String, String>,
+    pod_spec: Option<&'a k8s_openapi::api::core::v1::PodSpec>,
+    app: AppSpec,
+    /// The Service the app took its port from, if any.
+    service: Option<ResourceKey>,
+}
+
+impl Workload<'_> {
+    fn label(&self) -> String {
+        self.key.label(self.kind)
+    }
+}
+
+/// The pod template labels of a workload, empty when it sets none.
+fn template_labels(
+    metadata: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta>,
+) -> BTreeMap<String, String> {
+    metadata
+        .and_then(|meta| meta.labels.clone())
+        .unwrap_or_default()
+}
+
 /// Correlate K8s resources and convert to a Reliaburger Config.
 fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationReport) {
     let mut config = Config::default();
     let mut report = MigrationReport::default();
 
     // Separate by type for correlation
-    let mut deployments: Vec<(String, Deployment)> = Vec::new();
-    let mut daemonsets: Vec<(String, DaemonSet)> = Vec::new();
-    let mut statefulsets: Vec<(String, StatefulSet)> = Vec::new();
-    let mut services: BTreeMap<String, Service> = BTreeMap::new();
-    let mut ingresses: BTreeMap<String, Ingress> = BTreeMap::new();
-    let mut hpas: BTreeMap<String, HorizontalPodAutoscaler> = BTreeMap::new();
-    let mut configmaps: BTreeMap<String, ConfigMap> = BTreeMap::new();
-    let mut secrets: BTreeMap<String, Secret> = BTreeMap::new();
-    let mut jobs: Vec<(String, Job)> = Vec::new();
-    let mut cronjobs: Vec<(String, CronJob)> = Vec::new();
+    let mut deployments: Vec<(ResourceKey, Deployment)> = Vec::new();
+    let mut daemonsets: Vec<(ResourceKey, DaemonSet)> = Vec::new();
+    let mut statefulsets: Vec<(ResourceKey, StatefulSet)> = Vec::new();
+    let mut services: BTreeMap<ResourceKey, Service> = BTreeMap::new();
+    let mut ingresses: BTreeMap<ResourceKey, Ingress> = BTreeMap::new();
+    let mut hpas: BTreeMap<ResourceKey, HorizontalPodAutoscaler> = BTreeMap::new();
+    let mut configmaps = ConfigMaps::default();
+    let mut secrets: BTreeMap<ResourceKey, Secret> = BTreeMap::new();
+    let mut jobs: Vec<(ResourceKey, Job)> = Vec::new();
+    let mut cronjobs: Vec<(ResourceKey, CronJob)> = Vec::new();
 
     for resource in resources {
         match resource {
-            K8sResource::Deployment(n, d) => deployments.push((n, d)),
-            K8sResource::DaemonSet(n, d) => daemonsets.push((n, d)),
-            K8sResource::StatefulSet(n, d) => statefulsets.push((n, d)),
-            K8sResource::Service(n, s) => {
-                services.insert(n, s);
+            K8sResource::Deployment(k, d) => deployments.push((k, d)),
+            K8sResource::DaemonSet(k, d) => daemonsets.push((k, d)),
+            K8sResource::StatefulSet(k, d) => statefulsets.push((k, d)),
+            K8sResource::Service(k, s) => {
+                services.insert(k, s);
             }
-            K8sResource::Ingress(n, i) => {
-                ingresses.insert(n, i);
+            K8sResource::Ingress(k, i) => {
+                ingresses.insert(k, i);
             }
-            K8sResource::Hpa(n, h) => {
-                hpas.insert(n, h);
+            K8sResource::Hpa(k, h) => {
+                hpas.insert(k, h);
             }
-            K8sResource::ConfigMap(n, c) => {
-                configmaps.insert(n, c);
+            K8sResource::ConfigMap(k, c) => {
+                configmaps.all.insert(k, c);
             }
-            K8sResource::Secret(n, s) => {
-                secrets.insert(n, s);
+            K8sResource::Secret(k, s) => {
+                secrets.insert(k, s);
             }
-            K8sResource::Job(n, j) => jobs.push((n, j)),
-            K8sResource::CronJob(n, c) => cronjobs.push((n, c)),
+            K8sResource::Job(k, j) => jobs.push((k, j)),
+            K8sResource::CronJob(k, c) => cronjobs.push((k, c)),
             K8sResource::Namespace(n, _ns) => {
                 config.namespace.insert(
                     n.clone(),
@@ -297,184 +299,173 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
                 );
                 report.converted.push(format!("Namespace/{n}"));
             }
-            K8sResource::Unknown(kind, name) => {
+            K8sResource::Unknown(kind, key) => {
                 report
                     .dropped
-                    .push(format!("{kind}/{name} — no Reliaburger equivalent"));
+                    .push(format!("{} — no Reliaburger equivalent", key.label(&kind)));
             }
         }
     }
 
-    // Track which Ingresses/HPAs correlate to a workload, so the leftovers
-    // can be reported instead of silently vanishing (the ConfigMap/Secret
-    // sweeps below always reported; these two didn't).
-    let mut used_ingresses: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut used_hpas: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut used_services: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    // Convert Deployments → Apps (with correlated Service, Ingress, HPA)
-    for (name, deploy) in &deployments {
-        let mut app = deployment_to_app(name, deploy, &mut report);
-        let pod_spec = deploy.spec.as_ref().and_then(|s| s.template.spec.as_ref());
-
-        // Correlate Service by name match
-        if let Some(svc) = services.get(name) {
-            apply_service(&mut app, name, svc, pod_spec, &mut report);
-            used_services.insert(name.clone());
-        }
-        warn_unimported_ports(
-            &format!("Deployment/{name}"),
-            pod_spec,
-            &mut app,
-            &mut report,
-        );
-
-        // Correlate Ingress by backend service name
-        if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
-            if let Some(ing) = ingresses.get(&ing_name) {
-                apply_ingress(&mut app, &ing_name, ing, &mut report);
-                used_ingresses.insert(ing_name);
-            }
-        }
-
-        // Correlate HPA by its scaleTargetRef (the HPA's own metadata name is
-        // conventionally `{app}-hpa`, which a name-keyed lookup never matched).
-        if let Some(hpa_name) = find_hpa_for_workload(&hpas, name, "Deployment") {
-            if let Some(hpa) = hpas.get(&hpa_name) {
-                apply_hpa(&mut app, &hpa_name, hpa, &mut report);
-                used_hpas.insert(hpa_name);
-            }
-        }
-
-        let key = insert_app_without_overwrite(&mut config, &mut report, name, app, "Deployment");
-        report
-            .converted
-            .push(format!("Deployment/{name} → [app.{key}]"));
+    // Convert every workload's pod template first: Services, Ingresses and
+    // HPAs then fold into the resulting apps.
+    let mut workloads: Vec<Workload<'_>> = Vec::new();
+    for (key, deploy) in &deployments {
+        let spec = deploy.spec.as_ref();
+        workloads.push(Workload {
+            kind: "Deployment",
+            app: deployment_to_app(
+                &key.label("Deployment"),
+                deploy,
+                &mut configmaps,
+                &mut report,
+            ),
+            labels: template_labels(spec.and_then(|s| s.template.metadata.as_ref())),
+            pod_spec: spec.and_then(|s| s.template.spec.as_ref()),
+            key: key.clone(),
+            service: None,
+        });
     }
-
-    // Convert DaemonSets → Apps with replicas = "*" (Service + Ingress
-    // correlate the same way; an HPA cannot target a DaemonSet).
-    for (name, ds) in &daemonsets {
-        let mut app = daemonset_to_app(name, ds, &mut report);
-        let pod_spec = ds.spec.as_ref().and_then(|s| s.template.spec.as_ref());
-        if let Some(svc) = services.get(name) {
-            apply_service(&mut app, name, svc, pod_spec, &mut report);
-            used_services.insert(name.clone());
-        }
-        warn_unimported_ports(
-            &format!("DaemonSet/{name}"),
-            pod_spec,
-            &mut app,
-            &mut report,
-        );
-        if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
-            if let Some(ing) = ingresses.get(&ing_name) {
-                apply_ingress(&mut app, &ing_name, ing, &mut report);
-                used_ingresses.insert(ing_name);
-            }
-        }
-        let key = insert_app_without_overwrite(&mut config, &mut report, name, app, "DaemonSet");
-        report
-            .converted
-            .push(format!("DaemonSet/{name} → [app.{key}] (replicas = \"*\")"));
+    for (key, ds) in &daemonsets {
+        let spec = ds.spec.as_ref();
+        workloads.push(Workload {
+            kind: "DaemonSet",
+            app: daemonset_to_app(&key.label("DaemonSet"), ds, &mut configmaps, &mut report),
+            labels: template_labels(spec.and_then(|s| s.template.metadata.as_ref())),
+            pod_spec: spec.and_then(|s| s.template.spec.as_ref()),
+            key: key.clone(),
+            service: None,
+        });
     }
-
-    // Convert StatefulSets → Apps with warning (Service/Ingress/HPA used to
-    // be Deployment-only, so a StatefulSet's siblings were silently dropped).
-    for (name, ss) in &statefulsets {
-        let mut app = statefulset_to_app(name, ss, &mut report);
-        let pod_spec = ss.spec.as_ref().and_then(|s| s.template.spec.as_ref());
-        if let Some(svc) = services.get(name) {
-            apply_service(&mut app, name, svc, pod_spec, &mut report);
-            used_services.insert(name.clone());
-        }
-        warn_unimported_ports(
-            &format!("StatefulSet/{name}"),
-            pod_spec,
-            &mut app,
-            &mut report,
-        );
-        if let Some(ing_name) = find_ingress_for_service(&ingresses, name) {
-            if let Some(ing) = ingresses.get(&ing_name) {
-                apply_ingress(&mut app, &ing_name, ing, &mut report);
-                used_ingresses.insert(ing_name);
-            }
-        }
-        if let Some(hpa_name) = find_hpa_for_workload(&hpas, name, "StatefulSet") {
-            if let Some(hpa) = hpas.get(&hpa_name) {
-                apply_hpa(&mut app, &hpa_name, hpa, &mut report);
-                used_hpas.insert(hpa_name);
-            }
-        }
-        let key = insert_app_without_overwrite(&mut config, &mut report, name, app, "StatefulSet");
-        report
-            .converted
-            .push(format!("StatefulSet/{name} → [app.{key}]"));
-        report.warnings.push(MigrationWarning {
-            resource: format!("StatefulSet/{name}"),
-            message: "ordering guarantees and stable network IDs lost".to_string(),
+    for (key, ss) in &statefulsets {
+        let spec = ss.spec.as_ref();
+        workloads.push(Workload {
+            kind: "StatefulSet",
+            app: statefulset_to_app(&key.label("StatefulSet"), ss, &mut configmaps, &mut report),
+            labels: template_labels(spec.and_then(|s| s.template.metadata.as_ref())),
+            pod_spec: spec.and_then(|s| s.template.spec.as_ref()),
+            key: key.clone(),
+            service: None,
         });
     }
 
-    // Convert Jobs
-    for (name, job) in &jobs {
-        let job_spec = job_to_jobspec(name, job, &mut report);
-        config.job.insert(name.clone(), job_spec);
-        report.converted.push(format!("Job/{name} → [job.{name}]"));
+    // Services attach by label selector (D33), within their namespace.
+    let service_targets = correlate_services(&services, &mut workloads, &mut report);
+
+    // Track which Ingresses/HPAs correlate to a workload, so the leftovers
+    // can be reported instead of silently vanishing.
+    let mut used_ingresses: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut used_hpas: BTreeSet<ResourceKey> = BTreeSet::new();
+
+    for (index, workload) in workloads.iter_mut().enumerate() {
+        let label = workload.label();
+        warn_unimported_ports(&label, workload.pod_spec, &mut workload.app, &mut report);
+
+        // An Ingress follows its backend Service to the workloads that
+        // Service selected.
+        if let Some(ing_key) = find_ingress_for_workload(&ingresses, &service_targets, index) {
+            if let Some(ing) = ingresses.get(&ing_key) {
+                apply_ingress(
+                    &mut workload.app,
+                    &ing_key.label("Ingress"),
+                    ing,
+                    &mut report,
+                );
+                used_ingresses.insert(ing_key);
+            }
+        }
+
+        // An HPA cannot target a DaemonSet: it has no scale subresource.
+        if workload.kind != "DaemonSet" {
+            if let Some(hpa_key) = find_hpa_for_workload(&hpas, &workload.key, workload.kind) {
+                if let Some(hpa) = hpas.get(&hpa_key) {
+                    apply_hpa(
+                        &mut workload.app,
+                        &hpa_key.label("HorizontalPodAutoscaler"),
+                        hpa,
+                        &mut report,
+                    );
+                    used_hpas.insert(hpa_key);
+                }
+            }
+        }
     }
 
-    // Convert CronJobs
-    for (name, cj) in &cronjobs {
-        let job_spec = cronjob_to_jobspec(name, cj, &mut report);
-        config.job.insert(name.clone(), job_spec);
-        report
-            .converted
-            .push(format!("CronJob/{name} → [job.{name}]"));
+    for workload in workloads {
+        let label = workload.label();
+        let key = insert_without_overwrite(
+            &mut config.app,
+            "app",
+            &mut report,
+            &label,
+            &workload.key,
+            workload.app,
+        );
+        match workload.kind {
+            "DaemonSet" => report
+                .converted
+                .push(format!("{label} → [app.{key}] (replicas = \"*\")")),
+            "StatefulSet" => {
+                report.converted.push(format!("{label} → [app.{key}]"));
+                report.warnings.push(MigrationWarning {
+                    resource: label,
+                    message: "ordering guarantees and stable network IDs lost".to_string(),
+                });
+            }
+            _ => report.converted.push(format!("{label} → [app.{key}]")),
+        }
     }
 
-    // Report uncorrelated Services, Ingresses and HPAs: their names,
-    // routing or autoscaling are lost.
-    for name in services.keys() {
-        if !used_services.contains(name) {
+    for (key, job) in &jobs {
+        let label = key.label("Job");
+        let job_spec = job_to_jobspec(&label, job, &mut configmaps, &mut report);
+        let name =
+            insert_without_overwrite(&mut config.job, "job", &mut report, &label, key, job_spec);
+        report.converted.push(format!("{label} → [job.{name}]"));
+    }
+
+    for (key, cj) in &cronjobs {
+        let label = key.label("CronJob");
+        let job_spec = cronjob_to_jobspec(&label, cj, &mut configmaps, &mut report);
+        let name =
+            insert_without_overwrite(&mut config.job, "job", &mut report, &label, key, job_spec);
+        report.converted.push(format!("{label} → [job.{name}]"));
+    }
+
+    // Report uncorrelated Ingresses and HPAs: their routing or autoscaling
+    // is lost. (Services report themselves in `correlate_services`.)
+    for key in ingresses.keys() {
+        if !used_ingresses.contains(key) {
             report.warnings.push(MigrationWarning {
-                resource: format!("Service/{name}"),
-                message: "no imported workload has this name, so nothing answers to it; an app \
-                          is reachable only by its own name"
+                resource: key.label("Ingress"),
+                message: "no imported workload is selected by its backend Service; routing dropped"
                     .to_string(),
             });
         }
     }
-    for name in ingresses.keys() {
-        if !used_ingresses.contains(name) {
+    for key in hpas.keys() {
+        if !used_hpas.contains(key) {
             report.warnings.push(MigrationWarning {
-                resource: format!("Ingress/{name}"),
-                message: "no imported workload matches its backend service; routing dropped"
-                    .to_string(),
-            });
-        }
-    }
-    for name in hpas.keys() {
-        if !used_hpas.contains(name) {
-            report.warnings.push(MigrationWarning {
-                resource: format!("HorizontalPodAutoscaler/{name}"),
+                resource: key.label("HorizontalPodAutoscaler"),
                 message: "no imported workload matches its scaleTargetRef; autoscaling dropped"
                     .to_string(),
             });
         }
     }
 
-    // Report uncorrelated ConfigMaps as warnings
-    for name in configmaps.keys() {
-        report.warnings.push(MigrationWarning {
-            resource: format!("ConfigMap/{name}"),
-            message: "not referenced by any workload; import manually if needed".to_string(),
-        });
+    for key in configmaps.all.keys() {
+        if !configmaps.used.contains(key) {
+            report.warnings.push(MigrationWarning {
+                resource: key.label("ConfigMap"),
+                message: "not referenced by any workload's envFrom; import manually if needed"
+                    .to_string(),
+            });
+        }
     }
 
-    // Report Secrets
-    for name in secrets.keys() {
+    for key in secrets.keys() {
         report.warnings.push(MigrationWarning {
-            resource: format!("Secret/{name}"),
+            resource: key.label("Secret"),
             message: "re-encrypt values with `relish secret encrypt`".to_string(),
         });
     }
@@ -482,59 +473,178 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
     (config, report)
 }
 
-/// Find the HPA whose `scaleTargetRef` names this workload.
+/// Fold each Service into the workloads it selects, and report every
+/// Service that can't be represented exactly.
+///
+/// Kubernetes routes a Service to every pod whose labels include all of the
+/// Service's `spec.selector`, in the Service's namespace; names play no part.
+/// The importer does the same against each workload's pod template labels.
+/// A Service with no selector routes to nothing in Kubernetes (its endpoints
+/// are managed by hand), so for that one alone the importer falls back to the
+/// workload of the same name, and says so.
+///
+/// Returns the workloads each Service ended up attached to, which Ingress
+/// correlation follows.
+fn correlate_services(
+    services: &BTreeMap<ResourceKey, Service>,
+    workloads: &mut [Workload<'_>],
+    report: &mut MigrationReport,
+) -> BTreeMap<ResourceKey, Vec<usize>> {
+    let mut targets = BTreeMap::new();
+    for (svc_key, svc) in services {
+        let resource = svc_key.label("Service");
+        let selector = svc
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.selector.as_ref())
+            .filter(|selector| !selector.is_empty());
+
+        let matched: Vec<usize> = workloads
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.key.namespace == svc_key.namespace)
+            .filter(|(_, w)| match selector {
+                Some(selector) => selector
+                    .iter()
+                    .all(|(label, value)| w.labels.get(label) == Some(value)),
+                None => w.key.name == svc_key.name,
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        match (selector, matched.len()) {
+            (Some(_), 0) => report.warnings.push(MigrationWarning {
+                resource: resource.clone(),
+                message: "its selector selects no imported workload, so nothing answers to it; \
+                          an app is reachable only by its own name"
+                    .to_string(),
+            }),
+            (None, 0) => report.warnings.push(MigrationWarning {
+                resource: resource.clone(),
+                message: "has no selector and no imported workload has its name, so nothing \
+                          answers to it; an app is reachable only by its own name"
+                    .to_string(),
+            }),
+            (None, _) => report.warnings.push(MigrationWarning {
+                resource: resource.clone(),
+                message: format!(
+                    "has no selector, so it routes to nothing in Kubernetes; matched to {} by \
+                     name instead",
+                    workloads[matched[0]].label()
+                ),
+            }),
+            (Some(_), 1) => {}
+            (Some(_), count) => report.warnings.push(MigrationWarning {
+                resource: resource.clone(),
+                message: format!(
+                    "selects {count} workloads ({}); one Service can't front several apps, so \
+                     each takes its port and clients must call each app by its own name",
+                    matched
+                        .iter()
+                        .map(|&index| workloads[index].label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }),
+        }
+
+        for &index in &matched {
+            let workload = &mut workloads[index];
+            if let Some(earlier) = &workload.service {
+                report.warnings.push(MigrationWarning {
+                    resource: resource.clone(),
+                    message: format!(
+                        "{} already takes its port from {}; this Service's ports are not imported",
+                        workload.label(),
+                        earlier.label("Service")
+                    ),
+                });
+                continue;
+            }
+            let port = apply_service(
+                &mut workload.app,
+                &workload.key.name,
+                &resource,
+                svc,
+                workload.pod_spec,
+                report,
+            );
+            // The Service's own name isn't kept: an app answers only to its
+            // name, so clients that dialled the Service have to change.
+            if matched.len() == 1 && svc_key.name != workload.key.name {
+                report.warnings.push(MigrationWarning {
+                    resource: resource.clone(),
+                    message: format!(
+                        "attached to {} by its selector; the name {} is not kept, so clients \
+                         must connect to {}:{}",
+                        workload.label(),
+                        svc_key.name,
+                        workload.key.name,
+                        port.map_or_else(|| "its port".to_string(), |p| p.to_string())
+                    ),
+                });
+            }
+            workload.service = Some(svc_key.clone());
+        }
+        targets.insert(svc_key.clone(), matched);
+    }
+    targets
+}
+
+/// Find the HPA whose `scaleTargetRef` names this workload, in its namespace.
 ///
 /// Matching by the HPA's own metadata name (the old behaviour) never
 /// correlated a conventionally-named `api-hpa` with its `api` Deployment, so
 /// its autoscaling was silently lost. An absent/empty `kind` matches any
 /// workload — real manifests omit it and serde defaults it to `""`.
 fn find_hpa_for_workload(
-    hpas: &BTreeMap<String, HorizontalPodAutoscaler>,
-    workload_name: &str,
+    hpas: &BTreeMap<ResourceKey, HorizontalPodAutoscaler>,
+    workload: &ResourceKey,
     workload_kind: &str,
-) -> Option<String> {
-    for (hpa_name, hpa) in hpas {
-        if let Some(spec) = &hpa.spec {
-            let target = &spec.scale_target_ref;
-            if target.name == workload_name
-                && (target.kind.is_empty() || target.kind == workload_kind)
-            {
-                return Some(hpa_name.clone());
-            }
-        }
-    }
-    None
+) -> Option<ResourceKey> {
+    hpas.iter()
+        .filter(|(key, _)| key.namespace == workload.namespace)
+        .find(|(_, hpa)| {
+            hpa.spec.as_ref().is_some_and(|spec| {
+                let target = &spec.scale_target_ref;
+                target.name == workload.name
+                    && (target.kind.is_empty() || target.kind == workload_kind)
+            })
+        })
+        .map(|(key, _)| key.clone())
 }
 
-/// Insert an app under its own name, or under `{namespace}-{name}` when
-/// the name is already taken by a resource from another namespace.
-/// K8s scopes names per namespace; a flat TOML table does not, so a
-/// silent `insert` would overwrite the earlier app.
-fn insert_app_without_overwrite(
-    config: &mut Config,
+/// Insert a converted app or job under its own name, or under
+/// `{namespace}-{name}` when an earlier resource already took the name.
+/// Kubernetes scopes names per namespace; a flat TOML table does not, so a
+/// plain `insert` would silently overwrite the earlier one.
+fn insert_without_overwrite<T>(
+    table: &mut BTreeMap<String, T>,
+    table_name: &str,
     report: &mut MigrationReport,
-    name: &str,
-    app: AppSpec,
-    kind: &str,
+    label: &str,
+    key: &ResourceKey,
+    value: T,
 ) -> String {
-    let key = if config.app.contains_key(name) {
-        let namespace = app
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        let renamed = format!("{namespace}-{name}");
+    let mut name = key.name.clone();
+    if table.contains_key(&name) {
+        name = format!("{}-{}", key.namespace, key.name);
+        let mut suffix = 2;
+        while table.contains_key(&name) {
+            name = format!("{}-{}-{suffix}", key.namespace, key.name);
+            suffix += 1;
+        }
         report.warnings.push(MigrationWarning {
-            resource: format!("{kind}/{name}"),
+            resource: label.to_string(),
             message: format!(
-                "name collides with an earlier resource from another namespace; imported as [app.{renamed}]"
+                "name {:?} is already taken by an earlier imported resource; imported as \
+                 [{table_name}.{name}]",
+                key.name
             ),
         });
-        renamed
-    } else {
-        name.to_string()
-    };
-    config.app.insert(key.clone(), app);
-    key
+    }
+    table.insert(name.clone(), value);
+    name
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +663,7 @@ fn pod_spec_to_app(
     resource: &str,
     metadata_namespace: Option<&String>,
     pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    configmaps: &mut ConfigMaps,
     report: &mut MigrationReport,
 ) -> AppSpec {
     let container = pod_spec.and_then(|ps| ps.containers.first());
@@ -561,43 +672,7 @@ fn pod_spec_to_app(
     app.image = container.and_then(|c| c.image.clone());
     app.namespace = metadata_namespace.cloned();
 
-    // Warn about fields we only partially import, so a silent drop becomes
-    // visible in the migration report rather than a surprise in production (M28).
-    if let Some(ps) = pod_spec {
-        if ps.containers.len() > 1 {
-            report.warnings.push(MigrationWarning {
-                resource: resource.to_string(),
-                message: format!(
-                    "only the first of {} containers is imported; {} sidecar(s) dropped",
-                    ps.containers.len(),
-                    ps.containers.len() - 1
-                ),
-            });
-        }
-        if ps.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
-            report.warnings.push(MigrationWarning {
-                resource: resource.to_string(),
-                message: "pod volumes are not imported; declare Reliaburger volumes manually"
-                    .to_string(),
-            });
-        }
-        // A hostPath volume is the one kind a hand-written replacement can't
-        // just declare: a `source` needs the host-exec permission and an
-        // allowlist entry on every node that runs it.
-        for volume in ps.volumes.iter().flatten() {
-            if let Some(host_path) = &volume.host_path {
-                report.warnings.push(MigrationWarning {
-                    resource: resource.to_string(),
-                    message: format!(
-                        "hostPath volume {:?} ({}) is not imported; a hand-written `source` \
-                         needs the host-exec permission and a [storage] allowed_host_paths \
-                         entry in node.toml on every node that runs it",
-                        volume.name, host_path.path
-                    ),
-                });
-            }
-        }
-    }
+    warn_unimported_pod_fields(resource, pod_spec, report);
     if container.and_then(|c| c.liveness_probe.as_ref()).is_some() {
         report.warnings.push(MigrationWarning {
             resource: resource.to_string(),
@@ -605,7 +680,156 @@ fn pod_spec_to_app(
                 .to_string(),
         });
     }
+    app.env = import_env(resource, metadata_namespace, container, configmaps, report);
+    import_pod_template(resource, pod_spec, container, &mut app, report);
+    app
+}
 
+/// Report what a pod spec carries that neither an app nor a job can, so a
+/// silent drop becomes visible in the migration report rather than a
+/// surprise in production (M28).
+fn warn_unimported_pod_fields(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    report: &mut MigrationReport,
+) {
+    let mut warn = |message: String| {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message,
+        })
+    };
+    let Some(ps) = pod_spec else { return };
+    if ps.tolerations.as_ref().is_some_and(|t| !t.is_empty()) {
+        warn(
+            "tolerations are not imported; Reliaburger has no taints, so any node may run it"
+                .to_string(),
+        );
+    }
+    if ps.affinity.is_some() {
+        warn("affinity is not imported; use placement with node labels instead".to_string());
+    }
+    if ps
+        .topology_spread_constraints
+        .as_ref()
+        .is_some_and(|t| !t.is_empty())
+    {
+        warn("topologySpreadConstraints are not imported".to_string());
+    }
+    if ps.containers.len() > 1 {
+        warn(format!(
+            "only the first of {} containers is imported; {} sidecar(s) dropped",
+            ps.containers.len(),
+            ps.containers.len() - 1
+        ));
+    }
+    if ps.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
+        warn("pod volumes are not imported; declare Reliaburger volumes manually".to_string());
+    }
+    // A hostPath volume is the one kind a hand-written replacement can't
+    // just declare: a `source` needs the host-exec permission and an
+    // allowlist entry on every node that runs it.
+    for volume in ps.volumes.iter().flatten() {
+        if let Some(host_path) = &volume.host_path {
+            warn(format!(
+                "hostPath volume {:?} ({}) is not imported; a hand-written `source` \
+                 needs the host-exec permission and a [storage] allowed_host_paths \
+                 entry in node.toml on every node that runs it",
+                volume.name, host_path.path
+            ));
+        }
+    }
+}
+
+/// A container's environment: `envFrom` sources first, in order, then its
+/// explicit `env`, which wins on a clash, as in Kubernetes.
+///
+/// A ConfigMap in the input, in the same namespace, is flattened into plain
+/// values. That's an approximation (a later change to the ConfigMap no
+/// longer reaches the workload), so it's reported. A Secret, a ConfigMap
+/// that isn't in the input, and any `valueFrom` reference have no automatic
+/// mapping and are reported by name.
+fn import_env(
+    resource: &str,
+    metadata_namespace: Option<&String>,
+    container: Option<&k8s_openapi::api::core::v1::Container>,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> BTreeMap<String, EnvValue> {
+    let mut env = BTreeMap::new();
+    let Some(container) = container else {
+        return env;
+    };
+    let mut warn = |message: String| {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message,
+        })
+    };
+    for source in container.env_from.iter().flatten() {
+        let prefix = source.prefix.as_deref().unwrap_or_default();
+        if let Some(secret) = &source.secret_ref {
+            warn(format!(
+                "envFrom Secret/{} is not imported; encrypt each value with `relish secret \
+                 encrypt` and add it to env",
+                secret.name.as_deref().unwrap_or_default()
+            ));
+        }
+        let Some(reference) = &source.config_map_ref else {
+            continue;
+        };
+        let name = reference.name.as_deref().unwrap_or_default();
+        let key = ResourceKey::new(metadata_namespace.map(String::as_str), name);
+        let Some(configmap) = configmaps.all.get(&key) else {
+            warn(format!(
+                "envFrom ConfigMap/{name} is not in the input; its keys are not imported"
+            ));
+            continue;
+        };
+        let data = configmap.data.clone().unwrap_or_default();
+        warn(format!(
+            "envFrom ConfigMap/{name} flattened into {} env value(s); later changes to the \
+             ConfigMap won't reach it",
+            data.len()
+        ));
+        if configmap
+            .binary_data
+            .as_ref()
+            .is_some_and(|b| !b.is_empty())
+        {
+            warn(format!(
+                "envFrom ConfigMap/{name} binaryData is not imported"
+            ));
+        }
+        for (name, value) in data {
+            env.insert(format!("{prefix}{name}"), EnvValue::Plain(value));
+        }
+        configmaps.used.insert(key);
+    }
+    for env_var in container.env.iter().flatten() {
+        if let Some(value) = &env_var.value {
+            env.insert(env_var.name.clone(), EnvValue::Plain(value.clone()));
+        } else if env_var.value_from.is_some() {
+            warn(format!(
+                "env {} uses valueFrom (secret/configmap/field ref) — set the value manually \
+                 or use `relish secret encrypt`",
+                env_var.name
+            ));
+        }
+    }
+    env
+}
+
+/// The parts of a pod template only an app carries: argv, working
+/// directory and user, port, health check, resources, placement and init
+/// containers.
+fn import_pod_template(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&k8s_openapi::api::core::v1::Container>,
+    app: &mut AppSpec,
+    report: &mut MigrationReport,
+) {
     // Same split as Kubernetes: `command` replaces the image's Entrypoint,
     // `args` replaces its Cmd. The runtime applies the rules (Z1.1).
     if let Some(c) = container {
@@ -613,7 +837,7 @@ fn pod_spec_to_app(
         app.args = c.args.clone().unwrap_or_default();
         app.working_dir = c.working_dir.clone().map(PathBuf::from);
     }
-    import_security_context(resource, pod_spec, container, &mut app, report);
+    import_security_context(resource, pod_spec, container, app, report);
 
     let ports = container_ports(pod_spec);
     app.port = ports.first().map(|p| p.container_port as u16);
@@ -671,26 +895,6 @@ fn pod_spec_to_app(
         );
     }
 
-    // Env vars. Plain values convert directly; `valueFrom` references
-    // (secret/configmap/field) have no automatic mapping — surface them
-    // as warnings instead of dropping them silently.
-    if let Some(env_list) = container.and_then(|c| c.env.as_ref()) {
-        for env_var in env_list {
-            if let Some(ref value) = env_var.value {
-                app.env
-                    .insert(env_var.name.clone(), EnvValue::Plain(value.clone()));
-            } else if env_var.value_from.is_some() {
-                report.warnings.push(MigrationWarning {
-                    resource: resource.to_string(),
-                    message: format!(
-                        "env {} uses valueFrom (secret/configmap/field ref) — set the value manually or use `relish secret encrypt`",
-                        env_var.name
-                    ),
-                });
-            }
-        }
-    }
-
     // Node selector → placement.required
     if let Some(selector) = pod_spec.and_then(|ps| ps.node_selector.as_ref()) {
         let labels: Vec<String> = selector.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -723,8 +927,6 @@ fn pod_spec_to_app(
             });
         }
     }
-
-    app
 }
 
 /// The first container's declared ports, in order.
@@ -886,17 +1088,23 @@ fn warn_unimported_ports(
     });
 }
 
-fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationReport) -> AppSpec {
+fn deployment_to_app(
+    resource: &str,
+    deploy: &Deployment,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> AppSpec {
     let spec = deploy.spec.as_ref();
     let pod_spec = spec.and_then(|s| s.template.spec.as_ref());
     let mut app = pod_spec_to_app(
-        &format!("Deployment/{name}"),
+        resource,
         deploy.metadata.namespace.as_ref(),
         pod_spec,
+        configmaps,
         report,
     );
     import_scrape_annotations(
-        &format!("Deployment/{name}"),
+        resource,
         spec.and_then(|s| s.template.metadata.as_ref()),
         &mut app,
         report,
@@ -937,16 +1145,22 @@ fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationRepo
     app
 }
 
-fn daemonset_to_app(name: &str, ds: &DaemonSet, report: &mut MigrationReport) -> AppSpec {
+fn daemonset_to_app(
+    resource: &str,
+    ds: &DaemonSet,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> AppSpec {
     let pod_spec = ds.spec.as_ref().and_then(|s| s.template.spec.as_ref());
     let mut app = pod_spec_to_app(
-        &format!("DaemonSet/{name}"),
+        resource,
         ds.metadata.namespace.as_ref(),
         pod_spec,
+        configmaps,
         report,
     );
     import_scrape_annotations(
-        &format!("DaemonSet/{name}"),
+        resource,
         ds.spec.as_ref().and_then(|s| s.template.metadata.as_ref()),
         &mut app,
         report,
@@ -955,17 +1169,23 @@ fn daemonset_to_app(name: &str, ds: &DaemonSet, report: &mut MigrationReport) ->
     app
 }
 
-fn statefulset_to_app(name: &str, ss: &StatefulSet, report: &mut MigrationReport) -> AppSpec {
+fn statefulset_to_app(
+    resource: &str,
+    ss: &StatefulSet,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> AppSpec {
     let spec = ss.spec.as_ref();
     let pod_spec = spec.and_then(|s| s.template.spec.as_ref());
     let mut app = pod_spec_to_app(
-        &format!("StatefulSet/{name}"),
+        resource,
         ss.metadata.namespace.as_ref(),
         pod_spec,
+        configmaps,
         report,
     );
     import_scrape_annotations(
-        &format!("StatefulSet/{name}"),
+        resource,
         spec.and_then(|s| s.template.metadata.as_ref()),
         &mut app,
         report,
@@ -1138,19 +1358,20 @@ fn empty_app_spec() -> AppSpec {
 /// will fail to connect.
 fn apply_service(
     app: &mut AppSpec,
-    svc_name: &str,
+    app_name: &str,
+    resource: &str,
     svc: &Service,
     pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
     report: &mut MigrationReport,
-) {
-    let resource = format!("Service/{svc_name}");
+) -> Option<u16> {
+    let resource = resource.to_string();
     let service_ports = svc
         .spec
         .as_ref()
         .and_then(|spec| spec.ports.as_deref())
         .unwrap_or_default();
     let Some(first) = service_ports.first() else {
-        return;
+        return app.port;
     };
     let target = match &first.target_port {
         Some(target) => resolve_port(target, container_ports(pod_spec)),
@@ -1166,7 +1387,7 @@ fn apply_service(
                     .map_or_else(|| "none".to_string(), |p| p.to_string())
             ),
         });
-        return;
+        return app.port;
     };
 
     if app.port != Some(target) {
@@ -1183,7 +1404,7 @@ fn apply_service(
             resource: resource.clone(),
             message: format!(
                 "port {} forwards to container port {target}; Reliaburger has no port \
-                 mapping, so clients must connect to {svc_name}:{target} (ingress is \
+                 mapping, so clients must connect to {app_name}:{target} (ingress is \
                  unaffected)",
                 first.port
             ),
@@ -1213,38 +1434,46 @@ fn apply_service(
             ),
         });
     }
+    app.port
 }
 
-fn find_ingress_for_service(
-    ingresses: &BTreeMap<String, Ingress>,
-    service_name: &str,
-) -> Option<String> {
-    for (ing_name, ing) in ingresses {
-        if let Some(spec) = &ing.spec {
-            if let Some(rules) = &spec.rules {
-                for rule in rules {
-                    if let Some(http) = &rule.http {
-                        for path in &http.paths {
-                            if let Some(backend) = &path.backend.service {
-                                if backend.name == service_name {
-                                    return Some(ing_name.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+/// Find the first Ingress with a backend Service that selected this
+/// workload (`service_targets` maps each Service to the workloads it
+/// attached to). An Ingress routes to a Service, never straight to a
+/// workload, and only within its own namespace.
+fn find_ingress_for_workload(
+    ingresses: &BTreeMap<ResourceKey, Ingress>,
+    service_targets: &BTreeMap<ResourceKey, Vec<usize>>,
+    workload: usize,
+) -> Option<ResourceKey> {
+    ingresses
+        .iter()
+        .find(|(ing_key, ing)| {
+            ingress_backend_services(ing).any(|service| {
+                let key = ResourceKey {
+                    namespace: ing_key.namespace.clone(),
+                    name: service.to_string(),
+                };
+                service_targets
+                    .get(&key)
+                    .is_some_and(|targets| targets.contains(&workload))
+            })
+        })
+        .map(|(key, _)| key.clone())
 }
 
-fn apply_ingress(
-    app: &mut AppSpec,
-    ingress_name: &str,
-    ing: &Ingress,
-    report: &mut MigrationReport,
-) {
+/// The Service names every path of an Ingress routes to.
+fn ingress_backend_services(ing: &Ingress) -> impl Iterator<Item = &str> {
+    ing.spec
+        .iter()
+        .flat_map(|spec| spec.rules.iter().flatten())
+        .flat_map(|rule| rule.http.iter())
+        .flat_map(|http| http.paths.iter())
+        .filter_map(|path| path.backend.service.as_ref())
+        .map(|backend| backend.name.as_str())
+}
+
+fn apply_ingress(app: &mut AppSpec, resource: &str, ing: &Ingress, report: &mut MigrationReport) {
     if let Some(spec) = &ing.spec {
         // Reliaburger's IngressSpec is one host + one path prefix per app, so
         // everything beyond the first rule's first path is unrepresentable —
@@ -1252,7 +1481,7 @@ fn apply_ingress(
         if let Some(rules) = &spec.rules {
             if rules.len() > 1 {
                 report.warnings.push(MigrationWarning {
-                    resource: format!("Ingress/{ingress_name}"),
+                    resource: resource.to_string(),
                     message: format!(
                         "only the first of {} rules is imported; Reliaburger ingress is one host per app",
                         rules.len()
@@ -1263,7 +1492,7 @@ fn apply_ingress(
                 if let Some(http) = &rule.http {
                     if http.paths.len() > 1 {
                         report.warnings.push(MigrationWarning {
-                            resource: format!("Ingress/{ingress_name}"),
+                            resource: resource.to_string(),
                             message: format!(
                                 "only the first of {} paths is imported; Reliaburger ingress is one path prefix per app",
                                 http.paths.len()
@@ -1273,7 +1502,7 @@ fn apply_ingress(
                     if let Some(path_type) = http.paths.first().map(|p| p.path_type.as_str()) {
                         if path_type != "Prefix" && !path_type.is_empty() {
                             report.warnings.push(MigrationWarning {
-                                resource: format!("Ingress/{ingress_name}"),
+                                resource: resource.to_string(),
                                 message: format!(
                                     "pathType {path_type} is imported as prefix matching"
                                 ),
@@ -1285,13 +1514,13 @@ fn apply_ingress(
         }
         if spec.default_backend.is_some() {
             report.warnings.push(MigrationWarning {
-                resource: format!("Ingress/{ingress_name}"),
+                resource: resource.to_string(),
                 message: "defaultBackend is not imported".to_string(),
             });
         }
         if let Some(class) = spec.ingress_class_name.as_deref() {
             report.warnings.push(MigrationWarning {
-                resource: format!("Ingress/{ingress_name}"),
+                resource: resource.to_string(),
                 message: format!(
                     "ingressClassName {class} is dropped; Reliaburger's Wrapper serves all routes"
                 ),
@@ -1321,7 +1550,7 @@ fn apply_ingress(
                         )
                     };
                     report.warnings.push(MigrationWarning {
-                        resource: format!("Ingress/{ingress_name}"),
+                        resource: resource.to_string(),
                         message: format!(
                             "{source} is not imported; using tls = \"cluster\", so clients must trust the Reliaburger cluster root CA"
                         ),
@@ -1344,7 +1573,7 @@ fn apply_ingress(
 
 fn apply_hpa(
     app: &mut AppSpec,
-    hpa_name: &str,
+    resource: &str,
     hpa: &HorizontalPodAutoscaler,
     report: &mut MigrationReport,
 ) {
@@ -1385,7 +1614,7 @@ fn apply_hpa(
             crate::meat::autoscaler::AutoscaleConfig::from_spec(&autoscale, app.cpu, app.memory)
         {
             report.warnings.push(MigrationWarning {
-                resource: format!("HorizontalPodAutoscaler/{hpa_name}"),
+                resource: resource.to_string(),
                 message: format!(
                     "imported [autoscale] will not validate: {e}; fix it before applying"
                 ),
@@ -1405,6 +1634,7 @@ fn pod_to_jobspec(
     resource: &str,
     metadata_namespace: Option<&String>,
     pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    configmaps: &mut ConfigMaps,
     report: &mut MigrationReport,
 ) -> JobSpec {
     let container = pod_spec.and_then(|ps| ps.containers.first());
@@ -1425,22 +1655,9 @@ fn pod_to_jobspec(
         (!argv.is_empty()).then_some(argv)
     });
 
-    let mut env = BTreeMap::new();
-    if let Some(env_list) = container.and_then(|c| c.env.as_ref()) {
-        for env_var in env_list {
-            if let Some(ref value) = env_var.value {
-                env.insert(env_var.name.clone(), EnvValue::Plain(value.clone()));
-            } else if env_var.value_from.is_some() {
-                report.warnings.push(MigrationWarning {
-                    resource: resource.to_string(),
-                    message: format!(
-                        "env {} uses valueFrom (secret/configmap/field ref) — set the value manually or use `relish secret encrypt`",
-                        env_var.name
-                    ),
-                });
-            }
-        }
-    }
+    let env = import_env(resource, metadata_namespace, container, configmaps, report);
+    warn_unimported_pod_fields(resource, pod_spec, report);
+    warn_unimported_job_pod_fields(resource, pod_spec, container, report);
 
     let (memory, cpu) = match container.and_then(|c| c.resources.as_ref()) {
         Some(resources) => (
@@ -1478,43 +1695,198 @@ fn pod_to_jobspec(
     }
 }
 
-fn job_to_jobspec(name: &str, job: &Job, report: &mut MigrationReport) -> JobSpec {
-    let pod_spec = job.spec.as_ref().and_then(|s| s.template.spec.as_ref());
-    pod_to_jobspec(
-        &format!("Job/{name}"),
-        job.metadata.namespace.as_ref(),
-        pod_spec,
-        report,
-    )
+/// Report what a job's pod template carries that a `[job.*]` can't: a job
+/// runs one command in its image, as the image's user, from the image's
+/// working directory, anywhere in the cluster.
+fn warn_unimported_job_pod_fields(
+    resource: &str,
+    pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&k8s_openapi::api::core::v1::Container>,
+    report: &mut MigrationReport,
+) {
+    let mut warn = |message: String| {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message,
+        })
+    };
+    if pod_spec
+        .and_then(|ps| ps.node_selector.as_ref())
+        .is_some_and(|selector| !selector.is_empty())
+    {
+        warn("nodeSelector is not imported; a job has no placement".to_string());
+    }
+    if pod_spec
+        .and_then(|ps| ps.init_containers.as_ref())
+        .is_some_and(|inits| !inits.is_empty())
+    {
+        warn("initContainers are not imported; a job runs one container".to_string());
+    }
+    let Some(container) = container else { return };
+    if let Some(dir) = &container.working_dir {
+        warn(format!(
+            "workingDir {dir} is not imported; a job runs in its image's working directory"
+        ));
+    }
+    let pod_security = pod_spec.and_then(|ps| ps.security_context.as_ref());
+    let own_security = container.security_context.as_ref();
+    let user = own_security
+        .and_then(|sc| sc.run_as_user)
+        .or_else(|| pod_security.and_then(|sc| sc.run_as_user));
+    let group = own_security
+        .and_then(|sc| sc.run_as_group)
+        .or_else(|| pod_security.and_then(|sc| sc.run_as_group));
+    for (field, value) in [("runAsUser", user), ("runAsGroup", group)] {
+        if let Some(value) = value {
+            warn(format!(
+                "securityContext.{field} {value} is not imported; a job runs as its image's user"
+            ));
+        }
+    }
 }
 
-fn cronjob_to_jobspec(name: &str, cj: &CronJob, report: &mut MigrationReport) -> JobSpec {
+/// Map a Kubernetes Job spec's retry and deadline policy onto the job's
+/// `max_attempts` and `task_timeout_secs`, and report every field that
+/// changes how often or how many times the job runs.
+fn import_job_policy(
+    resource: &str,
+    spec: Option<&k8s_openapi::api::batch::v1::JobSpec>,
+    job_spec: &mut JobSpec,
+    report: &mut MigrationReport,
+) {
+    let Some(spec) = spec else { return };
+    let mut warn = |message: String| {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message,
+        })
+    };
+
+    // backoffLimit counts retries after the first attempt; max_attempts
+    // counts every attempt, and allows at most 10.
+    if let Some(limit) = spec.backoff_limit.filter(|limit| *limit >= 0) {
+        let attempts = i64::from(limit) + 1;
+        let max = i64::from(crate::meat::task_array::MAX_ATTEMPTS);
+        if attempts > max {
+            warn(format!(
+                "backoffLimit {limit} allows {attempts} attempts; a job allows at most {max}, \
+                 so max_attempts = {max}"
+            ));
+        }
+        job_spec.max_attempts = u8::try_from(attempts.min(max)).ok();
+    }
+
+    // The pod's deadline is per attempt (each retry is a new pod), which is
+    // exactly task_timeout_secs. The Job's own deadline spans every attempt;
+    // the nearest equivalent is the per-attempt one, so say it changed.
+    let pod_deadline = spec
+        .template
+        .spec
+        .as_ref()
+        .and_then(|ps| ps.active_deadline_seconds);
+    if let Some(seconds) = pod_deadline {
+        job_spec.task_timeout_secs = u32::try_from(seconds).ok();
+    }
+    if let Some(seconds) = spec.active_deadline_seconds {
+        if pod_deadline.is_some() {
+            warn(format!(
+                "activeDeadlineSeconds {seconds} on the Job is not imported; the pod's \
+                 per-attempt deadline is kept as task_timeout_secs"
+            ));
+        } else {
+            job_spec.task_timeout_secs = u32::try_from(seconds).ok();
+            warn(format!(
+                "activeDeadlineSeconds {seconds} bounds the whole Job; imported as \
+                 task_timeout_secs, which applies per attempt"
+            ));
+        }
+    }
+
+    if let Some(completions) = spec.completions.filter(|c| *c != 1) {
+        warn(format!(
+            "completions {completions} is not imported; the job runs once per trigger"
+        ));
+    }
+    if let Some(parallelism) = spec.parallelism.filter(|p| *p != 1) {
+        warn(format!(
+            "parallelism {parallelism} is not imported; one attempt runs at a time"
+        ));
+    }
+    if let Some(mode) = spec
+        .completion_mode
+        .as_deref()
+        .filter(|mode| *mode != "NonIndexed")
+    {
+        warn(format!("completionMode {mode} is not imported"));
+    }
+    if spec.pod_failure_policy.is_some() {
+        warn("podFailurePolicy is not imported; every failure is retried".to_string());
+    }
+}
+
+fn job_to_jobspec(
+    resource: &str,
+    job: &Job,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> JobSpec {
+    let spec = job.spec.as_ref();
+    let pod_spec = spec.and_then(|s| s.template.spec.as_ref());
+    let mut job_spec = pod_to_jobspec(
+        resource,
+        job.metadata.namespace.as_ref(),
+        pod_spec,
+        configmaps,
+        report,
+    );
+    import_job_policy(resource, spec, &mut job_spec, report);
+    job_spec
+}
+
+fn cronjob_to_jobspec(
+    resource: &str,
+    cj: &CronJob,
+    configmaps: &mut ConfigMaps,
+    report: &mut MigrationReport,
+) -> JobSpec {
     let spec = cj.spec.as_ref();
     let job_template = spec.and_then(|s| s.job_template.spec.as_ref());
     let pod_spec = job_template.and_then(|jt| jt.template.spec.as_ref());
 
     let mut job_spec = pod_to_jobspec(
-        &format!("CronJob/{name}"),
+        resource,
         cj.metadata.namespace.as_ref(),
         pod_spec,
+        configmaps,
         report,
     );
+    import_job_policy(resource, job_template, &mut job_spec, report);
     job_spec.schedule = spec.map(|s| s.schedule.clone());
 
     // Scheduling behaviour Reliaburger doesn't model — say so.
-    if spec.and_then(|s| s.suspend) == Some(true) {
+    let mut warn = |message: String| {
         report.warnings.push(MigrationWarning {
-            resource: format!("CronJob/{name}"),
-            message: "suspend = true is not imported; the job will run on its schedule".to_string(),
-        });
+            resource: resource.to_string(),
+            message,
+        })
+    };
+    if spec.and_then(|s| s.suspend) == Some(true) {
+        warn("suspend = true is not imported; the job will run on its schedule".to_string());
     }
     if let Some(policy) = spec.and_then(|s| s.concurrency_policy.as_ref()) {
         if policy != "Allow" {
-            report.warnings.push(MigrationWarning {
-                resource: format!("CronJob/{name}"),
-                message: format!("concurrencyPolicy {policy} is not imported"),
-            });
+            warn(format!("concurrencyPolicy {policy} is not imported"));
         }
+    }
+    if let Some(zone) = spec.and_then(|s| s.time_zone.as_ref()) {
+        warn(format!(
+            "timeZone {zone} is not imported; a job's schedule runs in UTC"
+        ));
+    }
+    if let Some(seconds) = spec.and_then(|s| s.starting_deadline_seconds) {
+        warn(format!(
+            "startingDeadlineSeconds {seconds} is not imported; a missed firing is skipped"
+        ));
     }
     job_spec
 }
@@ -2400,10 +2772,23 @@ metadata:
 spec:
   replicas: 1
   template:
+    metadata:
+      labels:
+        app: web
     spec:
       containers:
       - name: web
         image: web:v1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 80
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -2863,6 +3248,9 @@ metadata:
   name: backend
 spec:
   template:
+    metadata:
+      labels:
+        app: backend
     spec:
       containers:
       - name: backend
@@ -2876,6 +3264,8 @@ kind: Service
 metadata:
   name: backend
 spec:
+  selector:
+    app: backend
   ports:
   - port: 9898
     targetPort: http
@@ -3057,5 +3447,684 @@ spec:
                 .unwrap()
                 .starts_with("public.ecr.aws/docker/library/busybox@sha256:")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #703: keying by (namespace, name), selector correlation, envFrom, Job
+    // fields. Every finding there was a silent loss, so each test checks the
+    // report as well as the config.
+    // -----------------------------------------------------------------------
+
+    fn report_lines(report: &MigrationReport) -> Vec<String> {
+        report
+            .warnings
+            .iter()
+            .map(|w| format!("{}: {}", w.resource, w.message))
+            .collect()
+    }
+
+    #[test]
+    fn same_named_jobs_in_two_namespaces_both_survive() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: a
+spec:
+  template:
+    spec:
+      containers:
+      - name: migrate
+        image: migrate:a
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: migrate
+  namespace: b
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: migrate
+            image: migrate:b
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.job.len(), 2, "{:?}", result.config.job.keys());
+        assert_eq!(
+            result.config.job["migrate"].image.as_deref(),
+            Some("migrate:a")
+        );
+        assert_eq!(
+            result.config.job["b-migrate"].image.as_deref(),
+            Some("migrate:b")
+        );
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("CronJob/b/migrate") && w.contains("[job.b-migrate]")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn same_named_services_in_two_namespaces_attach_to_their_own_workload() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: alpha
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: api:alpha
+        ports:
+        - containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: beta
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: api:beta
+        ports:
+        - containerPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: alpha
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: beta
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 9090
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app["api"].port, Some(8080));
+        assert_eq!(result.config.app["beta-api"].port, Some(9090));
+        let warnings = report_lines(&result.report);
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("Service/")),
+            "each Service attaches to its own namespace's workload: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_attaches_by_label_selector_not_name() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        tier: frontend
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+        - containerPort: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-http
+spec:
+  selector:
+    app.kubernetes.io/name: web
+  ports:
+  - port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+spec:
+  rules:
+  - host: web.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-http
+            port:
+              number: 9000
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let web = &result.config.app["web"];
+        assert_eq!(web.port, Some(9000), "the Service's port wins");
+        assert_eq!(
+            web.ingress.as_ref().map(|i| i.host.as_str()),
+            Some("web.example.com"),
+            "the Ingress follows its Service to the workload"
+        );
+        let warnings = report_lines(&result.report);
+        // The Service's own name isn't kept, so its clients must be told.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Service/web-http") && w.contains("web:9000")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("nothing answers")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_selector_must_be_a_subset_of_the_pod_labels() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+    tier: frontend
+  ports:
+  - port: 9999
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        // Same name, but the selector doesn't match: Kubernetes would route
+        // nothing, so neither does the import.
+        assert_eq!(result.config.app["web"].port, Some(8080));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Service/web") && w.contains("selects no")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_selecting_two_workloads_is_reported() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blue
+spec:
+  template:
+    metadata:
+      labels:
+        app: shop
+        colour: blue
+    spec:
+      containers:
+      - name: shop
+        image: shop:blue
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: green
+spec:
+  template:
+    metadata:
+      labels:
+        app: shop
+        colour: green
+    spec:
+      containers:
+      - name: shop
+        image: shop:green
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  selector:
+    app: shop
+  ports:
+  - port: 8080
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        // Each workload still takes the Service's port...
+        assert_eq!(result.config.app["blue"].port, Some(8080));
+        assert_eq!(result.config.app["green"].port, Some(8080));
+        // ...but one Service name can't front two apps.
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Service/shop")
+                && w.contains("selects 2 workloads")
+                && w.contains("Deployment/blue")
+                && w.contains("Deployment/green")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_without_a_selector_falls_back_to_its_name_with_a_warning() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  ports:
+  - port: 8080
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app["web"].port, Some(8080));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Service/web") && w.contains("no selector")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_matching_service_named_after_its_workload_is_not_reported() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 8080
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(
+            result.report.warnings.is_empty(),
+            "{:?}",
+            report_lines(&result.report)
+        );
+        assert!(result.report.dropped.is_empty());
+    }
+
+    #[test]
+    fn env_from_configmap_in_input_is_flattened() {
+        let yaml = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+data:
+  LOG_LEVEL: debug
+  MODE: from-configmap
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        env:
+        - name: MODE
+          value: explicit
+        envFrom:
+        - configMapRef:
+            name: settings
+        - prefix: APP_
+          configMapRef:
+            name: settings
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let env = &result.config.app["web"].env;
+        let plain = |key: &str| match env.get(key) {
+            Some(EnvValue::Plain(v)) => Some(v.clone()),
+            _ => None,
+        };
+        assert_eq!(plain("LOG_LEVEL").as_deref(), Some("debug"));
+        assert_eq!(
+            plain("MODE").as_deref(),
+            Some("explicit"),
+            "explicit env wins"
+        );
+        assert_eq!(plain("APP_LOG_LEVEL").as_deref(), Some("debug"));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings.iter().any(
+                |w| w.starts_with("Deployment/web") && w.contains("envFrom ConfigMap/settings")
+            ),
+            "flattening is an approximation: {warnings:?}"
+        );
+        // A ConfigMap that envFrom consumed isn't "not referenced".
+        assert!(
+            !warnings.iter().any(|w| w.contains("not referenced")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn env_from_secret_is_warned() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup
+spec:
+  template:
+    spec:
+      containers:
+      - name: backup
+        image: backup:v1
+        envFrom:
+        - secretRef:
+            name: s3-credentials
+        - configMapRef:
+            name: not-in-the-input
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(result.config.job["backup"].env.is_empty());
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Job/backup") && w.contains("Secret/s3-credentials")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Job/backup")
+                && w.contains("ConfigMap/not-in-the-input")
+                && w.contains("not in the input")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn env_from_configmap_in_another_namespace_is_not_used() {
+        let yaml = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+  namespace: other
+data:
+  LOG_LEVEL: debug
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        envFrom:
+        - configMapRef:
+            name: settings
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert!(result.config.app["web"].env.is_empty());
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Deployment/web") && w.contains("not in the input")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn job_backoff_limit_maps_to_attempts() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      activeDeadlineSeconds: 300
+      containers:
+      - name: migrate
+        image: migrate:v1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: patient
+spec:
+  backoffLimit: 30
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      containers:
+      - name: patient
+        image: patient:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        // backoffLimit counts retries; max_attempts counts the first try too.
+        let migrate = &result.config.job["migrate"];
+        assert_eq!(migrate.max_attempts, Some(3));
+        // A pod's deadline is per attempt, exactly like task_timeout_secs.
+        assert_eq!(migrate.task_timeout_secs, Some(300));
+
+        let patient = &result.config.job["patient"];
+        assert_eq!(patient.max_attempts, Some(10), "clamped to the 1-10 range");
+        assert_eq!(patient.task_timeout_secs, Some(900));
+        let warnings = report_lines(&result.report);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Job/patient") && w.contains("backoffLimit 30")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Job/patient")
+                && w.contains("activeDeadlineSeconds 900")
+                && w.contains("per attempt")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("Job/migrate")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn job_completions_is_warned() {
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: render
+spec:
+  completions: 50
+  parallelism: 5
+  completionMode: Indexed
+  template:
+    spec:
+      tolerations:
+      - key: gpu
+        operator: Exists
+      affinity:
+        nodeAffinity: {}
+      nodeSelector:
+        disk: ssd
+      volumes:
+      - name: scratch
+        emptyDir: {}
+      containers:
+      - name: render
+        image: render:v1
+        workingDir: /work
+        securityContext:
+          runAsUser: 1000
+      - name: sidecar
+        image: sidecar:v1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: "0 3 * * *"
+  timeZone: Europe/London
+  startingDeadlineSeconds: 60
+  jobTemplate:
+    spec:
+      completions: 2
+      template:
+        spec:
+          containers:
+          - name: nightly
+            image: nightly:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let warnings = report_lines(&result.report);
+        for field in [
+            "completions 50",
+            "parallelism 5",
+            "completionMode Indexed",
+            "tolerations",
+            "affinity",
+            "nodeSelector",
+            "volumes",
+            "workingDir",
+            "runAsUser",
+            "sidecar(s)",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("Job/render") && w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
+        for field in [
+            "timeZone Europe/London",
+            "startingDeadlineSeconds",
+            "completions 2",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("CronJob/nightly") && w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_tolerations_and_affinity_are_warned() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      tolerations:
+      - key: dedicated
+        operator: Exists
+      affinity:
+        podAntiAffinity: {}
+      containers:
+      - name: web
+        image: web:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let warnings = report_lines(&result.report);
+        for field in ["tolerations", "affinity"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with("Deployment/web") && w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
     }
 }

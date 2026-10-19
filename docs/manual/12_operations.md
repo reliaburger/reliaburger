@@ -337,6 +337,10 @@ from the cluster, and that the hand-applied app survived every sync:
 scripts/demo/gitops.sh
 ```
 
+Like the rollout demo, it shows Bun's memory and CPU at every step and ends
+with their average and peak ([measuring a
+demo](01_deploy-an-app.md#rolling-deploys) has the details).
+
 ### What GitOps owns
 
 GitOps owns only what it wrote. The cluster remembers, in Raft, every app,

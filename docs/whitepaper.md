@@ -1038,17 +1038,17 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 
 Reliaburger provides bidirectional Kubernetes migration tooling. Neither direction is a perfect translation (the systems have different abstractions), but the goal is to preserve as much as possible and clearly report what was lost.
 
-**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. Today it groups them by name: a Service with the Deployment's name, an Ingress whose backend names that Service, and an HPA whose scale target names the Deployment. Matching on label selectors, the way Kubernetes itself does, is planned ([#703](https://github.com/reliaburger/reliaburger/issues/703)). Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
+**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. It matches them the way Kubernetes routes them, within one namespace: a Service attaches to every workload whose pod template labels include its selector, an Ingress follows its backend Service to that workload, and an HPA joins the workload its scale target names. Everything is keyed by namespace and name, so same-named resources in two namespaces never overwrite each other. A ConfigMap a workload reads with `envFrom` is flattened into its env, and a Job's `backoffLimit` and `activeDeadlineSeconds` become its attempt limit and timeout. Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
 
 ```bash
 # From files (repeat -f for multiple manifests)
 relish import -f deployment.yaml -f service.yaml
 
-# Fail on any conversion warning (CI gate)
+# Fail if anything was approximated or dropped (CI gate)
 relish import -f deployment.yaml --strict
 ```
 
-**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report.
+**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Containers keep their command, arguments, working directory and user. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report, and so is every encrypted env value, which exports as a placeholder that needs a Kubernetes Secret.
 
 ```bash
 relish export -f myapp.toml > k8s-manifests.yaml

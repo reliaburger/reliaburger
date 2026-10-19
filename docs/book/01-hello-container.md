@@ -2778,9 +2778,9 @@ pub struct ImageReference {
 
 The parser handles bare names (`alpine`), names with tags (`alpine:3.19`), user repos (`myuser/myimage:v1`), and custom registries (`ghcr.io/org/image:sha`). It distinguishes registries from user names by checking for a `.` or `:` in the first path component.
 
-### The `oci-distribution` crate
+### The `oci-client` crate
 
-We use the `oci-distribution` crate for the registry protocol. It handles HTTP authentication (we only need anonymous pulls for now), manifest parsing, and blob downloads. The key call is:
+We use the `oci-client` crate for the registry protocol. It handles HTTP authentication (we only need anonymous pulls for now), manifest parsing, and blob downloads. It used to be called `oci-distribution`, and we shipped that name until 0.2.2; upstream renamed it and kept going under the new name. The key call is:
 
 ```rust
 let (manifest, digest, config) = client
@@ -2789,6 +2789,29 @@ let (manifest, digest, config) = client
 ```
 
 This returns an `OciImageManifest` with the layer descriptors. If the registry returns a manifest index (multi-platform), the client's built-in platform resolver automatically selects the right architecture.
+
+Who decides which servers the client trusts? `oci-client` builds its own `reqwest` HTTP client inside, and it doesn't let us hand it one. So every registry client in Reliaburger starts from one function, `registry_client` in `src/grill/oci_pull.rs`, which sets what `oci-client`'s config does expose:
+
+```rust
+pub(crate) fn registry_client_config(protocol: ClientProtocol) -> ClientConfig {
+    ClientConfig {
+        protocol,
+        tls_certs_only: bundled_roots(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn registry_client(protocol: ClientProtocol) -> Result<Client, OciDistributionError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::try_from(registry_client_config(protocol))
+}
+```
+
+`tls_certs_only` trusts the Mozilla root list compiled into the binary (the `webpki-root-certs` crate) and nothing else. Left alone, reqwest 0.13 would read the operating system's trust store instead, and on a host with no CA bundle it would refuse to build a client at all. Installing *ring* as the process's crypto provider stops reqwest falling back to aws-lc. The `let _ =` throws away the error `install_default` returns when a provider is already installed, which is the normal case after the first call.
+
+The last line matters more than it looks. `Client::new` would be the obvious call, but when the config fails to build it logs a warning and quietly hands back a client with reqwest's own defaults. That's a different trust policy wearing the same type. `Client::try_from` returns the error instead. `try_from` comes from the standard `TryFrom` trait, Rust's general shape for a conversion that can fail: here, from a `ClientConfig` into a `Client`.
+
+One default we can't pin is the HTTP version. `oci-client` has no switch for it, and another crate in our build turns on reqwest's HTTP/2 support for everyone (chapter 15 explains how that happens), so registry pulls offer HTTP/2 in the TLS handshake and use it when the registry agrees. The test `registry_client_offers_http2_alongside_http1` pins that, so we notice if it changes.
 
 ### Layer unpacking and whiteouts
 

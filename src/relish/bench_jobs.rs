@@ -655,7 +655,7 @@ async fn measure_raw(args: &JobBenchArgs, cancel: &CancellationToken) -> JobBenc
             return report;
         }
     };
-    report.executable_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+    report.executable_sha256 = Some(hex::encode(Sha256::digest(&bytes)));
     drop(bytes);
     report.started_at = crate::testkit::runner::now_rfc3339();
     let measured_start = Instant::now();

@@ -289,6 +289,15 @@ mod tests {
         toml::from_str("image='fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nnamespace='tenant-a'\nruntime='shared-runc'\ncpu='100m-1000m'\nmemory='32Mi-64Mi'\n[env]\nTOKEN='first'").unwrap()
     }
     #[test]
+    fn executor_key_for_a_job_matches_its_known_answer() {
+        // SHA-256 of 32 zero bytes followed by "x".
+        let key = ExecutorKey([0; 32]).for_job(Some("x"));
+        assert_eq!(
+            hex::encode(key.0),
+            "fdded6faced1af47fdaaac589602f58e0e040a882627806c42ddcc38da604cf0"
+        );
+    }
+    #[test]
     fn startup_retries_runtime_host_and_helper_failures_but_not_refusals() {
         let timed_out = ExecutorError::Runtime(crate::grill::GrillError::StateUnavailable {
             instance: crate::grill::InstanceId("rbtest__executor-0".into()),

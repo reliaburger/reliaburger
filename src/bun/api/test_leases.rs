@@ -486,18 +486,24 @@ pub(super) async fn forward_test_lease_request<T: Serialize + ?Sized>(
         )
             .into_response();
     }
-    let Some(leader_url) = leader_api_url(state, council).await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no cluster leader known yet; retry shortly",
-        )
-            .into_response();
+    let leader_url = match leader_api_url(state, council, headers).await {
+        Ok(url) => url,
+        Err(NoLeaderRoute::Unknown) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no cluster leader known yet; retry shortly",
+            )
+                .into_response();
+        }
+        Err(refusal) => return refusal.into_response(),
     };
-    let mut request = state
-        .cluster_http
-        .client()
-        .request(method, format!("{leader_url}{path}"))
-        .header("x-reliaburger-lease-forwarded", "1");
+    let mut request = mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .request(method, format!("{leader_url}{path}"))
+            .header("x-reliaburger-lease-forwarded", "1"),
+    );
     for name in [
         axum::http::header::AUTHORIZATION,
         axum::http::header::COOKIE,

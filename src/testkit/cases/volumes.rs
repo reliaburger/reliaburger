@@ -151,6 +151,18 @@ mod tests {
 
     const NAMESPACE: &str = "rbtest-volumes-01";
 
+    #[test]
+    fn volume_workloads_pass_the_validation_the_api_applies() {
+        let ctx = TestContext::offline(NAMESPACE);
+        for size in [None, Some("4Mi")] {
+            let spec = idle_with_volume(&ctx, "vol-persist", size);
+            let config = crate::config::Config::parse(&spec).unwrap();
+            if let Err(error) = config.validate_intrinsic() {
+                panic!("the API would refuse this volume workload: {error}\n{spec}");
+            }
+        }
+    }
+
     /// A laptop's view of a two-node cluster: node `one` is the entry node
     /// and runs nothing; `two` runs `app` and answers only through `one`'s
     /// relay. The entry node refuses an exec for an app it doesn't run the

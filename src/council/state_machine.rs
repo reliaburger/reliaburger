@@ -1176,6 +1176,24 @@ impl StateMachineInner {
                     });
                 }
                 let rollouts = self.state.rollouts.entry(app_id.clone()).or_default();
+                // A node redeploying a version that already runs healthy
+                // everywhere (its share moved while the cluster was full)
+                // hasn't found a bad version. There's no previous spec to
+                // hold the app on: it is the previous spec. The node backs
+                // off and tries again.
+                if rollouts
+                    .last_released()
+                    .map(crate::meat::deploy_types::rollout_fingerprint)
+                    .as_deref()
+                    == Some(failure.fingerprint.as_str())
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "{app_id}'s spec already rolled out on every node; \
+                             a node's failed redeploy of it is not a rollout failure"
+                        ),
+                    });
+                }
                 // The first failure is the one that explains it. Another
                 // node's report of the same spec adds nothing.
                 if rollouts.failed_for(&failure.fingerprint).is_none() {
@@ -3186,6 +3204,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn snapshot_checksum_matches_the_fips_known_answer() {
+        // Stored beside every durable snapshot and checked on load.
+        assert_eq!(
+            hex::encode(snapshot_checksum(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     impl CouncilStateMachine {
         // Existing fixtures describe current plans, not a stale admission race.
         // Fill their CAS boundary from the preceding entry; explicit CAS tests
@@ -3330,6 +3357,66 @@ mod tests {
         });
         assert!(matches!(late, Some(CouncilResponse::Refused { .. })));
         assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    /// A node that redeploys a version already running healthy everywhere
+    /// (its share of replicas moved while the cluster was full) and has to
+    /// roll back hasn't found a bad version. Marking it would hold the app
+    /// on "the previous spec", which is the same version, until the
+    /// operator applied a different one: the 0.2.1 jobs soak's frontend
+    /// stayed `rollout-failed` that way after an upgrade walk.
+    #[test]
+    fn a_failure_of_the_released_spec_is_refused() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        let spec = web_spec("web:v1");
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: spec.clone(),
+        });
+        inner.apply_request(&RaftRequest::RolloutReleased {
+            app_id: app_id.clone(),
+            spec: spec.clone(),
+        });
+        let report = inner.apply_request(&RaftRequest::RolloutFailed {
+            app_id: app_id.clone(),
+            failure: failure_of(&spec),
+        });
+        assert!(
+            matches!(&report, Some(CouncilResponse::Refused { reason }) if reason.contains("already rolled out")),
+            "{report:?}"
+        );
+        assert_eq!(inner.state.rollouts[&app_id].failed, None);
+    }
+
+    /// The released version is v1; a failure of the new v2 is still marked.
+    #[test]
+    fn a_failure_of_a_new_version_after_a_release_is_marked() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v1"),
+        });
+        inner.apply_request(&RaftRequest::RolloutReleased {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v1"),
+        });
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: app_id.clone(),
+            spec: web_spec("web:v2"),
+        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::RolloutFailed {
+                app_id: app_id.clone(),
+                failure: failure_of(&web_spec("web:v2")),
+            }),
+            None
+        );
+        assert_eq!(
+            inner.state.rollouts[&app_id].failed,
+            Some(failure_of(&web_spec("web:v2")))
+        );
     }
 
     #[test]

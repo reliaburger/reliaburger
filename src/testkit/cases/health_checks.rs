@@ -49,7 +49,7 @@ async fn hanging_health_check_marks_instance_unhealthy(ctx: TestContext) -> Resu
 /// does not flap.
 async fn slow_but_within_timeout_app_stays_running(ctx: TestContext) -> Result<(), String> {
     let app = "slow";
-    // Responds after 500 ms; the probe timeout is 2 s, so every probe passes.
+    // Responds after 500 ms; the probe timeout is 1 s, so every probe passes.
     ctx.apply(&ctx.testapp_spec_args(app, "slow", 1, &["--delay", "500"]))
         .await?;
     ctx.wait_running_cluster(app, 1).await?;

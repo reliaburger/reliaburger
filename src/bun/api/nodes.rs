@@ -119,17 +119,16 @@ async fn ask_leader_to_hold(
     directory: Option<&LeaderDirectory>,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
-    let Some(leader_url) = super::upgrade::leader_base_url(state, council, directory).await else {
-        return Err(elect_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no cluster leader known yet; retry shortly",
-        ));
-    };
-    let request = state
-        .cluster_http
-        .client()
-        .post(format!("{leader_url}/v1/cluster/elect"))
-        .header(ELECT_HOLD_HEADER, "1");
+    let leader_url = super::upgrade::leader_base_url(state, council, directory, headers)
+        .await
+        .map_err(|refusal| elect_error(StatusCode::SERVICE_UNAVAILABLE, &refusal.to_string()))?;
+    let request = mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .post(format!("{leader_url}/v1/cluster/elect"))
+            .header(ELECT_HOLD_HEADER, "1"),
+    );
     let request = copy_forwarded_auth(request, headers);
     match tokio::time::timeout(HOLD_REQUEST_TIMEOUT, request.send()).await {
         Ok(Ok(response)) if response.status().is_success() => Ok(()),
