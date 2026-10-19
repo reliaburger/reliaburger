@@ -141,18 +141,18 @@ fn onion_objects_use_only_the_original_bpf_instruction_set() {
     // longer knew the index was in bounds.
     const BPF_ALU: u8 = 0x04;
     const BPF_JMP32: u8 = 0x06;
-    // This build's own objects, embedded at compile time like the
-    // library's, never a search of a shared target directory, which can
-    // find another worktree's (#878). Embedding also survives the test
-    // archive running on another machine.
+    // This build's own objects, embedded and aligned (ELF parsing needs
+    // it) like the library's: never a search of a shared target directory,
+    // which can find another worktree's (#878), and still there when the
+    // test archive runs on another machine.
     for (name, bytes) in [
         (
             "onion_connect.bpf.o",
-            &include_bytes!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o"))[..],
+            aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o")),
         ),
         (
             "onion_connect_owned.bpf.o",
-            &include_bytes!(concat!(env!("OUT_DIR"), "/onion_connect_owned.bpf.o"))[..],
+            aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect_owned.bpf.o")),
         ),
     ] {
         let file = object::File::parse(bytes).unwrap();
