@@ -261,9 +261,9 @@ Bun's collection loop samples metrics at `collection_interval_secs` (default 10)
 
 | Metric | Source |
 |--------|--------|
-| `node_cpu_usage_percent` | `sysinfo` global CPU usage |
-| `node_memory_used_bytes` | `sysinfo` used memory |
-| `node_memory_total_bytes` | `sysinfo` total memory |
+| `node_cpu_usage_percent` | `sysinfo` global CPU usage, 0–100 across all cores |
+| `node_memory_used_bytes` | `sysinfo` used memory: `MemTotal` − `MemAvailable` on Linux; app + wired + compressed (Activity Monitor's "Memory Used") on macOS |
+| `node_memory_total_bytes` | `sysinfo` total memory (`MemTotal` on Linux, `hw.memsize` on macOS) |
 | `node_disk_used_bytes` | sum over all disks |
 | `node_disk_total_bytes` | sum over all disks |
 | `node_network_rx_bytes` | sum over all interfaces |
@@ -277,7 +277,7 @@ Note: `node_memory_usage_percent` and `node_disk_usage_percent` (which the built
 
 | Metric | Source | Labels |
 |--------|--------|--------|
-| `process_cpu_percent` | `sysinfo` process CPU | `app` = `"{namespace}/{app}"`, `pid` |
+| `process_cpu_percent` | `sysinfo` process CPU, percent of one core (two busy cores read 200) | `app` = `"{namespace}/{app}"`, `pid` |
 | `process_memory_bytes` | `sysinfo` process RSS | `app` = `"{namespace}/{app}"`, `pid` |
 
 Instances without a PID are skipped. There are no counters here, no restart/OOM/throttle metrics, and no cgroup-derived limits.
