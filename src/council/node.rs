@@ -607,6 +607,30 @@ impl CouncilNode {
         Ok(self.state_machine.desired_state().await.security_state)
     }
 
+    /// [`Self::security_state_linearizable`], but a leader gets `within` to
+    /// prove it leads, as [`Self::confirm_leadership`] does.
+    ///
+    /// One leadership round gives each follower a single heartbeat interval
+    /// to answer, so on a loaded host a settled leader can fail it and refuse
+    /// a read it should serve (#1009). A follower, or a node that names no
+    /// leader, fails at once.
+    pub async fn security_state_confirmed(
+        &self,
+        within: std::time::Duration,
+    ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
+        #[cfg(test)]
+        self.hang_if_asked().await;
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
+        if !self.confirm_leadership(within).await {
+            return Err(CouncilError::ReadFailed(
+                "this node can't prove it leads the council".into(),
+            ));
+        }
+        Ok(self.state_machine.desired_state().await.security_state)
+    }
+
     /// The desired state, confirmed fresh with a quorum first, as
     /// [`Self::security_state_linearizable`] does. Fails on a follower and
     /// on a leader that has been deposed and doesn't know it yet. The
@@ -1153,6 +1177,51 @@ mod tests {
         };
         let (confirmed, ()) = tokio::join!(leader.confirm_leadership(Duration::from_secs(5)), heal);
         assert!(confirmed, "a settled leader gave up after one missed round");
+    }
+
+    #[tokio::test]
+    async fn settled_leader_serves_security_state_after_its_quorum_misses_a_heartbeat_round() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Slow heartbeats, not a lost leader: the followers must not depose
+        // it while it can't reach them (#1009).
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        // One confirmation round can't reach a quorum, so the single-round
+        // read the registry routes used to make answers 503.
+        assert!(leader.security_state_linearizable().await.is_err());
+
+        let healer = router.clone();
+        let heal = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            healer.heal().await;
+        };
+        let (read, ()) = tokio::join!(
+            leader.security_state_confirmed(Duration::from_secs(5)),
+            heal
+        );
+        assert!(
+            read.is_ok(),
+            "a settled leader refused a security read after one missed round"
+        );
+
+        let follower = &nodes[if leader_id == 1 { 1 } else { 0 }];
+        let started = std::time::Instant::now();
+        assert!(
+            follower
+                .security_state_confirmed(Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
