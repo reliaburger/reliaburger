@@ -1953,7 +1953,7 @@ Relish is implemented in Rust. The following crates are used:
 |-------|---------|---------|
 | `clap` (derive) | 4.x | CLI argument parsing, subcommand dispatch, help generation |
 | `ratatui` | 0.29.x | Terminal UI rendering framework (widgets, layouts, styles) |
-| `crossterm` | 0.28.x | Cross-platform terminal manipulation (raw mode, events, colours, cursor) |
+| `crossterm` | 0.29.x | Cross-platform terminal manipulation (raw mode, events, colours, cursor) |
 | `nucleo-matcher` | 0.3.x | Fuzzy matching for the TUI search view |
 | `reqwest` | 0.13.x | HTTP/1.1 client with mTLS, connection pooling, streaming; built through `http_client::builder()` |
 | `tokio` | 1.x | Async runtime for concurrent API calls, WebSocket streams, and TUI event loop |
