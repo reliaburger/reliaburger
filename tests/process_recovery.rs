@@ -1597,19 +1597,25 @@ async fn an_owned_start_refuses_a_binary_made_unexecutable_before_exec() {
 /// restart budget and ending `Failed` without a reason.
 #[tokio::test]
 async fn a_restart_after_the_binary_vanished_ends_failed_with_binary_not_found() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let tool = directory.path().join("self-deleting-tool");
-    // It runs long enough for the deploy to see it start, then removes
-    // its own file and exits, so the restart finds no binary.
-    std::fs::write(&tool, "#!/bin/sh\nsleep 1\nrm -f \"$0\"\nexit 1\n").unwrap();
-    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // It runs until the test has seen the deploy finish, then removes its
+    // own name and exits, so the restart finds no binary. It used to sleep
+    // one second instead, and a deploy that took longer than that to record
+    // the running process failed with "runtime process identity is
+    // unavailable" (#1130). A shared, already-launched script (#582) keeps
+    // macOS's first-launch assessment out of the deploy as well.
+    first_launch::install_script(
+        &tool,
+        "#!/bin/sh\ndir=${0%/*}\ndeadline=$(( $(date +%s) + 60 ))\nwhile [ ! -f \"$dir/vanish\" ]; do [ $(date +%s) -lt $deadline ] || exit 71; sleep 0.05; done\nrm -f \"$0\"\nexit 1\n",
+    );
     let (sender, shutdown, task) = running_agent(directory.path(), &[&tool]);
     deploy(
         &sender,
         &format!("[app.ghost]\nexec = {:?}\n", tool.display().to_string()),
     )
     .await;
+    std::fs::write(directory.path().join("vanish"), b"").unwrap();
 
     let reason = format!("binary not found: {}", tool.display());
     let failed = tokio::time::timeout(Duration::from_secs(20), async {
