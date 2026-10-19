@@ -847,7 +847,7 @@ fn select_council_candidates(
     // (seeded by leader node_id + current term)
     let top = candidates.iter().take(needed * 3).collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(hash(leader_id, current_term));
-    let selected = top.choose_multiple(&mut rng, needed);
+    let selected = top.sample(&mut rng, needed);
 
     selected.map(|n| n.node_id).collect()
 }
