@@ -84,12 +84,14 @@ impl ReleaseMetadata {
 
 /// Fetch and parse metadata from a URL.
 pub async fn fetch(url: &str) -> Result<ReleaseMetadata, UpgradeError> {
-    let response = reqwest::get(url)
-        .await
-        .map_err(|e| UpgradeError::FetchFailed {
-            url: url.to_string(),
-            reason: e.to_string(),
-        })?;
+    let fetch_failed = |e: reqwest::Error| UpgradeError::FetchFailed {
+        url: url.to_string(),
+        reason: e.to_string(),
+    };
+    let client = crate::http_client::builder()
+        .build()
+        .map_err(fetch_failed)?;
+    let response = client.get(url).send().await.map_err(fetch_failed)?;
     if !response.status().is_success() {
         return Err(UpgradeError::FetchFailed {
             url: url.to_string(),

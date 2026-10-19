@@ -16,6 +16,13 @@ import bench_baseline
 RUNS = json.loads((Path(__file__).parent / "fixtures" / "task-array-runs-2026-10-12.json")
                   .read_text())["runs"]
 
+# Every run from 12 to 18 October 2026 where the on-disk ledger benchmark alone
+# was more than 2x the rest of its run: a slow disk, not a regression (#1038).
+STALLS = json.loads((Path(__file__).parent / "fixtures" / "task-array-disk-stalls-2026-10.json")
+                    .read_text())["runs"]
+ON_DISK = "storage/ledger_and_index_64k"
+TMPFS = "storage/ledger_and_index_64k_tmpfs"
+
 SUITE = ["executor/fake_64k", "executor/process_true_256/1", "index_set/insert_sequential_1m",
          "index_set/insert_sparse_10k", "leader_tick/64_arrays_3_nodes", "state/json_encode_1m",
          "state/plan_and_complete_1m/3", "storage/ledger_and_index_64k"]
@@ -291,6 +298,79 @@ class BenchBaselineTests(unittest.TestCase):
         argv = self.remeasure_setup({"storage/ledger_and_index_64k": 2.89}, {})
         argv[-1] = f"{sys.executable} -c 'import sys; sys.exit(3)'"
         self.assertEqual(bench_baseline.main(argv), 1)
+
+    def test_a_report_only_benchmark_over_the_limit_does_not_fail(self):
+        current = scaled(self.suite, {ON_DISK: 3.2})
+        self.assertEqual(bench_baseline.compare(current, self.suite, 2.0).regressions, [ON_DISK])
+        result = bench_baseline.compare(current, self.suite, 2.0, report_only=[ON_DISK])
+        self.assertEqual(result.regressions, [])
+        self.assertFalse(result.failed)
+        row = next(row for row in result.rows if row[0] == ON_DISK)
+        self.assertAlmostEqual(row[3], 3.2)
+        self.assertAlmostEqual(row[4], 3.2)
+
+    def test_a_report_only_benchmark_is_not_part_of_the_rest(self):
+        # With the slow disk counted, the median of the rest rises to 1.3
+        # and hides a 2.6x regression in the CPU-bound benchmark beside it.
+        baseline = {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0, ON_DISK: 1.0}
+        current = {"a": 1.0, "b": 1.0, "c": 2.6, "d": 1.6, ON_DISK: 3.0}
+        self.assertEqual(bench_baseline.compare(current, baseline, 2.0).regressions, [ON_DISK])
+        result = bench_baseline.compare(current, baseline, 2.0, report_only=[ON_DISK])
+        self.assertEqual(result.regressions, ["c"])
+        self.assertAlmostEqual(result.runner, 1.3)
+
+    def test_the_whole_run_bound_ignores_a_report_only_benchmark(self):
+        baseline = {"a": 1.0, "b": 1.0, ON_DISK: 1.0, "d": 1.0}
+        current = {"a": 1.9, "b": 1.9, ON_DISK: 3.0, "d": 3.0}
+        self.assertTrue(bench_baseline.compare(current, baseline, 2.0).run_too_slow)
+        result = bench_baseline.compare(current, baseline, 2.0, report_only=[ON_DISK])
+        self.assertFalse(result.run_too_slow)
+
+    def test_the_disk_stalls_of_october_fail_with_every_benchmark_gated(self):
+        # The evidence for #1038: the on-disk ledger alone is over the limit.
+        for run in STALLS:
+            with self.subTest(run=run["run"]):
+                result = bench_baseline.compare(run["current"], run["baseline"], 2.0)
+                self.assertEqual(result.regressions, [ON_DISK])
+
+    def test_the_disk_stalls_of_october_pass_with_the_on_disk_ledger_report_only(self):
+        for run in STALLS:
+            with self.subTest(run=run["run"]):
+                result = bench_baseline.compare(run["current"], run["baseline"], 2.0,
+                                                report_only=[ON_DISK])
+                self.assertEqual(result.regressions, [])
+                self.assertFalse(result.failed)
+
+    def test_a_regression_in_any_gated_benchmark_of_the_disk_stalls_still_fails(self):
+        for run in STALLS:
+            # The runs predate the tmpfs variant: add it at an unremarkable
+            # ratio. A benchmark new in that run has no baseline to regress from.
+            baseline = dict(run["baseline"], **{TMPFS: 1.0})
+            current = dict(run["current"], **{TMPFS: 1.0})
+            gated = [name for name in current if name != ON_DISK and name in baseline]
+            for name in gated:
+                with self.subTest(run=run["run"], benchmark=name):
+                    ratios = {other: current[other] / baseline[other] for other in gated}
+                    ratio = ratios.pop(name)
+                    target = 2.1 * max(1.0, statistics.median(ratios.values()))
+                    pushed = scaled(current, {name: target / ratio})
+                    result = bench_baseline.compare(pushed, baseline, 2.0, report_only=[ON_DISK])
+                    self.assertEqual(result.regressions, [name])
+
+    def test_a_report_only_benchmark_is_not_remeasured(self):
+        argv = self.remeasure_setup({ON_DISK: 3.2}, {})
+        self.assertEqual(bench_baseline.main(argv + ["--report-only", ON_DISK]), 0)
+        self.assertEqual(self.filters(), [])
+        text = self.summary.read_text()
+        self.assertNotIn("re-measured", text)
+        self.assertRegex(text, rf"\| `{ON_DISK}` \(report only\) \|[^\n]*\| 3\.20 \| 3\.20 \|")
+
+    def test_a_report_only_benchmark_is_named_in_the_summary_heading(self):
+        argv = self.remeasure_setup({}, {})
+        self.assertEqual(bench_baseline.main(argv + ["--report-only", ON_DISK]), 0)
+        text = self.summary.read_text()
+        self.assertIn(f"`{ON_DISK}` is report only", text)
+        self.assertIn("| `executor/fake_64k` |", text)
 
     def test_an_empty_criterion_directory_is_an_error(self):
         empty = self.root / "empty"

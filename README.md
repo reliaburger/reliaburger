@@ -319,7 +319,10 @@ it would take out every replica or put the council's quorum at risk.
 **Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
 blue-green switches and autoscaling on metrics. Point the cluster at a Git
 repository and the leader keeps it in sync, verifying commit signatures if you
-ask it to.
+ask it to. `scripts/demo/rollout.sh` and `scripts/demo/gitops.sh` show both on
+a one-node cluster from a checkout, with
+[`examples/phase-1/proc-rollout.toml`](examples/phase-1/proc-rollout.toml) and
+[`examples/gitops/repository`](examples/gitops/repository).
 
 **A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
 cron schedule, a hook that runs before a deploy, and a task array that runs the

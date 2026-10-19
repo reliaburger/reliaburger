@@ -558,7 +558,7 @@ impl BunClient {
     fn build(base_url: &str, token: Option<&str>, ca_pem: Option<&[u8]>) -> Self {
         let mut websocket_tls = None;
         let client = (|| -> Result<reqwest::Client, String> {
-            let mut builder = reqwest::Client::builder()
+            let mut builder = crate::http_client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .redirect(reqwest::redirect::Policy::none());
             if let Some(token) = token {
@@ -702,7 +702,7 @@ impl BunClient {
     /// the cluster CA, without the API bearer or client identity.
     pub fn workload_http_builder(&self) -> Result<reqwest::ClientBuilder, String> {
         self.http().map_err(|error| error.to_string())?;
-        let mut builder = reqwest::Client::builder()
+        let mut builder = crate::http_client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(3));
@@ -3758,6 +3758,42 @@ mod tests {
             client.health().await.is_err(),
             "a client trusting a different CA must refuse the connection"
         );
+
+        shutdown.cancel();
+    }
+
+    /// The workload client merges the cluster CA with the public roots, so
+    /// it's the one a changed reqwest trust default could widen. A different
+    /// cluster CA must still be refused, and the right one accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workload_client_refuses_a_server_signed_by_a_different_cluster_ca() {
+        let server_hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("server-ca", b"ikm").unwrap();
+        let other_hierarchy = crate::sesame::ca::generate_ca_hierarchy("other-ca", b"ikm").unwrap();
+        let server = test_identity(&server_hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let addr = spawn_tls_health(&server, shutdown.clone()).await;
+        // The workload client verifies hostnames; the node leaf names `node-01`.
+        let url = format!("https://node-01:{}/v1/health", addr.port());
+
+        let wrong_ca_pem = pem_cert(&other_hierarchy.node.ca.certificate_der);
+        let wrong = BunClient::build(&format!("https://{addr}"), None, Some(&wrong_ca_pem))
+            .workload_http_builder()
+            .unwrap()
+            .resolve("node-01", addr)
+            .build()
+            .unwrap();
+        let refused = wrong.get(&url).send().await;
+        assert!(refused.is_err(), "{refused:?}");
+
+        let right_ca_pem = pem_cert(&server_hierarchy.node.ca.certificate_der);
+        let right = BunClient::build(&format!("https://{addr}"), None, Some(&right_ca_pem))
+            .workload_http_builder()
+            .unwrap()
+            .resolve("node-01", addr)
+            .build()
+            .unwrap();
+        assert!(right.get(&url).send().await.unwrap().status().is_success());
 
         shutdown.cancel();
     }

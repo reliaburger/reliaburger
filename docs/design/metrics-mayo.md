@@ -109,7 +109,7 @@ Retention is a single `retention_days` value (default **7**). Two paths prune Pa
 
 ### 3.3 Rollup Push to Council Members
 
-**What ships:** each worker node runs a rollup worker (`src/mayo/rollup_worker.rs`) that, every `rollup_interval_secs` (default 60), generates a `NodeRollup` -- 1-minute (min, max, sum, count) aggregates of the local metrics -- and sends it to its assigned council parent over the reporting transport (bincode-framed messages, `ReportingMessage::MetricsRollup`, not gRPC). The council member stores received rollups in a separate rollup store, exposed at `/v1/metrics/rollup` (this member's own data) and `/v1/metrics/cluster`.
+**What ships:** each worker node runs a rollup worker (`src/mayo/rollup_worker.rs`) that, every `rollup_interval_secs` (default 60), generates a `NodeRollup` -- 1-minute (min, max, sum, count) aggregates of the local metrics -- and sends it to its assigned council parent over the reporting transport (postcard-framed messages, `ReportingMessage::MetricsRollup`, not gRPC). The council member stores received rollups in a separate rollup store, exposed at `/v1/metrics/rollup` (this member's own data) and `/v1/metrics/cluster`.
 
 **What is planned -- not yet implemented:**
 
@@ -311,7 +311,7 @@ An executor's cgroup holds its helper as well as its task groups, so the sample 
 
 ### 5.4 Rollup Push to the Council
 
-Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to its council parent as a `ReportingMessage::MetricsRollup` over the reporting transport (bincode-framed, **not** gRPC or a bespoke TCP call). Parents are assigned by an FNV-1a hash of the node ID over the sorted council list (`src/reporting/assignment.rs`), so every node computes the same tree without coordination.
+Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to its council parent as a `ReportingMessage::MetricsRollup` over the reporting transport (postcard-framed, **not** gRPC or a bespoke TCP call). Parents are assigned by an FNV-1a hash of the node ID over the sorted council list (`src/reporting/assignment.rs`), so every node computes the same tree without coordination.
 
 **Reassignment backfill: implemented.** When the council changes and a node's parent moves, the worker's next push is a backfill: the last five minutes as per-minute rollups (`RollupGenerator::generate_backfill`), each stamped with its own minute so the new parent's `(node, timestamp)` dedup makes re-sends idempotent. A failed send keeps the backfill request set and retries on the next tick; minutes older than the five-minute window stay only in the node's local store.
 
@@ -697,7 +697,7 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 | `datafusion` | SQL query engine over Parquet | Executes queries against the on-disk Parquet blocks. Parquet read/write support ships with DataFusion, so there is no separate arrow/parquet dependency. Mayo's query language is DataFusion SQL, not PromQL. |
 | `object_store` | Block storage abstraction | Reads and writes Parquet blocks behind a single interface over a local path, `file://`, `s3://`, or `gs://`. |
 | `prometheus-parse` | Prometheus exposition parsing | Parses `text/plain` `/metrics` scrape responses (with `# HELP`, `# TYPE`, and metric lines) into samples. |
-| `bincode` | Rollup serialisation | Encodes `NodeRollup` payloads pushed node-to-council over TCP. |
+| `postcard` | Rollup serialisation | Encodes `NodeRollup` payloads pushed node-to-council over TCP. |
 | `axum`/`hyper` | HTTP server | Serves the `/v1/metrics*` and `/v1/alerts` JSON endpoints. (No remote-read or `/metrics` exposition endpoint -- planned.) |
 | `sysinfo` | Node + process metrics | Cross-platform CPU/memory/disk/network sampling; works on Linux and macOS without cgroup/`/proc` code. |
 | `tokio` | Async runtime | Drives the scrape scheduler, query fan-out, rollup push, and compaction background tasks. Already used by Bun. |

@@ -102,7 +102,7 @@ The `relish routes` command queries the Wrapper ingress proxy for the current ro
 |  +------------------+       +------------------+                  |
 |  |   API Client     |       | Output Formatter |                  |
 |  |                  |       |                  |                  |
-|  |  reqwest HTTP/2  |       |  human-readable  |                  |
+|  |  reqwest HTTP/1.1|       |  human-readable  |                  |
 |  |  mTLS, token     |       |  JSON, table,    |                  |
 |  |  auth, WebSocket |       |  TOML             |                  |
 |  |  streaming       |       |                  |                  |
@@ -1943,7 +1943,7 @@ Relish is implemented in Rust. The following crates are used:
 | `ratatui` | 0.29.x | Terminal UI rendering framework (widgets, layouts, styles) |
 | `crossterm` | 0.28.x | Cross-platform terminal manipulation (raw mode, events, colours, cursor) |
 | `nucleo-matcher` | 0.3.x | Fuzzy matching for the TUI search view |
-| `reqwest` | 0.12.x | HTTP/2 client with mTLS, connection pooling, streaming |
+| `reqwest` | 0.13.x | HTTP/1.1 client with mTLS, connection pooling, streaming; built through `http_client::builder()` |
 | `tokio` | 1.x | Async runtime for concurrent API calls, WebSocket streams, and TUI event loop |
 | `tokio-tungstenite` | 0.28.x | WebSocket client for streaming logs, events, and exec sessions |
 | `yaml_serde` | 0.10.x | YAML serialisation for `--output yaml` mode and Kubernetes import (the maintained successor to `serde_yaml`) |

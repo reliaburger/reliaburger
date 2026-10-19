@@ -92,7 +92,7 @@ impl NodeRenewalWorker {
             .map_err(|error| MtlsError::ConfigFailed(format!("renewal service token: {error}")))?;
         bearer.set_sensitive(true);
         headers.insert(reqwest::header::AUTHORIZATION, bearer);
-        let http = reqwest::Client::builder()
+        let http = crate::http_client::builder()
             .use_preconfigured_tls(tls)
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())

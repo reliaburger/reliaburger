@@ -446,7 +446,9 @@ task-array benchmarks when it touches the task-array leader, node pool,
 executor, range sets or `benches/task_arrays.rs`. The gossip numbers gate
 nothing; the task-array job fails only on a benchmark more than twice as slow
 against main's last baseline as the rest of its run, or on a run whose median
-benchmark is, and keeps its Criterion output for 90 days
+benchmark is. The on-disk ledger benchmark only reports, since it measures
+the runner's disk; its tmpfs twin is gated. The job keeps its Criterion output
+for 90 days
 ([how](testing.md#benchmarks-in-ci)).
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
@@ -994,6 +996,11 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`proc-init-container.toml`](../examples/phase-1/proc-init-container.toml) | App with init container |
 | [`proc-full-featured.toml`](../examples/phase-1/proc-full-featured.toml) | All Phase 1 features |
 | [`proc-multi-app.toml`](../examples/phase-1/proc-multi-app.toml) | Multiple apps in one config |
+| [`proc-rollout.toml`](../examples/phase-1/proc-rollout.toml) | Rolling deploy, rollback and automatic rollback ([`scripts/demo/rollout.sh`](../scripts/demo/rollout.sh) runs it) |
+| [`proc-exec-app.toml`](../examples/phase-8/proc-exec-app.toml) | A host binary as an app, and the allowlist it needs |
+| [`proc-run-before.toml`](../examples/phase-8/proc-run-before.toml) | A migration job that gates its app |
+| [`proc-script-job.toml`](../examples/phase-8/proc-script-job.toml) | A cron job written as an inline script (a template: needs Postgres) |
+| [`gitops/repository/`](../examples/gitops/repository) | A GitOps repository with directory namespaces ([`scripts/demo/gitops.sh`](../scripts/demo/gitops.sh) syncs it; [`node/gitops.toml`](../examples/node/gitops.toml) is its `[gitops]` section) |
 | **Real containers** (`container-*`) | **Pulls OCI images — requires Linux runc** |
 | [`container-hello.toml`](../examples/phase-1/container-hello.toml) | Alpine hello world job |
 | [`container-nginx.toml`](../examples/phase-1/container-nginx.toml) | nginx with health check |
@@ -1003,6 +1010,14 @@ See [`examples/`](../examples/) for ready-to-apply configs:
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
 | [`container-egress.toml`](../examples/phase-1/container-egress.toml) | Job egress allowlist that resolves and reaches one host |
+| [`container-allow-from.toml`](../examples/phase-1/container-allow-from.toml) | One cross-namespace path opened with `allow_from` |
+| [`container-tls-ingress.toml`](../examples/phase-1/container-tls-ingress.toml) | HTTPS ingress with the cluster's own certificates |
+| [`container-rollout.toml`](../examples/phase-1/container-rollout.toml) | Blue-green deploy with automatic rollback |
+| [`container-secrets.toml`](../examples/phase-1/container-secrets.toml) | An encrypted `ENC[AGE:...]` environment value |
+| [`container-batch-jobs.toml`](../examples/phase-8/container-batch-jobs.toml) | Named jobs submitted as one batch |
+| [`container-shared-runc-array.toml`](../examples/phase-8/container-shared-runc-array.toml) | A task array on reusable containers |
+| [`container-build-job.toml`](../examples/phase-8/container-build-job.toml) | Building the burger image on the cluster |
+| [`container-chaos-scenario.toml`](../examples/phase-8/container-chaos-scenario.toml) | A scripted chaos scenario against the tour's podinfo apps |
 
 ### Images, the pull-through cache, and cluster registries (Phase 12)
 
