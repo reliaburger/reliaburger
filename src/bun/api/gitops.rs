@@ -124,19 +124,19 @@ async fn admit_gitops_webhook(
                     });
             let leader = match advertised {
                 Some(address) => state.cluster_http.url(&address.to_string(), ""),
-                None => match leader_api_url(&state, council).await {
-                    Some(leader) => leader,
-                    None => {
-                        return webhook_unavailable("no cluster leader known yet; retry shortly");
-                    }
+                None => match leader_api_url(&state, council, &headers).await {
+                    Ok(leader) => leader,
+                    Err(refusal) => return webhook_unavailable(refusal),
                 },
             };
-            let mut request = state
-                .cluster_http
-                .client()
-                .post(format!("{leader}/v1/gitops/webhook"))
-                .header(WEBHOOK_FORWARDED_HEADER, "1")
-                .body(body);
+            let mut request = mark_leader_forwarded(
+                state
+                    .cluster_http
+                    .client()
+                    .post(format!("{leader}/v1/gitops/webhook"))
+                    .header(WEBHOOK_FORWARDED_HEADER, "1")
+                    .body(body),
+            );
             // Preserve the raw body and provider credentials. The receiving
             // leader authenticates the same bytes; no service token substitutes.
             for name in [

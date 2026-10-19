@@ -1683,6 +1683,34 @@ decompressor for qcow2 (Lima's `master` has added one since). The host agent
 still steps the guest clock every 10 s past 100 ms of drift. The workarounds
 stay.
 
+### A rotation while every node was down
+
+The soak rotates the operator's ingress certificate every few minutes, and
+after each reload it tells the checker which serial each node must now serve.
+The 0.2.1 candidate 6 jobs soak failed every node at once: "serves 100B, not
+the 100A reloaded 590 s ago". Bun was right; the harness had lost track.
+
+A rotation fired while the "every VM powered off at once" special held the
+whole cluster down. It skipped all three nodes, as it should, but it still
+made 100B the pair the harness calls current. On power-on, the special pushed
+that current pair to every node and never told the checker, which still
+expected 100A from the last rotation that had reached them. A single-node
+power-on did tell it, because it pushed the pair through code that also
+records the expectation. Now both paths use one helper,
+`push_current_pair`, and a test reads `qualify-sustained.sh` to check that
+every push of the current pair records what the node must serve
+([#1108](https://github.com/reliaburger/reliaburger/issues/1108)).
+
+The lesson is an old one: two copies of "do the thing, then record it" drift
+apart, and the copy that runs least is the one that's wrong. The all-off
+special runs once per soak.
+
+### An alert the load raises on purpose
+
+The checker fails a tier when a `relish wtf` warning outlasts ten minutes past the last settle. Candidate 6's 8 h jobs final failed that way on two warnings at once. One was a real bug (#1110, in Chapter 7). The other was Mayo's `cpu_throttle` alert, which fires once a guest's CPU stays above 90% for five minutes. The jobs soak drives 2-vCPU guests at the job target rate on purpose, so the alert fired nearly all run long, in passing runs too. It failed this one only because fourteen minutes went by without a settle to reset the clock (#1112).
+
+The alert said "the load is the load", which tells us nothing about the candidate, and whether it failed a tier came down to timing. So the checker now records `cpu_throttle` as an `info` finding instead of gating on it. `memory_high` stays gated, because a Bun that grows past 70% of its guest is the leak the soak exists to catch. The same fix caught a second bug: every cluster-wide alert shared one key, `warning|alerts-firing|cluster`, so an alert that had just started firing inherited the age of an older one. The key now ends in the rule's name, taken from the alert's title, so each alert keeps its own clock.
+
 ### Status from any node
 
 A one-replica app can run on the third VM while your CLI connects to the first.

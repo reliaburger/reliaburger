@@ -1086,6 +1086,23 @@ writes them back, byte for byte. A one-line `.gitattributes` keeps git from "fix
 fixtures' CRLFs, which would make the test check the wrong bytes. The bump also left one
 `pem` in `Cargo.lock` instead of two, since rcgen 0.14 had already moved to 4.
 
+One crate never showed up in `make outdated` at all. We were on `oci-distribution` 0.11,
+and upstream had renamed it `oci-client` and carried on publishing under the new name. No
+newer `oci-distribution` will ever exist, so `cargo update` saw nothing to do. A rename is
+invisible to every tool that compares version numbers; only reading the changelog, or the
+crate page, finds it
+([#1045](https://github.com/reliaburger/reliaburger/issues/1045)). Before we moved, we
+checked that `oci-client` 0.18 was a real, maintained release. bincode had just shown us
+that the next version can be a tombstone.
+
+`oci-client` 0.18 sits on reqwest 0.13, so the same three defaults moved, but
+`http_client::builder()` can't help: `oci-client` builds its reqwest client inside and
+takes only a config struct. That struct has a `tls_certs_only` field, so registry pulls
+trust the same bundled Mozilla roots, and we install ring before building the client. It
+has no HTTP version setting, so registry pulls offer HTTP/2 and use it when the registry
+agrees. Chapter 1 shows the code. A test pins the HTTP/2 offer, so the difference stays a
+known one rather than a surprise.
+
 The lockfile pins what we tested. It doesn't promise that what we tested is any good.
 
 ## Asking the cluster what it can do
@@ -5597,6 +5614,71 @@ change only its own ownership, so the services and runtime holds everyone
 else reads are the same either side of one. That's what makes them safe to
 leave in flight.
 
+#### The wait moved, not the write
+
+That last paragraph had a hole in it, and the 0.2.1 soak found it. Node 2
+rolled back mid-upgrade, its Bun restarted on a disk busy with the restart,
+and the journal said:
+
+```
+21:44:47 bun: a discovery journal write took 5864 ms; the agent loop went on meanwhile
+21:44:47 bun: agent loop turn took 4987 ms in deploy_op (health_probe_result): journal write 22 ms
+```
+
+The consumer's write did go on without the loop. Then a health probe came
+back with a change, and publishing an instance's health journals discovery
+too. `update_discovery_inventory` settles a write in flight first, exactly
+as the paragraph above promised. So the probe's turn sat out the other
+write's last five seconds, and its own write took 22 ms. The line was
+honest about the part it timed, and silent about the rest.
+
+Two changes (#1100). First, the wait gets a name. `settle_discovery_write`
+times its await as a new part, `TurnPart::InFlightWrite`, so a turn that
+pays for someone else's write now says "wait for a write in flight 4965 ms"
+instead of leaving four seconds unexplained. Second, a health probe doesn't
+pay at all. Publishing health now says what it did:
+
+```rust
+pub(super) enum HealthPublication {
+    Current,
+    Published,
+    Deferred,
+}
+```
+
+`Deferred` means a write is in flight, so nothing was published and nothing
+changed. The probe's caller handles it like a refused publication:
+
+```rust
+match self.publish_instance_health(&instance_id).await {
+    Ok(HealthPublication::Current | HealthPublication::Published) => {}
+    Ok(HealthPublication::Deferred) => { /* schedule the next probe, stop */ }
+    Err(error) => { /* log, schedule the next probe, stop */ }
+}
+```
+
+The `|` inside a pattern matches either variant, so one arm covers both
+outcomes that let the probe carry on. Stopping is safe for the same reason a
+failed publication's retry is: `service_map` changes only after a
+publication succeeds, so the next probe still sees a difference and
+publishes it. And because the probe stops before the restart code, an
+instance that turned unhealthy can't be restarted until its withdrawal is
+on disk.
+
+`a_health_change_waits_for_no_discovery_write_in_flight` leaves a 1.6 s write
+in flight, delivers an unhealthy probe through `handle_deploy_op`, and checks
+that the turn stays inside the budget, the backend still reads healthy, and
+the instance hasn't restarted. Then it lands the write, and the next probe
+publishes the withdrawal. `a_turn_that_waits_for_a_write_in_flight_names_the_wait`
+checks the new part.
+
+What we still didn't do is defer every writer. A restart that has already
+started its replacement, a deploy publishing a new backend, and a stop
+retiring a service still wait for a write in flight, because each decides
+what to do next from what it wrote. Health probes were different: they run
+on every interval for every checked instance, and what they publish can
+always wait for the next one.
+
 #### A 503 is an answer, not a verdict
 
 Candidate 7's jobs soak failed a pulse on one line: `deploy_from_cluster_registry`
@@ -6588,6 +6670,17 @@ it. Now the demo's test runs `validate_intrinsic`, the same checks the API
 applies, and `tests/suite/documented_manifests.rs` runs them on every manifest
 we tell people to apply as written: everything in `examples/`, and the TOML in
 the README, the quickstart, the Linux servers guide and the website.
+
+That guard only reads manifests we wrote by hand. `relish test` writes its own,
+in code, and two of its generators still set `interval = 1` with `timeout = 2`.
+Three 0.2.1 soaks (candidates 3 and 4, and the run that reproduced them) each
+recorded a failed chaos scenario that died at apply in 200 milliseconds. The harness kept the last three lines of the JSON
+report, which were closing brackets, so the reason sat unread in the evidence
+directory. A spec generated at run time is still a spec the API judges. Now
+each module that builds one has a unit test that renders it and runs
+`validate_intrinsic`: the `TestContext` helpers, the chaos workload, the bench
+suites and the volume and firewall fixtures. The soak records each failing
+case's reason instead of the tail of the file.
 
 Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
 already checks gossip rejoin; the replacement process's local boot-marker check

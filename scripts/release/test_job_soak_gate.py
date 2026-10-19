@@ -1,6 +1,7 @@
 """A pretty job table must not turn missing or orphaned evidence into a pass."""
 import copy
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -907,3 +908,33 @@ class ControllerFallback(unittest.TestCase):
         self.assertEqual(report["api_fallbacks"],snapshot["api_fallbacks"])
         text="\n".join(checker.job_qualification_lines(report))
         self.assertIn("API fallbacks: n1 missed 1, n2 missed 1; n3 answered 1",text)
+
+
+class CurrentPairExpectations(unittest.TestCase):
+    """#1108: a rotation during the all-off hold moved `current` on while
+    every node was down, and the special pushed it on power-on without
+    `ingress-expect`, so the checker failed every node for serving it."""
+
+    def functions(self):
+        source=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        bodies={}
+        for header in re.finditer(r"\n([a-z_]+)\(\) \{\n",source):
+            body=source[header.end():]
+            bodies[header.group(1)]=body[:body.index("\n}\n")]
+        return bodies
+
+    def test_every_push_of_the_current_pair_records_what_the_node_must_serve(self):
+        pushes={name:body for name,body in self.functions().items()
+                if 'push_pair "$node" "$tls/current/' in body}
+        self.assertIn("push_current_pair",pushes)
+        for name,body in pushes.items():
+            with self.subTest(function=name):
+                push=body.index('push_pair "$node" "$tls/current/')
+                self.assertIn("check ingress-expect",body[push:])
+
+    def test_power_on_and_the_all_off_special_push_through_the_helper(self):
+        bodies=self.functions()
+        for name in ("power_on","special_all_off"):
+            with self.subTest(function=name):
+                self.assertIn("push_current_pair",bodies[name])
+                self.assertNotIn('push_pair "$node" "$tls/current/',bodies[name])

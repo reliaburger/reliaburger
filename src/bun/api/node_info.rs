@@ -334,7 +334,11 @@ pub(super) async fn desired_apps_handler(
     directory: Option<axum::Extension<LeaderDirectory>>,
     headers: HeaderMap,
 ) -> Response {
-    let source = if headers.contains_key(DESIRED_APPS_FORWARDED_HEADER) {
+    // Either marker means another node forwarded this read here; it is
+    // never forwarded again.
+    let source = if headers.contains_key(DESIRED_APPS_FORWARDED_HEADER)
+        || headers.contains_key(LEADER_FORWARDED_HEADER)
+    {
         DesiredAppsSource::ForwardedRequest
     } else {
         DesiredAppsSource::Caller(directory.as_deref())
@@ -485,23 +489,23 @@ async fn desired_apps_from_leader(
     council: &crate::council::CouncilNode,
     directory: Option<&LeaderDirectory>,
 ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
-    let advertised = directory.and_then(|LeaderDirectory(directory)| {
-        let metrics = council.metrics();
-        let metrics = metrics.borrow();
-        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
-    });
-    let leader_url = match advertised {
-        Some(address) => state.cluster_http.url(&address.to_string(), ""),
-        None => leader_api_url(state, council).await.ok_or_else(|| {
-            "desired cluster state requires a current leader, and none is known yet; retry shortly"
-                .to_string()
-        })?,
-    };
-    let mut request = state
-        .cluster_http
-        .client()
-        .get(format!("{leader_url}/v1/diagnostics/apps"))
-        .header(DESIRED_APPS_FORWARDED_HEADER, "1");
+    // A read another node forwarded never gets here (it is refused
+    // first), so there's no inbound marker to check.
+    let leader_url = super::upgrade::leader_base_url(state, council, directory, &HeaderMap::new())
+        .await
+        .map_err(|refusal| match refusal {
+            NoLeaderRoute::Unknown => "desired cluster state requires a current leader, \
+                    and none is known yet; retry shortly"
+                .to_string(),
+            other => other.to_string(),
+        })?;
+    let mut request = mark_leader_forwarded(
+        state
+            .cluster_http
+            .client()
+            .get(format!("{leader_url}/v1/diagnostics/apps"))
+            .header(DESIRED_APPS_FORWARDED_HEADER, "1"),
+    );
     if let Some(token) = &state.service_token {
         request = request.bearer_auth(token);
     }

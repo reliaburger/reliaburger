@@ -335,8 +335,8 @@ Where does the cluster path plug into the runtime? Inside `ImageStore::pull_and_
 Except this "optimisation" turned out to be a correctness fix. Look at the external client's configuration:
 
 ```rust
-let client_config = oci_distribution::client::ClientConfig {
-    protocol: oci_distribution::client::ClientProtocol::Https,
+let client_config = oci_client::client::ClientConfig {
+    protocol: oci_client::client::ClientProtocol::Https,
     ..Default::default()
 };
 ```
@@ -374,7 +374,7 @@ pub fn decide(catalog, cached_repo, tag, now, recheck) -> CacheState
 
 `Miss` → fetch everything. `Fresh` (committed less than an hour ago) → serve the cache, touch nothing. `Stale` → the cheap move: a HEAD request for the manifest digest (a few hundred bytes) and compare with what we cached. Same digest: the tag hasn't moved, it's a `Hit`. New digest: `Refetch`. Note what `decide` takes: `now` is a *parameter*, not a call to the system clock. Time is an input like any other, which is why every path of this logic tests deterministically: no sleeps, no flaky windows.
 
-The network side hides behind a three-method trait (`head_manifest_digest`, `fetch_manifest`, `fetch_blob`) with two implementations from day one. `OciUpstream` wraps the `oci-distribution` client we already ship (with an `insecure_http` constructor so integration tests can point it at an in-process registry). The test mock scripts digests and *counts calls* with an `AtomicUsize`, which is how you prove statements like "a stale check makes exactly one HEAD and zero blob fetches", the pattern for testing internet-facing code with no internet.
+The network side hides behind a three-method trait (`head_manifest_digest`, `fetch_manifest`, `fetch_blob`) with two implementations from day one. `OciUpstream` wraps the `oci-client` crate (called `oci-distribution` until 0.2.2) we already ship (with an `insecure_http` constructor so integration tests can point it at an in-process registry). The test mock scripts digests and *counts calls* with an `AtomicUsize`, which is how you prove statements like "a stale check makes exactly one HEAD and zero blob fetches", the pattern for testing internet-facing code with no internet.
 
 Credentials follow the same resolve-at-startup shape as everything else in Sesame's orbit: `[images] external_registries` lists hosts with a username and a *secret name*; resolution maps names to plaintext through an injected lookup, and anything unresolvable degrades to anonymous access rather than failing the boot. Anonymous is what public registries want anyway.
 
