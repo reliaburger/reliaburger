@@ -776,7 +776,7 @@ enum Command {
         /// Kubernetes YAML files to import.
         #[arg(short = 'f', long = "file", required = true)]
         files: Vec<PathBuf>,
-        /// Exit non-zero if any warnings are generated.
+        /// Exit non-zero if anything is approximated or dropped.
         #[arg(long)]
         strict: bool,
     },

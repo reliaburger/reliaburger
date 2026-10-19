@@ -3,7 +3,9 @@
 # A demo sources this file, calls demo_start once, and drives the node it
 # started with `relish`. demo_start and demo_stop are the one place a demo's
 # cluster starts and stops: anything that should happen around every demo
-# (showing its resource use, say) goes there.
+# goes there. Measuring the demo's resource use does (#671): resources.py
+# samples Bun and its workloads in the background, demo_step shows the latest
+# sample before each heading, and demo_stop prints the average and peak.
 #
 # The node is a real one-node cluster, set up the way the manual says:
 # `relish init` writes its identity, CA and keys, and Bun runs it with
@@ -20,6 +22,10 @@
 #   DEMO_KEEP=1           keep the temporary directory, Bun's log included
 #   DEMO_RUNTIME          the node's runtime: process (default), or runc as root
 #                         on Linux to try the container examples
+#   DEMO_RESOURCES=0      don't measure the demo's resource use
+#   DEMO_RESOURCES_OUT    keep the samples there as resources.csv and steps.tsv,
+#                         with cpu.svg and memory.svg charts of them
+#   DEMO_SAMPLE_INTERVAL  seconds between samples (default 1)
 #
 # The scripts need bash 3.2 (macOS's /bin/bash).
 
@@ -33,11 +39,67 @@ DEMO_SECOND_APP_PORT=$((DEMO_PORT_BASE + 5))
 DEMO_THIRD_APP_PORT=$((DEMO_PORT_BASE + 6))
 DEMO_WORK=""
 DEMO_BUN_PID=""
+DEMO_RESOURCES_PID=""
+DEMO_RESOURCES_START=""
 
-# A section heading, so a reader can follow along.
+# A section heading, so a reader can follow along, after the resource use
+# of the step before it.
 demo_step() {
+    demo_resources_readout "$*"
     echo ""
     echo "==> $*"
+}
+
+# Sample Bun and its workloads in the background until demo_stop. Bun's
+# workloads are its children and the process runtime's owners, which outlive
+# Bun and so aren't its children; their command lines name the node's data
+# directory. Without python3 the demo still runs, unmeasured.
+demo_resources_start() {
+    if [[ "${DEMO_RESOURCES:-1}" == 0 ]]; then
+        return
+    fi
+    if ! command -v python3 >/dev/null; then
+        echo "    (resource use not measured: python3 isn't installed)"
+        return
+    fi
+    DEMO_RESOURCES_START="$(date +%s)"
+    printf '0\tcluster starts\n' >"${DEMO_WORK}/steps.tsv"
+    python3 "${DEMO_DIR}/resources.py" sample --pid "${DEMO_BUN_PID}" \
+        --marker "${DEMO_WORK}/data" --node demo-node --start "${DEMO_RESOURCES_START}" \
+        --interval "${DEMO_SAMPLE_INTERVAL:-1}" --csv "${DEMO_WORK}/resources.csv" \
+        2>"${DEMO_WORK}/resources.log" &
+    DEMO_RESOURCES_PID=$!
+}
+
+# Note step $1 for the charts and show the latest sample on one line.
+demo_resources_readout() {
+    if [[ -z "${DEMO_RESOURCES_PID}" ]]; then
+        return
+    fi
+    printf '%s\t%s\n' "$(($(date +%s) - DEMO_RESOURCES_START))" "$1" >>"${DEMO_WORK}/steps.tsv"
+    if ! python3 "${DEMO_DIR}/resources.py" readout --csv "${DEMO_WORK}/resources.csv" \
+        | sed 's/^/    /'; then
+        echo "    (no resource readout: see resources.log)"
+    fi
+}
+
+# Stop sampling, print the summary and keep the samples if asked to.
+demo_resources_stop() {
+    if [[ -z "${DEMO_RESOURCES_PID}" ]]; then
+        return
+    fi
+    kill -TERM "${DEMO_RESOURCES_PID}" 2>/dev/null
+    wait "${DEMO_RESOURCES_PID}" 2>/dev/null
+    DEMO_RESOURCES_PID=""
+    echo ""
+    python3 "${DEMO_DIR}/resources.py" summary --csv "${DEMO_WORK}/resources.csv" | sed '1s/^/==> /'
+    if [[ -n "${DEMO_RESOURCES_OUT:-}" ]]; then
+        mkdir -p "${DEMO_RESOURCES_OUT}"
+        cp "${DEMO_WORK}/resources.csv" "${DEMO_WORK}/steps.tsv" "${DEMO_RESOURCES_OUT}/"
+        python3 "${DEMO_DIR}/resources.py" chart --csv "${DEMO_WORK}/resources.csv" \
+            --steps "${DEMO_WORK}/steps.tsv" --out "${DEMO_RESOURCES_OUT}" >/dev/null
+        echo "    samples and charts in ${DEMO_RESOURCES_OUT}"
+    fi
 }
 
 # Show a command, then run it. A failing command fails the demo. The binary
@@ -146,6 +208,7 @@ demo_start() {
     "${BUN}" --config "${DEMO_WORK}/node.toml" --listen "127.0.0.1:${DEMO_API_PORT}" \
         --runtime "${DEMO_RUNTIME}" --cluster >"${DEMO_WORK}/bun.log" 2>&1 &
     DEMO_BUN_PID=$!
+    demo_resources_start
 
     export RELIABURGER_ENDPOINT="https://127.0.0.1:${DEMO_API_PORT}"
     export RELIABURGER_CA_CERT="${DEMO_WORK}/cluster/identity/root-ca.crt"
@@ -166,6 +229,7 @@ demo_stop() {
     # Clean up as far as possible whatever fails here; the demo's own exit
     # status is what's reported.
     set +e
+    demo_resources_stop
     if [[ -n "${DEMO_BUN_PID}" ]] && kill -0 "${DEMO_BUN_PID}" 2>/dev/null; then
         kill -TERM "${DEMO_BUN_PID}"
         local waited=0
