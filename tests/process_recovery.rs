@@ -1484,15 +1484,21 @@ async fn scaling_down_removes_the_ownership_journals_of_retired_instances() {
     let directory = tempfile::tempdir().unwrap();
     let (sender, shutdown, task) = running_agent(directory.path(), &[]);
     deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 3\n")).await;
-    let before = ["default__web-0", "default__web-1", "default__web-2"];
+    // A smaller share of the same version retires only the replicas that
+    // leave it; `web-0` stays as it was (#1111).
+    let retired = ["default__web-1", "default__web-2"];
     deploy(&sender, &format!("[app.web]\n{SLEEPER}replicas = 1\n")).await;
-    owners_forgotten(directory.path(), &before).await;
-    let kept = std::fs::read_dir(directory.path().join("process-owners"))
+    owners_forgotten(directory.path(), &retired).await;
+    let kept: Vec<String> = std::fs::read_dir(directory.path().join("process-owners"))
         .unwrap()
         .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
         .filter(|name| name.starts_with("default__web"))
-        .count();
-    assert_eq!(kept, 1, "the remaining replica keeps its journal");
+        .collect();
+    assert_eq!(
+        kept,
+        ["default__web-0"],
+        "the remaining replica keeps its journal"
+    );
 
     shutdown.cancel();
     task.await.unwrap();

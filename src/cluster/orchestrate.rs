@@ -2923,6 +2923,12 @@ async fn deploy_outcome(
                 reason,
                 ..
             } => {
+                // The abort says what happened to the instances; the first
+                // error says why. The leader's mark needs both (#1111).
+                let reason = match failure {
+                    Some(DeployWaitError::Failed(cause)) => format!("{cause}; {reason}"),
+                    _ => reason,
+                };
                 failure = Some(DeployWaitError::RolloutAborted {
                     rolled_back,
                     reason,
@@ -4809,6 +4815,61 @@ image = "busybox:latest"
         assert!(matches!(
             deploy_outcome(rx, Duration::from_secs(5)).await,
             Err(DeployWaitError::RolloutAborted { rolled_back: true, ref reason })
+                if reason.ends_with("rolled back — old instances preserved")
+        ));
+    }
+
+    /// #1111: the abort alone says only that the node rolled back. The
+    /// error before it says why, and the leader's `RolloutFailed` mark and
+    /// `relish wtf` need that too.
+    #[tokio::test]
+    async fn a_rollout_abort_reason_keeps_the_first_error() {
+        let (tx, rx) = mpsc::channel(8);
+        for event in [
+            ApplyEvent::Error {
+                message: "node capacity cannot admit cpu=100m mem=32Mi".into(),
+            },
+            ApplyEvent::Error {
+                message: "a later error".into(),
+            },
+            ApplyEvent::RolloutAborted {
+                app: "web".into(),
+                rolled_back: true,
+                reason: "rolled back — old instances preserved".into(),
+            },
+            ApplyEvent::Error {
+                message: "rolled back — old instances preserved".into(),
+            },
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let Err(DeployWaitError::RolloutAborted { reason, .. }) =
+            deploy_outcome(rx, Duration::from_secs(5)).await
+        else {
+            panic!("the abort must be the outcome");
+        };
+        assert_eq!(
+            reason,
+            "node capacity cannot admit cpu=100m mem=32Mi; rolled back — old instances preserved"
+        );
+    }
+
+    /// An abort with no error before it keeps its own reason.
+    #[tokio::test]
+    async fn a_rollout_abort_without_an_earlier_error_keeps_its_reason() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ApplyEvent::RolloutAborted {
+            app: "web".into(),
+            rolled_back: true,
+            reason: "rolled back — old instances preserved".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(matches!(
+            deploy_outcome(rx, Duration::from_secs(5)).await,
+            Err(DeployWaitError::RolloutAborted { ref reason, .. })
                 if reason == "rolled back — old instances preserved"
         ));
     }

@@ -849,7 +849,9 @@ max = 10            # never scale above 10 replicas
 
 **Scale-up** starts new instances using the same placement logic as a deploy (Meat picks nodes, Bun starts containers, health checks run, Wrapper/Onion add to pools). Scale-up doesn't drain or stop any existing instances: a node whose share grows receives the same spec with a higher count, and its agent starts only the added replicas beside the running ones (#346).
 
-**Scale-down** removes excess instances using the drain protocol (remove from routing, wait for drain, stop). Meat keeps the first placements and drops the rest. A node whose share shrinks still rolls its replicas at the lower count rather than stopping only the surplus.
+**Scale-down** removes excess instances using the drain protocol (remove from routing, wait for drain, stop). Meat keeps the first placements and drops the rest. A node whose share shrinks stops only the replicas whose ordinals left it, and leaves the rest running (#1111).
+
+**Moving replicas** between nodes (a lost node's replicas re-placed, an upgrade walk, a capacity refusal) changes a node's share without changing the version. The agent compares the new share with the one it runs: if nothing but the fixed count and the assigned ordinals changed, and every replica of the old share is running, it retires the departing ordinals first and then starts the arriving ones, so a full node frees the room the new replica needs. Replicas that stay in the share aren't touched. Any other change, a new version included, still rolls every replica (#1111).
 
 **GitOps interaction (Lettuce):**
 
