@@ -1203,7 +1203,7 @@ new app deployments still require free capacity and rollout headroom.
 
 **Implementation status:** this is the architecture implemented in
 [#266](https://github.com/reliaburger/reliaburger/pull/266), following the
-[resource-aware jobs plan](plans/2026-10-04-plan-delegated-jobs.md). The daily
+[resource-aware jobs plan](plans/archive/2026-10-04-plan-delegated-jobs.md). The daily
 throughput target remains unqualified until real workloads sustain at least
 1,158 unique successful completions per second with headroom, concurrent apps,
 failure recovery and bounded memory and storage. A short simulated burst doesn't
@@ -1229,7 +1229,7 @@ task cgroups; helper resources stay charged while idle. Other platforms retain
 the original owned process backend and refuse unsupported explicit limits.
 Host commands retain host access and Bun's user; they require trusted workloads.
 Neither path removes process creation, durable outcomes or external-effect
-idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
+idempotency costs. See the [execution and qualification plan](plans/archive/2026-10-07-plan-reusable-executors-and-throughput.md).
 
 Fast delegated jobs use bounded grant lookahead derived from verified duration
 summaries, covering receipt acceptance and grant delivery without increasing
@@ -1291,7 +1291,7 @@ GPU cluster placement and container device assignment remain tracked in F01
 ([#359](https://github.com/reliaburger/reliaburger/issues/359)). Their validation
 must measure useful records/tokens or training samples per second, queue and
 serving latency, accelerator utilisation and recovery, as well as task counts.
-See the [AI implementation sequence](plans/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
+See the [AI implementation sequence](plans/archive/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 

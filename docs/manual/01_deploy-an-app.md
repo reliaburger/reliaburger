@@ -564,8 +564,10 @@ definition and claims every matching UTC minute itself, so a leader change
 neither loses nor repeats an occurrence. An app or job whose name an unsettled
 deployment still owns is refused until that deployment settles, and apply
 refuses an overlapping app or job while an earlier run of it still has an
-uncertain outcome. Leadership changes or recovery preserve that fence; there is no automatic expiry or replay of an
-uncertain migration.
+uncertain outcome. Leadership changes or recovery preserve that fence, and
+nothing replays an uncertain migration on its own: after checking its side
+effects, acknowledge it with `relish batch replay` (see [batch
+jobs](14_batch-jobs.md)).
 
 A failed ordinary job gets four attempts in all, unless it sets `max_attempts`.
 A job whose exit Bun couldn't observe (say, the node crashed) is `unknown`, and

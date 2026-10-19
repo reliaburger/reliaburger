@@ -129,7 +129,7 @@ Every recorded event also goes to a Tokio `broadcast` channel. A broadcast sende
 
 The agent emits deploy, restart, unhealthy, stop, job-completed and job-failed events. Node membership and alert transitions live outside the agent task, so they remain deferred. We say that plainly rather than inventing data.
 
-The new `/v1/jobs` endpoint follows the same rule. It exposes the supervisor's raw state, restart count and age. It doesn't manufacture a cron schedule or a duration that the supervisor never stored.
+The new `/v1/jobs` endpoint followed the same rule. It exposed the supervisor's raw state, restart count and age, and didn't manufacture a cron schedule or a duration that the supervisor never stored. Since 0.2.0 it reads the leader's task arrays instead, because that's where every job lives now (Chapter 17), and the web dashboard shows the same runs and schedules in its job card (Chapter 11).
 
 ## Upgrading the connection
 
