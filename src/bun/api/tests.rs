@@ -2239,7 +2239,148 @@ const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
     ),
     ("POST", "/v1/upgrade/abort", ""),
     ("GET", "/v1/diagnostics/apps", ""),
+    ("POST", "/v1/batch/1/cancel", ""),
+    ("GET", "/v1/batch/1/results", ""),
+    ("GET", "/v1/batch/1/tasks/0/logs", ""),
 ];
+
+/// A run's cancel, results and task logs: a node that doesn't hold the run
+/// must ask the leader, not answer "not found" from its own replica (#1192).
+const RUN_CALLS: &[(&str, &str)] = &[
+    ("POST", "/v1/batch/1/cancel"),
+    ("GET", "/v1/batch/1/results"),
+    ("GET", "/v1/batch/1/tasks/0/logs"),
+];
+
+/// Node 2's router over `council`, with `token` in its store.
+fn router_over(
+    council: Arc<crate::council::CouncilNode>,
+    token: crate::sesame::types::ApiToken,
+) -> Router {
+    let (commands, _receiver) = mpsc::channel(4);
+    let store = crate::sesame::auth::new_token_store();
+    store.try_write().unwrap().push(token);
+    router(
+        commands,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council),
+        Some(store),
+        Some("internal".into()),
+        None,
+        None,
+        None,
+        0,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn a_follower_without_the_run_forwards_cancel_results_and_logs_to_the_leader() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(admin).await;
+
+    // The follower's replica has no run 1; only the leader can say.
+    for (method, path) in RUN_CALLS {
+        let (status, reply) =
+            send_bounded(follower.clone(), method, path, &admin_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{method} {path}: {reply}");
+        assert!(reply.contains("recorded by the leader"), "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        RUN_CALLS.iter().map(|(_, path)| *path).collect::<Vec<_>>()
+    );
+    assert!(
+        seen.iter().all(|(_, bearer, marked, _)| *marked
+            && bearer.as_deref() == Some(format!("Bearer {admin_key}").as_str())),
+        "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_node_with_no_leader_or_a_closed_fence_answers_run_calls_503_not_404() {
+    use crate::council::CouncilNode;
+    use crate::council::fence::RecoveryFence;
+    use crate::council::log_store::MemLogStore;
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::state_machine::CouncilStateMachine;
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo, RecoveryClaim};
+
+    async fn council(initialised: bool, fence: RecoveryFence) -> Arc<CouncilNode> {
+        let network = InMemoryRaftRouter::new();
+        let node = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, network.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        network.register(1, node.raft().clone()).await;
+        if initialised {
+            let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
+            node.initialize(std::collections::BTreeMap::from([(1, info)]))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !node.is_leader().await {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        Arc::new(node.with_recovery_fence(fence))
+    }
+
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    // Back from a whole-cluster stop before any election: no leader known.
+    let leaderless = council(false, RecoveryFence::serving(0)).await;
+    // A leader whose recovery fence a newer epoch closed.
+    let fence = RecoveryFence::serving(0);
+    let fenced = council(true, fence.clone()).await;
+    fence.observe_peer(RecoveryClaim { epoch: 1, id: None });
+
+    for node in [leaderless, fenced] {
+        let app = router_over(node.clone(), admin.clone());
+        for (method, path) in RUN_CALLS {
+            let (status, reply) =
+                send_bounded(app.clone(), method, path, &admin_key, "", &[]).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {path}: {reply}"
+            );
+        }
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_confirmed_leader_answers_404_for_a_run_it_does_not_hold() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let nodes = council_of(1).await;
+    let app = router_over(nodes[0].clone(), admin);
+    for (method, path) in RUN_CALLS {
+        let (status, reply) = send_bounded(app.clone(), method, path, &admin_key, "", &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
 
 #[tokio::test]
 async fn a_leader_without_quorum_answers_503_instead_of_forwarding_to_itself() {
