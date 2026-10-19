@@ -1561,6 +1561,18 @@ restart's step result goes through the same `launch_problem()` test, and a
 refusal moves the instance straight to `Failed` with the reason, as a fresh
 deploy does. Failures that might pass on a retry still take the budget path.
 
+The test for this runs a real agent and a script that deletes itself and
+exits. Its first version had the script sleep for one second first, "long
+enough for the deploy to see it start". On a busy Mac it failed once (#1130).
+The deploy records each workload's pid and start time once `start` returns,
+and a workload that has already exited by then fails the deploy with "runtime
+process identity is unavailable". Timing the fixture under load showed the
+margin going: the script could be running for a full second before the deploy
+finished, after a 667 ms agent-loop turn. The one-second sleep was a
+deadline in disguise. Now the script waits for a file that the test writes
+once the deploy has returned, and only then deletes itself. The test no
+longer depends on how fast the host is.
+
 What we didn't change is the cluster's placement reconciler. It still retries a
 refused deploy on its backoff, 5 s doubling to 5 min, so installing the binary
 is picked up without a re-apply. Each retry fails at once with the real
